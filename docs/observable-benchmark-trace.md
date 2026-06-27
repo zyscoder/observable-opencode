@@ -12,7 +12,7 @@ cd observable-opencode
 推荐固定到已验证分支：
 
 ```bash
-git checkout codex/obversable-opencode-trace
+git checkout codex/observable-opencode-trace
 ```
 
 ## 2. 安装基础依赖
