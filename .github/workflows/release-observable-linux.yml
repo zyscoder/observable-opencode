@@ -1,4 +1,4 @@
-name: release observable linux
+name: release observable
 
 on:
   push:
@@ -15,12 +15,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-observable-linux-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-observable-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Linux release assets
+    name: Build release assets
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -35,7 +35,7 @@ jobs:
       - name: Build CLI binaries
         run: bun run --cwd packages/opencode build --skip-embed-web-ui
 
-      - name: Prepare Linux release assets
+      - name: Prepare release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -48,6 +48,9 @@ jobs:
             opencode-linux-x64-baseline-musl
             opencode-linux-arm64
             opencode-linux-arm64-musl
+            opencode-darwin-arm64
+            opencode-darwin-x64
+            opencode-darwin-x64-baseline
           )
 
           for target in "${targets[@]}"; do
@@ -68,11 +71,15 @@ jobs:
         shell: bash
         run: |
           cat > release/RELEASE_NOTES.md <<'EOF'
-          Observable opencode Linux binaries with benchmark case trace support.
+          Observable opencode binaries with benchmark case trace support.
 
           Recommended asset for most x86_64 enterprise Linux hosts:
 
           - opencode-observable-linux-x64
+
+          Recommended asset for Apple Silicon macOS hosts:
+
+          - opencode-observable-darwin-arm64
 
           Other assets:
 
@@ -81,6 +88,8 @@ jobs:
           - opencode-observable-linux-x64-baseline-musl: Alpine/musl x86_64 without AVX2
           - opencode-observable-linux-arm64: Linux arm64
           - opencode-observable-linux-arm64-musl: Alpine/musl arm64
+          - opencode-observable-darwin-x64: macOS Intel
+          - opencode-observable-darwin-x64-baseline: macOS Intel without AVX2
 
           Enable trace at runtime with:
 
@@ -94,7 +103,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: opencode-observable-linux
+          name: opencode-observable
           path: release/
 
       - name: Publish GitHub Release

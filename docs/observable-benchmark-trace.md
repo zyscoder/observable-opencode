@@ -1,6 +1,6 @@
 # Observable Opencode Benchmark Trace 使用说明
 
-本文说明如何在 Linux 上安装改造后的 observable opencode，如何替换现有 `opencode` 命令，以及如何在 benchmark case 执行时生成结构化 trace 和可视化报告。
+本文说明如何安装改造后的 observable opencode，如何替换现有 `opencode` 命令，以及如何在 benchmark case 执行时生成结构化 trace 和可视化报告。
 
 ## 1. 获取代码
 
@@ -17,7 +17,7 @@ git checkout codex/observable-opencode-trace
 
 ## 2. 企业内网推荐：直接使用 GitHub Release 二进制
 
-企业内部 Linux 环境如果无法稳定访问 npm、GitHub dependency、Bun registry，不需要在内网机器上执行 `bun install`。推荐在 GitHub Actions 外网环境构建 Release，然后在内网机器只下载一个可执行文件。
+企业内部 Linux 或 macOS 环境如果无法稳定访问 npm、GitHub dependency、Bun registry，不需要在目标机器上执行 `bun install`。推荐在 GitHub Actions 外网环境构建 Release，然后在目标机器只下载一个可执行文件。
 
 Release workflow 位于：
 
@@ -37,7 +37,7 @@ git push origin v1.14.48-observable.1
 方式二：在 GitHub 页面手动触发。
 
 ```text
-Actions -> release observable linux -> Run workflow
+Actions -> release observable -> Run workflow
 ```
 
 手动触发时填写 tag，例如：
@@ -55,6 +55,9 @@ opencode-observable-linux-x64-musl
 opencode-observable-linux-x64-baseline-musl
 opencode-observable-linux-arm64
 opencode-observable-linux-arm64-musl
+opencode-observable-darwin-arm64
+opencode-observable-darwin-x64
+opencode-observable-darwin-x64-baseline
 SHA256SUMS
 ```
 
@@ -71,6 +74,18 @@ opencode-observable-linux-x64-baseline
 ```
 
 Alpine Linux 或 musl 环境使用 `*-musl` 资产。
+
+Apple Silicon macOS 使用：
+
+```text
+opencode-observable-darwin-arm64
+```
+
+Intel macOS 使用：
+
+```text
+opencode-observable-darwin-x64
+```
 
 ### 2.2 在企业 Linux 机器安装 Release 二进制
 
@@ -95,6 +110,28 @@ opencode --version
 ```
 
 如果内网机器不能直接访问 GitHub Release，可以先在有外网的机器下载 `opencode-observable-linux-x64` 和 `SHA256SUMS`，再通过企业内部制品库、堡垒机或离线介质分发到目标机器。
+
+### 2.3 在 macOS 机器安装 Release 二进制
+
+```bash
+export TAG="v1.14.48-observable.1"
+export ASSET="opencode-observable-darwin-arm64"
+
+curl -L \
+  -o /tmp/opencode \
+  "https://github.com/zyscoder/observable-opencode/releases/download/${TAG}/${ASSET}"
+
+curl -L \
+  -o /tmp/SHA256SUMS \
+  "https://github.com/zyscoder/observable-opencode/releases/download/${TAG}/SHA256SUMS"
+
+cd /tmp
+grep " ${ASSET}$" SHA256SUMS | sed "s#${ASSET}#opencode#" | shasum -a 256 -c -
+
+chmod +x /tmp/opencode
+sudo install -m 0755 /tmp/opencode /usr/local/bin/opencode
+opencode --version
+```
 
 ## 3. 源码方式：仅用于开发或外网构建机
 
