@@ -140,6 +140,7 @@ export type ActiveSpan = {
 
 const truthy = new Set(["1", "true", "yes", "on"])
 let active: ActiveCaseTrace | false | undefined
+let processFinalizerInstalled = false
 
 function nowIso() {
   return new Date().toISOString()
@@ -527,6 +528,26 @@ function jsonPretty(input: unknown) {
 const summarizeTextField = summarizeText
 const summarizeJsonField = summarizeJson
 
+function finishActiveFromProcessExit(code: number | undefined) {
+  const current = active || undefined
+  if (!current) return
+  current.finish({
+    status: code && code !== 0 ? "error" : "success",
+    result: {
+      exit_code: code ?? process.exitCode ?? 0,
+      reason: "process.exit",
+    },
+  })
+  active = false
+}
+
+function installProcessFinalizer() {
+  if (processFinalizerInstalled) return
+  processFinalizerInstalled = true
+  process.once("beforeExit", (code) => finishActiveFromProcessExit(code))
+  process.once("exit", (code) => finishActiveFromProcessExit(code))
+}
+
 export namespace CaseTrace {
   export function isEnabled() {
     return enabledFromEnv()
@@ -545,6 +566,7 @@ export namespace CaseTrace {
     }
     if (active) active.finish({ status: "cancelled", result: { reason: "reconfigured" } })
     active = new ActiveCaseTrace({ ...input, caseID })
+    installProcessFinalizer()
     return active || undefined
   }
 

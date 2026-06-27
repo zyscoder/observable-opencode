@@ -14,6 +14,7 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { CaseTrace } from "@/observability/case-trace"
 
 ensureProcessMetadata("worker")
 
@@ -96,8 +97,22 @@ export const rpc = {
   async shutdown() {
     Log.Default.info("worker shutting down")
 
-    await InstanceRuntime.disposeAllInstances()
-    if (server) await server.stop(true)
+    let failure: unknown
+    try {
+      await InstanceRuntime.disposeAllInstances()
+      if (server) await server.stop(true)
+    } catch (error) {
+      failure = error
+      throw error
+    } finally {
+      CaseTrace.finish({
+        status: failure ? "error" : "success",
+        error: failure,
+        result: {
+          reason: "worker.shutdown",
+        },
+      })
+    }
   },
 }
 
