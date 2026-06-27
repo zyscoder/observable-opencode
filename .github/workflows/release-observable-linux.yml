@@ -1,0 +1,117 @@
+name: release observable linux
+
+on:
+  push:
+    tags:
+      - "v*-observable.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.14.48-observable.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-observable-linux-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Linux release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Typecheck opencode package
+        run: bun run --cwd packages/opencode typecheck
+
+      - name: Build CLI binaries
+        run: bun run --cwd packages/opencode build --skip-embed-web-ui
+
+      - name: Prepare Linux release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          targets=(
+            opencode-linux-x64
+            opencode-linux-x64-baseline
+            opencode-linux-x64-musl
+            opencode-linux-x64-baseline-musl
+            opencode-linux-arm64
+            opencode-linux-arm64-musl
+          )
+
+          for target in "${targets[@]}"; do
+            source="packages/opencode/dist/${target}/bin/opencode"
+            if [ ! -f "$source" ]; then
+              echo "Missing expected binary: $source" >&2
+              exit 1
+            fi
+
+            asset="release/${target/opencode-/opencode-observable-}"
+            cp "$source" "$asset"
+            chmod +x "$asset"
+          done
+
+          (cd release && sha256sum opencode-observable-* > SHA256SUMS)
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release/RELEASE_NOTES.md <<'EOF'
+          Observable opencode Linux binaries with benchmark case trace support.
+
+          Recommended asset for most x86_64 enterprise Linux hosts:
+
+          - opencode-observable-linux-x64
+
+          Other assets:
+
+          - opencode-observable-linux-x64-baseline: x86_64 without AVX2
+          - opencode-observable-linux-x64-musl: Alpine/musl x86_64
+          - opencode-observable-linux-x64-baseline-musl: Alpine/musl x86_64 without AVX2
+          - opencode-observable-linux-arm64: Linux arm64
+          - opencode-observable-linux-arm64-musl: Alpine/musl arm64
+
+          Enable trace at runtime with:
+
+          ```bash
+          export OPENCODE_CASE_TRACE=1
+          export OPENCODE_CASE_ID="T1-001"
+          export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/opencode-traces"
+          ```
+          EOF
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-observable-linux
+          path: release/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release/opencode-observable-* release/SHA256SUMS --clobber
+          else
+            gh release create "$TAG_NAME" \
+              release/opencode-observable-* \
+              release/SHA256SUMS \
+              --title "$TAG_NAME" \
+              --notes-file release/RELEASE_NOTES.md \
+              --target "$GITHUB_SHA"
+          fi

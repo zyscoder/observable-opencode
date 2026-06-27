@@ -15,7 +15,88 @@ cd observable-opencode
 git checkout codex/observable-opencode-trace
 ```
 
-## 2. 安装基础依赖
+## 2. 企业内网推荐：直接使用 GitHub Release 二进制
+
+企业内部 Linux 环境如果无法稳定访问 npm、GitHub dependency、Bun registry，不需要在内网机器上执行 `bun install`。推荐在 GitHub Actions 外网环境构建 Release，然后在内网机器只下载一个可执行文件。
+
+Release workflow 位于：
+
+```text
+.github/workflows/release-observable-linux.yml
+```
+
+### 2.1 在 GitHub 上触发发布
+
+方式一：推送 tag 自动发布。
+
+```bash
+git tag v1.14.48-observable.1
+git push origin v1.14.48-observable.1
+```
+
+方式二：在 GitHub 页面手动触发。
+
+```text
+Actions -> release observable linux -> Run workflow
+```
+
+手动触发时填写 tag，例如：
+
+```text
+v1.14.48-observable.1
+```
+
+workflow 会发布这些资产：
+
+```text
+opencode-observable-linux-x64
+opencode-observable-linux-x64-baseline
+opencode-observable-linux-x64-musl
+opencode-observable-linux-x64-baseline-musl
+opencode-observable-linux-arm64
+opencode-observable-linux-arm64-musl
+SHA256SUMS
+```
+
+大多数企业 x86_64 glibc Linux 机器使用：
+
+```text
+opencode-observable-linux-x64
+```
+
+老旧 x86_64 CPU 如果不支持 AVX2，使用：
+
+```text
+opencode-observable-linux-x64-baseline
+```
+
+Alpine Linux 或 musl 环境使用 `*-musl` 资产。
+
+### 2.2 在企业 Linux 机器安装 Release 二进制
+
+```bash
+export TAG="v1.14.48-observable.1"
+export ASSET="opencode-observable-linux-x64"
+
+curl -L \
+  -o /tmp/opencode \
+  "https://github.com/zyscoder/observable-opencode/releases/download/${TAG}/${ASSET}"
+
+curl -L \
+  -o /tmp/SHA256SUMS \
+  "https://github.com/zyscoder/observable-opencode/releases/download/${TAG}/SHA256SUMS"
+
+cd /tmp
+grep " ${ASSET}$" SHA256SUMS | sed "s#${ASSET}#opencode#" | sha256sum -c -
+
+chmod +x /tmp/opencode
+sudo install -m 0755 /tmp/opencode /usr/local/bin/opencode
+opencode --version
+```
+
+如果内网机器不能直接访问 GitHub Release，可以先在有外网的机器下载 `opencode-observable-linux-x64` 和 `SHA256SUMS`，再通过企业内部制品库、堡垒机或离线介质分发到目标机器。
+
+## 3. 源码方式：仅用于开发或外网构建机
 
 Linux 机器需要先安装 Node.js、Git 和 Bun。Bun 版本建议使用仓库声明的 `1.3.13`。
 
@@ -37,7 +118,7 @@ bun install
 bun run --cwd packages/opencode typecheck
 ```
 
-## 3. 运行 observable opencode
+## 4. 运行 observable opencode
 
 ### 方式 A：源码方式运行，推荐用于 benchmark
 
@@ -89,7 +170,7 @@ packages/opencode/dist/opencode-linux-arm64/bin/opencode
 ./packages/opencode/dist/opencode-linux-x64/bin/opencode --version
 ```
 
-## 4. 替换现有 opencode
+## 5. 替换现有 opencode
 
 先确认当前 `opencode` 位置：
 
@@ -120,7 +201,7 @@ opencode --version
 
 如果线上环境不允许替换全局命令，推荐只在 benchmark runner 中把 `opencode` 命令路径改成 `/usr/local/bin/opencode-observable`。
 
-## 5. 配置 trace 环境变量
+## 6. 配置 trace 环境变量
 
 开启 case trace：
 
@@ -156,7 +237,7 @@ $OPENCODE_CASE_TRACE_DIR/
 - `trace.json`：case 执行结束后的结构化汇总。
 - `trace.html`：离线可视化报告，包含组件瀑布图、token 汇总、工具调用和错误面板。
 
-## 6. 运行 benchmark case
+## 7. 运行 benchmark case
 
 普通 prompt case 示例：
 
@@ -192,7 +273,7 @@ for case_id in T1-001 T1-002 T2-001; do
 done
 ```
 
-## 7. 查看 trace
+## 8. 查看 trace
 
 结构化检查：
 
@@ -209,7 +290,7 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 
 无 GUI 服务器可以将 `trace.html` 下载到本地浏览器打开。
 
-## 8. Trace 覆盖范围
+## 9. Trace 覆盖范围
 
 当前 trace 覆盖：
 
@@ -222,7 +303,7 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 9. 常见问题
+## 10. 常见问题
 
 ### 没有生成 trace
 
