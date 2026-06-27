@@ -24,6 +24,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { EffectBridge } from "@/effect/bridge"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
+import { CaseTrace } from "@/observability/case-trace"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -226,6 +227,24 @@ const live: Layer.Layer<
         })
       }
       const sortedTools = Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b)))
+      CaseTrace.event({
+        component: "context",
+        event_type: "llm.context.prepared",
+        data: {
+          sessionID: input.sessionID,
+          parentSessionID: input.parentSessionID,
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          agent: input.agent.name,
+          mode: input.agent.mode,
+          small: input.small ?? false,
+          system_count: system.length,
+          message_count: messages.length,
+          tool_count: Object.keys(sortedTools).length,
+          tool_choice: input.toolChoice,
+          retries: input.retries ?? 0,
+        },
+      })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -425,9 +444,52 @@ const live: Layer.Layer<
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
 
+            const span = CaseTrace.get()?.startSpan({
+              component: "llm",
+              operation: "stream",
+              name: `${input.model.providerID}/${input.model.id}`,
+              input: {
+                sessionID: input.sessionID,
+                parentSessionID: input.parentSessionID,
+                agent: input.agent.name,
+                model: {
+                  providerID: input.model.providerID,
+                  id: input.model.id,
+                },
+                message_count: input.messages.length,
+                system_count: input.system.length,
+                tool_count: Object.keys(input.tools).length,
+                tool_choice: input.toolChoice,
+              },
+            })
             const result = yield* run({ ...input, abort: ctrl.signal })
+            const traced = async function* () {
+              try {
+                for await (const event of result.fullStream) {
+                  span?.event({
+                    event_type: `stream.${event.type}`,
+                    data:
+                      event.type === "text-delta" || event.type === "reasoning-delta"
+                        ? { type: event.type, length: event.text.length }
+                        : event,
+                  })
+                  yield event
+                }
+                span?.end({
+                  output: {
+                    completed: true,
+                  },
+                })
+              } catch (error) {
+                span?.end({
+                  status: "error",
+                  error,
+                })
+                throw error
+              }
+            }
 
-            return Stream.fromAsyncIterable(result.fullStream, (e) => (e instanceof Error ? e : new Error(String(e))))
+            return Stream.fromAsyncIterable(traced(), (e) => (e instanceof Error ? e : new Error(String(e))))
           }),
         ),
       )

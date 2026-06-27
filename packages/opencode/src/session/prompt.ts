@@ -60,6 +60,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "@/storage/db"
 import * as Database from "@/storage/db"
 import { SessionTable } from "./session.sql"
+import { CaseTrace } from "@/observability/case-trace"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -311,6 +312,18 @@ export const layer = Layer.effect(
         }),
         { concurrency: "unbounded", discard: true },
       )
+      CaseTrace.event({
+        component: "context",
+        event_type: "prompt.parts.resolved",
+        data: {
+          template: CaseTrace.summarizeText(template),
+          part_count: parts.length,
+          part_types: parts.map((part) => part.type),
+          file_count: parts.filter((part) => part.type === "file").length,
+          agent_count: parts.filter((part) => part.type === "agent").length,
+          reference_count: parts.filter((part) => part.type === "text" && "metadata" in part && part.metadata).length,
+        },
+      })
       return parts
     })
 
@@ -1595,9 +1608,34 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
+        const span = CaseTrace.get()?.startSpan({
+          component: "prompt",
+          operation: "prompt",
+          name: input.agent,
+          input: {
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            agent: input.agent,
+            model: input.model,
+            variant: input.variant,
+            noReply: input.noReply,
+            tool_overrides: input.tools,
+            part_count: input.parts.length,
+            part_types: input.parts.map((part) => part.type),
+          },
+        })
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         yield* revert.cleanup(session)
         const message = yield* createUserMessage(input)
+        span?.event({
+          event_type: "user.message.created",
+          data: {
+            sessionID: message.info.sessionID,
+            messageID: message.info.id,
+            part_count: message.parts.length,
+            part_types: message.parts.map((part) => part.type),
+          },
+        })
         yield* sessions.touch(input.sessionID)
 
         const permissions: Permission.Ruleset = []
@@ -1609,8 +1647,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
         }
 
-        if (input.noReply === true) return message
-        return yield* loop({ sessionID: input.sessionID })
+        if (input.noReply === true) {
+          span?.end({
+            output: {
+              messageID: message.info.id,
+              noReply: true,
+            },
+          })
+          return message
+        }
+        const result = yield* loop({ sessionID: input.sessionID })
+        span?.end({
+          output: {
+            messageID: message.info.id,
+            resultMessageID: result.info.id,
+            resultRole: result.info.role,
+          },
+        })
+        return result
       },
     )
 
@@ -1673,6 +1727,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           step++
+          CaseTrace.event({
+            component: "prompt",
+            event_type: "loop.step",
+            data: {
+              sessionID,
+              step,
+              message_count: msgs.length,
+              pending_task_count: tasks.length,
+              lastUserID: lastUser.id,
+              lastAssistantID: lastAssistant?.id,
+              lastFinishedID: lastFinished?.id,
+            },
+          })
           if (step === 1)
             yield* title({
               session,
@@ -1799,6 +1866,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            CaseTrace.event({
+              component: "context",
+              event_type: "model.context.ready",
+              data: {
+                sessionID,
+                step,
+                agent: agent.name,
+                model: {
+                  providerID: model.providerID,
+                  id: model.id,
+                },
+                raw_message_count: msgs.length,
+                model_message_count: modelMsgs.length,
+                system_count: system.length,
+                tool_count: Object.keys(tools).length,
+                format: format.type,
+                isLastStep,
+              },
+            })
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1855,7 +1941,28 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const span = CaseTrace.get()?.startSpan({
+        component: "prompt",
+        operation: "loop",
+        name: "session.loop",
+        input: {
+          sessionID: input.sessionID,
+        },
+      })
+      const result = yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID),
+      )
+      span?.end({
+        output: {
+          sessionID: input.sessionID,
+          messageID: result.info.id,
+          role: result.info.role,
+          part_count: result.parts.length,
+        },
+      })
+      return result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(

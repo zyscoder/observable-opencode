@@ -9,6 +9,7 @@ import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Effect, Exit, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
+import { CaseTrace } from "@/observability/case-trace"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -167,8 +168,67 @@ export const TaskTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        run(params, ctx).pipe(Effect.orDie),
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => {
+        const traceSpan = CaseTrace.get()?.startSpan({
+          component: "task",
+          operation: "subagent",
+          name: params.subagent_type,
+          input: {
+            description: params.description,
+            prompt: CaseTrace.summarizeText(params.prompt),
+            subagent_type: params.subagent_type,
+            task_id: params.task_id,
+            command: params.command,
+            parent_session_id: ctx.sessionID,
+            message_id: ctx.messageID,
+          },
+        })
+        return run(params, ctx).pipe(
+          Effect.tap((result) =>
+            Effect.sync(() => {
+              traceSpan?.end({
+                output: {
+                  description: params.description,
+                  subagent_type: params.subagent_type,
+                  task_id: result.metadata.sessionId,
+                  model: result.metadata.model,
+                  output: CaseTrace.summarizeText(result.output),
+                },
+              })
+              CaseTrace.event({
+                component: "task",
+                event_type: "completed",
+                data: {
+                  description: params.description,
+                  subagent_type: params.subagent_type,
+                  task_id: result.metadata.sessionId,
+                  model: result.metadata.model,
+                  output: CaseTrace.summarizeText(result.output),
+                },
+              })
+            }),
+          ),
+          Effect.tapError((error) =>
+            Effect.sync(() => {
+              traceSpan?.end({
+                status: "error",
+                error,
+              })
+              CaseTrace.event({
+                component: "task",
+                event_type: "failed",
+                data: {
+                  description: params.description,
+                  subagent_type: params.subagent_type,
+                  task_id: params.task_id,
+                  error,
+                },
+              })
+            }),
+          ),
+          Effect.orDie,
+        )
+      },
     }
   }),
 )

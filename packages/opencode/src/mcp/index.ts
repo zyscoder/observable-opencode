@@ -31,6 +31,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { CaseTrace } from "@/observability/case-trace"
 
 const log = Log.create({ service: "mcp" })
 const DEFAULT_TIMEOUT = 30_000
@@ -134,7 +135,18 @@ function listTools(key: string, client: MCPClient, timeout: number) {
     try: () => client.listTools(undefined, { timeout }),
     catch: (err) => (err instanceof Error ? err : new Error(String(err))),
   }).pipe(
-    Effect.map((result) => result.tools),
+    Effect.map((result) => {
+      CaseTrace.event({
+        component: "mcp",
+        event_type: "tools.list",
+        data: {
+          server: key,
+          count: result.tools.length,
+          tools: result.tools.map((item) => item.name),
+        },
+      })
+      return result.tools
+    }),
     Effect.catch((error) => {
       if (!isOutputSchemaValidationError(error)) return Effect.fail(error)
 
@@ -143,20 +155,30 @@ function listTools(key: string, client: MCPClient, timeout: number) {
         try: () => client.request({ method: "tools/list" }, TolerantListToolsResultSchema, { timeout }),
         catch: (err) => (err instanceof Error ? err : new Error(String(err))),
       }).pipe(
-        Effect.map((result) =>
-          result.tools.map((tool) => ({
+        Effect.map((result) => {
+          CaseTrace.event({
+            component: "mcp",
+            event_type: "tools.list.tolerant",
+            data: {
+              server: key,
+              count: result.tools.length,
+              tools: result.tools.map((item) => item.name),
+              validation_error: error.message,
+            },
+          })
+          return result.tools.map((tool) => ({
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
-          })),
-        ),
+          }))
+        }),
       )
     }),
   )
 }
 
 // Convert MCP tool definition to AI SDK Tool type
-function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, timeout?: number): Tool {
+function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClient, timeout?: number): Tool {
   const inputSchema = mcpTool.inputSchema
 
   // Spread first, then override type to ensure it's always "object"
@@ -171,17 +193,45 @@ function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, timeout?: number
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(schema),
     execute: async (args: unknown) => {
-      return client.callTool(
-        {
-          name: mcpTool.name,
-          arguments: (args || {}) as Record<string, unknown>,
-        },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
+      const span = CaseTrace.get()?.startSpan({
+        component: "mcp",
+        operation: "tool.call",
+        name: `${clientName}:${mcpTool.name}`,
+        input: {
+          server: clientName,
+          tool: mcpTool.name,
+          args,
           timeout,
         },
-      )
+      })
+      try {
+        const result = await client.callTool(
+          {
+            name: mcpTool.name,
+            arguments: (args || {}) as Record<string, unknown>,
+          },
+          CallToolResultSchema,
+          {
+            resetTimeoutOnProgress: true,
+            timeout,
+          },
+        )
+        span?.end({
+          output: {
+            server: clientName,
+            tool: mcpTool.name,
+            content_count: Array.isArray(result.content) ? result.content.length : 0,
+            metadata: result.metadata,
+          },
+        })
+        return result
+      } catch (error) {
+        span?.end({
+          status: "error",
+          error,
+        })
+        throw error
+      }
     },
   })
 }
@@ -452,10 +502,28 @@ export const layer = Layer.effect(
     const create = Effect.fn("MCP.create")(function* (key: string, mcp: ConfigMCP.Info) {
       if (mcp.enabled === false) {
         log.info("mcp server disabled", { key })
+        CaseTrace.event({
+          component: "mcp",
+          event_type: "server.disabled",
+          data: {
+            server: key,
+            type: mcp.type,
+          },
+        })
         return DISABLED_RESULT
       }
 
       log.info("found", { key, type: mcp.type })
+      const span = CaseTrace.get()?.startSpan({
+        component: "mcp",
+        operation: "connect",
+        name: key,
+        input: {
+          server: key,
+          type: mcp.type,
+          timeout: mcp.timeout,
+        },
+      })
 
       const { client: mcpClient, status } =
         mcp.type === "remote"
@@ -463,16 +531,37 @@ export const layer = Layer.effect(
           : yield* connectLocal(key, mcp as ConfigMCP.Info & { type: "local" })
 
       if (!mcpClient) {
+        span?.end({
+          status: status.status === "failed" ? "error" : "success",
+          output: {
+            status,
+          },
+          error: status.status === "failed" ? status.error : undefined,
+        })
         return { status } satisfies CreateResult
       }
 
       const listed = yield* defs(key, mcpClient, mcp.timeout)
       if (!listed) {
         yield* Effect.tryPromise(() => mcpClient.close()).pipe(Effect.ignore)
+        span?.end({
+          status: "error",
+          output: {
+            status: "failed",
+            reason: "Failed to get tools",
+          },
+        })
         return { status: { status: "failed", error: "Failed to get tools" } } satisfies CreateResult
       }
 
       log.info("create() successfully created client", { key, toolCount: listed.length })
+      span?.end({
+        output: {
+          status,
+          tool_count: listed.length,
+          tools: listed.map((item) => item.name),
+        },
+      })
       return { mcpClient, status, defs: listed } satisfies CreateResult
     })
     const cfgSvc = yield* Config.Service
@@ -686,7 +775,12 @@ export const layer = Layer.effect(
 
             const timeout = entry?.timeout ?? defaultTimeout
             for (const mcpTool of listed) {
-              result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(mcpTool, client, timeout)
+              result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(
+                clientName,
+                mcpTool,
+                client,
+                timeout,
+              )
             }
           }),
         { concurrency: "unbounded" },

@@ -26,6 +26,7 @@ import { SessionEvent } from "@/v2/session-event"
 import { Modelv2 } from "@/v2/model"
 import * as DateTime from "effect/DateTime"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { CaseTrace } from "@/observability/case-trace"
 
 const DOOM_LOOP_THRESHOLD = 3
 const log = Log.create({ service: "session.processor" })
@@ -120,6 +121,20 @@ export const layer: Layer.Layer<
       // may execute tools internally before emitting start-step events,
       // so capturing inside the event handler can be too late.
       const initialSnapshot = yield* snapshot.track()
+      CaseTrace.event({
+        component: "processor",
+        event_type: "create",
+        data: {
+          sessionID: input.sessionID,
+          messageID: input.assistantMessage.id,
+          agent: input.assistantMessage.agent,
+          model: {
+            providerID: input.model.providerID,
+            id: input.model.id,
+          },
+          initialSnapshot,
+        },
+      })
       const ctx: ProcessorContext = {
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
@@ -189,6 +204,24 @@ export const layer: Layer.Layer<
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
+        CaseTrace.event({
+          component: "processor",
+          event_type: "tool.result",
+          data: {
+            sessionID: match.call.sessionID,
+            messageID: match.call.messageID,
+            partID: match.call.partID,
+            callID: toolCallID,
+            title: output.title,
+            metadata: output.metadata,
+            output: CaseTrace.summarizeText(output.output),
+            attachments: output.attachments?.map((item) => ({
+              filename: item.filename,
+              mime: item.mime,
+              url: item.url,
+            })),
+          },
+        })
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -207,6 +240,17 @@ export const layer: Layer.Layer<
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return false
+        CaseTrace.event({
+          component: "processor",
+          event_type: "tool.error",
+          data: {
+            sessionID: match.call.sessionID,
+            messageID: match.call.messageID,
+            partID: match.call.partID,
+            callID: toolCallID,
+            error: errorMessage(error),
+          },
+        })
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -226,6 +270,14 @@ export const layer: Layer.Layer<
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "start":
+            CaseTrace.event({
+              component: "processor",
+              event_type: "stream.start",
+              data: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+              },
+            })
             yield* status.set(ctx.sessionID, { type: "busy" })
             return
 
@@ -287,6 +339,16 @@ export const layer: Layer.Layer<
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.toolName}`)
             }
+            CaseTrace.event({
+              component: "processor",
+              event_type: "tool.input.start",
+              data: {
+                sessionID: ctx.sessionID,
+                callID: value.id,
+                tool: value.toolName,
+                providerExecuted: value.providerExecuted,
+              },
+            })
             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
               yield* sync.run(SessionEvent.Tool.Input.Started.Sync, {
@@ -334,6 +396,17 @@ export const layer: Layer.Layer<
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.toolName}`)
             }
+            CaseTrace.event({
+              component: "processor",
+              event_type: "tool.call",
+              data: {
+                sessionID: ctx.sessionID,
+                callID: value.toolCallId,
+                tool: value.toolName,
+                input: value.input,
+                providerMetadata: value.providerMetadata,
+              },
+            })
             const toolCall = yield* readToolCall(value.toolCallId)
             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
@@ -503,6 +576,22 @@ export const layer: Layer.Layer<
               usage: value.usage,
               metadata: value.providerMetadata,
             })
+            CaseTrace.usage({
+              ...usage.tokens,
+              cost: usage.cost,
+            })
+            CaseTrace.event({
+              component: "processor",
+              event_type: "finish.step",
+              data: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                finishReason: value.finishReason,
+                tokens: usage.tokens,
+                cost: usage.cost,
+                providerMetadata: value.providerMetadata,
+              },
+            })
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
@@ -627,6 +716,14 @@ export const layer: Layer.Layer<
             return
 
           case "finish":
+            CaseTrace.event({
+              component: "processor",
+              event_type: "stream.finish",
+              data: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+              },
+            })
             return
 
           default:
@@ -728,8 +825,24 @@ export const layer: Layer.Layer<
         slog.info("process")
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const span = CaseTrace.get()?.startSpan({
+          component: "processor",
+          operation: "process",
+          name: "session.processor",
+          input: {
+            sessionID: ctx.sessionID,
+            messageID: ctx.assistantMessage.id,
+            agent: streamInput.agent.name,
+            model: {
+              providerID: streamInput.model.providerID,
+              id: streamInput.model.id,
+            },
+            message_count: streamInput.messages.length,
+            tool_count: Object.keys(streamInput.tools).length,
+          },
+        })
 
-        return yield* Effect.gen(function* () {
+        const result = yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
@@ -792,6 +905,25 @@ export const layer: Layer.Layer<
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
         })
+        span?.end({
+          output: {
+            result,
+            blocked: ctx.blocked,
+            needsCompaction: ctx.needsCompaction,
+            hasError: Boolean(ctx.assistantMessage.error),
+          },
+        })
+        CaseTrace.event({
+          component: "processor",
+          event_type: "process.result",
+          data: {
+            result,
+            blocked: ctx.blocked,
+            needsCompaction: ctx.needsCompaction,
+            hasError: Boolean(ctx.assistantMessage.error),
+          },
+        })
+        return result
       })
 
       return {

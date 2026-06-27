@@ -25,6 +25,7 @@ import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@openc
 import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { CaseTrace } from "@/observability/case-trace"
 
 const runtimeTask = import("./run/runtime")
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
@@ -359,6 +360,27 @@ export const RunCommand = effectCmd({
         return message.slice(0, 50) + (message.length > 50 ? "..." : "")
       }
 
+      CaseTrace.configure({
+        input: {
+          command: args.command,
+          prompt: CaseTrace.summarizeText(initialInput ?? message),
+          files: files.map((file) => ({
+            filename: file.filename,
+            mime: file.mime,
+            url: file.url,
+          })),
+        },
+        environment: {
+          mode: args.interactive ? "interactive" : args.attach ? "attach" : "non-interactive",
+          format: args.format,
+          directory: directory ?? root,
+          requested_agent: args.agent,
+          requested_model: args.model,
+          variant: args.variant,
+          attach: Boolean(args.attach),
+        },
+      })
+
       async function session(sdk: OpencodeClient): Promise<SessionInfo | undefined> {
         if (args.session) {
           const current = await sdk.session
@@ -572,175 +594,299 @@ export const RunCommand = effectCmd({
       }
 
       async function execute(sdk: OpencodeClient) {
-        const sess = await session(sdk)
-        if (!sess?.id) {
-          UI.error("Session not found")
-          process.exit(1)
-        }
-        const sessionID = sess.id
-
-        function emit(type: string, data: Record<string, unknown>) {
-          if (args.format === "json") {
-            process.stdout.write(
-              JSON.stringify({
-                type,
-                timestamp: Date.now(),
-                sessionID,
-                ...data,
-              }) + EOL,
-            )
-            return true
+        const runSpan = CaseTrace.get()?.startSpan({
+          component: "run",
+          operation: "execute",
+          name: args.interactive ? "interactive" : "non-interactive",
+          input: {
+            command: args.command,
+            interactive: args.interactive,
+            attach: Boolean(args.attach),
+            format: args.format,
+          },
+          metadata: {
+            requested_agent: args.agent,
+            requested_model: args.model,
+            variant: args.variant,
+          },
+        })
+        let failure: unknown
+        try {
+          const sess = await session(sdk)
+          if (!sess?.id) {
+            UI.error("Session not found")
+            process.exit(1)
           }
-          return false
-        }
+          const sessionID = sess.id
+          CaseTrace.setSessionID(sessionID)
+          runSpan?.event({
+            event_type: "session.selected",
+            data: {
+              sessionID,
+              title: sess.title,
+              directory: sess.directory,
+              resumed: Boolean(args.session || args.continue),
+              forked: Boolean(args.fork),
+            },
+          })
 
-        // Consume one subscribed event stream for the active session and mirror it
-        // to stdout/UI. `client` is passed explicitly because attach mode may
-        // rebind the SDK to the session's directory after the subscription is
-        // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
-          const toggles = new Map<string, boolean>()
-          let error: string | undefined
-
-          for await (const event of events.stream) {
-            if (
-              event.type === "message.updated" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.info.role === "assistant" &&
-              args.format !== "json" &&
-              toggles.get("start") !== true
-            ) {
-              UI.empty()
-              UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
-              UI.empty()
-              toggles.set("start", true)
+          function emit(type: string, data: Record<string, unknown>) {
+            if (args.format === "json") {
+              process.stdout.write(
+                JSON.stringify({
+                  type,
+                  timestamp: Date.now(),
+                  sessionID,
+                  ...data,
+                }) + EOL,
+              )
+              return true
             }
+            return false
+          }
 
-            if (event.type === "message.part.updated") {
-              const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
+          // Consume one subscribed event stream for the active session and mirror it
+          // to stdout/UI. `client` is passed explicitly because attach mode may
+          // rebind the SDK to the session's directory after the subscription is
+          // created, and replies issued from inside the loop must use that client.
+          async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+            const toggles = new Map<string, boolean>()
+            let error: string | undefined
 
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  await tool(part)
-                  continue
+            for await (const event of events.stream) {
+              if (
+                event.type === "message.updated" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.info.role === "assistant" &&
+                args.format !== "json" &&
+                toggles.get("start") !== true
+              ) {
+                UI.empty()
+                UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
+                UI.empty()
+                toggles.set("start", true)
+              }
+
+              if (event.type === "message.part.updated") {
+                const part = event.properties.part
+                if (part.sessionID !== sessionID) continue
+
+                if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                  CaseTrace.event({
+                    component: "result",
+                    event_type: "tool.part.finalized",
+                    data: {
+                      tool: part.tool,
+                      callID: part.callID,
+                      status: part.state.status,
+                      time: "time" in part.state ? part.state.time : undefined,
+                    },
+                  })
+                  if (emit("tool_use", { part })) continue
+                  if (part.state.status === "completed") {
+                    await tool(part)
+                    continue
+                  }
+                  await toolError(part)
+                  UI.error(part.state.error)
                 }
-                await toolError(part)
-                UI.error(part.state.error)
+
+                if (
+                  part.type === "tool" &&
+                  part.tool === "task" &&
+                  part.state.status === "running" &&
+                  args.format !== "json"
+                ) {
+                  CaseTrace.event({
+                    component: "task",
+                    event_type: "task.part.running",
+                    data: {
+                      callID: part.callID,
+                      input: "input" in part.state ? part.state.input : undefined,
+                    },
+                  })
+                  if (toggles.get(part.id) === true) continue
+                  await tool(part)
+                  toggles.set(part.id, true)
+                }
+
+                if (part.type === "step-start") {
+                  CaseTrace.event({
+                    component: "processor",
+                    event_type: "step.start",
+                    data: {
+                      partID: part.id,
+                      snapshot: part.snapshot,
+                    },
+                  })
+                  if (emit("step_start", { part })) continue
+                }
+
+                if (part.type === "step-finish") {
+                  CaseTrace.event({
+                    component: "processor",
+                    event_type: "step.finish",
+                    data: {
+                      partID: part.id,
+                      reason: part.reason,
+                      tokens: part.tokens,
+                      cost: part.cost,
+                    },
+                  })
+                  if (emit("step_finish", { part })) continue
+                }
+
+                if (part.type === "text" && part.time?.end) {
+                  CaseTrace.event({
+                    component: "result",
+                    event_type: "text.completed",
+                    data: {
+                      partID: part.id,
+                      text: CaseTrace.summarizeText(part.text),
+                      time: part.time,
+                    },
+                  })
+                  if (emit("text", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  if (!process.stdout.isTTY) {
+                    process.stdout.write(text + EOL)
+                    continue
+                  }
+                  UI.empty()
+                  UI.println(text)
+                  UI.empty()
+                }
+
+                if (part.type === "reasoning" && part.time?.end && thinking) {
+                  CaseTrace.event({
+                    component: "result",
+                    event_type: "reasoning.completed",
+                    data: {
+                      partID: part.id,
+                      text: CaseTrace.summarizeText(part.text),
+                      time: part.time,
+                    },
+                  })
+                  if (emit("reasoning", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  const line = `Thinking: ${text}`
+                  if (process.stdout.isTTY) {
+                    UI.empty()
+                    UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+                    UI.empty()
+                    continue
+                  }
+                  process.stdout.write(line + EOL)
+                }
+              }
+
+              if (event.type === "session.error") {
+                const props = event.properties
+                if (props.sessionID !== sessionID || !props.error) continue
+                let err = String(props.error.name)
+                if ("data" in props.error && props.error.data && "message" in props.error.data) {
+                  err = String(props.error.data.message)
+                }
+                error = error ? error + EOL + err : err
+                CaseTrace.event({
+                  component: "run",
+                  event_type: "session.error",
+                  data: {
+                    error: props.error,
+                  },
+                })
+                if (emit("error", { error: props.error })) continue
+                UI.error(err)
               }
 
               if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
+                event.type === "session.status" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.status.type === "idle"
               ) {
-                if (toggles.get(part.id) === true) continue
-                await tool(part)
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
-                  continue
-                }
-                UI.empty()
-                UI.println(text)
-                UI.empty()
-              }
-
-              if (part.type === "reasoning" && part.time?.end && thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
-                }
-                process.stdout.write(line + EOL)
-              }
-            }
-
-            if (event.type === "session.error") {
-              const props = event.properties
-              if (props.sessionID !== sessionID || !props.error) continue
-              let err = String(props.error.name)
-              if ("data" in props.error && props.error.data && "message" in props.error.data) {
-                err = String(props.error.data.message)
-              }
-              error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
-            }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
-            }
-
-            if (event.type === "permission.asked") {
-              const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
-
-              if (args["dangerously-skip-permissions"]) {
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
+                CaseTrace.event({
+                  component: "run",
+                  event_type: "session.idle",
+                  data: event.properties.status,
                 })
-              } else {
-                UI.println(
-                  UI.Style.TEXT_WARNING_BOLD + "!",
-                  UI.Style.TEXT_NORMAL +
-                    `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-                )
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "reject",
+                break
+              }
+
+              if (event.type === "permission.asked") {
+                const permission = event.properties
+                if (permission.sessionID !== sessionID) continue
+                CaseTrace.event({
+                  component: "run",
+                  event_type: "permission.asked",
+                  data: {
+                    permission: permission.permission,
+                    patterns: permission.patterns,
+                    auto_reply: args["dangerously-skip-permissions"] ? "once" : "reject",
+                  },
                 })
+
+                if (args["dangerously-skip-permissions"]) {
+                  await client.permission.reply({
+                    requestID: permission.id,
+                    reply: "once",
+                  })
+                } else {
+                  UI.println(
+                    UI.Style.TEXT_WARNING_BOLD + "!",
+                    UI.Style.TEXT_NORMAL +
+                      `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
+                  )
+                  await client.permission.reply({
+                    requestID: permission.id,
+                    reply: "reject",
+                  })
+                }
               }
             }
+            return error
           }
-          return error
-        }
-        const cwd = args.attach ? (directory ?? sess.directory ?? (await current(sdk))) : (directory ?? root)
-        const client = args.attach ? attachSDK(cwd) : sdk
+          const cwd = args.attach ? (directory ?? sess.directory ?? (await current(sdk))) : (directory ?? root)
+          const client = args.attach ? attachSDK(cwd) : sdk
 
-        // Validate agent if specified
-        const agent = await pickAgent(client)
+          // Validate agent if specified
+          const agent = await pickAgent(client)
+          runSpan?.event({
+            event_type: "agent.selected",
+            data: {
+              agent,
+              cwd,
+            },
+          })
 
-        await share(client, sessionID)
+          await share(client, sessionID)
 
-        if (!args.interactive) {
-          const events = await client.event.subscribe()
-          const completed = loop(client, events)
+          if (!args.interactive) {
+            const events = await client.event.subscribe()
+            const completed = loop(client, events)
 
-          if (args.command) {
-            await client.session.command({
+            if (args.command) {
+              await client.session.command({
+                sessionID,
+                agent,
+                model: args.model,
+                command: args.command,
+                arguments: message,
+                variant: args.variant,
+              })
+              const error = await completed
+              if (error) process.exitCode = 1
+              return
+            }
+
+            const model = pick(args.model)
+            await client.session.prompt({
               sessionID,
               agent,
-              model: args.model,
-              command: args.command,
-              arguments: message,
+              model,
               variant: args.variant,
+              parts: [...files, { type: "text", text: message }],
             })
             const error = await completed
             if (error) process.exitCode = 1
@@ -748,40 +894,47 @@ export const RunCommand = effectCmd({
           }
 
           const model = pick(args.model)
-          await client.session.prompt({
-            sessionID,
-            agent,
-            model,
-            variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
-          })
-          const error = await completed
-          if (error) process.exitCode = 1
+          const { runInteractiveMode } = await runtimeTask
+          try {
+            await runInteractiveMode({
+              sdk: client,
+              directory: cwd,
+              sessionID,
+              sessionTitle: sess.title,
+              resume: Boolean(args.session || args.continue) && !args.fork,
+              agent,
+              model,
+              variant: args.variant,
+              files,
+              initialInput,
+              createSession: createFreshSession,
+              thinking,
+              demo: args.demo,
+            })
+          } catch (error) {
+            dieInteractive(error)
+          }
           return
-        }
-
-        const model = pick(args.model)
-        const { runInteractiveMode } = await runtimeTask
-        try {
-          await runInteractiveMode({
-            sdk: client,
-            directory: cwd,
-            sessionID,
-            sessionTitle: sess.title,
-            resume: Boolean(args.session || args.continue) && !args.fork,
-            agent,
-            model,
-            variant: args.variant,
-            files,
-            initialInput,
-            createSession: createFreshSession,
-            thinking,
-            demo: args.demo,
-          })
         } catch (error) {
-          dieInteractive(error)
+          failure = error
+          throw error
+        } finally {
+          const status = failure || process.exitCode ? "error" : "success"
+          runSpan?.end({
+            status,
+            error: failure,
+            output: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
+          CaseTrace.finish({
+            status,
+            error: failure,
+            result: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
         }
-        return
       }
 
       if (args.interactive && !args.attach && !args.session && !args.continue) {
@@ -793,6 +946,21 @@ export const RunCommand = effectCmd({
           return Server.Default().app.fetch(request)
         }) as typeof globalThis.fetch
 
+        const runSpan = CaseTrace.get()?.startSpan({
+          component: "run",
+          operation: "execute",
+          name: "interactive-local",
+          input: {
+            interactive: true,
+            attach: false,
+          },
+          metadata: {
+            requested_agent: args.agent,
+            requested_model: args.model,
+            variant: args.variant,
+          },
+        })
+        let failure: unknown
         try {
           return await runInteractiveLocalMode({
             directory: directory ?? root,
@@ -810,7 +978,24 @@ export const RunCommand = effectCmd({
             demo: args.demo,
           })
         } catch (error) {
+          failure = error
           dieInteractive(error)
+        } finally {
+          const status = failure || process.exitCode ? "error" : "success"
+          runSpan?.end({
+            status,
+            error: failure,
+            output: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
+          CaseTrace.finish({
+            status,
+            error: failure,
+            result: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
         }
       }
 

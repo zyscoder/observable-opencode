@@ -6,6 +6,7 @@ import { Ripgrep } from "../file/ripgrep"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
 import DESCRIPTION from "./skill.txt"
+import { CaseTrace, type ActiveSpan } from "@/observability/case-trace"
 
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
@@ -20,8 +21,20 @@ export const SkillTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
-        Effect.gen(function* () {
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => {
+        let traceSpan: ActiveSpan | undefined
+        return Effect.gen(function* () {
+          traceSpan = CaseTrace.get()?.startSpan({
+            component: "skill",
+            operation: "load",
+            name: params.name,
+            input: {
+              name: params.name,
+              sessionID: ctx.sessionID,
+              messageID: ctx.messageID,
+              callID: ctx.callID,
+            },
+          })
           const info = yield* skill.get(params.name)
           if (!info) {
             const all = yield* skill.all()
@@ -35,6 +48,12 @@ export const SkillTool = Tool.define(
             always: [params.name],
             metadata: {},
           })
+          traceSpan?.event({
+            event_type: "permission.accepted",
+            data: {
+              name: params.name,
+            },
+          })
 
           const dir = path.dirname(info.location)
           const base = pathToFileURL(dir).href
@@ -47,7 +66,7 @@ export const SkillTool = Tool.define(
             Effect.map((chunk) => [...chunk].map((file) => `<file>${file}</file>`).join("\n")),
           )
 
-          return {
+          const result = {
             title: `Loaded skill: ${info.name}`,
             output: [
               `<skill_content name="${info.name}">`,
@@ -69,7 +88,27 @@ export const SkillTool = Tool.define(
               dir,
             },
           }
-        }).pipe(Effect.orDie),
+          traceSpan?.end({
+            output: {
+              name: info.name,
+              dir,
+              sampled_files: files,
+              output: CaseTrace.summarizeText(result.output),
+            },
+          })
+          return result
+        }).pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() =>
+              traceSpan?.end({
+                status: "error",
+                error,
+              }),
+            ),
+          ),
+          Effect.orDie,
+        )
+      },
     }
   }),
 )

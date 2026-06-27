@@ -5,6 +5,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
+import { CaseTrace, type ActiveSpan } from "@/observability/case-trace"
 
 interface Metadata {
   [key: string]: any
@@ -97,7 +98,21 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           "message.id": ctx.messageID,
           ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
         }
+        let traceSpan: ActiveSpan | undefined
         return Effect.gen(function* () {
+          traceSpan = CaseTrace.get()?.startSpan({
+            component: "tool",
+            operation: "execute",
+            name: id,
+            input: {
+              args,
+              sessionID: ctx.sessionID,
+              messageID: ctx.messageID,
+              agent: ctx.agent,
+              callID: ctx.callID,
+            },
+            metadata: attrs,
+          })
           const decoded = yield* decode(args).pipe(
             Effect.mapError((error) =>
               toolInfo.formatValidationError
@@ -110,11 +125,19 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           )
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
           if (result.metadata.truncated !== undefined) {
+            traceSpan?.end({
+              output: {
+                title: result.title,
+                metadata: result.metadata,
+                output: CaseTrace.summarizeText(result.output),
+                attachments: result.attachments?.length ?? 0,
+              },
+            })
             return result
           }
           const agent = yield* agents.get(ctx.agent)
           const truncated = yield* truncate.output(result.output, {}, agent)
-          return {
+          const finalResult = {
             ...result,
             output: truncated.content,
             metadata: {
@@ -123,7 +146,38 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(truncated.truncated && { outputPath: truncated.outputPath }),
             },
           }
-        }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
+          traceSpan?.end({
+            output: {
+              title: finalResult.title,
+              metadata: finalResult.metadata,
+              output: CaseTrace.summarizeText(finalResult.output),
+              attachments: finalResult.attachments?.length ?? 0,
+            },
+          })
+          return finalResult
+        }).pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() => {
+              traceSpan?.end({
+                status: "error",
+                error,
+              })
+              CaseTrace.get()?.event({
+                component: "tool",
+                event_type: "execute.error",
+                data: {
+                  tool: id,
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.messageID,
+                  callID: ctx.callID,
+                  error,
+                },
+              })
+            }),
+          ),
+          Effect.orDie,
+          Effect.withSpan("Tool.execute", { attributes: attrs }),
+        )
       }
       return toolInfo
     })

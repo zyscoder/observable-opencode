@@ -12,6 +12,7 @@
 import * as Locale from "@/util/locale"
 import { isExitCommand, isNewCommand } from "./prompt.shared"
 import type { FooterApi, FooterEvent, RunPrompt } from "./types"
+import { CaseTrace } from "@/observability/case-trace"
 
 type Trace = {
   write(type: string, data?: unknown): void
@@ -160,6 +161,16 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           const start = Date.now()
           const ctrl = new AbortController()
           state.ctrl = ctrl
+          const span = CaseTrace.get()?.startSpan({
+            component: "runtime",
+            operation: "turn",
+            name: "interactive.turn",
+            input: {
+              prompt: CaseTrace.summarizeText(prompt.text),
+              queue: state.queue.length,
+              part_count: prompt.parts.length,
+            },
+          })
 
           try {
             await input.footer.idle()
@@ -190,12 +201,31 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             if (next.type === "error") {
               throw next.error
             }
+            span?.end({
+              output: {
+                queue: state.queue.length,
+              },
+            })
+          } catch (error) {
+            span?.end({
+              status: "error",
+              error,
+            })
+            throw error
           } finally {
             if (state.ctrl === ctrl) {
               state.ctrl = undefined
             }
 
             const duration = Locale.duration(Math.max(0, Date.now() - start))
+            CaseTrace.event({
+              component: "runtime",
+              event_type: "turn.duration",
+              data: {
+                duration,
+                queue: state.queue.length,
+              },
+            })
             emit(
               {
                 type: "turn.duration",
@@ -208,6 +238,13 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           }
         }
       } catch (error) {
+        CaseTrace.event({
+          component: "runtime",
+          event_type: "queue.error",
+          data: {
+            error,
+          },
+        })
         done.reject(error)
         return
       } finally {
@@ -223,6 +260,13 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             queue: state.queue.length,
           },
         )
+        CaseTrace.event({
+          component: "runtime",
+          event_type: "turn.idle",
+          data: {
+            queue: state.queue.length,
+          },
+        })
       }
 
       finish()
@@ -240,6 +284,16 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     }
 
     state.queue.push(prompt)
+    CaseTrace.event({
+      component: "runtime",
+      event_type: "queue.enqueue",
+      data: {
+        prompt: CaseTrace.summarizeText(prompt.text),
+        part_count: prompt.parts.length,
+        queue: state.queue.length,
+        new_session: isNewCommand(prompt.text),
+      },
+    })
     emit(
       {
         type: "queue",
