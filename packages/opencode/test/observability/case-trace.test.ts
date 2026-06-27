@@ -173,4 +173,111 @@ describe("case trace", () => {
     expect(html).toContain('class="process-scroll"')
     expect(html).toContain('class="io-scroll"')
   })
+
+  test("stores large semantic payloads as artifacts and keeps trace.json lightweight", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-artifact-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "large-trace-payload.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const payload = "semantic-context-before-compaction:" + "x".repeat(5000)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "context", event_type: "context.before_compaction", data: { payload: ${JSON.stringify(payload)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "artifact-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "128",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "artifact-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+
+    expect(trace.artifacts.length).toBeGreaterThanOrEqual(1)
+    expect(JSON.stringify(trace).includes(payload)).toBe(false)
+
+    const artifact = trace.artifacts.find((item: any) => item.kind === "json")
+    expect(artifact).toBeTruthy()
+    const artifactText = await fs.readFile(path.join(caseDir, artifact.path), "utf8")
+    expect(artifactText).toContain(payload)
+
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    expect(html).toContain("查看完整内容")
+    expect(html).toContain(payload)
+  })
+
+  test("renders artifact-backed summaries with expandable full content", () => {
+    const trace = {
+      trace_version: "1.0",
+      case_id: "artifact-html-case",
+      run_id: "run_artifact_html",
+      started_at: "2026-06-27T00:00:00.000Z",
+      ended_at: "2026-06-27T00:00:01.000Z",
+      duration_ms: 1000,
+      status: "success",
+      environment: {},
+      token_usage: {},
+      errors: [],
+      artifacts: [
+        {
+          artifact_id: "artifact_1",
+          kind: "text",
+          label: "llm.final_model_messages",
+          path: "artifacts/artifact_1.txt",
+          length: 55,
+          hash: "hash",
+          preview: "short preview",
+          created_at: "2026-06-27T00:00:00.000Z",
+        },
+      ],
+      spans: [
+        {
+          span_id: "span_1",
+          component: "llm",
+          operation: "stream",
+          name: "model call",
+          status: "success",
+          start_time: "2026-06-27T00:00:00.000Z",
+          start_ms: 0,
+          end_time: "2026-06-27T00:00:00.010Z",
+          end_ms: 10,
+          duration_ms: 10,
+          input_summary: {
+            type: "text",
+            length: 55,
+            hash: "hash",
+            preview: "short preview",
+            artifact_id: "artifact_1",
+          },
+        },
+      ],
+      events: [],
+    } as TraceSummary
+
+    const html = renderCaseTraceHtml(trace, {
+      artifactContents: new Map([["artifact_1", "full semantic model messages payload"]]),
+    } as any)
+
+    expect(html).toContain("Artifacts")
+    expect(html).toContain("查看完整内容")
+    expect(html).toContain("full semantic model messages payload")
+  })
 })

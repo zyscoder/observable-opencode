@@ -214,9 +214,6 @@ export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/opencode-traces"
 可选配置：
 
 ```bash
-# 默认只记录摘要、长度、hash 和 preview。设置为 1 后记录完整内容，谨慎用于私域代码仓。
-export OPENCODE_CASE_TRACE_FULL_CONTENT=0
-
 # 单字段 preview 最大长度，默认 2048。
 export OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH=4096
 ```
@@ -229,13 +226,19 @@ $OPENCODE_CASE_TRACE_DIR/
     events.jsonl
     trace.json
     trace.html
+    artifacts/
+      artifact_*.json
+      artifact_*.txt
 ```
 
 其中：
 
 - `events.jsonl`：运行时增量事件流，即使 case 中途失败也能保留已发生事件。
-- `trace.json`：case 执行结束后的结构化汇总。
-- `trace.html`：离线可视化报告，包含组件瀑布图、token 汇总、工具调用和错误面板。
+- `trace.json`：case 执行结束后的结构化汇总，只保留大文本的摘要、长度、hash、preview 和 artifact 索引，不直接内嵌完整大文本。
+- `artifacts/`：保存超过 preview 阈值的完整语义载荷，例如上下文快照、模型输入、工具结果、压缩前后内容等。
+- `trace.html`：离线可视化报告，包含组件瀑布图、token 汇总、工具调用、错误面板和 Artifacts 面板。生成 HTML 时会把 `artifacts/` 中的完整内容嵌入报告，因此打开单个 `trace.html` 就能展开查看大文本。
+
+> 注意：`OPENCODE_CASE_TRACE=1` 会记录用于复盘的语义信息，可能包含私域代码、工具输出和模型上下文。生产或企业内网环境请把 `OPENCODE_CASE_TRACE_DIR` 指向受控目录，并按企业数据策略管理 trace 文件。
 
 ## 7. 运行 benchmark case
 

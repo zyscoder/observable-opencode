@@ -28,6 +28,18 @@ export type TraceFieldSummary = {
   preview?: string
   value?: string | number | boolean | null
   keys?: string[]
+  artifact_id?: string
+}
+
+export type TraceArtifact = {
+  artifact_id: string
+  kind: "text" | "json"
+  label?: string
+  path: string
+  length: number
+  hash: string
+  preview: string
+  created_at: string
 }
 
 export type TraceTokenUsage = {
@@ -91,6 +103,7 @@ export type TraceSummary = {
   token_usage: TraceTokenUsage
   spans: TraceSpan[]
   events: TraceEvent[]
+  artifacts?: TraceArtifact[]
   errors: TraceError[]
   result?: Record<string, unknown>
 }
@@ -202,11 +215,6 @@ function maxFieldLength() {
   return safeNumber(process.env.OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH || 2048) || 2048
 }
 
-function fullContent() {
-  const value = process.env.OPENCODE_CASE_TRACE_FULL_CONTENT
-  return value ? truthy.has(value.toLowerCase()) : false
-}
-
 function summarizeScalar(input: unknown): TraceFieldSummary {
   if (input === null) return { type: "null", value: null }
   if (typeof input === "string") return summarizeText(input)
@@ -222,7 +230,7 @@ export function summarizeText(input: unknown): TraceFieldSummary {
     type: "text",
     length: text.length,
     hash: hash(text),
-    preview: fullContent() ? text : text.slice(0, limit),
+    preview: text.slice(0, limit),
   }
 }
 
@@ -235,7 +243,7 @@ export function summarizeJson(input: unknown): TraceFieldSummary {
     length: serialized.length,
     hash: hash(serialized),
     keys,
-    preview: fullContent() ? serialized : serialized.slice(0, maxFieldLength()),
+    preview: serialized.slice(0, maxFieldLength()),
   }
 }
 
@@ -296,12 +304,14 @@ class ActiveCaseTrace {
   readonly runID = crypto.randomUUID()
   readonly rootDir: string
   readonly caseDir: string
+  readonly artifactDir: string
   readonly eventsFile: string
   readonly traceFile: string
   readonly htmlFile: string
   readonly startedAt = Date.now()
   readonly startedIso = nowIso()
   private sequence = 0
+  private artifactSequence = 0
   private finished = false
   private sessionID: string | undefined
   private input: Record<string, unknown> | undefined
@@ -309,6 +319,7 @@ class ActiveCaseTrace {
   private environment: Record<string, unknown>
   private spans = new Map<string, TraceSpan>()
   private events: TraceEvent[] = []
+  private artifacts: TraceArtifact[] = []
   private errors: TraceError[] = []
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
@@ -317,6 +328,7 @@ class ActiveCaseTrace {
     this.caseID = safeCaseID(config.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
     this.rootDir = config.traceDir ?? defaultTraceDir()
     this.caseDir = path.join(this.rootDir, this.caseID)
+    this.artifactDir = path.join(this.caseDir, "artifacts")
     this.eventsFile = path.join(this.caseDir, "events.jsonl")
     this.traceFile = path.join(this.caseDir, "trace.json")
     this.htmlFile = path.join(this.caseDir, "trace.html")
@@ -364,7 +376,8 @@ class ActiveCaseTrace {
       status: "running",
       start_time: new Date(started).toISOString(),
       start_ms: started - this.startedAt,
-      input_summary: input.input === undefined ? undefined : summarizeJson(input.input),
+      input_summary:
+        input.input === undefined ? undefined : this.summarizeJson(input.input, `${input.component}.${input.operation}.input`),
       metadata: input.metadata,
     }
     this.spans.set(id, span)
@@ -397,7 +410,8 @@ class ActiveCaseTrace {
     span.end_time = new Date(ended).toISOString()
     span.end_ms = ended - this.startedAt
     span.duration_ms = Math.max(0, ended - (this.startedAt + span.start_ms))
-    span.output_summary = input?.output === undefined ? span.output_summary : summarizeJson(input.output)
+    span.output_summary =
+      input?.output === undefined ? span.output_summary : this.summarizeJson(input.output, `${span.component}.${span.operation}.output`)
     span.metadata = {
       ...(span.metadata ?? {}),
       ...(input?.metadata ?? {}),
@@ -422,7 +436,7 @@ class ActiveCaseTrace {
       event_type: input.event_type,
       timestamp: new Date(time).toISOString(),
       time_ms: time - this.startedAt,
-      data: input.data === undefined ? undefined : summarizeJson(input.data),
+      data: input.data === undefined ? undefined : this.summarizeJson(input.data, `${input.component}.${input.event_type}.data`),
     }
     this.events.push(event)
     this.write("event", event)
@@ -448,7 +462,7 @@ class ActiveCaseTrace {
     const summary = this.summary(input?.status ?? (error ? "error" : "success"))
     this.write("trace.finish", summary)
     this.safeWrite(this.traceFile, jsonPretty(summary))
-    this.safeWrite(this.htmlFile, renderCaseTraceHtml(summary))
+    this.safeWrite(this.htmlFile, renderCaseTraceHtml(summary, { artifactDir: this.caseDir }))
   }
 
   private summary(status: TraceStatus): TraceSummary {
@@ -467,9 +481,69 @@ class ActiveCaseTrace {
       token_usage: this.tokenUsage,
       spans: [...this.spans.values()],
       events: this.events,
+      artifacts: this.artifacts,
       errors: this.errors,
       result: this.result,
     }
+  }
+
+  summarizeText(input: unknown, label = "text"): TraceFieldSummary {
+    const text = String(input ?? "")
+    const summary: TraceFieldSummary = {
+      type: "text",
+      length: text.length,
+      hash: hash(text),
+      preview: text.slice(0, maxFieldLength()),
+    }
+    if (text.length <= maxFieldLength()) return summary
+    const artifact = this.writeArtifact("text", label, text)
+    return {
+      ...summary,
+      artifact_id: artifact.artifact_id,
+    }
+  }
+
+  summarizeJson(input: unknown, label = "json"): TraceFieldSummary {
+    if (input === null || typeof input !== "object") return summarizeScalar(input)
+    const serialized = json(input)
+    const keys = Array.isArray(input) ? undefined : Object.keys(input as Record<string, unknown>).slice(0, 50)
+    const summary: TraceFieldSummary = {
+      type: Array.isArray(input) ? "array" : "object",
+      length: serialized.length,
+      hash: hash(serialized),
+      keys,
+      preview: serialized.slice(0, maxFieldLength()),
+    }
+    if (serialized.length <= maxFieldLength()) return summary
+    const artifact = this.writeArtifact("json", label, prettyJsonString(serialized))
+    return {
+      ...summary,
+      artifact_id: artifact.artifact_id,
+    }
+  }
+
+  private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
+    const artifactID = `artifact_${++this.artifactSequence}_${crypto.randomUUID().slice(0, 8)}`
+    const safeLabel = (label || kind).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80)
+    const filename = `${artifactID}_${safeLabel}.${kind === "json" ? "json" : "txt"}`
+    const relativePath = `artifacts/${filename}`
+    const artifact: TraceArtifact = {
+      artifact_id: artifactID,
+      kind,
+      label,
+      path: relativePath,
+      length: content.length,
+      hash: hash(content),
+      preview: content.slice(0, maxFieldLength()),
+      created_at: nowIso(),
+    }
+    this.artifacts.push(artifact)
+    try {
+      fs.mkdirSync(this.artifactDir, { recursive: true })
+      fs.writeFileSync(path.join(this.caseDir, relativePath), content)
+      this.write("artifact.write", artifact)
+    } catch {}
+    return artifact
   }
 
   private open() {
@@ -523,6 +597,14 @@ function jsonPretty(input: unknown) {
     },
     2,
   )
+}
+
+function prettyJsonString(input: string) {
+  try {
+    return JSON.stringify(JSON.parse(input), null, 2)
+  } catch {
+    return input
+  }
 }
 
 const summarizeTextField = summarizeText
@@ -593,10 +675,10 @@ export namespace CaseTrace {
   }
 
   export function summarizeText(input: unknown) {
-    return summarizeTextField(input)
+    return active ? active.summarizeText(input) : summarizeTextField(input)
   }
 
   export function summarizeJson(input: unknown) {
-    return summarizeJsonField(input)
+    return active ? active.summarizeJson(input) : summarizeJsonField(input)
   }
 }

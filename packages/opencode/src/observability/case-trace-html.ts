@@ -1,4 +1,11 @@
-import type { TraceComponent, TraceFieldSummary, TraceSummary } from "./case-trace"
+import fs from "fs"
+import path from "path"
+import type { TraceArtifact, TraceComponent, TraceFieldSummary, TraceSummary } from "./case-trace"
+
+type RenderCaseTraceHtmlOptions = {
+  artifactDir?: string
+  artifactContents?: Map<string, string> | Record<string, string>
+}
 
 function escapeHtml(input: unknown) {
   return String(input ?? "")
@@ -85,6 +92,29 @@ function preview(input: unknown, limit = 180): string {
   } catch {
     return String(input).slice(0, limit)
   }
+}
+
+function artifactID(input: unknown) {
+  if (!input || typeof input !== "object") return undefined
+  const summary = input as Partial<TraceFieldSummary>
+  return typeof summary.artifact_id === "string" ? summary.artifact_id : undefined
+}
+
+function collectArtifactContents(trace: TraceSummary, options: RenderCaseTraceHtmlOptions = {}) {
+  const contents = new Map<string, string>()
+  if (options.artifactContents instanceof Map) {
+    for (const [key, value] of options.artifactContents) contents.set(key, value)
+  } else if (options.artifactContents) {
+    for (const [key, value] of Object.entries(options.artifactContents)) contents.set(key, value)
+  }
+  if (!options.artifactDir) return contents
+  for (const artifact of trace.artifacts ?? []) {
+    if (contents.has(artifact.artifact_id)) continue
+    try {
+      contents.set(artifact.artifact_id, fs.readFileSync(path.join(options.artifactDir, artifact.path), "utf8"))
+    } catch {}
+  }
+  return contents
 }
 
 function collectComponents(trace: TraceSummary) {
@@ -206,14 +236,26 @@ function renderSummary(input: unknown) {
   return text ? `<code>${escapeHtml(text)}</code>` : `<span class="muted">-</span>`
 }
 
-function renderIoCell(label: string, input: unknown) {
+function renderArtifactDetails(input: unknown, artifactContents: Map<string, string>) {
+  const id = artifactID(input)
+  if (!id) return ""
+  const content = artifactContents.get(id)
+  if (content === undefined) return `<div class="artifact-missing">完整内容未嵌入：<code>${escapeHtml(id)}</code></div>`
+  return `<details class="artifact-inline">
+    <summary>查看完整内容 <code>${escapeHtml(id)}</code></summary>
+    <pre>${escapeHtml(content)}</pre>
+  </details>`
+}
+
+function renderIoCell(label: string, input: unknown, artifactContents: Map<string, string>) {
   return `<div class="io-cell">
     <div class="io-label">${escapeHtml(label)}</div>
     <div class="io-scroll">${renderSummary(input)}</div>
+    ${renderArtifactDetails(input, artifactContents)}
   </div>`
 }
 
-function renderAgentProcess(trace: TraceSummary) {
+function renderAgentProcess(trace: TraceSummary, artifactContents: Map<string, string>) {
   const items = processItems(trace)
   if (!items.length) return `<div class="empty">没有流程事件。</div>`
   return `<div class="process-scroll"><div class="process">
@@ -230,15 +272,44 @@ function renderAgentProcess(trace: TraceSummary) {
               ${item.duration !== undefined ? `<span class="muted">${escapeHtml(formatMs(item.duration))}</span>` : ""}
             </div>
             <div class="step-io">
-              ${item.input !== undefined ? renderIoCell("输入", item.input) : ""}
-              ${item.output !== undefined ? renderIoCell("输出", item.output) : ""}
-              ${item.data !== undefined ? renderIoCell("事件", item.data) : ""}
+              ${item.input !== undefined ? renderIoCell("输入", item.input, artifactContents) : ""}
+              ${item.output !== undefined ? renderIoCell("输出", item.output, artifactContents) : ""}
+              ${item.data !== undefined ? renderIoCell("事件", item.data, artifactContents) : ""}
             </div>
           </div>
         </div>`,
       )
       .join("")}
   </div></div>`
+}
+
+function renderArtifacts(trace: TraceSummary, artifactContents: Map<string, string>) {
+  const artifacts = trace.artifacts ?? []
+  if (!artifacts.length) return `<div class="empty">没有大文本 artifact。</div>`
+  return `<div class="artifacts">
+    ${artifacts
+      .map((artifact: TraceArtifact) => {
+        const content = artifactContents.get(artifact.artifact_id)
+        return `<details class="artifact-row">
+          <summary>
+            <span class="pill trace">${escapeHtml(artifact.kind)}</span>
+            <strong>${escapeHtml(artifact.label ?? artifact.artifact_id)}</strong>
+            <code>${escapeHtml(artifact.artifact_id)}</code>
+            <span class="muted">${artifact.length} chars</span>
+          </summary>
+          <div class="artifact-meta">
+            <span>path: <code>${escapeHtml(artifact.path)}</code></span>
+            <span>hash: <code>${escapeHtml(artifact.hash)}</code></span>
+          </div>
+          ${
+            content === undefined
+              ? `<div class="artifact-missing">完整内容未嵌入。</div>`
+              : `<pre>${escapeHtml(content)}</pre>`
+          }
+        </details>`
+      })
+      .join("")}
+  </div>`
 }
 
 function renderFlow(trace: TraceSummary) {
@@ -283,7 +354,8 @@ function renderFlow(trace: TraceSummary) {
   </div>`
 }
 
-export function renderCaseTraceHtml(trace: TraceSummary) {
+export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTraceHtmlOptions = {}) {
+  const artifactContents = collectArtifactContents(trace, options)
   const spans = trace.spans.toSorted((a, b) => a.start_ms - b.start_ms)
   const maxEnd = Math.max(trace.duration_ms, ...spans.map((span) => span.end_ms ?? span.start_ms))
   const duration = Math.max(1, maxEnd)
@@ -572,6 +644,42 @@ export function renderCaseTraceHtml(trace: TraceSummary) {
     }
     .empty, .more { color: var(--muted); font-size: 13px; }
     details summary { cursor: pointer; color: #344054; font-weight: 650; }
+    .artifact-inline {
+      margin-top: 6px;
+      border-top: 1px solid #edf0f5;
+      padding-top: 6px;
+    }
+    .artifact-inline summary, .artifact-row summary {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+    .artifact-inline pre, .artifact-row pre {
+      margin-top: 8px;
+      max-height: 520px;
+      white-space: pre;
+      overflow: auto;
+    }
+    .artifact-row {
+      border-top: 1px solid #edf0f5;
+      padding: 10px 0;
+    }
+    .artifact-row:first-child { border-top: 0; }
+    .artifact-meta {
+      margin-top: 8px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .artifact-missing {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     @media (max-width: 760px) {
       header, main { padding-left: 16px; padding-right: 16px; }
       .edge { grid-template-columns: 1fr; }
@@ -608,7 +716,12 @@ export function renderCaseTraceHtml(trace: TraceSummary) {
 
     <section>
       <h2>Agent 运行流程</h2>
-      ${renderAgentProcess(trace)}
+      ${renderAgentProcess(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>Artifacts</h2>
+      ${renderArtifacts(trace, artifactContents)}
     </section>
 
     <section>
