@@ -124,4 +124,53 @@ describe("case trace", () => {
     expect(html).toContain("runtime")
     expect(html).toContain("llm")
   })
+
+  test("renders all agent process items with scrollable input and output cells", () => {
+    const spans = Array.from({ length: 130 }, (_, index) => {
+      const item = index + 1
+      return {
+        span_id: `span_${item}`,
+        component: "runtime" as const,
+        operation: "turn",
+        name: `interactive.turn.${item}`,
+        status: "success" as const,
+        start_time: "2026-06-27T00:00:00.000Z",
+        start_ms: item * 10,
+        end_time: "2026-06-27T00:00:00.010Z",
+        end_ms: item * 10 + 5,
+        duration_ms: 5,
+        input_summary: {
+          type: "text",
+          preview: `input-${item}-` + "x".repeat(320),
+        },
+        output_summary: {
+          type: "text",
+          preview: `output-${item}-` + "y".repeat(320),
+        },
+      }
+    })
+
+    const trace: TraceSummary = {
+      trace_version: "1.0",
+      case_id: "all-process-case",
+      run_id: "run_all_process",
+      started_at: "2026-06-27T00:00:00.000Z",
+      ended_at: "2026-06-27T00:00:02.000Z",
+      duration_ms: 2000,
+      status: "success",
+      environment: {},
+      token_usage: {},
+      errors: [],
+      spans,
+      events: [],
+    }
+
+    const html = renderCaseTraceHtml(trace)
+
+    expect(html).toContain("interactive.turn.1")
+    expect(html).toContain("interactive.turn.130")
+    expect(html).not.toContain("已展示前 120 条")
+    expect(html).toContain('class="process-scroll"')
+    expect(html).toContain('class="io-scroll"')
+  })
 })

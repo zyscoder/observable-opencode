@@ -206,12 +206,18 @@ function renderSummary(input: unknown) {
   return text ? `<code>${escapeHtml(text)}</code>` : `<span class="muted">-</span>`
 }
 
+function renderIoCell(label: string, input: unknown) {
+  return `<div class="io-cell">
+    <div class="io-label">${escapeHtml(label)}</div>
+    <div class="io-scroll">${renderSummary(input)}</div>
+  </div>`
+}
+
 function renderAgentProcess(trace: TraceSummary) {
   const items = processItems(trace)
   if (!items.length) return `<div class="empty">没有流程事件。</div>`
-  const visible = items.slice(0, 120)
-  return `<div class="process">
-    ${visible
+  return `<div class="process-scroll"><div class="process">
+    ${items
       .map(
         (item) => `<div class="step">
           <div class="step-time">${escapeHtml(formatMs(item.time))}</div>
@@ -224,16 +230,15 @@ function renderAgentProcess(trace: TraceSummary) {
               ${item.duration !== undefined ? `<span class="muted">${escapeHtml(formatMs(item.duration))}</span>` : ""}
             </div>
             <div class="step-io">
-              ${item.input !== undefined ? `<span>输入 ${renderSummary(item.input)}</span>` : ""}
-              ${item.output !== undefined ? `<span>输出 ${renderSummary(item.output)}</span>` : ""}
-              ${item.data !== undefined ? `<span>事件 ${renderSummary(item.data)}</span>` : ""}
+              ${item.input !== undefined ? renderIoCell("输入", item.input) : ""}
+              ${item.output !== undefined ? renderIoCell("输出", item.output) : ""}
+              ${item.data !== undefined ? renderIoCell("事件", item.data) : ""}
             </div>
           </div>
         </div>`,
       )
       .join("")}
-    ${items.length > visible.length ? `<div class="more">已展示前 ${visible.length} 条，剩余 ${items.length - visible.length} 条可在原始 JSON 中查看。</div>` : ""}
-  </div>`
+  </div></div>`
 }
 
 function renderFlow(trace: TraceSummary) {
@@ -403,7 +408,13 @@ export function renderCaseTraceHtml(trace: TraceSummary) {
     .arrow { color: #98a2b3; font-weight: 700; text-align: center; }
     .edge-count { color: #344054; font-weight: 650; }
     .edge-sample { color: var(--muted); overflow-wrap: anywhere; }
-    .process { position: relative; }
+    .process-scroll {
+      max-height: min(78vh, 860px);
+      overflow-y: auto;
+      padding-right: 8px;
+      overscroll-behavior: contain;
+    }
+    .process { position: relative; min-width: 0; }
     .step {
       display: grid;
       grid-template-columns: 72px 18px minmax(0, 1fr);
@@ -435,6 +446,32 @@ export function renderCaseTraceHtml(trace: TraceSummary) {
       gap: 6px;
       color: var(--muted);
       font-size: 12px;
+      min-width: 0;
+    }
+    .io-cell {
+      min-width: 0;
+      border: 1px solid #edf0f5;
+      border-radius: 6px;
+      background: #fcfcfd;
+      padding: 6px 8px;
+    }
+    .io-label {
+      margin-bottom: 4px;
+      color: #475467;
+      font-size: 11px;
+      font-weight: 650;
+    }
+    .io-scroll {
+      max-width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding-bottom: 2px;
+      white-space: nowrap;
+    }
+    .io-scroll code {
+      display: inline-block;
+      min-width: max-content;
+      white-space: pre;
     }
     .timeline {
       position: relative;
