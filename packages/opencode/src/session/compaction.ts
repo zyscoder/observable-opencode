@@ -472,7 +472,7 @@ export const layer: Layer.Layer<
           chosen_action: "summarize_head_preserve_tail",
           rationale:
             "Older conversation history is summarized while selected recent tail is serialized into the compaction prompt.",
-          evidence_refs: [compactionSnapshot.snapshot_id],
+          source_refs: [compactionSnapshot.snapshot_id],
           metadata: {
             sessionID: input.sessionID,
             selected_head_messages: selected.head.length,
@@ -541,7 +541,7 @@ export const layer: Layer.Layer<
           previous_summary: previousSummary,
           serialized_tail: tail,
           result: "compact",
-          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,
@@ -653,7 +653,7 @@ export const layer: Layer.Layer<
           previous_summary: previousSummary,
           serialized_tail: tail,
           result: "error",
-          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,
@@ -671,26 +671,6 @@ export const layer: Layer.Layer<
             parts: [],
           },
         )
-        const evidence = summary
-          ? CaseTrace.finalEvidence({
-              claim: summary,
-              confidence: "medium",
-              evidence_refs: compactionSnapshot ? [compactionSnapshot.snapshot_id] : undefined,
-              metadata: {
-                sessionID: input.sessionID,
-                messageID: msg.id,
-                kind: "compaction_summary",
-              },
-            })
-          : undefined
-        if (evidence && compactionSnapshot) {
-          CaseTrace.edge({
-            from: { type: "context_snapshot", id: compactionSnapshot.snapshot_id },
-            to: { type: "final_response_evidence", id: evidence.claim_id },
-            relation: "context_to_compaction_summary",
-            label: "Compaction output produced from selected context",
-          })
-        }
         const compactionNode = CaseTrace.compaction({
           trigger: input.overflow ? "overflow" : input.auto ? "auto" : "manual",
           provider_id: model.providerID,
@@ -704,7 +684,7 @@ export const layer: Layer.Layer<
           output_summary: summary,
           auto_continue: input.auto,
           result,
-          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,
@@ -724,7 +704,7 @@ export const layer: Layer.Layer<
               previous_summary: previousSummary,
               serialized_tail: tail,
             },
-            evidence_refs: compactionNode ? [`compaction:${compactionNode.node_id}`] : undefined,
+            source_refs: compactionNode ? [`compaction:${compactionNode.node_id}`] : undefined,
             metadata: {
               sessionID: input.sessionID,
               parentID: input.parentID,

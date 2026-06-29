@@ -261,7 +261,7 @@ export OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH=4096
 $OPENCODE_CASE_TRACE_DIR/
   T1-001/
     manifest.json
-    causal-trace.json
+    provenance-trace.json
     records.jsonl
     raw-events.jsonl
     viewer.html
@@ -276,14 +276,14 @@ $OPENCODE_CASE_TRACE_DIR/
 其中：
 
 - `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
-- `causal-trace.json`：Causal Trace v2 主文件，包含因果图节点、因果边、artifact 索引、token/耗时等指标和诊断提示。
+- `provenance-trace.json`：Trace Provenance v3 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
 - `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
 - `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
 - `partial/latest.json`：运行中快照。长时间运行或收到 `SIGINT/SIGTERM/SIGHUP` 时也能保留可查看状态。
 - `artifacts/sha256/`：按内容 hash 去重保存大文本，例如模型上下文包、MCP 返回、skill 指令、工具输出、压缩前后摘要等。
-- `viewer.html`：离线可视化报告，包含 Causal Graph、Timeline、Evidence Inspector 和 Context Analyzer 四个视图。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
+- `viewer.html`：离线可视化报告，包含 Component Dataflow、Execution Timeline、IO Inspector、Context Ledger 和 Artifact Browser。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
 
-当前实现仍会保留 `events.jsonl`、`trace.json`、`trace.html` 作为兼容副产物；新分析链路应优先使用 `manifest.json`、`causal-trace.json` 和 `viewer.html`。
+当前实现仍会保留 `events.jsonl`、`trace.json`、`trace.html` 作为低层调试和兼容副产物；新分析链路应优先使用 `manifest.json`、`provenance-trace.json` 和 `viewer.html`。
 
 > 注意：`OPENCODE_CASE_TRACE=1` 会记录用于复盘的语义信息，可能包含私域代码、工具输出和模型上下文。生产或企业内网环境请把 `OPENCODE_CASE_TRACE_DIR` 指向受控目录，并按企业数据策略管理 trace 文件。
 
@@ -331,8 +331,8 @@ done
 jq '{case_id, status, duration_ms, token_usage, files}' \
   /data/evo-bench/opencode-traces/T1-001/manifest.json
 
-jq '{nodes: (.nodes | length), edges: (.edges | length), artifacts: (.artifacts | length), metrics}' \
-  /data/evo-bench/opencode-traces/T1-001/causal-trace.json
+jq '{records: (.records | length), dataflow_edges: (.dataflow_edges | length), artifacts: (.artifacts | length), metrics}' \
+  /data/evo-bench/opencode-traces/T1-001/provenance-trace.json
 ```
 
 打开可视化报告：
@@ -356,22 +356,18 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/viewer.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. 语义层 Trace
+## 10. Trace Provenance v3
 
-`trace_version: "1.2"` 在原有 spans、events 和 artifacts 之外，新增语义层字段。语义层的目标不是自动判断根因，而是把归因所需证据结构化记录下来。
+`provenance-trace.json` 的 `trace_version` 为 `"3.0"`。v3 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照和组件间数据流结构化记录下来。
 
-新增字段：
+主字段：
 
-- `context_snapshots`：记录每次 LLM 调用或上下文压缩前的最终上下文，包括 system、messages、tools、model、agent 和数量统计。
-- `semantic_decisions`：记录可观测决策，例如工具调用、reasoning block、压缩上下文选择。
-- `semantic_edges`：记录证据之间的因果引用关系，例如 context 到 LLM、tool 到 verification、change 到 verification。
-- `verification_records`：记录 bash/test 类命令的验证语义，包括 command、cwd、exit code、阶段、stdout/stderr 和简单失败解析。
-- `change_records`：记录 edit 类工具产生的文件变更、diff、增删行和关联证据。
-- `constraint_records`：记录从用户 prompt 中识别出的约束，例如只读、不修改、运行测试、只改必要文件；case 结束时会根据可观测事实把部分 `unknown` 收敛为 `observed_satisfied` 或 `observed_violated`。
-- `final_response_evidence`：记录最终回答或压缩摘要中的关键 claim，并链接到具体上下文、工具、验证或变更证据。
-- `design_records`：记录架构理解和方案设计类回答中的需求摘要、模块边界、设计约束、候选/选中方案、取舍、风险和测试策略。
+- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs` 和 `artifact_refs`。
+- `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`。
+- `artifacts`：大文本或结构化大对象索引，完整内容在 `artifacts/sha256/` 下按 hash 去重保存。
+- `metrics`：spans、events、records、dataflow_edges、artifacts 和 token/cost 统计。
 
-证据引用采用 `type:id` 格式，例如：
+事实引用采用 `type:id` 格式，例如：
 
 ```text
 context_snapshot:ctx_1_xxxxxxxx
@@ -380,15 +376,17 @@ verification:ver_1_xxxxxxxx
 change:chg_1_xxxxxxxx
 ```
 
-大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并会嵌入到 `trace.html` 供展开查看。
+大文本不会直接塞进 `provenance-trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `viewer.html` 的 artifact 链接查看。
 
-`trace.html` 新增视图：
+`viewer.html` 视图：
 
-- `Evidence Chain`：查看语义决策、语义边和最终回答证据。
-- `LLM Context`：查看每次 LLM 调用的 system、messages 和 tool schema。
-- `Changes & Verification`：查看变更记录和测试/命令验证记录。
-- `Design Records`：查看方案设计记录和相关证据引用。
-- `Constraints`：查看用户约束及当前可观测状态。
+- `Component Dataflow`：查看组件间数据流边，不做根因判断。
+- `Execution Timeline`：按时间展示全部组件事实记录。
+- `IO Inspector`：聚合 LLM/tool/MCP/skill/subagent/response 的输入输出摘要。
+- `Context Ledger`：展示 LLM context package 和 compaction 前后摘要。
+- `Artifacts`：查看大文本 artifact 索引和路径。
+
+`trace.json` 作为兼容副产物保留 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和 `dataflow_edges`。旧版 `final_response_evidence`、`semantic_edges`、`evidence_refs` 不再作为正式输出字段使用。
 
 语义层会对常见敏感字段做脱敏，包括 `apiKey`、`authorization`、`cookie`、`secret`、`password`、`credential`、`access_token`、`refresh_token`、`auth_token`，以及 `sk-...`、`Bearer ...` 等字符串模式。`token_usage`、`token_estimate`、`tokens`、`inputTokens`、`outputTokens` 等计量字段不会被误脱敏。
 

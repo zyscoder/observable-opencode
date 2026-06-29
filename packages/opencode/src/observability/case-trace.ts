@@ -2,7 +2,7 @@ import crypto from "crypto"
 import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
-import { renderCausalTraceHtml } from "./causal-trace-viewer"
+import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
 import { renderCaseTraceHtml } from "./case-trace-html"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
@@ -123,8 +123,7 @@ export type TraceSemanticDecision = {
   intent?: string
   chosen_action?: string
   rationale?: TraceFieldSummary
-  confidence?: "low" | "medium" | "high" | string
-  evidence_refs?: string[]
+  source_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -169,7 +168,7 @@ export type TraceChangeRecord = {
   files: string[]
   intent?: string
   diff?: TraceFieldSummary
-  evidence_refs?: string[]
+  source_refs?: string[]
   verification_refs?: string[]
   metadata?: Record<string, unknown>
 }
@@ -179,16 +178,15 @@ export type TraceConstraintRecord = {
   source: "user" | "system" | "runtime" | string
   constraint: string
   status: "observed_satisfied" | "observed_violated" | "unknown"
-  evidence_refs?: string[]
+  source_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
-export type TraceFinalResponseEvidence = {
-  claim_id: string
+export type TraceResponseSegment = {
+  segment_id: string
   response_artifact?: string
-  claim: TraceFieldSummary
-  evidence_refs?: string[]
-  confidence?: "low" | "medium" | "high" | string
+  text: TraceFieldSummary
+  source_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -204,7 +202,7 @@ export type TraceDesignRecord = {
   tradeoffs?: TraceFieldSummary
   risks?: TraceFieldSummary
   test_strategy?: TraceFieldSummary
-  evidence_refs?: string[]
+  source_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -221,7 +219,7 @@ export type CausalNodeKind =
   | "observation"
   | "change"
   | "verification"
-  | "final.claim"
+  | "response.output"
   | "runtime.event"
 
 export type CausalNode = {
@@ -234,7 +232,7 @@ export type CausalNode = {
   title?: string
   status?: TraceStatus | TraceVerificationRecord["status"]
   data?: Record<string, unknown>
-  evidence_refs?: string[]
+  source_refs?: string[]
   artifact_refs?: string[]
   metadata?: Record<string, unknown>
 }
@@ -249,7 +247,7 @@ export type CausalEdge = {
 }
 
 export type TraceManifest = {
-  trace_version: "2.0"
+  trace_version: "3.0"
   case_id: string
   run_id: string
   session_id?: string
@@ -262,7 +260,7 @@ export type TraceManifest = {
   token_usage: TraceTokenUsage
   result?: Record<string, unknown>
   files: {
-    causal_trace: string
+    provenance_trace: string
     records: string
     raw_events: string
     viewer: string
@@ -270,32 +268,65 @@ export type TraceManifest = {
   }
 }
 
-export type DiagnosticHint = {
-  hint_id: string
-  category: string
-  message: string
-  evidence_refs?: string[]
+export type ProvenanceRecord = {
+  record_id: string
+  component?: TraceComponent
+  event_type: string
+  span_id?: string
+  parent_span_id?: string
+  timestamp: string
+  time_ms: number
+  title?: string
+  status?: TraceStatus | TraceVerificationRecord["status"]
+  duration_ms?: number
+  token_usage?: TraceTokenUsage
+  error?: unknown
+  input_refs?: string[]
+  output_refs?: string[]
+  source_refs?: string[]
+  artifact_refs?: string[]
+  data?: Record<string, unknown>
+  metadata?: Record<string, unknown>
 }
 
-export type CausalTraceSummary = {
-  trace_version: "2.0"
+export type DataflowEdge = {
+  edge_id: string
+  from: TraceRef
+  to: TraceRef
+  relation:
+    | "produced"
+    | "consumed"
+    | "prompted"
+    | "returned"
+    | "selected_into_context"
+    | "compressed_from"
+    | "compressed_to"
+    | "spawned"
+    | "continued_from"
+    | "wrote_artifact"
+    | string
+  label?: string
+  metadata?: Record<string, unknown>
+}
+
+export type ProvenanceTraceSummary = {
+  trace_version: "3.0"
   manifest: TraceManifest
-  nodes: CausalNode[]
-  edges: CausalEdge[]
+  records: ProvenanceRecord[]
+  dataflow_edges: DataflowEdge[]
   artifacts: TraceArtifact[]
   metrics: {
     spans: number
     events: number
-    nodes: number
-    edges: number
+    records: number
+    dataflow_edges: number
     artifacts: number
     token_usage: TraceTokenUsage
   }
-  diagnostics_hints: DiagnosticHint[]
 }
 
 export type TraceSummary = {
-  trace_version: "1.0" | "1.1" | "1.2"
+  trace_version: "1.0" | "1.1" | "1.2" | "1.3"
   case_id: string
   run_id: string
   session_id?: string
@@ -313,11 +344,11 @@ export type TraceSummary = {
   result?: Record<string, unknown>
   context_snapshots?: TraceContextSnapshot[]
   semantic_decisions?: TraceSemanticDecision[]
-  semantic_edges?: TraceSemanticEdge[]
+  dataflow_edges?: TraceSemanticEdge[]
   verification_records?: TraceVerificationRecord[]
   change_records?: TraceChangeRecord[]
   constraint_records?: TraceConstraintRecord[]
-  final_response_evidence?: TraceFinalResponseEvidence[]
+  response_segments?: TraceResponseSegment[]
   design_records?: TraceDesignRecord[]
 }
 
@@ -366,9 +397,11 @@ type ContextSnapshotInput = Omit<TraceContextSnapshot, "snapshot_id" | "messages
   metadata?: Record<string, unknown>
 }
 
-type SemanticDecisionInput = Omit<TraceSemanticDecision, "decision_id" | "rationale" | "metadata"> & {
+type SemanticDecisionInput = Omit<TraceSemanticDecision, "decision_id" | "rationale" | "metadata" | "source_refs"> & {
   decision_id?: string
   rationale?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -387,18 +420,30 @@ type VerificationRecordInput = Omit<
   stderr?: unknown
 }
 
-type ChangeRecordInput = Omit<TraceChangeRecord, "change_id" | "diff"> & {
+type ChangeRecordInput = Omit<TraceChangeRecord, "change_id" | "diff" | "source_refs"> & {
   change_id?: string
   diff?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
 }
 
-type ConstraintRecordInput = Omit<TraceConstraintRecord, "constraint_id"> & {
+type ConstraintRecordInput = Omit<TraceConstraintRecord, "constraint_id" | "source_refs"> & {
   constraint_id?: string
+  source_refs?: string[]
+  evidence_refs?: string[]
 }
 
-type FinalResponseEvidenceInput = Omit<TraceFinalResponseEvidence, "claim_id" | "claim"> & {
+type ResponseOutputInput = Omit<TraceResponseSegment, "segment_id" | "text" | "source_refs"> & {
+  segment_id?: string
+  text: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+}
+
+type FinalResponseEvidenceInput = Omit<ResponseOutputInput, "segment_id" | "text"> & {
   claim_id?: string
   claim: unknown
+  confidence?: "low" | "medium" | "high" | string
 }
 
 type DesignRecordInput = Omit<
@@ -412,6 +457,7 @@ type DesignRecordInput = Omit<
   | "tradeoffs"
   | "risks"
   | "test_strategy"
+  | "source_refs"
 > & {
   design_id?: string
   requirement_summary?: unknown
@@ -422,11 +468,15 @@ type DesignRecordInput = Omit<
   tradeoffs?: unknown
   risks?: unknown
   test_strategy?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
 }
 
-type CausalNodeInput = Omit<CausalNode, "node_id" | "timestamp" | "time_ms" | "data" | "artifact_refs"> & {
+type CausalNodeInput = Omit<CausalNode, "node_id" | "timestamp" | "time_ms" | "data" | "artifact_refs" | "source_refs"> & {
   node_id?: string
   data?: Record<string, unknown>
+  source_refs?: string[]
+  evidence_refs?: string[]
 }
 
 type CausalEdgeInput = Omit<CausalEdge, "edge_id"> & {
@@ -439,6 +489,7 @@ type ObservationInput = {
   summary: unknown
   data?: unknown
   span_id?: string
+  source_refs?: string[]
   evidence_refs?: string[]
   confidence?: "low" | "medium" | "high" | string
   metadata?: Record<string, unknown>
@@ -460,6 +511,7 @@ type CompactionRecordInput = {
   auto_continue?: boolean
   result?: string
   span_id?: string
+  source_refs?: string[]
   evidence_refs?: string[]
   metadata?: Record<string, unknown>
 }
@@ -745,7 +797,7 @@ class ActiveCaseTrace {
   readonly traceFile: string
   readonly htmlFile: string
   readonly manifestFile: string
-  readonly causalTraceFile: string
+  readonly provenanceTraceFile: string
   readonly viewerFile: string
   readonly partialDir: string
   readonly partialFile: string
@@ -765,7 +817,6 @@ class ActiveCaseTrace {
   private artifactByDedupeKey = new Map<string, TraceArtifact>()
   private causalNodes: CausalNode[] = []
   private causalEdges: CausalEdge[] = []
-  private diagnosticHints: DiagnosticHint[] = []
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
@@ -773,7 +824,7 @@ class ActiveCaseTrace {
   private verificationRecords: TraceVerificationRecord[] = []
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
-  private finalResponseEvidence: TraceFinalResponseEvidence[] = []
+  private responseSegments: TraceResponseSegment[] = []
   private designRecords: TraceDesignRecord[] = []
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
@@ -796,7 +847,7 @@ class ActiveCaseTrace {
     this.traceFile = path.join(this.caseDir, "trace.json")
     this.htmlFile = path.join(this.caseDir, "trace.html")
     this.manifestFile = path.join(this.caseDir, "manifest.json")
-    this.causalTraceFile = path.join(this.caseDir, "causal-trace.json")
+    this.provenanceTraceFile = path.join(this.caseDir, "provenance-trace.json")
     this.viewerFile = path.join(this.caseDir, "viewer.html")
     this.partialDir = path.join(this.caseDir, "partial")
     this.partialFile = path.join(this.partialDir, "latest.json")
@@ -1036,8 +1087,7 @@ class ActiveCaseTrace {
       chosen_action: input.chosen_action,
       rationale:
         input.rationale === undefined ? undefined : this.summarizeText(input.rationale, "semantic.decision.rationale"),
-      confidence: input.confidence,
-      evidence_refs: input.evidence_refs,
+      source_refs: input.source_refs ?? input.evidence_refs,
       metadata: input.metadata,
     }
     this.semanticDecisions.push(decision)
@@ -1120,7 +1170,8 @@ class ActiveCaseTrace {
   }
 
   change(input: ChangeRecordInput) {
-    const evidenceRefs =
+    const sourceRefs =
+      input.source_refs ??
       input.evidence_refs ??
       (this.recentFailedVerificationID ? [`verification:${this.recentFailedVerificationID}`] : undefined)
     const change: TraceChangeRecord = {
@@ -1130,7 +1181,7 @@ class ActiveCaseTrace {
       files: input.files,
       intent: input.intent,
       diff: input.diff === undefined ? undefined : this.summarizeText(input.diff, "change.diff"),
-      evidence_refs: evidenceRefs,
+      source_refs: sourceRefs,
       verification_refs: input.verification_refs,
       metadata: input.metadata,
     }
@@ -1148,11 +1199,11 @@ class ActiveCaseTrace {
         files: input.files,
         intent: input.intent,
         diff: input.diff,
-        evidence_refs: evidenceRefs,
+        source_refs: sourceRefs,
         verification_refs: input.verification_refs,
         metadata: input.metadata,
       },
-      evidence_refs: evidenceRefs,
+      source_refs: sourceRefs,
     })
     this.recentChangeID = change.change_id
     if (this.recentFailedVerificationID) {
@@ -1172,7 +1223,7 @@ class ActiveCaseTrace {
       source: input.source,
       constraint: redactText(input.constraint),
       status: input.status,
-      evidence_refs: input.evidence_refs,
+      source_refs: input.source_refs ?? input.evidence_refs,
       metadata: input.metadata,
     }
     this.constraintRecords.push(constraint)
@@ -1180,36 +1231,44 @@ class ActiveCaseTrace {
     return constraint
   }
 
-  finalEvidence(input: FinalResponseEvidenceInput) {
-    const evidenceRefs = this.normalizeEvidenceRefs(input.evidence_refs)
-    const evidence: TraceFinalResponseEvidence = {
-      claim_id: input.claim_id ?? semanticID("claim", this.finalResponseEvidence.length + 1),
+  responseOutput(input: ResponseOutputInput) {
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const segment: TraceResponseSegment = {
+      segment_id: input.segment_id ?? semanticID("segment", this.responseSegments.length + 1),
       response_artifact: input.response_artifact,
-      claim: this.summarizeText(input.claim, "result.final_response.claim"),
-      evidence_refs: evidenceRefs,
-      confidence: input.confidence,
+      text: this.summarizeText(input.text, "result.response.output"),
+      source_refs: sourceRefs,
       metadata: input.metadata,
     }
-    this.finalResponseEvidence.push(evidence)
-    this.write("semantic.final_response_evidence", evidence)
-    const claim = this.node({
-      node_id: `claimnode_${evidence.claim_id}`,
-      kind: "final.claim",
+    this.responseSegments.push(segment)
+    this.write("semantic.response_output", segment)
+    const record = this.node({
+      node_id: `responsenode_${segment.segment_id}`,
+      kind: "response.output",
       component: "result",
-      title: `Final claim ${this.finalResponseEvidence.length}`,
+      title: `Response output ${this.responseSegments.length}`,
       data: {
-        claim_id: evidence.claim_id,
+        segment_id: segment.segment_id,
         response_artifact: input.response_artifact,
-        claim: input.claim,
-        confidence: input.confidence,
+        text: input.text,
         metadata: input.metadata,
       },
-      evidence_refs: evidenceRefs,
+      source_refs: sourceRefs,
     })
-    for (const ref of evidenceRefs ?? []) {
-      this.linkEvidenceToClaim(ref, claim.node_id)
+    for (const ref of sourceRefs ?? []) {
+      this.linkSourceToResponse(ref, record.node_id)
     }
-    return evidence
+    return segment
+  }
+
+  finalEvidence(input: FinalResponseEvidenceInput) {
+    return this.responseOutput({
+      segment_id: input.claim_id,
+      response_artifact: input.response_artifact,
+      text: input.claim,
+      source_refs: input.source_refs ?? input.evidence_refs,
+      metadata: input.metadata,
+    })
   }
 
   designRecord(input: DesignRecordInput) {
@@ -1225,7 +1284,7 @@ class ActiveCaseTrace {
       tradeoffs: this.summarizeDesignField(input.tradeoffs, "design.tradeoffs"),
       risks: this.summarizeDesignField(input.risks, "design.risks"),
       test_strategy: this.summarizeDesignField(input.test_strategy, "design.test_strategy"),
-      evidence_refs: this.normalizeEvidenceRefs(input.evidence_refs),
+      source_refs: this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs),
       metadata: input.metadata,
     }
     this.designRecords.push(design)
@@ -1244,7 +1303,7 @@ class ActiveCaseTrace {
       title: input.title,
       status: input.status,
       data: input.data === undefined ? undefined : this.summarizeCausalObject(input.data, `${input.kind}.data`),
-      evidence_refs: input.evidence_refs,
+      source_refs: input.source_refs ?? input.evidence_refs,
       artifact_refs: [],
       metadata: input.metadata,
     }
@@ -1271,6 +1330,7 @@ class ActiveCaseTrace {
   }
 
   observation(input: ObservationInput) {
+    const sourceRefs = input.source_refs ?? input.evidence_refs
     const node = this.node({
       kind: "observation",
       component: this.componentForObservationSource(input.source),
@@ -1282,26 +1342,26 @@ class ActiveCaseTrace {
         category: input.category,
         summary: input.summary,
         data: input.data,
-        confidence: input.confidence,
         metadata: input.metadata,
       },
-      evidence_refs: input.evidence_refs,
+      source_refs: sourceRefs,
       metadata: input.metadata,
     })
-    for (const ref of input.evidence_refs ?? []) {
-      const parsed = this.parseEvidenceRef(ref)
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
       if (!parsed) continue
       this.causalEdge({
         from: parsed,
         to: { type: "node", id: node.node_id, label: "observation" },
-        relation: parsed.type === "compaction" || parsed.id.startsWith("compaction") ? "compaction_to_observation" : "evidence_to_observation",
-        label: "Observation derived from evidence",
+        relation: parsed.type === "compaction" || parsed.id.startsWith("compaction") ? "compaction_to_observation" : "source_to_observation",
+        label: "Observation produced from source record",
       })
     }
     return node
   }
 
   compaction(input: CompactionRecordInput) {
+    const sourceRefs = input.source_refs ?? input.evidence_refs
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -1325,23 +1385,23 @@ class ActiveCaseTrace {
         result: input.result,
         metadata: input.metadata,
       },
-      evidence_refs: input.evidence_refs,
+      source_refs: sourceRefs,
       metadata: input.metadata,
     })
-    for (const ref of input.evidence_refs ?? []) {
-      const parsed = this.parseEvidenceRef(ref)
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
       if (!parsed) continue
       this.causalEdge({
         from: parsed,
         to: { type: "compaction", id: node.node_id, label: "context.compaction" },
-        relation: "evidence_to_compaction",
-        label: "Compaction used prior evidence",
+        relation: "source_to_compaction",
+        label: "Compaction consumed source context",
       })
     }
     return node
   }
 
-  currentEvidenceRefs() {
+  currentSourceRefs() {
     return [
       ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
       ...this.recentToolSpanIDs.slice(-3).map((id) => `tool_span:${id}`),
@@ -1358,13 +1418,13 @@ class ActiveCaseTrace {
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
     const summary = this.summary(input?.status ?? (error ? "error" : "success"))
-    const causal = this.causalSummary(summary.status)
+    const provenance = this.provenanceSummary(summary.status)
     this.write("trace.finish", summary)
-    this.writeRecord("finish", causal.manifest)
-    this.safeWrite(this.manifestFile, jsonPretty(causal.manifest))
-    this.safeWrite(this.causalTraceFile, jsonPretty(causal))
-    this.writePartial(true, causal)
-    this.safeWrite(this.viewerFile, renderCausalTraceHtml(causal))
+    this.writeRecord("finish", provenance.manifest)
+    this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
+    this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
+    this.writePartial(true, provenance)
+    this.safeWrite(this.viewerFile, renderProvenanceTraceHtml(provenance))
     this.safeWrite(this.traceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderCaseTraceHtml(summary, { artifactDir: this.caseDir }))
   }
@@ -1372,7 +1432,7 @@ class ActiveCaseTrace {
   private summary(status: TraceStatus): TraceSummary {
     const ended = Date.now()
     return {
-      trace_version: "1.2",
+      trace_version: "1.3",
       case_id: this.caseID,
       run_id: this.runID,
       session_id: this.sessionID,
@@ -1390,11 +1450,11 @@ class ActiveCaseTrace {
       result: this.result,
       context_snapshots: this.contextSnapshots,
       semantic_decisions: this.semanticDecisions,
-      semantic_edges: this.semanticEdges,
+      dataflow_edges: this.semanticEdges,
       verification_records: this.verificationRecords,
       change_records: this.changeRecords,
       constraint_records: this.constraintRecords,
-      final_response_evidence: this.finalResponseEvidence,
+      response_segments: this.responseSegments,
       design_records: this.designRecords,
     }
   }
@@ -1402,7 +1462,7 @@ class ActiveCaseTrace {
   private manifest(status: TraceStatus): TraceManifest {
     const ended = Date.now()
     return {
-      trace_version: "2.0",
+      trace_version: "3.0",
       case_id: this.caseID,
       run_id: this.runID,
       session_id: this.sessionID,
@@ -1415,7 +1475,7 @@ class ActiveCaseTrace {
       token_usage: this.tokenUsage,
       result: this.result,
       files: {
-        causal_trace: "causal-trace.json",
+        provenance_trace: "provenance-trace.json",
         records: "records.jsonl",
         raw_events: "raw-events.jsonl",
         viewer: "viewer.html",
@@ -1424,24 +1484,54 @@ class ActiveCaseTrace {
     }
   }
 
-  private causalSummary(status: TraceStatus): CausalTraceSummary {
+  private provenanceSummary(status: TraceStatus): ProvenanceTraceSummary {
     const manifest = this.manifest(status)
     return {
-      trace_version: "2.0",
+      trace_version: "3.0",
       manifest,
-      nodes: this.causalNodes,
-      edges: this.causalEdges,
+      records: this.provenanceRecords(),
+      dataflow_edges: this.provenanceDataflowEdges(),
       artifacts: this.artifacts,
       metrics: {
         spans: this.spans.size,
         events: this.events.length,
-        nodes: this.causalNodes.length,
-        edges: this.causalEdges.length,
+        records: this.causalNodes.length,
+        dataflow_edges: this.causalEdges.length,
         artifacts: this.artifacts.length,
         token_usage: this.tokenUsage,
       },
-      diagnostics_hints: this.diagnosticHints,
     }
+  }
+
+  private provenanceRecords(): ProvenanceRecord[] {
+    return this.causalNodes.map((node) => ({
+      record_id: node.node_id,
+      component: node.component,
+      event_type: node.kind === "final.claim" ? "response.output" : node.kind,
+      span_id: node.span_id,
+      timestamp: node.timestamp,
+      time_ms: node.time_ms,
+      title: node.title,
+      status: node.status,
+      duration_ms: optionalNumber(node.data?.duration_ms),
+      token_usage: node.data?.token_usage as TraceTokenUsage | undefined,
+      error: node.data?.error,
+      source_refs: node.source_refs,
+      artifact_refs: node.artifact_refs,
+      data: node.data,
+      metadata: node.metadata,
+    }))
+  }
+
+  private provenanceDataflowEdges(): DataflowEdge[] {
+    return this.causalEdges.map((edge) => ({
+      edge_id: edge.edge_id,
+      from: this.provenanceRef(edge.from),
+      to: this.provenanceRef(edge.to),
+      relation: this.provenanceRelation(edge.relation),
+      label: this.provenanceLabel(edge.label),
+      metadata: edge.metadata,
+    }))
   }
 
   summarizeText(input: unknown, label = "text"): TraceFieldSummary {
@@ -1535,11 +1625,11 @@ class ActiveCaseTrace {
     return [...refs]
   }
 
-  private normalizeEvidenceRefs(input: string[] | undefined) {
+  private normalizeSourceRefs(input: string[] | undefined) {
     const provided = input ?? []
     const concreteProvided = provided.filter((item) => !item.startsWith("recent_"))
     if (provided.length && concreteProvided.length === provided.length) return concreteProvided
-    return [...concreteProvided, ...this.currentEvidenceRefs()].filter(
+    return [...concreteProvided, ...this.currentSourceRefs()].filter(
       (item, index, array) => array.indexOf(item) === index,
     )
   }
@@ -1553,32 +1643,32 @@ class ActiveCaseTrace {
     for (const constraint of this.constraintRecords) {
       if (constraint.status !== "unknown") continue
       const text = constraint.constraint.toLowerCase()
-      const evidenceRefs = new Set(constraint.evidence_refs ?? [])
+      const sourceRefs = new Set(constraint.source_refs ?? [])
       if (/do not modify|read[- ]?only|只读|不修改|不要修改/.test(text)) {
         if (this.changeRecords.length) {
           constraint.status = "observed_violated"
-          for (const change of this.changeRecords) evidenceRefs.add(`change:${change.change_id}`)
+          for (const change of this.changeRecords) sourceRefs.add(`change:${change.change_id}`)
         } else {
           constraint.status = "observed_satisfied"
         }
       } else if (/run verification tests|run tests|执行测试|运行测试/.test(text)) {
         const verifications = this.verificationRecords.filter((item) => isTestLikeCommand(item.command))
         constraint.status = verifications.length ? "observed_satisfied" : "observed_violated"
-        for (const verification of verifications) evidenceRefs.add(`verification:${verification.verification_id}`)
+        for (const verification of verifications) sourceRefs.add(`verification:${verification.verification_id}`)
       } else if (/only make necessary changes|only necessary|minimal change|只改必要|最小修改/.test(text)) {
         if (!this.changeRecords.length) {
           constraint.status = "observed_satisfied"
         } else {
           const hasLinkedChange = this.changeRecords.some(
-            (change) => (change.evidence_refs?.length ?? 0) > 0 || (change.verification_refs?.length ?? 0) > 0,
+            (change) => (change.source_refs?.length ?? 0) > 0 || (change.verification_refs?.length ?? 0) > 0,
           )
           const hasVerification = this.verificationRecords.length > 0
           if (hasLinkedChange || hasVerification) constraint.status = "observed_satisfied"
         }
-        for (const change of this.changeRecords) evidenceRefs.add(`change:${change.change_id}`)
-        for (const verification of this.verificationRecords) evidenceRefs.add(`verification:${verification.verification_id}`)
+        for (const change of this.changeRecords) sourceRefs.add(`change:${change.change_id}`)
+        for (const verification of this.verificationRecords) sourceRefs.add(`verification:${verification.verification_id}`)
       }
-      constraint.evidence_refs = [...evidenceRefs]
+      constraint.source_refs = [...sourceRefs]
       this.write("semantic.constraint_evaluated", constraint)
     }
   }
@@ -1602,7 +1692,7 @@ class ActiveCaseTrace {
     return "result"
   }
 
-  private parseEvidenceRef(ref: string): TraceRef | undefined {
+  private parseSourceRef(ref: string): TraceRef | undefined {
     const index = ref.indexOf(":")
     if (index === -1) return undefined
     return {
@@ -1611,21 +1701,48 @@ class ActiveCaseTrace {
     }
   }
 
-  private linkEvidenceToClaim(ref: string, claimNodeID: string) {
-    const parsed = this.parseEvidenceRef(ref)
+  private linkSourceToResponse(ref: string, responseNodeID: string) {
+    const parsed = this.parseSourceRef(ref)
     if (!parsed) return
-    let relation = "evidence_to_claim"
-    if (parsed.type === "observation") relation = "observation_to_claim"
-    else if (parsed.type === "verification") relation = "verification_to_claim"
-    else if (parsed.type === "change") relation = "change_to_claim"
-    else if (parsed.type === "context_snapshot" || parsed.type === "context") relation = "context_to_claim"
-    else if (parsed.type === "tool_span" || parsed.type === "span") relation = "tool_to_claim"
     this.causalEdge({
       from: parsed,
-      to: { type: "node", id: claimNodeID, label: "final.claim" },
-      relation,
-      label: "Final claim referenced this evidence",
+      to: { type: "node", id: responseNodeID, label: "response.output" },
+      relation: "source_to_response",
+      label: "Response output consumed source record",
     })
+  }
+
+  private provenanceRef(ref: TraceRef): TraceRef {
+    const type = ref.type === "final_response_evidence" ? "response_segment" : ref.type
+    const label = ref.label === "final.claim" ? "response.output" : ref.label
+    return {
+      ...ref,
+      type,
+      label,
+    }
+  }
+
+  private provenanceRelation(relation: string): DataflowEdge["relation"] {
+    if (relation === "context_to_llm") return "selected_into_context"
+    if (relation === "compaction_to_context") return "compressed_to"
+    if (relation === "source_to_compaction" || relation === "evidence_to_compaction") return "compressed_from"
+    if (relation === "context_to_compaction_summary") return "compressed_to"
+    if (relation === "llm_to_tool") return "prompted"
+    if (relation === "source_to_response" || /_to_claim$/.test(relation)) return "consumed"
+    if (relation === "source_to_observation" || relation === "evidence_to_observation" || relation === "tool_to_observation" || relation === "compaction_to_observation") return "produced"
+    if (relation === "processor_to_final_response") return "produced"
+    if (relation === "final_response_to_design_record") return "produced"
+    if (relation === "change_to_verification" || relation === "failure_to_change") return "continued_from"
+    return relation
+  }
+
+  private provenanceLabel(label: string | undefined) {
+    if (!label) return undefined
+    return label
+      .replace(/final response evidence/gi, "response output")
+      .replace(/final claim/gi, "response output")
+      .replace(/claim/gi, "response")
+      .replace(/evidence/gi, "source record")
   }
 
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
@@ -1674,7 +1791,7 @@ class ActiveCaseTrace {
       fs.writeFileSync(this.rawEventsFile, "")
       fs.writeFileSync(this.recordsFile, "")
       this.write("trace.start", {
-        trace_version: "1.2",
+        trace_version: "1.3",
         case_id: this.caseID,
         run_id: this.runID,
         started_at: this.startedIso,
@@ -1738,13 +1855,13 @@ class ActiveCaseTrace {
     } catch {}
   }
 
-  private writePartial(force = false, summary?: CausalTraceSummary) {
+  private writePartial(force = false, summary?: ProvenanceTraceSummary) {
     if (!this.writable) return
     const now = Date.now()
     const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
     if (!force && now < this.nextPartialWrite) return
     this.nextPartialWrite = now + interval
-    this.safeWrite(this.partialFile, jsonPretty(summary ?? this.causalSummary("running")))
+    this.safeWrite(this.partialFile, jsonPretty(summary ?? this.provenanceSummary("running")))
   }
 
   private safeWrite(target: string, content: string) {
@@ -1912,6 +2029,10 @@ export namespace CaseTrace {
     return get()?.finalEvidence(input)
   }
 
+  export function responseOutput(input: ResponseOutputInput) {
+    return get()?.responseOutput(input)
+  }
+
   export function designRecord(input: DesignRecordInput) {
     return get()?.designRecord(input)
   }
@@ -1933,7 +2054,11 @@ export namespace CaseTrace {
   }
 
   export function currentEvidenceRefs() {
-    return get()?.currentEvidenceRefs() ?? []
+    return get()?.currentSourceRefs() ?? []
+  }
+
+  export function currentSourceRefs() {
+    return get()?.currentSourceRefs() ?? []
   }
 
   export function finish(input?: FinishTraceInput) {

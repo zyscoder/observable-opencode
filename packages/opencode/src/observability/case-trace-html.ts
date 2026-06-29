@@ -383,17 +383,17 @@ function renderContextSnapshots(trace: TraceSummary, artifactContents: Map<strin
   </div>`
 }
 
-function renderEvidenceChain(trace: TraceSummary, artifactContents: Map<string, string>) {
+function renderSourceRecords(trace: TraceSummary, artifactContents: Map<string, string>) {
   const decisions = trace.semantic_decisions ?? []
-  const edges = trace.semantic_edges ?? []
-  const finalEvidence = trace.final_response_evidence ?? []
-  if (!decisions.length && !edges.length && !finalEvidence.length) return `<div class="empty">没有语义证据链。</div>`
+  const edges = trace.dataflow_edges ?? []
+  const responseSegments = trace.response_segments ?? []
+  if (!decisions.length && !edges.length && !responseSegments.length) return `<div class="empty">没有响应和来源记录。</div>`
 
   return `<div>
     ${
       decisions.length
         ? `<h3>Decisions</h3><table>
-          <thead><tr><th>ID</th><th>组件</th><th>类型</th><th>意图</th><th>动作</th><th>理由</th><th>证据</th></tr></thead>
+          <thead><tr><th>ID</th><th>组件</th><th>类型</th><th>意图</th><th>动作</th><th>理由</th><th>来源</th></tr></thead>
           <tbody>
             ${decisions
               .map(
@@ -404,7 +404,7 @@ function renderEvidenceChain(trace: TraceSummary, artifactContents: Map<string, 
                   <td>${escapeHtml(item.intent ?? "")}</td>
                   <td>${escapeHtml(item.chosen_action ?? "")}</td>
                   <td>${renderSummary(item.rationale)}</td>
-                  <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+                  <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
                 </tr>`,
               )
               .join("")}
@@ -414,7 +414,7 @@ function renderEvidenceChain(trace: TraceSummary, artifactContents: Map<string, 
     }
     ${
       edges.length
-        ? `<h3>Semantic Edges</h3><table>
+        ? `<h3>Dataflow Edges</h3><table>
           <thead><tr><th>关系</th><th>From</th><th>To</th><th>说明</th></tr></thead>
           <tbody>
             ${edges
@@ -432,14 +432,14 @@ function renderEvidenceChain(trace: TraceSummary, artifactContents: Map<string, 
         : ""
     }
     ${
-      finalEvidence.length
-        ? `<h3>Final Response Evidence</h3><div class="process">
-          ${finalEvidence
+      responseSegments.length
+        ? `<h3>Response Output</h3><div class="process">
+          ${responseSegments
             .map(
               (item) => `<div class="io-cell">
-                <div class="io-label"><code>${escapeHtml(item.claim_id)}</code> ${escapeHtml(item.confidence ?? "")}</div>
-                ${renderIoCell("Claim", item.claim, artifactContents)}
-                <div class="muted">evidence: ${escapeHtml((item.evidence_refs ?? []).join(", ") || "-")}</div>
+                <div class="io-label"><code>${escapeHtml(item.segment_id)}</code></div>
+                ${renderIoCell("Text", item.text, artifactContents)}
+                <div class="muted">source refs: ${escapeHtml((item.source_refs ?? []).join(", ") || "-")}</div>
               </div>`,
             )
             .join("")}
@@ -496,7 +496,7 @@ function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map
     ${
       changes.length
         ? `<h3>Changes</h3><table>
-          <thead><tr><th>ID</th><th>文件</th><th>意图</th><th>证据</th><th>Diff</th></tr></thead>
+          <thead><tr><th>ID</th><th>文件</th><th>意图</th><th>来源</th><th>Diff</th></tr></thead>
           <tbody>
             ${changes
               .map(
@@ -504,7 +504,7 @@ function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map
                   <td><code>${escapeHtml(item.change_id)}</code></td>
                   <td>${escapeHtml(item.files.join(", "))}</td>
                   <td>${escapeHtml(item.intent ?? "")}</td>
-                  <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+                  <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
                   <td>${item.diff ? renderArtifactDetails(item.diff, artifactContents) || renderSummary(item.diff) : ""}</td>
                 </tr>`,
               )
@@ -537,7 +537,7 @@ function renderDesignRecords(trace: TraceSummary, artifactContents: Map<string, 
             ${item.risks ? renderIoCell("Risks", item.risks, artifactContents) : ""}
             ${item.test_strategy ? renderIoCell("Test Strategy", item.test_strategy, artifactContents) : ""}
           </div>
-          <div class="muted">evidence: ${escapeHtml((item.evidence_refs ?? []).join(", ") || "-")}</div>
+          <div class="muted">source refs: ${escapeHtml((item.source_refs ?? []).join(", ") || "-")}</div>
         </div>`,
       )
       .join("")}
@@ -548,7 +548,7 @@ function renderConstraints(trace: TraceSummary) {
   const constraints = trace.constraint_records ?? []
   if (!constraints.length) return `<div class="empty">没有约束记录。</div>`
   return `<table>
-    <thead><tr><th>ID</th><th>来源</th><th>约束</th><th>状态</th><th>证据</th></tr></thead>
+    <thead><tr><th>ID</th><th>来源</th><th>约束</th><th>状态</th><th>Source Refs</th></tr></thead>
     <tbody>
       ${constraints
         .map(
@@ -557,7 +557,7 @@ function renderConstraints(trace: TraceSummary) {
             <td>${escapeHtml(item.source)}</td>
             <td>${escapeHtml(item.constraint)}</td>
             <td>${escapeHtml(item.status)}</td>
-            <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+            <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
           </tr>`,
         )
         .join("")}
@@ -931,8 +931,8 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
     </section>
 
     <section>
-      <h2>Evidence Chain</h2>
-      ${renderEvidenceChain(trace, artifactContents)}
+      <h2>Response & Source Records</h2>
+      ${renderSourceRecords(trace, artifactContents)}
     </section>
 
     <section>

@@ -740,21 +740,20 @@ export const layer: Layer.Layer<
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
-            const finalEvidence = CaseTrace.finalEvidence({
-              claim: ctx.currentText.text,
-              confidence: "medium",
+            const responseSegment = CaseTrace.responseOutput({
+              text: ctx.currentText.text,
               metadata: {
                 sessionID: ctx.sessionID,
                 messageID: ctx.assistantMessage.id,
                 partID: ctx.currentText.id,
               },
             })
-            if (finalEvidence) {
+            if (responseSegment) {
               CaseTrace.edge({
                 from: { type: "processor_text", id: ctx.currentText.id },
-                to: { type: "final_response_evidence", id: finalEvidence.claim_id },
+                to: { type: "response_segment", id: responseSegment.segment_id },
                 relation: "processor_to_final_response",
-                label: "Completed assistant text recorded as final response evidence",
+                label: "Completed assistant text recorded as response output",
               })
             }
             if (isDesignLikeResponse(ctx.currentText.text)) {
@@ -786,20 +785,20 @@ export const layer: Layer.Layer<
                 tradeoffs: keywordExcerpt(ctx.currentText.text, ["取舍", "权衡", "trade", "tradeoff"]),
                 risks: keywordExcerpt(ctx.currentText.text, ["风险", "risk"]),
                 test_strategy: keywordExcerpt(ctx.currentText.text, ["测试", "验证", "test", "verification"]),
-                evidence_refs: finalEvidence?.evidence_refs,
+                source_refs: responseSegment?.source_refs,
                 metadata: {
                   sessionID: ctx.sessionID,
                   messageID: ctx.assistantMessage.id,
                   partID: ctx.currentText.id,
-                  source_claim_id: finalEvidence?.claim_id,
+                  source_segment_id: responseSegment?.segment_id,
                 },
               })
-              if (designRecord && finalEvidence) {
+              if (designRecord && responseSegment) {
                 CaseTrace.edge({
-                  from: { type: "final_response_evidence", id: finalEvidence.claim_id },
+                  from: { type: "response_segment", id: responseSegment.segment_id },
                   to: { type: "design_record", id: designRecord.design_id },
                   relation: "final_response_to_design_record",
-                  label: "Design-like final response extracted into structured design record",
+                  label: "Design-like response output extracted into structured design record",
                 })
               }
             }

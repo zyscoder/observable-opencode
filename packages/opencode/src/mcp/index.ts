@@ -228,7 +228,7 @@ function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClie
             metadata: result.metadata,
           },
           span_id: span?.id,
-          evidence_refs: span ? [`span:${span.id}`] : undefined,
+          source_refs: span ? [`span:${span.id}`] : undefined,
         })
         span?.end({
           output: {

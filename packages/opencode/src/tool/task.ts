@@ -218,7 +218,7 @@ export const TaskTool = Tool.define(
                   output: result.output,
                 },
                 span_id: traceSpan?.id,
-                evidence_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
+                source_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
                 metadata: {
                   child_session_id: result.metadata.sessionId,
                 },

@@ -108,7 +108,7 @@ export const SkillTool = Tool.define(
               rendered_output: result.output,
             },
             span_id: traceSpan?.id,
-            evidence_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
+            source_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
           })
           return result
         }).pipe(

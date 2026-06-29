@@ -1661,7 +1661,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               source: "user",
               constraint: item.text,
               status: "unknown",
-              evidence_refs: [message.info.id],
+              source_refs: [message.info.id],
               metadata: {
                 sessionID: message.info.sessionID,
                 messageID: message.info.id,

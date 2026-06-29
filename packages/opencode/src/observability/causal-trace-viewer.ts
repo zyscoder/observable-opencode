@@ -1,4 +1,4 @@
-import type { CausalTraceSummary, CausalNode, TraceArtifact } from "./case-trace"
+import type { ProvenanceTraceSummary, ProvenanceRecord, TraceArtifact } from "./case-trace"
 
 function escapeHtml(input: unknown) {
   return String(input ?? "")
@@ -36,35 +36,35 @@ function artifactLinks(ids: string[] | undefined, artifacts: Map<string, TraceAr
     .join(" ")
 }
 
-function renderNode(node: CausalNode, artifacts: Map<string, TraceArtifact>) {
-  return `<article class="node node-${escapeHtml(node.kind.replace(/[^a-z0-9_-]/gi, "-"))}">
+function renderRecord(record: ProvenanceRecord, artifacts: Map<string, TraceArtifact>) {
+  return `<article class="node node-${escapeHtml(record.event_type.replace(/[^a-z0-9_-]/gi, "-"))}">
     <div class="node-head">
-      <span class="kind">${escapeHtml(node.kind)}</span>
-      <strong>${escapeHtml(node.title ?? node.node_id)}</strong>
-      ${node.status ? `<span class="status">${escapeHtml(node.status)}</span>` : ""}
-      <span class="muted">${escapeHtml(node.node_id)}</span>
+      <span class="kind">${escapeHtml(record.event_type)}</span>
+      <strong>${escapeHtml(record.title ?? record.record_id)}</strong>
+      ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+      <span class="muted">${escapeHtml(record.record_id)}</span>
     </div>
     <div class="node-grid">
       <div>
         <div class="label">Data</div>
-        <pre>${escapeHtml(preview(node.data, 900))}</pre>
+        <pre>${escapeHtml(preview(record.data, 900))}</pre>
       </div>
       <div>
-        <div class="label">Evidence</div>
-        <div class="refs">${escapeHtml((node.evidence_refs ?? []).join(", ") || "-")}</div>
+        <div class="label">Source Refs</div>
+        <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
         <div class="label">Artifacts</div>
-        <div class="refs">${artifactLinks(node.artifact_refs, artifacts)}</div>
+        <div class="refs">${artifactLinks(record.artifact_refs, artifacts)}</div>
       </div>
     </div>
   </article>`
 }
 
-function renderEdges(trace: CausalTraceSummary) {
-  if (!trace.edges.length) return `<div class="empty">No causal edges.</div>`
+function renderDataflow(trace: ProvenanceTraceSummary) {
+  if (!trace.dataflow_edges.length) return `<div class="empty">No dataflow edges.</div>`
   return `<table>
     <thead><tr><th>Relation</th><th>From</th><th>To</th><th>Label</th></tr></thead>
     <tbody>
-      ${trace.edges
+      ${trace.dataflow_edges
         .map(
           (edge) => `<tr>
             <td>${escapeHtml(edge.relation)}</td>
@@ -78,56 +78,42 @@ function renderEdges(trace: CausalTraceSummary) {
   </table>`
 }
 
-function renderTimeline(trace: CausalTraceSummary, artifacts: Map<string, TraceArtifact>) {
-  const nodes = trace.nodes.toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!nodes.length) return `<div class="empty">No timeline nodes.</div>`
+function renderTimeline(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records.toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length) return `<div class="empty">No timeline records.</div>`
   return `<div class="timeline">
-    ${nodes
+    ${records
       .map(
-        (node) => `<div class="timeline-row">
-          <div class="time">${escapeHtml(`${node.time_ms} ms`)}</div>
-          ${renderNode(node, artifacts)}
+        (record) => `<div class="timeline-row">
+          <div class="time">${escapeHtml(`${record.time_ms} ms`)}</div>
+          ${renderRecord(record, artifacts)}
         </div>`,
       )
       .join("")}
   </div>`
 }
 
-function renderEvidence(trace: CausalTraceSummary, artifacts: Map<string, TraceArtifact>) {
-  const claims = trace.nodes.filter((node) => node.kind === "final.claim")
-  if (!claims.length) return `<div class="empty">No final claims.</div>`
+function renderIo(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records.filter((record) =>
+    ["llm.call", "tool.call", "mcp.call", "skill.load", "subagent.call", "observation", "response.output"].includes(
+      record.event_type,
+    ),
+  )
+  if (!records.length) return `<div class="empty">No IO records.</div>`
   return `<div class="claims">
-    ${claims
-      .map((claim) => {
-        const incoming = trace.edges.filter((edge) => edge.to.id === claim.node_id)
-        return `<section class="claim">
-          ${renderNode(claim, artifacts)}
-          <h3>Incoming Evidence</h3>
-          ${
-            incoming.length
-              ? `<ul>${incoming
-                  .map(
-                    (edge) =>
-                      `<li><code>${escapeHtml(edge.relation)}</code> from <code>${escapeHtml(edge.from.type)}:${escapeHtml(edge.from.id)}</code></li>`,
-                  )
-                  .join("")}</ul>`
-              : `<div class="empty">No linked evidence.</div>`
-          }
-        </section>`
-      })
-      .join("")}
+    ${records.map((record) => renderRecord(record, artifacts)).join("")}
   </div>`
 }
 
-function renderContext(trace: CausalTraceSummary, artifacts: Map<string, TraceArtifact>) {
-  const contexts = trace.nodes.filter((node) => node.kind === "context.pack" || node.kind === "context.compaction")
+function renderContext(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const contexts = trace.records.filter((record) => record.event_type === "context.pack" || record.event_type === "context.compaction")
   if (!contexts.length) return `<div class="empty">No context or compaction nodes.</div>`
   return `<div class="context-list">
-    ${contexts.map((node) => renderNode(node, artifacts)).join("")}
+    ${contexts.map((record) => renderRecord(record, artifacts)).join("")}
   </div>`
 }
 
-function renderArtifacts(trace: CausalTraceSummary) {
+function renderArtifacts(trace: ProvenanceTraceSummary) {
   if (!trace.artifacts.length) return `<div class="empty">No artifacts.</div>`
   return `<table>
     <thead><tr><th>Artifact</th><th>Label</th><th>Length</th><th>Occurrences</th><th>Path</th></tr></thead>
@@ -147,7 +133,7 @@ function renderArtifacts(trace: CausalTraceSummary) {
   </table>`
 }
 
-export function renderCausalTraceHtml(trace: CausalTraceSummary) {
+export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
   const artifacts = new Map(trace.artifacts.map((artifact) => [artifact.artifact_id, artifact]))
   const statusClass = trace.manifest.status === "success" ? "ok" : trace.manifest.status === "running" ? "running" : "bad"
 
@@ -156,7 +142,7 @@ export function renderCausalTraceHtml(trace: CausalTraceSummary) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Causal Trace - ${escapeHtml(trace.manifest.case_id)}</title>
+  <title>Trace Provenance - ${escapeHtml(trace.manifest.case_id)}</title>
   <style>
     :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#17202a; --muted:#667085; --border:#d9dee7; --accent:#0f766e; --bad:#b42318; }
     * { box-sizing: border-box; }
@@ -192,31 +178,31 @@ export function renderCausalTraceHtml(trace: CausalTraceSummary) {
 </head>
 <body>
   <header>
-    <h1>Causal Trace</h1>
+    <h1>Trace Provenance</h1>
     <div class="meta">
       <span>case: <code>${escapeHtml(trace.manifest.case_id)}</code></span>
       <span>run: <code>${escapeHtml(trace.manifest.run_id)}</code></span>
       <span class="status-pill ${statusClass}">${escapeHtml(trace.manifest.status)}</span>
-      <span>${trace.metrics.nodes} nodes</span>
-      <span>${trace.metrics.edges} edges</span>
+      <span>${trace.metrics.records} records</span>
+      <span>${trace.metrics.dataflow_edges} dataflow edges</span>
       <span>${trace.metrics.artifacts} artifacts</span>
     </div>
   </header>
   <main>
-    <section id="causal-graph">
-      <h2>Causal Graph</h2>
-      ${renderEdges(trace)}
+    <section id="component-dataflow">
+      <h2>Component Dataflow</h2>
+      ${renderDataflow(trace)}
     </section>
     <section id="timeline">
-      <h2>Timeline</h2>
+      <h2>Execution Timeline</h2>
       ${renderTimeline(trace, artifacts)}
     </section>
-    <section id="evidence-inspector">
-      <h2>Evidence Inspector</h2>
-      ${renderEvidence(trace, artifacts)}
+    <section id="io-inspector">
+      <h2>IO Inspector</h2>
+      ${renderIo(trace, artifacts)}
     </section>
-    <section id="context-analyzer">
-      <h2>Context Analyzer</h2>
+    <section id="context-ledger">
+      <h2>Context Ledger</h2>
       ${renderContext(trace, artifacts)}
     </section>
     <section id="artifacts">
@@ -227,4 +213,3 @@ export function renderCausalTraceHtml(trace: CausalTraceSummary) {
 </body>
 </html>`
 }
-

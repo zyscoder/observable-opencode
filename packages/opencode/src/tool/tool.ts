@@ -163,7 +163,7 @@ function semanticToolResult(input: {
         metadata: input.result.metadata,
       },
       span_id: input.spanID,
-      evidence_refs: verification ? [`verification:${verification.verification_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
+      source_refs: verification ? [`verification:${verification.verification_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
     })
   }
 
@@ -200,7 +200,7 @@ function semanticToolResult(input: {
         metadata: input.result.metadata,
       },
       span_id: input.spanID,
-      evidence_refs: change ? [`change:${change.change_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
+      source_refs: change ? [`change:${change.change_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
     })
   } else if (!command) {
     CaseTrace.observation({
@@ -213,7 +213,7 @@ function semanticToolResult(input: {
         metadata: input.result.metadata,
       },
       span_id: input.spanID,
-      evidence_refs: input.spanID ? [`span:${input.spanID}`] : undefined,
+      source_refs: input.spanID ? [`span:${input.spanID}`] : undefined,
     })
   }
 }
