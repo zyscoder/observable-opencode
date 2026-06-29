@@ -14,6 +14,208 @@ async function exists(file: string) {
 }
 
 describe("case trace", () => {
+  test("writes causal trace v2 bundle with graph nodes, records, partial snapshot, and viewer", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-causal-trace-bundle-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "causal-bundle.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "fix pricing bug" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test" })`,
+        `const ctx = CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", provider_id: "deepseek", model_id: "unit-test", agent: "build", message_count: 1, messages: [{ role: "user", content: "fix pricing bug" }] })`,
+        `const obs = CaseTrace.observation({ source: "tool", category: "file", summary: "pricing.mjs owns discount calculation", data: { file: "src/pricing.mjs", lines: "1-20" }, evidence_refs: ctx ? ["context:" + ctx.snapshot_id] : [] })`,
+        `CaseTrace.finalEvidence({ claim: "Discount bug is in pricing.mjs.", evidence_refs: obs ? ["observation:" + obs.node_id] : [], confidence: "high" })`,
+        `span?.end({ output: { completed: true } })`,
+        `CaseTrace.finish({ status: "success", result: { exit_code: 0 } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "causal-bundle-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "causal-bundle-case")
+    for (const file of ["manifest.json", "causal-trace.json", "records.jsonl", "raw-events.jsonl", "viewer.html"]) {
+      expect(await exists(path.join(caseDir, file))).toBe(true)
+    }
+    expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
+
+    const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
+    const causal = JSON.parse(await fs.readFile(path.join(caseDir, "causal-trace.json"), "utf8")) as any
+    const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const viewer = await fs.readFile(path.join(caseDir, "viewer.html"), "utf8")
+
+    expect(manifest.trace_version).toBe("2.0")
+    expect(manifest.case_id).toBe("causal-bundle-case")
+    expect(causal.trace_version).toBe("2.0")
+    expect(causal.nodes.map((node: any) => node.kind)).toContain("run.start")
+    expect(causal.nodes.map((node: any) => node.kind)).toContain("context.pack")
+    expect(causal.nodes.map((node: any) => node.kind)).toContain("llm.call")
+    expect(causal.nodes.map((node: any) => node.kind)).toContain("observation")
+    expect(causal.nodes.map((node: any) => node.kind)).toContain("final.claim")
+    expect(causal.edges.some((edge: any) => edge.relation === "observation_to_claim")).toBe(true)
+    expect(records).toContain('"record_type":"node"')
+    expect(viewer).toContain("Causal Graph")
+    expect(viewer).toContain("Timeline")
+    expect(viewer).toContain("Evidence Inspector")
+    expect(viewer).toContain("Context Analyzer")
+  })
+
+  test("deduplicates artifact-backed causal payloads by hash", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-causal-trace-dedupe-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "causal-dedupe.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const repeated = "same-large-observation:" + "x".repeat(6000)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.observation({ source: "mcp", category: "repo_fact", summary: ${JSON.stringify(repeated)}, data: { payload: ${JSON.stringify(repeated)} } })`,
+        `CaseTrace.observation({ source: "mcp", category: "repo_fact", summary: ${JSON.stringify(repeated)}, data: { payload: ${JSON.stringify(repeated)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "causal-dedupe-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const causal = JSON.parse(await fs.readFile(path.join(dir, "causal-dedupe-case", "causal-trace.json"), "utf8")) as any
+    const samePayloadArtifacts = causal.artifacts.filter((artifact: any) => artifact.label === "observation.data")
+
+    expect(samePayloadArtifacts).toHaveLength(1)
+    expect(samePayloadArtifacts[0].occurrences).toBe(2)
+    expect(samePayloadArtifacts[0].path).toMatch(/^artifacts\/sha256\//)
+  })
+
+  test("finalizes causal trace v2 bundle when a traced process receives SIGINT", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-causal-trace-sigint-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "causal-sigint.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "long running" } })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "causal-sigint-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    await Bun.sleep(300)
+    proc.kill("SIGINT")
+    await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    const caseDir = path.join(dir, "causal-sigint-case")
+    expect(await exists(path.join(caseDir, "manifest.json"))).toBe(true)
+    expect(await exists(path.join(caseDir, "causal-trace.json"))).toBe(true)
+    expect(await exists(path.join(caseDir, "viewer.html"))).toBe(true)
+    expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
+
+    const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
+    const causal = JSON.parse(await fs.readFile(path.join(caseDir, "causal-trace.json"), "utf8")) as any
+
+    expect(manifest.status).toBe("cancelled")
+    expect(manifest.result.reason).toBe("SIGINT")
+    expect(causal.manifest.status).toBe("cancelled")
+  })
+
+  test("records observation and compaction nodes for causal analysis", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-causal-trace-semantics-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "causal-semantics.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const previousSummary = "Previous summary with pricing facts " + "x".repeat(3000)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const compaction = CaseTrace.compaction({ trigger: "overflow", provider_id: "deepseek", model_id: "unit-test", input_tokens: 21000, context_limit: 20000, selected_head_messages: 8, selected_tail_messages: 2, hidden_compaction_messages: 1, previous_summary: ${JSON.stringify(previousSummary)}, serialized_tail: "tail message", output_summary: "pricing facts preserved", auto_continue: true })`,
+        `const obs = CaseTrace.observation({ source: "compaction", category: "preserved_fact", summary: "pricing fact preserved after compaction", data: { fact: "pricing owns discounts" }, evidence_refs: compaction ? ["compaction:" + compaction.node_id] : [] })`,
+        `CaseTrace.finalEvidence({ claim: "Pricing owns discounts.", evidence_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "causal-semantics-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "96",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const causal = JSON.parse(await fs.readFile(path.join(dir, "causal-semantics-case", "causal-trace.json"), "utf8")) as any
+    const compaction = causal.nodes.find((node: any) => node.kind === "context.compaction")
+    const observation = causal.nodes.find((node: any) => node.kind === "observation")
+
+    expect(compaction).toBeTruthy()
+    expect(compaction.data.trigger).toBe("overflow")
+    expect(compaction.data.auto_continue).toBe(true)
+    expect(compaction.data.previous_summary.artifact_id).toBeTruthy()
+    expect(observation.data.source).toBe("compaction")
+    expect(causal.edges.some((edge: any) => edge.relation === "compaction_to_observation")).toBe(true)
+    expect(causal.edges.some((edge: any) => edge.relation === "observation_to_claim")).toBe(true)
+  })
+
   test("finalizes trace.json and trace.html when a traced process exits", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

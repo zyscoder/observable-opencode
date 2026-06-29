@@ -530,6 +530,25 @@ export const layer: Layer.Layer<
       })
 
       if (result === "compact") {
+        CaseTrace.compaction({
+          trigger: input.overflow ? "overflow" : input.auto ? "auto" : "manual",
+          provider_id: model.providerID,
+          model_id: model.id,
+          context_limit: model.limit.context,
+          selected_head_messages: selected.head.length,
+          selected_tail_messages: selected.tail.length,
+          hidden_compaction_messages: hidden.size,
+          previous_summary: previousSummary,
+          serialized_tail: tail,
+          result: "compact",
+          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          metadata: {
+            sessionID: input.sessionID,
+            parentID: input.parentID,
+            auto: input.auto,
+            overflow: input.overflow,
+          },
+        })
         processor.message.error = new MessageV2.ContextOverflowError({
           message: replay
             ? "Conversation history too large to compact - exceeds model context limit"
@@ -622,7 +641,29 @@ export const layer: Layer.Layer<
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (processor.message.error) {
+        CaseTrace.compaction({
+          trigger: input.overflow ? "overflow" : input.auto ? "auto" : "manual",
+          provider_id: model.providerID,
+          model_id: model.id,
+          context_limit: model.limit.context,
+          selected_head_messages: selected.head.length,
+          selected_tail_messages: selected.tail.length,
+          hidden_compaction_messages: hidden.size,
+          previous_summary: previousSummary,
+          serialized_tail: tail,
+          result: "error",
+          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          metadata: {
+            sessionID: input.sessionID,
+            parentID: input.parentID,
+            auto: input.auto,
+            overflow: input.overflow,
+            error: processor.message.error,
+          },
+        })
+        return "stop"
+      }
       if (result === "continue") {
         const summary = summaryText(
           (yield* session.messages({ sessionID: input.sessionID })).find((item) => item.info.id === msg.id) ?? {
@@ -648,6 +689,46 @@ export const layer: Layer.Layer<
             to: { type: "final_response_evidence", id: evidence.claim_id },
             relation: "context_to_compaction_summary",
             label: "Compaction output produced from selected context",
+          })
+        }
+        const compactionNode = CaseTrace.compaction({
+          trigger: input.overflow ? "overflow" : input.auto ? "auto" : "manual",
+          provider_id: model.providerID,
+          model_id: model.id,
+          context_limit: model.limit.context,
+          selected_head_messages: selected.head.length,
+          selected_tail_messages: selected.tail.length,
+          hidden_compaction_messages: hidden.size,
+          previous_summary: previousSummary,
+          serialized_tail: tail,
+          output_summary: summary,
+          auto_continue: input.auto,
+          result,
+          evidence_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          metadata: {
+            sessionID: input.sessionID,
+            parentID: input.parentID,
+            auto: input.auto,
+            overflow: input.overflow,
+            plugin_context_count: compacting.context.length,
+            plugin_replaced_prompt: Boolean(compacting.prompt),
+          },
+        })
+        if (summary) {
+          CaseTrace.observation({
+            source: "compaction",
+            category: "summary",
+            summary,
+            data: {
+              summary,
+              previous_summary: previousSummary,
+              serialized_tail: tail,
+            },
+            evidence_refs: compactionNode ? [`compaction:${compactionNode.node_id}`] : undefined,
+            metadata: {
+              sessionID: input.sessionID,
+              parentID: input.parentID,
+            },
           })
         }
         if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {

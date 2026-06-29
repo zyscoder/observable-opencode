@@ -150,6 +150,21 @@ function semanticToolResult(input: {
         label: "Tool output recorded as verification evidence",
       })
     }
+    CaseTrace.observation({
+      source: input.id,
+      category: isVerificationCommand(command) ? "verification_output" : "command_output",
+      summary: input.result.title,
+      data: {
+        command,
+        cwd: stringValue(input.args, "workdir"),
+        exit_code: exitCode,
+        output: objectValue(input.result.metadata, "output") ?? input.result.output,
+        stderr: objectValue(input.result.metadata, "stderr"),
+        metadata: input.result.metadata,
+      },
+      span_id: input.spanID,
+      evidence_refs: verification ? [`verification:${verification.verification_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
+    })
   }
 
   if (input.id === "edit" || diff || filediff) {
@@ -175,6 +190,31 @@ function semanticToolResult(input: {
         label: "Tool result changed repository files",
       })
     }
+    CaseTrace.observation({
+      source: input.id,
+      category: "repository_change",
+      summary: input.result.title,
+      data: {
+        files,
+        diff: diff ?? (typeof filediff === "object" && filediff ? stringValue(filediff, "patch") : undefined),
+        metadata: input.result.metadata,
+      },
+      span_id: input.spanID,
+      evidence_refs: change ? [`change:${change.change_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
+    })
+  } else if (!command) {
+    CaseTrace.observation({
+      source: input.id,
+      category: "tool_output",
+      summary: input.result.title,
+      data: {
+        args: input.args,
+        output: input.result.output,
+        metadata: input.result.metadata,
+      },
+      span_id: input.spanID,
+      evidence_refs: input.spanID ? [`span:${input.spanID}`] : undefined,
+    })
   }
 }
 

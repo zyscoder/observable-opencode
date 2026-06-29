@@ -2,6 +2,7 @@ import crypto from "crypto"
 import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
+import { renderCausalTraceHtml } from "./causal-trace-viewer"
 import { renderCaseTraceHtml } from "./case-trace-html"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
@@ -40,6 +41,8 @@ export type TraceArtifact = {
   hash: string
   preview: string
   created_at: string
+  dedupe_key?: string
+  occurrences?: number
 }
 
 export type TraceTokenUsage = {
@@ -205,6 +208,92 @@ export type TraceDesignRecord = {
   metadata?: Record<string, unknown>
 }
 
+export type CausalNodeKind =
+  | "run.start"
+  | "task.loop"
+  | "context.pack"
+  | "context.compaction"
+  | "llm.call"
+  | "tool.call"
+  | "mcp.call"
+  | "skill.load"
+  | "subagent.call"
+  | "observation"
+  | "change"
+  | "verification"
+  | "final.claim"
+  | "runtime.event"
+
+export type CausalNode = {
+  node_id: string
+  kind: CausalNodeKind | string
+  component?: TraceComponent
+  span_id?: string
+  timestamp: string
+  time_ms: number
+  title?: string
+  status?: TraceStatus | TraceVerificationRecord["status"]
+  data?: Record<string, unknown>
+  evidence_refs?: string[]
+  artifact_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type CausalEdge = {
+  edge_id: string
+  from: TraceRef
+  to: TraceRef
+  relation: string
+  label?: string
+  metadata?: Record<string, unknown>
+}
+
+export type TraceManifest = {
+  trace_version: "2.0"
+  case_id: string
+  run_id: string
+  session_id?: string
+  started_at: string
+  ended_at?: string
+  duration_ms: number
+  status: TraceStatus
+  input?: Record<string, unknown>
+  environment: Record<string, unknown>
+  token_usage: TraceTokenUsage
+  result?: Record<string, unknown>
+  files: {
+    causal_trace: string
+    records: string
+    raw_events: string
+    viewer: string
+    partial_latest: string
+  }
+}
+
+export type DiagnosticHint = {
+  hint_id: string
+  category: string
+  message: string
+  evidence_refs?: string[]
+}
+
+export type CausalTraceSummary = {
+  trace_version: "2.0"
+  manifest: TraceManifest
+  nodes: CausalNode[]
+  edges: CausalEdge[]
+  artifacts: TraceArtifact[]
+  metrics: {
+    spans: number
+    events: number
+    nodes: number
+    edges: number
+    artifacts: number
+    token_usage: TraceTokenUsage
+  }
+  diagnostics_hints: DiagnosticHint[]
+}
+
 export type TraceSummary = {
   trace_version: "1.0" | "1.1" | "1.2"
   case_id: string
@@ -333,6 +422,46 @@ type DesignRecordInput = Omit<
   tradeoffs?: unknown
   risks?: unknown
   test_strategy?: unknown
+}
+
+type CausalNodeInput = Omit<CausalNode, "node_id" | "timestamp" | "time_ms" | "data" | "artifact_refs"> & {
+  node_id?: string
+  data?: Record<string, unknown>
+}
+
+type CausalEdgeInput = Omit<CausalEdge, "edge_id"> & {
+  edge_id?: string
+}
+
+type ObservationInput = {
+  source: string
+  category?: string
+  summary: unknown
+  data?: unknown
+  span_id?: string
+  evidence_refs?: string[]
+  confidence?: "low" | "medium" | "high" | string
+  metadata?: Record<string, unknown>
+}
+
+type CompactionRecordInput = {
+  trigger: "manual" | "auto" | "overflow" | string
+  provider_id?: string
+  model_id?: string
+  input_tokens?: number
+  context_limit?: number
+  reserved_output_tokens?: number
+  selected_head_messages?: number
+  selected_tail_messages?: number
+  hidden_compaction_messages?: number
+  previous_summary?: unknown
+  serialized_tail?: unknown
+  output_summary?: unknown
+  auto_continue?: boolean
+  result?: string
+  span_id?: string
+  evidence_refs?: string[]
+  metadata?: Record<string, unknown>
 }
 
 export type ActiveSpan = {
@@ -500,9 +629,8 @@ function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }
     .filter(Boolean)
     .join("\n")
   const failures: TraceParsedFailure[] = []
-
   const expectedCandidates = text
-    .split(/\r?\n/)
+    .split(/\r?\n|\\n/)
     .map((line, index) => {
       if (line.includes("${")) return undefined
       const expected = line.match(/^\s*(?:(?:[A-Za-z]*Error):\s*)?expected\s+([^,\n]+),\s*got\s+([^\n]+)\s*$/i)
@@ -612,8 +740,15 @@ class ActiveCaseTrace {
   readonly caseDir: string
   readonly artifactDir: string
   readonly eventsFile: string
+  readonly rawEventsFile: string
+  readonly recordsFile: string
   readonly traceFile: string
   readonly htmlFile: string
+  readonly manifestFile: string
+  readonly causalTraceFile: string
+  readonly viewerFile: string
+  readonly partialDir: string
+  readonly partialFile: string
   readonly startedAt = Date.now()
   readonly startedIso = nowIso()
   private sequence = 0
@@ -624,8 +759,13 @@ class ActiveCaseTrace {
   private result: Record<string, unknown> | undefined
   private environment: Record<string, unknown>
   private spans = new Map<string, TraceSpan>()
+  private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
   private artifacts: TraceArtifact[] = []
+  private artifactByDedupeKey = new Map<string, TraceArtifact>()
+  private causalNodes: CausalNode[] = []
+  private causalEdges: CausalEdge[] = []
+  private diagnosticHints: DiagnosticHint[] = []
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
@@ -643,6 +783,7 @@ class ActiveCaseTrace {
   private recentToolSpanIDs: string[] = []
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
+  private nextPartialWrite = 0
 
   constructor(config: CaseTraceConfig) {
     this.caseID = safeCaseID(config.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
@@ -650,8 +791,15 @@ class ActiveCaseTrace {
     this.caseDir = path.join(this.rootDir, this.caseID)
     this.artifactDir = path.join(this.caseDir, "artifacts")
     this.eventsFile = path.join(this.caseDir, "events.jsonl")
+    this.rawEventsFile = path.join(this.caseDir, "raw-events.jsonl")
+    this.recordsFile = path.join(this.caseDir, "records.jsonl")
     this.traceFile = path.join(this.caseDir, "trace.json")
     this.htmlFile = path.join(this.caseDir, "trace.html")
+    this.manifestFile = path.join(this.caseDir, "manifest.json")
+    this.causalTraceFile = path.join(this.caseDir, "causal-trace.json")
+    this.viewerFile = path.join(this.caseDir, "viewer.html")
+    this.partialDir = path.join(this.caseDir, "partial")
+    this.partialFile = path.join(this.partialDir, "latest.json")
     this.input = config.input
     this.environment = {
       cwd: process.cwd(),
@@ -705,6 +853,22 @@ class ActiveCaseTrace {
     this.spans.set(id, span)
     if (["tool", "skill", "task", "mcp"].includes(input.component)) this.remember(this.recentToolSpanIDs, id)
     this.write("span.start", span)
+    const nodeKind = this.nodeKindForSpan(input.component)
+    if (nodeKind) {
+      const node = this.node({
+        kind: nodeKind,
+        component: input.component,
+        span_id: id,
+        title: input.name ?? input.operation,
+        status: "running",
+        data: {
+          operation: input.operation,
+          input: input.input,
+        },
+        metadata: input.metadata,
+      })
+      this.spanNodeIDs.set(id, node.node_id)
+    }
     let ended = false
     return {
       id,
@@ -750,6 +914,22 @@ class ActiveCaseTrace {
       this.errors.push(error)
     }
     this.write("span.end", span)
+    const nodeID = this.spanNodeIDs.get(id)
+    if (nodeID) {
+      const node = this.causalNodes.find((item) => item.node_id === nodeID)
+      if (node) {
+        node.status = span.status
+        node.data = {
+          ...(node.data ?? {}),
+          duration_ms: span.duration_ms,
+          output: input?.output === undefined ? node.data?.output : this.summarizeCausalValue(input.output, `${span.component}.${span.operation}.output`),
+          token_usage: usage,
+          error: error,
+        }
+        this.writeRecord("node.update", node)
+        this.writePartial()
+      }
+    }
   }
 
   event(input: TraceEventInput) {
@@ -768,6 +948,14 @@ class ActiveCaseTrace {
     }
     this.events.push(event)
     this.write("event", event)
+    if (input.component === "runtime" || input.component === "prompt") {
+      this.node({
+        kind: "runtime.event",
+        component: input.component,
+        title: input.event_type,
+        data: input.data === undefined ? undefined : { payload: input.data },
+      })
+    }
   }
 
   usage(input: unknown, spanID?: string) {
@@ -805,6 +993,36 @@ class ActiveCaseTrace {
     this.contextSnapshots.push(snapshot)
     this.remember(this.recentContextSnapshotIDs, snapshot.snapshot_id)
     this.write("semantic.context_snapshot", snapshot)
+    const node = this.node({
+      node_id: `ctxnode_${snapshot.snapshot_id}`,
+      kind: "context.pack",
+      component: "context",
+      span_id: input.span_id,
+      title: `${input.agent ?? "agent"} context package`,
+      data: {
+        snapshot_id: snapshot.snapshot_id,
+        phase: input.phase,
+        provider_id: input.provider_id,
+        model_id: input.model_id,
+        agent: input.agent,
+        message_count: input.message_count,
+        system_count: input.system_count,
+        tool_count: input.tool_count,
+        token_estimate: input.token_estimate,
+        messages: input.messages,
+        system: input.system,
+        tools: input.tools,
+        metadata: input.metadata,
+      },
+    })
+    if (input.span_id) {
+      this.causalEdge({
+        from: { type: "node", id: node.node_id, label: "context.pack" },
+        to: { type: "span", id: input.span_id, label: "llm.call" },
+        relation: input.phase === "compaction" ? "compaction_to_context" : "context_to_llm",
+        label: "Context package prepared for model call",
+      })
+    }
     return snapshot
   }
 
@@ -838,6 +1056,13 @@ class ActiveCaseTrace {
     }
     this.semanticEdges.push(edge)
     this.write("semantic.edge", edge)
+    this.causalEdge({
+      from: input.from,
+      to: input.to,
+      relation: input.relation,
+      label: input.label,
+      metadata: input.metadata,
+    })
     return edge
   }
 
@@ -863,6 +1088,25 @@ class ActiveCaseTrace {
     this.verificationRecords.push(verification)
     this.remember(this.recentVerificationIDs, verification.verification_id)
     this.write("semantic.verification", verification)
+    this.node({
+      node_id: `vernode_${verification.verification_id}`,
+      kind: "verification",
+      component: "tool",
+      span_id: input.span_id,
+      title: input.command ?? input.purpose ?? "verification",
+      status: verification.status,
+      data: {
+        verification_id: verification.verification_id,
+        command: input.command,
+        cwd: input.cwd,
+        purpose: input.purpose,
+        stage: verification.stage,
+        exit_code: verification.exit_code,
+        parsed_failures: verification.parsed_failures,
+        stdout: input.stdout,
+        stderr: input.stderr,
+      },
+    })
     if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
     if (verification.status === "passed" && this.recentChangeID) {
       this.edge({
@@ -893,6 +1137,23 @@ class ActiveCaseTrace {
     this.changeRecords.push(change)
     this.remember(this.recentChangeIDs, change.change_id)
     this.write("semantic.change", change)
+    this.node({
+      node_id: `chgnode_${change.change_id}`,
+      kind: "change",
+      component: "tool",
+      span_id: input.span_id,
+      title: input.intent ?? "repository change",
+      data: {
+        change_id: change.change_id,
+        files: input.files,
+        intent: input.intent,
+        diff: input.diff,
+        evidence_refs: evidenceRefs,
+        verification_refs: input.verification_refs,
+        metadata: input.metadata,
+      },
+      evidence_refs: evidenceRefs,
+    })
     this.recentChangeID = change.change_id
     if (this.recentFailedVerificationID) {
       this.edge({
@@ -931,6 +1192,23 @@ class ActiveCaseTrace {
     }
     this.finalResponseEvidence.push(evidence)
     this.write("semantic.final_response_evidence", evidence)
+    const claim = this.node({
+      node_id: `claimnode_${evidence.claim_id}`,
+      kind: "final.claim",
+      component: "result",
+      title: `Final claim ${this.finalResponseEvidence.length}`,
+      data: {
+        claim_id: evidence.claim_id,
+        response_artifact: input.response_artifact,
+        claim: input.claim,
+        confidence: input.confidence,
+        metadata: input.metadata,
+      },
+      evidence_refs: evidenceRefs,
+    })
+    for (const ref of evidenceRefs ?? []) {
+      this.linkEvidenceToClaim(ref, claim.node_id)
+    }
     return evidence
   }
 
@@ -955,6 +1233,114 @@ class ActiveCaseTrace {
     return design
   }
 
+  node(input: CausalNodeInput) {
+    const node: CausalNode = {
+      node_id: input.node_id ?? semanticID("node", this.causalNodes.length + 1),
+      kind: input.kind,
+      component: input.component,
+      span_id: input.span_id,
+      timestamp: nowIso(),
+      time_ms: Math.max(0, Date.now() - this.startedAt),
+      title: input.title,
+      status: input.status,
+      data: input.data === undefined ? undefined : this.summarizeCausalObject(input.data, `${input.kind}.data`),
+      evidence_refs: input.evidence_refs,
+      artifact_refs: [],
+      metadata: input.metadata,
+    }
+    node.artifact_refs = this.collectArtifactRefs(node.data)
+    this.causalNodes.push(node)
+    this.writeRecord("node", node)
+    this.writePartial()
+    return node
+  }
+
+  causalEdge(input: CausalEdgeInput) {
+    const edge: CausalEdge = {
+      edge_id: input.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
+      from: input.from,
+      to: input.to,
+      relation: input.relation,
+      label: input.label,
+      metadata: input.metadata,
+    }
+    this.causalEdges.push(edge)
+    this.writeRecord("edge", edge)
+    this.writePartial()
+    return edge
+  }
+
+  observation(input: ObservationInput) {
+    const node = this.node({
+      kind: "observation",
+      component: this.componentForObservationSource(input.source),
+      span_id: input.span_id,
+      title: input.category ?? input.source,
+      status: "success",
+      data: {
+        source: input.source,
+        category: input.category,
+        summary: input.summary,
+        data: input.data,
+        confidence: input.confidence,
+        metadata: input.metadata,
+      },
+      evidence_refs: input.evidence_refs,
+      metadata: input.metadata,
+    })
+    for (const ref of input.evidence_refs ?? []) {
+      const parsed = this.parseEvidenceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "node", id: node.node_id, label: "observation" },
+        relation: parsed.type === "compaction" || parsed.id.startsWith("compaction") ? "compaction_to_observation" : "evidence_to_observation",
+        label: "Observation derived from evidence",
+      })
+    }
+    return node
+  }
+
+  compaction(input: CompactionRecordInput) {
+    const node = this.node({
+      kind: "context.compaction",
+      component: "context",
+      span_id: input.span_id,
+      title: `${input.trigger} compaction`,
+      status: input.result === "error" ? "error" : "success",
+      data: {
+        trigger: input.trigger,
+        provider_id: input.provider_id,
+        model_id: input.model_id,
+        input_tokens: input.input_tokens,
+        context_limit: input.context_limit,
+        reserved_output_tokens: input.reserved_output_tokens,
+        selected_head_messages: input.selected_head_messages,
+        selected_tail_messages: input.selected_tail_messages,
+        hidden_compaction_messages: input.hidden_compaction_messages,
+        previous_summary: input.previous_summary,
+        serialized_tail: input.serialized_tail,
+        output_summary: input.output_summary,
+        auto_continue: input.auto_continue,
+        result: input.result,
+        metadata: input.metadata,
+      },
+      evidence_refs: input.evidence_refs,
+      metadata: input.metadata,
+    })
+    for (const ref of input.evidence_refs ?? []) {
+      const parsed = this.parseEvidenceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "compaction", id: node.node_id, label: "context.compaction" },
+        relation: "evidence_to_compaction",
+        label: "Compaction used prior evidence",
+      })
+    }
+    return node
+  }
+
   currentEvidenceRefs() {
     return [
       ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
@@ -972,7 +1358,13 @@ class ActiveCaseTrace {
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
     const summary = this.summary(input?.status ?? (error ? "error" : "success"))
+    const causal = this.causalSummary(summary.status)
     this.write("trace.finish", summary)
+    this.writeRecord("finish", causal.manifest)
+    this.safeWrite(this.manifestFile, jsonPretty(causal.manifest))
+    this.safeWrite(this.causalTraceFile, jsonPretty(causal))
+    this.writePartial(true, causal)
+    this.safeWrite(this.viewerFile, renderCausalTraceHtml(causal))
     this.safeWrite(this.traceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderCaseTraceHtml(summary, { artifactDir: this.caseDir }))
   }
@@ -1004,6 +1396,51 @@ class ActiveCaseTrace {
       constraint_records: this.constraintRecords,
       final_response_evidence: this.finalResponseEvidence,
       design_records: this.designRecords,
+    }
+  }
+
+  private manifest(status: TraceStatus): TraceManifest {
+    const ended = Date.now()
+    return {
+      trace_version: "2.0",
+      case_id: this.caseID,
+      run_id: this.runID,
+      session_id: this.sessionID,
+      started_at: this.startedIso,
+      ended_at: new Date(ended).toISOString(),
+      duration_ms: Math.max(0, ended - this.startedAt),
+      status,
+      input: this.input,
+      environment: this.environment,
+      token_usage: this.tokenUsage,
+      result: this.result,
+      files: {
+        causal_trace: "causal-trace.json",
+        records: "records.jsonl",
+        raw_events: "raw-events.jsonl",
+        viewer: "viewer.html",
+        partial_latest: "partial/latest.json",
+      },
+    }
+  }
+
+  private causalSummary(status: TraceStatus): CausalTraceSummary {
+    const manifest = this.manifest(status)
+    return {
+      trace_version: "2.0",
+      manifest,
+      nodes: this.causalNodes,
+      edges: this.causalEdges,
+      artifacts: this.artifacts,
+      metrics: {
+        spans: this.spans.size,
+        events: this.events.length,
+        nodes: this.causalNodes.length,
+        edges: this.causalEdges.length,
+        artifacts: this.artifacts.length,
+        token_usage: this.tokenUsage,
+      },
+      diagnostics_hints: this.diagnosticHints,
     }
   }
 
@@ -1046,6 +1483,56 @@ class ActiveCaseTrace {
     if (input === undefined) return undefined
     if (input === null || typeof input !== "object") return this.summarizeText(input, label)
     return this.summarizeJson(input, label)
+  }
+
+  private summarizeCausalObject(input: Record<string, unknown>, label: string): Record<string, unknown> {
+    const output: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(input)) {
+      output[key] = this.summarizeCausalValue(value, `${label}.${key}`)
+    }
+    return output
+  }
+
+  private summarizeCausalValue(input: unknown, label: string): unknown {
+    if (input === undefined) return undefined
+    if (input === null) return null
+    if (typeof input === "string") {
+      return input.length > maxFieldLength() ? this.summarizeText(input, this.causalArtifactLabel(label)) : input
+    }
+    if (typeof input === "number" || typeof input === "boolean") return input
+    if (Array.isArray(input)) {
+      const serialized = json(input)
+      if (serialized.length > maxFieldLength()) return this.summarizeJson(input, this.causalArtifactLabel(label))
+      return input.map((item, index) => this.summarizeCausalValue(item, `${label}.${index}`))
+    }
+    if (typeof input === "object") {
+      const serialized = json(input)
+      if (serialized.length > maxFieldLength()) return this.summarizeJson(input, this.causalArtifactLabel(label))
+      return this.summarizeCausalObject(input as Record<string, unknown>, label)
+    }
+    return String(input)
+  }
+
+  private causalArtifactLabel(label: string) {
+    if (/observation\.data\.summary$/.test(label) || /observation\.summary/.test(label)) return "observation.summary"
+    if (/observation\.data/.test(label)) return "observation.data"
+    if (/context\.compaction.*previous_summary/.test(label)) return "compaction.previous_summary"
+    if (/context\.compaction.*serialized_tail/.test(label)) return "compaction.serialized_tail"
+    if (/context\.compaction.*output_summary/.test(label)) return "compaction.output_summary"
+    if (/context\.pack/.test(label)) return "context.pack"
+    return label.replace(/\.data\./, ".")
+  }
+
+  private collectArtifactRefs(input: unknown): string[] {
+    const refs = new Set<string>()
+    const visit = (value: unknown) => {
+      if (!value || typeof value !== "object") return
+      const summary = value as Partial<TraceFieldSummary>
+      if (typeof summary.artifact_id === "string") refs.add(summary.artifact_id)
+      for (const child of Object.values(value as Record<string, unknown>)) visit(child)
+    }
+    visit(input)
+    return [...refs]
   }
 
   private normalizeEvidenceRefs(input: string[] | undefined) {
@@ -1096,26 +1583,85 @@ class ActiveCaseTrace {
     }
   }
 
+  private nodeKindForSpan(component: TraceComponent): CausalNodeKind | undefined {
+    if (component === "llm") return "llm.call"
+    if (component === "tool") return "tool.call"
+    if (component === "mcp") return "mcp.call"
+    if (component === "skill") return "skill.load"
+    if (component === "task") return "subagent.call"
+    if (component === "runtime" || component === "prompt" || component === "processor") return "task.loop"
+    return undefined
+  }
+
+  private componentForObservationSource(source: string): TraceComponent {
+    if (/mcp/i.test(source)) return "mcp"
+    if (/skill/i.test(source)) return "skill"
+    if (/task|subagent/i.test(source)) return "task"
+    if (/compaction|context/i.test(source)) return "context"
+    if (/verification|change|tool|file|grep|bash|read|edit/i.test(source)) return "tool"
+    return "result"
+  }
+
+  private parseEvidenceRef(ref: string): TraceRef | undefined {
+    const index = ref.indexOf(":")
+    if (index === -1) return undefined
+    return {
+      type: ref.slice(0, index),
+      id: ref.slice(index + 1),
+    }
+  }
+
+  private linkEvidenceToClaim(ref: string, claimNodeID: string) {
+    const parsed = this.parseEvidenceRef(ref)
+    if (!parsed) return
+    let relation = "evidence_to_claim"
+    if (parsed.type === "observation") relation = "observation_to_claim"
+    else if (parsed.type === "verification") relation = "verification_to_claim"
+    else if (parsed.type === "change") relation = "change_to_claim"
+    else if (parsed.type === "context_snapshot" || parsed.type === "context") relation = "context_to_claim"
+    else if (parsed.type === "tool_span" || parsed.type === "span") relation = "tool_to_claim"
+    this.causalEdge({
+      from: parsed,
+      to: { type: "node", id: claimNodeID, label: "final.claim" },
+      relation,
+      label: "Final claim referenced this evidence",
+    })
+  }
+
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
-    const artifactID = `artifact_${++this.artifactSequence}_${crypto.randomUUID().slice(0, 8)}`
+    const redacted = redactText(content)
+    const contentHash = hash(redacted)
+    const dedupeKey = `${kind}:${contentHash}`
+    const existing = this.artifactByDedupeKey.get(dedupeKey)
+    if (existing) {
+      existing.occurrences = (existing.occurrences ?? 1) + 1
+      this.writeRecord("artifact.reuse", existing)
+      this.writePartial()
+      return existing
+    }
+    const artifactID = `artifact_${++this.artifactSequence}_${contentHash}`
     const safeLabel = (label || kind).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80)
-    const filename = `${artifactID}_${safeLabel}.${kind === "json" ? "json" : "txt"}`
-    const relativePath = `artifacts/${filename}`
+    const filename = `${contentHash}_${safeLabel}.${kind === "json" ? "json" : "txt"}`
+    const relativePath = `artifacts/sha256/${filename}`
     const artifact: TraceArtifact = {
       artifact_id: artifactID,
       kind,
       label,
       path: relativePath,
-      length: content.length,
-      hash: hash(content),
-      preview: content.slice(0, maxFieldLength()),
+      length: redacted.length,
+      hash: contentHash,
+      preview: redacted.slice(0, maxFieldLength()),
       created_at: nowIso(),
+      dedupe_key: dedupeKey,
+      occurrences: 1,
     }
     this.artifacts.push(artifact)
+    this.artifactByDedupeKey.set(dedupeKey, artifact)
     try {
-      fs.mkdirSync(this.artifactDir, { recursive: true })
-      fs.writeFileSync(path.join(this.caseDir, relativePath), content)
+      fs.mkdirSync(path.dirname(path.join(this.caseDir, relativePath)), { recursive: true })
+      fs.writeFileSync(path.join(this.caseDir, relativePath), redacted)
       this.write("artifact.write", artifact)
+      this.writeRecord("artifact", artifact)
     } catch {}
     return artifact
   }
@@ -1123,7 +1669,10 @@ class ActiveCaseTrace {
   private open() {
     try {
       fs.mkdirSync(this.caseDir, { recursive: true })
+      fs.mkdirSync(this.partialDir, { recursive: true })
       fs.writeFileSync(this.eventsFile, "")
+      fs.writeFileSync(this.rawEventsFile, "")
+      fs.writeFileSync(this.recordsFile, "")
       this.write("trace.start", {
         trace_version: "1.2",
         case_id: this.caseID,
@@ -1134,6 +1683,19 @@ class ActiveCaseTrace {
         input: this.input,
         environment: this.environment,
       })
+      this.node({
+        kind: "run.start",
+        component: "run",
+        title: this.caseID,
+        status: "running",
+        data: {
+          case_id: this.caseID,
+          run_id: this.runID,
+          input: this.input,
+          environment: this.environment,
+        },
+      })
+      this.writePartial(true)
     } catch {
       this.writable = false
     }
@@ -1151,7 +1713,38 @@ class ActiveCaseTrace {
           data,
         }) + "\n",
       )
+      fs.appendFileSync(
+        this.rawEventsFile,
+        json({
+          time: nowIso(),
+          type,
+          data,
+        }) + "\n",
+      )
     } catch {}
+  }
+
+  private writeRecord(recordType: string, data: unknown) {
+    if (!this.writable) return
+    try {
+      fs.appendFileSync(
+        this.recordsFile,
+        json({
+          time: nowIso(),
+          record_type: recordType,
+          data,
+        }) + "\n",
+      )
+    } catch {}
+  }
+
+  private writePartial(force = false, summary?: CausalTraceSummary) {
+    if (!this.writable) return
+    const now = Date.now()
+    const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
+    if (!force && now < this.nextPartialWrite) return
+    this.nextPartialWrite = now + interval
+    this.safeWrite(this.partialFile, jsonPretty(summary ?? this.causalSummary("running")))
   }
 
   private safeWrite(target: string, content: string) {
@@ -1204,11 +1797,52 @@ function finishActiveFromProcessExit(code: number | undefined) {
   active = false
 }
 
+function finishActiveFromSignal(signal: NodeJS.Signals) {
+  const current = active || undefined
+  if (!current) return
+  current.finish({
+    status: "cancelled",
+    result: {
+      reason: signal,
+      signal,
+    },
+  })
+  active = false
+}
+
+function finishActiveFromError(reason: string, error: unknown) {
+  const current = active || undefined
+  if (!current) return
+  current.finish({
+    status: "error",
+    error,
+    result: {
+      reason,
+    },
+  })
+  active = false
+}
+
 function installProcessFinalizer() {
   if (processFinalizerInstalled) return
   processFinalizerInstalled = true
   process.once("beforeExit", (code) => finishActiveFromProcessExit(code))
   process.once("exit", (code) => finishActiveFromProcessExit(code))
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
+    process.once(signal, () => {
+      finishActiveFromSignal(signal)
+      const code = signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129
+      process.exit(code)
+    })
+  }
+  process.once("uncaughtException", (error) => {
+    finishActiveFromError("uncaughtException", error)
+    process.exit(1)
+  })
+  process.once("unhandledRejection", (error) => {
+    finishActiveFromError("unhandledRejection", error)
+    process.exit(1)
+  })
 }
 
 export namespace CaseTrace {
@@ -1280,6 +1914,22 @@ export namespace CaseTrace {
 
   export function designRecord(input: DesignRecordInput) {
     return get()?.designRecord(input)
+  }
+
+  export function node(input: CausalNodeInput) {
+    return get()?.node(input)
+  }
+
+  export function causalEdge(input: CausalEdgeInput) {
+    return get()?.causalEdge(input)
+  }
+
+  export function observation(input: ObservationInput) {
+    return get()?.observation(input)
+  }
+
+  export function compaction(input: CompactionRecordInput) {
+    return get()?.compaction(input)
   }
 
   export function currentEvidenceRefs() {

@@ -260,20 +260,30 @@ export OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH=4096
 ```text
 $OPENCODE_CASE_TRACE_DIR/
   T1-001/
-    events.jsonl
-    trace.json
-    trace.html
+    manifest.json
+    causal-trace.json
+    records.jsonl
+    raw-events.jsonl
+    viewer.html
+    partial/
+      latest.json
     artifacts/
-      artifact_*.json
-      artifact_*.txt
+      sha256/
+        <hash>_<label>.json
+        <hash>_<label>.txt
 ```
 
 其中：
 
-- `events.jsonl`：运行时增量事件流，即使 case 中途失败也能保留已发生事件。
-- `trace.json`：case 执行结束后的结构化汇总，只保留大文本的摘要、长度、hash、preview 和 artifact 索引，不直接内嵌完整大文本。
-- `artifacts/`：保存超过 preview 阈值的完整语义载荷，例如上下文快照、模型输入、工具结果、压缩前后内容等。
-- `trace.html`：离线可视化报告，包含组件瀑布图、token 汇总、工具调用、错误面板和 Artifacts 面板。生成 HTML 时会把 `artifacts/` 中的完整内容嵌入报告，因此打开单个 `trace.html` 就能展开查看大文本。
+- `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
+- `causal-trace.json`：Causal Trace v2 主文件，包含因果图节点、因果边、artifact 索引、token/耗时等指标和诊断提示。
+- `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
+- `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
+- `partial/latest.json`：运行中快照。长时间运行或收到 `SIGINT/SIGTERM/SIGHUP` 时也能保留可查看状态。
+- `artifacts/sha256/`：按内容 hash 去重保存大文本，例如模型上下文包、MCP 返回、skill 指令、工具输出、压缩前后摘要等。
+- `viewer.html`：离线可视化报告，包含 Causal Graph、Timeline、Evidence Inspector 和 Context Analyzer 四个视图。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
+
+当前实现仍会保留 `events.jsonl`、`trace.json`、`trace.html` 作为兼容副产物；新分析链路应优先使用 `manifest.json`、`causal-trace.json` 和 `viewer.html`。
 
 > 注意：`OPENCODE_CASE_TRACE=1` 会记录用于复盘的语义信息，可能包含私域代码、工具输出和模型上下文。生产或企业内网环境请把 `OPENCODE_CASE_TRACE_DIR` 指向受控目录，并按企业数据策略管理 trace 文件。
 
@@ -318,17 +328,20 @@ done
 结构化检查：
 
 ```bash
-jq '{case_id, status, duration_ms, token_usage, spans: (.spans | length), events: (.events | length), errors: (.errors | length)}' \
-  /data/evo-bench/opencode-traces/T1-001/trace.json
+jq '{case_id, status, duration_ms, token_usage, files}' \
+  /data/evo-bench/opencode-traces/T1-001/manifest.json
+
+jq '{nodes: (.nodes | length), edges: (.edges | length), artifacts: (.artifacts | length), metrics}' \
+  /data/evo-bench/opencode-traces/T1-001/causal-trace.json
 ```
 
 打开可视化报告：
 
 ```bash
-xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
+xdg-open /data/evo-bench/opencode-traces/T1-001/viewer.html
 ```
 
-无 GUI 服务器可以将 `trace.html` 下载到本地浏览器打开。
+无 GUI 服务器可以将整个 `T1-001/` 目录下载到本地，再用浏览器打开 `viewer.html`。由于大文本 artifact 不再默认内嵌进 HTML，单独下载 `viewer.html` 只能看到摘要，无法打开 artifact 链接。
 
 ## 9. Trace 覆盖范围
 

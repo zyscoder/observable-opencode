@@ -216,11 +216,26 @@ function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClie
             timeout,
           },
         )
+        CaseTrace.observation({
+          source: "mcp",
+          category: `${clientName}:${mcpTool.name}`,
+          summary: `MCP tool ${clientName}:${mcpTool.name} returned ${Array.isArray(result.content) ? result.content.length : 0} content item(s).`,
+          data: {
+            server: clientName,
+            tool: mcpTool.name,
+            args,
+            content: result.content,
+            metadata: result.metadata,
+          },
+          span_id: span?.id,
+          evidence_refs: span ? [`span:${span.id}`] : undefined,
+        })
         span?.end({
           output: {
             server: clientName,
             tool: mcpTool.name,
             content_count: Array.isArray(result.content) ? result.content.length : 0,
+            content: CaseTrace.summarizeJson(result.content),
             metadata: result.metadata,
           },
         })

@@ -206,6 +206,23 @@ export const TaskTool = Tool.define(
                   output: CaseTrace.summarizeText(result.output),
                 },
               })
+              CaseTrace.observation({
+                source: "subagent",
+                category: params.subagent_type,
+                summary: result.output,
+                data: {
+                  description: params.description,
+                  subagent_type: params.subagent_type,
+                  child_session_id: result.metadata.sessionId,
+                  model: result.metadata.model,
+                  output: result.output,
+                },
+                span_id: traceSpan?.id,
+                evidence_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
+                metadata: {
+                  child_session_id: result.metadata.sessionId,
+                },
+              })
             }),
           ),
           Effect.tapError((error) =>

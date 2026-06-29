@@ -96,6 +96,20 @@ export const SkillTool = Tool.define(
               output: CaseTrace.summarizeText(result.output),
             },
           })
+          CaseTrace.observation({
+            source: "skill",
+            category: info.name,
+            summary: `Loaded skill ${info.name}`,
+            data: {
+              name: info.name,
+              dir,
+              content: info.content,
+              sampled_files: files,
+              rendered_output: result.output,
+            },
+            span_id: traceSpan?.id,
+            evidence_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
+          })
           return result
         }).pipe(
           Effect.tapError((error) =>
