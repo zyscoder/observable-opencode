@@ -21,6 +21,7 @@ import { serviceUse } from "@/effect/service-use"
 import { SyncEvent } from "@/sync"
 import { SessionEvent } from "@/v2/session-event"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { CaseTrace } from "@/observability/case-trace"
 
 const log = Log.create({ service: "session.compaction" })
 
@@ -433,6 +434,52 @@ export const layer: Layer.Layer<
         stripMedia: true,
         toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
       })
+      const compactionSnapshot = CaseTrace.contextSnapshot({
+        phase: "compaction",
+        provider_id: model.providerID,
+        model_id: model.id,
+        agent: "compaction",
+        message_count: modelMessages.length + 1,
+        system_count: 0,
+        tool_count: 0,
+        messages: [
+          ...modelMessages,
+          {
+            role: "user",
+            content: [{ type: "text", text: nextPrompt }],
+          },
+        ],
+        metadata: {
+          sessionID: input.sessionID,
+          parentID: input.parentID,
+          auto: input.auto,
+          overflow: input.overflow,
+          history_messages: history.length,
+          hidden_compaction_messages: hidden.size,
+          selected_head_messages: selected.head.length,
+          selected_tail_messages: selected.tail.length,
+          plugin_context_count: compacting.context.length,
+          plugin_replaced_prompt: Boolean(compacting.prompt),
+          previous_summary: previousSummary ? CaseTrace.summarizeText(previousSummary) : undefined,
+          serialized_tail: tail ? CaseTrace.summarizeText(tail) : undefined,
+        },
+      })
+      if (compactionSnapshot) {
+        CaseTrace.decision({
+          component: "context",
+          decision_type: "compaction_context_selection",
+          intent: "select conversation history for compaction",
+          chosen_action: "summarize_head_preserve_tail",
+          rationale:
+            "Older conversation history is summarized while selected recent tail is serialized into the compaction prompt.",
+          evidence_refs: [compactionSnapshot.snapshot_id],
+          metadata: {
+            sessionID: input.sessionID,
+            selected_head_messages: selected.head.length,
+            selected_tail_messages: selected.tail.length,
+          },
+        })
+      }
       const ctx = yield* InstanceState.context
       const msg: MessageV2.Assistant = {
         id: MessageID.ascending(),
@@ -583,6 +630,26 @@ export const layer: Layer.Layer<
             parts: [],
           },
         )
+        const evidence = summary
+          ? CaseTrace.finalEvidence({
+              claim: summary,
+              confidence: "medium",
+              evidence_refs: compactionSnapshot ? [compactionSnapshot.snapshot_id] : undefined,
+              metadata: {
+                sessionID: input.sessionID,
+                messageID: msg.id,
+                kind: "compaction_summary",
+              },
+            })
+          : undefined
+        if (evidence && compactionSnapshot) {
+          CaseTrace.edge({
+            from: { type: "context_snapshot", id: compactionSnapshot.snapshot_id },
+            to: { type: "final_response_evidence", id: evidence.claim_id },
+            relation: "context_to_compaction_summary",
+            label: "Compaction output produced from selected context",
+          })
+        }
         if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
           yield* sync.run(SessionEvent.Compaction.Ended.Sync, {
             sessionID: input.sessionID,

@@ -462,6 +462,39 @@ const live: Layer.Layer<
                 tool_choice: input.toolChoice,
               },
             })
+            const contextSnapshot = CaseTrace.contextSnapshot({
+              span_id: span?.id,
+              phase: "llm_request",
+              provider_id: input.model.providerID,
+              model_id: input.model.id,
+              agent: input.agent.name,
+              message_count: input.messages.length,
+              system_count: input.system.length,
+              tool_count: Object.keys(input.tools).length,
+              messages: input.messages,
+              system: input.system,
+              tools: Object.fromEntries(
+                Object.entries(input.tools).map(([name, tool]) => [
+                  name,
+                  {
+                    description: "description" in tool ? tool.description : undefined,
+                    inputSchema: "inputSchema" in tool ? tool.inputSchema : undefined,
+                  },
+                ]),
+              ),
+              metadata: {
+                tool_choice: input.toolChoice,
+                parentSessionID: input.parentSessionID,
+              },
+            })
+            if (span && contextSnapshot) {
+              CaseTrace.edge({
+                from: { type: "context_snapshot", id: contextSnapshot.snapshot_id },
+                to: { type: "span", id: span.id, label: "llm.stream" },
+                relation: "context_to_llm",
+                label: "Final model input prepared before provider stream",
+              })
+            }
             const result = yield* run({ ...input, abort: ctrl.signal })
             const traced = async function* () {
               try {

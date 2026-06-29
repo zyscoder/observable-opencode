@@ -77,6 +77,107 @@ export type InferDef<T> =
       ? Def<P, M>
       : never
 
+function objectValue(input: unknown, key: string) {
+  if (!input || typeof input !== "object") return undefined
+  return (input as Record<string, unknown>)[key]
+}
+
+function stringValue(input: unknown, key: string) {
+  const value = objectValue(input, key)
+  return typeof value === "string" ? value : undefined
+}
+
+function numberValue(input: unknown, key: string) {
+  const value = objectValue(input, key)
+  return typeof value === "number" ? value : undefined
+}
+
+function isVerificationCommand(command: string | undefined) {
+  return Boolean(
+    command &&
+      /\b(test|pytest|jest|vitest|mocha)\b|bun test|npm test|pnpm test|yarn test|go test|cargo test|node .*test|xcodebuild/i.test(
+        command,
+      ),
+  )
+}
+
+function toolIntent(id: string, args: unknown) {
+  const command = stringValue(args, "command")
+  if (id === "read") return "read repository context"
+  if (id === "grep" || id === "glob") return "search repository context"
+  if (id === "edit" || id === "write") return "modify repository files"
+  if (isVerificationCommand(command)) return "run verification command"
+  if (command) return "run shell command"
+  return "execute tool"
+}
+
+function semanticToolResult(input: {
+  id: string
+  args: unknown
+  ctx: Context
+  spanID?: string
+  result: ExecuteResult
+}) {
+  const command = stringValue(input.args, "command")
+  const diff = stringValue(input.result.metadata, "diff")
+  const filediff = objectValue(input.result.metadata, "filediff")
+  const editFile =
+    typeof filediff === "object" && filediff ? stringValue(filediff, "file") : stringValue(input.args, "filePath")
+
+  if (command) {
+    const exitCode = numberValue(input.result.metadata, "exit")
+    const verification = CaseTrace.verification({
+      span_id: input.spanID,
+      tool_call_id: input.ctx.callID,
+      command,
+      cwd: stringValue(input.args, "workdir"),
+      purpose: stringValue(input.args, "description") ?? input.result.title,
+      stage: isVerificationCommand(command) ? "unknown" : "exploration",
+      exit_code: exitCode,
+      status: exitCode === undefined ? "unknown" : exitCode === 0 ? "passed" : "failed",
+      stdout: objectValue(input.result.metadata, "output") ?? input.result.output,
+      stderr: objectValue(input.result.metadata, "stderr"),
+      metadata: {
+        tool: input.id,
+        truncated: input.result.metadata.truncated,
+      },
+    })
+    if (verification && input.spanID) {
+      CaseTrace.edge({
+        from: { type: "span", id: input.spanID, label: input.id },
+        to: { type: "verification", id: verification.verification_id },
+        relation: "tool_to_observation",
+        label: "Tool output recorded as verification evidence",
+      })
+    }
+  }
+
+  if (input.id === "edit" || diff || filediff) {
+    const files = [editFile].filter((item): item is string => Boolean(item))
+    const change = CaseTrace.change({
+      span_id: input.spanID,
+      tool_call_id: input.ctx.callID,
+      files,
+      intent: `Apply ${input.id} tool result`,
+      diff: diff ?? (typeof filediff === "object" && filediff ? stringValue(filediff, "patch") : undefined),
+      metadata: {
+        tool: input.id,
+        title: input.result.title,
+        additions: typeof filediff === "object" && filediff ? numberValue(filediff, "additions") : undefined,
+        deletions: typeof filediff === "object" && filediff ? numberValue(filediff, "deletions") : undefined,
+      },
+    })
+    if (change && input.spanID) {
+      CaseTrace.edge({
+        from: { type: "span", id: input.spanID, label: input.id },
+        to: { type: "change", id: change.change_id },
+        relation: "tool_to_change",
+        label: "Tool result changed repository files",
+      })
+    }
+  }
+}
+
 function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadata>(
   id: string,
   init: Init<Parameters, Result>,
@@ -113,6 +214,27 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             },
             metadata: attrs,
           })
+          const decision = CaseTrace.decision({
+            span_id: traceSpan?.id,
+            component: "tool",
+            decision_type: "tool_execute",
+            intent: toolIntent(id, args),
+            chosen_action: id,
+            rationale: stringValue(args, "description") ?? stringValue(args, "command") ?? id,
+            metadata: {
+              callID: ctx.callID,
+              sessionID: ctx.sessionID,
+              messageID: ctx.messageID,
+            },
+          })
+          if (decision && traceSpan) {
+            CaseTrace.edge({
+              from: { type: "decision", id: decision.decision_id },
+              to: { type: "span", id: traceSpan.id, label: id },
+              relation: "llm_to_tool",
+              label: "Model selected tool execution",
+            })
+          }
           const decoded = yield* decode(args).pipe(
             Effect.mapError((error) =>
               toolInfo.formatValidationError
@@ -125,6 +247,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           )
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
           if (result.metadata.truncated !== undefined) {
+            semanticToolResult({ id, args, ctx, spanID: traceSpan?.id, result })
             traceSpan?.end({
               output: {
                 title: result.title,
@@ -146,6 +269,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(truncated.truncated && { outputPath: truncated.outputPath }),
             },
           }
+          semanticToolResult({ id, args, ctx, spanID: traceSpan?.id, result: finalResult })
           traceSpan?.end({
             output: {
               title: finalResult.title,

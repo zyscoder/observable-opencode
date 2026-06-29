@@ -343,7 +343,32 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. 常见问题
+## 10. 语义层 Trace
+
+`trace_version: "1.1"` 在原有 spans、events 和 artifacts 之外，新增语义层字段。语义层的目标不是自动判断根因，而是把归因所需证据结构化记录下来。
+
+新增字段：
+
+- `context_snapshots`：记录每次 LLM 调用或上下文压缩前的最终上下文，包括 system、messages、tools、model、agent 和数量统计。
+- `semantic_decisions`：记录可观测决策，例如工具调用、reasoning block、压缩上下文选择。
+- `semantic_edges`：记录证据之间的因果引用关系，例如 context 到 LLM、tool 到 verification、change 到 verification。
+- `verification_records`：记录 bash/test 类命令的验证语义，包括 command、cwd、exit code、阶段、stdout/stderr 和简单失败解析。
+- `change_records`：记录 edit 类工具产生的文件变更、diff、增删行和关联证据。
+- `constraint_records`：记录从用户 prompt 中识别出的约束，例如只读、不修改、运行测试、只改必要文件。
+- `final_response_evidence`：记录最终回答或压缩摘要中的关键 claim，并链接到最近的工具、验证或变更证据。
+
+大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并会嵌入到 `trace.html` 供展开查看。
+
+`trace.html` 新增视图：
+
+- `Evidence Chain`：查看语义决策、语义边和最终回答证据。
+- `LLM Context`：查看每次 LLM 调用的 system、messages 和 tool schema。
+- `Changes & Verification`：查看变更记录和测试/命令验证记录。
+- `Constraints`：查看用户约束及当前可观测状态。
+
+语义层会对常见敏感字段做脱敏，包括 `apiKey`、`token`、`secret`、`authorization`、`cookie`、`password`，以及 `sk-...`、`Bearer ...` 等字符串模式。
+
+## 11. 常见问题
 
 ### 没有生成 trace
 

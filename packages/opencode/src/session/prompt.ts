@@ -1636,6 +1636,39 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             part_types: message.parts.map((part) => part.type),
           },
         })
+        {
+          const userText = input.parts
+            .filter((part): part is Extract<(typeof input.parts)[number], { type: "text" }> => part.type === "text")
+            .map((part) => part.text)
+            .join("\n")
+          const constraints = [
+            {
+              match: /不要修改|不修改|只读|只分析|do not modify|read[- ]?only/i,
+              text: "Do not modify repository files",
+            },
+            {
+              match: /运行测试|执行测试|run tests?|execute tests?/i,
+              text: "Run verification tests",
+            },
+            {
+              match: /只改必要|最小修改|only necessary|minimal change/i,
+              text: "Only make necessary changes",
+            },
+          ]
+          for (const item of constraints) {
+            if (!item.match.test(userText)) continue
+            CaseTrace.constraint({
+              source: "user",
+              constraint: item.text,
+              status: "unknown",
+              evidence_refs: [message.info.id],
+              metadata: {
+                sessionID: message.info.sessionID,
+                messageID: message.info.id,
+              },
+            })
+          }
+        }
         yield* sessions.touch(input.sessionID)
 
         const permissions: Permission.Ruleset = []

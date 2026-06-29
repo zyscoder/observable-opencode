@@ -331,6 +331,19 @@ export const layer: Layer.Layer<
             ctx.reasoningMap[value.id].text = ctx.reasoningMap[value.id].text
             ctx.reasoningMap[value.id].time = { ...ctx.reasoningMap[value.id].time, end: Date.now() }
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
+            CaseTrace.decision({
+              span_id: undefined,
+              component: "processor",
+              decision_type: "reasoning_block",
+              intent: "capture model reasoning emitted by provider",
+              chosen_action: "continue_processing_stream",
+              rationale: ctx.reasoningMap[value.id].text,
+              metadata: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                reasoningID: value.id,
+              },
+            })
             yield* session.updatePart(ctx.reasoningMap[value.id])
             delete ctx.reasoningMap[value.id]
             return
@@ -711,6 +724,24 @@ export const layer: Layer.Layer<
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+            const finalEvidence = CaseTrace.finalEvidence({
+              claim: ctx.currentText.text,
+              confidence: "medium",
+              evidence_refs: ["recent_tool_results", "recent_verification_records", "recent_change_records"],
+              metadata: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                partID: ctx.currentText.id,
+              },
+            })
+            if (finalEvidence) {
+              CaseTrace.edge({
+                from: { type: "processor_text", id: ctx.currentText.id },
+                to: { type: "final_response_evidence", id: finalEvidence.claim_id },
+                relation: "processor_to_final_response",
+                label: "Completed assistant text recorded as final response evidence",
+              })
+            }
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
             return

@@ -280,4 +280,77 @@ describe("case trace", () => {
     expect(html).toContain("查看完整内容")
     expect(html).toContain("full semantic model messages payload")
   })
+
+  test("persists semantic trace records with artifacts and redaction", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-semantic-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "semantic-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const secret = "sk-test-secret-value"
+    const longMessage = "semantic model message: " + "x".repeat(5000)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/test" })`,
+        `CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", provider_id: "deepseek", model_id: "deepseek-v4-pro", agent: "build", message_count: 1, system_count: 1, tool_count: 1, token_estimate: 128, messages: [{ role: "user", content: ${JSON.stringify(longMessage)}, apiKey: ${JSON.stringify(secret)} }], system: ["system prompt"], tools: { bash: { description: "run command", authorization: "Bearer abc" } } })`,
+        `CaseTrace.decision({ span_id: span?.id, component: "llm", decision_type: "tool_call", intent: "run tests", chosen_action: "bash", rationale: "Need verification", evidence_refs: ["ctx_1"] })`,
+        `CaseTrace.verification({ span_id: span?.id, tool_call_id: "call_1", command: "node test.js", cwd: "/tmp/project", purpose: "Run unit tests", stage: "baseline", exit_code: 1, status: "failed", stdout: "Error: expected 170, got 30", stderr: "" })`,
+        `CaseTrace.change({ span_id: span?.id, tool_call_id: "call_2", files: ["src/pricing.mjs"], intent: "Fix discount formula", diff: "- old\\\\n+ new", evidence_refs: ["ver_1"] })`,
+        `CaseTrace.constraint({ source: "user", constraint: "do not modify files", status: "observed_satisfied", evidence_refs: ["span_1"] })`,
+        `CaseTrace.finalEvidence({ response_artifact: "artifact_final", claim: "The formula returned discount amount instead of discounted price.", evidence_refs: ["ver_1", "chg_1"], confidence: "high" })`,
+        `CaseTrace.edge({ from: { type: "verification", id: "ver_1" }, to: { type: "change", id: "chg_1" }, relation: "failure_to_change", label: "test failure led to edit" })`,
+        `span?.end({ output: { completed: true } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "semantic-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "128",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "semantic-case")
+    const traceText = await fs.readFile(path.join(caseDir, "trace.json"), "utf8")
+    const trace = JSON.parse(traceText) as any
+
+    expect(trace.trace_version).toBe("1.1")
+    expect(trace.context_snapshots).toHaveLength(1)
+    expect(trace.semantic_decisions).toHaveLength(1)
+    expect(trace.verification_records).toHaveLength(1)
+    expect(trace.change_records).toHaveLength(1)
+    expect(trace.constraint_records).toHaveLength(1)
+    expect(trace.final_response_evidence).toHaveLength(1)
+    expect(trace.semantic_edges.length).toBeGreaterThanOrEqual(1)
+    expect(trace.semantic_edges.some((edge: any) => edge.relation === "failure_to_change")).toBe(true)
+    expect(trace.context_snapshots[0].messages.artifact_id).toBeTruthy()
+    expect(trace.verification_records[0].parsed_failures[0]).toMatchObject({ expected: "170", actual: "30" })
+    expect(traceText).not.toContain(secret)
+    expect(traceText).not.toContain("Bearer abc")
+
+    const artifactText = await fs.readFile(path.join(caseDir, trace.artifacts[0].path), "utf8")
+    expect(artifactText).toContain("semantic model message")
+    expect(artifactText).not.toContain(secret)
+    expect(artifactText).not.toContain("Bearer abc")
+
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    expect(html).toContain("Evidence Chain")
+    expect(html).toContain("LLM Context")
+    expect(html).toContain("Changes & Verification")
+    expect(html).toContain("Constraints")
+  })
 })

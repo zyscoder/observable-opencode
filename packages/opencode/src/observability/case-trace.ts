@@ -89,8 +89,108 @@ export type TraceEvent = {
   data?: unknown
 }
 
+export type TraceRef = {
+  type: string
+  id: string
+  label?: string
+}
+
+export type TraceContextSnapshot = {
+  snapshot_id: string
+  span_id?: string
+  phase: "llm_request" | "compaction" | "other"
+  provider_id?: string
+  model_id?: string
+  agent?: string
+  message_count?: number
+  system_count?: number
+  tool_count?: number
+  token_estimate?: number
+  messages?: TraceFieldSummary
+  system?: TraceFieldSummary
+  tools?: TraceFieldSummary
+  metadata?: Record<string, unknown>
+}
+
+export type TraceSemanticDecision = {
+  decision_id: string
+  span_id?: string
+  component: TraceComponent
+  decision_type: string
+  intent?: string
+  chosen_action?: string
+  rationale?: TraceFieldSummary
+  confidence?: "low" | "medium" | "high" | string
+  evidence_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceSemanticEdge = {
+  edge_id: string
+  from: TraceRef
+  to: TraceRef
+  relation: string
+  label?: string
+  metadata?: Record<string, unknown>
+}
+
+export type TraceParsedFailure = {
+  message?: string
+  expected?: string
+  actual?: string
+  file?: string
+  line?: number
+  column?: number
+}
+
+export type TraceVerificationRecord = {
+  verification_id: string
+  span_id?: string
+  tool_call_id?: string
+  command?: string
+  cwd?: string
+  purpose?: string
+  stage?: "baseline" | "post_change" | "exploration" | "unknown"
+  exit_code?: number
+  status: "passed" | "failed" | "unknown"
+  parsed_failures: TraceParsedFailure[]
+  stdout?: TraceFieldSummary
+  stderr?: TraceFieldSummary
+  metadata?: Record<string, unknown>
+}
+
+export type TraceChangeRecord = {
+  change_id: string
+  span_id?: string
+  tool_call_id?: string
+  files: string[]
+  intent?: string
+  diff?: TraceFieldSummary
+  evidence_refs?: string[]
+  verification_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceConstraintRecord = {
+  constraint_id: string
+  source: "user" | "system" | "runtime" | string
+  constraint: string
+  status: "observed_satisfied" | "observed_violated" | "unknown"
+  evidence_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceFinalResponseEvidence = {
+  claim_id: string
+  response_artifact?: string
+  claim: TraceFieldSummary
+  evidence_refs?: string[]
+  confidence?: "low" | "medium" | "high" | string
+  metadata?: Record<string, unknown>
+}
+
 export type TraceSummary = {
-  trace_version: "1.0"
+  trace_version: "1.0" | "1.1"
   case_id: string
   run_id: string
   session_id?: string
@@ -106,6 +206,13 @@ export type TraceSummary = {
   artifacts?: TraceArtifact[]
   errors: TraceError[]
   result?: Record<string, unknown>
+  context_snapshots?: TraceContextSnapshot[]
+  semantic_decisions?: TraceSemanticDecision[]
+  semantic_edges?: TraceSemanticEdge[]
+  verification_records?: TraceVerificationRecord[]
+  change_records?: TraceChangeRecord[]
+  constraint_records?: TraceConstraintRecord[]
+  final_response_evidence?: TraceFinalResponseEvidence[]
 }
 
 type CaseTraceConfig = {
@@ -145,6 +252,49 @@ type FinishTraceInput = {
   error?: unknown
 }
 
+type ContextSnapshotInput = Omit<TraceContextSnapshot, "snapshot_id" | "messages" | "system" | "tools" | "metadata"> & {
+  snapshot_id?: string
+  messages?: unknown
+  system?: unknown
+  tools?: unknown
+  metadata?: Record<string, unknown>
+}
+
+type SemanticDecisionInput = Omit<TraceSemanticDecision, "decision_id" | "rationale" | "metadata"> & {
+  decision_id?: string
+  rationale?: unknown
+  metadata?: Record<string, unknown>
+}
+
+type SemanticEdgeInput = Omit<TraceSemanticEdge, "edge_id"> & {
+  edge_id?: string
+}
+
+type VerificationRecordInput = Omit<
+  TraceVerificationRecord,
+  "verification_id" | "parsed_failures" | "stdout" | "stderr" | "status"
+> & {
+  verification_id?: string
+  status?: TraceVerificationRecord["status"]
+  parsed_failures?: TraceParsedFailure[]
+  stdout?: unknown
+  stderr?: unknown
+}
+
+type ChangeRecordInput = Omit<TraceChangeRecord, "change_id" | "diff"> & {
+  change_id?: string
+  diff?: unknown
+}
+
+type ConstraintRecordInput = Omit<TraceConstraintRecord, "constraint_id"> & {
+  constraint_id?: string
+}
+
+type FinalResponseEvidenceInput = Omit<TraceFinalResponseEvidence, "claim_id" | "claim"> & {
+  claim_id?: string
+  claim: unknown
+}
+
 export type ActiveSpan = {
   id: string
   event(input: Omit<TraceEventInput, "span_id" | "component"> & { component?: TraceComponent }): void
@@ -152,6 +302,8 @@ export type ActiveSpan = {
 }
 
 const truthy = new Set(["1", "true", "yes", "on"])
+const secretKeyPattern = /(api[-_]?key|token|secret|authorization|cookie|password|passwd|credential)/i
+const secretTextPatterns = [/\bsk-[a-zA-Z0-9_-]{8,}\b/g, /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi]
 let active: ActiveCaseTrace | false | undefined
 let processFinalizerInstalled = false
 
@@ -182,6 +334,13 @@ function safeNumber(input: unknown) {
   return Math.max(0, value)
 }
 
+function optionalNumber(input: unknown) {
+  if (input === undefined || input === null) return undefined
+  const value = Number(input)
+  if (!Number.isFinite(value)) return undefined
+  return value
+}
+
 function defaultTraceDir() {
   return process.env.OPENCODE_CASE_TRACE_DIR || path.join(Global.Path.data, "case-traces")
 }
@@ -191,12 +350,15 @@ function json(input: unknown) {
   return JSON.stringify(
     input,
     (_key, value) => {
+      const key = String(_key ?? "")
+      if (key && secretKeyPattern.test(key)) return "[REDACTED]"
       if (typeof value === "bigint") return String(value)
       if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`
       if (value instanceof Error) {
         return errorInfo(value)
       }
       if (value instanceof URL) return value.toString()
+      if (typeof value === "string") return redactText(value)
       if (value && typeof value === "object") {
         if (seen.has(value)) return "[Circular]"
         seen.add(value)
@@ -209,6 +371,12 @@ function json(input: unknown) {
 
 function hash(input: string) {
   return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16)
+}
+
+function redactText(input: string) {
+  let output = input
+  for (const pattern of secretTextPatterns) output = output.replace(pattern, "[REDACTED]")
+  return output
 }
 
 function maxFieldLength() {
@@ -224,7 +392,7 @@ function summarizeScalar(input: unknown): TraceFieldSummary {
 }
 
 export function summarizeText(input: unknown): TraceFieldSummary {
-  const text = String(input ?? "")
+  const text = redactText(String(input ?? ""))
   const limit = maxFieldLength()
   return {
     type: "text",
@@ -245,6 +413,38 @@ export function summarizeJson(input: unknown): TraceFieldSummary {
     keys,
     preview: serialized.slice(0, maxFieldLength()),
   }
+}
+
+function semanticID(prefix: string, sequence: number) {
+  return `${prefix}_${sequence}_${crypto.randomUUID().slice(0, 8)}`
+}
+
+function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }): TraceParsedFailure[] {
+  const text = [input.stdout, input.stderr]
+    .map((item) => String(item ?? ""))
+    .filter(Boolean)
+    .join("\n")
+  const failures: TraceParsedFailure[] = []
+
+  const expected = text.match(/expected\s+([^,\n]+),\s*got\s+([^\n]+)/i)
+  if (expected) {
+    failures.push({
+      message: expected[0],
+      expected: expected[1]?.trim(),
+      actual: expected[2]?.trim(),
+    })
+  }
+
+  const location = text.match(/((?:file:\/\/)?[^\s:]+):(\d+)(?::(\d+))?/)
+  if (location) {
+    const target = failures[0] ?? {}
+    target.file = location[1]
+    target.line = optionalNumber(location[2])
+    target.column = optionalNumber(location[3])
+    if (!failures.length) failures.push(target)
+  }
+
+  return failures
 }
 
 export function summarizeMessages(input: unknown): TraceFieldSummary {
@@ -321,6 +521,15 @@ class ActiveCaseTrace {
   private events: TraceEvent[] = []
   private artifacts: TraceArtifact[] = []
   private errors: TraceError[] = []
+  private contextSnapshots: TraceContextSnapshot[] = []
+  private semanticDecisions: TraceSemanticDecision[] = []
+  private semanticEdges: TraceSemanticEdge[] = []
+  private verificationRecords: TraceVerificationRecord[] = []
+  private changeRecords: TraceChangeRecord[] = []
+  private constraintRecords: TraceConstraintRecord[] = []
+  private finalResponseEvidence: TraceFinalResponseEvidence[] = []
+  private recentFailedVerificationID: string | undefined
+  private recentChangeID: string | undefined
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
 
@@ -377,7 +586,9 @@ class ActiveCaseTrace {
       start_time: new Date(started).toISOString(),
       start_ms: started - this.startedAt,
       input_summary:
-        input.input === undefined ? undefined : this.summarizeJson(input.input, `${input.component}.${input.operation}.input`),
+        input.input === undefined
+          ? undefined
+          : this.summarizeJson(input.input, `${input.component}.${input.operation}.input`),
       metadata: input.metadata,
     }
     this.spans.set(id, span)
@@ -411,7 +622,9 @@ class ActiveCaseTrace {
     span.end_ms = ended - this.startedAt
     span.duration_ms = Math.max(0, ended - (this.startedAt + span.start_ms))
     span.output_summary =
-      input?.output === undefined ? span.output_summary : this.summarizeJson(input.output, `${span.component}.${span.operation}.output`)
+      input?.output === undefined
+        ? span.output_summary
+        : this.summarizeJson(input.output, `${span.component}.${span.operation}.output`)
     span.metadata = {
       ...(span.metadata ?? {}),
       ...(input?.metadata ?? {}),
@@ -436,7 +649,10 @@ class ActiveCaseTrace {
       event_type: input.event_type,
       timestamp: new Date(time).toISOString(),
       time_ms: time - this.startedAt,
-      data: input.data === undefined ? undefined : this.summarizeJson(input.data, `${input.component}.${input.event_type}.data`),
+      data:
+        input.data === undefined
+          ? undefined
+          : this.summarizeJson(input.data, `${input.component}.${input.event_type}.data`),
     }
     this.events.push(event)
     this.write("event", event)
@@ -451,6 +667,154 @@ class ActiveCaseTrace {
       span_id: spanID,
       data: usage,
     })
+  }
+
+  contextSnapshot(input: ContextSnapshotInput) {
+    const snapshot: TraceContextSnapshot = {
+      snapshot_id: input.snapshot_id ?? semanticID("ctx", this.contextSnapshots.length + 1),
+      span_id: input.span_id,
+      phase: input.phase,
+      provider_id: input.provider_id,
+      model_id: input.model_id,
+      agent: input.agent,
+      message_count: input.message_count,
+      system_count: input.system_count,
+      tool_count: input.tool_count,
+      token_estimate: input.token_estimate,
+      messages:
+        input.messages === undefined
+          ? undefined
+          : this.summarizeJson(input.messages, `context.${input.phase}.messages`),
+      system:
+        input.system === undefined ? undefined : this.summarizeJson(input.system, `context.${input.phase}.system`),
+      tools: input.tools === undefined ? undefined : this.summarizeJson(input.tools, `context.${input.phase}.tools`),
+      metadata: input.metadata,
+    }
+    this.contextSnapshots.push(snapshot)
+    this.write("semantic.context_snapshot", snapshot)
+    return snapshot
+  }
+
+  decision(input: SemanticDecisionInput) {
+    const decision: TraceSemanticDecision = {
+      decision_id: input.decision_id ?? semanticID("dec", this.semanticDecisions.length + 1),
+      span_id: input.span_id,
+      component: input.component,
+      decision_type: input.decision_type,
+      intent: input.intent,
+      chosen_action: input.chosen_action,
+      rationale:
+        input.rationale === undefined ? undefined : this.summarizeText(input.rationale, "semantic.decision.rationale"),
+      confidence: input.confidence,
+      evidence_refs: input.evidence_refs,
+      metadata: input.metadata,
+    }
+    this.semanticDecisions.push(decision)
+    this.write("semantic.decision", decision)
+    return decision
+  }
+
+  edge(input: SemanticEdgeInput) {
+    const edge: TraceSemanticEdge = {
+      edge_id: input.edge_id ?? semanticID("edge", this.semanticEdges.length + 1),
+      from: input.from,
+      to: input.to,
+      relation: input.relation,
+      label: input.label,
+      metadata: input.metadata,
+    }
+    this.semanticEdges.push(edge)
+    this.write("semantic.edge", edge)
+    return edge
+  }
+
+  verification(input: VerificationRecordInput) {
+    const parsed = input.parsed_failures ?? parseVerificationFailures({ stdout: input.stdout, stderr: input.stderr })
+    const exitCode = optionalNumber(input.exit_code)
+    const status = input.status ?? (exitCode === undefined ? "unknown" : exitCode === 0 ? "passed" : "failed")
+    const verification: TraceVerificationRecord = {
+      verification_id: input.verification_id ?? semanticID("ver", this.verificationRecords.length + 1),
+      span_id: input.span_id,
+      tool_call_id: input.tool_call_id,
+      command: input.command,
+      cwd: input.cwd,
+      purpose: input.purpose,
+      stage: input.stage ?? "unknown",
+      exit_code: exitCode,
+      status,
+      parsed_failures: parsed,
+      stdout: input.stdout === undefined ? undefined : this.summarizeText(input.stdout, "verification.stdout"),
+      stderr: input.stderr === undefined ? undefined : this.summarizeText(input.stderr, "verification.stderr"),
+      metadata: input.metadata,
+    }
+    this.verificationRecords.push(verification)
+    this.write("semantic.verification", verification)
+    if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
+    if (verification.status === "passed" && this.recentChangeID) {
+      this.edge({
+        from: { type: "change", id: this.recentChangeID },
+        to: { type: "verification", id: verification.verification_id },
+        relation: "change_to_verification",
+        label: "Verification ran after repository change",
+      })
+    }
+    return verification
+  }
+
+  change(input: ChangeRecordInput) {
+    const evidenceRefs =
+      input.evidence_refs ?? (this.recentFailedVerificationID ? [this.recentFailedVerificationID] : undefined)
+    const change: TraceChangeRecord = {
+      change_id: input.change_id ?? semanticID("chg", this.changeRecords.length + 1),
+      span_id: input.span_id,
+      tool_call_id: input.tool_call_id,
+      files: input.files,
+      intent: input.intent,
+      diff: input.diff === undefined ? undefined : this.summarizeText(input.diff, "change.diff"),
+      evidence_refs: evidenceRefs,
+      verification_refs: input.verification_refs,
+      metadata: input.metadata,
+    }
+    this.changeRecords.push(change)
+    this.write("semantic.change", change)
+    this.recentChangeID = change.change_id
+    if (this.recentFailedVerificationID) {
+      this.edge({
+        from: { type: "verification", id: this.recentFailedVerificationID },
+        to: { type: "change", id: change.change_id },
+        relation: "failure_to_change",
+        label: "Change followed a failed verification record",
+      })
+    }
+    return change
+  }
+
+  constraint(input: ConstraintRecordInput) {
+    const constraint: TraceConstraintRecord = {
+      constraint_id: input.constraint_id ?? semanticID("constraint", this.constraintRecords.length + 1),
+      source: input.source,
+      constraint: redactText(input.constraint),
+      status: input.status,
+      evidence_refs: input.evidence_refs,
+      metadata: input.metadata,
+    }
+    this.constraintRecords.push(constraint)
+    this.write("semantic.constraint", constraint)
+    return constraint
+  }
+
+  finalEvidence(input: FinalResponseEvidenceInput) {
+    const evidence: TraceFinalResponseEvidence = {
+      claim_id: input.claim_id ?? semanticID("claim", this.finalResponseEvidence.length + 1),
+      response_artifact: input.response_artifact,
+      claim: this.summarizeText(input.claim, "result.final_response.claim"),
+      evidence_refs: input.evidence_refs,
+      confidence: input.confidence,
+      metadata: input.metadata,
+    }
+    this.finalResponseEvidence.push(evidence)
+    this.write("semantic.final_response_evidence", evidence)
+    return evidence
   }
 
   finish(input?: FinishTraceInput) {
@@ -468,7 +832,7 @@ class ActiveCaseTrace {
   private summary(status: TraceStatus): TraceSummary {
     const ended = Date.now()
     return {
-      trace_version: "1.0",
+      trace_version: "1.1",
       case_id: this.caseID,
       run_id: this.runID,
       session_id: this.sessionID,
@@ -484,11 +848,18 @@ class ActiveCaseTrace {
       artifacts: this.artifacts,
       errors: this.errors,
       result: this.result,
+      context_snapshots: this.contextSnapshots,
+      semantic_decisions: this.semanticDecisions,
+      semantic_edges: this.semanticEdges,
+      verification_records: this.verificationRecords,
+      change_records: this.changeRecords,
+      constraint_records: this.constraintRecords,
+      final_response_evidence: this.finalResponseEvidence,
     }
   }
 
   summarizeText(input: unknown, label = "text"): TraceFieldSummary {
-    const text = String(input ?? "")
+    const text = redactText(String(input ?? ""))
     const summary: TraceFieldSummary = {
       type: "text",
       length: text.length,
@@ -589,10 +960,17 @@ class ActiveCaseTrace {
 }
 
 function jsonPretty(input: unknown) {
+  const seen = new WeakSet<object>()
   return JSON.stringify(
     input,
-    (_key, value) => {
+    (key, value) => {
+      if (key && secretKeyPattern.test(key)) return "[REDACTED]"
       if (typeof value === "bigint") return String(value)
+      if (typeof value === "string") return redactText(value)
+      if (value && typeof value === "object") {
+        if (seen.has(value)) return "[Circular]"
+        seen.add(value)
+      }
       return value
     },
     2,
@@ -667,6 +1045,34 @@ export namespace CaseTrace {
 
   export function usage(input: unknown, spanID?: string) {
     get()?.usage(input, spanID)
+  }
+
+  export function contextSnapshot(input: ContextSnapshotInput) {
+    return get()?.contextSnapshot(input)
+  }
+
+  export function decision(input: SemanticDecisionInput) {
+    return get()?.decision(input)
+  }
+
+  export function edge(input: SemanticEdgeInput) {
+    return get()?.edge(input)
+  }
+
+  export function verification(input: VerificationRecordInput) {
+    return get()?.verification(input)
+  }
+
+  export function change(input: ChangeRecordInput) {
+    return get()?.change(input)
+  }
+
+  export function constraint(input: ConstraintRecordInput) {
+    return get()?.constraint(input)
+  }
+
+  export function finalEvidence(input: FinalResponseEvidenceInput) {
+    return get()?.finalEvidence(input)
   }
 
   export function finish(input?: FinishTraceInput) {

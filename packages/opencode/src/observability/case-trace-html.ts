@@ -354,6 +354,189 @@ function renderFlow(trace: TraceSummary) {
   </div>`
 }
 
+function renderContextSnapshots(trace: TraceSummary, artifactContents: Map<string, string>) {
+  const snapshots = trace.context_snapshots ?? []
+  if (!snapshots.length) return `<div class="empty">没有 LLM 上下文快照。</div>`
+  return `<div class="process">
+    ${snapshots
+      .map(
+        (snapshot) => `<div class="step">
+          <div class="step-time">${escapeHtml(snapshot.phase)}</div>
+          <div class="step-dot context"></div>
+          <div class="step-body">
+            <div class="step-head">
+              <span class="pill context">context</span>
+              <strong>${escapeHtml(snapshot.snapshot_id)}</strong>
+              <span class="muted">${escapeHtml([snapshot.provider_id, snapshot.model_id].filter(Boolean).join("/") || "-")}</span>
+              <span class="muted">${snapshot.message_count ?? 0} messages</span>
+              <span class="muted">${snapshot.tool_count ?? 0} tools</span>
+            </div>
+            <div class="step-io">
+              ${snapshot.system ? renderIoCell("System", snapshot.system, artifactContents) : ""}
+              ${snapshot.messages ? renderIoCell("Messages", snapshot.messages, artifactContents) : ""}
+              ${snapshot.tools ? renderIoCell("Tools", snapshot.tools, artifactContents) : ""}
+            </div>
+          </div>
+        </div>`,
+      )
+      .join("")}
+  </div>`
+}
+
+function renderEvidenceChain(trace: TraceSummary, artifactContents: Map<string, string>) {
+  const decisions = trace.semantic_decisions ?? []
+  const edges = trace.semantic_edges ?? []
+  const finalEvidence = trace.final_response_evidence ?? []
+  if (!decisions.length && !edges.length && !finalEvidence.length) return `<div class="empty">没有语义证据链。</div>`
+
+  return `<div>
+    ${
+      decisions.length
+        ? `<h3>Decisions</h3><table>
+          <thead><tr><th>ID</th><th>组件</th><th>类型</th><th>意图</th><th>动作</th><th>理由</th><th>证据</th></tr></thead>
+          <tbody>
+            ${decisions
+              .map(
+                (item) => `<tr>
+                  <td><code>${escapeHtml(item.decision_id)}</code></td>
+                  <td>${escapeHtml(item.component)}</td>
+                  <td>${escapeHtml(item.decision_type)}</td>
+                  <td>${escapeHtml(item.intent ?? "")}</td>
+                  <td>${escapeHtml(item.chosen_action ?? "")}</td>
+                  <td>${renderSummary(item.rationale)}</td>
+                  <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+                </tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>`
+        : ""
+    }
+    ${
+      edges.length
+        ? `<h3>Semantic Edges</h3><table>
+          <thead><tr><th>关系</th><th>From</th><th>To</th><th>说明</th></tr></thead>
+          <tbody>
+            ${edges
+              .map(
+                (edge) => `<tr>
+                  <td>${escapeHtml(edge.relation)}</td>
+                  <td><code>${escapeHtml(edge.from.type)}:${escapeHtml(edge.from.id)}</code></td>
+                  <td><code>${escapeHtml(edge.to.type)}:${escapeHtml(edge.to.id)}</code></td>
+                  <td>${escapeHtml(edge.label ?? "")}</td>
+                </tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>`
+        : ""
+    }
+    ${
+      finalEvidence.length
+        ? `<h3>Final Response Evidence</h3><div class="process">
+          ${finalEvidence
+            .map(
+              (item) => `<div class="io-cell">
+                <div class="io-label"><code>${escapeHtml(item.claim_id)}</code> ${escapeHtml(item.confidence ?? "")}</div>
+                ${renderIoCell("Claim", item.claim, artifactContents)}
+                <div class="muted">evidence: ${escapeHtml((item.evidence_refs ?? []).join(", ") || "-")}</div>
+              </div>`,
+            )
+            .join("")}
+        </div>`
+        : ""
+    }
+  </div>`
+}
+
+function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map<string, string>) {
+  const verifications = trace.verification_records ?? []
+  const changes = trace.change_records ?? []
+  if (!verifications.length && !changes.length) return `<div class="empty">没有变更或验证记录。</div>`
+
+  return `<div>
+    ${
+      verifications.length
+        ? `<h3>Verification</h3><table>
+          <thead><tr><th>ID</th><th>阶段</th><th>状态</th><th>命令</th><th>失败解析</th><th>输出</th></tr></thead>
+          <tbody>
+            ${verifications
+              .map(
+                (item) => `<tr>
+                  <td><code>${escapeHtml(item.verification_id)}</code></td>
+                  <td>${escapeHtml(item.stage ?? "unknown")}</td>
+                  <td>${escapeHtml(item.status)}</td>
+                  <td><code>${escapeHtml(item.command ?? "")}</code></td>
+                  <td>${escapeHtml(
+                    item.parsed_failures
+                      .map((failure) =>
+                        [
+                          failure.file,
+                          failure.line,
+                          failure.message,
+                          failure.expected && `expected ${failure.expected}`,
+                          failure.actual && `actual ${failure.actual}`,
+                        ]
+                          .filter(Boolean)
+                          .join(" "),
+                      )
+                      .join("; "),
+                  )}</td>
+                  <td>
+                    ${item.stdout ? renderArtifactDetails(item.stdout, artifactContents) || renderSummary(item.stdout) : ""}
+                    ${item.stderr ? renderArtifactDetails(item.stderr, artifactContents) || renderSummary(item.stderr) : ""}
+                  </td>
+                </tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>`
+        : ""
+    }
+    ${
+      changes.length
+        ? `<h3>Changes</h3><table>
+          <thead><tr><th>ID</th><th>文件</th><th>意图</th><th>证据</th><th>Diff</th></tr></thead>
+          <tbody>
+            ${changes
+              .map(
+                (item) => `<tr>
+                  <td><code>${escapeHtml(item.change_id)}</code></td>
+                  <td>${escapeHtml(item.files.join(", "))}</td>
+                  <td>${escapeHtml(item.intent ?? "")}</td>
+                  <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+                  <td>${item.diff ? renderArtifactDetails(item.diff, artifactContents) || renderSummary(item.diff) : ""}</td>
+                </tr>`,
+              )
+              .join("")}
+          </tbody>
+        </table>`
+        : ""
+    }
+  </div>`
+}
+
+function renderConstraints(trace: TraceSummary) {
+  const constraints = trace.constraint_records ?? []
+  if (!constraints.length) return `<div class="empty">没有约束记录。</div>`
+  return `<table>
+    <thead><tr><th>ID</th><th>来源</th><th>约束</th><th>状态</th><th>证据</th></tr></thead>
+    <tbody>
+      ${constraints
+        .map(
+          (item) => `<tr>
+            <td><code>${escapeHtml(item.constraint_id)}</code></td>
+            <td>${escapeHtml(item.source)}</td>
+            <td>${escapeHtml(item.constraint)}</td>
+            <td>${escapeHtml(item.status)}</td>
+            <td>${escapeHtml((item.evidence_refs ?? []).join(", "))}</td>
+          </tr>`,
+        )
+        .join("")}
+    </tbody>
+  </table>`
+}
+
 export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTraceHtmlOptions = {}) {
   const artifactContents = collectArtifactContents(trace, options)
   const spans = trace.spans.toSorted((a, b) => a.start_ms - b.start_ms)
@@ -717,6 +900,26 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
     <section>
       <h2>Agent 运行流程</h2>
       ${renderAgentProcess(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>Evidence Chain</h2>
+      ${renderEvidenceChain(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>LLM Context</h2>
+      ${renderContextSnapshots(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>Changes & Verification</h2>
+      ${renderChangesAndVerification(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>Constraints</h2>
+      ${renderConstraints(trace)}
     </section>
 
     <section>
