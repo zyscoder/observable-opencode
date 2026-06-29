@@ -189,8 +189,24 @@ export type TraceFinalResponseEvidence = {
   metadata?: Record<string, unknown>
 }
 
+export type TraceDesignRecord = {
+  design_id: string
+  span_id?: string
+  source?: "final_response" | "context" | "manual" | string
+  requirement_summary?: TraceFieldSummary
+  existing_boundaries?: TraceFieldSummary
+  design_constraints?: TraceFieldSummary
+  candidate_solutions?: TraceFieldSummary
+  selected_solution?: TraceFieldSummary
+  tradeoffs?: TraceFieldSummary
+  risks?: TraceFieldSummary
+  test_strategy?: TraceFieldSummary
+  evidence_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
 export type TraceSummary = {
-  trace_version: "1.0" | "1.1"
+  trace_version: "1.0" | "1.1" | "1.2"
   case_id: string
   run_id: string
   session_id?: string
@@ -213,6 +229,7 @@ export type TraceSummary = {
   change_records?: TraceChangeRecord[]
   constraint_records?: TraceConstraintRecord[]
   final_response_evidence?: TraceFinalResponseEvidence[]
+  design_records?: TraceDesignRecord[]
 }
 
 type CaseTraceConfig = {
@@ -295,6 +312,29 @@ type FinalResponseEvidenceInput = Omit<TraceFinalResponseEvidence, "claim_id" | 
   claim: unknown
 }
 
+type DesignRecordInput = Omit<
+  TraceDesignRecord,
+  | "design_id"
+  | "requirement_summary"
+  | "existing_boundaries"
+  | "design_constraints"
+  | "candidate_solutions"
+  | "selected_solution"
+  | "tradeoffs"
+  | "risks"
+  | "test_strategy"
+> & {
+  design_id?: string
+  requirement_summary?: unknown
+  existing_boundaries?: unknown
+  design_constraints?: unknown
+  candidate_solutions?: unknown
+  selected_solution?: unknown
+  tradeoffs?: unknown
+  risks?: unknown
+  test_strategy?: unknown
+}
+
 export type ActiveSpan = {
   id: string
   event(input: Omit<TraceEventInput, "span_id" | "component"> & { component?: TraceComponent }): void
@@ -302,7 +342,6 @@ export type ActiveSpan = {
 }
 
 const truthy = new Set(["1", "true", "yes", "on"])
-const secretKeyPattern = /(api[-_]?key|token|secret|authorization|cookie|password|passwd|credential)/i
 const secretTextPatterns = [/\bsk-[a-zA-Z0-9_-]{8,}\b/g, /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi]
 let active: ActiveCaseTrace | false | undefined
 let processFinalizerInstalled = false
@@ -351,7 +390,7 @@ function json(input: unknown) {
     input,
     (_key, value) => {
       const key = String(_key ?? "")
-      if (key && secretKeyPattern.test(key)) return "[REDACTED]"
+      if (isSensitiveKey(key)) return "[REDACTED]"
       if (typeof value === "bigint") return String(value)
       if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`
       if (value instanceof Error) {
@@ -367,6 +406,42 @@ function json(input: unknown) {
     },
     0,
   )
+}
+
+function normalizeKey(input: string) {
+  return input
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+}
+
+function isSensitiveKey(input: string) {
+  if (!input) return false
+  const key = normalizeKey(input)
+  if (!key) return false
+  const safeMetricKeys = new Set([
+    "token",
+    "tokens",
+    "token_usage",
+    "token_estimate",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "input_token_details",
+    "output_token_details",
+  ])
+  if (safeMetricKeys.has(key)) return false
+  if (/^(api_key|authorization|cookie|password|passwd|credential|secret)$/.test(key)) return true
+  if (/^(access_token|refresh_token|auth_token|id_token)$/.test(key)) return true
+  if (/(^|_)(authorization|cookie|password|passwd|credential|secret)($|_)/.test(key)) return true
+  if (/(^|_)api_key($|_)/.test(key)) return true
+  if (/(^|_)(access_token|refresh_token|auth_token|id_token)($|_)/.test(key)) return true
+  return false
 }
 
 function hash(input: string) {
@@ -426,16 +501,38 @@ function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }
     .join("\n")
   const failures: TraceParsedFailure[] = []
 
-  const expected = text.match(/expected\s+([^,\n]+),\s*got\s+([^\n]+)/i)
+  const expectedCandidates = text
+    .split(/\r?\n/)
+    .map((line, index) => {
+      if (line.includes("${")) return undefined
+      const expected = line.match(/^\s*(?:(?:[A-Za-z]*Error):\s*)?expected\s+([^,\n]+),\s*got\s+([^\n]+)\s*$/i)
+      if (!expected) return undefined
+      const hasErrorPrefix = /^\s*[A-Za-z]*Error:\s*/i.test(line)
+      return {
+        index,
+        score: hasErrorPrefix ? 2 : 1,
+        message: expected[0].trim(),
+        expected: expected[1]?.trim(),
+        actual: expected[2]?.trim(),
+      }
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .toSorted((a, b) => b.score - a.score || a.index - b.index)
+  const expected = expectedCandidates[0]
   if (expected) {
     failures.push({
-      message: expected[0],
-      expected: expected[1]?.trim(),
-      actual: expected[2]?.trim(),
+      message: expected.message,
+      expected: expected.expected,
+      actual: expected.actual,
     })
   }
 
-  const location = text.match(/((?:file:\/\/)?[^\s:]+):(\d+)(?::(\d+))?/)
+  const locations = [...text.matchAll(/((?:file:\/\/)?[^\s:]+):(\d+)(?::(\d+))?/g)].toSorted((a, b) => {
+    const aHasColumn = a[3] ? 1 : 0
+    const bHasColumn = b[3] ? 1 : 0
+    return bHasColumn - aHasColumn || a.index - b.index
+  })
+  const location = locations[0]
   if (location) {
     const target = failures[0] ?? {}
     target.file = location[1]
@@ -445,6 +542,15 @@ function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }
   }
 
   return failures
+}
+
+function isTestLikeCommand(command: string | undefined) {
+  return Boolean(
+    command &&
+      /\b(test|pytest|jest|vitest|mocha)\b|bun test|npm test|pnpm test|yarn test|go test|cargo test|node .*test|xcodebuild/i.test(
+        command,
+      ),
+  )
 }
 
 export function summarizeMessages(input: unknown): TraceFieldSummary {
@@ -528,8 +634,13 @@ class ActiveCaseTrace {
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
   private finalResponseEvidence: TraceFinalResponseEvidence[] = []
+  private designRecords: TraceDesignRecord[] = []
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
+  private recentContextSnapshotIDs: string[] = []
+  private recentVerificationIDs: string[] = []
+  private recentChangeIDs: string[] = []
+  private recentToolSpanIDs: string[] = []
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
 
@@ -592,6 +703,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.spans.set(id, span)
+    if (["tool", "skill", "task", "mcp"].includes(input.component)) this.remember(this.recentToolSpanIDs, id)
     this.write("span.start", span)
     let ended = false
     return {
@@ -691,6 +803,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.contextSnapshots.push(snapshot)
+    this.remember(this.recentContextSnapshotIDs, snapshot.snapshot_id)
     this.write("semantic.context_snapshot", snapshot)
     return snapshot
   }
@@ -748,6 +861,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
+    this.remember(this.recentVerificationIDs, verification.verification_id)
     this.write("semantic.verification", verification)
     if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
     if (verification.status === "passed" && this.recentChangeID) {
@@ -763,7 +877,8 @@ class ActiveCaseTrace {
 
   change(input: ChangeRecordInput) {
     const evidenceRefs =
-      input.evidence_refs ?? (this.recentFailedVerificationID ? [this.recentFailedVerificationID] : undefined)
+      input.evidence_refs ??
+      (this.recentFailedVerificationID ? [`verification:${this.recentFailedVerificationID}`] : undefined)
     const change: TraceChangeRecord = {
       change_id: input.change_id ?? semanticID("chg", this.changeRecords.length + 1),
       span_id: input.span_id,
@@ -776,6 +891,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.changeRecords.push(change)
+    this.remember(this.recentChangeIDs, change.change_id)
     this.write("semantic.change", change)
     this.recentChangeID = change.change_id
     if (this.recentFailedVerificationID) {
@@ -804,11 +920,12 @@ class ActiveCaseTrace {
   }
 
   finalEvidence(input: FinalResponseEvidenceInput) {
+    const evidenceRefs = this.normalizeEvidenceRefs(input.evidence_refs)
     const evidence: TraceFinalResponseEvidence = {
       claim_id: input.claim_id ?? semanticID("claim", this.finalResponseEvidence.length + 1),
       response_artifact: input.response_artifact,
       claim: this.summarizeText(input.claim, "result.final_response.claim"),
-      evidence_refs: input.evidence_refs,
+      evidence_refs: evidenceRefs,
       confidence: input.confidence,
       metadata: input.metadata,
     }
@@ -817,8 +934,39 @@ class ActiveCaseTrace {
     return evidence
   }
 
+  designRecord(input: DesignRecordInput) {
+    const design: TraceDesignRecord = {
+      design_id: input.design_id ?? semanticID("design", this.designRecords.length + 1),
+      span_id: input.span_id,
+      source: input.source,
+      requirement_summary: this.summarizeDesignField(input.requirement_summary, "design.requirement_summary"),
+      existing_boundaries: this.summarizeDesignField(input.existing_boundaries, "design.existing_boundaries"),
+      design_constraints: this.summarizeDesignField(input.design_constraints, "design.design_constraints"),
+      candidate_solutions: this.summarizeDesignField(input.candidate_solutions, "design.candidate_solutions"),
+      selected_solution: this.summarizeDesignField(input.selected_solution, "design.selected_solution"),
+      tradeoffs: this.summarizeDesignField(input.tradeoffs, "design.tradeoffs"),
+      risks: this.summarizeDesignField(input.risks, "design.risks"),
+      test_strategy: this.summarizeDesignField(input.test_strategy, "design.test_strategy"),
+      evidence_refs: this.normalizeEvidenceRefs(input.evidence_refs),
+      metadata: input.metadata,
+    }
+    this.designRecords.push(design)
+    this.write("semantic.design_record", design)
+    return design
+  }
+
+  currentEvidenceRefs() {
+    return [
+      ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
+      ...this.recentToolSpanIDs.slice(-3).map((id) => `tool_span:${id}`),
+      ...this.recentVerificationIDs.slice(-3).map((id) => `verification:${id}`),
+      ...this.recentChangeIDs.slice(-3).map((id) => `change:${id}`),
+    ].filter((item, index, array) => array.indexOf(item) === index)
+  }
+
   finish(input?: FinishTraceInput) {
     if (this.finished) return
+    this.evaluateConstraints()
     this.finished = true
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
@@ -832,7 +980,7 @@ class ActiveCaseTrace {
   private summary(status: TraceStatus): TraceSummary {
     const ended = Date.now()
     return {
-      trace_version: "1.1",
+      trace_version: "1.2",
       case_id: this.caseID,
       run_id: this.runID,
       session_id: this.sessionID,
@@ -855,6 +1003,7 @@ class ActiveCaseTrace {
       change_records: this.changeRecords,
       constraint_records: this.constraintRecords,
       final_response_evidence: this.finalResponseEvidence,
+      design_records: this.designRecords,
     }
   }
 
@@ -893,6 +1042,60 @@ class ActiveCaseTrace {
     }
   }
 
+  private summarizeDesignField(input: unknown, label: string) {
+    if (input === undefined) return undefined
+    if (input === null || typeof input !== "object") return this.summarizeText(input, label)
+    return this.summarizeJson(input, label)
+  }
+
+  private normalizeEvidenceRefs(input: string[] | undefined) {
+    const provided = input ?? []
+    const concreteProvided = provided.filter((item) => !item.startsWith("recent_"))
+    if (provided.length && concreteProvided.length === provided.length) return concreteProvided
+    return [...concreteProvided, ...this.currentEvidenceRefs()].filter(
+      (item, index, array) => array.indexOf(item) === index,
+    )
+  }
+
+  private remember(target: string[], id: string, limit = 12) {
+    target.push(id)
+    if (target.length > limit) target.splice(0, target.length - limit)
+  }
+
+  private evaluateConstraints() {
+    for (const constraint of this.constraintRecords) {
+      if (constraint.status !== "unknown") continue
+      const text = constraint.constraint.toLowerCase()
+      const evidenceRefs = new Set(constraint.evidence_refs ?? [])
+      if (/do not modify|read[- ]?only|只读|不修改|不要修改/.test(text)) {
+        if (this.changeRecords.length) {
+          constraint.status = "observed_violated"
+          for (const change of this.changeRecords) evidenceRefs.add(`change:${change.change_id}`)
+        } else {
+          constraint.status = "observed_satisfied"
+        }
+      } else if (/run verification tests|run tests|执行测试|运行测试/.test(text)) {
+        const verifications = this.verificationRecords.filter((item) => isTestLikeCommand(item.command))
+        constraint.status = verifications.length ? "observed_satisfied" : "observed_violated"
+        for (const verification of verifications) evidenceRefs.add(`verification:${verification.verification_id}`)
+      } else if (/only make necessary changes|only necessary|minimal change|只改必要|最小修改/.test(text)) {
+        if (!this.changeRecords.length) {
+          constraint.status = "observed_satisfied"
+        } else {
+          const hasLinkedChange = this.changeRecords.some(
+            (change) => (change.evidence_refs?.length ?? 0) > 0 || (change.verification_refs?.length ?? 0) > 0,
+          )
+          const hasVerification = this.verificationRecords.length > 0
+          if (hasLinkedChange || hasVerification) constraint.status = "observed_satisfied"
+        }
+        for (const change of this.changeRecords) evidenceRefs.add(`change:${change.change_id}`)
+        for (const verification of this.verificationRecords) evidenceRefs.add(`verification:${verification.verification_id}`)
+      }
+      constraint.evidence_refs = [...evidenceRefs]
+      this.write("semantic.constraint_evaluated", constraint)
+    }
+  }
+
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
     const artifactID = `artifact_${++this.artifactSequence}_${crypto.randomUUID().slice(0, 8)}`
     const safeLabel = (label || kind).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80)
@@ -922,7 +1125,7 @@ class ActiveCaseTrace {
       fs.mkdirSync(this.caseDir, { recursive: true })
       fs.writeFileSync(this.eventsFile, "")
       this.write("trace.start", {
-        trace_version: "1.0",
+        trace_version: "1.2",
         case_id: this.caseID,
         run_id: this.runID,
         started_at: this.startedIso,
@@ -964,7 +1167,7 @@ function jsonPretty(input: unknown) {
   return JSON.stringify(
     input,
     (key, value) => {
-      if (key && secretKeyPattern.test(key)) return "[REDACTED]"
+      if (isSensitiveKey(key)) return "[REDACTED]"
       if (typeof value === "bigint") return String(value)
       if (typeof value === "string") return redactText(value)
       if (value && typeof value === "object") {
@@ -1073,6 +1276,14 @@ export namespace CaseTrace {
 
   export function finalEvidence(input: FinalResponseEvidenceInput) {
     return get()?.finalEvidence(input)
+  }
+
+  export function designRecord(input: DesignRecordInput) {
+    return get()?.designRecord(input)
+  }
+
+  export function currentEvidenceRefs() {
+    return get()?.currentEvidenceRefs() ?? []
   }
 
   export function finish(input?: FinishTraceInput) {

@@ -516,6 +516,34 @@ function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map
   </div>`
 }
 
+function renderDesignRecords(trace: TraceSummary, artifactContents: Map<string, string>) {
+  const records = trace.design_records ?? []
+  if (!records.length) return `<div class="empty">没有方案设计记录。</div>`
+  return `<div class="process">
+    ${records
+      .map(
+        (item) => `<div class="io-cell">
+          <div class="io-label">
+            <code>${escapeHtml(item.design_id)}</code>
+            ${item.source ? `<span class="muted">${escapeHtml(item.source)}</span>` : ""}
+          </div>
+          <div class="step-io">
+            ${item.requirement_summary ? renderIoCell("Requirement", item.requirement_summary, artifactContents) : ""}
+            ${item.existing_boundaries ? renderIoCell("Boundaries", item.existing_boundaries, artifactContents) : ""}
+            ${item.design_constraints ? renderIoCell("Constraints", item.design_constraints, artifactContents) : ""}
+            ${item.candidate_solutions ? renderIoCell("Candidates", item.candidate_solutions, artifactContents) : ""}
+            ${item.selected_solution ? renderIoCell("Selected Solution", item.selected_solution, artifactContents) : ""}
+            ${item.tradeoffs ? renderIoCell("Tradeoffs", item.tradeoffs, artifactContents) : ""}
+            ${item.risks ? renderIoCell("Risks", item.risks, artifactContents) : ""}
+            ${item.test_strategy ? renderIoCell("Test Strategy", item.test_strategy, artifactContents) : ""}
+          </div>
+          <div class="muted">evidence: ${escapeHtml((item.evidence_refs ?? []).join(", ") || "-")}</div>
+        </div>`,
+      )
+      .join("")}
+  </div>`
+}
+
 function renderConstraints(trace: TraceSummary) {
   const constraints = trace.constraint_records ?? []
   if (!constraints.length) return `<div class="empty">没有约束记录。</div>`
@@ -915,6 +943,11 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
     <section>
       <h2>Changes & Verification</h2>
       ${renderChangesAndVerification(trace, artifactContents)}
+    </section>
+
+    <section>
+      <h2>Design Records</h2>
+      ${renderDesignRecords(trace, artifactContents)}
     </section>
 
     <section>

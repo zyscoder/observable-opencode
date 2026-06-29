@@ -345,7 +345,7 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 
 ## 10. 语义层 Trace
 
-`trace_version: "1.1"` 在原有 spans、events 和 artifacts 之外，新增语义层字段。语义层的目标不是自动判断根因，而是把归因所需证据结构化记录下来。
+`trace_version: "1.2"` 在原有 spans、events 和 artifacts 之外，新增语义层字段。语义层的目标不是自动判断根因，而是把归因所需证据结构化记录下来。
 
 新增字段：
 
@@ -354,8 +354,18 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `semantic_edges`：记录证据之间的因果引用关系，例如 context 到 LLM、tool 到 verification、change 到 verification。
 - `verification_records`：记录 bash/test 类命令的验证语义，包括 command、cwd、exit code、阶段、stdout/stderr 和简单失败解析。
 - `change_records`：记录 edit 类工具产生的文件变更、diff、增删行和关联证据。
-- `constraint_records`：记录从用户 prompt 中识别出的约束，例如只读、不修改、运行测试、只改必要文件。
-- `final_response_evidence`：记录最终回答或压缩摘要中的关键 claim，并链接到最近的工具、验证或变更证据。
+- `constraint_records`：记录从用户 prompt 中识别出的约束，例如只读、不修改、运行测试、只改必要文件；case 结束时会根据可观测事实把部分 `unknown` 收敛为 `observed_satisfied` 或 `observed_violated`。
+- `final_response_evidence`：记录最终回答或压缩摘要中的关键 claim，并链接到具体上下文、工具、验证或变更证据。
+- `design_records`：记录架构理解和方案设计类回答中的需求摘要、模块边界、设计约束、候选/选中方案、取舍、风险和测试策略。
+
+证据引用采用 `type:id` 格式，例如：
+
+```text
+context_snapshot:ctx_1_xxxxxxxx
+tool_span:span_2_xxxxxxxx
+verification:ver_1_xxxxxxxx
+change:chg_1_xxxxxxxx
+```
 
 大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并会嵌入到 `trace.html` 供展开查看。
 
@@ -364,9 +374,10 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `Evidence Chain`：查看语义决策、语义边和最终回答证据。
 - `LLM Context`：查看每次 LLM 调用的 system、messages 和 tool schema。
 - `Changes & Verification`：查看变更记录和测试/命令验证记录。
+- `Design Records`：查看方案设计记录和相关证据引用。
 - `Constraints`：查看用户约束及当前可观测状态。
 
-语义层会对常见敏感字段做脱敏，包括 `apiKey`、`token`、`secret`、`authorization`、`cookie`、`password`，以及 `sk-...`、`Bearer ...` 等字符串模式。
+语义层会对常见敏感字段做脱敏，包括 `apiKey`、`authorization`、`cookie`、`secret`、`password`、`credential`、`access_token`、`refresh_token`、`auth_token`，以及 `sk-...`、`Bearer ...` 等字符串模式。`token_usage`、`token_estimate`、`tokens`、`inputTokens`、`outputTokens` 等计量字段不会被误脱敏。
 
 ## 11. 常见问题
 

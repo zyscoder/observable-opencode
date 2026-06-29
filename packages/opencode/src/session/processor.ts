@@ -82,6 +82,22 @@ interface ProcessorContext extends Input {
 
 type StreamEvent = Event
 
+function isDesignLikeResponse(text: string) {
+  return /架构|模块边界|分层|方案设计|设计方案|方案|取舍|权衡|风险|测试策略|architecture|boundary|design|trade-?off|risk|test strategy/i.test(
+    text,
+  )
+}
+
+function keywordExcerpt(text: string, keywords: string[]) {
+  const lowerKeywords = keywords.map((item) => item.toLowerCase())
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => lowerKeywords.some((keyword) => line.toLowerCase().includes(keyword)))
+  return lines.length ? lines.slice(0, 8).join("\n") : undefined
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
 
 export const layer: Layer.Layer<
@@ -727,7 +743,6 @@ export const layer: Layer.Layer<
             const finalEvidence = CaseTrace.finalEvidence({
               claim: ctx.currentText.text,
               confidence: "medium",
-              evidence_refs: ["recent_tool_results", "recent_verification_records", "recent_change_records"],
               metadata: {
                 sessionID: ctx.sessionID,
                 messageID: ctx.assistantMessage.id,
@@ -741,6 +756,52 @@ export const layer: Layer.Layer<
                 relation: "processor_to_final_response",
                 label: "Completed assistant text recorded as final response evidence",
               })
+            }
+            if (isDesignLikeResponse(ctx.currentText.text)) {
+              const designRecord = CaseTrace.designRecord({
+                source: "final_response",
+                requirement_summary: keywordExcerpt(ctx.currentText.text, [
+                  "需求",
+                  "目标",
+                  "requirement",
+                  "goal",
+                ]),
+                existing_boundaries: keywordExcerpt(ctx.currentText.text, [
+                  "架构",
+                  "边界",
+                  "分层",
+                  "模块",
+                  "architecture",
+                  "boundary",
+                ]),
+                design_constraints: keywordExcerpt(ctx.currentText.text, [
+                  "约束",
+                  "兼容",
+                  "稳定",
+                  "constraint",
+                  "compat",
+                  "stability",
+                ]),
+                selected_solution: ctx.currentText.text,
+                tradeoffs: keywordExcerpt(ctx.currentText.text, ["取舍", "权衡", "trade", "tradeoff"]),
+                risks: keywordExcerpt(ctx.currentText.text, ["风险", "risk"]),
+                test_strategy: keywordExcerpt(ctx.currentText.text, ["测试", "验证", "test", "verification"]),
+                evidence_refs: finalEvidence?.evidence_refs,
+                metadata: {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.id,
+                  partID: ctx.currentText.id,
+                  source_claim_id: finalEvidence?.claim_id,
+                },
+              })
+              if (designRecord && finalEvidence) {
+                CaseTrace.edge({
+                  from: { type: "final_response_evidence", id: finalEvidence.claim_id },
+                  to: { type: "design_record", id: designRecord.design_id },
+                  relation: "final_response_to_design_record",
+                  label: "Design-like final response extracted into structured design record",
+                })
+              }
             }
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined

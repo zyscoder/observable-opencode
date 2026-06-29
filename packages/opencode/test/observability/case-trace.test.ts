@@ -328,7 +328,7 @@ describe("case trace", () => {
     const traceText = await fs.readFile(path.join(caseDir, "trace.json"), "utf8")
     const trace = JSON.parse(traceText) as any
 
-    expect(trace.trace_version).toBe("1.1")
+    expect(trace.trace_version).toBe("1.2")
     expect(trace.context_snapshots).toHaveLength(1)
     expect(trace.semantic_decisions).toHaveLength(1)
     expect(trace.verification_records).toHaveLength(1)
@@ -352,5 +352,249 @@ describe("case trace", () => {
     expect(html).toContain("LLM Context")
     expect(html).toContain("Changes & Verification")
     expect(html).toContain("Constraints")
+  })
+
+  test("preserves token metrics while redacting credentials", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-redaction-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "redaction-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "token-test", metadata: { token_usage: { total: 9 }, apiKey: "sk-test-secret-value" } })`,
+        `CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", token_estimate: 128, message_count: 1, metadata: { tokens: 128, token_usage: { input: 3, output: 6 }, authorization: "Bearer abcdefgh" }, messages: [{ role: "user", content: "hello", access_token: "sk-another-secret-value" }] })`,
+        `span?.end({ tokenUsage: { inputTokens: 3, outputTokens: 6, totalTokens: 9 } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "redaction-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const traceText = await fs.readFile(path.join(dir, "redaction-case", "trace.json"), "utf8")
+    const trace = JSON.parse(traceText) as TraceSummary
+
+    expect(trace.token_usage.total).toBe(9)
+    expect(trace.spans[0].token_usage?.total).toBe(9)
+    expect(trace.context_snapshots?.[0]?.token_estimate).toBe(128)
+    expect(trace.context_snapshots?.[0]?.metadata?.tokens).toBe(128)
+    expect((trace.context_snapshots?.[0]?.metadata as any)?.token_usage).toEqual({ input: 3, output: 6 })
+    expect(traceText).not.toContain("sk-test-secret-value")
+    expect(traceText).not.toContain("sk-another-secret-value")
+    expect(traceText).not.toContain("Bearer abcdefgh")
+  })
+
+  test("parses concrete expected and actual values from verification failures", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-failure-parse-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "failure-parse-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const stdout = [
+      "file:///tmp/project/test/pricing.test.mjs:11",
+      "throw new Error(`expected ${item.expected}, got ${actual}`)",
+      "Error: expected 170, got 30",
+      "    at file:///tmp/project/test/pricing.test.mjs:11:13",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ command: "node test/pricing.test.mjs", exit_code: 1, stdout: ${JSON.stringify(stdout)}, stderr: "" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "failure-parse-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "failure-parse-case", "trace.json"), "utf8")) as any
+    expect(trace.verification_records[0].parsed_failures[0]).toMatchObject({
+      message: "Error: expected 170, got 30",
+      expected: "170",
+      actual: "30",
+      file: "file:///tmp/project/test/pricing.test.mjs",
+      line: 11,
+      column: 13,
+    })
+  })
+
+  test("evaluates read-only constraints at trace finish", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-constraint-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "constraint-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ caseID: "readonly-ok" })`,
+        `CaseTrace.constraint({ source: "user", constraint: "Do not modify repository files", status: "unknown" })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `CaseTrace.configure({ caseID: "readonly-violated" })`,
+        `CaseTrace.constraint({ source: "user", constraint: "Do not modify repository files", status: "unknown" })`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "unexpected edit" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const ok = JSON.parse(await fs.readFile(path.join(dir, "readonly-ok", "trace.json"), "utf8")) as any
+    const violated = JSON.parse(await fs.readFile(path.join(dir, "readonly-violated", "trace.json"), "utf8")) as any
+
+    expect(ok.constraint_records[0]).toMatchObject({
+      constraint: "Do not modify repository files",
+      status: "observed_satisfied",
+    })
+    expect(violated.constraint_records[0]).toMatchObject({
+      constraint: "Do not modify repository files",
+      status: "observed_violated",
+    })
+  })
+
+  test("uses concrete evidence refs for final response claims", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-evidence-refs-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "evidence-ref-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "bash" })`,
+        `const ctx = CaseTrace.contextSnapshot({ phase: "llm_request", messages: [{ role: "user", content: "fix tests" }] })`,
+        `const ver = CaseTrace.verification({ span_id: span?.id, command: "node test/pricing.test.mjs", exit_code: 1, stdout: "Error: expected 170, got 30" })`,
+        `const chg = CaseTrace.change({ span_id: span?.id, files: ["src/pricing.mjs"], intent: "Fix discount formula" })`,
+        `span?.end({ output: { ok: true } })`,
+        `CaseTrace.finalEvidence({ claim: "Fixed discount calculation.", evidence_refs: ["recent_tool_results", "recent_verification_records", "recent_change_records"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "evidence-ref-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "evidence-ref-case", "trace.json"), "utf8")) as any
+    const refs = trace.final_response_evidence[0].evidence_refs
+
+    expect(refs).toContain(`context_snapshot:${trace.context_snapshots[0].snapshot_id}`)
+    expect(refs).toContain(`tool_span:${trace.spans[0].span_id}`)
+    expect(refs).toContain(`verification:${trace.verification_records[0].verification_id}`)
+    expect(refs).toContain(`change:${trace.change_records[0].change_id}`)
+    expect(refs.some((item: string) => item.startsWith("recent_"))).toBe(false)
+  })
+
+  test("persists and renders design records", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-design-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "design-record-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const designText = [
+      "方案设计：在 checkout 层新增折扣策略接口。",
+      "架构边界：pricing 负责折扣，tax 负责税费。",
+      "取舍：保持 API 稳定，但增加策略注入。",
+      "风险：历史订单回放需要兼容旧字段。",
+      "测试策略：补充 pricing 单测和 checkout 集成测试。",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.contextSnapshot({ phase: "llm_request", messages: [{ role: "user", content: "设计折扣能力扩展方案" }] })`,
+        `CaseTrace.designRecord({ source: "final_response", requirement_summary: "设计折扣能力扩展方案", existing_boundaries: "pricing/tax/checkout", selected_solution: ${JSON.stringify(designText)}, tradeoffs: "保持 API 稳定", risks: "历史订单兼容", test_strategy: "pricing 单测和 checkout 集成测试" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "design-record-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "design-record-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    expect(trace.design_records).toHaveLength(1)
+    expect(trace.design_records[0].selected_solution.artifact_id).toBeTruthy()
+
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    expect(html).toContain("Design Records")
+    expect(html).toContain("查看完整内容")
+    expect(html).toContain("checkout 层新增折扣策略接口")
   })
 })
