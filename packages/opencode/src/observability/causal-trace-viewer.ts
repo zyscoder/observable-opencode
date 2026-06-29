@@ -36,6 +36,24 @@ function artifactLinks(ids: string[] | undefined, artifacts: Map<string, TraceAr
     .join(" ")
 }
 
+function sourceLocations(record: ProvenanceRecord) {
+  if (!record.source_locations?.length) return `<span class="muted">-</span>`
+  return record.source_locations
+    .map((location) => {
+      const target = location.uri ?? location.path ?? "-"
+      const line =
+        location.line_start === undefined
+          ? ""
+          : location.line_end && location.line_end !== location.line_start
+            ? `:${location.line_start}-${location.line_end}`
+            : `:${location.line_start}`
+      return `<div class="source-location"><code>${escapeHtml(`${target}${line}`)}</code>${
+        location.snippet_preview ? `<pre>${escapeHtml(location.snippet_preview)}</pre>` : ""
+      }</div>`
+    })
+    .join("")
+}
+
 function renderRecord(record: ProvenanceRecord, artifacts: Map<string, TraceArtifact>) {
   return `<article class="node node-${escapeHtml(record.event_type.replace(/[^a-z0-9_-]/gi, "-"))}">
     <div class="node-head">
@@ -52,6 +70,8 @@ function renderRecord(record: ProvenanceRecord, artifacts: Map<string, TraceArti
       <div>
         <div class="label">Source Refs</div>
         <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+        <div class="label">Source Locations</div>
+        <div class="refs source-locations">${sourceLocations(record)}</div>
         <div class="label">Artifacts</div>
         <div class="refs">${artifactLinks(record.artifact_refs, artifacts)}</div>
       </div>
@@ -170,6 +190,8 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .timeline-row { display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 12px; }
     .time { padding-top: 12px; color: var(--muted); font-size: 12px; text-align: right; }
     .refs { overflow-x: auto; white-space: nowrap; padding: 6px 0; }
+    .source-locations { white-space: normal; display: grid; gap: 8px; }
+    .source-location pre { max-height: 120px; white-space: pre; }
     .empty { color: var(--muted); font-size: 13px; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     a { color: #0369a1; }

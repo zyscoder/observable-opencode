@@ -264,6 +264,7 @@ $OPENCODE_CASE_TRACE_DIR/
     provenance-trace.json
     records.jsonl
     raw-events.jsonl
+    trace.html
     viewer.html
     partial/
       latest.json
@@ -276,14 +277,15 @@ $OPENCODE_CASE_TRACE_DIR/
 其中：
 
 - `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
-- `provenance-trace.json`：Trace Provenance v3 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
+- `provenance-trace.json`：Trace Semantic Contract v4 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
 - `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
 - `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
 - `partial/latest.json`：运行中快照。长时间运行或收到 `SIGINT/SIGTERM/SIGHUP` 时也能保留可查看状态。
 - `artifacts/sha256/`：按内容 hash 去重保存大文本，例如模型上下文包、MCP 返回、skill 指令、工具输出、压缩前后摘要等。
-- `viewer.html`：离线可视化报告，包含 Component Dataflow、Execution Timeline、IO Inspector、Context Ledger 和 Artifact Browser。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
+- `trace.html`：正式离线可视化报告，包含 Component Dataflow、Execution Timeline、IO Inspector、Context Ledger 和 Artifact Browser。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
+- `viewer.html`：兼容 alias，打开后跳转或提示使用 `trace.html`；新分析链路不应依赖它。
 
-当前实现仍会保留 `events.jsonl`、`trace.json`、`trace.html` 作为低层调试和兼容副产物；新分析链路应优先使用 `manifest.json`、`provenance-trace.json` 和 `viewer.html`。
+当前实现仍会保留 `events.jsonl`、`trace.json` 作为低层调试和兼容副产物；新分析链路应优先使用 `manifest.json`、`provenance-trace.json` 和 `trace.html`。
 
 > 注意：`OPENCODE_CASE_TRACE=1` 会记录用于复盘的语义信息，可能包含私域代码、工具输出和模型上下文。生产或企业内网环境请把 `OPENCODE_CASE_TRACE_DIR` 指向受控目录，并按企业数据策略管理 trace 文件。
 
@@ -338,10 +340,10 @@ jq '{records: (.records | length), dataflow_edges: (.dataflow_edges | length), a
 打开可视化报告：
 
 ```bash
-xdg-open /data/evo-bench/opencode-traces/T1-001/viewer.html
+xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 ```
 
-无 GUI 服务器可以将整个 `T1-001/` 目录下载到本地，再用浏览器打开 `viewer.html`。由于大文本 artifact 不再默认内嵌进 HTML，单独下载 `viewer.html` 只能看到摘要，无法打开 artifact 链接。
+无 GUI 服务器可以将整个 `T1-001/` 目录下载到本地，再用浏览器打开 `trace.html`。由于大文本 artifact 不再默认内嵌进 HTML，单独下载 `trace.html` 只能看到摘要，无法打开 artifact 链接。
 
 ## 9. Trace 覆盖范围
 
@@ -356,14 +358,14 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/viewer.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. Trace Provenance v3
+## 10. Trace Semantic Contract v4
 
-`provenance-trace.json` 的 `trace_version` 为 `"3.0"`。v3 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照和组件间数据流结构化记录下来。
+`provenance-trace.json` 的 `trace_version` 为 `"4.0"`。v4 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照和组件间数据流结构化记录下来。
 
 主字段：
 
-- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs` 和 `artifact_refs`。
-- `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`。
+- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs`、`source_locations` 和 `artifact_refs`。正式 records 不包含 `runtime.event`、流式 delta 或纯 prompt 元数据节点。
+- `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`、`derived_from`、`verified_by`、`modified_by`。
 - `artifacts`：大文本或结构化大对象索引，完整内容在 `artifacts/sha256/` 下按 hash 去重保存。
 - `metrics`：spans、events、records、dataflow_edges、artifacts 和 token/cost 统计。
 
@@ -376,9 +378,9 @@ verification:ver_1_xxxxxxxx
 change:chg_1_xxxxxxxx
 ```
 
-大文本不会直接塞进 `provenance-trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `viewer.html` 的 artifact 链接查看。
+大文本不会直接塞进 `provenance-trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `trace.html` 的 artifact 链接查看。
 
-`viewer.html` 视图：
+`trace.html` 视图：
 
 - `Component Dataflow`：查看组件间数据流边，不做根因判断。
 - `Execution Timeline`：按时间展示全部组件事实记录。

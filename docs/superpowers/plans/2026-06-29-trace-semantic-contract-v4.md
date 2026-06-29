@@ -19,6 +19,13 @@
 - Large texts remain artifact-backed.
 - TDD is required for behavior changes.
 
+## Execution Notes
+
+- Implemented in the current `codex/causal-trace-v2` branch.
+- Bun is not available in the current shell (`zsh: command not found: bun`), so Bun test execution could not be completed in this environment.
+- Static verification completed with `./node_modules/.bin/tsgo --noEmit -p packages/opencode/tsconfig.json`.
+- Whitespace verification completed with `git diff --check`.
+
 ---
 
 ### Task 1: Contract Module And Failing Schema Tests
