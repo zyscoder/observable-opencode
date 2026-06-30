@@ -1,6 +1,6 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "4.1" as const
+export const TRACE_VERSION = "4.2" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
@@ -12,6 +12,7 @@ export const FORMAL_RECORD_TYPES = [
   "mcp.call",
   "skill.load",
   "subagent.call",
+  "loop.decision",
   "observation",
   "change",
   "verification",

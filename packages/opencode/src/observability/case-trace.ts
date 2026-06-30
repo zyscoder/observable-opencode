@@ -243,6 +243,7 @@ export type CausalNodeKind =
   | "mcp.call"
   | "skill.load"
   | "subagent.call"
+  | "loop.decision"
   | "observation"
   | "change"
   | "verification"
@@ -294,7 +295,6 @@ export type TraceManifest = {
     trace_html: string
     records: string
     raw_events: string
-    viewer_alias?: string
     partial_latest: string
   }
 }
@@ -828,6 +828,19 @@ function mergeUsage(target: TraceTokenUsage, next: TraceTokenUsage) {
   target.cost = safeNumber(target.cost) + safeNumber(next.cost)
 }
 
+function cloneTokenUsage(input: TraceTokenUsage | undefined): TraceTokenUsage | undefined {
+  if (!input) return undefined
+  return {
+    input: safeNumber(input.input),
+    output: safeNumber(input.output),
+    reasoning: safeNumber(input.reasoning),
+    cached_input: safeNumber(input.cached_input),
+    cache_write: safeNumber(input.cache_write),
+    total: safeNumber(input.total),
+    cost: safeNumber(input.cost),
+  }
+}
+
 function stringField(input: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     const value = input[key]
@@ -842,6 +855,65 @@ function numberField(input: Record<string, unknown>, keys: string[]) {
     if (value !== undefined) return value
   }
   return undefined
+}
+
+function booleanField(input: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = input[key]
+    if (typeof value === "boolean") return value
+  }
+  return undefined
+}
+
+function stringArrayField(input: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = input[key]
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string")
+  }
+  return undefined
+}
+
+function loopDecisionFromRuntimeEvent(
+  component: TraceComponent,
+  eventType: string,
+  data: unknown,
+  state: { has_user_visible_response: boolean; has_final_answer: boolean },
+) {
+  if (component !== "processor") return undefined
+  if (!/step\.finish|loop\.decision|loop\.finish|message\.finish|message\.completed/.test(eventType)) return undefined
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
+  const record = data as Record<string, unknown>
+  const reason = stringField(record, ["reason", "stop_reason", "finish_reason"]) ?? eventType
+  const syntheticContinue =
+    booleanField(record, ["synthetic_continue", "synthetic", "auto"]) ?? (stringField(record, ["synthetic_continue"]) === "true")
+  const compactionContinue =
+    booleanField(record, ["compaction_continue"]) ??
+    (record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
+      ? booleanField(record.metadata as Record<string, unknown>, ["compaction_continue"])
+      : undefined) ??
+    false
+  const decision = (() => {
+    if (compactionContinue || syntheticContinue) return "auto_continue"
+    if (/stop|complete|done|end/i.test(reason)) return "stop"
+    if (/tool|continue|next/i.test(reason)) return "continue"
+    return "unknown"
+  })()
+  return {
+    decision,
+    reason,
+    agent: stringField(record, ["agent"]),
+    message_id: stringField(record, ["message_id", "messageID", "id"]),
+    part_count: numberField(record, ["part_count", "partCount"]),
+    part_types: stringArrayField(record, ["part_types", "partTypes"]),
+    has_user_visible_response: state.has_user_visible_response,
+    has_final_answer: state.has_final_answer,
+    synthetic_continue: Boolean(syntheticContinue),
+    compaction_continue: Boolean(compactionContinue),
+    runtime_refs: {
+      session_id: stringField(record, ["session_id", "sessionID"]),
+      message_id: stringField(record, ["message_id", "messageID", "id"]),
+    },
+  }
 }
 
 function normalizeSourcePath(input: string) {
@@ -940,32 +1012,48 @@ function traceContextLedger(input: {
   }
 }
 
-function enrichSubagentOutput(output: unknown, parentRecordID: string): unknown {
+function childTraceDir(caseDir: string, childSessionID: string) {
+  return path.join(caseDir, "subtraces", childSessionID)
+}
+
+function childTraceRelativeDir(childSessionID: string) {
+  return `subtraces/${childSessionID}`
+}
+
+function childTraceAvailable(caseDir: string, childSessionID: string) {
+  return fs.existsSync(path.join(childTraceDir(caseDir, childSessionID), "trace.json"))
+}
+
+function enrichSubagentOutput(output: unknown, parentRecordID: string, caseDir: string): unknown {
   if (!output || typeof output !== "object" || Array.isArray(output)) return output
   const record = output as Record<string, unknown>
   const childSessionID = stringField(record, ["child_session_id", "task_id", "session_id"])
   if (!childSessionID) return output
+  const available = childTraceAvailable(caseDir, childSessionID)
   return {
     ...record,
     trace_ref: {
       parent_record_id: parentRecordID,
       child_session_id: childSessionID,
-      child_trace_dir: `subtraces/${childSessionID}`,
       child_status: "success",
+      child_trace_available: available,
+      ...(available ? { child_trace_dir: childTraceRelativeDir(childSessionID) } : {}),
     },
   }
 }
 
-function subagentTraceRef(output: unknown, parentRecordID: string) {
+function subagentTraceRef(output: unknown, parentRecordID: string, caseDir: string) {
   if (!output || typeof output !== "object" || Array.isArray(output)) return undefined
   const record = output as Record<string, unknown>
   const childSessionID = stringField(record, ["child_session_id", "task_id", "session_id"])
   if (!childSessionID) return undefined
+  const available = childTraceAvailable(caseDir, childSessionID)
   return {
     parent_record_id: parentRecordID,
     child_session_id: childSessionID,
-    child_trace_dir: `subtraces/${childSessionID}`,
     child_status: stringField(record, ["child_status", "status"]) ?? "success",
+    child_trace_available: available,
+    ...(available ? { child_trace_dir: childTraceRelativeDir(childSessionID) } : {}),
   }
 }
 
@@ -1055,20 +1143,6 @@ function isWeakObservation(input: ObservationInput) {
   return onlyPathData && pathLikeSummary
 }
 
-function renderTraceHtmlAlias() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta http-equiv="refresh" content="0; url=trace.html" />
-  <title>Trace Viewer Moved</title>
-</head>
-<body>
-  <p>viewer.html is a compatibility alias. Open <a href="trace.html">trace.html</a>.</p>
-</body>
-</html>`
-}
-
 class ActiveCaseTrace {
   readonly caseID: string
   readonly runID = crypto.randomUUID()
@@ -1083,7 +1157,6 @@ class ActiveCaseTrace {
   readonly htmlFile: string
   readonly manifestFile: string
   readonly provenanceTraceFile: string
-  readonly viewerFile: string
   readonly partialDir: string
   readonly partialFile: string
   readonly startedAt = Date.now()
@@ -1134,7 +1207,6 @@ class ActiveCaseTrace {
     this.htmlFile = path.join(this.caseDir, "trace.html")
     this.manifestFile = path.join(this.caseDir, "manifest.json")
     this.provenanceTraceFile = path.join(this.caseDir, "provenance-trace.json")
-    this.viewerFile = path.join(this.caseDir, "viewer.html")
     this.partialDir = path.join(this.caseDir, "partial")
     this.partialFile = path.join(this.partialDir, "latest.json")
     this.input = config.input
@@ -1252,7 +1324,7 @@ class ActiveCaseTrace {
     if (nodeID) {
       const node = this.causalNodes.find((item) => item.node_id === nodeID)
       if (node) {
-        const output = span.component === "task" ? enrichSubagentOutput(input?.output, nodeID) : input?.output
+        const output = span.component === "task" ? enrichSubagentOutput(input?.output, nodeID, this.caseDir) : input?.output
         const summarizedOutput =
           output === undefined ? node.data?.output : this.summarizeCausalValue(output, `${span.component}.${span.operation}.output`)
         const spanEndData = this.spanEndData(span, input, output, summarizedOutput, usage, error, nodeID)
@@ -1307,7 +1379,7 @@ class ActiveCaseTrace {
     const data: Record<string, unknown> = {
       duration_ms: span.duration_ms,
       output: summarizedOutput,
-      token_usage: usage,
+      token_usage: cloneTokenUsage(usage),
       error,
     }
     if (span.component === "llm") {
@@ -1322,12 +1394,13 @@ class ActiveCaseTrace {
         : undefined
     }
     if (span.component === "task") {
-      const traceRef = subagentTraceRef(rawOutput, nodeID)
+      const traceRef = subagentTraceRef(rawOutput, nodeID, this.caseDir)
       if (traceRef) {
         data.trace_ref = traceRef
         data.child_session_id = traceRef.child_session_id
-        data.child_trace_dir = traceRef.child_trace_dir
         data.child_status = traceRef.child_status
+        data.child_trace_available = traceRef.child_trace_available
+        if (traceRef.child_trace_dir) data.child_trace_dir = traceRef.child_trace_dir
       }
       const artifactID = this.collectArtifactRefs(summarizedOutput)[0]
       if (artifactID) data.output_artifact_id = artifactID
@@ -1351,6 +1424,20 @@ class ActiveCaseTrace {
     }
     this.events.push(event)
     this.write("event", event)
+    const loopDecision = loopDecisionFromRuntimeEvent(input.component, input.event_type, input.data, {
+      has_user_visible_response: this.responseSegments.some((segment) => segment.visibility === "user_visible"),
+      has_final_answer: this.responseSegments.some((segment) => segment.response_role === "final_answer"),
+    })
+    if (loopDecision) {
+      this.node({
+        kind: "loop.decision",
+        component: input.component,
+        span_id: input.span_id,
+        title: loopDecision.decision,
+        status: "success",
+        data: loopDecision,
+      })
+    }
     if (shouldPromoteRuntimeEvent(input.component, input.event_type, input.data)) {
       this.node({
         kind: "task.loop",
@@ -1899,7 +1986,6 @@ class ActiveCaseTrace {
     this.safeWrite(this.traceFile, jsonPretty(provenance))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
-    this.safeWrite(this.viewerFile, renderTraceHtmlAlias())
   }
 
   private summary(status: TraceStatus): TraceSummary {
@@ -1915,7 +2001,7 @@ class ActiveCaseTrace {
       status,
       input: this.input,
       environment: this.environment,
-      token_usage: this.tokenUsage,
+      token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
       spans: [...this.spans.values()],
       events: this.events,
       artifacts: this.artifacts,
@@ -1945,7 +2031,7 @@ class ActiveCaseTrace {
       status,
       input: this.input,
       environment: this.environment,
-      token_usage: this.tokenUsage,
+      token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
       result: this.result,
       files: {
         trace: "trace.json",
@@ -1954,7 +2040,6 @@ class ActiveCaseTrace {
         trace_html: "trace.html",
         records: "records.jsonl",
         raw_events: "raw-events.jsonl",
-        viewer_alias: "viewer.html",
         partial_latest: "partial/latest.json",
       },
     }
@@ -1976,7 +2061,7 @@ class ActiveCaseTrace {
         records: records.length,
         dataflow_edges: dataflowEdges.length,
         artifacts: this.artifacts.length,
-        token_usage: this.tokenUsage,
+        token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
       },
     }
   }
@@ -1998,7 +2083,7 @@ class ActiveCaseTrace {
         title: node.title,
         status: node.status,
         duration_ms: optionalNumber(node.data?.duration_ms),
-        token_usage: node.data?.token_usage as TraceTokenUsage | undefined,
+        token_usage: cloneTokenUsage(node.data?.token_usage as TraceTokenUsage | undefined),
         error: node.data?.error,
         source_refs: node.source_refs,
         source_locations: node.source_locations,

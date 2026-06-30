@@ -4,7 +4,8 @@ import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { renderCaseTraceHtml } from "@/observability/case-trace-html"
-import type { TraceSummary } from "@/observability/case-trace"
+import { renderProvenanceTraceHtml } from "@/observability/causal-trace-viewer"
+import type { ProvenanceTraceSummary, TraceSummary } from "@/observability/case-trace"
 
 async function exists(file: string) {
   return fs
@@ -23,7 +24,7 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v4.1 bundle with trace.json as formal provenance", async () => {
+  test("writes trace semantic contract v4.2 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -64,6 +65,7 @@ describe("case trace", () => {
     for (const file of ["manifest.json", "trace.json", "legacy-trace.json", "records.jsonl", "raw-events.jsonl", "trace.html"]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
+    expect(await exists(path.join(caseDir, "viewer.html"))).toBe(false)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
@@ -89,13 +91,16 @@ describe("case trace", () => {
       "returned_by",
     ])
 
-    expect(manifest.trace_version).toBe("4.1")
+    expect(manifest.trace_version).toBe("4.2")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
-    expect(provenance.trace_version).toBe("4.1")
+    expect(manifest.files.viewer_alias).toBeUndefined()
+    expect(provenance.trace_version).toBe("4.2")
     expect(legacy.trace_version).toBe("1.3")
+    expect(provenance.metrics.token_usage.total).toBe(15)
+    expect(provenanceText).not.toContain("[Circular]")
     expect(provenance.records.map((record: any) => record.event_type)).toContain("run.start")
     expect(provenance.records.map((record: any) => record.event_type)).toContain("context.pack")
     expect(provenance.records.map((record: any) => record.event_type)).toContain("llm.call")
@@ -118,11 +123,12 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace Provenance")
+    expect(traceHtml).toContain("Trace v4.2")
+    expect(traceHtml).toContain('id="overview"')
+    expect(traceHtml).toContain('id="agent-flow"')
     expect(traceHtml).toContain("Component Dataflow")
-    expect(traceHtml).toContain("Execution Timeline")
     expect(traceHtml).toContain("IO Inspector")
-    expect(traceHtml).toContain("Context Ledger")
+    expect(traceHtml).toContain("Context And Compaction")
     expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
@@ -173,7 +179,7 @@ describe("case trace", () => {
     expect(relations).not.toContain("tool_to_change")
   })
 
-  test("adds v4.1 semantic fields for source locations, compaction ledger, response visibility, and subagent trace refs", async () => {
+  test("adds v4.2 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -229,9 +235,121 @@ describe("case trace", () => {
     expect(response.data.is_final_for_case).toBe(true)
     expect(intermediate.data.is_final_for_case).toBe(false)
     expect(subagent.data.child_session_id).toBe("ses_child_1")
-    expect(subagent.data.child_trace_dir).toBe("subtraces/ses_child_1")
+    expect(subagent.data.child_trace_available).toBe(false)
+    expect(subagent.data.child_trace_dir).toBeUndefined()
+    expect(subagent.data.trace_ref.child_trace_dir).toBeUndefined()
     expect(subagent.data.child_status).toBe("success")
     expect(subagent.data.output_artifact_id).toBeTruthy()
+  })
+
+  test("promotes MCP JSON text facts onto mcp.call records as well as observations", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-mcp-call-facts-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "mcp-call-facts.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const fact = {
+      key: "pricing-owner",
+      path: "src/pricing.mjs",
+      line_start: 1,
+      line_end: 20,
+      fact: "pricing.mjs owns coupon math and promotion stacking.",
+    }
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "mcp", operation: "tool.call", name: "trace-facts:audit_facts", input: { server: "trace-facts", tool: "audit_facts", args: { topic: "pricing" } } })`,
+        `const output = { server: "trace-facts", tool: "audit_facts", content: [{ type: "text", text: ${JSON.stringify(JSON.stringify(fact))} }] }`,
+        `span?.end({ output })`,
+        `CaseTrace.observation({ source: "mcp", category: "trace-facts:audit_facts", summary: "pricing owner", data: output, source_refs: span ? ["span:" + span.id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "mcp-call-facts-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "mcp-call-facts-case", "trace.json"), "utf8")) as any
+    const mcpCall = trace.records.find((record: any) => record.event_type === "mcp.call")
+    const observation = trace.records.find((record: any) => record.event_type === "observation")
+
+    expect(mcpCall.typed_resources[0]).toMatchObject({
+      type: "repo_fact",
+      key: "pricing-owner",
+      fact: "pricing.mjs owns coupon math and promotion stacking.",
+    })
+    expect(mcpCall.source_locations[0]).toMatchObject({
+      path: "src/pricing.mjs",
+      line_start: 1,
+      line_end: 20,
+    })
+    expect(observation.typed_resources[0]).toMatchObject(mcpCall.typed_resources[0])
+  })
+
+  test("records loop decisions as formal facts when processor loop events are observed", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-loop-decision-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "loop-decision.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "already answered" })`,
+        `CaseTrace.event({ component: "processor", event_type: "step.finish", data: { agent: "build", messageID: "msg_1", reason: "stop", part_count: 2, part_types: ["text"], synthetic_continue: false, compaction_continue: false } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "loop-decision-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "loop-decision-case", "trace.json"), "utf8")) as any
+    const loopDecision = trace.records.find((record: any) => record.event_type === "loop.decision")
+
+    expect(loopDecision).toBeTruthy()
+    expect(loopDecision.data).toMatchObject({
+      decision: "stop",
+      reason: "stop",
+      agent: "build",
+      message_id: "msg_1",
+      part_count: 2,
+      part_types: ["text"],
+      has_user_visible_response: true,
+      has_final_answer: true,
+      synthetic_continue: false,
+      compaction_continue: false,
+    })
   })
 
   test("promotes MCP JSON text facts into typed resources and source locations", async () => {
@@ -674,6 +792,139 @@ describe("case trace", () => {
     expect(html).not.toContain("已展示前 120 条")
     expect(html).toContain('class="process-scroll"')
     expect(html).toContain('class="io-scroll"')
+  })
+
+  test("renders v4.2 provenance report with flow-style sections and scrollable IO panes", () => {
+    const trace: ProvenanceTraceSummary = {
+      trace_version: "4.2",
+      manifest: {
+        trace_version: "4.2",
+        case_id: "viewer-v42-case",
+        run_id: "run_viewer_v42",
+        started_at: "2026-06-30T00:00:00.000Z",
+        ended_at: "2026-06-30T00:00:01.000Z",
+        duration_ms: 1000,
+        status: "success",
+        input: { prompt: "fix pricing" },
+        environment: { model: "deepseek/deepseek-v4-pro" },
+        token_usage: { input: 10, output: 5, total: 15 },
+        files: {
+          trace: "trace.json",
+          legacy_trace: "legacy-trace.json",
+          provenance_trace: "provenance-trace.json",
+          trace_html: "trace.html",
+          records: "records.jsonl",
+          raw_events: "raw-events.jsonl",
+          partial_latest: "partial/latest.json",
+        },
+      },
+      records: [
+        {
+          record_id: "llm_1",
+          component: "llm",
+          event_type: "llm.call",
+          timestamp: "2026-06-30T00:00:00.100Z",
+          time_ms: 100,
+          title: "deepseek/deepseek-v4-pro",
+          status: "success",
+          duration_ms: 500,
+          token_usage: { input: 10, output: 5, total: 15 },
+          data: {
+            input: { prompt: "fix pricing" },
+            output: { text: "need tools" },
+            agent: "build",
+            provider_id: "deepseek",
+            model_id: "deepseek-v4-pro",
+          },
+        },
+        {
+          record_id: "mcp_1",
+          component: "mcp",
+          event_type: "mcp.call",
+          timestamp: "2026-06-30T00:00:00.300Z",
+          time_ms: 300,
+          title: "trace-facts:audit_facts",
+          status: "success",
+          source_locations: [{ path: "src/pricing.mjs", line_start: 1, line_end: 20 }],
+          typed_resources: [
+            {
+              type: "repo_fact",
+              key: "pricing-owner",
+              fact: "pricing.mjs owns coupon math.",
+              source_location: { path: "src/pricing.mjs", line_start: 1, line_end: 20 },
+            },
+          ],
+          data: {
+            input: { tool: "audit_facts" },
+            output: { fact: "pricing.mjs owns coupon math." },
+          },
+        },
+        {
+          record_id: "resp_1",
+          component: "result",
+          event_type: "response.output",
+          timestamp: "2026-06-30T00:00:00.900Z",
+          time_ms: 900,
+          title: "Response output 1",
+          source_refs: ["tool_span:span_1"],
+          data: {
+            text: "pricing bug is line 5",
+            response_role: "final_answer",
+            is_final_for_case: true,
+          },
+        },
+      ],
+      dataflow_edges: [
+        {
+          edge_id: "edge_1",
+          from: { type: "node", id: "mcp_1" },
+          to: { type: "node", id: "resp_1" },
+          relation: "consumed",
+          label: "MCP fact used by final response",
+        },
+      ],
+      artifacts: [
+        {
+          artifact_id: "artifact_1",
+          kind: "text",
+          label: "llm.output",
+          path: "artifacts/sha256/artifact_1.txt",
+          length: 120,
+          hash: "hash",
+          preview: "artifact preview",
+          created_at: "2026-06-30T00:00:00.000Z",
+        },
+      ],
+      metrics: {
+        spans: 1,
+        events: 2,
+        records: 3,
+        dataflow_edges: 1,
+        artifacts: 1,
+        token_usage: { input: 10, output: 5, total: 15 },
+      },
+    }
+
+    const html = renderProvenanceTraceHtml(trace)
+
+    for (const id of [
+      "overview",
+      "agent-flow",
+      "component-dataflow",
+      "io-inspector",
+      "semantic-facts",
+      "context-compaction",
+      "artifacts",
+    ]) {
+      expect(html).toContain(`id="${id}"`)
+    }
+    expect(html).toContain("Trace v4.2")
+    expect(html).toContain('class="io-grid"')
+    expect(html).toContain('class="io-input"')
+    expect(html).toContain('class="io-output"')
+    expect(html).toContain("repo_fact")
+    expect(html).toContain("pricing-owner")
+    expect(html).toContain("final_answer")
   })
 
   test("stores large semantic payloads as artifacts and keeps trace.json lightweight", async () => {
