@@ -261,7 +261,10 @@ export OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH=4096
 $OPENCODE_CASE_TRACE_DIR/
   T1-001/
     manifest.json
+    trace.json
+    legacy-trace.json
     provenance-trace.json
+    events.jsonl
     records.jsonl
     raw-events.jsonl
     trace.html
@@ -277,7 +280,10 @@ $OPENCODE_CASE_TRACE_DIR/
 其中：
 
 - `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
-- `provenance-trace.json`：Trace Semantic Contract v4 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
+- `trace.json`：Trace Semantic Contract v4.1 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
+- `legacy-trace.json`：旧版 v1.3 调试摘要，保留 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和旧 `dataflow_edges`。
+- `provenance-trace.json`：兼容别名，内容与 v4.1 `trace.json` 保持一致。新分析链路应优先读取 `trace.json`。
+- `events.jsonl`：旧版事件流，保留用于兼容。
 - `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
 - `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
 - `partial/latest.json`：运行中快照。长时间运行或收到 `SIGINT/SIGTERM/SIGHUP` 时也能保留可查看状态。
@@ -285,7 +291,7 @@ $OPENCODE_CASE_TRACE_DIR/
 - `trace.html`：正式离线可视化报告，包含 Component Dataflow、Execution Timeline、IO Inspector、Context Ledger 和 Artifact Browser。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
 - `viewer.html`：兼容 alias，打开后跳转或提示使用 `trace.html`；新分析链路不应依赖它。
 
-当前实现仍会保留 `events.jsonl`、`trace.json` 作为低层调试和兼容副产物；新分析链路应优先使用 `manifest.json`、`provenance-trace.json` 和 `trace.html`。
+当前实现仍会保留 `events.jsonl`、`legacy-trace.json`、`provenance-trace.json` 作为兼容副产物；新分析链路应优先使用 `manifest.json`、`trace.json` 和 `trace.html`。
 
 > 注意：`OPENCODE_CASE_TRACE=1` 会记录用于复盘的语义信息，可能包含私域代码、工具输出和模型上下文。生产或企业内网环境请把 `OPENCODE_CASE_TRACE_DIR` 指向受控目录，并按企业数据策略管理 trace 文件。
 
@@ -334,7 +340,7 @@ jq '{case_id, status, duration_ms, token_usage, files}' \
   /data/evo-bench/opencode-traces/T1-001/manifest.json
 
 jq '{records: (.records | length), dataflow_edges: (.dataflow_edges | length), artifacts: (.artifacts | length), metrics}' \
-  /data/evo-bench/opencode-traces/T1-001/provenance-trace.json
+  /data/evo-bench/opencode-traces/T1-001/trace.json
 ```
 
 打开可视化报告：
@@ -358,13 +364,13 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. Trace Semantic Contract v4
+## 10. Trace Semantic Contract v4.1
 
-`provenance-trace.json` 的 `trace_version` 为 `"4.0"`。v4 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照和组件间数据流结构化记录下来。
+`trace.json` 的 `trace_version` 为 `"4.1"`。v4.1 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照和组件间数据流结构化记录下来。
 
 主字段：
 
-- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs`、`source_locations` 和 `artifact_refs`。正式 records 不包含 `runtime.event`、流式 delta 或纯 prompt 元数据节点。
+- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs`、`source_locations`、`typed_resources` 和 `artifact_refs`。正式 records 不包含 `runtime.event`、流式 delta 或纯 prompt 元数据节点。
 - `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`、`derived_from`、`verified_by`、`modified_by`。
 - `artifacts`：大文本或结构化大对象索引，完整内容在 `artifacts/sha256/` 下按 hash 去重保存。
 - `metrics`：spans、events、records、dataflow_edges、artifacts 和 token/cost 统计。
@@ -378,7 +384,16 @@ verification:ver_1_xxxxxxxx
 change:chg_1_xxxxxxxx
 ```
 
-大文本不会直接塞进 `provenance-trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `trace.html` 的 artifact 链接查看。
+大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `trace.html` 的 artifact 链接查看。
+
+v4.1 增强了这些语义事实：
+
+- `mcp.call` 和 MCP observation 会尝试解析 text JSON，提取 `typed_resources` 和 `source_locations`，例如 `repo_fact` 的 `key/fact/path/line_start/line_end`。
+- `subagent.call` 会在记录顶层保留 `child_session_id`、`child_trace_dir`、`child_status` 和 `output_artifact_id`，便于离线拼接父子 trace。
+- `response.output` 会标记 `response_role`，区分 `final_answer`、`intermediate_summary`、`subagent_result` 和 `auto_continue_summary`。只有最终用户答案应为 `is_final_for_case: true`。
+- `context.compaction` 的 `context_ledger` 会记录 `ledger_id_quality`，当只能估算 retained/dropped message id 时标记为 `estimated`。
+- `llm.call` 会记录 request-level facts，包括 agent、provider、model、message/tool 数、token/cache 使用和 stop/finish reason。
+- 只重复路径且没有独立语义价值的 `tool_output` observation 不进入正式 records。
 
 `trace.html` 视图：
 
@@ -388,7 +403,7 @@ change:chg_1_xxxxxxxx
 - `Context Ledger`：展示 LLM context package 和 compaction 前后摘要。
 - `Artifacts`：查看大文本 artifact 索引和路径。
 
-`trace.json` 作为兼容副产物保留 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和 `dataflow_edges`。旧版 `final_response_evidence`、`semantic_edges`、`evidence_refs` 不再作为正式输出字段使用。
+`legacy-trace.json` 作为兼容副产物保留旧版 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和 `dataflow_edges`。旧版 `final_response_evidence`、`semantic_edges`、`evidence_refs` 不再作为正式输出字段使用。
 
 语义层会对常见敏感字段做脱敏，包括 `apiKey`、`authorization`、`cookie`、`secret`、`password`、`credential`、`access_token`、`refresh_token`、`auth_token`，以及 `sk-...`、`Bearer ...` 等字符串模式。`token_usage`、`token_estimate`、`tokens`、`inputTokens`、`outputTokens` 等计量字段不会被误脱敏。
 
@@ -408,11 +423,11 @@ echo "$OPENCODE_CASE_TRACE_DIR"
 
 ### trace.html 为空或缺少工具调用
 
-先看 `trace.json` 中是否存在 spans：
+先看 `legacy-trace.json` 中是否存在 spans：
 
 ```bash
 jq '.spans[] | {component, operation, name, status, duration_ms}' \
-  "$OPENCODE_CASE_TRACE_DIR/$OPENCODE_CASE_ID/trace.json"
+  "$OPENCODE_CASE_TRACE_DIR/$OPENCODE_CASE_ID/legacy-trace.json"
 ```
 
 如果没有工具调用，通常说明该 case 没有触发工具，或者模型在失败前还没有发起 tool call。

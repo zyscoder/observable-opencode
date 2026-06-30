@@ -116,6 +116,7 @@ export type TraceContextLedger = {
   dropped_fact_refs?: string[]
   summary_artifact_id?: string
   algorithm?: string
+  ledger_id_quality?: "concrete" | "estimated" | "unknown" | string
 }
 
 export type TraceContextSnapshot = {
@@ -207,6 +208,7 @@ export type TraceResponseSegment = {
   segment_id: string
   response_artifact?: string
   text: TraceFieldSummary
+  response_role?: "final_answer" | "intermediate_summary" | "subagent_result" | "auto_continue_summary" | string
   visibility?: "user_visible" | "internal_continue" | "compaction_followup" | "debug" | string
   turn_index?: number
   is_final_for_case?: boolean
@@ -258,6 +260,7 @@ export type CausalNode = {
   data?: Record<string, unknown>
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
+  typed_resources?: Record<string, unknown>[]
   artifact_refs?: string[]
   metadata?: Record<string, unknown>
 }
@@ -285,7 +288,9 @@ export type TraceManifest = {
   token_usage: TraceTokenUsage
   result?: Record<string, unknown>
   files: {
-    provenance_trace: string
+    trace: string
+    legacy_trace: string
+    provenance_trace?: string
     trace_html: string
     records: string
     raw_events: string
@@ -311,6 +316,7 @@ export type ProvenanceRecord = {
   output_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
+  typed_resources?: Record<string, unknown>[]
   artifact_refs?: string[]
   data?: Record<string, unknown>
   metadata?: Record<string, unknown>
@@ -467,6 +473,7 @@ type ConstraintRecordInput = Omit<TraceConstraintRecord, "constraint_id" | "sour
 type ResponseOutputInput = Omit<TraceResponseSegment, "segment_id" | "text" | "source_refs" | "source_locations"> & {
   segment_id?: string
   text: unknown
+  response_role?: TraceResponseSegment["response_role"]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
@@ -509,6 +516,7 @@ type CausalNodeInput = Omit<CausalNode, "node_id" | "timestamp" | "time_ms" | "d
   data?: Record<string, unknown>
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
+  typed_resources?: Record<string, unknown>[]
   evidence_refs?: string[]
 }
 
@@ -908,6 +916,13 @@ function traceContextLedger(input: {
   const metadata = input.metadata ?? {}
   const retainedCount = safeNumber(input.selected_head_messages) + safeNumber(input.selected_tail_messages)
   const droppedCount = safeNumber(input.hidden_compaction_messages)
+  const hasConcreteIDs = Boolean(
+    input.context_ledger?.retained_message_ids?.length ||
+      input.context_ledger?.dropped_message_ids?.length ||
+      input.context_ledger?.retained_fact_refs?.length ||
+      input.context_ledger?.dropped_fact_refs?.length,
+  )
+  const hasEstimatedIDs = retainedCount > 0 || droppedCount > 0
   return {
     algorithm: stringField(metadata, ["algorithm", "compaction_algorithm"]) ?? input.context_ledger?.algorithm ?? "head-tail-summary",
     token_estimate_before: input.context_ledger?.token_estimate_before ?? input.input_tokens,
@@ -921,6 +936,7 @@ function traceContextLedger(input: {
     retained_fact_refs: input.context_ledger?.retained_fact_refs ?? [],
     dropped_fact_refs: input.context_ledger?.dropped_fact_refs ?? [],
     summary_artifact_id: input.context_ledger?.summary_artifact_id,
+    ledger_id_quality: input.context_ledger?.ledger_id_quality ?? (hasConcreteIDs ? "concrete" : hasEstimatedIDs ? "estimated" : "unknown"),
   }
 }
 
@@ -940,23 +956,78 @@ function enrichSubagentOutput(output: unknown, parentRecordID: string): unknown 
   }
 }
 
-function observationSemanticExtras(source: string, data: unknown): Record<string, unknown> {
+function subagentTraceRef(output: unknown, parentRecordID: string) {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return undefined
+  const record = output as Record<string, unknown>
+  const childSessionID = stringField(record, ["child_session_id", "task_id", "session_id"])
+  if (!childSessionID) return undefined
+  return {
+    parent_record_id: parentRecordID,
+    child_session_id: childSessionID,
+    child_trace_dir: `subtraces/${childSessionID}`,
+    child_status: stringField(record, ["child_status", "status"]) ?? "success",
+  }
+}
+
+function parsedJsonObject(input: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(input)
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+}
+
+function mcpContentItems(data: unknown): unknown[] {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return []
+  const record = data as Record<string, unknown>
+  if (Array.isArray(record.content)) return record.content
+  const output = record.output
+  if (output && typeof output === "object" && !Array.isArray(output) && Array.isArray((output as Record<string, unknown>).content)) {
+    return (output as Record<string, unknown>).content as unknown[]
+  }
+  return []
+}
+
+function mcpSemanticExtras(data: unknown): { typed_resources: Record<string, unknown>[]; source_locations: TraceSourceLocation[] } {
+  const typedResources: Record<string, unknown>[] = []
+  const sourceLocations: TraceSourceLocation[] = []
+  for (const [index, item] of mcpContentItems(data).slice(0, 20).entries()) {
+    const value = item && typeof item === "object" ? (item as Record<string, unknown>) : {}
+    const text = typeof value.text === "string" ? value.text : undefined
+    const parsed = text ? parsedJsonObject(text) : undefined
+    if (parsed && (parsed.fact || parsed.key || parsed.path || parsed.file || parsed.uri)) {
+      const sourceLocation = sourceLocationFromRecord(parsed)
+      if (sourceLocation) sourceLocations.push({ ...sourceLocation })
+      typedResources.push({
+        index,
+        type: "repo_fact",
+        key: stringField(parsed, ["key"]),
+        fact: stringField(parsed, ["fact", "summary", "text"]),
+        source_location: sourceLocation ? { ...sourceLocation } : undefined,
+        text_hash: text ? `sha256:${hash(text)}` : undefined,
+      })
+      continue
+    }
+    typedResources.push({
+      index,
+      type: typeof value.type === "string" ? value.type : typeof item,
+      uri: typeof value.uri === "string" ? value.uri : undefined,
+      text_hash: text ? `sha256:${hash(text)}` : undefined,
+      preview: text?.slice(0, 240),
+    })
+  }
+  return { typed_resources: typedResources, source_locations: dedupeSourceLocations(sourceLocations) }
+}
+
+function observationSemanticExtras(source: string, data: unknown): {
+  typed_resources?: Record<string, unknown>[]
+  source_locations?: TraceSourceLocation[]
+} {
   if (!data || typeof data !== "object" || Array.isArray(data)) return {}
   const record = data as Record<string, unknown>
   if (/mcp/i.test(source)) {
-    const content = Array.isArray(record.content) ? record.content : []
-    return {
-      typed_resources: content.slice(0, 20).map((item, index) => {
-        const value = item && typeof item === "object" ? (item as Record<string, unknown>) : {}
-        return {
-          index,
-          type: typeof value.type === "string" ? value.type : typeof item,
-          uri: typeof value.uri === "string" ? value.uri : undefined,
-          text_hash: typeof value.text === "string" ? `sha256:${hash(value.text)}` : undefined,
-          preview: typeof value.text === "string" ? value.text.slice(0, 240) : undefined,
-        }
-      }),
-    }
+    return mcpSemanticExtras(record)
   }
   if (/skill/i.test(source)) {
     return {
@@ -971,6 +1042,17 @@ function observationSemanticExtras(source: string, data: unknown): Record<string
     }
   }
   return {}
+}
+
+function isWeakObservation(input: ObservationInput) {
+  if (input.category !== "tool_output") return false
+  if (!/tool/i.test(input.source)) return false
+  const summary = typeof input.summary === "string" ? input.summary : ""
+  const data = input.data && typeof input.data === "object" && !Array.isArray(input.data) ? (input.data as Record<string, unknown>) : {}
+  const keys = Object.keys(data)
+  const onlyPathData = keys.length > 0 && keys.every((key) => ["path", "file", "filePath", "uri"].includes(key))
+  const pathLikeSummary = /(^|\/)[^/\s]+\.[a-z0-9]+$/i.test(summary) || summary.includes("/private/")
+  return onlyPathData && pathLikeSummary
 }
 
 function renderTraceHtmlAlias() {
@@ -997,6 +1079,7 @@ class ActiveCaseTrace {
   readonly rawEventsFile: string
   readonly recordsFile: string
   readonly traceFile: string
+  readonly legacyTraceFile: string
   readonly htmlFile: string
   readonly manifestFile: string
   readonly provenanceTraceFile: string
@@ -1047,6 +1130,7 @@ class ActiveCaseTrace {
     this.rawEventsFile = path.join(this.caseDir, "raw-events.jsonl")
     this.recordsFile = path.join(this.caseDir, "records.jsonl")
     this.traceFile = path.join(this.caseDir, "trace.json")
+    this.legacyTraceFile = path.join(this.caseDir, "legacy-trace.json")
     this.htmlFile = path.join(this.caseDir, "trace.html")
     this.manifestFile = path.join(this.caseDir, "manifest.json")
     this.provenanceTraceFile = path.join(this.caseDir, "provenance-trace.json")
@@ -1114,10 +1198,7 @@ class ActiveCaseTrace {
         span_id: id,
         title: input.name ?? input.operation,
         status: "running",
-        data: {
-          operation: input.operation,
-          input: input.input,
-        },
+        data: this.spanStartData(input),
         metadata: input.metadata,
       })
       this.spanNodeIDs.set(id, node.node_id)
@@ -1172,18 +1253,86 @@ class ActiveCaseTrace {
       const node = this.causalNodes.find((item) => item.node_id === nodeID)
       if (node) {
         const output = span.component === "task" ? enrichSubagentOutput(input?.output, nodeID) : input?.output
+        const summarizedOutput =
+          output === undefined ? node.data?.output : this.summarizeCausalValue(output, `${span.component}.${span.operation}.output`)
+        const spanEndData = this.spanEndData(span, input, output, summarizedOutput, usage, error, nodeID)
         node.status = span.status
         node.data = {
           ...(node.data ?? {}),
-          duration_ms: span.duration_ms,
-          output: output === undefined ? node.data?.output : this.summarizeCausalValue(output, `${span.component}.${span.operation}.output`),
-          token_usage: usage,
-          error: error,
+          ...spanEndData,
+        }
+        if (span.component === "mcp") {
+          const extras = mcpSemanticExtras(input?.output)
+          node.typed_resources = extras.typed_resources.length ? extras.typed_resources : node.typed_resources
+          node.source_locations = dedupeSourceLocations([...(node.source_locations ?? []), ...extras.source_locations])
         }
         this.writeRecord("node.update", node)
         this.writePartial()
       }
     }
+  }
+
+  private spanStartData(input: StartSpanInput): Record<string, unknown> {
+    const base: Record<string, unknown> = {
+      operation: input.operation,
+      input: input.input,
+    }
+    if (input.component !== "llm") return base
+    const record = input.input && typeof input.input === "object" && !Array.isArray(input.input) ? (input.input as Record<string, unknown>) : {}
+    const model = record.model && typeof record.model === "object" && !Array.isArray(record.model) ? (record.model as Record<string, unknown>) : {}
+    const [nameProvider, nameModel] = typeof input.name === "string" && input.name.includes("/") ? input.name.split("/", 2) : []
+    return {
+      ...base,
+      request_id: stringField(record, ["request_id", "response_id", "id"]),
+      agent: stringField(record, ["agent"]),
+      provider_id: stringField(model, ["providerID", "provider_id"]) ?? stringField(record, ["providerID", "provider_id"]) ?? nameProvider,
+      model_id: stringField(model, ["id", "modelID", "model_id"]) ?? stringField(record, ["modelID", "model_id"]) ?? nameModel,
+      message_count: numberField(record, ["message_count", "messageCount"]),
+      system_count: numberField(record, ["system_count", "systemCount"]),
+      tool_count: numberField(record, ["tool_count", "toolCount"]),
+      tool_choice: record.tool_choice,
+      input_context_snapshot_ref: stringField(record, ["input_context_snapshot_ref", "context_snapshot_ref"]),
+    }
+  }
+
+  private spanEndData(
+    span: TraceSpan,
+    input: EndSpanInput | undefined,
+    rawOutput: unknown,
+    summarizedOutput: unknown,
+    usage: TraceTokenUsage | undefined,
+    error: TraceError | undefined,
+    nodeID: string,
+  ): Record<string, unknown> {
+    const data: Record<string, unknown> = {
+      duration_ms: span.duration_ms,
+      output: summarizedOutput,
+      token_usage: usage,
+      error,
+    }
+    if (span.component === "llm") {
+      const output = rawOutput && typeof rawOutput === "object" && !Array.isArray(rawOutput) ? (rawOutput as Record<string, unknown>) : {}
+      data.finish_reason = stringField(output, ["finish_reason", "finishReason"])
+      data.stop_reason = stringField(output, ["stop_reason", "stopReason"])
+      data.cache_usage = usage
+        ? {
+            cached_input: usage.cached_input,
+            cache_write: usage.cache_write,
+          }
+        : undefined
+    }
+    if (span.component === "task") {
+      const traceRef = subagentTraceRef(rawOutput, nodeID)
+      if (traceRef) {
+        data.trace_ref = traceRef
+        data.child_session_id = traceRef.child_session_id
+        data.child_trace_dir = traceRef.child_trace_dir
+        data.child_status = traceRef.child_status
+      }
+      const artifactID = this.collectArtifactRefs(summarizedOutput)[0]
+      if (artifactID) data.output_artifact_id = artifactID
+    }
+    return data
   }
 
   event(input: TraceEventInput) {
@@ -1453,8 +1602,13 @@ class ActiveCaseTrace {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
+    const responseRole =
+      input.response_role ??
+      (input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined) ??
+      this.inferResponseRole(visibility)
     const isFinalForCase =
-      input.is_final_for_case ?? (typeof input.metadata?.is_final_for_case === "boolean" ? input.metadata.is_final_for_case : true)
+      input.is_final_for_case ??
+      (typeof input.metadata?.is_final_for_case === "boolean" ? input.metadata.is_final_for_case : responseRole === "final_answer")
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.metadata),
@@ -1463,12 +1617,14 @@ class ActiveCaseTrace {
       ...(input.metadata ?? {}),
       visibility,
       turn_index: turnIndex,
+      response_role: responseRole,
       is_final_for_case: isFinalForCase,
     }
     const segment: TraceResponseSegment = {
       segment_id: input.segment_id ?? semanticID("segment", this.responseSegments.length + 1),
       response_artifact: input.response_artifact,
       text: this.summarizeText(input.text, "result.response.output"),
+      response_role: responseRole,
       visibility,
       turn_index: turnIndex,
       is_final_for_case: isFinalForCase,
@@ -1487,6 +1643,7 @@ class ActiveCaseTrace {
         segment_id: segment.segment_id,
         response_artifact: input.response_artifact,
         text: input.text,
+        response_role: responseRole,
         visibility,
         turn_index: turnIndex,
         is_final_for_case: isFinalForCase,
@@ -1510,6 +1667,43 @@ class ActiveCaseTrace {
       source_refs: input.source_refs ?? input.evidence_refs,
       metadata: input.metadata,
     })
+  }
+
+  private inferResponseRole(visibility: string | undefined): TraceResponseSegment["response_role"] {
+    if (visibility === "internal_continue") return "intermediate_summary"
+    if (visibility === "compaction_followup") return "auto_continue_summary"
+    return "final_answer"
+  }
+
+  private normalizeFinalResponseSegments() {
+    const finalSegments = this.responseSegments.filter((segment) => segment.response_role === "final_answer")
+    const finalSegment = finalSegments.at(-1)
+    for (const segment of this.responseSegments) {
+      const shouldBeFinal = segment === finalSegment
+      if (segment.response_role !== "final_answer") {
+        segment.is_final_for_case = false
+      } else if (!shouldBeFinal) {
+        segment.response_role = "intermediate_summary"
+        segment.is_final_for_case = false
+      } else {
+        segment.is_final_for_case = shouldBeFinal
+      }
+      segment.metadata = {
+        ...(segment.metadata ?? {}),
+        response_role: segment.response_role,
+        is_final_for_case: segment.is_final_for_case,
+      }
+      const node = this.causalNodes.find((item) => item.node_id === `responsenode_${segment.segment_id}`)
+      if (!node?.data) continue
+      node.data.response_role = segment.response_role
+      node.data.is_final_for_case = segment.is_final_for_case
+      const metadata = node.data.metadata && typeof node.data.metadata === "object" ? (node.data.metadata as Record<string, unknown>) : {}
+      node.data.metadata = {
+        ...metadata,
+        response_role: segment.response_role,
+        is_final_for_case: segment.is_final_for_case,
+      }
+    }
   }
 
   designRecord(input: DesignRecordInput) {
@@ -1546,6 +1740,7 @@ class ActiveCaseTrace {
       data: input.data === undefined ? undefined : this.summarizeCausalObject(input.data, `${input.kind}.data`),
       source_refs: input.source_refs ?? input.evidence_refs,
       source_locations: input.source_locations,
+      typed_resources: input.typed_resources,
       artifact_refs: [],
       metadata: input.metadata,
     }
@@ -1572,13 +1767,22 @@ class ActiveCaseTrace {
   }
 
   observation(input: ObservationInput) {
+    if (isWeakObservation(input)) {
+      this.writeRecord("observation.suppressed", {
+        source: input.source,
+        category: input.category,
+        reason: "path-only tool_output observation has no independent attribution value",
+      })
+      return undefined
+    }
     const sourceRefs = input.source_refs ?? input.evidence_refs
+    const semanticExtras = observationSemanticExtras(input.source, input.data)
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.data),
       ...collectSourceLocations(input.metadata),
+      ...(semanticExtras.source_locations ?? []),
     ])
-    const semanticExtras = observationSemanticExtras(input.source, input.data)
     const node = this.node({
       kind: "observation",
       component: this.componentForObservationSource(input.source),
@@ -1591,11 +1795,12 @@ class ActiveCaseTrace {
         summary: input.summary,
         data: input.data,
         source_locations: sourceLocations,
-        ...semanticExtras,
+        typed_resources: semanticExtras.typed_resources,
         metadata: input.metadata,
       },
       source_refs: sourceRefs,
       source_locations: sourceLocations,
+      typed_resources: semanticExtras.typed_resources,
       metadata: input.metadata,
     })
     for (const ref of sourceRefs ?? []) {
@@ -1614,6 +1819,19 @@ class ActiveCaseTrace {
   compaction(input: CompactionRecordInput) {
     const sourceRefs = input.source_refs ?? input.evidence_refs
     const contextLedger = traceContextLedger(input)
+    const previousSummary =
+      input.previous_summary === undefined
+        ? undefined
+        : this.summarizeCausalValue(input.previous_summary, "context.compaction.previous_summary")
+    const serializedTail =
+      input.serialized_tail === undefined
+        ? undefined
+        : this.summarizeCausalValue(input.serialized_tail, "context.compaction.serialized_tail")
+    const outputSummary =
+      input.output_summary === undefined
+        ? undefined
+        : this.summarizeCausalValue(input.output_summary, "context.compaction.output_summary")
+    contextLedger.summary_artifact_id = contextLedger.summary_artifact_id ?? this.collectArtifactRefs(outputSummary)[0]
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -1630,9 +1848,9 @@ class ActiveCaseTrace {
         selected_head_messages: input.selected_head_messages,
         selected_tail_messages: input.selected_tail_messages,
         hidden_compaction_messages: input.hidden_compaction_messages,
-        previous_summary: input.previous_summary,
-        serialized_tail: input.serialized_tail,
-        output_summary: input.output_summary,
+        previous_summary: previousSummary,
+        serialized_tail: serializedTail,
+        output_summary: outputSummary,
         context_ledger: contextLedger,
         auto_continue: input.auto_continue,
         result: input.result,
@@ -1666,6 +1884,7 @@ class ActiveCaseTrace {
   finish(input?: FinishTraceInput) {
     if (this.finished) return
     this.evaluateConstraints()
+    this.normalizeFinalResponseSegments()
     this.finished = true
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
@@ -1677,7 +1896,8 @@ class ActiveCaseTrace {
     this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
     this.writePartial(true, provenance)
-    this.safeWrite(this.traceFile, jsonPretty(summary))
+    this.safeWrite(this.traceFile, jsonPretty(provenance))
+    this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
     this.safeWrite(this.viewerFile, renderTraceHtmlAlias())
   }
@@ -1728,6 +1948,8 @@ class ActiveCaseTrace {
       token_usage: this.tokenUsage,
       result: this.result,
       files: {
+        trace: "trace.json",
+        legacy_trace: "legacy-trace.json",
         provenance_trace: "provenance-trace.json",
         trace_html: "trace.html",
         records: "records.jsonl",
@@ -1780,6 +2002,7 @@ class ActiveCaseTrace {
         error: node.data?.error,
         source_refs: node.source_refs,
         source_locations: node.source_locations,
+        typed_resources: node.typed_resources,
         artifact_refs: node.artifact_refs,
         data: node.data,
         metadata: node.metadata,

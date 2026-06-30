@@ -54,12 +54,46 @@ function sourceLocations(record: ProvenanceRecord) {
     .join("")
 }
 
+function typedResources(record: ProvenanceRecord) {
+  const resources =
+    record.typed_resources ??
+    (record.data?.typed_resources && Array.isArray(record.data.typed_resources)
+      ? (record.data.typed_resources as Record<string, unknown>[])
+      : [])
+  if (!resources.length) return `<span class="muted">-</span>`
+  return resources
+    .map((resource) => {
+      const label = [resource.type, resource.key, resource.name, resource.uri].filter(Boolean).join(" ")
+      const location =
+        resource.source_location && typeof resource.source_location === "object"
+          ? sourceLocationLabel(resource.source_location as Record<string, unknown>)
+          : ""
+      return `<div class="typed-resource">
+        <code>${escapeHtml(label || JSON.stringify(resource))}</code>
+        ${resource.fact ? `<div>${escapeHtml(resource.fact)}</div>` : ""}
+        ${location ? `<div class="muted">${escapeHtml(location)}</div>` : ""}
+      </div>`
+    })
+    .join("")
+}
+
+function sourceLocationLabel(location: Record<string, unknown>) {
+  const target = typeof location.uri === "string" ? location.uri : typeof location.path === "string" ? location.path : ""
+  const start = typeof location.line_start === "number" ? location.line_start : undefined
+  const end = typeof location.line_end === "number" ? location.line_end : undefined
+  if (!target) return ""
+  if (start === undefined) return target
+  return end && end !== start ? `${target}:${start}-${end}` : `${target}:${start}`
+}
+
 function renderRecord(record: ProvenanceRecord, artifacts: Map<string, TraceArtifact>) {
+  const responseRole = typeof record.data?.response_role === "string" ? record.data.response_role : undefined
   return `<article class="node node-${escapeHtml(record.event_type.replace(/[^a-z0-9_-]/gi, "-"))}">
     <div class="node-head">
       <span class="kind">${escapeHtml(record.event_type)}</span>
       <strong>${escapeHtml(record.title ?? record.record_id)}</strong>
       ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+      ${responseRole ? `<span class="status">role: ${escapeHtml(responseRole)}</span>` : ""}
       <span class="muted">${escapeHtml(record.record_id)}</span>
     </div>
     <div class="node-grid">
@@ -72,6 +106,8 @@ function renderRecord(record: ProvenanceRecord, artifacts: Map<string, TraceArti
         <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
         <div class="label">Source Locations</div>
         <div class="refs source-locations">${sourceLocations(record)}</div>
+        <div class="label">Typed Resources</div>
+        <div class="refs typed-resources">${typedResources(record)}</div>
         <div class="label">Artifacts</div>
         <div class="refs">${artifactLinks(record.artifact_refs, artifacts)}</div>
       </div>
@@ -192,6 +228,8 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .refs { overflow-x: auto; white-space: nowrap; padding: 6px 0; }
     .source-locations { white-space: normal; display: grid; gap: 8px; }
     .source-location pre { max-height: 120px; white-space: pre; }
+    .typed-resources { white-space: normal; display: grid; gap: 8px; }
+    .typed-resource { padding: 6px; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
     .empty { color: var(--muted); font-size: 13px; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     a { color: #0369a1; }
