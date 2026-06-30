@@ -1818,6 +1818,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             !hasToolCalls &&
             lastUser.id < lastAssistant.id
           ) {
+            CaseTrace.exitGate({
+              session_id: sessionID,
+              message_id: lastAssistant.id,
+              has_final_answer: true,
+              needs_compaction: false,
+              auto_continue: false,
+              synthetic_continue: false,
+              continuation_source: "none",
+              decision: "exit",
+              reason: "assistant_finished_without_pending_tools",
+              metadata: {
+                step,
+                finish: lastAssistant.finish,
+                last_user_id: lastUser.id,
+                last_assistant_id: lastAssistant.id,
+                has_tool_calls: hasToolCalls,
+              },
+            })
             yield* slog.info("exiting loop")
             break
           }
@@ -1856,6 +1874,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               step,
             },
           })
+          CaseTrace.agentLifecycle({
+            session_id: sessionID,
+            message_id: lastUser.id,
+            agent: lastUser.agent,
+            phase: "turn.started",
+            status: "running",
+            summary: {
+              step,
+              pending_task_count: tasks.length,
+              has_tool_calls: hasToolCalls,
+            },
+            metadata: {
+              last_user_id: lastUser.id,
+              last_assistant_id: lastAssistant?.id,
+              last_finished_id: lastFinished?.id,
+            },
+          })
           if (step === 1)
             yield* title({
               session,
@@ -1868,11 +1903,37 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
+            CaseTrace.agentLifecycle({
+              session_id: sessionID,
+              message_id: task.id,
+              agent: lastUser.agent,
+              phase: "subagent.resume",
+              status: "running",
+              summary: {
+                step,
+                task_id: task.id,
+              },
+            })
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             continue
           }
 
           if (task?.type === "compaction") {
+            CaseTrace.exitGate({
+              session_id: sessionID,
+              message_id: task.id,
+              has_final_answer: false,
+              needs_compaction: true,
+              auto_continue: task.auto,
+              synthetic_continue: true,
+              continuation_source: "compaction",
+              decision: "continue",
+              reason: task.overflow ? "overflow_compaction_task" : "scheduled_compaction_task",
+              metadata: {
+                step,
+                overflow: task.overflow,
+              },
+            })
             const result = yield* compaction.process({
               messages: msgs,
               parentID: lastUser.id,
@@ -1889,6 +1950,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
+            CaseTrace.exitGate({
+              session_id: sessionID,
+              message_id: lastFinished.id,
+              has_final_answer: false,
+              needs_compaction: true,
+              auto_continue: true,
+              synthetic_continue: true,
+              continuation_source: "compaction",
+              decision: "continue",
+              reason: "last_finished_overflow",
+              metadata: {
+                step,
+                finish: lastFinished.finish,
+              },
+            })
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
             continue
           }
@@ -2140,6 +2216,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             if (result === "stop") return "break" as const
             if (result === "compact") {
+              CaseTrace.exitGate({
+                session_id: sessionID,
+                message_id: handle.message.id,
+                has_final_answer: false,
+                needs_compaction: true,
+                auto_continue: true,
+                synthetic_continue: true,
+                continuation_source: "compaction",
+                decision: "continue",
+                reason: "processor_requested_compaction",
+                metadata: {
+                  step,
+                  finish: handle.message.finish,
+                },
+              })
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,

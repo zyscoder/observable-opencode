@@ -34,6 +34,15 @@ type Result = Awaited<ReturnType<typeof streamText>>
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
   mergeDeep(target, source ?? {}) as Record<string, any>
 
+function traceAgentRole(input: { agent: Agent.Info; parentSessionID?: string; small?: boolean }) {
+  const name = input.agent.name.toLowerCase()
+  if (name === "title") return "title"
+  if (name === "compaction") return "compaction"
+  if (input.parentSessionID) return "subagent"
+  if (input.small) return "background"
+  return "main"
+}
+
 export type StreamInput = {
   user: MessageV2.User
   sessionID: string
@@ -586,10 +595,46 @@ const live: Layer.Layer<
                 label: "Final model input prepared before provider stream",
               })
             }
+            const turnID = span?.id ?? `${input.sessionID}:${input.user.id}:${Date.now()}`
+            const turnStarted = Date.now()
+            const agentRole = traceAgentRole(input)
+            CaseTrace.llmTurn({
+              turn_id: turnID,
+              span_id: span?.id,
+              session_id: input.sessionID,
+              parent_session_id: input.parentSessionID,
+              message_id: input.user.id,
+              agent: input.agent.name,
+              agent_role: agentRole,
+              provider_id: input.model.providerID,
+              model_id: input.model.id,
+              status: "running",
+              is_background: agentRole === "title" || agentRole === "background",
+              input_context_refs: contextSnapshot ? [`context_snapshot:${contextSnapshot.snapshot_id}`] : undefined,
+              source_refs: contextSnapshot ? [`context_snapshot:${contextSnapshot.snapshot_id}`] : undefined,
+              metadata: {
+                tool_choice: input.toolChoice,
+                mode: input.agent.mode,
+                small: input.small ?? false,
+              },
+            })
             const result = yield* run({ ...input, abort: ctrl.signal })
             const traced = async function* () {
+              let finishReason: string | undefined
+              let stopReason: string | undefined
+              let tokenUsage: unknown
+              let requestID: string | undefined
               try {
                 for await (const event of result.fullStream) {
+                  const eventRecord = event as Record<string, any>
+                  if (eventRecord.response?.id && typeof eventRecord.response.id === "string")
+                    requestID = eventRecord.response.id
+                  if (eventRecord.finishReason && typeof eventRecord.finishReason === "string")
+                    finishReason = eventRecord.finishReason
+                  if (eventRecord.stopReason && typeof eventRecord.stopReason === "string")
+                    stopReason = eventRecord.stopReason
+                  if (eventRecord.usage) tokenUsage = eventRecord.usage
+                  if (eventRecord.totalUsage) tokenUsage = eventRecord.totalUsage
                   span?.event({
                     event_type: `stream.${event.type}`,
                     data:
@@ -602,12 +647,53 @@ const live: Layer.Layer<
                 span?.end({
                   output: {
                     completed: true,
+                    finish_reason: finishReason,
+                    stop_reason: stopReason,
+                    request_id: requestID,
                   },
+                  tokenUsage,
+                })
+                CaseTrace.llmTurn({
+                  turn_id: turnID,
+                  span_id: span?.id,
+                  session_id: input.sessionID,
+                  parent_session_id: input.parentSessionID,
+                  message_id: input.user.id,
+                  agent: input.agent.name,
+                  agent_role: agentRole,
+                  provider_id: input.model.providerID,
+                  model_id: input.model.id,
+                  request_id: requestID,
+                  status: "success",
+                  duration_ms: Math.max(0, Date.now() - turnStarted),
+                  finish_reason: finishReason,
+                  stop_reason: stopReason,
+                  token_usage: tokenUsage,
+                  is_background: agentRole === "title" || agentRole === "background",
+                  source_refs: span ? [`span:${span.id}`] : undefined,
                 })
               } catch (error) {
                 span?.end({
                   status: "error",
                   error,
+                })
+                CaseTrace.llmTurn({
+                  turn_id: turnID,
+                  span_id: span?.id,
+                  session_id: input.sessionID,
+                  parent_session_id: input.parentSessionID,
+                  message_id: input.user.id,
+                  agent: input.agent.name,
+                  agent_role: agentRole,
+                  provider_id: input.model.providerID,
+                  model_id: input.model.id,
+                  status: "error",
+                  duration_ms: Math.max(0, Date.now() - turnStarted),
+                  is_background: agentRole === "title" || agentRole === "background",
+                  source_refs: span ? [`span:${span.id}`] : undefined,
+                  metadata: {
+                    error,
+                  },
                 })
                 throw error
               }

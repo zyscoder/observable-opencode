@@ -120,6 +120,8 @@ export type TraceContextLedger = {
   retained_fact_refs?: string[]
   dropped_fact_refs?: string[]
   summary_artifact_id?: string
+  auto_continue_prompt_ref?: string
+  quality_flags?: string[]
   algorithm?: string
   ledger_id_quality?: "concrete" | "estimated" | "unknown" | string
 }
@@ -238,6 +240,72 @@ export type TraceDesignRecord = {
   metadata?: Record<string, unknown>
 }
 
+export type TraceLlmTurnRecord = {
+  turn_id: string
+  span_id?: string
+  session_id?: string
+  parent_session_id?: string
+  message_id?: string
+  agent?: string
+  agent_role?: "main" | "subagent" | "compaction" | "title" | "background" | string
+  provider_id?: string
+  model_id?: string
+  input_context_refs?: string[]
+  prompt_transform_refs?: string[]
+  tool_schema_ref?: string
+  request_id?: string
+  status?: TraceStatus
+  duration_ms?: number
+  finish_reason?: string
+  stop_reason?: string
+  token_usage?: TraceTokenUsage
+  is_background?: boolean
+  source_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceAgentLifecycleRecord = {
+  lifecycle_id: string
+  span_id?: string
+  session_id?: string
+  message_id?: string
+  agent?: string
+  phase: string
+  status?: TraceStatus | TraceVerificationRecord["status"]
+  summary?: TraceFieldSummary
+  source_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceExitGateRecord = {
+  gate_id: string
+  span_id?: string
+  session_id?: string
+  message_id?: string
+  has_final_answer?: boolean
+  needs_compaction?: boolean
+  auto_continue?: boolean
+  synthetic_continue?: boolean
+  continuation_source?: "user" | "compaction" | "system" | "none" | string
+  decision: "continue" | "exit" | "wait" | "cancel" | string
+  reason?: string
+  source_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceEvidenceFact = {
+  fact_id: string
+  span_id?: string
+  source: string
+  category?: string
+  summary: TraceFieldSummary
+  data?: TraceFieldSummary
+  confidence?: "observed" | "inferred" | string
+  source_refs?: string[]
+  source_locations?: TraceSourceLocation[]
+  metadata?: Record<string, unknown>
+}
+
 export type CausalNodeKind =
   | "run.start"
   | "task.loop"
@@ -246,6 +314,9 @@ export type CausalNodeKind =
   | "context.pack"
   | "context.compaction"
   | "llm.call"
+  | "llm.turn"
+  | "agent.lifecycle"
+  | "exit.gate"
   | "decision"
   | "tool.call"
   | "mcp.call"
@@ -253,6 +324,7 @@ export type CausalNodeKind =
   | "subagent.call"
   | "loop.decision"
   | "observation"
+  | "evidence.fact"
   | "change"
   | "verification"
   | "response.output"
@@ -359,6 +431,7 @@ export type DataflowEdge = {
     | "returned_to"
     | "delegated_to"
     | "reported_to"
+    | "supported_response"
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -526,6 +599,34 @@ type DesignRecordInput = Omit<
   tradeoffs?: unknown
   risks?: unknown
   test_strategy?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+}
+
+type LlmTurnInput = Omit<TraceLlmTurnRecord, "turn_id" | "token_usage" | "source_refs"> & {
+  turn_id?: string
+  token_usage?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+}
+
+type AgentLifecycleInput = Omit<TraceAgentLifecycleRecord, "lifecycle_id" | "summary" | "source_refs"> & {
+  lifecycle_id?: string
+  summary?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+}
+
+type ExitGateInput = Omit<TraceExitGateRecord, "gate_id" | "source_refs"> & {
+  gate_id?: string
+  source_refs?: string[]
+  evidence_refs?: string[]
+}
+
+type EvidenceFactInput = Omit<TraceEvidenceFact, "fact_id" | "summary" | "data" | "source_refs"> & {
+  fact_id?: string
+  summary: unknown
+  data?: unknown
   source_refs?: string[]
   evidence_refs?: string[]
 }
@@ -1088,6 +1189,7 @@ function traceContextLedger(input: {
   selected_tail_messages?: number
   hidden_compaction_messages?: number
   output_summary?: unknown
+  auto_continue?: boolean
   context_ledger?: TraceContextLedger
   metadata?: Record<string, unknown>
 }): TraceContextLedger {
@@ -1101,6 +1203,12 @@ function traceContextLedger(input: {
       input.context_ledger?.dropped_fact_refs?.length,
   )
   const hasEstimatedIDs = retainedCount > 0 || droppedCount > 0
+  const qualityFlags = new Set<string>(input.context_ledger?.quality_flags ?? [])
+  if (!input.input_tokens && !input.context_ledger?.token_estimate_before) qualityFlags.add("missing_token_estimate")
+  if (!hasConcreteIDs) qualityFlags.add("message_ids_estimated_or_missing")
+  if (input.auto_continue) qualityFlags.add("auto_continue_enabled")
+  if (!input.context_ledger?.summary_artifact_id && input.output_summary !== undefined)
+    qualityFlags.add("summary_artifact_pending")
   return {
     algorithm:
       stringField(metadata, ["algorithm", "compaction_algorithm"]) ??
@@ -1121,6 +1229,9 @@ function traceContextLedger(input: {
     retained_fact_refs: input.context_ledger?.retained_fact_refs ?? [],
     dropped_fact_refs: input.context_ledger?.dropped_fact_refs ?? [],
     summary_artifact_id: input.context_ledger?.summary_artifact_id,
+    auto_continue_prompt_ref:
+      input.context_ledger?.auto_continue_prompt_ref ?? stringField(metadata, ["auto_continue_prompt_ref"]),
+    quality_flags: [...qualityFlags],
     ledger_id_quality:
       input.context_ledger?.ledger_id_quality ??
       (hasConcreteIDs ? "concrete" : hasEstimatedIDs ? "estimated" : "unknown"),
@@ -1352,6 +1463,15 @@ function mergeTypedResources(
   })
 }
 
+function mergeRefs(current: string[] | undefined, next: string[] | undefined) {
+  const merged = [...(current ?? []), ...(next ?? [])]
+  return merged.length ? merged.filter((item, index, array) => array.indexOf(item) === index) : undefined
+}
+
+function omitUndefined(input: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined))
+}
+
 function isWeakObservation(input: ObservationInput) {
   if (input.category !== "tool_output") return false
   if (!/tool/i.test(input.source)) return false
@@ -1364,6 +1484,13 @@ function isWeakObservation(input: ObservationInput) {
   const onlyPathData = keys.length > 0 && keys.every((key) => ["path", "file", "filePath", "uri"].includes(key))
   const pathLikeSummary = /(^|\/)[^/\s]+\.[a-z0-9]+$/i.test(summary) || summary.includes("/private/")
   return onlyPathData && pathLikeSummary
+}
+
+function isEvidenceWorthyObservation(input: ObservationInput) {
+  if (isWeakObservation(input)) return false
+  if (/tool|mcp|skill|subagent|task|verification|grep|read|bash|file/i.test(input.source)) return true
+  if (input.category && /tool|mcp|skill|subagent|verification|test|file|grep|read/i.test(input.category)) return true
+  return false
 }
 
 class ActiveCaseTrace {
@@ -1413,6 +1540,7 @@ class ActiveCaseTrace {
   private recentPromptNodeIDs: string[] = []
   private recentContextNodeIDs: string[] = []
   private recentLLMNodeIDs: string[] = []
+  private recentEvidenceNodeIDs: string[] = []
   private recentVerificationIDs: string[] = []
   private recentChangeIDs: string[] = []
   private recentToolSpanIDs: string[] = []
@@ -2187,6 +2315,164 @@ class ActiveCaseTrace {
     return design
   }
 
+  llmTurn(input: LlmTurnInput) {
+    const turnID = input.turn_id ?? input.span_id ?? semanticID("llmturn", this.causalNodes.length + 1)
+    const usage = input.token_usage ? normalizeTokenUsage(input.token_usage) : undefined
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const data: Record<string, unknown> = omitUndefined({
+      turn_id: turnID,
+      span_id: input.span_id,
+      session_id: input.session_id,
+      parent_session_id: input.parent_session_id,
+      message_id: input.message_id,
+      agent: input.agent,
+      agent_role: input.agent_role,
+      provider_id: input.provider_id,
+      model_id: input.model_id,
+      input_context_refs: input.input_context_refs,
+      prompt_transform_refs: input.prompt_transform_refs,
+      tool_schema_ref: input.tool_schema_ref,
+      request_id: input.request_id,
+      status: input.status,
+      duration_ms: input.duration_ms,
+      finish_reason: input.finish_reason,
+      stop_reason: input.stop_reason,
+      token_usage: cloneTokenUsage(usage),
+      is_background: input.is_background,
+      metadata: input.metadata,
+    })
+    const nodeID = `llmturn_${turnID}`
+    const existing = this.causalNodes.find((item) => item.node_id === nodeID)
+    if (existing) {
+      existing.status = input.status ?? existing.status
+      existing.data = {
+        ...(existing.data ?? {}),
+        ...data,
+      }
+      existing.source_refs = mergeRefs(existing.source_refs, sourceRefs)
+      existing.artifact_refs = this.collectArtifactRefs(existing.data)
+      this.writeRecord("node.update", existing)
+      this.writePartial()
+      return existing
+    }
+    const node = this.node({
+      node_id: nodeID,
+      kind: "llm.turn",
+      component: "llm",
+      span_id: input.span_id,
+      title: `${input.agent ?? "agent"} ${input.provider_id ?? "provider"}/${input.model_id ?? "model"}`,
+      status: input.status ?? "running",
+      data,
+      source_refs: sourceRefs,
+      metadata: input.metadata,
+    })
+    if (input.span_id) {
+      this.causalEdge({
+        from: { type: "span", id: input.span_id, label: "llm.call" },
+        to: { type: "llm_turn", id: turnID, label: "llm.turn" },
+        relation: "derived_from",
+        label: "LLM turn normalized from provider span",
+      })
+    }
+    return node
+  }
+
+  agentLifecycle(input: AgentLifecycleInput) {
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    return this.node({
+      node_id: `lifecycle_${input.lifecycle_id ?? semanticID("life", this.causalNodes.length + 1)}`,
+      kind: "agent.lifecycle",
+      component: "processor",
+      span_id: input.span_id,
+      title: input.phase,
+      status: input.status,
+      data: {
+        lifecycle_id: input.lifecycle_id,
+        session_id: input.session_id,
+        message_id: input.message_id,
+        agent: input.agent,
+        phase: input.phase,
+        status: input.status,
+        summary:
+          input.summary === undefined ? undefined : this.summarizeCausalValue(input.summary, "agent.lifecycle.summary"),
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      metadata: input.metadata,
+    })
+  }
+
+  exitGate(input: ExitGateInput) {
+    const gateID = input.gate_id ?? semanticID("gate", this.causalNodes.length + 1)
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    return this.node({
+      node_id: `exitgate_${gateID}`,
+      kind: "exit.gate",
+      component: "processor",
+      span_id: input.span_id,
+      title: input.decision,
+      status: input.decision === "cancel" ? "cancelled" : "success",
+      data: {
+        gate_id: gateID,
+        session_id: input.session_id,
+        message_id: input.message_id,
+        has_final_answer: input.has_final_answer,
+        needs_compaction: input.needs_compaction,
+        auto_continue: input.auto_continue,
+        synthetic_continue: input.synthetic_continue,
+        continuation_source: input.continuation_source,
+        decision: input.decision,
+        reason: input.reason,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      metadata: input.metadata,
+    })
+  }
+
+  evidenceFact(input: EvidenceFactInput) {
+    const factID = input.fact_id ?? semanticID("fact", this.causalNodes.length + 1)
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const sourceLocations = dedupeSourceLocations([
+      ...(input.source_locations ?? []),
+      ...collectSourceLocations(input.data),
+      ...collectSourceLocations(input.metadata),
+    ])
+    const node = this.node({
+      node_id: `evidence_${factID}`,
+      kind: "evidence.fact",
+      component: this.componentForObservationSource(input.source),
+      span_id: input.span_id,
+      title: input.category ?? input.source,
+      status: "success",
+      data: {
+        fact_id: factID,
+        source: input.source,
+        category: input.category,
+        summary: input.summary,
+        data: input.data,
+        confidence: input.confidence ?? "observed",
+        source_locations: sourceLocations,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      source_locations: sourceLocations,
+      metadata: input.metadata,
+    })
+    this.remember(this.recentEvidenceNodeIDs, node.node_id)
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "evidence", id: node.node_id, label: "evidence.fact" },
+        relation: "derived_from",
+        label: "Evidence fact derived from source record",
+      })
+    }
+    return node
+  }
+
   node(input: CausalNodeInput) {
     const node: CausalNode = {
       node_id: input.node_id ?? semanticID("node", this.causalNodes.length + 1),
@@ -2280,6 +2566,19 @@ class ActiveCaseTrace {
         label: "Observation produced from source record",
       })
     }
+    if (isEvidenceWorthyObservation(input)) {
+      this.evidenceFact({
+        source: input.source,
+        category: input.category,
+        summary: input.summary,
+        data: input.data,
+        span_id: input.span_id,
+        source_refs: [`observation:${node.node_id}`],
+        source_locations: sourceLocations,
+        confidence: "observed",
+        metadata: input.metadata,
+      })
+    }
     return node
   }
 
@@ -2299,6 +2598,9 @@ class ActiveCaseTrace {
         ? undefined
         : this.summarizeCausalValue(input.output_summary, "context.compaction.output_summary")
     contextLedger.summary_artifact_id = contextLedger.summary_artifact_id ?? this.collectArtifactRefs(outputSummary)[0]
+    if (contextLedger.summary_artifact_id && contextLedger.quality_flags?.includes("summary_artifact_pending")) {
+      contextLedger.quality_flags = contextLedger.quality_flags.filter((flag) => flag !== "summary_artifact_pending")
+    }
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -2345,6 +2647,7 @@ class ActiveCaseTrace {
       ...this.recentContextNodeIDs.slice(-3).map((id) => `context:${id}`),
       ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
       ...this.recentLLMNodeIDs.slice(-2).map((id) => `llm:${id}`),
+      ...this.recentEvidenceNodeIDs.slice(-6).map((id) => `evidence:${id}`),
       ...this.recentToolSpanIDs.slice(-3).map((id) => `tool_span:${id}`),
       ...this.recentVerificationIDs.slice(-3).map((id) => `verification:${id}`),
       ...this.recentChangeIDs.slice(-3).map((id) => `change:${id}`),
@@ -2662,8 +2965,11 @@ class ActiveCaseTrace {
     this.causalEdge({
       from: parsed,
       to: { type: "node", id: responseNodeID, label: "response.output" },
-      relation: "source_to_response",
-      label: "Response output consumed source record",
+      relation: parsed.type === "evidence" ? "evidence_to_response" : "source_to_response",
+      label:
+        parsed.type === "evidence"
+          ? "Evidence fact supported response output"
+          : "Response output consumed source record",
     })
   }
 
@@ -2988,6 +3294,22 @@ export namespace CaseTrace {
 
   export function designRecord(input: DesignRecordInput) {
     return get()?.designRecord(input)
+  }
+
+  export function llmTurn(input: LlmTurnInput) {
+    return get()?.llmTurn(input)
+  }
+
+  export function agentLifecycle(input: AgentLifecycleInput) {
+    return get()?.agentLifecycle(input)
+  }
+
+  export function exitGate(input: ExitGateInput) {
+    return get()?.exitGate(input)
+  }
+
+  export function evidenceFact(input: EvidenceFactInput) {
+    return get()?.evidenceFact(input)
   }
 
   export function node(input: CausalNodeInput) {

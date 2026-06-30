@@ -655,6 +655,23 @@ export const layer: Layer.Layer<
                 step: ctx.currentStep,
               },
             })
+            const overflow = isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
+            CaseTrace.agentLifecycle({
+              session_id: ctx.sessionID,
+              message_id: ctx.assistantMessage.id,
+              agent: ctx.assistantMessage.agent,
+              phase: "llm.step.finished",
+              status: "success",
+              summary: {
+                finish_reason: value.finishReason,
+                tokens: usage.tokens,
+                cost: usage.cost,
+                needs_compaction: overflow,
+              },
+              metadata: {
+                step: ctx.currentStep,
+              },
+            })
             CaseTrace.decision({
               component: "processor",
               decision_type: "llm_step_finish",
@@ -664,7 +681,7 @@ export const layer: Layer.Layer<
                 finish_reason: value.finishReason,
                 tokens: usage.tokens,
                 cost: usage.cost,
-                needs_compaction: isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model }),
+                needs_compaction: overflow,
               },
               metadata: {
                 sessionID: ctx.sessionID,
@@ -719,11 +736,20 @@ export const layer: Layer.Layer<
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
-            if (
-              !ctx.assistantMessage.summary &&
-              isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
-            ) {
+            if (!ctx.assistantMessage.summary && overflow) {
               ctx.needsCompaction = true
+              CaseTrace.agentLifecycle({
+                session_id: ctx.sessionID,
+                message_id: ctx.assistantMessage.id,
+                agent: ctx.assistantMessage.agent,
+                phase: "compaction.required",
+                status: "running",
+                summary: {
+                  trigger: "overflow",
+                  finish_reason: value.finishReason,
+                  tokens: usage.tokens,
+                },
+              })
             }
             return
           }
@@ -796,6 +822,18 @@ export const layer: Layer.Layer<
               metadata: {
                 sessionID: ctx.sessionID,
                 messageID: ctx.assistantMessage.id,
+                partID: ctx.currentText.id,
+              },
+            })
+            CaseTrace.agentLifecycle({
+              session_id: ctx.sessionID,
+              message_id: ctx.assistantMessage.id,
+              agent: ctx.assistantMessage.agent,
+              phase: "response.completed",
+              status: "success",
+              summary: ctx.currentText.text,
+              source_refs: responseSegment ? [`response_segment:${responseSegment.segment_id}`] : undefined,
+              metadata: {
                 partID: ctx.currentText.id,
               },
             })
@@ -1048,6 +1086,28 @@ export const layer: Layer.Layer<
             blocked: ctx.blocked,
             needsCompaction: ctx.needsCompaction,
             hasError: Boolean(ctx.assistantMessage.error),
+          },
+        })
+        const hasFinalAnswer = Boolean(
+          ctx.assistantMessage.finish &&
+            !["tool-calls", "unknown"].includes(ctx.assistantMessage.finish) &&
+            !ctx.assistantMessage.error,
+        )
+        CaseTrace.exitGate({
+          span_id: span?.id,
+          session_id: ctx.sessionID,
+          message_id: ctx.assistantMessage.id,
+          has_final_answer: hasFinalAnswer,
+          needs_compaction: ctx.needsCompaction,
+          auto_continue: result === "compact",
+          synthetic_continue: false,
+          continuation_source: result === "compact" ? "compaction" : result === "continue" ? "system" : "none",
+          decision: result === "stop" || hasFinalAnswer ? "exit" : result === "compact" ? "continue" : "continue",
+          reason: result,
+          metadata: {
+            blocked: ctx.blocked,
+            hasError: Boolean(ctx.assistantMessage.error),
+            finish: ctx.assistantMessage.finish,
           },
         })
         CaseTrace.event({

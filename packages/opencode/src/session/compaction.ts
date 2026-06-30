@@ -626,6 +626,7 @@ export const layer: Layer.Layer<
         return "stop"
       }
 
+      let autoContinuePromptRef: string | undefined
       if (result === "continue" && input.auto) {
         if (replay) {
           const original = replay.info
@@ -640,6 +641,7 @@ export const layer: Layer.Layer<
             tools: original.tools,
             system: original.system,
           })
+          autoContinuePromptRef = `message:${replayMsg.id}`
           for (const part of replay.parts) {
             if (part.type === "compaction") continue
             const replayPart =
@@ -683,6 +685,7 @@ export const layer: Layer.Layer<
               agent: userMessage.agent,
               model: userMessage.model,
             })
+            autoContinuePromptRef = `message:${continueMsg.id}`
             const text =
               (input.overflow
                 ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
@@ -726,6 +729,7 @@ export const layer: Layer.Layer<
             retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
             dropped_message_ids: hiddenMessageIDs,
             ledger_id_quality: "concrete",
+            auto_continue_prompt_ref: autoContinuePromptRef,
           },
           metadata: {
             sessionID: input.sessionID,
@@ -763,6 +767,7 @@ export const layer: Layer.Layer<
             retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
             dropped_message_ids: hiddenMessageIDs,
             ledger_id_quality: "concrete",
+            auto_continue_prompt_ref: autoContinuePromptRef,
           },
           metadata: {
             sessionID: input.sessionID,

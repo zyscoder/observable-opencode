@@ -185,6 +185,33 @@ function recordSummary(record: ProvenanceRecord) {
   if (record.event_type === "llm.call") {
     return [data.provider_id, data.model_id, formatTokens(record.token_usage)].filter(Boolean).join(" | ")
   }
+  if (record.event_type === "llm.turn") {
+    return [
+      data.agent_role ? `role=${String(data.agent_role)}` : "",
+      data.agent ? `agent=${String(data.agent)}` : "",
+      data.provider_id && data.model_id ? `${String(data.provider_id)}/${String(data.model_id)}` : "",
+      data.finish_reason ? `finish=${String(data.finish_reason)}` : "",
+      formatTokens(record.token_usage),
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
+  if (record.event_type === "agent.lifecycle") {
+    return [data.phase ? `phase=${String(data.phase)}` : "", preview(data.summary, 180)].filter(Boolean).join(" | ")
+  }
+  if (record.event_type === "exit.gate") {
+    return [
+      data.decision ? `decision=${String(data.decision)}` : "",
+      data.reason ? `reason=${String(data.reason)}` : "",
+      data.continuation_source ? `source=${String(data.continuation_source)}` : "",
+      data.needs_compaction !== undefined ? `compact=${String(data.needs_compaction)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
+  if (record.event_type === "evidence.fact") {
+    return [data.source, data.category, preview(data.summary, 160)].filter(Boolean).join(" | ")
+  }
   if (record.event_type === "tool.call" || record.event_type === "mcp.call") {
     return [data.tool_name, data.server, data.name, preview(data.output, 120)].filter(Boolean).join(" | ")
   }
@@ -228,6 +255,10 @@ function hasSemanticFacts(record: ProvenanceRecord) {
         "context.pack",
         "context.compaction",
         "decision",
+        "llm.turn",
+        "agent.lifecycle",
+        "exit.gate",
+        "evidence.fact",
         "observation",
         "change",
         "verification",
@@ -349,12 +380,16 @@ function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<st
     "context.pack",
     "context.compaction",
     "llm.call",
+    "llm.turn",
+    "agent.lifecycle",
+    "exit.gate",
     "decision",
     "tool.call",
     "mcp.call",
     "skill.load",
     "subagent.call",
     "loop.decision",
+    "evidence.fact",
     "response.output",
   ])
   const records = trace.records
@@ -412,12 +447,16 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
       "context.pack",
       "context.compaction",
       "llm.call",
+      "llm.turn",
+      "agent.lifecycle",
+      "exit.gate",
       "decision",
       "tool.call",
       "mcp.call",
       "skill.load",
       "subagent.call",
       "observation",
+      "evidence.fact",
       "response.output",
     ].includes(record.event_type),
   )
@@ -496,6 +535,161 @@ function renderSemanticFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
               </div>
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
+function renderLlmTurns(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records
+    .filter((record) => record.event_type === "llm.turn")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="llm-turns"><h2>LLM Turns</h2><div class="empty">No LLM turn records.</div></section>`
+  return `<section id="llm-turns">
+    <div class="section-title">
+      <h2>LLM Turns</h2>
+      <span class="muted">Normalized provider turns. Title/background turns are marked by role.</span>
+    </div>
+    <div class="fact-list">
+      ${records
+        .map(
+          (record) => `<article class="fact-card">
+            <div class="fact-head">
+              <span class="kind">${escapeHtml(record.event_type)}</span>
+              <span class="component">${escapeHtml(String(record.data?.agent_role ?? "unknown"))}</span>
+              ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+              <strong>${escapeHtml(recordLabel(record))}</strong>
+              <code>${escapeHtml(record.record_id)}</code>
+            </div>
+            <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
+            <div class="flow-meta">
+              <span>duration ${formatDuration(record.duration_ms)}</span>
+              <span>tokens ${escapeHtml(formatTokens(record.token_usage))}</span>
+              ${record.artifact_refs?.length ? `<span>artifacts ${artifactLinks(record.artifact_refs, artifacts)}</span>` : ""}
+            </div>
+            <pre class="semantic-data">${escapeHtml(pretty(record.data, 2200))}</pre>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
+function renderLifecycle(trace: ProvenanceTraceSummary) {
+  const records = trace.records
+    .filter((record) => record.event_type === "agent.lifecycle" || record.event_type === "exit.gate")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="lifecycle"><h2>Lifecycle And Exit Gates</h2><div class="empty">No lifecycle records.</div></section>`
+  return `<section id="lifecycle">
+    <div class="section-title">
+      <h2>Lifecycle And Exit Gates</h2>
+      <span class="muted">Turn milestones, compaction decisions, and non-interactive exit decisions.</span>
+    </div>
+    <div class="flow-list">
+      ${records
+        .map(
+          (record, index) => `<article class="flow-row">
+            <div class="flow-index"><span>${index + 1}</span><code>${escapeHtml(`${record.time_ms}ms`)}</code></div>
+            <div class="flow-main">
+              <div class="flow-head">
+                <span class="kind">${escapeHtml(record.event_type)}</span>
+                ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+                <strong>${escapeHtml(recordLabel(record))}</strong>
+              </div>
+              <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
+              <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
+            </div>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
+function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records
+    .filter((record) => record.event_type === "subagent.call" || record.data?.agent_role === "subagent")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="subagents"><h2>Subagents</h2><div class="empty">No subagent records.</div></section>`
+  return `<section id="subagents">
+    <div class="section-title">
+      <h2>Subagents</h2>
+      <span class="muted">Delegated prompts, child turns, returned output, and child trace refs.</span>
+    </div>
+    <div class="io-list">
+      ${records
+        .map(
+          (record) => `<article class="io-record">
+            <div class="io-head">
+              <span class="kind">${escapeHtml(record.event_type)}</span>
+              ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+              <strong>${escapeHtml(recordLabel(record))}</strong>
+              <code>${escapeHtml(record.record_id)}</code>
+            </div>
+            <div class="io-grid">
+              <div class="io-input">
+                <div class="pane-title">Delegated / Input</div>
+                <pre>${escapeHtml(pretty(recordInput(record)))}</pre>
+              </div>
+              <div class="io-output">
+                <div class="pane-title">Returned / Output</div>
+                <pre>${escapeHtml(pretty(recordOutput(record)))}</pre>
+                <div class="refs">refs ${artifactLinks(record.output_refs ?? record.artifact_refs, artifacts)}</div>
+              </div>
+            </div>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
+function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records
+    .filter((record) => record.event_type === "evidence.fact")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="evidence-facts"><h2>Evidence Facts</h2><div class="empty">No evidence facts.</div></section>`
+  return `<section id="evidence-facts">
+    <div class="section-title">
+      <h2>Evidence Facts</h2>
+      <span class="muted">Observed facts extracted from tools, MCP, skills, verification, and subagents.</span>
+    </div>
+    <div class="fact-list">
+      ${records
+        .map(
+          (record) => `<article class="fact-card">
+            <div class="fact-head">
+              <span class="kind">${escapeHtml(record.event_type)}</span>
+              ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
+              <strong>${escapeHtml(recordLabel(record))}</strong>
+              <code>${escapeHtml(record.record_id)}</code>
+            </div>
+            <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
+            <div class="fact-grid">
+              <div>
+                <div class="label">Source Refs</div>
+                <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+              </div>
+              <div>
+                <div class="label">Source Locations</div>
+                <div class="source-locations">${sourceLocations(record)}</div>
+              </div>
+              <div>
+                <div class="label">Artifacts</div>
+                <div class="refs">${artifactLinks(record.artifact_refs, artifacts)}</div>
+              </div>
+              <div>
+                <div class="label">Tokens</div>
+                <div class="refs">${escapeHtml(formatTokens(record.token_usage))}</div>
+              </div>
+            </div>
+            <pre class="semantic-data">${escapeHtml(pretty(record.data, 2400))}</pre>
           </article>`,
         )
         .join("")}
@@ -671,6 +865,10 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
       <nav>
         <a href="#overview">Overview</a>
         <a href="#semantic-pipeline">Semantic Pipeline</a>
+        <a href="#llm-turns">LLM Turns</a>
+        <a href="#lifecycle">Lifecycle</a>
+        <a href="#subagents">Subagents</a>
+        <a href="#evidence-facts">Evidence Facts</a>
         <a href="#agent-flow">Agent Flow</a>
         <a href="#component-dataflow">Component Dataflow</a>
         <a href="#io-inspector">IO Inspector</a>
@@ -683,6 +881,10 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
   <main>
     ${renderOverview(trace)}
     ${renderSemanticPipeline(trace, artifacts)}
+    ${renderLlmTurns(trace, artifacts)}
+    ${renderLifecycle(trace)}
+    ${renderSubagents(trace, artifacts)}
+    ${renderEvidenceFacts(trace, artifacts)}
     ${renderAgentFlow(trace, artifacts)}
     <section id="component-dataflow">
       <h2>Component Dataflow</h2>

@@ -172,6 +172,7 @@ export const TaskTool = Tool.define(
               title: params.description,
               metadata: {
                 sessionId: nextSession.id,
+                childMessageId: result.info.id,
                 model,
               },
               output: [
@@ -188,6 +189,16 @@ export const TaskTool = Tool.define(
                 to: { type: "session", id: ctx.sessionID, label: "parent_session" },
                 relation: "subagent_to_parent",
                 label: "Subagent result was returned to the parent agent",
+              })
+              CaseTrace.edge({
+                from: { type: "message", id: result.info.id, label: "child_final_message" },
+                to: { type: "span", id: ctx.callID ?? nextSession.id, label: "parent_task" },
+                relation: "returned_to",
+                label: "Subagent final message returned to parent task call",
+                metadata: {
+                  parent_session_id: ctx.sessionID,
+                  child_session_id: nextSession.id,
+                },
               })
             }
             return output
@@ -230,10 +241,27 @@ export const TaskTool = Tool.define(
                 output: {
                   description: params.description,
                   subagent_type: params.subagent_type,
+                  child_session_id: result.metadata.sessionId,
+                  child_message_id: result.metadata.childMessageId,
                   task_id: result.metadata.sessionId,
                   model: result.metadata.model,
                   output: CaseTrace.summarizeText(result.output),
                 },
+              })
+              CaseTrace.evidenceFact({
+                source: "subagent",
+                category: params.subagent_type,
+                summary: result.output,
+                data: {
+                  description: params.description,
+                  subagent_type: params.subagent_type,
+                  child_session_id: result.metadata.sessionId,
+                  child_message_id: result.metadata.childMessageId,
+                  output: result.output,
+                },
+                span_id: traceSpan?.id,
+                source_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
+                confidence: "observed",
               })
               CaseTrace.event({
                 component: "task",
