@@ -24,7 +24,7 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v4.2 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes trace semantic contract v4.3 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -62,7 +62,14 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const caseDir = path.join(dir, "causal-bundle-case")
-    for (const file of ["manifest.json", "trace.json", "legacy-trace.json", "records.jsonl", "raw-events.jsonl", "trace.html"]) {
+    for (const file of [
+      "manifest.json",
+      "trace.json",
+      "legacy-trace.json",
+      "records.jsonl",
+      "raw-events.jsonl",
+      "trace.html",
+    ]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
     expect(await exists(path.join(caseDir, "viewer.html"))).toBe(false)
@@ -89,15 +96,25 @@ describe("case trace", () => {
       "failed_before",
       "read_from",
       "returned_by",
+      "submitted",
+      "assembled",
+      "transformed_to",
+      "resolved_to",
+      "used_as_context",
+      "selected_by",
+      "called",
+      "returned_to",
+      "delegated_to",
+      "reported_to",
     ])
 
-    expect(manifest.trace_version).toBe("4.2")
+    expect(manifest.trace_version).toBe("4.3")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
-    expect(provenance.trace_version).toBe("4.2")
+    expect(provenance.trace_version).toBe("4.3")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -123,13 +140,65 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v4.2")
+    expect(traceHtml).toContain("Trace v4.3")
     expect(traceHtml).toContain('id="overview"')
     expect(traceHtml).toContain('id="agent-flow"')
     expect(traceHtml).toContain("Component Dataflow")
     expect(traceHtml).toContain("IO Inspector")
     expect(traceHtml).toContain("Context And Compaction")
     expect(traceHtml).not.toContain("Evidence Inspector")
+  })
+
+  test("writes v4.3 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v43-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "semantic-v43.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "find owner of pricing API" }, environment: { model: "unit-test" } })`,
+        `const prompt = CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_v43", message_id: "msg_user", agent: "build", input: { parts: [{ type: "text", text: "find owner of pricing API" }] }, output: { part_count: 1 } })`,
+        `const transform = CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_v43", message_id: "msg_assistant", step: 1, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [{ role: "user", id: "msg_user" }] }, output: { model_messages: [{ role: "user", content: "find owner of pricing API" }], system: ["system prompt"], tools: { grep: { description: "search" } } }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }], source_refs: prompt ? ["prompt:" + prompt.node_id] : [] })`,
+        `const decision = CaseTrace.decision({ component: "processor", decision_type: "llm_tool_call", intent: "search pricing owner", chosen_action: "grep", rationale: { recent_reasoning: "Need source evidence before answering", input: { pattern: "pricing" } }, source_refs: transform ? ["context:" + transform.node_id] : [] })`,
+        `CaseTrace.edge({ from: { type: "decision", id: decision?.decision_id ?? "missing" }, to: { type: "tool_call", id: "call_grep", label: "grep" }, relation: "decision_to_tool", label: "Model selected grep" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "semantic-v43-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "semantic-v43-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    const eventTypes = trace.records.map((record: any) => record.event_type)
+
+    expect(trace.trace_version).toBe("4.3")
+    expect(eventTypes).toContain("prompt.assembly")
+    expect(eventTypes).toContain("context.transform")
+    expect(eventTypes).toContain("decision")
+    expect(trace.dataflow_edges.some((edge: any) => edge.relation === "selected_by")).toBe(true)
+    expect(html).toContain("Semantic Pipeline")
+    expect(html).toContain("prompt.assembly")
+    expect(html).toContain("context.transform")
+    expect(html).toContain("llm_tool_call")
   })
 
   test("filters low-value runtime events from formal provenance and normalizes legacy relations", async () => {
@@ -179,7 +248,7 @@ describe("case trace", () => {
     expect(relations).not.toContain("tool_to_change")
   })
 
-  test("adds v4.2 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
+  test("adds v4.3 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -669,7 +738,9 @@ describe("case trace", () => {
     expect(await exists(path.join(dir, "exit-case", "legacy-trace.json"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "trace.html"))).toBe(true)
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "exit-case", "legacy-trace.json"), "utf8")) as TraceSummary
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "exit-case", "legacy-trace.json"), "utf8"),
+    ) as TraceSummary
     expect(trace.status).toBe("success")
     expect(trace.events.some((event) => event.event_type === "turn.start")).toBe(true)
   })
@@ -794,13 +865,13 @@ describe("case trace", () => {
     expect(html).toContain('class="io-scroll"')
   })
 
-  test("renders v4.2 provenance report with flow-style sections and scrollable IO panes", () => {
+  test("renders v4.3 provenance report with flow-style sections and scrollable IO panes", () => {
     const trace: ProvenanceTraceSummary = {
-      trace_version: "4.2",
+      trace_version: "4.3",
       manifest: {
-        trace_version: "4.2",
-        case_id: "viewer-v42-case",
-        run_id: "run_viewer_v42",
+        trace_version: "4.3",
+        case_id: "viewer-v43-case",
+        run_id: "run_viewer_v43",
         started_at: "2026-06-30T00:00:00.000Z",
         ended_at: "2026-06-30T00:00:01.000Z",
         duration_ms: 1000,
@@ -918,7 +989,7 @@ describe("case trace", () => {
     ]) {
       expect(html).toContain(`id="${id}"`)
     }
-    expect(html).toContain("Trace v4.2")
+    expect(html).toContain("Trace v4.3")
     expect(html).toContain('class="io-grid"')
     expect(html).toContain('class="io-input"')
     expect(html).toContain('class="io-output"')
@@ -1194,7 +1265,9 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "failure-parse-case", "legacy-trace.json"), "utf8")) as any
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "failure-parse-case", "legacy-trace.json"), "utf8"),
+    ) as any
     expect(trace.verification_records[0].parsed_failures[0]).toMatchObject({
       message: "Error: expected 170, got 30",
       expected: "170",
@@ -1242,7 +1315,9 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const ok = JSON.parse(await fs.readFile(path.join(dir, "readonly-ok", "legacy-trace.json"), "utf8")) as any
-    const violated = JSON.parse(await fs.readFile(path.join(dir, "readonly-violated", "legacy-trace.json"), "utf8")) as any
+    const violated = JSON.parse(
+      await fs.readFile(path.join(dir, "readonly-violated", "legacy-trace.json"), "utf8"),
+    ) as any
 
     expect(ok.constraint_records[0]).toMatchObject({
       constraint: "Do not modify repository files",
@@ -1279,7 +1354,7 @@ describe("case trace", () => {
       env: {
         ...process.env,
         OPENCODE_CASE_TRACE: "1",
-      OPENCODE_CASE_ID: "source-ref-case",
+        OPENCODE_CASE_ID: "source-ref-case",
         OPENCODE_CASE_TRACE_DIR: dir,
       },
       stdout: "pipe",

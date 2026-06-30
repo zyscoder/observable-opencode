@@ -418,6 +418,11 @@ export const layer: Layer.Layer<
         cfg,
         model,
       })
+      const selectedHeadIDs = selected.head.map((item) => item.info.id)
+      const selectedTailIDs = selected.tail.map((item) => item.info.id)
+      const hiddenMessageIDs = [...hidden]
+        .map((index) => history[index]?.info.id)
+        .filter((id): id is MessageID => Boolean(id))
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
@@ -428,6 +433,45 @@ export const layer: Layer.Layer<
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: tailMessages })
       const tail = yield* serialize({ messages: tailMessages, model })
       const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context, tail })
+      const compactionPromptNode = CaseTrace.contextTransform({
+        stage: "compaction_prompt_built",
+        session_id: input.sessionID,
+        message_id: input.parentID,
+        agent: "compaction",
+        provider_id: model.providerID,
+        model_id: model.id,
+        input: {
+          previous_summary: previousSummary,
+          plugin_context: compacting.context,
+          serialized_tail: tail,
+        },
+        output: {
+          prompt: nextPrompt,
+        },
+        transforms: [
+          {
+            name: "head-tail-summary",
+            selected_head_message_ids: selectedHeadIDs,
+            selected_tail_message_ids: selectedTailIDs,
+            hidden_compaction_message_ids: hiddenMessageIDs,
+            tail_turns: cfg.compaction?.tail_turns ?? DEFAULT_TAIL_TURNS,
+            preserve_recent_budget: preserveRecentBudget({ cfg, model }),
+          },
+          {
+            name: "experimental.session.compacting",
+            plugin_context_count: compacting.context.length,
+            plugin_replaced_prompt: Boolean(compacting.prompt),
+          },
+          {
+            name: "summary_template",
+            template_length: SUMMARY_TEMPLATE.length,
+          },
+        ],
+        metadata: {
+          auto: input.auto,
+          overflow: input.overflow,
+        },
+      })
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
@@ -442,6 +486,12 @@ export const layer: Layer.Layer<
         message_count: modelMessages.length + 1,
         system_count: 0,
         tool_count: 0,
+        context_ledger: {
+          algorithm: "head-tail-summary",
+          retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
+          dropped_message_ids: hiddenMessageIDs,
+          ledger_id_quality: "concrete",
+        },
         messages: [
           ...modelMessages,
           {
@@ -460,10 +510,21 @@ export const layer: Layer.Layer<
           selected_tail_messages: selected.tail.length,
           plugin_context_count: compacting.context.length,
           plugin_replaced_prompt: Boolean(compacting.prompt),
+          selected_head_message_ids: selectedHeadIDs,
+          selected_tail_message_ids: selectedTailIDs,
+          hidden_compaction_message_ids: hiddenMessageIDs,
           previous_summary: previousSummary ? CaseTrace.summarizeText(previousSummary) : undefined,
           serialized_tail: tail ? CaseTrace.summarizeText(tail) : undefined,
         },
       })
+      if (compactionPromptNode && compactionSnapshot) {
+        CaseTrace.edge({
+          from: { type: "context", id: compactionPromptNode.node_id, label: "compaction_prompt_built" },
+          to: { type: "context_snapshot", id: compactionSnapshot.snapshot_id, label: "compaction_context" },
+          relation: "context_to_context",
+          label: "Compaction prompt was converted into the compaction model context",
+        })
+      }
       if (compactionSnapshot) {
         CaseTrace.decision({
           component: "context",
@@ -542,6 +603,12 @@ export const layer: Layer.Layer<
           serialized_tail: tail,
           result: "compact",
           source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          context_ledger: {
+            algorithm: "head-tail-summary",
+            retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
+            dropped_message_ids: hiddenMessageIDs,
+            ledger_id_quality: "concrete",
+          },
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,
@@ -654,6 +721,12 @@ export const layer: Layer.Layer<
           serialized_tail: tail,
           result: "error",
           source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          context_ledger: {
+            algorithm: "head-tail-summary",
+            retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
+            dropped_message_ids: hiddenMessageIDs,
+            ledger_id_quality: "concrete",
+          },
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,
@@ -685,6 +758,12 @@ export const layer: Layer.Layer<
           auto_continue: input.auto,
           result,
           source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+          context_ledger: {
+            algorithm: "head-tail-summary",
+            retained_message_ids: [...selectedHeadIDs, ...selectedTailIDs],
+            dropped_message_ids: hiddenMessageIDs,
+            ledger_id_quality: "concrete",
+          },
           metadata: {
             sessionID: input.sessionID,
             parentID: input.parentID,

@@ -121,6 +121,37 @@ export const TaskTool = Tool.define(
         () =>
           Effect.gen(function* () {
             const parts = yield* ops.resolvePromptParts(params.prompt)
+            const subagentPromptNode = CaseTrace.promptAssembly({
+              stage: "subagent_prompt",
+              session_id: nextSession.id,
+              message_id: messageID,
+              agent: next.name,
+              model,
+              input: {
+                parent_session_id: ctx.sessionID,
+                parent_message_id: ctx.messageID,
+                description: params.description,
+                prompt: params.prompt,
+                subagent_type: params.subagent_type,
+              },
+              output: {
+                parts,
+                part_count: parts.length,
+                part_types: parts.map((part) => part.type),
+              },
+              metadata: {
+                resumed: Boolean(taskID),
+                command: params.command,
+              },
+            })
+            if (subagentPromptNode) {
+              CaseTrace.edge({
+                from: { type: "session", id: ctx.sessionID, label: "parent_session" },
+                to: { type: "prompt", id: subagentPromptNode.node_id, label: "subagent_prompt" },
+                relation: "parent_to_subagent",
+                label: "Parent agent delegated prompt context to subagent",
+              })
+            }
             const result = yield* ops.prompt({
               messageID,
               sessionID: nextSession.id,
@@ -137,7 +168,7 @@ export const TaskTool = Tool.define(
               parts,
             })
 
-            return {
+            const output = {
               title: params.description,
               metadata: {
                 sessionId: nextSession.id,
@@ -151,6 +182,15 @@ export const TaskTool = Tool.define(
                 "</task_result>",
               ].join("\n"),
             }
+            if (subagentPromptNode) {
+              CaseTrace.edge({
+                from: { type: "session", id: nextSession.id, label: "child_session" },
+                to: { type: "session", id: ctx.sessionID, label: "parent_session" },
+                relation: "subagent_to_parent",
+                label: "Subagent result was returned to the parent agent",
+              })
+            }
+            return output
           }),
         (_, exit) =>
           Effect.gen(function* () {

@@ -163,7 +163,11 @@ function semanticToolResult(input: {
         metadata: input.result.metadata,
       },
       span_id: input.spanID,
-      source_refs: verification ? [`verification:${verification.verification_id}`] : input.spanID ? [`span:${input.spanID}`] : undefined,
+      source_refs: verification
+        ? [`verification:${verification.verification_id}`]
+        : input.spanID
+          ? [`span:${input.spanID}`]
+          : undefined,
     })
   }
 
@@ -265,13 +269,15 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               callID: ctx.callID,
               sessionID: ctx.sessionID,
               messageID: ctx.messageID,
+              tool_description: toolInfo.description,
+              args,
             },
           })
           if (decision && traceSpan) {
             CaseTrace.edge({
               from: { type: "decision", id: decision.decision_id },
               to: { type: "span", id: traceSpan.id, label: id },
-              relation: "llm_to_tool",
+              relation: "decision_to_tool",
               label: "Model selected tool execution",
             })
           }

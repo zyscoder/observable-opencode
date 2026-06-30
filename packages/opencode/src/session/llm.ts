@@ -227,6 +227,72 @@ const live: Layer.Layer<
         })
       }
       const sortedTools = Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b)))
+      CaseTrace.contextTransform({
+        stage: "llm_request_ready",
+        session_id: input.sessionID,
+        agent: input.agent.name,
+        provider_id: input.model.providerID,
+        model_id: input.model.id,
+        input: {
+          stream_input: {
+            system: input.system,
+            messages: input.messages,
+            tool_names: Object.keys(input.tools),
+            tool_choice: input.toolChoice,
+          },
+        },
+        output: {
+          provider_messages: messages,
+          system,
+          params: {
+            temperature: params.temperature,
+            topP: params.topP,
+            topK: params.topK,
+            maxOutputTokens: params.maxOutputTokens,
+            toolChoice: input.toolChoice,
+            retries: input.retries ?? 0,
+            providerOptions: ProviderTransform.providerOptions(input.model, params.options),
+          },
+          tools: Object.fromEntries(
+            Object.entries(sortedTools).map(([name, item]) => [
+              name,
+              {
+                description: "description" in item ? item.description : undefined,
+                inputSchema: "inputSchema" in item ? item.inputSchema : undefined,
+              },
+            ]),
+          ),
+          activeTools: Object.keys(sortedTools).filter((x) => x !== "invalid"),
+          header_keys: [
+            ...Object.keys(input.model.headers),
+            ...Object.keys(headers),
+            input.model.providerID.startsWith("opencode") ? "x-opencode-project" : "x-session-affinity",
+            "User-Agent",
+          ].filter((item, index, array) => array.indexOf(item) === index),
+        },
+        transforms: [
+          {
+            name: "system_prompt_composition",
+            agent_prompt: Boolean(input.agent.prompt),
+            provider_prompt_count: SystemPrompt.provider(input.model).length,
+            user_system_present: Boolean(input.user.system),
+          },
+          { name: "experimental.chat.system.transform" },
+          { name: "chat.params" },
+          { name: "chat.headers" },
+          { name: "resolveTools", tool_count: Object.keys(sortedTools).length },
+          ...(isLiteLLMProxy && Object.keys(tools).length === 0 && hasToolCalls(input.messages)
+            ? [{ name: "compat_noop_tool_injection" }]
+            : []),
+        ],
+        metadata: {
+          parentSessionID: input.parentSessionID,
+          mode: input.agent.mode,
+          small: input.small ?? false,
+          isWorkflow,
+          isOpenaiOauth,
+        },
+      })
       CaseTrace.event({
         component: "context",
         event_type: "llm.context.prepared",
@@ -415,8 +481,33 @@ const live: Layer.Layer<
               specificationVersion: "v3" as const,
               async transformParams(args) {
                 if (args.type === "stream") {
+                  const before = args.params.prompt
+                  const after = ProviderTransform.message(args.params.prompt, input.model, options)
+                  CaseTrace.contextTransform({
+                    stage: "provider_message_transform",
+                    session_id: input.sessionID,
+                    agent: input.agent.name,
+                    provider_id: input.model.providerID,
+                    model_id: input.model.id,
+                    input: {
+                      prompt: before,
+                    },
+                    output: {
+                      prompt: after,
+                    },
+                    transforms: [
+                      {
+                        name: "ProviderTransform.message",
+                        provider_id: input.model.providerID,
+                        model_id: input.model.id,
+                      },
+                    ],
+                    metadata: {
+                      options,
+                    },
+                  })
                   // @ts-expect-error
-                  args.params.prompt = ProviderTransform.message(args.params.prompt, input.model, options)
+                  args.params.prompt = after
                 }
                 return args.params
               },

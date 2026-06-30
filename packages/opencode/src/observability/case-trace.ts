@@ -3,7 +3,12 @@ import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
 import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
-import { TRACE_VERSION, isFormalRecordType, normalizeRelation, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
+import {
+  TRACE_VERSION,
+  isFormalRecordType,
+  normalizeRelation,
+  shouldPromoteRuntimeEvent,
+} from "./trace-semantic-contract"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
 
@@ -236,9 +241,12 @@ export type TraceDesignRecord = {
 export type CausalNodeKind =
   | "run.start"
   | "task.loop"
+  | "prompt.assembly"
+  | "context.transform"
   | "context.pack"
   | "context.compaction"
   | "llm.call"
+  | "decision"
   | "tool.call"
   | "mcp.call"
   | "skill.load"
@@ -341,6 +349,16 @@ export type DataflowEdge = {
     | "failed_before"
     | "read_from"
     | "returned_by"
+    | "submitted"
+    | "assembled"
+    | "transformed_to"
+    | "resolved_to"
+    | "used_as_context"
+    | "selected_by"
+    | "called"
+    | "returned_to"
+    | "delegated_to"
+    | "reported_to"
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -439,6 +457,7 @@ type SemanticDecisionInput = Omit<TraceSemanticDecision, "decision_id" | "ration
   rationale?: unknown
   source_refs?: string[]
   evidence_refs?: string[]
+  source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
 }
 
@@ -511,7 +530,10 @@ type DesignRecordInput = Omit<
   evidence_refs?: string[]
 }
 
-type CausalNodeInput = Omit<CausalNode, "node_id" | "timestamp" | "time_ms" | "data" | "artifact_refs" | "source_refs"> & {
+type CausalNodeInput = Omit<
+  CausalNode,
+  "node_id" | "timestamp" | "time_ms" | "data" | "artifact_refs" | "source_refs"
+> & {
   node_id?: string
   data?: Record<string, unknown>
   source_refs?: string[]
@@ -556,6 +578,55 @@ type CompactionRecordInput = {
   span_id?: string
   source_refs?: string[]
   evidence_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+type PromptAssemblyStage =
+  | "initial_user_request"
+  | "resolved_parts"
+  | "user_message_created"
+  | "subagent_prompt"
+  | "command_prompt"
+  | (string & {})
+
+type PromptAssemblyInput = {
+  stage: PromptAssemblyStage
+  session_id?: string
+  message_id?: string
+  agent?: string
+  model?: unknown
+  input?: unknown
+  output?: unknown
+  parts?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+  source_locations?: TraceSourceLocation[]
+  metadata?: Record<string, unknown>
+}
+
+type ContextTransformStage =
+  | "session_messages_before_plugin"
+  | "session_messages_after_plugin"
+  | "model_messages_built"
+  | "llm_request_ready"
+  | "provider_message_transform"
+  | "compaction_prompt_built"
+  | (string & {})
+
+type ContextTransformInput = {
+  stage: ContextTransformStage
+  session_id?: string
+  message_id?: string
+  step?: number
+  agent?: string
+  provider_id?: string
+  model_id?: string
+  input?: unknown
+  output?: unknown
+  transforms?: unknown
+  source_refs?: string[]
+  evidence_refs?: string[]
+  source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
 }
 
@@ -880,12 +951,18 @@ function loopDecisionFromRuntimeEvent(
   state: { has_user_visible_response: boolean; has_final_answer: boolean },
 ) {
   if (component !== "processor") return undefined
-  if (!/step\.finish|loop\.decision|loop\.finish|message\.finish|message\.completed/.test(eventType)) return undefined
+  if (
+    !/step\.finish|finish\.step|loop\.decision|loop\.finish|message\.finish|message\.completed|process\.result/.test(
+      eventType,
+    )
+  )
+    return undefined
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
   const record = data as Record<string, unknown>
   const reason = stringField(record, ["reason", "stop_reason", "finish_reason"]) ?? eventType
   const syntheticContinue =
-    booleanField(record, ["synthetic_continue", "synthetic", "auto"]) ?? (stringField(record, ["synthetic_continue"]) === "true")
+    booleanField(record, ["synthetic_continue", "synthetic", "auto"]) ??
+    stringField(record, ["synthetic_continue"]) === "true"
   const compactionContinue =
     booleanField(record, ["compaction_continue"]) ??
     (record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
@@ -938,9 +1015,38 @@ function sourceLocationFromRecord(input: Record<string, unknown>): TraceSourceLo
   }
 }
 
+function sourceLocationsFromText(input: string): TraceSourceLocation[] {
+  const output: TraceSourceLocation[] = []
+  const pathPattern =
+    /((?:file:\/\/)?(?:[./~\w@+-][^\s:'")\]]*\/)?[^\s:'")\]]+\.(?:mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt|sh|yaml|yml))(?::(\d+))?(?::(\d+))?/gi
+  for (const match of input.matchAll(pathPattern)) {
+    const raw = match[1]
+    if (!raw) continue
+    const sourcePath = normalizeSourcePath(raw)
+    if (!sourcePath) continue
+    output.push({
+      uri: /^[a-z]+:\/\//i.test(sourcePath) ? sourcePath : undefined,
+      path: /^[a-z]+:\/\//i.test(sourcePath) ? undefined : sourcePath,
+      line_start: optionalNumber(match[2]),
+      line_end: optionalNumber(match[2]),
+      snippet_preview: lineExcerpt(input, match.index ?? 0),
+    })
+    if (output.length >= 40) break
+  }
+  return dedupeSourceLocations(output)
+}
+
+function lineExcerpt(input: string, index: number) {
+  const start = input.lastIndexOf("\n", Math.max(0, index - 1)) + 1
+  const endIndex = input.indexOf("\n", index)
+  const end = endIndex === -1 ? input.length : endIndex
+  return input.slice(start, end).trim().slice(0, 240) || undefined
+}
+
 function collectSourceLocations(input: unknown, output: TraceSourceLocation[] = [], depth = 0): TraceSourceLocation[] {
   if (depth > 4 || input === undefined || input === null) return output
   if (typeof input === "string") {
+    output.push(...sourceLocationsFromText(input))
     const sourcePath = normalizeSourcePath(input)
     if (sourcePath && /\.(mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt)$/i.test(sourcePath)) {
       output.push({
@@ -996,19 +1102,28 @@ function traceContextLedger(input: {
   )
   const hasEstimatedIDs = retainedCount > 0 || droppedCount > 0
   return {
-    algorithm: stringField(metadata, ["algorithm", "compaction_algorithm"]) ?? input.context_ledger?.algorithm ?? "head-tail-summary",
+    algorithm:
+      stringField(metadata, ["algorithm", "compaction_algorithm"]) ??
+      input.context_ledger?.algorithm ??
+      "head-tail-summary",
     token_estimate_before: input.context_ledger?.token_estimate_before ?? input.input_tokens,
     token_estimate_after:
       input.context_ledger?.token_estimate_after ??
-      (input.context_limit === undefined ? undefined : Math.min(safeNumber(input.input_tokens), safeNumber(input.context_limit))),
+      (input.context_limit === undefined
+        ? undefined
+        : Math.min(safeNumber(input.input_tokens), safeNumber(input.context_limit))),
     retained_message_ids:
-      input.context_ledger?.retained_message_ids ?? Array.from({ length: retainedCount }, (_, index) => `retained:${index + 1}`),
+      input.context_ledger?.retained_message_ids ??
+      Array.from({ length: retainedCount }, (_, index) => `retained:${index + 1}`),
     dropped_message_ids:
-      input.context_ledger?.dropped_message_ids ?? Array.from({ length: droppedCount }, (_, index) => `dropped:${index + 1}`),
+      input.context_ledger?.dropped_message_ids ??
+      Array.from({ length: droppedCount }, (_, index) => `dropped:${index + 1}`),
     retained_fact_refs: input.context_ledger?.retained_fact_refs ?? [],
     dropped_fact_refs: input.context_ledger?.dropped_fact_refs ?? [],
     summary_artifact_id: input.context_ledger?.summary_artifact_id,
-    ledger_id_quality: input.context_ledger?.ledger_id_quality ?? (hasConcreteIDs ? "concrete" : hasEstimatedIDs ? "estimated" : "unknown"),
+    ledger_id_quality:
+      input.context_ledger?.ledger_id_quality ??
+      (hasConcreteIDs ? "concrete" : hasEstimatedIDs ? "estimated" : "unknown"),
   }
 }
 
@@ -1071,13 +1186,21 @@ function mcpContentItems(data: unknown): unknown[] {
   const record = data as Record<string, unknown>
   if (Array.isArray(record.content)) return record.content
   const output = record.output
-  if (output && typeof output === "object" && !Array.isArray(output) && Array.isArray((output as Record<string, unknown>).content)) {
+  if (
+    output &&
+    typeof output === "object" &&
+    !Array.isArray(output) &&
+    Array.isArray((output as Record<string, unknown>).content)
+  ) {
     return (output as Record<string, unknown>).content as unknown[]
   }
   return []
 }
 
-function mcpSemanticExtras(data: unknown): { typed_resources: Record<string, unknown>[]; source_locations: TraceSourceLocation[] } {
+function mcpSemanticExtras(data: unknown): {
+  typed_resources: Record<string, unknown>[]
+  source_locations: TraceSourceLocation[]
+} {
   const typedResources: Record<string, unknown>[] = []
   const sourceLocations: TraceSourceLocation[] = []
   for (const [index, item] of mcpContentItems(data).slice(0, 20).entries()) {
@@ -1108,7 +1231,10 @@ function mcpSemanticExtras(data: unknown): { typed_resources: Record<string, unk
   return { typed_resources: typedResources, source_locations: dedupeSourceLocations(sourceLocations) }
 }
 
-function observationSemanticExtras(source: string, data: unknown): {
+function observationSemanticExtras(
+  source: string,
+  data: unknown,
+): {
   typed_resources?: Record<string, unknown>[]
   source_locations?: TraceSourceLocation[]
 } {
@@ -1124,7 +1250,8 @@ function observationSemanticExtras(source: string, data: unknown): {
           type: "skill",
           name: stringField(record, ["name"]),
           path: stringField(record, ["dir"]),
-          sampled_files_hash: typeof record.sampled_files === "string" ? `sha256:${hash(record.sampled_files)}` : undefined,
+          sampled_files_hash:
+            typeof record.sampled_files === "string" ? `sha256:${hash(record.sampled_files)}` : undefined,
         },
       ],
     }
@@ -1132,11 +1259,107 @@ function observationSemanticExtras(source: string, data: unknown): {
   return {}
 }
 
+function typedResourcesForSpan(
+  component: TraceComponent,
+  operation: string,
+  name: string | undefined,
+  payload: unknown,
+) {
+  const record =
+    payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {}
+  const input =
+    record.input && typeof record.input === "object" && !Array.isArray(record.input)
+      ? (record.input as Record<string, unknown>)
+      : record
+  if (component === "llm") {
+    const model =
+      input.model && typeof input.model === "object" && !Array.isArray(input.model)
+        ? (input.model as Record<string, unknown>)
+        : {}
+    return [
+      {
+        type: "llm_request",
+        agent: stringField(input, ["agent"]),
+        provider_id:
+          stringField(model, ["providerID", "provider_id"]) ?? stringField(input, ["providerID", "provider_id"]),
+        model_id: stringField(model, ["id", "modelID", "model_id"]) ?? stringField(input, ["modelID", "model_id"]),
+        message_count: numberField(input, ["message_count", "messageCount"]),
+        tool_count: numberField(input, ["tool_count", "toolCount"]),
+      },
+    ]
+  }
+  if (component === "tool") {
+    const args =
+      input.args && typeof input.args === "object" && !Array.isArray(input.args)
+        ? (input.args as Record<string, unknown>)
+        : {}
+    return [
+      {
+        type: "tool_call",
+        tool_name: name ?? operation,
+        call_id: stringField(input, ["callID", "call_id"]),
+        intent_hint: stringField(args, ["description", "query", "pattern", "command"]),
+        command: stringField(args, ["command"]),
+        path: stringField(args, ["path", "filePath", "filepath"]),
+        workdir: stringField(args, ["workdir", "cwd"]),
+      },
+    ]
+  }
+  if (component === "task") {
+    return [
+      {
+        type: "subagent_task",
+        subagent_type: stringField(input, ["subagent_type"]) ?? name,
+        description: stringField(input, ["description"]),
+        parent_session_id: stringField(input, ["parent_session_id", "sessionID", "session_id"]),
+        child_session_id: stringField(record, ["task_id", "child_session_id", "sessionId", "session_id"]),
+      },
+    ]
+  }
+  if (component === "skill") {
+    return [
+      {
+        type: "skill",
+        name: stringField(input, ["name"]) ?? name,
+        path: stringField(record, ["dir"]),
+      },
+    ]
+  }
+  if (component === "mcp") {
+    return [
+      {
+        type: "mcp_call",
+        server: stringField(input, ["server"]) ?? name?.split(":")[0],
+        tool_name: stringField(input, ["tool"]) ?? name?.split(":").slice(1).join(":"),
+      },
+    ]
+  }
+  return undefined
+}
+
+function mergeTypedResources(
+  current: Record<string, unknown>[] | undefined,
+  next: Record<string, unknown>[] | undefined,
+) {
+  const merged = [...(current ?? []), ...(next ?? [])]
+  if (!merged.length) return undefined
+  const seen = new Set<string>()
+  return merged.filter((item) => {
+    const key = json(item)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 function isWeakObservation(input: ObservationInput) {
   if (input.category !== "tool_output") return false
   if (!/tool/i.test(input.source)) return false
   const summary = typeof input.summary === "string" ? input.summary : ""
-  const data = input.data && typeof input.data === "object" && !Array.isArray(input.data) ? (input.data as Record<string, unknown>) : {}
+  const data =
+    input.data && typeof input.data === "object" && !Array.isArray(input.data)
+      ? (input.data as Record<string, unknown>)
+      : {}
   const keys = Object.keys(data)
   const onlyPathData = keys.length > 0 && keys.every((key) => ["path", "file", "filePath", "uri"].includes(key))
   const pathLikeSummary = /(^|\/)[^/\s]+\.[a-z0-9]+$/i.test(summary) || summary.includes("/private/")
@@ -1187,6 +1410,9 @@ class ActiveCaseTrace {
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
   private recentContextSnapshotIDs: string[] = []
+  private recentPromptNodeIDs: string[] = []
+  private recentContextNodeIDs: string[] = []
+  private recentLLMNodeIDs: string[] = []
   private recentVerificationIDs: string[] = []
   private recentChangeIDs: string[] = []
   private recentToolSpanIDs: string[] = []
@@ -1271,6 +1497,8 @@ class ActiveCaseTrace {
         title: input.name ?? input.operation,
         status: "running",
         data: this.spanStartData(input),
+        source_locations: collectSourceLocations(input.input),
+        typed_resources: typedResourcesForSpan(input.component, input.operation, input.name, input.input),
         metadata: input.metadata,
       })
       this.spanNodeIDs.set(id, node.node_id)
@@ -1324,9 +1552,12 @@ class ActiveCaseTrace {
     if (nodeID) {
       const node = this.causalNodes.find((item) => item.node_id === nodeID)
       if (node) {
-        const output = span.component === "task" ? enrichSubagentOutput(input?.output, nodeID, this.caseDir) : input?.output
+        const output =
+          span.component === "task" ? enrichSubagentOutput(input?.output, nodeID, this.caseDir) : input?.output
         const summarizedOutput =
-          output === undefined ? node.data?.output : this.summarizeCausalValue(output, `${span.component}.${span.operation}.output`)
+          output === undefined
+            ? node.data?.output
+            : this.summarizeCausalValue(output, `${span.component}.${span.operation}.output`)
         const spanEndData = this.spanEndData(span, input, output, summarizedOutput, usage, error, nodeID)
         node.status = span.status
         node.data = {
@@ -1338,6 +1569,22 @@ class ActiveCaseTrace {
           node.typed_resources = extras.typed_resources.length ? extras.typed_resources : node.typed_resources
           node.source_locations = dedupeSourceLocations([...(node.source_locations ?? []), ...extras.source_locations])
         }
+        node.typed_resources = mergeTypedResources(
+          node.typed_resources,
+          typedResourcesForSpan(span.component, span.operation, span.name, {
+            input: span.input_summary,
+            output,
+            ...(output && typeof output === "object" && !Array.isArray(output)
+              ? (output as Record<string, unknown>)
+              : {}),
+          }),
+        )
+        node.source_locations = dedupeSourceLocations([
+          ...(node.source_locations ?? []),
+          ...collectSourceLocations(output),
+          ...collectSourceLocations(input?.metadata),
+        ])
+        node.artifact_refs = this.collectArtifactRefs(node.data)
         this.writeRecord("node.update", node)
         this.writePartial()
       }
@@ -1350,15 +1597,26 @@ class ActiveCaseTrace {
       input: input.input,
     }
     if (input.component !== "llm") return base
-    const record = input.input && typeof input.input === "object" && !Array.isArray(input.input) ? (input.input as Record<string, unknown>) : {}
-    const model = record.model && typeof record.model === "object" && !Array.isArray(record.model) ? (record.model as Record<string, unknown>) : {}
-    const [nameProvider, nameModel] = typeof input.name === "string" && input.name.includes("/") ? input.name.split("/", 2) : []
+    const record =
+      input.input && typeof input.input === "object" && !Array.isArray(input.input)
+        ? (input.input as Record<string, unknown>)
+        : {}
+    const model =
+      record.model && typeof record.model === "object" && !Array.isArray(record.model)
+        ? (record.model as Record<string, unknown>)
+        : {}
+    const [nameProvider, nameModel] =
+      typeof input.name === "string" && input.name.includes("/") ? input.name.split("/", 2) : []
     return {
       ...base,
       request_id: stringField(record, ["request_id", "response_id", "id"]),
       agent: stringField(record, ["agent"]),
-      provider_id: stringField(model, ["providerID", "provider_id"]) ?? stringField(record, ["providerID", "provider_id"]) ?? nameProvider,
-      model_id: stringField(model, ["id", "modelID", "model_id"]) ?? stringField(record, ["modelID", "model_id"]) ?? nameModel,
+      provider_id:
+        stringField(model, ["providerID", "provider_id"]) ??
+        stringField(record, ["providerID", "provider_id"]) ??
+        nameProvider,
+      model_id:
+        stringField(model, ["id", "modelID", "model_id"]) ?? stringField(record, ["modelID", "model_id"]) ?? nameModel,
       message_count: numberField(record, ["message_count", "messageCount"]),
       system_count: numberField(record, ["system_count", "systemCount"]),
       tool_count: numberField(record, ["tool_count", "toolCount"]),
@@ -1383,7 +1641,10 @@ class ActiveCaseTrace {
       error,
     }
     if (span.component === "llm") {
-      const output = rawOutput && typeof rawOutput === "object" && !Array.isArray(rawOutput) ? (rawOutput as Record<string, unknown>) : {}
+      const output =
+        rawOutput && typeof rawOutput === "object" && !Array.isArray(rawOutput)
+          ? (rawOutput as Record<string, unknown>)
+          : {}
       data.finish_reason = stringField(output, ["finish_reason", "finishReason"])
       data.stop_reason = stringField(output, ["stop_reason", "stopReason"])
       data.cache_usage = usage
@@ -1519,6 +1780,7 @@ class ActiveCaseTrace {
   }
 
   decision(input: SemanticDecisionInput) {
+    const sourceRefs = input.source_refs ?? input.evidence_refs
     const decision: TraceSemanticDecision = {
       decision_id: input.decision_id ?? semanticID("dec", this.semanticDecisions.length + 1),
       span_id: input.span_id,
@@ -1528,12 +1790,116 @@ class ActiveCaseTrace {
       chosen_action: input.chosen_action,
       rationale:
         input.rationale === undefined ? undefined : this.summarizeText(input.rationale, "semantic.decision.rationale"),
-      source_refs: input.source_refs ?? input.evidence_refs,
+      source_refs: sourceRefs,
       metadata: input.metadata,
     }
     this.semanticDecisions.push(decision)
     this.write("semantic.decision", decision)
+    this.node({
+      node_id: `decisionnode_${decision.decision_id}`,
+      kind: "decision",
+      component: input.component,
+      span_id: input.span_id,
+      title: input.chosen_action ?? input.decision_type,
+      status: "success",
+      data: {
+        decision_id: decision.decision_id,
+        decision_type: input.decision_type,
+        intent: input.intent,
+        chosen_action: input.chosen_action,
+        rationale: input.rationale,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      source_locations: dedupeSourceLocations([
+        ...(input.source_locations ?? []),
+        ...collectSourceLocations(input.metadata),
+      ]),
+      metadata: input.metadata,
+    })
     return decision
+  }
+
+  promptAssembly(input: PromptAssemblyInput) {
+    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const node = this.node({
+      kind: "prompt.assembly",
+      component: "prompt",
+      title: input.stage,
+      status: "success",
+      data: {
+        stage: input.stage,
+        session_id: input.session_id,
+        message_id: input.message_id,
+        agent: input.agent,
+        model: input.model,
+        input: input.input,
+        output: input.output,
+        parts: input.parts,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      source_locations: dedupeSourceLocations([
+        ...(input.source_locations ?? []),
+        ...collectSourceLocations(input.input),
+        ...collectSourceLocations(input.output),
+        ...collectSourceLocations(input.parts),
+      ]),
+      metadata: input.metadata,
+    })
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "node", id: node.node_id, label: "prompt.assembly" },
+        relation: "prompt_to_message",
+        label: "Prompt assembly consumed source record",
+      })
+    }
+    return node
+  }
+
+  contextTransform(input: ContextTransformInput) {
+    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const node = this.node({
+      kind: "context.transform",
+      component: "context",
+      title: input.stage,
+      status: "success",
+      data: {
+        stage: input.stage,
+        session_id: input.session_id,
+        message_id: input.message_id,
+        step: input.step,
+        agent: input.agent,
+        provider_id: input.provider_id,
+        model_id: input.model_id,
+        input: input.input,
+        output: input.output,
+        transforms: input.transforms,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      source_locations: dedupeSourceLocations([
+        ...(input.source_locations ?? []),
+        ...collectSourceLocations(input.input),
+        ...collectSourceLocations(input.output),
+        ...collectSourceLocations(input.transforms),
+      ]),
+      metadata: input.metadata,
+    })
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "node", id: node.node_id, label: "context.transform" },
+        relation: "context_transform",
+        label: "Context transform consumed source record",
+      })
+    }
+    return node
   }
 
   edge(input: SemanticEdgeInput) {
@@ -1608,7 +1974,9 @@ class ActiveCaseTrace {
         stderr: input.stderr,
       },
       source_locations: sourceLocations,
-      source_refs: sourceLocations.map((location) => location.uri ?? location.path).filter((item): item is string => Boolean(item)),
+      source_refs: sourceLocations
+        .map((location) => location.uri ?? location.path)
+        .filter((item): item is string => Boolean(item)),
     })
     if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
     if (verification.status === "passed" && this.recentChangeID) {
@@ -1695,7 +2063,9 @@ class ActiveCaseTrace {
       this.inferResponseRole(visibility)
     const isFinalForCase =
       input.is_final_for_case ??
-      (typeof input.metadata?.is_final_for_case === "boolean" ? input.metadata.is_final_for_case : responseRole === "final_answer")
+      (typeof input.metadata?.is_final_for_case === "boolean"
+        ? input.metadata.is_final_for_case
+        : responseRole === "final_answer")
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.metadata),
@@ -1784,7 +2154,10 @@ class ActiveCaseTrace {
       if (!node?.data) continue
       node.data.response_role = segment.response_role
       node.data.is_final_for_case = segment.is_final_for_case
-      const metadata = node.data.metadata && typeof node.data.metadata === "object" ? (node.data.metadata as Record<string, unknown>) : {}
+      const metadata =
+        node.data.metadata && typeof node.data.metadata === "object"
+          ? (node.data.metadata as Record<string, unknown>)
+          : {}
       node.data.metadata = {
         ...metadata,
         response_role: segment.response_role,
@@ -1833,6 +2206,10 @@ class ActiveCaseTrace {
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     this.causalNodes.push(node)
+    if (node.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, node.node_id)
+    if (node.kind === "context.pack" || node.kind === "context.transform")
+      this.remember(this.recentContextNodeIDs, node.node_id)
+    if (node.kind === "llm.call") this.remember(this.recentLLMNodeIDs, node.node_id)
     this.writeRecord("node", node)
     this.writePartial()
     return node
@@ -1896,7 +2273,10 @@ class ActiveCaseTrace {
       this.causalEdge({
         from: parsed,
         to: { type: "node", id: node.node_id, label: "observation" },
-        relation: parsed.type === "compaction" || parsed.id.startsWith("compaction") ? "compaction_to_observation" : "source_to_observation",
+        relation:
+          parsed.type === "compaction" || parsed.id.startsWith("compaction")
+            ? "compaction_to_observation"
+            : "source_to_observation",
         label: "Observation produced from source record",
       })
     }
@@ -1961,7 +2341,10 @@ class ActiveCaseTrace {
 
   currentSourceRefs() {
     return [
+      ...this.recentPromptNodeIDs.slice(-2).map((id) => `prompt:${id}`),
+      ...this.recentContextNodeIDs.slice(-3).map((id) => `context:${id}`),
       ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
+      ...this.recentLLMNodeIDs.slice(-2).map((id) => `llm:${id}`),
       ...this.recentToolSpanIDs.slice(-3).map((id) => `tool_span:${id}`),
       ...this.recentVerificationIDs.slice(-3).map((id) => `verification:${id}`),
       ...this.recentChangeIDs.slice(-3).map((id) => `change:${id}`),
@@ -2237,7 +2620,8 @@ class ActiveCaseTrace {
           if (hasLinkedChange || hasVerification) constraint.status = "observed_satisfied"
         }
         for (const change of this.changeRecords) sourceRefs.add(`change:${change.change_id}`)
-        for (const verification of this.verificationRecords) sourceRefs.add(`verification:${verification.verification_id}`)
+        for (const verification of this.verificationRecords)
+          sourceRefs.add(`verification:${verification.verification_id}`)
       }
       constraint.source_refs = [...sourceRefs]
       this.write("semantic.constraint_evaluated", constraint)
@@ -2568,6 +2952,14 @@ export namespace CaseTrace {
 
   export function decision(input: SemanticDecisionInput) {
     return get()?.decision(input)
+  }
+
+  export function promptAssembly(input: PromptAssemblyInput) {
+    return get()?.promptAssembly(input)
+  }
+
+  export function contextTransform(input: ContextTransformInput) {
+    return get()?.contextTransform(input)
   }
 
   export function edge(input: SemanticEdgeInput) {

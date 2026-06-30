@@ -324,6 +324,25 @@ export const layer = Layer.effect(
           reference_count: parts.filter((part) => part.type === "text" && "metadata" in part && part.metadata).length,
         },
       })
+      CaseTrace.promptAssembly({
+        stage: "resolved_parts",
+        input: {
+          template,
+          references: files.map((match) => match[1]).filter(Boolean),
+        },
+        output: {
+          part_count: parts.length,
+          part_types: parts.map((part) => part.type),
+          file_count: parts.filter((part) => part.type === "file").length,
+          agent_count: parts.filter((part) => part.type === "agent").length,
+          reference_count: parts.filter((part) => part.type === "text" && "metadata" in part && part.metadata).length,
+        },
+        parts,
+        metadata: {
+          cwd: ctx.directory,
+          worktree: ctx.worktree,
+        },
+      })
       return parts
     })
 
@@ -1624,9 +1643,53 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             part_types: input.parts.map((part) => part.type),
           },
         })
+        const promptNode = CaseTrace.promptAssembly({
+          stage: "initial_user_request",
+          session_id: input.sessionID,
+          message_id: input.messageID,
+          agent: input.agent,
+          model: input.model,
+          input: {
+            parts: input.parts,
+            tool_overrides: input.tools,
+            format: input.format,
+            noReply: input.noReply,
+          },
+          output: {
+            part_count: input.parts.length,
+            part_types: input.parts.map((part) => part.type),
+          },
+          metadata: {
+            variant: input.variant,
+          },
+        })
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         yield* revert.cleanup(session)
         const message = yield* createUserMessage(input)
+        const userMessageNode = CaseTrace.promptAssembly({
+          stage: "user_message_created",
+          session_id: message.info.sessionID,
+          message_id: message.info.id,
+          agent: message.info.agent,
+          model: message.info.model,
+          input: {
+            requested_message_id: input.messageID,
+            requested_agent: input.agent,
+          },
+          output: {
+            message: message.info,
+            parts: message.parts,
+          },
+          source_refs: promptNode ? [`prompt:${promptNode.node_id}`] : undefined,
+        })
+        if (promptNode && userMessageNode) {
+          CaseTrace.edge({
+            from: { type: "prompt", id: promptNode.node_id, label: "initial_user_request" },
+            to: { type: "prompt", id: userMessageNode.node_id, label: "user_message_created" },
+            relation: "prompt_to_message",
+            label: "User prompt was persisted as a session message",
+          })
+        }
         span?.event({
           event_type: "user.message.created",
           data: {
@@ -1773,6 +1836,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               lastFinishedID: lastFinished?.id,
             },
           })
+          CaseTrace.decision({
+            component: "prompt",
+            decision_type: "agent_loop_step",
+            intent: "orchestrate next agent turn",
+            chosen_action: tasks.length ? "handle_pending_task" : "prepare_llm_turn",
+            rationale: {
+              step,
+              message_count: msgs.length,
+              pending_task_count: tasks.length,
+              pending_task_types: tasks.map((item) => item.type),
+              last_user_id: lastUser.id,
+              last_assistant_id: lastAssistant?.id,
+              last_finished_id: lastFinished?.id,
+              has_tool_calls: hasToolCalls,
+            },
+            metadata: {
+              sessionID,
+              step,
+            },
+          })
           if (step === 1)
             yield* title({
               session,
@@ -1888,7 +1971,61 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
             }
 
+            const messagesBeforePlugin = structuredClone(msgs)
+            const rawContextNode = CaseTrace.contextTransform({
+              stage: "session_messages_before_plugin",
+              session_id: sessionID,
+              step,
+              agent: agent.name,
+              input: {
+                filtered_session_messages: messagesBeforePlugin,
+              },
+              output: {
+                message_count: messagesBeforePlugin.length,
+                roles: messagesBeforePlugin.map((item) => item.info.role),
+              },
+              transforms: [
+                { name: "MessageV2.filterCompactedEffect" },
+                ...(step > 1 && lastFinished ? [{ name: "system_reminder_injection" }] : []),
+                { name: "insertReminders" },
+              ],
+              metadata: {
+                last_user_id: lastUser.id,
+                last_finished_id: lastFinished?.id,
+                format: lastUser.format?.type ?? "text",
+              },
+            })
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            const transformedContextNode = CaseTrace.contextTransform({
+              stage: "session_messages_after_plugin",
+              session_id: sessionID,
+              step,
+              agent: agent.name,
+              input: {
+                messages_before_plugin: messagesBeforePlugin,
+              },
+              output: {
+                messages: msgs,
+              },
+              transforms: [
+                {
+                  name: "experimental.chat.messages.transform",
+                  owner: "plugin",
+                },
+              ],
+              metadata: {
+                format: lastUser.format?.type ?? "text",
+              },
+              source_refs: rawContextNode ? [`context:${rawContextNode.node_id}`] : undefined,
+            })
+            if (rawContextNode && transformedContextNode) {
+              CaseTrace.edge({
+                from: { type: "context", id: rawContextNode.node_id, label: "session_messages_before_plugin" },
+                to: { type: "context", id: transformedContextNode.node_id, label: "session_messages_after_plugin" },
+                relation: "context_to_context",
+                label: "Session messages were passed through plugin message transforms",
+              })
+            }
 
             const [skills, env, instructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
@@ -1899,6 +2036,57 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const modelContextNode = CaseTrace.contextTransform({
+              stage: "model_messages_built",
+              session_id: sessionID,
+              message_id: msg.id,
+              step,
+              agent: agent.name,
+              provider_id: model.providerID,
+              model_id: model.id,
+              input: {
+                session_messages: msgs,
+              },
+              output: {
+                model_messages: modelMsgs,
+                system,
+                tools: Object.fromEntries(
+                  Object.entries(tools).map(([name, tool]) => [
+                    name,
+                    {
+                      description: "description" in tool ? tool.description : undefined,
+                      inputSchema: "inputSchema" in tool ? tool.inputSchema : undefined,
+                    },
+                  ]),
+                ),
+                max_steps_message_injected: isLastStep,
+              },
+              transforms: [
+                { name: "SystemPrompt.skills", output_present: Boolean(skills) },
+                { name: "SystemPrompt.environment", count: env.length },
+                { name: "Instruction.system", count: instructions.length },
+                { name: "MessageV2.toModelMessagesEffect", output_count: modelMsgs.length },
+                ...(format.type === "json_schema" ? [{ name: "StructuredOutput.system_prompt" }] : []),
+                ...(isLastStep ? [{ name: "max_steps_guard" }] : []),
+              ],
+              source_refs: transformedContextNode ? [`context:${transformedContextNode.node_id}`] : undefined,
+              metadata: {
+                raw_message_count: msgs.length,
+                model_message_count: modelMsgs.length,
+                system_count: system.length,
+                tool_count: Object.keys(tools).length,
+                format: format.type,
+                isLastStep,
+              },
+            })
+            if (transformedContextNode && modelContextNode) {
+              CaseTrace.edge({
+                from: { type: "context", id: transformedContextNode.node_id, label: "session_messages_after_plugin" },
+                to: { type: "context", id: modelContextNode.node_id, label: "model_messages_built" },
+                relation: "context_to_context",
+                label: "Plugin-transformed session messages were converted to model messages",
+              })
+            }
             CaseTrace.event({
               component: "context",
               event_type: "model.context.ready",

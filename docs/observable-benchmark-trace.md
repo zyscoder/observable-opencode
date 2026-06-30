@@ -279,15 +279,15 @@ $OPENCODE_CASE_TRACE_DIR/
 其中：
 
 - `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
-- `trace.json`：Trace Semantic Contract v4.2 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
+- `trace.json`：Trace Semantic Contract v4.3 主文件，包含事实记录、组件数据流、artifact 索引、token/耗时等指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
 - `legacy-trace.json`：旧版 v1.3 调试摘要，保留 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和旧 `dataflow_edges`。
-- `provenance-trace.json`：兼容别名，内容与 v4.2 `trace.json` 保持一致。新分析链路应优先读取 `trace.json`。
+- `provenance-trace.json`：兼容别名，内容与 v4.3 `trace.json` 保持一致。新分析链路应优先读取 `trace.json`。
 - `events.jsonl`：旧版事件流，保留用于兼容。
 - `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
 - `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
 - `partial/latest.json`：运行中快照。长时间运行或收到 `SIGINT/SIGTERM/SIGHUP` 时也能保留可查看状态。
 - `artifacts/sha256/`：按内容 hash 去重保存大文本，例如模型上下文包、MCP 返回、skill 指令、工具输出、压缩前后摘要等。
-- `trace.html`：唯一正式离线可视化报告，包含 Overview、Agent Flow、Component Dataflow、IO Inspector、Semantic Facts、Context And Compaction 和 Artifacts。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
+- `trace.html`：唯一正式离线可视化报告，包含 Overview、Semantic Pipeline、Agent Flow、Component Dataflow、IO Inspector、Semantic Facts、Context And Compaction 和 Artifacts。大文本通过 artifact 链接查看，避免 HTML 过度膨胀。
 
 当前实现不再生成 `viewer.html`。`events.jsonl`、`legacy-trace.json`、`provenance-trace.json` 仍作为兼容副产物保留；新分析链路应优先使用 `manifest.json`、`trace.json` 和 `trace.html`。
 
@@ -362,14 +362,14 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. Trace Semantic Contract v4.2
+## 10. Trace Semantic Contract v4.3
 
-`trace.json` 的 `trace_version` 为 `"4.2"`。v4.2 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照、任务循环决策和组件间数据流结构化记录下来。
+`trace.json` 的 `trace_version` 为 `"4.3"`。v4.3 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、输入输出、上下文快照、任务循环决策和组件间数据流结构化记录下来。
 
 主字段：
 
-- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs`、`source_locations`、`typed_resources` 和 `artifact_refs`。正式 records 不包含 `runtime.event`、流式 delta 或纯 prompt 元数据节点。
-- `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`、`derived_from`、`verified_by`、`modified_by`。
+- `records`：组件事实记录，每条记录包含 `record_id`、`component`、`event_type`、时间、状态、摘要数据、`source_refs`、`source_locations`、`typed_resources` 和 `artifact_refs`。正式 records 不包含 `runtime.event` 或流式 delta。
+- `dataflow_edges`：组件间数据流边，只表达数据如何流转，例如 `selected_into_context`、`prompted`、`produced`、`consumed`、`compressed_from`、`compressed_to`、`spawned`、`continued_from`、`derived_from`、`verified_by`、`modified_by`、`transformed_to`、`used_as_context`、`selected_by`、`delegated_to` 和 `reported_to`。
 - `artifacts`：大文本或结构化大对象索引，完整内容在 `artifacts/sha256/` 下按 hash 去重保存。
 - `metrics`：spans、events、records、dataflow_edges、artifacts 和 token/cost 统计。
 
@@ -384,23 +384,28 @@ change:chg_1_xxxxxxxx
 
 大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `trace.html` 的 artifact 链接查看。
 
-v4.2 增强了这些语义事实：
+v4.3 增强了这些语义事实：
 
+- `prompt.assembly` 记录用户原始请求、模板解析、持久化 user message、subagent prompt 等 prompt 组装过程。
+- `context.transform` 记录 session messages 在插件转换前后、转为 model messages、LLM request ready、provider message transform、compaction prompt build 等层级转换。
+- `decision` 作为正式事实进入 `records`，覆盖任务编排 step、模型 reasoning block、LLM tool call、tool execute、compaction context selection、LLM step finish 等可观测决策。
 - `mcp.call` 和 MCP observation 会尝试解析 text JSON，提取 `typed_resources` 和 `source_locations`，例如 `repo_fact` 的 `key/fact/path/line_start/line_end`。
-- `subagent.call` 会在记录顶层保留 `child_session_id`、`child_status`、`child_trace_available` 和 `output_artifact_id`。只有真实存在子 trace 时才写入 `child_trace_dir`，避免把不存在的路径当作事实。
+- `subagent.call` 会在记录顶层保留 `child_session_id`、`child_status`、`child_trace_available` 和 `output_artifact_id`，并通过 `prompt.assembly` 与 `dataflow_edges` 展示 parent agent 与 subagent 的 prompt/结果交互。
 - `response.output` 会标记 `response_role`，区分 `final_answer`、`intermediate_summary`、`subagent_result` 和 `auto_continue_summary`。只有最终用户答案应为 `is_final_for_case: true`。
-- `context.compaction` 的 `context_ledger` 会记录 `ledger_id_quality`，当只能估算 retained/dropped message id 时标记为 `estimated`。
+- `context.compaction` 的 `context_ledger` 会记录 retained/dropped message id、算法名和 `ledger_id_quality`；当前 head-tail summary 路径会尽量写入 concrete message id。
 - `llm.call` 会记录 request-level facts，包括 agent、provider、model、message/tool 数、token/cache 使用和 stop/finish reason。
 - `loop.decision` 会把 processor step finish / loop finish 类运行事件提升为正式事实，记录 decision、reason、agent、message id、part count、part types、final-answer 状态和 auto-continue 标记。
+- 工具、MCP、skill、subagent 和 shell/grep/read/edit 输出会尽量抽取 `typed_resources` 与 `source_locations`，包括常见的 `path:line` 文本位置。
 - `metrics.token_usage`、`manifest.token_usage` 和 `llm.call.token_usage` 使用独立 JSON-safe 对象序列化，避免出现 `"[Circular]"`。
 - 只重复路径且没有独立语义价值的 `tool_output` observation 不进入正式 records。
 
 `trace.html` 视图：
 
 - `Overview`：查看 case、run、耗时、records、dataflow、artifacts、tokens 和组件统计。
+- `Semantic Pipeline`：按“用户请求、prompt 组装、上下文转换、LLM 调用、决策、工具/skill/MCP/subagent、输出”的顺序展示语义流水线。
 - `Agent Flow`：按时间展示全部组件事实记录，不再只展示前 120 条。
 - `Component Dataflow`：查看组件间数据流边，不做根因判断。
-- `IO Inspector`：聚合 LLM/tool/MCP/skill/subagent/response 的输入输出摘要，输入和输出左右分栏并支持横向滚动。
+- `IO Inspector`：聚合 prompt/context/LLM/decision/tool/MCP/skill/subagent/response 的输入输出摘要，输入和输出左右分栏并支持横向滚动。
 - `Semantic Facts`：集中展示 typed resources、source locations、source refs、artifact refs、最终回答事实和 loop decisions。
 - `Context And Compaction`：展示 LLM context package 和 compaction 前后摘要；页面中保留 `Context Ledger` 兼容文案。
 - `Artifacts`：查看大文本 artifact 索引和路径。

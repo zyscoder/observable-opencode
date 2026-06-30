@@ -1,13 +1,16 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "4.2" as const
+export const TRACE_VERSION = "4.3" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
   "task.loop",
+  "prompt.assembly",
+  "context.transform",
   "context.pack",
   "context.compaction",
   "llm.call",
+  "decision",
   "tool.call",
   "mcp.call",
   "skill.load",
@@ -36,6 +39,16 @@ export const FORMAL_DATAFLOW_RELATIONS = [
   "failed_before",
   "read_from",
   "returned_by",
+  "submitted",
+  "assembled",
+  "transformed_to",
+  "resolved_to",
+  "used_as_context",
+  "selected_by",
+  "called",
+  "returned_to",
+  "delegated_to",
+  "reported_to",
 ] as const
 
 export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]
@@ -50,6 +63,17 @@ const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
   change_to_verification: "verified_by",
   context_to_llm: "prompted",
   compaction_to_context: "compressed_to",
+  prompt_to_context: "used_as_context",
+  prompt_to_message: "assembled",
+  message_to_context: "used_as_context",
+  context_transform: "transformed_to",
+  context_to_context: "transformed_to",
+  context_to_provider: "transformed_to",
+  decision_to_tool: "selected_by",
+  decision_to_task: "selected_by",
+  tool_call_to_span: "called",
+  subagent_to_parent: "reported_to",
+  parent_to_subagent: "delegated_to",
   source_to_response: "consumed",
   source_to_observation: "derived_from",
   source_to_compaction: "compressed_from",

@@ -1,4 +1,5 @@
 import type { ProvenanceTraceSummary, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "./case-trace"
+import { TRACE_VERSION } from "./trace-semantic-contract"
 
 function escapeHtml(input: unknown) {
   return String(input ?? "")
@@ -65,7 +66,8 @@ function artifactLinks(ids: string[] | undefined, artifacts: Map<string, TraceAr
 }
 
 function sourceLocationLabel(location: Record<string, unknown>) {
-  const target = typeof location.uri === "string" ? location.uri : typeof location.path === "string" ? location.path : ""
+  const target =
+    typeof location.uri === "string" ? location.uri : typeof location.path === "string" ? location.path : ""
   const start = typeof location.line_start === "number" ? location.line_start : undefined
   const end = typeof location.line_end === "number" ? location.line_end : undefined
   if (!target) return ""
@@ -133,11 +135,38 @@ function formatTokens(usage: TraceTokenUsage | undefined) {
 }
 
 function recordLabel(record: ProvenanceRecord) {
-  return record.title || record.data?.tool_name || record.data?.model_id || record.data?.response_role || record.record_id
+  return (
+    record.title || record.data?.tool_name || record.data?.model_id || record.data?.response_role || record.record_id
+  )
 }
 
 function recordSummary(record: ProvenanceRecord) {
   const data = record.data ?? {}
+  if (record.event_type === "decision") {
+    return [
+      data.decision_type ? `type=${String(data.decision_type)}` : "",
+      data.intent ? `intent=${String(data.intent)}` : "",
+      data.chosen_action ? `action=${String(data.chosen_action)}` : "",
+      preview(data.rationale, 160),
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
+  if (record.event_type === "prompt.assembly") {
+    return [data.stage ? `stage=${String(data.stage)}` : "", preview(data.output ?? data.parts ?? data.input, 180)]
+      .filter(Boolean)
+      .join(" | ")
+  }
+  if (record.event_type === "context.transform") {
+    return [
+      data.stage ? `stage=${String(data.stage)}` : "",
+      data.agent ? `agent=${String(data.agent)}` : "",
+      data.model_id ? `model=${String(data.model_id)}` : "",
+      preview(data.transforms, 160),
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
   if (record.event_type === "loop.decision") {
     return [
       data.decision ? `decision=${String(data.decision)}` : "",
@@ -149,7 +178,9 @@ function recordSummary(record: ProvenanceRecord) {
       .join(" | ")
   }
   if (record.event_type === "response.output") {
-    return [data.response_role ? `role=${String(data.response_role)}` : "", preview(data.text, 160)].filter(Boolean).join(" | ")
+    return [data.response_role ? `role=${String(data.response_role)}` : "", preview(data.text, 160)]
+      .filter(Boolean)
+      .join(" | ")
   }
   if (record.event_type === "llm.call") {
     return [data.provider_id, data.model_id, formatTokens(record.token_usage)].filter(Boolean).join(" | ")
@@ -158,7 +189,9 @@ function recordSummary(record: ProvenanceRecord) {
     return [data.tool_name, data.server, data.name, preview(data.output, 120)].filter(Boolean).join(" | ")
   }
   if (record.event_type === "context.compaction") {
-    return [data.algorithm, data.reason, data.before_tokens, data.after_tokens].filter((item) => item !== undefined).join(" | ")
+    return [data.algorithm, data.reason, data.before_tokens, data.after_tokens]
+      .filter((item) => item !== undefined)
+      .join(" | ")
   }
   return preview(data.summary ?? data.output ?? data.text ?? data, 180)
 }
@@ -189,7 +222,18 @@ function hasSemanticFacts(record: ProvenanceRecord) {
       record.source_locations?.length ||
       record.source_refs?.length ||
       record.artifact_refs?.length ||
-      ["observation", "change", "verification", "response.output", "loop.decision"].includes(record.event_type),
+      [
+        "prompt.assembly",
+        "context.transform",
+        "context.pack",
+        "context.compaction",
+        "decision",
+        "observation",
+        "change",
+        "verification",
+        "response.output",
+        "loop.decision",
+      ].includes(record.event_type),
   )
 }
 
@@ -207,7 +251,8 @@ function componentStats(trace: ProvenanceTraceSummary) {
 }
 
 function renderOverview(trace: ProvenanceTraceSummary) {
-  const statusClass = trace.manifest.status === "success" ? "ok" : trace.manifest.status === "running" ? "running" : "bad"
+  const statusClass =
+    trace.manifest.status === "success" ? "ok" : trace.manifest.status === "running" ? "running" : "bad"
   return `<section id="overview">
     <div class="section-title">
       <h2>Overview</h2>
@@ -239,7 +284,8 @@ function renderOverview(trace: ProvenanceTraceSummary) {
 
 function renderAgentFlow(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length) return `<section id="agent-flow"><h2>Agent Flow</h2><div class="empty">No records.</div></section>`
+  if (!records.length)
+    return `<section id="agent-flow"><h2>Agent Flow</h2><div class="empty">No records.</div></section>`
   return `<section id="agent-flow">
     <div class="section-title">
       <h2>Agent Flow</h2>
@@ -295,13 +341,88 @@ function renderDataflow(trace: ProvenanceTraceSummary) {
   </table></div>`
 }
 
+function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const pipelineTypes = new Set([
+    "run.start",
+    "prompt.assembly",
+    "context.transform",
+    "context.pack",
+    "context.compaction",
+    "llm.call",
+    "decision",
+    "tool.call",
+    "mcp.call",
+    "skill.load",
+    "subagent.call",
+    "loop.decision",
+    "response.output",
+  ])
+  const records = trace.records
+    .filter((record) => pipelineTypes.has(record.event_type))
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="semantic-pipeline"><h2>Semantic Pipeline</h2><div class="empty">No semantic pipeline records.</div></section>`
+  return `<section id="semantic-pipeline">
+    <div class="section-title">
+      <h2>Semantic Pipeline</h2>
+      <span class="muted">User request, context transformations, model calls, decisions, tools, subagents, and outputs.</span>
+    </div>
+    <div class="pipeline">
+      ${records
+        .map(
+          (record, index) => `<article class="pipeline-card">
+            <div class="pipeline-index">${index + 1}</div>
+            <div class="pipeline-body">
+              <div class="flow-head">
+                <span class="kind">${escapeHtml(record.event_type)}</span>
+                ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
+                ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
+                <strong>${escapeHtml(recordLabel(record))}</strong>
+              </div>
+              <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
+              <div class="pipeline-io">
+                <div>
+                  <div class="pane-title">Input</div>
+                  <pre>${escapeHtml(pretty(recordInput(record), 2200))}</pre>
+                </div>
+                <div>
+                  <div class="pane-title">Output</div>
+                  <pre>${escapeHtml(pretty(recordOutput(record), 2200))}</pre>
+                </div>
+              </div>
+              <div class="flow-meta">
+                <span>id <code>${escapeHtml(record.record_id)}</code></span>
+                <span>${escapeHtml(`${record.time_ms}ms`)}</span>
+                ${record.artifact_refs?.length ? `<span>artifacts ${artifactLinks(record.artifact_refs, artifacts)}</span>` : ""}
+                ${record.source_refs?.length ? `<span>sources <code>${escapeHtml(record.source_refs.join(", "))}</code></span>` : ""}
+              </div>
+            </div>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
 function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter((record) =>
-    ["llm.call", "tool.call", "mcp.call", "skill.load", "subagent.call", "observation", "response.output"].includes(
-      record.event_type,
-    ),
+    [
+      "prompt.assembly",
+      "context.transform",
+      "context.pack",
+      "context.compaction",
+      "llm.call",
+      "decision",
+      "tool.call",
+      "mcp.call",
+      "skill.load",
+      "subagent.call",
+      "observation",
+      "response.output",
+    ].includes(record.event_type),
   )
-  if (!records.length) return `<section id="io-inspector"><h2>IO Inspector</h2><div class="empty">No IO records.</div></section>`
+  if (!records.length)
+    return `<section id="io-inspector"><h2>IO Inspector</h2><div class="empty">No IO records.</div></section>`
   return `<section id="io-inspector">
     <div class="section-title">
       <h2>IO Inspector</h2>
@@ -339,7 +460,8 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
 
 function renderSemanticFacts(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(hasSemanticFacts)
-  if (!records.length) return `<section id="semantic-facts"><h2>Semantic Facts</h2><div class="empty">No semantic facts.</div></section>`
+  if (!records.length)
+    return `<section id="semantic-facts"><h2>Semantic Facts</h2><div class="empty">No semantic facts.</div></section>`
   return `<section id="semantic-facts">
     <div class="section-title">
       <h2>Semantic Facts</h2>
@@ -453,7 +575,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Trace v4.2 - ${escapeHtml(trace.manifest.case_id)}</title>
+  <title>Trace v${escapeHtml(TRACE_VERSION)} - ${escapeHtml(trace.manifest.case_id)}</title>
   <style>
     :root {
       color-scheme: light;
@@ -505,6 +627,13 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .component-strip { display: flex; gap: 10px; overflow-x: auto; margin-top: 12px; padding-bottom: 2px; }
     .component-chip { flex: 0 0 210px; display: grid; gap: 2px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 12px; }
     .flow-list, .io-list, .fact-list, .context-list { display: grid; gap: 10px; }
+    .pipeline { display: grid; gap: 10px; }
+    .pipeline-card { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
+    .pipeline-index { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-weight: 800; }
+    .pipeline-body { min-width: 0; }
+    .pipeline-io { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 10px; }
+    .pipeline-io > div { min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .pipeline-io pre { max-height: 260px; }
     .flow-row { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
     .flow-index { display: grid; align-content: start; gap: 4px; color: var(--muted); }
     .flow-index span { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-weight: 800; }
@@ -526,13 +655,13 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
     .empty { color: var(--muted); font-size: 13px; }
     @media (max-width: 1100px) { .overview-grid { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .fact-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 760px) { main, .header-inner { padding-left: 14px; padding-right: 14px; } .overview-grid, .flow-row, .io-grid, .fact-grid { grid-template-columns: 1fr; } header { position: static; } }
+    @media (max-width: 760px) { main, .header-inner { padding-left: 14px; padding-right: 14px; } .overview-grid, .flow-row, .io-grid, .fact-grid, .pipeline-card, .pipeline-io { grid-template-columns: 1fr; } header { position: static; } }
   </style>
 </head>
 <body>
   <header>
     <div class="header-inner">
-      <h1>Trace v4.2</h1>
+      <h1>Trace v${escapeHtml(TRACE_VERSION)}</h1>
       <div class="muted">Trace Provenance</div>
       <div class="meta">
         <span>case <code>${escapeHtml(trace.manifest.case_id)}</code></span>
@@ -541,6 +670,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
       </div>
       <nav>
         <a href="#overview">Overview</a>
+        <a href="#semantic-pipeline">Semantic Pipeline</a>
         <a href="#agent-flow">Agent Flow</a>
         <a href="#component-dataflow">Component Dataflow</a>
         <a href="#io-inspector">IO Inspector</a>
@@ -552,6 +682,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
   </header>
   <main>
     ${renderOverview(trace)}
+    ${renderSemanticPipeline(trace, artifacts)}
     ${renderAgentFlow(trace, artifacts)}
     <section id="component-dataflow">
       <h2>Component Dataflow</h2>

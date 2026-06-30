@@ -78,6 +78,8 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: MessageV2.TextPart | undefined
   reasoningMap: Record<string, MessageV2.ReasoningPart>
+  lastReasoningText: string | undefined
+  currentStep: number
 }
 
 type StreamEvent = Event
@@ -162,6 +164,8 @@ export const layer: Layer.Layer<
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        lastReasoningText: undefined,
+        currentStep: 0,
       }
       let aborted = false
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
@@ -360,6 +364,7 @@ export const layer: Layer.Layer<
                 reasoningID: value.id,
               },
             })
+            ctx.lastReasoningText = ctx.reasoningMap[value.id].text
             yield* session.updatePart(ctx.reasoningMap[value.id])
             delete ctx.reasoningMap[value.id]
             return
@@ -436,6 +441,32 @@ export const layer: Layer.Layer<
                 providerMetadata: value.providerMetadata,
               },
             })
+            const toolDecision = CaseTrace.decision({
+              component: "processor",
+              decision_type: "llm_tool_call",
+              intent: "model requested tool execution",
+              chosen_action: value.toolName,
+              rationale: {
+                tool: value.toolName,
+                input: value.input,
+                recent_reasoning: ctx.lastReasoningText,
+                provider_metadata: value.providerMetadata,
+              },
+              metadata: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                callID: value.toolCallId,
+                step: ctx.currentStep,
+              },
+            })
+            if (toolDecision) {
+              CaseTrace.edge({
+                from: { type: "decision", id: toolDecision.decision_id, label: "llm_tool_call" },
+                to: { type: "tool_call", id: value.toolCallId, label: value.toolName },
+                relation: "decision_to_tool",
+                label: "Model stream emitted a tool call after its current reasoning context",
+              })
+            }
             const toolCall = yield* readToolCall(value.toolCallId)
             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (Flag.OPENCODE_EXPERIMENTAL_EVENT_SYSTEM) {
@@ -572,6 +603,8 @@ export const layer: Layer.Layer<
             throw value.error
 
           case "start-step":
+            ctx.currentStep += 1
+            ctx.lastReasoningText = undefined
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
@@ -619,6 +652,24 @@ export const layer: Layer.Layer<
                 tokens: usage.tokens,
                 cost: usage.cost,
                 providerMetadata: value.providerMetadata,
+                step: ctx.currentStep,
+              },
+            })
+            CaseTrace.decision({
+              component: "processor",
+              decision_type: "llm_step_finish",
+              intent: "decide whether the agent loop should stop, continue, call tools, or compact",
+              chosen_action: value.finishReason,
+              rationale: {
+                finish_reason: value.finishReason,
+                tokens: usage.tokens,
+                cost: usage.cost,
+                needs_compaction: isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model }),
+              },
+              metadata: {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                step: ctx.currentStep,
               },
             })
             if (!ctx.assistantMessage.summary) {
@@ -759,12 +810,7 @@ export const layer: Layer.Layer<
             if (isDesignLikeResponse(ctx.currentText.text)) {
               const designRecord = CaseTrace.designRecord({
                 source: "final_response",
-                requirement_summary: keywordExcerpt(ctx.currentText.text, [
-                  "需求",
-                  "目标",
-                  "requirement",
-                  "goal",
-                ]),
+                requirement_summary: keywordExcerpt(ctx.currentText.text, ["需求", "目标", "requirement", "goal"]),
                 existing_boundaries: keywordExcerpt(ctx.currentText.text, [
                   "架构",
                   "边界",
