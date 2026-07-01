@@ -306,11 +306,62 @@ export type TraceEvidenceFact = {
   fact_kind?: string
   canonical_subject?: string
   claim?: string
+  structured_claim?: TraceStructuredClaim
   support_level?: "direct" | "context" | "execution" | "weak" | string
   quality_flags?: string[]
   confidence?: "observed" | "inferred" | string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceStructuredClaim = {
+  subject?: string
+  predicate?: string
+  value?: string | number | boolean | null
+  qualifier?: string
+  source_span?: TraceSourceLocation
+  extraction_method:
+    | "explicit_structured_data"
+    | "mcp_json_text"
+    | "source_location_fields"
+    | "verification_output"
+    | "summary_sentence"
+    | "fallback_summary"
+    | string
+  raw_artifact_ref?: string
+}
+
+export type TraceResponseClaimRecord = {
+  claim_id: string
+  response_segment_id?: string
+  text: TraceFieldSummary
+  claim_index: number
+  direct_evidence_refs: string[]
+  context_refs: string[]
+  execution_refs: string[]
+  source_refs?: string[]
+  source_locations?: TraceSourceLocation[]
+  support_level: "direct" | "contextual" | "execution_only" | "unsupported" | string
+  quality_flags: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceCompactionCheckRecord = {
+  check_id: string
+  span_id?: string
+  session_id?: string
+  message_id?: string
+  provider_id?: string
+  model_id?: string
+  token_usage?: TraceTokenUsage
+  token_estimate?: number
+  context_limit?: number
+  reserved_tokens?: number
+  overflow: boolean
+  selected_algorithm?: string
+  trigger_reason: string
+  source_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -329,12 +380,19 @@ export type TraceHealthMetrics = {
   circular_reference_markers: number
   open_records: number
   finalized_open_records: number
+  expected_lifecycle_finalized_records?: number
+  unexpected_missing_close_records?: number
   llm_turns_missing_token_usage: number
   llm_turns_missing_finish_reason: number
   compaction_quality_flags: Record<string, number>
   empty_subagent_results: number
   broad_response_refs: number
   duplicate_evidence_facts: number
+  generic_evidence_facts?: number
+  unsupported_response_claims?: number
+  context_only_response_claims?: number
+  payload_duplication_groups?: number
+  compaction_check_missing?: number
   issues: TraceHealthIssue[]
 }
 
@@ -344,6 +402,7 @@ export type CausalNodeKind =
   | "prompt.assembly"
   | "context.transform"
   | "context.pack"
+  | "context.compaction_check"
   | "context.compaction"
   | "llm.call"
   | "llm.turn"
@@ -360,6 +419,7 @@ export type CausalNodeKind =
   | "change"
   | "verification"
   | "response.output"
+  | "response.claim"
 
 export type CausalNode = {
   node_id: string
@@ -464,6 +524,10 @@ export type DataflowEdge = {
     | "delegated_to"
     | "reported_to"
     | "supported_response"
+    | "claimed_by"
+    | "supports_claim"
+    | "contextualizes_claim"
+    | "executed_for_claim"
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -604,6 +668,27 @@ type ResponseOutputInput = Omit<TraceResponseSegment, "segment_id" | "text" | "s
   evidence_refs?: string[]
 }
 
+type ResponseClaimInput = Omit<
+  TraceResponseClaimRecord,
+  | "claim_id"
+  | "text"
+  | "direct_evidence_refs"
+  | "context_refs"
+  | "execution_refs"
+  | "source_refs"
+  | "source_locations"
+  | "support_level"
+  | "quality_flags"
+> & {
+  claim_id?: string
+  text: unknown
+  source_refs?: string[]
+  source_locations?: TraceSourceLocation[]
+  evidence_refs?: string[]
+  support_level?: TraceResponseClaimRecord["support_level"]
+  quality_flags?: string[]
+}
+
 type FinalResponseEvidenceInput = Omit<ResponseOutputInput, "segment_id" | "text"> & {
   claim_id?: string
   claim: unknown
@@ -710,6 +795,17 @@ type CompactionRecordInput = {
   result?: string
   context_ledger?: TraceContextLedger
   span_id?: string
+  source_refs?: string[]
+  evidence_refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+type CompactionCheckInput = Omit<
+  TraceCompactionCheckRecord,
+  "check_id" | "token_usage" | "source_refs" | "metadata"
+> & {
+  check_id?: string
+  token_usage?: unknown
   source_refs?: string[]
   evidence_refs?: string[]
   metadata?: Record<string, unknown>
@@ -1531,6 +1627,48 @@ function classifySourceRefs(input: string[] | undefined) {
   }
 }
 
+function splitResponseClaims(input: unknown): string[] {
+  const text = typeof input === "string" ? input : stringPreview(input, 8000)
+  if (!text.trim()) return []
+  const normalized = text
+    .replace(/\r\n/g, "\n")
+    .split(/\n+|(?:^|\n)\s*(?:[-*]|\d+\.)\s+/)
+    .flatMap((part) => part.match(/[^。！？.!?；;]+[。！？.!?]?/g) ?? [part])
+    .map((part) => part.trim())
+    .filter(Boolean)
+  const seen = new Set<string>()
+  return normalized
+    .map((claim) => claim.replace(/\s+/g, " ").trim())
+    .filter((claim) => {
+      const textLength = claim.replace(/\s/g, "").length
+      const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
+      if (textLength < 6 && !hasFactSignal) return false
+      if (/^(好的|可以|下面|因此|总结|结论)[:：]?$/.test(claim)) return false
+      const key = claim.toLowerCase()
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .slice(0, 50)
+}
+
+function responseClaimSupportLevel(classifiedRefs: ReturnType<typeof classifySourceRefs>) {
+  if (classifiedRefs.direct_evidence_refs.length) return "direct"
+  if (classifiedRefs.context_refs.length) return "contextual"
+  if (classifiedRefs.execution_refs.length) return "execution_only"
+  return "unsupported"
+}
+
+function responseClaimQualityFlags(classifiedRefs: ReturnType<typeof classifySourceRefs>) {
+  const flags: string[] = []
+  if (!classifiedRefs.direct_evidence_refs.length) {
+    if (classifiedRefs.context_refs.length) flags.push("context_only_claim")
+    else if (classifiedRefs.execution_refs.length) flags.push("execution_only_claim")
+    else flags.push("unsupported_response_claim")
+  }
+  return flags
+}
+
 function dedupeStrings(input: string[]) {
   return input.filter((item, index, array) => array.indexOf(item) === index)
 }
@@ -1571,16 +1709,234 @@ function evidenceQualityFlags(input: EvidenceFactInput) {
   return flags
 }
 
+function recordFromUnknown(input: unknown): Record<string, unknown> | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+  return input as Record<string, unknown>
+}
+
+function primitiveClaimValue(input: unknown): string | number | boolean | null | undefined {
+  if (input === null) return null
+  if (typeof input === "string" || typeof input === "number" || typeof input === "boolean") return input
+  if (input === undefined) return undefined
+  try {
+    return JSON.stringify(input)
+  } catch {
+    return String(input)
+  }
+}
+
+function firstPresentField(input: unknown, keys: string[]) {
+  const record = recordFromUnknown(input)
+  if (!record) return undefined
+  for (const key of keys) {
+    if (record[key] !== undefined && record[key] !== "") return record[key]
+  }
+  return undefined
+}
+
+function parseJsonObjectText(input: string): Record<string, unknown> | undefined {
+  const trimmed = input.trim()
+  if (!trimmed) return undefined
+  const candidates = [trimmed]
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fenced?.[1]) candidates.push(fenced[1].trim())
+  const objectMatch = trimmed.match(/\{[\s\S]*\}/)
+  if (objectMatch?.[0]) candidates.push(objectMatch[0])
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+function jsonLikePayload(input: unknown): Record<string, unknown> | undefined {
+  if (recordFromUnknown(input)) return recordFromUnknown(input)
+  if (typeof input !== "string") return undefined
+  return parseJsonObjectText(input)
+}
+
+function textPayloadFromRecord(input: unknown) {
+  const record = recordFromUnknown(input)
+  if (!record) return undefined
+  for (const key of ["text", "content", "fact", "claim", "summary", "value", "output"]) {
+    const value = record[key]
+    if (typeof value === "string" && value.trim()) return value
+  }
+  return undefined
+}
+
+function claimSourceSpan(input: unknown, sourceLocations: TraceSourceLocation[]) {
+  const record = recordFromUnknown(input)
+  const fromRecord = record ? sourceLocationFromRecord(record) : undefined
+  return fromRecord ?? sourceLocations[0]
+}
+
+function rawArtifactRef(input: unknown) {
+  const record = recordFromUnknown(input)
+  if (!record) return undefined
+  const direct = record.artifact_id
+  if (typeof direct === "string") return direct
+  for (const value of Object.values(record)) {
+    if (recordFromUnknown(value) && typeof (value as Record<string, unknown>).artifact_id === "string") {
+      return (value as Record<string, unknown>).artifact_id as string
+    }
+  }
+  return undefined
+}
+
+function isGenericClaimText(input: string) {
+  const text = input.trim()
+  if (!text) return true
+  if (/returned\s+\d+\s+content\s+item/i.test(text)) return true
+  if (/^(result|output|response|summary|file observed|pricing file observed)\b/i.test(text)) return true
+  if (text.length < 12 && !/\d/.test(text)) return true
+  return false
+}
+
+function structuredClaimFromRecord(
+  record: Record<string, unknown>,
+  extractionMethod: TraceStructuredClaim["extraction_method"],
+  sourceSpan?: TraceSourceLocation,
+): TraceStructuredClaim | undefined {
+  const subject = primitiveClaimValue(firstPresentField(record, ["subject", "symbol", "name", "key", "path", "file"]))
+  const predicate = primitiveClaimValue(
+    firstPresentField(record, ["predicate", "relation", "property", "type", "category"]),
+  )
+  const value = primitiveClaimValue(firstPresentField(record, ["value", "fact", "claim", "text", "owner", "status"]))
+  const qualifier = primitiveClaimValue(firstPresentField(record, ["qualifier", "reason", "confidence", "stage"]))
+  if (subject === undefined && predicate === undefined && value === undefined) return undefined
+  return {
+    subject: subject === undefined ? undefined : String(subject),
+    predicate: predicate === undefined ? undefined : String(predicate),
+    value,
+    qualifier: qualifier === undefined ? undefined : String(qualifier),
+    source_span: sourceSpan,
+    extraction_method: extractionMethod,
+    raw_artifact_ref: rawArtifactRef(record),
+  }
+}
+
+function structuredClaimFromEvidence(
+  input: EvidenceFactInput,
+  sourceLocations: TraceSourceLocation[],
+): { structured_claim: TraceStructuredClaim; quality_flags: string[] } {
+  const flags: string[] = []
+  const sourceSpan = claimSourceSpan(input.data, sourceLocations)
+  const dataRecord = recordFromUnknown(input.data)
+  const source = input.source.toLowerCase()
+  const category = input.category?.toLowerCase() ?? ""
+
+  if (dataRecord) {
+    const explicit = structuredClaimFromRecord(dataRecord, "explicit_structured_data", sourceSpan)
+    if (
+      explicit &&
+      (dataRecord.subject !== undefined || dataRecord.predicate !== undefined || dataRecord.value !== undefined)
+    ) {
+      if (!explicit.source_span) flags.push("missing_source_span")
+      return { structured_claim: explicit, quality_flags: flags }
+    }
+    const textPayload = textPayloadFromRecord(dataRecord)
+    const parsed = textPayload ? parseJsonObjectText(textPayload) : undefined
+    if (parsed) {
+      const parsedClaim = structuredClaimFromRecord(
+        parsed,
+        source.includes("mcp") ? "mcp_json_text" : "explicit_structured_data",
+        sourceSpan,
+      )
+      if (parsedClaim) {
+        if (!parsedClaim.source_span) flags.push("missing_source_span")
+        return { structured_claim: parsedClaim, quality_flags: flags }
+      }
+    } else if (source.includes("mcp") && textPayload) {
+      flags.push("unparsed_mcp_text")
+    }
+    const locationClaim = structuredClaimFromRecord(dataRecord, "source_location_fields", sourceSpan)
+    if (
+      locationClaim &&
+      (dataRecord.path !== undefined || dataRecord.file !== undefined || dataRecord.symbol !== undefined)
+    ) {
+      if (!locationClaim.predicate) locationClaim.predicate = "located_at"
+      if (!locationClaim.value && sourceSpan?.path) locationClaim.value = sourceSpan.path
+      if (!locationClaim.source_span) flags.push("missing_source_span")
+      return { structured_claim: locationClaim, quality_flags: flags }
+    }
+    if (/verification|test|command|bash/.test(source) || /verification|test|command/.test(category)) {
+      const verificationClaim = structuredClaimFromRecord(
+        {
+          subject:
+            firstPresentField(dataRecord, ["command", "cmd", "tool_name", "name"]) ?? input.category ?? input.source,
+          predicate: "exit_status",
+          value: firstPresentField(dataRecord, ["status", "exit_code", "exitCode", "result"]),
+          reason: firstPresentField(dataRecord, ["message", "stderr", "stdout"]),
+        },
+        "verification_output",
+        sourceSpan,
+      )
+      flags.push("weak_verification_claim")
+      if (verificationClaim) {
+        if (!verificationClaim.source_span) flags.push("missing_source_span")
+        return { structured_claim: verificationClaim, quality_flags: flags }
+      }
+    }
+  }
+
+  const textRecord = jsonLikePayload(input.data)
+  if (textRecord) {
+    const jsonClaim = structuredClaimFromRecord(
+      textRecord,
+      source.includes("mcp") ? "mcp_json_text" : "explicit_structured_data",
+      sourceSpan,
+    )
+    if (jsonClaim) {
+      if (!jsonClaim.source_span) flags.push("missing_source_span")
+      return { structured_claim: jsonClaim, quality_flags: flags }
+    }
+  }
+
+  const summary = stringPreview(input.summary, 1000)
+  const extractionMethod: TraceStructuredClaim["extraction_method"] = isGenericClaimText(summary)
+    ? "fallback_summary"
+    : "summary_sentence"
+  if (extractionMethod === "fallback_summary") {
+    flags.push("generic_claim", "fallback_summary_claim")
+  }
+  if (!sourceSpan) flags.push("missing_source_span")
+  if (rawArtifactRef(input.summary) || rawArtifactRef(input.data)) flags.push("artifact_only_claim")
+  return {
+    structured_claim: {
+      subject: input.canonical_subject ?? input.category ?? input.source,
+      predicate: "observed",
+      value: summary,
+      source_span: sourceSpan,
+      extraction_method: extractionMethod,
+      raw_artifact_ref: rawArtifactRef(input.data) ?? rawArtifactRef(input.summary),
+    },
+    quality_flags: flags,
+  }
+}
+
 function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourceLocation[]) {
-  const qualityFlags = dedupeStrings([...(input.quality_flags ?? []), ...evidenceQualityFlags(input)])
+  const structured = structuredClaimFromEvidence(input, sourceLocations)
+  const qualityFlags = dedupeStrings([
+    ...(input.quality_flags ?? []),
+    ...evidenceQualityFlags(input),
+    ...structured.quality_flags,
+  ])
   const path =
     sourceLocations.find((location) => location.path)?.path ??
     firstStringField(input.data, ["path", "file", "filePath", "filepath"])
   const symbol = firstStringField(input.data, ["symbol", "name", "key"])
   const factText = firstStringField(input.data, ["fact", "claim", "summary", "text"])
-  const subject = symbol ?? path ?? input.category ?? input.source
+  const subject =
+    input.canonical_subject ?? structured.structured_claim.subject ?? symbol ?? path ?? input.category ?? input.source
   const summary = stringPreview(input.summary, 500)
-  const claim = factText ?? summary
+  const structuredValue =
+    structured.structured_claim.value === undefined ? undefined : String(structured.structured_claim.value)
+  const claim = factText ?? structuredValue ?? summary
   const source = input.source.toLowerCase()
   const category = input.category?.toLowerCase() ?? ""
   const factKind = (() => {
@@ -1595,8 +1951,9 @@ function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourc
   })()
   return {
     fact_kind: input.fact_kind ?? factKind,
-    canonical_subject: input.canonical_subject ?? subject,
+    canonical_subject: subject,
     claim: input.claim ?? claim,
+    structured_claim: structured.structured_claim,
     support_level: input.support_level ?? (qualityFlags.includes("empty_subagent_result") ? "weak" : "direct"),
     quality_flags: qualityFlags,
   }
@@ -2404,7 +2761,89 @@ class ActiveCaseTrace {
     for (const ref of classifiedRefs.direct_evidence_refs) {
       this.linkSourceToResponse(ref, record.node_id)
     }
+    if (responseRole === "final_answer" && visibility === "user_visible") {
+      const claims = splitResponseClaims(input.text)
+      claims.forEach((claim, index) => {
+        this.responseClaim({
+          response_segment_id: segment.segment_id,
+          text: claim,
+          claim_index: index + 1,
+          source_refs: sourceRefs,
+          source_locations: sourceLocations,
+          metadata: {
+            response_node_id: record.node_id,
+            response_role: responseRole,
+            turn_index: turnIndex,
+          },
+        })
+      })
+    }
     return segment
+  }
+
+  responseClaim(input: ResponseClaimInput) {
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const classifiedRefs = classifySourceRefs(sourceRefs)
+    const sourceLocations = dedupeSourceLocations([
+      ...(input.source_locations ?? []),
+      ...collectSourceLocations(input.text),
+      ...collectSourceLocations(input.metadata),
+    ])
+    const supportLevel = input.support_level ?? responseClaimSupportLevel(classifiedRefs)
+    const qualityFlags = dedupeStrings([...(input.quality_flags ?? []), ...responseClaimQualityFlags(classifiedRefs)])
+    const claim: TraceResponseClaimRecord = {
+      claim_id: input.claim_id ?? semanticID("claim", this.causalNodes.length + 1),
+      response_segment_id: input.response_segment_id,
+      text: this.summarizeText(input.text, "result.response.claim"),
+      claim_index: input.claim_index,
+      direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+      context_refs: classifiedRefs.context_refs,
+      execution_refs: classifiedRefs.execution_refs,
+      source_refs: sourceRefs,
+      source_locations: sourceLocations,
+      support_level: supportLevel,
+      quality_flags: qualityFlags,
+      metadata: input.metadata,
+    }
+    const node = this.node({
+      node_id: `responseclaim_${claim.claim_id}`,
+      kind: "response.claim",
+      component: "result",
+      title: `Response claim ${claim.claim_index}`,
+      status: "success",
+      data: {
+        claim_id: claim.claim_id,
+        response_segment_id: claim.response_segment_id,
+        text: input.text,
+        claim_index: claim.claim_index,
+        direct_evidence_refs: claim.direct_evidence_refs,
+        context_refs: claim.context_refs,
+        execution_refs: claim.execution_refs,
+        support_level: claim.support_level,
+        quality_flags: claim.quality_flags,
+        source_locations: sourceLocations,
+        metadata: input.metadata,
+      },
+      source_refs: sourceRefs,
+      source_locations: sourceLocations,
+      metadata: input.metadata,
+    })
+    const responseNodeID =
+      input.metadata && typeof input.metadata.response_node_id === "string"
+        ? input.metadata.response_node_id
+        : undefined
+    if (responseNodeID) {
+      this.causalEdge({
+        from: { type: "node", id: responseNodeID, label: "response.output" },
+        to: { type: "response_claim", id: node.node_id, label: "response.claim" },
+        relation: "response_to_claim",
+        label: "Response output was split into a claim",
+      })
+    }
+    for (const ref of claim.direct_evidence_refs) this.linkSourceToClaim(ref, node.node_id, "evidence_to_claim")
+    for (const ref of claim.context_refs) this.linkSourceToClaim(ref, node.node_id, "context_to_claim")
+    for (const ref of claim.execution_refs) this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
+    return claim
   }
 
   finalEvidence(input: FinalResponseEvidenceInput) {
@@ -2618,6 +3057,7 @@ class ActiveCaseTrace {
         fact_kind: canonical.fact_kind,
         canonical_subject: canonical.canonical_subject,
         claim: canonical.claim,
+        structured_claim: canonical.structured_claim,
         support_level: canonical.support_level,
         quality_flags: canonical.quality_flags,
         confidence: input.confidence ?? "observed",
@@ -2962,11 +3402,26 @@ class ActiveCaseTrace {
     const circularReferenceMarkers = countCircularMarkers(records)
     const openRecords = records.filter((record) => record.status === "running")
     const finalizedOpenRecords = records.filter((record) => record.data?.finalized_status === "finalized_without_close")
-    for (const record of finalizedOpenRecords.slice(0, 20)) {
+    const expectedFinalizedTypes = new Set([
+      "run.start",
+      "task.loop",
+      "llm.call",
+      "llm.turn",
+      "agent.lifecycle",
+      "prompt.assembly",
+      "context.transform",
+    ])
+    const expectedLifecycleFinalizedRecords = finalizedOpenRecords.filter(
+      (record) => record.status === "success" && expectedFinalizedTypes.has(record.event_type),
+    )
+    const unexpectedMissingCloseRecords = finalizedOpenRecords.filter(
+      (record) => !expectedLifecycleFinalizedRecords.includes(record),
+    )
+    for (const record of unexpectedMissingCloseRecords.slice(0, 20)) {
       issues.push({
-        kind: "finalized_open_record",
-        severity: "info",
-        message: "Record was open at trace finish and was finalized without a component close event.",
+        kind: "unexpected_missing_close_record",
+        severity: "warning",
+        message: "Record was open at trace finish and was finalized without an expected lifecycle close policy.",
         record_id: record.record_id,
         event_type: record.event_type,
       })
@@ -3067,16 +3522,68 @@ class ActiveCaseTrace {
         count: duplicateEvidenceFacts,
       })
     }
+    const evidenceFacts = records.filter((record) => record.event_type === "evidence.fact")
+    const genericEvidenceFacts = evidenceFacts.filter((record) => {
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && (flags.includes("generic_claim") || flags.includes("fallback_summary_claim"))
+    })
+    for (const record of genericEvidenceFacts.slice(0, 20)) {
+      issues.push({
+        kind: "generic_evidence_fact",
+        severity: "info",
+        message: "Evidence fact used a generic or fallback claim; offline attribution should inspect its raw artifact.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    const responseClaims = records.filter((record) => record.event_type === "response.claim")
+    const unsupportedResponseClaims = responseClaims.filter((record) => {
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && flags.includes("unsupported_response_claim")
+    })
+    const contextOnlyResponseClaims = responseClaims.filter((record) => {
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && flags.includes("context_only_claim")
+    })
+    for (const record of unsupportedResponseClaims.slice(0, 20)) {
+      issues.push({
+        kind: "unsupported_response_claim",
+        severity: "warning",
+        message: "Response claim has no direct evidence, context, or execution refs.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    const payloadDuplicationGroups = this.artifacts.filter((artifact) => (artifact.occurrences ?? 1) > 1).length
+    const compactionRecords = records.filter((record) => record.event_type === "context.compaction")
+    const compactionCheckRecords = records.filter((record) => record.event_type === "context.compaction_check")
+    const compactionCheckMissing =
+      compactionRecords.length && !compactionCheckRecords.length ? compactionRecords.length : 0
+    if (compactionCheckMissing) {
+      issues.push({
+        kind: "compaction_check_missing",
+        severity: "warning",
+        message: "Compaction record was observed without a preceding compaction check record.",
+        count: compactionCheckMissing,
+      })
+    }
     return {
       circular_reference_markers: circularReferenceMarkers,
       open_records: openRecords.length,
       finalized_open_records: finalizedOpenRecords.length,
+      expected_lifecycle_finalized_records: expectedLifecycleFinalizedRecords.length,
+      unexpected_missing_close_records: unexpectedMissingCloseRecords.length,
       llm_turns_missing_token_usage: llmTurnsMissingTokenUsage.length,
       llm_turns_missing_finish_reason: llmTurnsMissingFinishReason.length,
       compaction_quality_flags: compactionQualityFlags,
       empty_subagent_results: emptySubagentRecords.length,
       broad_response_refs: broadResponses.length,
       duplicate_evidence_facts: duplicateEvidenceFacts,
+      generic_evidence_facts: genericEvidenceFacts.length,
+      unsupported_response_claims: unsupportedResponseClaims.length,
+      context_only_response_claims: contextOnlyResponseClaims.length,
+      payload_duplication_groups: payloadDuplicationGroups,
+      compaction_check_missing: compactionCheckMissing,
       issues,
     }
   }
@@ -3279,6 +3786,49 @@ class ActiveCaseTrace {
     return "result"
   }
 
+  compactionCheck(input: CompactionCheckInput) {
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const checkID = input.check_id ?? semanticID("compactioncheck", this.causalNodes.length + 1)
+    const usage = input.token_usage ? normalizeTokenUsage(input.token_usage) : undefined
+    const data = omitUndefined({
+      check_id: checkID,
+      session_id: input.session_id,
+      message_id: input.message_id,
+      provider_id: input.provider_id,
+      model_id: input.model_id,
+      token_usage: usage,
+      token_estimate: input.token_estimate,
+      context_limit: input.context_limit,
+      reserved_tokens: input.reserved_tokens,
+      overflow: input.overflow,
+      selected_algorithm: input.selected_algorithm,
+      trigger_reason: input.trigger_reason,
+      metadata: input.metadata,
+    })
+    const node = this.node({
+      node_id: `compactioncheck_${checkID}`,
+      kind: "context.compaction_check",
+      component: "context",
+      span_id: input.span_id,
+      title: input.overflow ? "Compaction check overflow" : "Compaction check",
+      status: "success",
+      data,
+      source_refs: sourceRefs,
+      metadata: input.metadata,
+    })
+    for (const ref of sourceRefs ?? []) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed) continue
+      this.causalEdge({
+        from: parsed,
+        to: { type: "compaction_check", id: node.node_id, label: "context.compaction_check" },
+        relation: "derived_from",
+        label: "Compaction check used source record",
+      })
+    }
+    return node
+  }
+
   private parseSourceRef(ref: string): TraceRef | undefined {
     const index = ref.indexOf(":")
     if (index === -1) return undefined
@@ -3302,6 +3852,26 @@ class ActiveCaseTrace {
     })
   }
 
+  private linkSourceToClaim(
+    ref: string,
+    claimNodeID: string,
+    relation: "evidence_to_claim" | "context_to_claim" | "execution_to_claim",
+  ) {
+    const parsed = this.parseSourceRef(ref)
+    if (!parsed) return
+    this.causalEdge({
+      from: parsed,
+      to: { type: "response_claim", id: claimNodeID, label: "response.claim" },
+      relation,
+      label:
+        relation === "evidence_to_claim"
+          ? "Evidence fact supports response claim"
+          : relation === "context_to_claim"
+            ? "Context record contextualizes response claim"
+            : "Execution record was used for response claim",
+    })
+  }
+
   private provenanceRef(ref: TraceRef): TraceRef {
     const type = ref.type === "final_response_evidence" ? "response_segment" : ref.type
     const label = ref.label === "final.claim" ? "response.output" : ref.label
@@ -3318,11 +3888,7 @@ class ActiveCaseTrace {
 
   private provenanceLabel(label: string | undefined) {
     if (!label) return undefined
-    return label
-      .replace(/final response evidence/gi, "response output")
-      .replace(/final claim/gi, "response output")
-      .replace(/claim/gi, "response")
-      .replace(/evidence/gi, "source record")
+    return label.replace(/final response evidence/gi, "response output").replace(/final claim/gi, "response output")
   }
 
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
@@ -3641,6 +4207,10 @@ export namespace CaseTrace {
 
   export function compaction(input: CompactionRecordInput) {
     return get()?.compaction(input)
+  }
+
+  export function compactionCheck(input: CompactionCheckInput) {
+    return get()?.compactionCheck(input)
   }
 
   export function currentEvidenceRefs() {

@@ -116,6 +116,23 @@ function typedResources(record: ProvenanceRecord) {
     .join("")
 }
 
+function structuredClaim(record: ProvenanceRecord) {
+  const claim = record.data?.structured_claim
+  if (!claim || typeof claim !== "object" || Array.isArray(claim)) return `<span class="muted">-</span>`
+  const value = claim as Record<string, unknown>
+  const sourceSpan =
+    value.source_span && typeof value.source_span === "object" && !Array.isArray(value.source_span)
+      ? sourceLocationLabel(value.source_span as Record<string, unknown>)
+      : ""
+  return `<div class="structured-claim">
+    <div><span class="label">Subject</span><strong>${escapeHtml(value.subject ?? "-")}</strong></div>
+    <div><span class="label">Predicate</span><strong>${escapeHtml(value.predicate ?? "-")}</strong></div>
+    <div><span class="label">Value</span><code>${escapeHtml(value.value ?? "-")}</code></div>
+    <div><span class="label">Method</span><code>${escapeHtml(value.extraction_method ?? "-")}</code></div>
+    ${sourceSpan ? `<div class="claim-span"><span class="label">Source Span</span><code>${escapeHtml(sourceSpan)}</code></div>` : ""}
+  </div>`
+}
+
 function formatDuration(ms: number | undefined) {
   if (ms === undefined) return "-"
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
@@ -182,6 +199,15 @@ function recordSummary(record: ProvenanceRecord) {
       .filter(Boolean)
       .join(" | ")
   }
+  if (record.event_type === "response.claim") {
+    return [
+      data.support_level ? `support=${String(data.support_level)}` : "",
+      Array.isArray(data.quality_flags) && data.quality_flags.length ? `flags=${data.quality_flags.join(",")}` : "",
+      preview(data.text, 160),
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
   if (record.event_type === "llm.call") {
     return [data.provider_id, data.model_id, formatTokens(record.token_usage)].filter(Boolean).join(" | ")
   }
@@ -218,6 +244,17 @@ function recordSummary(record: ProvenanceRecord) {
   if (record.event_type === "context.compaction") {
     return [data.algorithm, data.reason, data.before_tokens, data.after_tokens]
       .filter((item) => item !== undefined)
+      .join(" | ")
+  }
+  if (record.event_type === "context.compaction_check") {
+    return [
+      data.trigger_reason ? `reason=${String(data.trigger_reason)}` : "",
+      data.overflow !== undefined ? `overflow=${String(data.overflow)}` : "",
+      data.token_estimate !== undefined ? `tokens=${String(data.token_estimate)}` : "",
+      data.context_limit !== undefined ? `limit=${String(data.context_limit)}` : "",
+      data.selected_algorithm ? `algorithm=${String(data.selected_algorithm)}` : "",
+    ]
+      .filter(Boolean)
       .join(" | ")
   }
   return preview(data.summary ?? data.output ?? data.text ?? data, 180)
@@ -325,6 +362,16 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
     ["Circular Markers", health.circular_reference_markers, "Path-cycle markers left in structured JSON."],
     ["Open Records", health.open_records, "Records still running after finalization."],
     ["Finalized Open", health.finalized_open_records, "Open records closed by trace finalizer."],
+    [
+      "Expected Finalized",
+      health.expected_lifecycle_finalized_records ?? 0,
+      "Lifecycle records finalized by an expected close policy.",
+    ],
+    [
+      "Unexpected Missing Close",
+      health.unexpected_missing_close_records ?? 0,
+      "Finalized records without an expected lifecycle close policy.",
+    ],
     ["LLM Missing Tokens", health.llm_turns_missing_token_usage, "LLM turns without token usage."],
     ["LLM Missing Finish", health.llm_turns_missing_finish_reason, "LLM turns without finish reason."],
     ["Empty Subagent", health.empty_subagent_results, "Subagent/task facts with empty returned result."],
@@ -334,6 +381,15 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
       "Responses whose legacy source_refs are wider than direct evidence.",
     ],
     ["Duplicate Evidence", health.duplicate_evidence_facts, "Repeated evidence facts after canonicalization."],
+    ["Generic Evidence", health.generic_evidence_facts ?? 0, "Evidence facts that fell back to generic claims."],
+    ["Unsupported Claims", health.unsupported_response_claims ?? 0, "Response claims without any provenance refs."],
+    [
+      "Context Only Claims",
+      health.context_only_response_claims ?? 0,
+      "Response claims supported only by context refs.",
+    ],
+    ["Payload Dup Groups", health.payload_duplication_groups ?? 0, "Artifact payloads reused multiple times."],
+    ["Missing Compaction Check", health.compaction_check_missing ?? 0, "Compactions without a check record."],
   ] as const
 
   return `<section id="trace-health">
@@ -753,6 +809,10 @@ function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
             <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
             <div class="fact-grid">
               <div>
+                <div class="label">Structured Claim</div>
+                ${structuredClaim(record)}
+              </div>
+              <div>
                 <div class="label">Source Refs</div>
                 <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
               </div>
@@ -777,10 +837,58 @@ function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
   </section>`
 }
 
+function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
+  const records = trace.records
+    .filter((record) => record.event_type === "response.claim")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="claim-evidence-matrix"><h2>Claim Evidence Matrix</h2><div class="empty">No response claim records.</div></section>`
+  return `<section id="claim-evidence-matrix">
+    <div class="section-title">
+      <h2>Claim Evidence Matrix</h2>
+      <span class="muted">Final-answer claims mapped to direct evidence, context, and execution refs.</span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Claim</th>
+            <th>Support</th>
+            <th>Quality Flags</th>
+            <th>Direct Evidence</th>
+            <th>Context</th>
+            <th>Execution</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${records
+            .map((record) => {
+              const data = record.data ?? {}
+              const direct = Array.isArray(data.direct_evidence_refs) ? data.direct_evidence_refs : []
+              const context = Array.isArray(data.context_refs) ? data.context_refs : []
+              const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
+              const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
+              return `<tr>
+                <td><div class="claim-text">${escapeHtml(preview(data.text, 520))}</div><code>${escapeHtml(record.record_id)}</code></td>
+                <td><span class="status">${escapeHtml(data.support_level ?? "-")}</span></td>
+                <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
+                <td><div class="refs">${escapeHtml(direct.join(", ") || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(context.join(", ") || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(execution.join(", ") || "-")}</div></td>
+              </tr>`
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  </section>`
+}
+
 function renderContextAndCompaction(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(
     (record) =>
       record.event_type === "context.pack" ||
+      record.event_type === "context.compaction_check" ||
       record.event_type === "context.compaction" ||
       record.component === "context",
   )
@@ -933,6 +1041,10 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .refs { overflow-x: auto; white-space: nowrap; padding-top: 7px; color: var(--muted); font-size: 12px; }
     .fact-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
     .semantic-data { max-height: 220px; }
+    .structured-claim { display: grid; gap: 6px; min-width: 220px; }
+    .structured-claim strong, .structured-claim code { display: block; max-width: 100%; overflow-x: auto; white-space: nowrap; }
+    .claim-span { grid-column: 1 / -1; }
+    .claim-text { min-width: 260px; max-height: 140px; overflow: auto; white-space: pre-wrap; }
     .source-locations, .typed-resources { display: grid; gap: 6px; min-width: 0; }
     .source-location pre { max-height: 120px; background: #f8fafc; color: var(--text); border-color: var(--border); white-space: pre; }
     .typed-resource { padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
@@ -960,6 +1072,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
         <a href="#llm-turns">LLM Turns</a>
         <a href="#lifecycle">Lifecycle</a>
         <a href="#subagents">Subagents</a>
+        <a href="#claim-evidence-matrix">Claim Matrix</a>
         <a href="#evidence-facts">Evidence Facts</a>
         <a href="#agent-flow">Agent Flow</a>
         <a href="#component-dataflow">Component Dataflow</a>
@@ -977,6 +1090,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     ${renderLlmTurns(trace, artifacts)}
     ${renderLifecycle(trace)}
     ${renderSubagents(trace, artifacts)}
+    ${renderClaimEvidenceMatrix(trace)}
     ${renderEvidenceFacts(trace, artifacts)}
     ${renderAgentFlow(trace, artifacts)}
     <section id="component-dataflow">

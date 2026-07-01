@@ -1,6 +1,6 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "4.5" as const
+export const TRACE_VERSION = "4.6" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
@@ -8,6 +8,7 @@ export const FORMAL_RECORD_TYPES = [
   "prompt.assembly",
   "context.transform",
   "context.pack",
+  "context.compaction_check",
   "context.compaction",
   "llm.call",
   "llm.turn",
@@ -24,6 +25,7 @@ export const FORMAL_RECORD_TYPES = [
   "change",
   "verification",
   "response.output",
+  "response.claim",
 ] as const
 
 export type FormalRecordType = (typeof FORMAL_RECORD_TYPES)[number]
@@ -54,6 +56,10 @@ export const FORMAL_DATAFLOW_RELATIONS = [
   "delegated_to",
   "reported_to",
   "supported_response",
+  "claimed_by",
+  "supports_claim",
+  "contextualizes_claim",
+  "executed_for_claim",
 ] as const
 
 export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]
@@ -81,6 +87,10 @@ const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
   parent_to_subagent: "delegated_to",
   source_to_response: "consumed",
   evidence_to_response: "supported_response",
+  response_to_claim: "claimed_by",
+  evidence_to_claim: "supports_claim",
+  context_to_claim: "contextualizes_claim",
+  execution_to_claim: "executed_for_claim",
   source_to_observation: "derived_from",
   source_to_compaction: "compressed_from",
   compaction_to_observation: "derived_from",

@@ -1919,6 +1919,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (task?.type === "compaction") {
+            CaseTrace.compactionCheck({
+              session_id: sessionID,
+              message_id: task.id,
+              provider_id: model.providerID,
+              model_id: model.id,
+              context_limit: model.limit.context,
+              overflow: Boolean(task.overflow),
+              selected_algorithm: "head-tail-summary",
+              trigger_reason: task.overflow ? "overflow_compaction_task" : "scheduled_compaction_task",
+              metadata: {
+                step,
+                auto: task.auto,
+              },
+            })
             CaseTrace.exitGate({
               session_id: sessionID,
               message_id: task.id,
@@ -1945,28 +1959,54 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            CaseTrace.exitGate({
+          if (lastFinished && lastFinished.summary !== true) {
+            const naturalOverflow = yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })
+            const forcedOverflow =
+              CaseTrace.isEnabled() && process.env.OPENCODE_TRACE_FORCE_COMPACTION === "1" && step === 1
+            const needsCompaction = naturalOverflow || forcedOverflow
+            CaseTrace.compactionCheck({
               session_id: sessionID,
               message_id: lastFinished.id,
-              has_final_answer: false,
-              needs_compaction: true,
-              auto_continue: true,
-              synthetic_continue: true,
-              continuation_source: "compaction",
-              decision: "continue",
-              reason: "last_finished_overflow",
+              provider_id: model.providerID,
+              model_id: model.id,
+              token_usage: lastFinished.tokens,
+              token_estimate:
+                lastFinished.tokens.total ||
+                lastFinished.tokens.input +
+                  lastFinished.tokens.output +
+                  lastFinished.tokens.cache.read +
+                  lastFinished.tokens.cache.write,
+              context_limit: model.limit.context,
+              overflow: needsCompaction,
+              selected_algorithm: "head-tail-summary",
+              trigger_reason: forcedOverflow ? "forced_trace_compaction" : "last_finished_overflow_check",
               metadata: {
                 step,
                 finish: lastFinished.finish,
+                natural_overflow: naturalOverflow,
+                forced_overflow: forcedOverflow,
               },
             })
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+            if (needsCompaction) {
+              CaseTrace.exitGate({
+                session_id: sessionID,
+                message_id: lastFinished.id,
+                has_final_answer: false,
+                needs_compaction: true,
+                auto_continue: true,
+                synthetic_continue: true,
+                continuation_source: "compaction",
+                decision: "continue",
+                reason: "last_finished_overflow",
+                metadata: {
+                  step,
+                  finish: lastFinished.finish,
+                  forced_overflow: forcedOverflow,
+                },
+              })
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)

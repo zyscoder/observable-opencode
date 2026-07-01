@@ -517,6 +517,35 @@ export const layer: Layer.Layer<
           serialized_tail: tail ? CaseTrace.summarizeText(tail) : undefined,
         },
       })
+      CaseTrace.compactionCheck({
+        session_id: input.sessionID,
+        message_id: input.parentID,
+        provider_id: model.providerID,
+        model_id: model.id,
+        token_estimate: Token.estimate([previousSummary, tail, nextPrompt].filter(Boolean).join("\n\n")),
+        context_limit: model.limit.context,
+        overflow: Boolean(input.overflow),
+        selected_algorithm: "head-tail-summary",
+        trigger_reason: input.overflow
+          ? "overflow_compaction_process"
+          : input.auto
+            ? "auto_compaction_process"
+            : "manual_compaction_process",
+        source_refs: compactionSnapshot ? [`context:${compactionSnapshot.snapshot_id}`] : undefined,
+        metadata: {
+          auto: input.auto,
+          overflow: input.overflow,
+          history_messages: history.length,
+          hidden_compaction_messages: hidden.size,
+          selected_head_messages: selected.head.length,
+          selected_tail_messages: selected.tail.length,
+          selected_head_message_ids: selectedHeadIDs,
+          selected_tail_message_ids: selectedTailIDs,
+          hidden_compaction_message_ids: hiddenMessageIDs,
+          plugin_context_count: compacting.context.length,
+          plugin_replaced_prompt: Boolean(compacting.prompt),
+        },
+      })
       if (compactionPromptNode && compactionSnapshot) {
         CaseTrace.edge({
           from: { type: "context", id: compactionPromptNode.node_id, label: "compaction_prompt_built" },

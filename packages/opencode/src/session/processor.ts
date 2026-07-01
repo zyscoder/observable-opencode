@@ -10,7 +10,7 @@ import * as Session from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { Image } from "@/image/image"
-import { isOverflow } from "./overflow"
+import { isOverflow, usable } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
@@ -655,7 +655,30 @@ export const layer: Layer.Layer<
                 step: ctx.currentStep,
               },
             })
-            const overflow = isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
+            const cfg = yield* config.get()
+            const overflow = isOverflow({ cfg, tokens: usage.tokens, model: ctx.model })
+            const usableLimit = usable({ cfg, model: ctx.model })
+            const tokenEstimate =
+              usage.tokens.total ??
+              usage.tokens.input + usage.tokens.output + usage.tokens.cache.read + usage.tokens.cache.write
+            CaseTrace.compactionCheck({
+              session_id: ctx.sessionID,
+              message_id: ctx.assistantMessage.id,
+              provider_id: ctx.model.providerID,
+              model_id: ctx.model.id,
+              token_usage: usage.tokens,
+              token_estimate: tokenEstimate,
+              context_limit: ctx.model.limit.context,
+              reserved_tokens: Math.max(0, ctx.model.limit.context - usableLimit),
+              overflow,
+              selected_algorithm: "head-tail-summary",
+              trigger_reason: "llm_step_finished",
+              metadata: {
+                step: ctx.currentStep,
+                usable_limit: usableLimit,
+                compaction_auto: cfg.compaction?.auto,
+              },
+            })
             CaseTrace.agentLifecycle({
               session_id: ctx.sessionID,
               message_id: ctx.assistantMessage.id,

@@ -24,7 +24,7 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v4.5 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes trace semantic contract v4.6 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -39,6 +39,7 @@ describe("case trace", () => {
         `const ctx = CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", provider_id: "deepseek", model_id: "unit-test", agent: "build", message_count: 1, messages: [{ role: "user", content: "fix pricing bug" }] })`,
         `const obs = CaseTrace.observation({ source: "tool", category: "file", summary: "pricing.mjs owns discount calculation", data: { file: "src/pricing.mjs", lines: "1-20" }, source_refs: ctx ? ["context:" + ctx.snapshot_id] : [] })`,
         `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file", summary: "pricing.mjs owns discount calculation", data: { path: "src/pricing.mjs", symbol: "discount" }, source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `CaseTrace.compactionCheck({ session_id: "ses_test", message_id: "msg_user", provider_id: "deepseek", model_id: "unit-test", token_estimate: 120, context_limit: 1000, reserved_tokens: 100, overflow: false, selected_algorithm: "head-tail-summary", trigger_reason: "unit_test_no_overflow" })`,
         `CaseTrace.responseOutput({ text: "Discount bug is in pricing.mjs.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
         `span?.end({ output: { completed: true, finish_reason: "stop" }, tokenUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 3, totalTokens: 15 } })`,
         `CaseTrace.finish({ status: "success", result: { exit_code: 0 } })`,
@@ -108,15 +109,19 @@ describe("case trace", () => {
       "delegated_to",
       "reported_to",
       "supported_response",
+      "claimed_by",
+      "supports_claim",
+      "contextualizes_claim",
+      "executed_for_claim",
     ])
 
-    expect(manifest.trace_version).toBe("4.5")
+    expect(manifest.trace_version).toBe("4.6")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
-    expect(provenance.trace_version).toBe("4.5")
+    expect(provenance.trace_version).toBe("4.6")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -125,9 +130,12 @@ describe("case trace", () => {
     expect(provenance.records.map((record: any) => record.event_type)).toContain("llm.call")
     expect(provenance.records.map((record: any) => record.event_type)).toContain("observation")
     expect(provenance.records.map((record: any) => record.event_type)).toContain("response.output")
+    expect(provenance.records.map((record: any) => record.event_type)).toContain("response.claim")
+    expect(provenance.records.map((record: any) => record.event_type)).toContain("context.compaction_check")
     expect(provenance.records.map((record: any) => record.event_type)).not.toContain("runtime.event")
     expect(provenance.dataflow_edges.every((edge: any) => allowedRelations.has(edge.relation))).toBe(true)
     expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supported_response")).toBe(true)
+    expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supports_claim")).toBe(true)
     expect(provenanceText).not.toContain("diagnostics_hints")
     expect(provenanceText).not.toContain("evidence_refs")
     expect(provenanceText).not.toContain("final.claim")
@@ -142,21 +150,23 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v4.5")
+    expect(traceHtml).toContain("Trace v4.6")
     expect(traceHtml).toContain('id="overview"')
     expect(traceHtml).toContain('id="trace-health"')
     expect(traceHtml).toContain('id="agent-flow"')
     expect(traceHtml).toContain('id="llm-turns"')
     expect(traceHtml).toContain('id="lifecycle"')
     expect(traceHtml).toContain('id="subagents"')
+    expect(traceHtml).toContain('id="claim-evidence-matrix"')
     expect(traceHtml).toContain('id="evidence-facts"')
+    expect(traceHtml).toContain("Claim Evidence Matrix")
     expect(traceHtml).toContain("Component Dataflow")
     expect(traceHtml).toContain("IO Inspector")
     expect(traceHtml).toContain("Context And Compaction")
     expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
-  test("writes v4.5 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
+  test("writes v4.6 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-v45.ts")
@@ -197,7 +207,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.5")
+    expect(trace.trace_version).toBe("4.6")
     expect(eventTypes).toContain("prompt.assembly")
     expect(eventTypes).toContain("context.transform")
     expect(eventTypes).toContain("decision")
@@ -208,7 +218,7 @@ describe("case trace", () => {
     expect(html).toContain("llm_tool_call")
   })
 
-  test("writes v4.5 lifecycle provenance records for LLM turns, exit gates, and evidence facts", async () => {
+  test("writes v4.6 lifecycle provenance records for LLM turns, exit gates, evidence facts, and response claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-lifecycle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "lifecycle-v45.ts")
@@ -256,7 +266,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.5")
+    expect(trace.trace_version).toBe("4.6")
     expect(eventTypes).toContain("llm.turn")
     expect(eventTypes).toContain("agent.lifecycle")
     expect(eventTypes).toContain("exit.gate")
@@ -265,6 +275,12 @@ describe("case trace", () => {
     expect(evidenceFact.data.fact_kind).toBe("code_reference")
     expect(evidenceFact.data.canonical_subject).toBe("applyDiscount")
     expect(evidenceFact.data.claim).toBe("applyDiscount is implemented in src/pricing.mjs lines 7-11")
+    expect(evidenceFact.data.structured_claim).toMatchObject({
+      subject: "applyDiscount",
+      predicate: "located_at",
+      value: "src/pricing.mjs",
+      extraction_method: "source_location_fields",
+    })
     expect(evidenceFact.data.support_level).toBe("direct")
     expect(evidenceFact.data.quality_flags).toEqual([])
     const llmTurn = trace.records.find((record: any) => record.event_type === "llm.turn")
@@ -285,7 +301,11 @@ describe("case trace", () => {
     expect(response.data.direct_evidence_refs).toHaveLength(1)
     expect(response.data.context_refs[0].startsWith("context_snapshot:")).toBe(true)
     expect(response.data.execution_refs[0].startsWith("tool_span:")).toBe(true)
+    const responseClaim = trace.records.find((record: any) => record.event_type === "response.claim")
+    expect(responseClaim.data.direct_evidence_refs).toHaveLength(1)
+    expect(responseClaim.data.support_level).toBe("direct")
     expect(trace.dataflow_edges.filter((edge: any) => edge.relation === "supported_response")).toHaveLength(1)
+    expect(trace.dataflow_edges.some((edge: any) => edge.relation === "supports_claim")).toBe(true)
     expect(trace.metrics.trace_health.circular_reference_markers).toBe(0)
     expect(html).toContain("LLM Turns")
     expect(html).toContain("Lifecycle And Exit Gates")
@@ -294,7 +314,7 @@ describe("case trace", () => {
     expect(html).toContain("applyDiscount")
   })
 
-  test("writes v4.5 structurally safe trace JSON and finalizes open lifecycle records", async () => {
+  test("writes v4.6 structurally safe trace JSON and classifies finalized lifecycle records", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-quality-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "quality-v45.ts")
@@ -336,7 +356,7 @@ describe("case trace", () => {
     const trace = JSON.parse(traceText) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
 
-    expect(trace.trace_version).toBe("4.5")
+    expect(trace.trace_version).toBe("4.6")
     expect(traceText).not.toContain("[Circular]")
     expect(trace.records.filter((record: any) => record.status === "running")).toHaveLength(0)
     const openTurn = trace.records.find((record: any) => record.record_id === "llmturn_open_turn")
@@ -346,7 +366,9 @@ describe("case trace", () => {
     const health = trace.metrics.trace_health
     expect(health.circular_reference_markers).toBe(0)
     expect(health.finalized_open_records).toBeGreaterThan(0)
-    expect(health.issues.some((issue: any) => issue.kind === "finalized_open_record")).toBe(true)
+    expect(health.expected_lifecycle_finalized_records).toBeGreaterThan(0)
+    expect(health.unexpected_missing_close_records).toBe(0)
+    expect(health.issues.some((issue: any) => issue.kind === "finalized_open_record")).toBe(false)
     expect(html).toContain('id="trace-health"')
   })
 
@@ -397,7 +419,7 @@ describe("case trace", () => {
     expect(relations).not.toContain("tool_to_change")
   })
 
-  test("adds v4.5 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
+  test("adds v4.6 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -1015,13 +1037,13 @@ describe("case trace", () => {
     expect(html).toContain('class="io-scroll"')
   })
 
-  test("renders v4.5 provenance report with flow-style sections and scrollable IO panes", () => {
+  test("renders v4.6 provenance report with flow-style sections and scrollable IO panes", () => {
     const trace: ProvenanceTraceSummary = {
-      trace_version: "4.5",
+      trace_version: "4.6",
       manifest: {
-        trace_version: "4.5",
-        case_id: "viewer-v45-case",
-        run_id: "run_viewer_v45",
+        trace_version: "4.6",
+        case_id: "viewer-v46-case",
+        run_id: "run_viewer_v46",
         started_at: "2026-06-30T00:00:00.000Z",
         ended_at: "2026-06-30T00:00:01.000Z",
         duration_ms: 1000,
@@ -1094,6 +1116,50 @@ describe("case trace", () => {
             is_final_for_case: true,
           },
         },
+        {
+          record_id: "evidence_1",
+          component: "mcp",
+          event_type: "evidence.fact",
+          timestamp: "2026-06-30T00:00:00.820Z",
+          time_ms: 820,
+          title: "repo_fact",
+          status: "success",
+          source_refs: ["mcp:mcp_1"],
+          source_locations: [{ path: "src/pricing.mjs", line_start: 5, line_end: 5 }],
+          data: {
+            fact_kind: "mcp_fact",
+            canonical_subject: "pricing",
+            claim: "pricing bug is line 5",
+            structured_claim: {
+              subject: "pricing",
+              predicate: "bug_location",
+              value: "line 5",
+              extraction_method: "mcp_json_text",
+              source_span: { path: "src/pricing.mjs", line_start: 5, line_end: 5 },
+            },
+            quality_flags: [],
+          },
+        },
+        {
+          record_id: "claim_1",
+          component: "result",
+          event_type: "response.claim",
+          timestamp: "2026-06-30T00:00:00.920Z",
+          time_ms: 920,
+          title: "Response claim 1",
+          status: "success",
+          source_refs: ["evidence:evidence_1", "tool_span:span_1"],
+          data: {
+            text: "pricing bug is line 5",
+            response_segment_id: "segment_1",
+            claim_index: 1,
+            direct_evidence_refs: ["evidence:evidence_1"],
+            context_refs: [],
+            execution_refs: ["tool_span:span_1"],
+            support_level: "direct",
+            quality_flags: [],
+          },
+        },
       ],
       dataflow_edges: [
         {
@@ -1102,6 +1168,13 @@ describe("case trace", () => {
           to: { type: "node", id: "resp_1" },
           relation: "consumed",
           label: "MCP fact used by final response",
+        },
+        {
+          edge_id: "edge_2",
+          from: { type: "evidence", id: "evidence_1" },
+          to: { type: "response_claim", id: "claim_1" },
+          relation: "supports_claim",
+          label: "Evidence supports response claim",
         },
       ],
       artifacts: [
@@ -1119,29 +1192,28 @@ describe("case trace", () => {
       metrics: {
         spans: 1,
         events: 2,
-        records: 3,
-        dataflow_edges: 1,
+        records: 5,
+        dataflow_edges: 2,
         artifacts: 1,
         token_usage: { input: 10, output: 5, total: 15 },
         trace_health: {
           circular_reference_markers: 0,
           open_records: 1,
           finalized_open_records: 1,
+          expected_lifecycle_finalized_records: 1,
+          unexpected_missing_close_records: 0,
           llm_turns_missing_token_usage: 0,
           llm_turns_missing_finish_reason: 0,
           compaction_quality_flags: {},
           empty_subagent_results: 0,
           broad_response_refs: 0,
           duplicate_evidence_facts: 0,
-          issues: [
-            {
-              kind: "finalized_open_record",
-              severity: "info",
-              message: "Record was open at trace finish and was finalized.",
-              record_id: "llm_1",
-              event_type: "llm.call",
-            },
-          ],
+          generic_evidence_facts: 0,
+          unsupported_response_claims: 0,
+          context_only_response_claims: 0,
+          payload_duplication_groups: 0,
+          compaction_check_missing: 0,
+          issues: [],
         },
       },
     }
@@ -1155,6 +1227,7 @@ describe("case trace", () => {
       "llm-turns",
       "lifecycle",
       "subagents",
+      "claim-evidence-matrix",
       "evidence-facts",
       "agent-flow",
       "component-dataflow",
@@ -1165,8 +1238,10 @@ describe("case trace", () => {
     ]) {
       expect(html).toContain(`id="${id}"`)
     }
-    expect(html).toContain("Trace v4.5")
+    expect(html).toContain("Trace v4.6")
     expect(html).toContain("Trace Health")
+    expect(html).toContain("Claim Evidence Matrix")
+    expect(html).toContain("structured_claim")
     expect(html).toContain('class="io-grid"')
     expect(html).toContain('class="io-input"')
     expect(html).toContain('class="io-output"')
