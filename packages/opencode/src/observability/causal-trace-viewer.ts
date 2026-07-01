@@ -787,6 +787,11 @@ function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, T
               </div>
               <div class="io-output">
                 <div class="pane-title">Returned / Output</div>
+                ${
+                  record.data?.child_trace_unavailable_reason
+                    ? `<div class="refs">child trace unavailable: <code>${escapeHtml(record.data.child_trace_unavailable_reason)}</code></div>`
+                    : ""
+                }
                 <pre>${escapeHtml(pretty(recordOutput(record)))}</pre>
                 <div class="refs">refs ${artifactLinks(record.output_refs ?? record.artifact_refs, artifacts)}</div>
               </div>

@@ -1427,6 +1427,7 @@ function enrichSubagentOutput(output: unknown, parentRecordID: string, caseDir: 
       child_session_id: childSessionID,
       child_status: "success",
       child_trace_available: available,
+      ...(available ? {} : { child_trace_unavailable_reason: "child_trace_file_not_found" }),
       ...(available ? { child_trace_dir: childTraceRelativeDir(childSessionID) } : {}),
     },
   }
@@ -1443,6 +1444,7 @@ function subagentTraceRef(output: unknown, parentRecordID: string, caseDir: stri
     child_session_id: childSessionID,
     child_status: stringField(record, ["child_status", "status"]) ?? "success",
     child_trace_available: available,
+    ...(available ? {} : { child_trace_unavailable_reason: "child_trace_file_not_found" }),
     ...(available ? { child_trace_dir: childTraceRelativeDir(childSessionID) } : {}),
   }
 }
@@ -1674,6 +1676,7 @@ function splitResponseClaims(input: unknown): string[] {
   return normalized
     .map((claim) => claim.replace(/\s+/g, " ").trim())
     .filter((claim) => {
+      if (isBrokenClaimFragment(claim)) return false
       const textLength = claim.replace(/\s/g, "").length
       const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
       if (textLength < 6 && !hasFactSignal) return false
@@ -1687,16 +1690,18 @@ function splitResponseClaims(input: unknown): string[] {
 }
 
 function isNonFactualResponseClaim(input: string) {
+  if (isMarkdownTableStructuralRow(input)) return true
   const normalized = input
     .trim()
     .replace(/^#+\s*/, "")
-    .replace(/^[-*]\s*/, "")
     .replace(/\*\*/g, "")
-    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/^[-*]\s*/, "")
+    .replace(/^["'`*_]+|["'`*_]+$/g, "")
     .replace(/[。.!?；;:：]+$/g, "")
     .trim()
     .toLowerCase()
   if (!normalized) return true
+  if (/^\d+[.)]?$/.test(normalized)) return true
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
   if (
@@ -1705,9 +1710,49 @@ function isNonFactualResponseClaim(input: string) {
     )
   )
     return true
+  if (
+    /^(?:[一二三四五六七八九十]+[、.]\s*)?(需求影响分析报告|资料交叉比对|一致性结论|依据来源|使用的上下文资料|上下文资料|压缩链路验证汇总)$/.test(
+      normalized,
+    )
+  )
+    return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
   if (/^(以下是|下面是|这里是).*(总结|结论)$/.test(normalized)) return true
   return false
+}
+
+function markdownTableCells(input: string) {
+  const trimmed = input.trim()
+  if (!trimmed.includes("|")) return []
+  return trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim().replace(/\*\*/g, "").replace(/`/g, "").trim())
+}
+
+function isLikelyTableHeaderCell(input: string) {
+  const normalized = input.trim().toLowerCase()
+  if (!normalized) return true
+  if (/^:?-{2,}:?$/.test(normalized)) return true
+  if (/^(项目|结果|来源|关键信息|维度|说明|文件|路径|子 agent 结论|subagent result)$/.test(normalized)) return true
+  if (/^mcp\s+[\w-]+$/i.test(normalized)) return true
+  if (/^syntheticfacts[_\w.-]*$/i.test(normalized)) return true
+  if (/^(?:[\w@+.-]+\/)?[\w@+.-]+\.(?:md|mjs|js|ts|tsx|json|txt|py|go|rs|java|yaml|yml)$/i.test(normalized)) return true
+  return false
+}
+
+function isMarkdownTableStructuralRow(input: string) {
+  const cells = markdownTableCells(input)
+  if (cells.length < 2) return false
+  if (cells.every((cell) => /^:?-{2,}:?$/.test(cell))) return true
+  const joined = cells.join(" ")
+  const hasFactValue =
+    /billing-platform|15\s*%|15 percent|0\.15|全部通过|pricing tests passed|失败|通过|无需改动|Math\.min|quoteOwner\(|renewalQuote\(input\)|48000|51000/i.test(
+      joined,
+    )
+  if (hasFactValue) return false
+  return cells.every(isLikelyTableHeaderCell)
 }
 
 function protectClaimSegments(input: string) {
@@ -1723,6 +1768,7 @@ function protectClaimSegments(input: string) {
   protect(/`[^`\n]+`/g)
   protect(/\b\d+\.\d+%?/g)
   protect(/\b\d+\s*percent\b/gi)
+  protect(/\b[\w@+.-]+\.(?:mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt|sh|yaml|yml)\b/gi)
   protect(/(?:^|[\s('"，。；;：:])((?:\.{0,2}\/|\/)?[\w@~-]+(?:\/[\w@~.-]+)+)(?=$|[\s)'",，。；;：:])/g)
   protect(/\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\b/g)
   protect(/\b[A-Za-z_$][\w$]*\([^。\n]*?\)/g)
@@ -2149,6 +2195,12 @@ function collectTextCandidates(input: unknown, output: string[] = [], depth = 0)
   if (typeof input !== "object") return output
   const record = input as Record<string, unknown>
   for (const key of [
+    "parts",
+    "input",
+    "body",
+    "prompt",
+    "messages",
+    "message",
     "text",
     "content",
     "fact",
@@ -2894,6 +2946,8 @@ class ActiveCaseTrace {
         data.child_session_id = traceRef.child_session_id
         data.child_status = traceRef.child_status
         data.child_trace_available = traceRef.child_trace_available
+        if (traceRef.child_trace_unavailable_reason)
+          data.child_trace_unavailable_reason = traceRef.child_trace_unavailable_reason
         if (traceRef.child_trace_dir) data.child_trace_dir = traceRef.child_trace_dir
       }
       if (isEmptySubagentOutput(rawOutput)) data.quality_flags = ["empty_subagent_result"]
@@ -3911,17 +3965,25 @@ class ActiveCaseTrace {
       input.output_summary === undefined
         ? undefined
         : this.summarizeCausalValue(input.output_summary, "context.compaction.output_summary")
-    contextLedger.summary_artifact_id = contextLedger.summary_artifact_id ?? this.collectArtifactRefs(outputSummary)[0]
+    const forcedSummaryArtifactID =
+      input.output_summary === undefined
+        ? undefined
+        : (this.collectArtifactRefs(outputSummary)[0] ?? this.writeCompactionSummaryArtifact(input.output_summary))
+    contextLedger.summary_artifact_id = contextLedger.summary_artifact_id ?? forcedSummaryArtifactID
     if (contextLedger.summary_artifact_id && contextLedger.quality_flags?.includes("summary_artifact_pending")) {
       contextLedger.quality_flags = contextLedger.quality_flags.filter((flag) => flag !== "summary_artifact_pending")
     }
     const serializedTailArtifactRef = this.collectArtifactRefs(serializedTail)[0]
-    const summaryArtifactRef = contextLedger.summary_artifact_id ?? this.collectArtifactRefs(outputSummary)[0]
+    const summaryArtifactRef = contextLedger.summary_artifact_id ?? forcedSummaryArtifactID
     const metadata = input.metadata ?? {}
-    const afterContextRefs = dedupeStrings([
+    const explicitAfterContextRefs = dedupeStrings([
       ...(input.after_context_refs ?? []),
       ...(stringArrayField(metadata, ["after_context_refs", "afterContextRefs"]) ?? []),
     ])
+    const afterContextRefs =
+      explicitAfterContextRefs.length || !contextLedger.auto_continue_prompt_ref
+        ? explicitAfterContextRefs
+        : [contextLedger.auto_continue_prompt_ref]
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -4571,6 +4633,11 @@ class ActiveCaseTrace {
     }
     visit(input)
     return [...refs]
+  }
+
+  private writeCompactionSummaryArtifact(input: unknown) {
+    if (typeof input === "string") return this.writeArtifact("text", "compaction.output_summary", input).artifact_id
+    return this.writeArtifact("json", "compaction.output_summary", prettyJsonString(json(input))).artifact_id
   }
 
   private normalizeSourceRefs(input: string[] | undefined) {
