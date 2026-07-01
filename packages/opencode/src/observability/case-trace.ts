@@ -340,6 +340,7 @@ export type TraceResponseClaimRecord = {
   direct_evidence_refs: string[]
   context_refs: string[]
   execution_refs: string[]
+  legacy_context_refs?: string[]
   matched_evidence_refs?: string[]
   candidate_evidence_refs?: string[]
   match_strategy?: string
@@ -407,6 +408,8 @@ export type TraceHealthMetrics = {
   weak_evidence_matches?: number
   mcp_json_parse_shadowed?: number
   skill_request_unresolved?: number
+  background_llm_turns?: number
+  legacy_context_ref_claims?: number
   issues: TraceHealthIssue[]
 }
 
@@ -808,6 +811,7 @@ type CompactionRecordInput = {
   auto_continue?: boolean
   result?: string
   context_ledger?: TraceContextLedger
+  after_context_refs?: string[]
   span_id?: string
   source_refs?: string[]
   evidence_refs?: string[]
@@ -1240,9 +1244,24 @@ function loopDecisionFromRuntimeEvent(
 }
 
 function normalizeSourcePath(input: string) {
-  if (!input.trim()) return undefined
-  if (/^[a-z]+:\/\//i.test(input)) return input
-  return input.replace(/^file:\/\//, "")
+  const trimmed = input
+    .trim()
+    .replace(/^["'(<]+/, "")
+    .replace(/[)"'>,，。；;]+$/, "")
+  if (!trimmed) return undefined
+  if (/[`*]/.test(trimmed)) return undefined
+  if (/\s/.test(trimmed)) return undefined
+  if (/^[a-z]+:\/\//i.test(trimmed)) return trimmed
+  return trimmed.replace(/^file:\/\//, "")
+}
+
+function isStandaloneSourcePath(input: string) {
+  const sourcePath = normalizeSourcePath(input)
+  if (!sourcePath) return false
+  if (/^[a-z]+:\/\//i.test(sourcePath)) return true
+  return /^(?:\.{0,2}\/|\/|~\/|[\w@+.-]+\/)?[\w@+.-]+\.(?:mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt|sh|yaml|yml)$/i.test(
+    sourcePath,
+  )
 }
 
 function sourceLocationFromRecord(input: Record<string, unknown>): TraceSourceLocation | undefined {
@@ -1294,7 +1313,7 @@ function collectSourceLocations(input: unknown, output: TraceSourceLocation[] = 
   if (typeof input === "string") {
     output.push(...sourceLocationsFromText(input))
     const sourcePath = normalizeSourcePath(input)
-    if (sourcePath && /\.(mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt)$/i.test(sourcePath)) {
+    if (sourcePath && isStandaloneSourcePath(input)) {
       output.push({
         uri: /^[a-z]+:\/\//i.test(sourcePath) ? sourcePath : undefined,
         path: /^[a-z]+:\/\//i.test(sourcePath) ? undefined : sourcePath,
@@ -1658,13 +1677,37 @@ function splitResponseClaims(input: unknown): string[] {
       const textLength = claim.replace(/\s/g, "").length
       const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
       if (textLength < 6 && !hasFactSignal) return false
-      if (/^(好的|可以|下面|因此|总结|结论)[:：]?$/.test(claim)) return false
+      if (isNonFactualResponseClaim(claim)) return false
       const key = claim.toLowerCase()
       if (seen.has(key)) return false
       seen.add(key)
       return true
     })
     .slice(0, 50)
+}
+
+function isNonFactualResponseClaim(input: string) {
+  const normalized = input
+    .trim()
+    .replace(/^#+\s*/, "")
+    .replace(/^[-*]\s*/, "")
+    .replace(/\*\*/g, "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[。.!?；;:：]+$/g, "")
+    .trim()
+    .toLowerCase()
+  if (!normalized) return true
+  if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
+  if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
+  if (
+    /^(goal|constraints?\s*&?\s*preferences?|progress|done|in progress|blocked|key decisions|next steps|critical context|relevant files)$/.test(
+      normalized,
+    )
+  )
+    return true
+  if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
+  if (/^(以下是|下面是|这里是).*(总结|结论)$/.test(normalized)) return true
+  return false
 }
 
 function protectClaimSegments(input: string) {
@@ -1859,6 +1902,24 @@ function evidenceMatchAnalysis(claimText: unknown, evidenceData: Record<string, 
     score += 0.45
     reasons.push("owner_value")
   }
+  if (factKind === "verification_output" && isVerificationClaimText(claim)) {
+    score += 0.5
+    reasons.push("verification_result")
+    if (
+      /(pass|passed|通过|成功)/i.test(claim) &&
+      /(pass|passed|exit[_ -]?code.{0,20}0|退出码.{0,20}0|通过|成功)/i.test(haystack)
+    ) {
+      score += 0.25
+      reasons.push("verification_passed")
+    }
+    if (
+      /(fail|failed|失败|断言|assert)/i.test(claim) &&
+      /(fail|failed|assert|expected|actual|失败|断言)/i.test(haystack)
+    ) {
+      score += 0.25
+      reasons.push("verification_failed")
+    }
+  }
   const finalScore = Math.min(1, Number(score.toFixed(2)))
   const strongReasons = reasons.filter((reason) => reason !== "shared_terms")
   return {
@@ -1916,6 +1977,15 @@ function availableSkillNames(input: unknown) {
     if (match[1]) names.add(match[1])
   }
   return [...names]
+}
+
+function availableSkillNamesFromError(input: string) {
+  const match = input.match(/available skills?:\s*([^\n.]+)/i)
+  if (!match?.[1]) return []
+  return match[1]
+    .split(/[,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
 }
 
 function objectField(input: unknown, key: string) {
@@ -2731,6 +2801,7 @@ class ActiveCaseTrace {
           node.typed_resources = extras.typed_resources.length ? extras.typed_resources : node.typed_resources
           node.source_locations = dedupeSourceLocations([...(node.source_locations ?? []), ...extras.source_locations])
         }
+        this.applySkillToolClosure(node, span, output, error)
         node.typed_resources = mergeTypedResources(
           node.typed_resources,
           typedResourcesForSpan(span.component, span.operation, span.name, {
@@ -2830,6 +2901,63 @@ class ActiveCaseTrace {
       if (artifactID) data.output_artifact_id = artifactID
     }
     return data
+  }
+
+  private applySkillToolClosure(node: CausalNode, span: TraceSpan, rawOutput: unknown, error: TraceError | undefined) {
+    if (span.component !== "tool") return
+    if ((span.name ?? "").toLowerCase() !== "skill") return
+    if (!error) return
+    const input = recordFromUnknown(node.data?.input)
+    const args = recordFromUnknown(input?.args)
+    const skillName = firstStringField(args, ["name"]) ?? firstStringField(input, ["name"]) ?? "unknown"
+    const message = [error.message, stringPreview(rawOutput, 1000)].filter(Boolean).join("\n")
+    const availableSkillNames = availableSkillNamesFromError(message)
+    const requestStatus = /not found|missing|unknown skill|not available/i.test(message) ? "missing" : "error"
+    const qualityFlags = ["skill_request_unresolved"]
+    node.status = "error"
+    node.data = {
+      ...(node.data ?? {}),
+      skill_name: skillName,
+      request_status: requestStatus,
+      available_skill_names: availableSkillNames,
+      quality_flags: qualityFlags,
+    }
+    const callID = firstStringField(input, ["callID", "call_id"])
+    const skillNode = this.causalNodes.find((item) => {
+      if (item.kind !== "skill.load") return false
+      if (item.status !== "running") return false
+      if (item.title === skillName) return true
+      const itemInput = recordFromUnknown(item.data?.input)
+      return (
+        firstStringField(itemInput, ["name"]) === skillName ||
+        (callID !== undefined && firstStringField(itemInput, ["callID", "call_id"]) === callID)
+      )
+    })
+    if (!skillNode) return
+    skillNode.status = "error"
+    skillNode.data = {
+      ...(skillNode.data ?? {}),
+      output: this.summarizeCausalValue(rawOutput, "skill.load.output"),
+      error,
+      skill_name: skillName,
+      request_status: requestStatus,
+      available_skill_names: availableSkillNames,
+      quality_flags: qualityFlags,
+    }
+    if (skillNode.span_id) {
+      const skillSpan = this.spans.get(skillNode.span_id)
+      if (skillSpan?.status === "running") {
+        const ended = Date.now()
+        skillSpan.status = "error"
+        skillSpan.end_time = new Date(ended).toISOString()
+        skillSpan.end_ms = ended - this.startedAt
+        skillSpan.duration_ms = Math.max(0, skillSpan.end_ms - skillSpan.start_ms)
+        skillSpan.output_summary = this.summarizeJson(rawOutput, "skill.load.output")
+        skillSpan.error = error
+      }
+    }
+    skillNode.artifact_refs = this.collectArtifactRefs(skillNode.data)
+    this.writeRecord("node.update", skillNode)
   }
 
   event(input: TraceEventInput) {
@@ -3302,6 +3430,7 @@ class ActiveCaseTrace {
       : classifiedRefs.direct_evidence_refs.length <= 1
         ? classifiedRefs.direct_evidence_refs
         : []
+    const legacyContextRefs = sourceRefs.filter((ref) => !effectiveDirectEvidenceRefs.includes(ref))
     const effectiveClassifiedRefs = {
       ...classifiedRefs,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
@@ -3317,10 +3446,6 @@ class ActiveCaseTrace {
       ...responseClaimQualityFlags(effectiveClassifiedRefs),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
       ...(evidenceMatch.weak ? ["weak_evidence_match"] : []),
-      ...(classifiedRefs.direct_evidence_refs.length > effectiveDirectEvidenceRefs.length &&
-      classifiedRefs.direct_evidence_refs.length > 1
-        ? ["over_attributed_claim"]
-        : []),
       ...(classifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
         ? ["unmatched_direct_evidence_refs"]
         : []),
@@ -3333,6 +3458,7 @@ class ActiveCaseTrace {
       direct_evidence_refs: effectiveDirectEvidenceRefs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
+      legacy_context_refs: legacyContextRefs,
       matched_evidence_refs: evidenceMatch.refs,
       candidate_evidence_refs: evidenceMatch.candidateRefs,
       match_strategy: evidenceMatch.strategy,
@@ -3362,6 +3488,7 @@ class ActiveCaseTrace {
         direct_evidence_refs: claim.direct_evidence_refs,
         context_refs: claim.context_refs,
         execution_refs: claim.execution_refs,
+        legacy_context_refs: claim.legacy_context_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
         match_strategy: claim.match_strategy,
@@ -3788,6 +3915,13 @@ class ActiveCaseTrace {
     if (contextLedger.summary_artifact_id && contextLedger.quality_flags?.includes("summary_artifact_pending")) {
       contextLedger.quality_flags = contextLedger.quality_flags.filter((flag) => flag !== "summary_artifact_pending")
     }
+    const serializedTailArtifactRef = this.collectArtifactRefs(serializedTail)[0]
+    const summaryArtifactRef = contextLedger.summary_artifact_id ?? this.collectArtifactRefs(outputSummary)[0]
+    const metadata = input.metadata ?? {}
+    const afterContextRefs = dedupeStrings([
+      ...(input.after_context_refs ?? []),
+      ...(stringArrayField(metadata, ["after_context_refs", "afterContextRefs"]) ?? []),
+    ])
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -3807,6 +3941,18 @@ class ActiveCaseTrace {
         previous_summary: previousSummary,
         serialized_tail: serializedTail,
         output_summary: outputSummary,
+        algorithm: contextLedger.algorithm,
+        before_context_refs: sourceRefs ?? [],
+        after_context_refs: afterContextRefs,
+        serialized_tail_artifact_ref: serializedTailArtifactRef,
+        summary_artifact_ref: summaryArtifactRef,
+        retained_message_ids: contextLedger.retained_message_ids,
+        dropped_message_ids: contextLedger.dropped_message_ids,
+        retained_fact_refs: contextLedger.retained_fact_refs,
+        dropped_fact_refs: contextLedger.dropped_fact_refs,
+        token_estimate_before: contextLedger.token_estimate_before,
+        token_estimate_after: contextLedger.token_estimate_after,
+        auto_continue_prompt_ref: contextLedger.auto_continue_prompt_ref,
         context_ledger: contextLedger,
         auto_continue: input.auto_continue,
         result: input.result,
@@ -4015,6 +4161,12 @@ class ActiveCaseTrace {
       })
     }
     const llmTurns = records.filter((record) => record.event_type === "llm.turn")
+    const backgroundLlmTurns = llmTurns.filter(
+      (record) =>
+        record.data?.agent_role === "title" ||
+        record.data?.agent_role === "background" ||
+        record.data?.is_background === true,
+    )
     const llmTurnsMissingTokenUsage = llmTurns.filter(
       (record) => record.data?.agent_role !== "title" && !record.token_usage?.total,
     )
@@ -4162,6 +4314,10 @@ class ActiveCaseTrace {
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && flags.includes("over_attributed_claim")
     })
+    const legacyContextRefClaims = responseClaims.filter((record) => {
+      const legacyRefs = record.data?.legacy_context_refs
+      return Array.isArray(legacyRefs) && legacyRefs.length > 0
+    })
     const weakEvidenceMatches = responseClaims.filter((record) => {
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && flags.includes("weak_evidence_match")
@@ -4281,6 +4437,8 @@ class ActiveCaseTrace {
       weak_evidence_matches: weakEvidenceMatches.length,
       mcp_json_parse_shadowed: mcpJsonParseShadowed.length,
       skill_request_unresolved: unresolvedSkillRequests.length,
+      background_llm_turns: backgroundLlmTurns.length,
+      legacy_context_ref_claims: legacyContextRefClaims.length,
       issues,
     }
   }
@@ -4577,14 +4735,20 @@ class ActiveCaseTrace {
           score: analysis.score,
           reasons: analysis.reasons,
           weak: analysis.weak,
+          factKind: typeof node?.data?.fact_kind === "string" ? node.data.fact_kind : undefined,
         }
       })
       .filter((item) => item.score >= 0.35)
       .sort((a, b) => b.score - a.score)
-    const refs = scored.slice(0, 3).map((item) => item.ref)
-    const score = scored[0]?.score ?? 0
-    const reasons = dedupeStrings(scored.flatMap((item) => item.reasons))
-    const weak = scored.some((item) => item.weak)
+    const isVerificationClaim = isVerificationClaimText(stringPreview(claimText, 2000))
+    const preferred =
+      isVerificationClaim && scored.some((item) => item.factKind === "verification_output")
+        ? scored.filter((item) => item.factKind === "verification_output")
+        : scored
+    const refs = preferred.slice(0, 3).map((item) => item.ref)
+    const score = preferred[0]?.score ?? 0
+    const reasons = dedupeStrings(preferred.flatMap((item) => item.reasons))
+    const weak = preferred.some((item) => item.weak)
     return {
       refs,
       score,

@@ -374,6 +374,7 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
     ],
     ["LLM Missing Tokens", health.llm_turns_missing_token_usage, "LLM turns without token usage."],
     ["LLM Missing Finish", health.llm_turns_missing_finish_reason, "LLM turns without finish reason."],
+    ["Background LLM", health.background_llm_turns ?? 0, "Title/background model turns shown as secondary flow."],
     ["Empty Subagent", health.empty_subagent_results, "Subagent/task facts with empty returned result."],
     [
       "Broad Responses",
@@ -391,7 +392,11 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
       "Response claims supported only by context refs.",
     ],
     ["Broken Claims", health.broken_claim_fragments ?? 0, "Claim fragments produced by sentence splitting."],
-    ["Over Attributed", health.over_attributed_claims ?? 0, "Claims whose broad refs were narrowed by matching."],
+    [
+      "Legacy Claim Refs",
+      health.legacy_context_ref_claims ?? 0,
+      "Claims that kept wider source refs as legacy context after direct evidence matching.",
+    ],
     ["Non-final Claims", health.non_final_response_claims ?? 0, "Claims attached to non-final response segments."],
     ["Weak Matches", health.weak_evidence_matches ?? 0, "Claims supported only by weak evidence overlap."],
     ["MCP Shadowed", health.mcp_json_parse_shadowed ?? 0, "MCP JSON facts shadowed by weaker parsers."],
@@ -868,6 +873,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
             <th>Reasons</th>
             <th>Candidates</th>
             <th>Direct Evidence</th>
+            <th>Legacy Refs</th>
             <th>Context</th>
             <th>Execution</th>
           </tr>
@@ -880,6 +886,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
               const matched = Array.isArray(data.matched_evidence_refs) ? data.matched_evidence_refs : []
               const reasons = Array.isArray(data.match_reasons) ? data.match_reasons : []
               const candidates = Array.isArray(data.candidate_evidence_refs) ? data.candidate_evidence_refs : []
+              const legacy = Array.isArray(data.legacy_context_refs) ? data.legacy_context_refs : []
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
@@ -892,6 +899,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
                 <td>${reasons.length ? reasons.map((reason) => `<code>${escapeHtml(reason)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
                 <td><div class="refs">${escapeHtml(candidates.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(direct.join(", ") || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(legacy.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(context.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(execution.join(", ") || "-")}</div></td>
               </tr>`

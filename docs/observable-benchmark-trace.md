@@ -279,9 +279,9 @@ $OPENCODE_CASE_TRACE_DIR/
 其中：
 
 - `manifest.json`：case 入口文件，记录 case id、run id、状态、时间、模型/环境、结果和各 trace 文件路径。
-- `trace.json`：Trace Semantic Contract v4.8 主文件，包含事实记录、回答 claim、组件数据流、artifact 索引、token/耗时和 trace health 指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
+- `trace.json`：Trace Semantic Contract v4.9 主文件，包含事实记录、回答 claim、组件数据流、artifact 索引、token/耗时和 trace health 指标。该文件只记录可观测事实，不输出根因判断或诊断提示。
 - `legacy-trace.json`：旧版 v1.3 调试摘要，保留 `spans`、`events`、`context_snapshots`、`verification_records`、`change_records`、`constraint_records`、`response_segments`、`design_records` 和旧 `dataflow_edges`。
-- `provenance-trace.json`：兼容别名，内容与 v4.8 `trace.json` 保持一致。新分析链路应优先读取 `trace.json`。
+- `provenance-trace.json`：兼容别名，内容与 v4.9 `trace.json` 保持一致。新分析链路应优先读取 `trace.json`。
 - `events.jsonl`：旧版事件流，保留用于兼容。
 - `records.jsonl`：语义 write-ahead log。节点、边、artifact、finish 等记录会边运行边写入，便于长跑 case 追踪。
 - `raw-events.jsonl`：低层运行事件流，主要用于调试 trace 系统本身，不作为主要归因入口。
@@ -362,9 +362,9 @@ xdg-open /data/evo-bench/opencode-traces/T1-001/trace.html
 - `task`：subagent 类型、子 session、任务结果。
 - `mcp`：MCP 连接、tools/list、tool/call、错误。
 
-## 10. Trace Semantic Contract v4.8
+## 10. Trace Semantic Contract v4.9
 
-`trace.json` 的 `trace_version` 为 `"4.8"`。v4.8 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、回答 claim、输入输出、上下文快照、任务循环决策、生命周期闭环、证据来源和组件间数据流结构化记录下来，并额外暴露 trace 自身的质量信号。
+`trace.json` 的 `trace_version` 为 `"4.9"`。v4.9 的目标不是自动判断根因，而是把离线归因分析需要消费的事实、回答 claim、输入输出、上下文快照、任务循环决策、生命周期闭环、证据来源和组件间数据流结构化记录下来，并额外暴露 trace 自身的质量信号。
 
 主字段：
 
@@ -384,7 +384,7 @@ change:chg_1_xxxxxxxx
 
 大文本不会直接塞进 `trace.json`。字段中如果出现 `artifact_id`，说明完整内容保存在 `artifacts/` 中，并可通过 `trace.html` 的 artifact 链接查看。
 
-v4.8 增强了这些语义事实：
+v4.9 增强了这些语义事实：
 
 - `prompt.assembly` 记录用户原始请求、模板解析、持久化 user message、subagent prompt 等 prompt 组装过程。
 - `context.transform` 记录 session messages 在插件转换前后、转为 model messages、LLM request ready、provider message transform、compaction prompt build 等层级转换。
@@ -392,18 +392,18 @@ v4.8 增强了这些语义事实：
 - `mcp.call` 和 MCP observation 会尝试解析 text JSON，提取 `typed_resources` 和 `source_locations`，例如 `repo_fact` 的 `subject/predicate/value/path/line_start/line_end`。MCP JSON text 还会优先进入 `evidence.fact.structured_claim`，`extraction_method` 保留为 `mcp_json_text`，避免退化成 `returned N content item` 这类泛化事实，也避免被较弱的行级正则抢先解析。
 - `subagent.call` 会在记录顶层保留 `child_session_id`、`child_status`、`child_trace_available` 和 `output_artifact_id`，并通过 `prompt.assembly` 与 `dataflow_edges` 展示 parent agent 与 subagent 的 prompt/结果交互。
 - `response.output` 会标记 `response_role`，区分 `final_answer`、`intermediate_summary`、`subagent_result` 和 `auto_continue_summary`。只有最终用户答案应为 `is_final_for_case: true`。同时会把引用拆为 `direct_evidence_refs`、`context_refs` 和 `execution_refs`。
-- `response.claim` 会把最终用户答案拆成可归因的结论单元。v4.8 只对 `response_role=final_answer`、`visibility=user_visible`、`is_final_for_case=true` 的最终回答生成 claim，避免中间工具说明或 compaction summary 污染 claim matrix。拆分时会保护代码路径、函数调用、小数、百分比和内联代码，避免把 `src/pricing.mjs`、`Math.min(...)`、`0.15` 拆成无意义片段。每个 claim 记录 `direct_evidence_refs`、`context_refs`、`execution_refs`、`matched_evidence_refs`、`candidate_evidence_refs`、`match_reasons`、`match_strategy`、`match_score`、`support_level` 和 `quality_flags`，并通过 `supports_claim`、`contextualizes_claim`、`executed_for_claim` 等边连接到对应事实。离线归因应优先消费 `response.claim.matched_evidence_refs`，再回看完整 `response.output.source_refs`。
+- `response.claim` 会把最终用户答案拆成可归因的结论单元。v4.9 只对 `response_role=final_answer`、`visibility=user_visible`、`is_final_for_case=true` 的最终回答生成 claim，避免中间工具说明或 compaction summary 污染 claim matrix。拆分时会保护代码路径、函数调用、小数、百分比和内联代码，并过滤 `Here's the summary`、`No further steps needed`、纯标题等无事实含义文本。每个 claim 记录 `direct_evidence_refs`、`legacy_context_refs`、`context_refs`、`execution_refs`、`matched_evidence_refs`、`candidate_evidence_refs`、`match_reasons`、`match_strategy`、`match_score`、`support_level` 和 `quality_flags`。离线归因应优先消费 `response.claim.matched_evidence_refs/direct_evidence_refs`，把 `legacy_context_refs` 作为回溯上下文，不要当作直接证据。
 - `context.compaction_check` 会记录一次是否需要压缩的判定，包括 provider/model、token estimate、context limit、reserved tokens、overflow、selected algorithm 和 trigger reason。即使没有真正触发 `context.compaction`，也能解释为什么当前轮未压缩。测试场景可通过 `OPENCODE_TRACE_FORCE_COMPACTION=1` 触发每个 session 一次确定性强制压缩，并在 metadata 中标记 `deterministic_forced_compaction`。
-- `context.compaction` 的 `context_ledger` 会记录 retained/dropped message id、算法名和 `ledger_id_quality`；当前 head-tail summary 路径会尽量写入 concrete message id。
+- `context.compaction` 的 `context_ledger` 会记录 retained/dropped message id、算法名和 `ledger_id_quality`；v4.9 还会把 `algorithm`、`before_context_refs`、`after_context_refs`、`serialized_tail_artifact_ref`、`summary_artifact_ref`、`retained_message_ids`、`dropped_message_ids`、`retained_fact_refs`、`dropped_fact_refs`、`token_estimate_before`、`token_estimate_after` 和 `auto_continue_prompt_ref` 提升到顶层，便于离线归因模块不解析深层 ledger 也能消费压缩前后链路。
 - `llm.call` 会记录 request-level facts，包括 agent、provider、model、message/tool 数、token/cache 使用和 stop/finish reason。
 - `llm.turn` 作为 LLM 调用的语义生命周期视图，记录 turn id、session/message、agent role、provider/model、输入上下文引用、状态、耗时、finish/stop reason、request id 和 token usage。离线归因应优先消费 `llm.turn`，再回看 `llm.call` 的 span 级细节。
 - `agent.lifecycle` 记录关键任务循环节点，例如 `turn.started`、`response.completed`、`compaction.required`、`subagent.resume` 等，用于还原 agent 在主流程、压缩流程和子任务流程中的阶段性状态。
 - `exit.gate` 记录非交互式执行是否继续、退出、等待或取消，以及当时是否已有 final answer、是否需要 compaction、是否触发 auto-continue、continuation 来源和原因。
-- `evidence.fact` 从高价值 observation 中抽取稳定事实，例如工具读取、MCP 返回、skill 加载、验证输出和 subagent 输出。记录中会包含 `fact_kind`、`canonical_subject`、`claim`、`structured_claim`、`support_level` 和 `quality_flags`。`structured_claim` 会尽量表达为 `subject/predicate/value/source_span/extraction_method`。v4.8 会递归解析 `content[].text`、JSON 文本、`<path>...</path>` 文件输出和带行号源码行，并优先抽取行级语义事实；无法可靠解析时会打 `generic_claim`、`fallback_summary_claim`、`generic_mcp_fact`、`path_only_evidence_fact` 或 `unparsed_mcp_text` 等质量标记，而不是伪装成强事实。
-- `skill.load` 除了真实 skill 加载事件，也会记录用户显式请求某个 skill 但模型上下文未暴露该 skill 的事实。此类记录包含 `skill_name`、`request_source`、`request_status` 和 `available_skill_names`，用于离线分析判断是“未加载”还是“上下文不可见”。
+- `evidence.fact` 从高价值 observation 中抽取稳定事实，例如工具读取、MCP 返回、skill 加载、验证输出和 subagent 输出。记录中会包含 `fact_kind`、`canonical_subject`、`claim`、`structured_claim`、`support_level` 和 `quality_flags`。`structured_claim` 会尽量表达为 `subject/predicate/value/source_span/extraction_method`。v4.9 会递归解析 `content[].text`、JSON 文本、`<path>...</path>` 文件输出和带行号源码行，并优先抽取行级语义事实；无法可靠解析时会打 `generic_claim`、`fallback_summary_claim`、`generic_mcp_fact`、`path_only_evidence_fact` 或 `unparsed_mcp_text` 等质量标记，而不是伪装成强事实。
+- `skill.load` 除了真实 skill 加载事件，也会记录用户显式请求某个 skill 但模型上下文未暴露该 skill 的事实。此类记录包含 `skill_name`、`request_source`、`request_status`、`available_skill_names` 和错误信息。v4.9 会把缺失或失败的 skill 工具调用闭合为 `status=error`，并通过 `skill_request_unresolved` 计入 trace health，避免 finalizer 把缺失 skill 误标为成功。
 - `loop.decision` 会把 processor step finish / loop finish 类运行事件提升为正式事实，记录 decision、reason、agent、message id、part count、part types、final-answer 状态和 auto-continue 标记。
 - 工具、MCP、skill、subagent 和 shell/grep/read/edit 输出会尽量抽取 `typed_resources` 与 `source_locations`，包括常见的 `path:line` 文本位置。
-- `metrics.trace_health` 记录 trace 质量事实，包括结构化 JSON 中的 circular marker、未闭合/被 finalizer 收口的 running records、expected lifecycle finalized records、unexpected missing close records、缺 token usage 的 LLM turn、缺 finish reason 的 LLM turn、compaction quality flags、空 subagent 结果、过宽 response refs、重复 evidence facts、generic evidence facts、generic MCP facts、path-only evidence facts、unsupported response claims、context-only response claims、broken claim fragments、over-attributed claims、non-final response claims、weak evidence matches、MCP JSON parse shadowing、unresolved skill requests、payload duplication groups 和 compaction check missing。这些指标只描述 trace 质量，不给出根因诊断。
+- `metrics.trace_health` 记录 trace 质量事实，包括结构化 JSON 中的 circular marker、未闭合/被 finalizer 收口的 running records、expected lifecycle finalized records、unexpected missing close records、缺 token usage 的 LLM turn、缺 finish reason 的 LLM turn、background/title LLM turn、compaction quality flags、空 subagent 结果、过宽 response refs、带 legacy context refs 的 response claims、重复 evidence facts、generic evidence facts、generic MCP facts、path-only evidence facts、unsupported response claims、context-only response claims、broken claim fragments、non-final response claims、weak evidence matches、MCP JSON parse shadowing、unresolved skill requests、payload duplication groups 和 compaction check missing。这些指标只描述 trace 质量，不给出根因诊断。
 - `metrics.token_usage`、`manifest.token_usage` 和 `llm.call.token_usage` 使用路径栈 JSON-safe 序列化；共享对象引用不会被误判为 `"[Circular]"`，真实路径环才会被标记。
 - trace 结束时会对仍处于 `running` 的 span/node 做 finalizer 收口，写入 `finalized_status: "finalized_without_close"` 和 `finalized_reason`，避免成功 case 的主 trace 中残留未解释的 running 记录。
 - 只重复路径且没有独立语义价值的 `tool_output` observation 不进入正式 records。
@@ -416,7 +416,7 @@ v4.8 增强了这些语义事实：
 - `LLM Turns`：集中展示规范化 LLM turn，按角色区分主 agent、subagent、compaction、title/background 等调用。
 - `Lifecycle`：展示 turn milestone、compaction required、auto continue 和 exit gate 决策。
 - `Subagents`：展示 delegated prompt、child session/message、returned output 和 parent-child 数据流。
-- `Claim Evidence Matrix`：按最终回答 claim 展示 direct evidence、context refs、execution refs、support level 和 quality flags，是人工检查与离线归因消费前的主入口。
+- `Claim Evidence Matrix`：按最终回答 claim 展示 direct evidence、legacy refs、context refs、execution refs、support level 和 quality flags，是人工检查与离线归因消费前的主入口。
 - `Evidence Facts`：集中展示从工具、MCP、skill、验证和 subagent 输出中抽取出的事实及其来源，优先展示 `structured_claim` 的 subject、predicate、value、source span 和 extraction method。
 - `Agent Flow`：按时间展示全部组件事实记录，不再只展示前 120 条。
 - `Component Dataflow`：查看组件间数据流边，不做根因判断。
