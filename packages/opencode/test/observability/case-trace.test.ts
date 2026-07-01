@@ -24,7 +24,7 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v4.4 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes trace semantic contract v4.5 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -38,7 +38,8 @@ describe("case trace", () => {
         `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_test", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 1, system_count: 0, tool_count: 2 } })`,
         `const ctx = CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", provider_id: "deepseek", model_id: "unit-test", agent: "build", message_count: 1, messages: [{ role: "user", content: "fix pricing bug" }] })`,
         `const obs = CaseTrace.observation({ source: "tool", category: "file", summary: "pricing.mjs owns discount calculation", data: { file: "src/pricing.mjs", lines: "1-20" }, source_refs: ctx ? ["context:" + ctx.snapshot_id] : [] })`,
-        `CaseTrace.responseOutput({ text: "Discount bug is in pricing.mjs.", source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file", summary: "pricing.mjs owns discount calculation", data: { path: "src/pricing.mjs", symbol: "discount" }, source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `CaseTrace.responseOutput({ text: "Discount bug is in pricing.mjs.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
         `span?.end({ output: { completed: true, finish_reason: "stop" }, tokenUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 3, totalTokens: 15 } })`,
         `CaseTrace.finish({ status: "success", result: { exit_code: 0 } })`,
       ].join("\n"),
@@ -109,13 +110,13 @@ describe("case trace", () => {
       "supported_response",
     ])
 
-    expect(manifest.trace_version).toBe("4.4")
+    expect(manifest.trace_version).toBe("4.5")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
-    expect(provenance.trace_version).toBe("4.4")
+    expect(provenance.trace_version).toBe("4.5")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -126,7 +127,7 @@ describe("case trace", () => {
     expect(provenance.records.map((record: any) => record.event_type)).toContain("response.output")
     expect(provenance.records.map((record: any) => record.event_type)).not.toContain("runtime.event")
     expect(provenance.dataflow_edges.every((edge: any) => allowedRelations.has(edge.relation))).toBe(true)
-    expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "consumed")).toBe(true)
+    expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supported_response")).toBe(true)
     expect(provenanceText).not.toContain("diagnostics_hints")
     expect(provenanceText).not.toContain("evidence_refs")
     expect(provenanceText).not.toContain("final.claim")
@@ -141,8 +142,9 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v4.4")
+    expect(traceHtml).toContain("Trace v4.5")
     expect(traceHtml).toContain('id="overview"')
+    expect(traceHtml).toContain('id="trace-health"')
     expect(traceHtml).toContain('id="agent-flow"')
     expect(traceHtml).toContain('id="llm-turns"')
     expect(traceHtml).toContain('id="lifecycle"')
@@ -154,10 +156,10 @@ describe("case trace", () => {
     expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
-  test("writes v4.4 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v44-"))
+  test("writes v4.5 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
-    const script = path.join(dir, "semantic-v44.ts")
+    const script = path.join(dir, "semantic-v45.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
     await fs.writeFile(
@@ -165,8 +167,8 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "find owner of pricing API" }, environment: { model: "unit-test" } })`,
-        `const prompt = CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_v44", message_id: "msg_user", agent: "build", input: { parts: [{ type: "text", text: "find owner of pricing API" }] }, output: { part_count: 1 } })`,
-        `const transform = CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_v44", message_id: "msg_assistant", step: 1, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [{ role: "user", id: "msg_user" }] }, output: { model_messages: [{ role: "user", content: "find owner of pricing API" }], system: ["system prompt"], tools: { grep: { description: "search" } } }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }], source_refs: prompt ? ["prompt:" + prompt.node_id] : [] })`,
+        `const prompt = CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_v45", message_id: "msg_user", agent: "build", input: { parts: [{ type: "text", text: "find owner of pricing API" }] }, output: { part_count: 1 } })`,
+        `const transform = CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_v45", message_id: "msg_assistant", step: 1, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [{ role: "user", id: "msg_user" }] }, output: { model_messages: [{ role: "user", content: "find owner of pricing API" }], system: ["system prompt"], tools: { grep: { description: "search" } } }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }], source_refs: prompt ? ["prompt:" + prompt.node_id] : [] })`,
         `const decision = CaseTrace.decision({ component: "processor", decision_type: "llm_tool_call", intent: "search pricing owner", chosen_action: "grep", rationale: { recent_reasoning: "Need source evidence before answering", input: { pattern: "pricing" } }, source_refs: transform ? ["context:" + transform.node_id] : [] })`,
         `CaseTrace.edge({ from: { type: "decision", id: decision?.decision_id ?? "missing" }, to: { type: "tool_call", id: "call_grep", label: "grep" }, relation: "decision_to_tool", label: "Model selected grep" })`,
         `CaseTrace.finish({ status: "success" })`,
@@ -178,7 +180,7 @@ describe("case trace", () => {
       env: {
         ...process.env,
         OPENCODE_CASE_TRACE: "1",
-        OPENCODE_CASE_ID: "semantic-v44-case",
+        OPENCODE_CASE_ID: "semantic-v45-case",
         OPENCODE_CASE_TRACE_DIR: dir,
       },
       stdout: "pipe",
@@ -190,12 +192,12 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const caseDir = path.join(dir, "semantic-v44-case")
+    const caseDir = path.join(dir, "semantic-v45-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.4")
+    expect(trace.trace_version).toBe("4.5")
     expect(eventTypes).toContain("prompt.assembly")
     expect(eventTypes).toContain("context.transform")
     expect(eventTypes).toContain("decision")
@@ -206,10 +208,10 @@ describe("case trace", () => {
     expect(html).toContain("llm_tool_call")
   })
 
-  test("writes v4.4 lifecycle provenance records for LLM turns, exit gates, and evidence facts", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v44-lifecycle-"))
+  test("writes v4.5 lifecycle provenance records for LLM turns, exit gates, and evidence facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-lifecycle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
-    const script = path.join(dir, "lifecycle-v44.ts")
+    const script = path.join(dir, "lifecycle-v45.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
     await fs.writeFile(
@@ -217,16 +219,16 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "locate discount calculation" }, environment: { model: "unit-test" } })`,
-        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_v44", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 1, system_count: 1, tool_count: 1 } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_v45", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 1, system_count: 1, tool_count: 1 } })`,
         `const ctx = CaseTrace.contextSnapshot({ span_id: span?.id, phase: "llm_request", provider_id: "deepseek", model_id: "unit-test", agent: "build", message_count: 1, messages: [{ role: "user", content: "locate discount calculation" }], system: ["system prompt"], tools: { grep: { description: "search files" } } })`,
-        `CaseTrace.llmTurn({ turn_id: "turn_1", span_id: span?.id, session_id: "ses_v44", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running", input_context_refs: ctx ? ["context_snapshot:" + ctx.snapshot_id] : [] })`,
-        `CaseTrace.agentLifecycle({ session_id: "ses_v44", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: { step: 1, goal: "locate discount calculation" } })`,
+        `CaseTrace.llmTurn({ turn_id: "turn_1", span_id: span?.id, session_id: "ses_v45", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running", input_context_refs: ctx ? ["context_snapshot:" + ctx.snapshot_id] : [] })`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_v45", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: { step: 1, goal: "locate discount calculation" } })`,
         `const obs = CaseTrace.observation({ source: "tool", category: "file_read", summary: "src/pricing.mjs defines applyDiscount", data: { path: "src/pricing.mjs", line_start: 7, line_end: 11, snippet: "export function applyDiscount(total, percent) { return total * (1 - percent) }" }, source_refs: span ? ["span:" + span.id] : [] })`,
         `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "applyDiscount is implemented in src/pricing.mjs lines 7-11", data: { path: "src/pricing.mjs", line_start: 7, line_end: 11, symbol: "applyDiscount" }, source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
-        `CaseTrace.responseOutput({ text: "applyDiscount is implemented in src/pricing.mjs lines 7-11.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
-        `CaseTrace.exitGate({ session_id: "ses_v44", message_id: "msg_assistant", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "assistant_finished_without_pending_tools", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
-        `CaseTrace.agentLifecycle({ session_id: "ses_v44", message_id: "msg_assistant", agent: "build", phase: "response.completed", status: "success", summary: { final_answer: true } })`,
-        `CaseTrace.llmTurn({ turn_id: "turn_1", span_id: span?.id, session_id: "ses_v44", message_id: "msg_assistant", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "success", duration_ms: 123, finish_reason: "stop", token_usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 }, request_id: "req_unit" })`,
+        `CaseTrace.responseOutput({ text: "applyDiscount is implemented in src/pricing.mjs lines 7-11.", source_refs: fact && ctx && span ? ["evidence:" + fact.node_id, "context_snapshot:" + ctx.snapshot_id, "tool_span:" + span.id] : [] })`,
+        `CaseTrace.exitGate({ session_id: "ses_v45", message_id: "msg_assistant", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "assistant_finished_without_pending_tools", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_v45", message_id: "msg_assistant", agent: "build", phase: "response.completed", status: "success", summary: { final_answer: true } })`,
+        `CaseTrace.llmTurn({ turn_id: "turn_1", span_id: span?.id, session_id: "ses_v45", message_id: "msg_assistant", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "success", duration_ms: 123, finish_reason: "stop", token_usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 }, request_id: "req_unit" })`,
         `span?.end({ output: { completed: true, finish_reason: "stop", request_id: "req_unit" }, tokenUsage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -237,7 +239,7 @@ describe("case trace", () => {
       env: {
         ...process.env,
         OPENCODE_CASE_TRACE: "1",
-        OPENCODE_CASE_ID: "lifecycle-v44-case",
+        OPENCODE_CASE_ID: "lifecycle-v45-case",
         OPENCODE_CASE_TRACE_DIR: dir,
       },
       stdout: "pipe",
@@ -249,16 +251,22 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const caseDir = path.join(dir, "lifecycle-v44-case")
+    const caseDir = path.join(dir, "lifecycle-v45-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.4")
+    expect(trace.trace_version).toBe("4.5")
     expect(eventTypes).toContain("llm.turn")
     expect(eventTypes).toContain("agent.lifecycle")
     expect(eventTypes).toContain("exit.gate")
     expect(eventTypes).toContain("evidence.fact")
+    const evidenceFact = trace.records.find((record: any) => record.event_type === "evidence.fact")
+    expect(evidenceFact.data.fact_kind).toBe("code_reference")
+    expect(evidenceFact.data.canonical_subject).toBe("applyDiscount")
+    expect(evidenceFact.data.claim).toBe("applyDiscount is implemented in src/pricing.mjs lines 7-11")
+    expect(evidenceFact.data.support_level).toBe("direct")
+    expect(evidenceFact.data.quality_flags).toEqual([])
     const llmTurn = trace.records.find((record: any) => record.event_type === "llm.turn")
     expect(llmTurn.status).toBe("success")
     expect(llmTurn.duration_ms).toBe(123)
@@ -273,11 +281,73 @@ describe("case trace", () => {
       decision: "exit",
       reason: "assistant_finished_without_pending_tools",
     })
-    expect(trace.dataflow_edges.some((edge: any) => edge.relation === "supported_response")).toBe(true)
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    expect(response.data.direct_evidence_refs).toHaveLength(1)
+    expect(response.data.context_refs[0].startsWith("context_snapshot:")).toBe(true)
+    expect(response.data.execution_refs[0].startsWith("tool_span:")).toBe(true)
+    expect(trace.dataflow_edges.filter((edge: any) => edge.relation === "supported_response")).toHaveLength(1)
+    expect(trace.metrics.trace_health.circular_reference_markers).toBe(0)
     expect(html).toContain("LLM Turns")
     expect(html).toContain("Lifecycle And Exit Gates")
     expect(html).toContain("Evidence Facts")
+    expect(html).toContain("Trace Health")
     expect(html).toContain("applyDiscount")
+  })
+
+  test("writes v4.5 structurally safe trace JSON and finalizes open lifecycle records", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-quality-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "quality-v45.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "quality trace" }, environment: { model: "unit-test" } })`,
+        `const shared = { path: "src/pricing.mjs", line_start: 1, line_end: 12 }`,
+        `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing file observed", data: { path: "src/pricing.mjs", line_start: 1, line_end: 12, symbol: "renewalQuote" }, source_locations: [shared] })`,
+        `CaseTrace.responseOutput({ text: "renewalQuote is in src/pricing.mjs.", source_refs: fact ? ["evidence:" + fact.node_id, "context_snapshot:ctx_manual", "tool_span:span_manual"] : [], source_locations: [shared] })`,
+        `CaseTrace.llmTurn({ turn_id: "open_turn", session_id: "ses_quality", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running" })`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_quality", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: "open lifecycle" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "quality-v45-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "quality-v45-case")
+    const traceText = await fs.readFile(path.join(caseDir, "trace.json"), "utf8")
+    const trace = JSON.parse(traceText) as any
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+
+    expect(trace.trace_version).toBe("4.5")
+    expect(traceText).not.toContain("[Circular]")
+    expect(trace.records.filter((record: any) => record.status === "running")).toHaveLength(0)
+    const openTurn = trace.records.find((record: any) => record.record_id === "llmturn_open_turn")
+    expect(openTurn.status).toBe("success")
+    expect(openTurn.data.finalized_status).toBe("finalized_without_close")
+    expect(openTurn.data.finalized_reason).toBe("trace_finished")
+    const health = trace.metrics.trace_health
+    expect(health.circular_reference_markers).toBe(0)
+    expect(health.finalized_open_records).toBeGreaterThan(0)
+    expect(health.issues.some((issue: any) => issue.kind === "finalized_open_record")).toBe(true)
+    expect(html).toContain('id="trace-health"')
   })
 
   test("filters low-value runtime events from formal provenance and normalizes legacy relations", async () => {
@@ -327,7 +397,7 @@ describe("case trace", () => {
     expect(relations).not.toContain("tool_to_change")
   })
 
-  test("adds v4.4 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
+  test("adds v4.5 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -742,7 +812,8 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `const compaction = CaseTrace.compaction({ trigger: "overflow", provider_id: "deepseek", model_id: "unit-test", input_tokens: 21000, context_limit: 20000, selected_head_messages: 8, selected_tail_messages: 2, hidden_compaction_messages: 1, previous_summary: ${JSON.stringify(previousSummary)}, serialized_tail: "tail message", output_summary: "pricing facts preserved", auto_continue: true })`,
         `const obs = CaseTrace.observation({ source: "compaction", category: "preserved_fact", summary: "pricing fact preserved after compaction", data: { fact: "pricing owns discounts" }, source_refs: compaction ? ["compaction:" + compaction.node_id] : [] })`,
-        `CaseTrace.responseOutput({ text: "Pricing owns discounts.", source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `const fact = CaseTrace.evidenceFact({ source: "compaction", category: "preserved_fact", summary: "pricing fact preserved after compaction", data: { fact: "pricing owns discounts" }, source_refs: obs ? ["observation:" + obs.node_id] : [] })`,
+        `CaseTrace.responseOutput({ text: "Pricing owns discounts.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -778,7 +849,7 @@ describe("case trace", () => {
     expect(observation.data.source).toBe("compaction")
     expect(observation.source_refs).toContain(`compaction:${compaction.record_id}`)
     expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "derived_from")).toBe(true)
-    expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "consumed")).toBe(true)
+    expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supported_response")).toBe(true)
   })
 
   test("finalizes trace.json and trace.html when a traced process exits", async () => {
@@ -944,13 +1015,13 @@ describe("case trace", () => {
     expect(html).toContain('class="io-scroll"')
   })
 
-  test("renders v4.4 provenance report with flow-style sections and scrollable IO panes", () => {
+  test("renders v4.5 provenance report with flow-style sections and scrollable IO panes", () => {
     const trace: ProvenanceTraceSummary = {
-      trace_version: "4.4",
+      trace_version: "4.5",
       manifest: {
-        trace_version: "4.4",
-        case_id: "viewer-v44-case",
-        run_id: "run_viewer_v44",
+        trace_version: "4.5",
+        case_id: "viewer-v45-case",
+        run_id: "run_viewer_v45",
         started_at: "2026-06-30T00:00:00.000Z",
         ended_at: "2026-06-30T00:00:01.000Z",
         duration_ms: 1000,
@@ -1052,6 +1123,26 @@ describe("case trace", () => {
         dataflow_edges: 1,
         artifacts: 1,
         token_usage: { input: 10, output: 5, total: 15 },
+        trace_health: {
+          circular_reference_markers: 0,
+          open_records: 1,
+          finalized_open_records: 1,
+          llm_turns_missing_token_usage: 0,
+          llm_turns_missing_finish_reason: 0,
+          compaction_quality_flags: {},
+          empty_subagent_results: 0,
+          broad_response_refs: 0,
+          duplicate_evidence_facts: 0,
+          issues: [
+            {
+              kind: "finalized_open_record",
+              severity: "info",
+              message: "Record was open at trace finish and was finalized.",
+              record_id: "llm_1",
+              event_type: "llm.call",
+            },
+          ],
+        },
       },
     }
 
@@ -1059,6 +1150,7 @@ describe("case trace", () => {
 
     for (const id of [
       "overview",
+      "trace-health",
       "semantic-pipeline",
       "llm-turns",
       "lifecycle",
@@ -1073,7 +1165,8 @@ describe("case trace", () => {
     ]) {
       expect(html).toContain(`id="${id}"`)
     }
-    expect(html).toContain("Trace v4.4")
+    expect(html).toContain("Trace v4.5")
+    expect(html).toContain("Trace Health")
     expect(html).toContain('class="io-grid"')
     expect(html).toContain('class="io-input"')
     expect(html).toContain('class="io-output"')

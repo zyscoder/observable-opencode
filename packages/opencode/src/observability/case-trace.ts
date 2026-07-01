@@ -219,6 +219,9 @@ export type TraceResponseSegment = {
   visibility?: "user_visible" | "internal_continue" | "compaction_followup" | "debug" | string
   turn_index?: number
   is_final_for_case?: boolean
+  direct_evidence_refs?: string[]
+  context_refs?: string[]
+  execution_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
@@ -300,10 +303,39 @@ export type TraceEvidenceFact = {
   category?: string
   summary: TraceFieldSummary
   data?: TraceFieldSummary
+  fact_kind?: string
+  canonical_subject?: string
+  claim?: string
+  support_level?: "direct" | "context" | "execution" | "weak" | string
+  quality_flags?: string[]
   confidence?: "observed" | "inferred" | string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
+}
+
+export type TraceHealthIssue = {
+  kind: string
+  severity: "info" | "warning" | "error"
+  message: string
+  record_id?: string
+  event_type?: string
+  count?: number
+  refs?: string[]
+  metadata?: Record<string, unknown>
+}
+
+export type TraceHealthMetrics = {
+  circular_reference_markers: number
+  open_records: number
+  finalized_open_records: number
+  llm_turns_missing_token_usage: number
+  llm_turns_missing_finish_reason: number
+  compaction_quality_flags: Record<string, number>
+  empty_subagent_results: number
+  broad_response_refs: number
+  duplicate_evidence_facts: number
+  issues: TraceHealthIssue[]
 }
 
 export type CausalNodeKind =
@@ -449,6 +481,7 @@ export type ProvenanceTraceSummary = {
     dataflow_edges: number
     artifacts: number
     token_usage: TraceTokenUsage
+    trace_health: TraceHealthMetrics
   }
 }
 
@@ -780,28 +813,30 @@ function defaultTraceDir() {
   return process.env.OPENCODE_CASE_TRACE_DIR || path.join(Global.Path.data, "case-traces")
 }
 
+function sanitizeForJson(input: unknown, key = "", stack = new WeakSet<object>()): unknown {
+  if (isSensitiveKey(key)) return "[REDACTED]"
+  if (typeof input === "bigint") return String(input)
+  if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
+  if (input instanceof Error) return errorInfo(input)
+  if (input instanceof URL) return input.toString()
+  if (typeof input === "string") return redactText(input)
+  if (!input || typeof input !== "object") return input
+  if (stack.has(input)) return "[Circular]"
+  stack.add(input)
+  try {
+    if (Array.isArray(input)) return input.map((item, index) => sanitizeForJson(item, String(index), stack))
+    const output: Record<string, unknown> = {}
+    for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) {
+      output[childKey] = sanitizeForJson(value, childKey, stack)
+    }
+    return output
+  } finally {
+    stack.delete(input)
+  }
+}
+
 function json(input: unknown) {
-  const seen = new WeakSet<object>()
-  return JSON.stringify(
-    input,
-    (_key, value) => {
-      const key = String(_key ?? "")
-      if (isSensitiveKey(key)) return "[REDACTED]"
-      if (typeof value === "bigint") return String(value)
-      if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`
-      if (value instanceof Error) {
-        return errorInfo(value)
-      }
-      if (value instanceof URL) return value.toString()
-      if (typeof value === "string") return redactText(value)
-      if (value && typeof value === "object") {
-        if (seen.has(value)) return "[Circular]"
-        seen.add(value)
-      }
-      return value
-    },
-    0,
-  )
+  return JSON.stringify(sanitizeForJson(input), undefined, 0)
 }
 
 function normalizeKey(input: string) {
@@ -1472,6 +1507,123 @@ function omitUndefined(input: Record<string, unknown>) {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined))
 }
 
+function classifySourceRefs(input: string[] | undefined) {
+  const direct_evidence_refs: string[] = []
+  const context_refs: string[] = []
+  const execution_refs: string[] = []
+  for (const ref of input ?? []) {
+    const separator = ref.indexOf(":")
+    const type = separator === -1 ? "" : ref.slice(0, separator)
+    if (type === "evidence") {
+      direct_evidence_refs.push(ref)
+      continue
+    }
+    if (["prompt", "context", "context_snapshot", "llm"].includes(type)) {
+      context_refs.push(ref)
+      continue
+    }
+    execution_refs.push(ref)
+  }
+  return {
+    direct_evidence_refs: dedupeStrings(direct_evidence_refs),
+    context_refs: dedupeStrings(context_refs),
+    execution_refs: dedupeStrings(execution_refs),
+  }
+}
+
+function dedupeStrings(input: string[]) {
+  return input.filter((item, index, array) => array.indexOf(item) === index)
+}
+
+function stringPreview(input: unknown, limit = 400) {
+  if (typeof input === "string") return input.slice(0, limit)
+  if (input === undefined || input === null) return ""
+  try {
+    return JSON.stringify(input).slice(0, limit)
+  } catch {
+    return String(input).slice(0, limit)
+  }
+}
+
+function objectField(input: unknown, key: string) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+  return (input as Record<string, unknown>)[key]
+}
+
+function firstStringField(input: unknown, keys: string[]) {
+  for (const key of keys) {
+    const value = objectField(input, key)
+    if (typeof value === "string" && value.trim()) return value
+  }
+  return undefined
+}
+
+function isEmptySubagentOutput(input: unknown) {
+  const text = stringPreview(input, 2000)
+  return /<task_result>\s*<\/task_result>/i.test(text)
+}
+
+function evidenceQualityFlags(input: EvidenceFactInput) {
+  const flags: string[] = []
+  if (/subagent|task/i.test(input.source) && isEmptySubagentOutput(input.data ?? input.summary)) {
+    flags.push("empty_subagent_result")
+  }
+  return flags
+}
+
+function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourceLocation[]) {
+  const qualityFlags = dedupeStrings([...(input.quality_flags ?? []), ...evidenceQualityFlags(input)])
+  const path =
+    sourceLocations.find((location) => location.path)?.path ??
+    firstStringField(input.data, ["path", "file", "filePath", "filepath"])
+  const symbol = firstStringField(input.data, ["symbol", "name", "key"])
+  const factText = firstStringField(input.data, ["fact", "claim", "summary", "text"])
+  const subject = symbol ?? path ?? input.category ?? input.source
+  const summary = stringPreview(input.summary, 500)
+  const claim = factText ?? summary
+  const source = input.source.toLowerCase()
+  const category = input.category?.toLowerCase() ?? ""
+  const factKind = (() => {
+    if (source.includes("mcp")) return "mcp_fact"
+    if (source.includes("skill")) return "skill_instruction"
+    if (source.includes("subagent") || source.includes("task")) return "subagent_result"
+    if (/verification|test|command|bash/.test(source) || /verification|test|command/.test(category)) {
+      return "verification_output"
+    }
+    if (/file|read|grep|code/.test(source) || /file|read|grep|code/.test(category)) return "code_reference"
+    return "observation"
+  })()
+  return {
+    fact_kind: input.fact_kind ?? factKind,
+    canonical_subject: input.canonical_subject ?? subject,
+    claim: input.claim ?? claim,
+    support_level: input.support_level ?? (qualityFlags.includes("empty_subagent_result") ? "weak" : "direct"),
+    quality_flags: qualityFlags,
+  }
+}
+
+function countCircularMarkers(input: unknown, stack = new WeakSet<object>()): number {
+  if (input === "[Circular]") return 1
+  if (!input || typeof input !== "object") return 0
+  if (stack.has(input)) return 1
+  stack.add(input)
+  try {
+    let count = 0
+    for (const value of Object.values(input as Record<string, unknown>)) count += countCircularMarkers(value, stack)
+    return count
+  } finally {
+    stack.delete(input)
+  }
+}
+
+function aggregateFlags(target: Record<string, number>, flags: unknown) {
+  if (!Array.isArray(flags)) return
+  for (const flag of flags) {
+    if (typeof flag !== "string" || !flag) continue
+    target[flag] = (target[flag] ?? 0) + 1
+  }
+}
+
 function isWeakObservation(input: ObservationInput) {
   if (input.category !== "tool_output") return false
   if (!/tool/i.test(input.source)) return false
@@ -1791,6 +1943,7 @@ class ActiveCaseTrace {
         data.child_trace_available = traceRef.child_trace_available
         if (traceRef.child_trace_dir) data.child_trace_dir = traceRef.child_trace_dir
       }
+      if (isEmptySubagentOutput(rawOutput)) data.quality_flags = ["empty_subagent_result"]
       const artifactID = this.collectArtifactRefs(summarizedOutput)[0]
       if (artifactID) data.output_artifact_id = artifactID
     }
@@ -2183,6 +2336,7 @@ class ActiveCaseTrace {
 
   responseOutput(input: ResponseOutputInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const classifiedRefs = classifySourceRefs(sourceRefs)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
     const responseRole =
@@ -2204,6 +2358,9 @@ class ActiveCaseTrace {
       turn_index: turnIndex,
       response_role: responseRole,
       is_final_for_case: isFinalForCase,
+      direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+      context_refs: classifiedRefs.context_refs,
+      execution_refs: classifiedRefs.execution_refs,
     }
     const segment: TraceResponseSegment = {
       segment_id: input.segment_id ?? semanticID("segment", this.responseSegments.length + 1),
@@ -2213,6 +2370,9 @@ class ActiveCaseTrace {
       visibility,
       turn_index: turnIndex,
       is_final_for_case: isFinalForCase,
+      direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+      context_refs: classifiedRefs.context_refs,
+      execution_refs: classifiedRefs.execution_refs,
       source_refs: sourceRefs,
       source_locations: sourceLocations,
       metadata,
@@ -2232,13 +2392,16 @@ class ActiveCaseTrace {
         visibility,
         turn_index: turnIndex,
         is_final_for_case: isFinalForCase,
+        direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+        context_refs: classifiedRefs.context_refs,
+        execution_refs: classifiedRefs.execution_refs,
         source_locations: sourceLocations,
         metadata,
       },
       source_refs: sourceRefs,
       source_locations: sourceLocations,
     })
-    for (const ref of sourceRefs ?? []) {
+    for (const ref of classifiedRefs.direct_evidence_refs) {
       this.linkSourceToResponse(ref, record.node_id)
     }
     return segment
@@ -2438,6 +2601,7 @@ class ActiveCaseTrace {
       ...collectSourceLocations(input.data),
       ...collectSourceLocations(input.metadata),
     ])
+    const canonical = canonicalEvidence(input, sourceLocations)
     const node = this.node({
       node_id: `evidence_${factID}`,
       kind: "evidence.fact",
@@ -2451,6 +2615,11 @@ class ActiveCaseTrace {
         category: input.category,
         summary: input.summary,
         data: input.data,
+        fact_kind: canonical.fact_kind,
+        canonical_subject: canonical.canonical_subject,
+        claim: canonical.claim,
+        support_level: canonical.support_level,
+        quality_flags: canonical.quality_flags,
         confidence: input.confidence ?? "observed",
         source_locations: sourceLocations,
         metadata: input.metadata,
@@ -2658,11 +2827,13 @@ class ActiveCaseTrace {
     if (this.finished) return
     this.evaluateConstraints()
     this.normalizeFinalResponseSegments()
-    this.finished = true
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
-    const summary = this.summary(input?.status ?? (error ? "error" : "success"))
+    const status = input?.status ?? (error ? "error" : "success")
+    this.finalizeOpenRecords(status)
+    this.finished = true
+    const summary = this.summary(status)
     const provenance = this.provenanceSummary(summary.status)
     this.write("trace.finish", summary)
     this.writeRecord("finish", provenance.manifest)
@@ -2735,6 +2906,7 @@ class ActiveCaseTrace {
     const manifest = this.manifest(status)
     const records = this.provenanceRecords()
     const dataflowEdges = this.provenanceDataflowEdges()
+    const traceHealth = this.traceHealth(records)
     return {
       trace_version: TRACE_VERSION,
       manifest,
@@ -2748,7 +2920,164 @@ class ActiveCaseTrace {
         dataflow_edges: dataflowEdges.length,
         artifacts: this.artifacts.length,
         token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
+        trace_health: traceHealth,
       },
+    }
+  }
+
+  private finalizeOpenRecords(status: TraceStatus) {
+    const finalStatus: TraceStatus = status === "running" ? "cancelled" : status
+    const finalizedReason =
+      finalStatus === "cancelled" ? "trace_cancelled" : finalStatus === "error" ? "trace_error" : "trace_finished"
+    const finalizedAt = new Date().toISOString()
+    for (const span of this.spans.values()) {
+      if (span.status !== "running") continue
+      span.status = finalStatus
+      span.end_time = finalizedAt
+      span.end_ms = Date.now() - this.startedAt
+      span.duration_ms = Math.max(0, span.end_ms - span.start_ms)
+      span.metadata = {
+        ...(span.metadata ?? {}),
+        finalized_status: "finalized_without_close",
+        finalized_reason: finalizedReason,
+      }
+    }
+    for (const node of this.causalNodes) {
+      if (node.status !== "running") continue
+      node.status = finalStatus
+      node.data = {
+        ...(node.data ?? {}),
+        finalized_status: "finalized_without_close",
+        finalized_reason: finalizedReason,
+        finalized_at: finalizedAt,
+        original_status: "running",
+      }
+      node.artifact_refs = this.collectArtifactRefs(node.data)
+      this.writeRecord("node.update", node)
+    }
+  }
+
+  private traceHealth(records: ProvenanceRecord[]): TraceHealthMetrics {
+    const issues: TraceHealthIssue[] = []
+    const circularReferenceMarkers = countCircularMarkers(records)
+    const openRecords = records.filter((record) => record.status === "running")
+    const finalizedOpenRecords = records.filter((record) => record.data?.finalized_status === "finalized_without_close")
+    for (const record of finalizedOpenRecords.slice(0, 20)) {
+      issues.push({
+        kind: "finalized_open_record",
+        severity: "info",
+        message: "Record was open at trace finish and was finalized without a component close event.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of openRecords.slice(0, 20)) {
+      issues.push({
+        kind: "open_record",
+        severity: "warning",
+        message: "Record is still running after trace finalization.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    const llmTurns = records.filter((record) => record.event_type === "llm.turn")
+    const llmTurnsMissingTokenUsage = llmTurns.filter(
+      (record) => record.data?.agent_role !== "title" && !record.token_usage?.total,
+    )
+    const llmTurnsMissingFinishReason = llmTurns.filter(
+      (record) => record.data?.agent_role !== "title" && !record.data?.finish_reason,
+    )
+    for (const record of llmTurnsMissingTokenUsage.slice(0, 20)) {
+      issues.push({
+        kind: "llm_turn_missing_token_usage",
+        severity: "warning",
+        message: "LLM turn has no token usage.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of llmTurnsMissingFinishReason.slice(0, 20)) {
+      issues.push({
+        kind: "llm_turn_missing_finish_reason",
+        severity: "info",
+        message: "LLM turn has no finish reason.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    const compactionQualityFlags: Record<string, number> = {}
+    for (const record of records.filter((item) => item.event_type === "context.compaction")) {
+      const contextLedger = objectField(record.data, "context_ledger")
+      aggregateFlags(compactionQualityFlags, objectField(contextLedger, "quality_flags"))
+    }
+    for (const [flag, count] of Object.entries(compactionQualityFlags)) {
+      issues.push({
+        kind: "compaction_quality_flag",
+        severity: flag.includes("missing") || flag.includes("pending") ? "warning" : "info",
+        message: `Compaction quality flag observed: ${flag}.`,
+        count,
+        metadata: { flag },
+      })
+    }
+    const emptySubagentRecords = records.filter((record) => {
+      if (record.event_type !== "subagent.call" && record.event_type !== "evidence.fact") return false
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && flags.includes("empty_subagent_result")
+    })
+    for (const record of emptySubagentRecords.slice(0, 20)) {
+      issues.push({
+        kind: "empty_subagent_result",
+        severity: "warning",
+        message: "Subagent returned no substantive task result.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    const broadResponses = records.filter((record) => {
+      if (record.event_type !== "response.output") return false
+      const sourceCount = record.source_refs?.length ?? 0
+      const directCount = Array.isArray(record.data?.direct_evidence_refs) ? record.data.direct_evidence_refs.length : 0
+      return sourceCount > 8 && directCount < sourceCount
+    })
+    for (const record of broadResponses.slice(0, 20)) {
+      issues.push({
+        kind: "broad_response_refs",
+        severity: "info",
+        message: "Response has broad legacy source refs; prefer direct_evidence_refs for attribution.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+        count: record.source_refs?.length,
+      })
+    }
+    const evidenceKeys = new Map<string, number>()
+    for (const record of records.filter((item) => item.event_type === "evidence.fact")) {
+      const key = [record.data?.source, record.data?.category, record.data?.canonical_subject, record.data?.claim].join(
+        "|",
+      )
+      evidenceKeys.set(key, (evidenceKeys.get(key) ?? 0) + 1)
+    }
+    const duplicateEvidenceFacts = [...evidenceKeys.values()]
+      .filter((count) => count > 1)
+      .reduce((a, b) => a + b - 1, 0)
+    if (duplicateEvidenceFacts) {
+      issues.push({
+        kind: "duplicate_evidence_facts",
+        severity: "info",
+        message: "Duplicate evidence facts were observed.",
+        count: duplicateEvidenceFacts,
+      })
+    }
+    return {
+      circular_reference_markers: circularReferenceMarkers,
+      open_records: openRecords.length,
+      finalized_open_records: finalizedOpenRecords.length,
+      llm_turns_missing_token_usage: llmTurnsMissingTokenUsage.length,
+      llm_turns_missing_finish_reason: llmTurnsMissingFinishReason.length,
+      compaction_quality_flags: compactionQualityFlags,
+      empty_subagent_results: emptySubagentRecords.length,
+      broad_response_refs: broadResponses.length,
+      duplicate_evidence_facts: duplicateEvidenceFacts,
+      issues,
     }
   }
 
@@ -3124,21 +3453,7 @@ class ActiveCaseTrace {
 }
 
 function jsonPretty(input: unknown) {
-  const seen = new WeakSet<object>()
-  return JSON.stringify(
-    input,
-    (key, value) => {
-      if (isSensitiveKey(key)) return "[REDACTED]"
-      if (typeof value === "bigint") return String(value)
-      if (typeof value === "string") return redactText(value)
-      if (value && typeof value === "object") {
-        if (seen.has(value)) return "[Circular]"
-        seen.add(value)
-      }
-      return value
-    },
-    2,
-  )
+  return JSON.stringify(sanitizeForJson(input), undefined, 2)
 }
 
 function prettyJsonString(input: string) {

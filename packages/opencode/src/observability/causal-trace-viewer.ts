@@ -313,6 +313,86 @@ function renderOverview(trace: ProvenanceTraceSummary) {
   </section>`
 }
 
+function renderTraceHealth(trace: ProvenanceTraceSummary) {
+  const health = trace.metrics.trace_health
+  const compactionFlags = Object.entries(health.compaction_quality_flags ?? {})
+  const issueSeverity = health.issues.some((issue) => issue.severity === "error")
+    ? "bad"
+    : health.issues.some((issue) => issue.severity === "warning")
+      ? "running"
+      : "ok"
+  const healthCards = [
+    ["Circular Markers", health.circular_reference_markers, "Path-cycle markers left in structured JSON."],
+    ["Open Records", health.open_records, "Records still running after finalization."],
+    ["Finalized Open", health.finalized_open_records, "Open records closed by trace finalizer."],
+    ["LLM Missing Tokens", health.llm_turns_missing_token_usage, "LLM turns without token usage."],
+    ["LLM Missing Finish", health.llm_turns_missing_finish_reason, "LLM turns without finish reason."],
+    ["Empty Subagent", health.empty_subagent_results, "Subagent/task facts with empty returned result."],
+    [
+      "Broad Responses",
+      health.broad_response_refs,
+      "Responses whose legacy source_refs are wider than direct evidence.",
+    ],
+    ["Duplicate Evidence", health.duplicate_evidence_facts, "Repeated evidence facts after canonicalization."],
+  ] as const
+
+  return `<section id="trace-health">
+    <div class="section-title">
+      <h2>Trace Health</h2>
+      <span class="status-pill ${issueSeverity}">${health.issues.length} issues</span>
+    </div>
+    <div class="health-grid">
+      ${healthCards
+        .map(
+          ([label, value, hint]) => `<div class="health-card">
+            <span class="label">${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+            <span class="muted">${escapeHtml(hint)}</span>
+          </div>`,
+        )
+        .join("")}
+    </div>
+    <div class="health-details">
+      <div>
+        <h3>Compaction Quality Flags</h3>
+        ${
+          compactionFlags.length
+            ? `<div class="flag-list">${compactionFlags
+                .map(
+                  ([flag, count]) =>
+                    `<span class="flag"><code>${escapeHtml(flag)}</code><strong>${escapeHtml(count)}</strong></span>`,
+                )
+                .join("")}</div>`
+            : `<div class="empty">No compaction quality flags.</div>`
+        }
+      </div>
+      <div>
+        <h3>Quality Issues</h3>
+        ${
+          health.issues.length
+            ? `<div class="issue-list">${health.issues
+                .map(
+                  (issue) => `<article class="issue-row">
+                    <div>
+                      <span class="severity ${escapeHtml(issue.severity)}">${escapeHtml(issue.severity)}</span>
+                      <strong>${escapeHtml(issue.kind)}</strong>
+                    </div>
+                    <div class="flow-summary">${escapeHtml(issue.message)}</div>
+                    <div class="flow-meta">
+                      ${issue.record_id ? `<span>record <code>${escapeHtml(issue.record_id)}</code></span>` : ""}
+                      ${issue.event_type ? `<span>event <code>${escapeHtml(issue.event_type)}</code></span>` : ""}
+                      ${issue.count !== undefined ? `<span>count ${escapeHtml(issue.count)}</span>` : ""}
+                    </div>
+                  </article>`,
+                )
+                .join("")}</div>`
+            : `<div class="empty">No trace health issues.</div>`
+        }
+      </div>
+    </div>
+  </section>`
+}
+
 function renderAgentFlow(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.toSorted((a, b) => a.time_ms - b.time_ms)
   if (!records.length)
@@ -820,6 +900,17 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .overview-grid strong, .overview-grid code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .component-strip { display: flex; gap: 10px; overflow-x: auto; margin-top: 12px; padding-bottom: 2px; }
     .component-chip { flex: 0 0 210px; display: grid; gap: 2px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 12px; }
+    .health-grid { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 10px; }
+    .health-card { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
+    .health-card strong { display: block; margin: 2px 0 4px; font-size: 24px; line-height: 1.1; }
+    .health-details { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); gap: 12px; margin-top: 14px; }
+    .flag-list, .issue-list { display: grid; gap: 8px; margin-top: 8px; }
+    .flag { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .issue-row { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .severity { display: inline-flex; align-items: center; min-height: 22px; margin-right: 8px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .severity.info { color: var(--blue); background: #eef6ff; border-color: #b2ddff; }
+    .severity.warning { color: var(--amber); background: #fff7e6; border-color: #fedf89; }
+    .severity.error { color: var(--bad); background: #fff1f0; border-color: #fecdca; }
     .flow-list, .io-list, .fact-list, .context-list { display: grid; gap: 10px; }
     .pipeline { display: grid; gap: 10px; }
     .pipeline-card { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
@@ -848,8 +939,8 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     .fact-text { margin-top: 5px; color: #344054; font-size: 13px; }
     .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
     .empty { color: var(--muted); font-size: 13px; }
-    @media (max-width: 1100px) { .overview-grid { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .fact-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 760px) { main, .header-inner { padding-left: 14px; padding-right: 14px; } .overview-grid, .flow-row, .io-grid, .fact-grid, .pipeline-card, .pipeline-io { grid-template-columns: 1fr; } header { position: static; } }
+    @media (max-width: 1100px) { .overview-grid { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .fact-grid, .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .health-details { grid-template-columns: 1fr; } }
+    @media (max-width: 760px) { main, .header-inner { padding-left: 14px; padding-right: 14px; } .overview-grid, .flow-row, .io-grid, .fact-grid, .pipeline-card, .pipeline-io, .health-grid { grid-template-columns: 1fr; } header { position: static; } }
   </style>
 </head>
 <body>
@@ -864,6 +955,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
       </div>
       <nav>
         <a href="#overview">Overview</a>
+        <a href="#trace-health">Trace Health</a>
         <a href="#semantic-pipeline">Semantic Pipeline</a>
         <a href="#llm-turns">LLM Turns</a>
         <a href="#lifecycle">Lifecycle</a>
@@ -880,6 +972,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
   </header>
   <main>
     ${renderOverview(trace)}
+    ${renderTraceHealth(trace)}
     ${renderSemanticPipeline(trace, artifacts)}
     ${renderLlmTurns(trace, artifacts)}
     ${renderLifecycle(trace)}
