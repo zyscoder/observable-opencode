@@ -392,6 +392,10 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
     ],
     ["Broken Claims", health.broken_claim_fragments ?? 0, "Claim fragments produced by sentence splitting."],
     ["Over Attributed", health.over_attributed_claims ?? 0, "Claims whose broad refs were narrowed by matching."],
+    ["Non-final Claims", health.non_final_response_claims ?? 0, "Claims attached to non-final response segments."],
+    ["Weak Matches", health.weak_evidence_matches ?? 0, "Claims supported only by weak evidence overlap."],
+    ["MCP Shadowed", health.mcp_json_parse_shadowed ?? 0, "MCP JSON facts shadowed by weaker parsers."],
+    ["Skill Unresolved", health.skill_request_unresolved ?? 0, "Requested skills not observed as loaded."],
     ["Payload Dup Groups", health.payload_duplication_groups ?? 0, "Artifact payloads reused multiple times."],
     ["Missing Compaction Check", health.compaction_check_missing ?? 0, "Compactions without a check record."],
   ] as const
@@ -861,6 +865,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
             <th>Quality Flags</th>
             <th>Matched Evidence</th>
             <th>Match</th>
+            <th>Reasons</th>
+            <th>Candidates</th>
             <th>Direct Evidence</th>
             <th>Context</th>
             <th>Execution</th>
@@ -872,6 +878,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
               const data = record.data ?? {}
               const direct = Array.isArray(data.direct_evidence_refs) ? data.direct_evidence_refs : []
               const matched = Array.isArray(data.matched_evidence_refs) ? data.matched_evidence_refs : []
+              const reasons = Array.isArray(data.match_reasons) ? data.match_reasons : []
+              const candidates = Array.isArray(data.candidate_evidence_refs) ? data.candidate_evidence_refs : []
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
@@ -881,6 +889,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
                 <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
                 <td><div class="refs">${escapeHtml(matched.join(", ") || "-")}</div></td>
                 <td><code>${escapeHtml(data.match_strategy ?? "-")}</code><br/><span class="muted">${escapeHtml(data.match_score ?? "-")}</span></td>
+                <td>${reasons.length ? reasons.map((reason) => `<code>${escapeHtml(reason)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
+                <td><div class="refs">${escapeHtml(candidates.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(direct.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(context.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(execution.join(", ") || "-")}</div></td>

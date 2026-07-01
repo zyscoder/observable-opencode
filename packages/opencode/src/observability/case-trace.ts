@@ -341,8 +341,11 @@ export type TraceResponseClaimRecord = {
   context_refs: string[]
   execution_refs: string[]
   matched_evidence_refs?: string[]
+  candidate_evidence_refs?: string[]
   match_strategy?: string
   match_score?: number
+  match_reasons?: string[]
+  original_direct_evidence_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   support_level: "direct" | "contextual" | "execution_only" | "unsupported" | string
@@ -400,6 +403,10 @@ export type TraceHealthMetrics = {
   over_attributed_claims?: number
   generic_mcp_facts?: number
   path_only_evidence_facts?: number
+  non_final_response_claims?: number
+  weak_evidence_matches?: number
+  mcp_json_parse_shadowed?: number
+  skill_request_unresolved?: number
   issues: TraceHealthIssue[]
 }
 
@@ -1783,34 +1790,82 @@ function evidenceMatchStrings(data: Record<string, unknown> | undefined) {
   return dedupeStrings(output.filter(Boolean))
 }
 
-function evidenceMatchScore(claimText: unknown, evidenceData: Record<string, unknown> | undefined) {
-  if (!evidenceData) return 0
+function isVerificationClaimText(input: string) {
+  return /test|测试|passed|failed|pass|fail|assert|断言|exit|退出码|验证|pricing tests|expected|actual|通过|失败|\b48000\b|\b51000\b/i.test(
+    input,
+  )
+}
+
+function predicateMatchesClaim(predicate: string | undefined, claim: string) {
+  if (!predicate) return false
+  if (claim.includes(predicate)) return true
+  if (predicate === "owner" && /owner|owned|team|负责|归属/.test(claim)) return true
+  if (predicate === "discount-cap" && /discount|折扣|cap|capped|limit|upper|上限|封顶|0\.15|15/.test(claim)) return true
+  if (predicate === "implementation-entry" && /entry|入口|实现|implementation|src\/|\.mjs/.test(claim)) return true
+  if (predicate === "exit-status" && isVerificationClaimText(claim)) return true
+  return false
+}
+
+function evidenceMatchAnalysis(claimText: unknown, evidenceData: Record<string, unknown> | undefined) {
+  const reasons: string[] = []
+  if (!evidenceData) return { score: 0, reasons, weak: false }
   const claim = normalizeMatchText(claimText)
-  if (!claim) return 0
+  if (!claim) return { score: 0, reasons, weak: false }
   const strings = evidenceMatchStrings(evidenceData)
   const haystack = normalizeMatchText(strings.join(" "))
-  if (!haystack) return 0
+  if (!haystack) return { score: 0, reasons, weak: false }
+  const factKind = typeof evidenceData.fact_kind === "string" ? evidenceData.fact_kind : ""
+  if (factKind === "verification_output" && !isVerificationClaimText(claim)) {
+    return { score: 0, reasons: ["incompatible_verification_fact"], weak: false }
+  }
   const structured = recordFromUnknown(evidenceData.structured_claim)
   let score = 0
   const structuredValue = structured?.value === undefined ? undefined : normalizeMatchText(structured.value)
   const structuredSubject = structured?.subject === undefined ? undefined : normalizeMatchText(structured.subject)
   const structuredPredicate = structured?.predicate === undefined ? undefined : normalizeMatchText(structured.predicate)
-  if (structuredValue && claim.includes(structuredValue)) score += 0.55
-  if (structuredSubject && claim.includes(structuredSubject)) score += 0.25
-  if (structuredPredicate && claim.includes(structuredPredicate.replace(/-/g, " "))) score += 0.2
+  if (structuredValue && claim.includes(structuredValue)) {
+    score += 0.55
+    reasons.push("structured_value")
+  }
+  if (structuredSubject && claim.includes(structuredSubject)) {
+    score += 0.25
+    reasons.push("structured_subject")
+  }
+  if (predicateMatchesClaim(structuredPredicate, claim)) {
+    score += 0.2
+    reasons.push("structured_predicate")
+  }
   const span = recordFromUnknown(structured?.source_span)
   const sourcePath = typeof span?.path === "string" ? normalizeMatchText(span.path) : undefined
   if (sourcePath) {
     const basename = sourcePath.split("/").at(-1)
-    if (claim.includes(sourcePath) || (basename && claim.includes(basename))) score += 0.35
+    if (claim.includes(sourcePath) || (basename && claim.includes(basename))) {
+      score += 0.35
+      reasons.push("source_path")
+    }
   }
   const claimTerms = new Set(matchTerms(claim))
   const evidenceTerms = new Set(matchTerms(haystack))
   const shared = [...claimTerms].filter((term) => evidenceTerms.has(term))
-  if (shared.length) score += Math.min(0.5, shared.length * 0.12)
-  if (/0\.15/.test(claim) && /0\.15/.test(haystack)) score += 0.45
-  if (/billing-platform/.test(claim) && /billing-platform/.test(haystack)) score += 0.45
-  return Math.min(1, Number(score.toFixed(2)))
+  if (shared.length) {
+    score += Math.min(0.36, shared.length * 0.09)
+    reasons.push("shared_terms")
+  }
+  if (/0\.15/.test(claim) && /0\.15/.test(haystack)) {
+    score += 0.45
+    reasons.push("discount_cap_value")
+  }
+  if (/billing-platform/.test(claim) && /billing-platform/.test(haystack)) {
+    score += 0.45
+    reasons.push("owner_value")
+  }
+  const finalScore = Math.min(1, Number(score.toFixed(2)))
+  const strongReasons = reasons.filter((reason) => reason !== "shared_terms")
+  return {
+    score: finalScore,
+    reasons: dedupeStrings(reasons),
+    weak: finalScore > 0 && finalScore < 0.45 && strongReasons.length === 0,
+  }
 }
 
 function dedupeStrings(input: string[]) {
@@ -1825,6 +1880,42 @@ function stringPreview(input: unknown, limit = 400) {
   } catch {
     return String(input).slice(0, limit)
   }
+}
+
+function fieldSummaryText(input: unknown) {
+  const record = recordFromUnknown(input)
+  if (!record) return stringPreview(input, 8000)
+  const value = record.value
+  if (typeof value === "string") return value
+  const preview = record.preview
+  if (typeof preview === "string") return preview
+  return stringPreview(input, 8000)
+}
+
+function requestedSkillNames(input: unknown) {
+  const names = new Set<string>()
+  const text = collectTextCandidates(input).join("\n")
+  for (const match of text.matchAll(/\b(?:use|load|call|调用|使用|加载)\s+([a-zA-Z][\w-]{1,80})\s+skill\b/gi)) {
+    if (match[1]) names.add(match[1])
+  }
+  for (const match of text.matchAll(/\b([a-zA-Z][\w-]{1,80})\s+skill\b/gi)) {
+    const name = match[1]
+    if (!name || ["the", "this", "a", "an"].includes(name.toLowerCase())) continue
+    names.add(name)
+  }
+  return [...names]
+}
+
+function availableSkillNames(input: unknown) {
+  const names = new Set<string>()
+  const text = stringPreview(input, 200000)
+  for (const match of text.matchAll(/<name>\s*([^<\s]+)\s*<\/name>/gi)) {
+    if (match[1]) names.add(match[1])
+  }
+  for (const match of text.matchAll(/"name"\s*:\s*"([^"]+)"/gi)) {
+    if (match[1]) names.add(match[1])
+  }
+  return [...names]
 }
 
 function objectField(input: unknown, key: string) {
@@ -2006,6 +2097,41 @@ function collectTextCandidates(input: unknown, output: string[] = [], depth = 0)
   return dedupeStrings(output)
 }
 
+function structuredCandidateScore(candidate: StructuredClaimCandidate) {
+  const record = candidate.record
+  let score = candidate.extraction_method === "mcp_json_text" ? 100 : 0
+  const hasSubject = record.subject !== undefined || record.symbol !== undefined || record.name !== undefined
+  const hasPredicate = record.predicate !== undefined || record.relation !== undefined || record.property !== undefined
+  const hasValue =
+    record.value !== undefined ||
+    record.fact !== undefined ||
+    record.claim !== undefined ||
+    record.text !== undefined ||
+    record.owner !== undefined ||
+    record.status !== undefined
+  const structuredCount = [hasSubject, hasPredicate, hasValue].filter(Boolean).length
+  score += structuredCount * 30
+  if (sourceLocationFromRecord(record)) score += 10
+  const onlyLocation =
+    structuredCount === 0 &&
+    (record.path !== undefined ||
+      record.file !== undefined ||
+      record.filePath !== undefined ||
+      record.uri !== undefined)
+  if (onlyLocation) score -= 100
+  return score
+}
+
+function sortedStructuredClaimCandidates(input: unknown) {
+  return collectStructuredClaimCandidates(input).sort(
+    (a, b) => structuredCandidateScore(b) - structuredCandidateScore(a),
+  )
+}
+
+function strongStructuredClaimCandidates(input: unknown) {
+  return sortedStructuredClaimCandidates(input).filter((candidate) => structuredCandidateScore(candidate) >= 70)
+}
+
 function claimSourceSpan(input: unknown, sourceLocations: TraceSourceLocation[]) {
   const record = recordFromUnknown(input)
   const fromRecord = record ? sourceLocationFromRecord(record) : undefined
@@ -2181,17 +2307,32 @@ function structuredClaimFromEvidence(
     const textPayload = textPayloadFromRecord(dataRecord)
     const parsed = textPayload ? parseJsonObjectText(textPayload) : undefined
     if (parsed) {
+      const parsedSourceSpan = sourceLocationFromRecord(parsed) ?? sourceSpan
       const parsedClaim = structuredClaimFromRecord(
         parsed,
         source.includes("mcp") ? "mcp_json_text" : "explicit_structured_data",
-        sourceSpan,
+        parsedSourceSpan,
       )
       if (parsedClaim) {
         if (!parsedClaim.source_span) flags.push("missing_source_span")
+        if (parsedClaim.extraction_method === "mcp_json_text") flags.push("mcp_json_fact_extracted")
         return { structured_claim: parsedClaim, quality_flags: flags }
       }
     } else if (source.includes("mcp") && textPayload) {
       flags.push("unparsed_mcp_text")
+    }
+    for (const candidate of strongStructuredClaimCandidates(dataRecord)) {
+      const candidateSourceSpan = sourceLocationFromRecord(candidate.record) ?? sourceSpan
+      const candidateClaim = structuredClaimFromRecord(
+        candidate.record,
+        source.includes("mcp") ? "mcp_json_text" : candidate.extraction_method,
+        candidateSourceSpan,
+      )
+      if (candidateClaim) {
+        if (!candidateClaim.source_span) flags.push("missing_source_span")
+        if (candidateClaim.extraction_method === "mcp_json_text") flags.push("mcp_json_fact_extracted")
+        return { structured_claim: candidateClaim, quality_flags: flags }
+      }
     }
     for (const textCandidate of collectTextCandidates(dataRecord)) {
       const lineClaim = structuredLineClaimsFromText(textCandidate, sourceSpan)[0]
@@ -2232,7 +2373,7 @@ function structuredClaimFromEvidence(
     }
   }
 
-  const structuredCandidates = collectStructuredClaimCandidates(input.data)
+  const structuredCandidates = sortedStructuredClaimCandidates(input.data)
   for (const candidate of structuredCandidates) {
     const candidateSourceSpan = sourceLocationFromRecord(candidate.record) ?? sourceSpan
     const candidateClaim = structuredClaimFromRecord(
@@ -2423,6 +2564,7 @@ class ActiveCaseTrace {
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
   private responseSegments: TraceResponseSegment[] = []
+  private claimedResponseSegmentIDs = new Set<string>()
   private designRecords: TraceDesignRecord[] = []
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
@@ -2434,6 +2576,8 @@ class ActiveCaseTrace {
   private recentVerificationIDs: string[] = []
   private recentChangeIDs: string[] = []
   private recentToolSpanIDs: string[] = []
+  private requestedSkillNames = new Set<string>()
+  private recordedSkillRequestNames = new Set<string>()
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
   private nextPartialWrite = 0
@@ -2876,6 +3020,7 @@ class ActiveCaseTrace {
         label: "Prompt assembly consumed source record",
       })
     }
+    for (const name of requestedSkillNames([input.input, input.parts])) this.requestedSkillNames.add(name)
     return node
   }
 
@@ -2917,6 +3062,9 @@ class ActiveCaseTrace {
         relation: "context_transform",
         label: "Context transform consumed source record",
       })
+    }
+    if (input.stage === "model_messages_built" || input.stage === "llm_request_ready") {
+      this.recordRequestedSkillAvailability(input.output, node.node_id)
     }
     return node
   }
@@ -3142,23 +3290,6 @@ class ActiveCaseTrace {
     for (const ref of classifiedRefs.direct_evidence_refs) {
       this.linkSourceToResponse(ref, record.node_id)
     }
-    if (responseRole === "final_answer" && visibility === "user_visible") {
-      const claims = splitResponseClaims(input.text)
-      claims.forEach((claim, index) => {
-        this.responseClaim({
-          response_segment_id: segment.segment_id,
-          text: claim,
-          claim_index: index + 1,
-          source_refs: sourceRefs,
-          source_locations: sourceLocations,
-          metadata: {
-            response_node_id: record.node_id,
-            response_role: responseRole,
-            turn_index: turnIndex,
-          },
-        })
-      })
-    }
     return segment
   }
 
@@ -3185,6 +3316,7 @@ class ActiveCaseTrace {
       ...(input.quality_flags ?? []),
       ...responseClaimQualityFlags(effectiveClassifiedRefs),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
+      ...(evidenceMatch.weak ? ["weak_evidence_match"] : []),
       ...(classifiedRefs.direct_evidence_refs.length > effectiveDirectEvidenceRefs.length &&
       classifiedRefs.direct_evidence_refs.length > 1
         ? ["over_attributed_claim"]
@@ -3202,8 +3334,11 @@ class ActiveCaseTrace {
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
       matched_evidence_refs: evidenceMatch.refs,
+      candidate_evidence_refs: evidenceMatch.candidateRefs,
       match_strategy: evidenceMatch.strategy,
       match_score: evidenceMatch.score,
+      match_reasons: evidenceMatch.reasons,
+      original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       source_refs: sourceRefs,
       source_locations: sourceLocations,
       support_level: supportLevel,
@@ -3228,8 +3363,11 @@ class ActiveCaseTrace {
         context_refs: claim.context_refs,
         execution_refs: claim.execution_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
+        candidate_evidence_refs: claim.candidate_evidence_refs,
         match_strategy: claim.match_strategy,
         match_score: claim.match_score,
+        match_reasons: claim.match_reasons,
+        original_direct_evidence_refs: claim.original_direct_evidence_refs,
         support_level: claim.support_level,
         quality_flags: claim.quality_flags,
         source_locations: sourceLocations,
@@ -3304,6 +3442,35 @@ class ActiveCaseTrace {
         response_role: segment.response_role,
         is_final_for_case: segment.is_final_for_case,
       }
+    }
+  }
+
+  private emitFinalResponseClaims() {
+    for (const segment of this.responseSegments) {
+      if (this.claimedResponseSegmentIDs.has(segment.segment_id)) continue
+      if (segment.response_role !== "final_answer") continue
+      if (segment.visibility !== "user_visible") continue
+      if (segment.is_final_for_case !== true) continue
+      const responseNodeID = `responsenode_${segment.segment_id}`
+      const responseNode = this.causalNodes.find((item) => item.node_id === responseNodeID)
+      const responseText = responseNode?.data?.text ?? fieldSummaryText(segment.text)
+      const claims = splitResponseClaims(responseText)
+      claims.forEach((claim, index) => {
+        this.responseClaim({
+          response_segment_id: segment.segment_id,
+          text: claim,
+          claim_index: index + 1,
+          source_refs: segment.source_refs,
+          source_locations: segment.source_locations,
+          metadata: {
+            response_node_id: responseNodeID,
+            response_role: segment.response_role,
+            turn_index: segment.turn_index,
+            is_final_for_case: segment.is_final_for_case,
+          },
+        })
+      })
+      this.claimedResponseSegmentIDs.add(segment.segment_id)
     }
   }
 
@@ -3678,6 +3845,7 @@ class ActiveCaseTrace {
     if (this.finished) return
     this.evaluateConstraints()
     this.normalizeFinalResponseSegments()
+    this.emitFinalResponseClaims()
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
@@ -3946,6 +4114,10 @@ class ActiveCaseTrace {
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && flags.includes("path_only_evidence_fact")
     })
+    const mcpJsonParseShadowed = evidenceFacts.filter((record) => {
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && flags.includes("mcp_json_parse_shadowed")
+    })
     for (const record of genericEvidenceFacts.slice(0, 20)) {
       issues.push({
         kind: "generic_evidence_fact",
@@ -3990,6 +4162,33 @@ class ActiveCaseTrace {
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && flags.includes("over_attributed_claim")
     })
+    const weakEvidenceMatches = responseClaims.filter((record) => {
+      const flags = record.data?.quality_flags
+      return Array.isArray(flags) && flags.includes("weak_evidence_match")
+    })
+    const responseSegments = new Map(
+      records
+        .filter((record) => record.event_type === "response.output")
+        .map((record) => [String(record.data?.segment_id ?? ""), record]),
+    )
+    const nonFinalResponseClaims = responseClaims.filter((record) => {
+      const segment = responseSegments.get(String(record.data?.response_segment_id ?? ""))
+      return (
+        !segment ||
+        segment.data?.response_role !== "final_answer" ||
+        segment.data?.visibility !== "user_visible" ||
+        segment.data?.is_final_for_case !== true
+      )
+    })
+    const unresolvedSkillRequests = records.filter((record) => {
+      if (record.event_type !== "skill.load") return false
+      const flags = record.data?.quality_flags
+      return (
+        (Array.isArray(flags) && flags.includes("skill_request_unresolved")) ||
+        record.data?.request_status === "missing" ||
+        record.data?.request_status === "requested"
+      )
+    })
     for (const record of unsupportedResponseClaims.slice(0, 20)) {
       issues.push({
         kind: "unsupported_response_claim",
@@ -4013,6 +4212,33 @@ class ActiveCaseTrace {
         kind: "over_attributed_claim",
         severity: "info",
         message: "Response claim had broader source evidence than the matched direct evidence refs.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of nonFinalResponseClaims.slice(0, 20)) {
+      issues.push({
+        kind: "non_final_response_claim",
+        severity: "warning",
+        message: "Response claim is attached to a response segment that is not the final user-visible answer.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of weakEvidenceMatches.slice(0, 20)) {
+      issues.push({
+        kind: "weak_evidence_match",
+        severity: "info",
+        message: "Response claim was supported only by a weak evidence overlap.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of unresolvedSkillRequests.slice(0, 20)) {
+      issues.push({
+        kind: "skill_request_unresolved",
+        severity: "info",
+        message: "User requested a skill that was not observed as loaded in the model context.",
         record_id: record.record_id,
         event_type: record.event_type,
       })
@@ -4051,6 +4277,10 @@ class ActiveCaseTrace {
       over_attributed_claims: overAttributedClaims.length,
       generic_mcp_facts: genericMcpFacts.length,
       path_only_evidence_facts: pathOnlyEvidenceFacts.length,
+      non_final_response_claims: nonFinalResponseClaims.length,
+      weak_evidence_matches: weakEvidenceMatches.length,
+      mcp_json_parse_shadowed: mcpJsonParseShadowed.length,
+      skill_request_unresolved: unresolvedSkillRequests.length,
       issues,
     }
   }
@@ -4253,6 +4483,32 @@ class ActiveCaseTrace {
     return "result"
   }
 
+  private recordRequestedSkillAvailability(contextOutput: unknown, sourceNodeID: string) {
+    if (!this.requestedSkillNames.size) return
+    const available = availableSkillNames(contextOutput)
+    const availableSet = new Set(available)
+    for (const skillName of this.requestedSkillNames) {
+      if (this.recordedSkillRequestNames.has(skillName)) continue
+      this.recordedSkillRequestNames.add(skillName)
+      const requestStatus = availableSet.has(skillName) ? "requested" : "missing"
+      this.node({
+        node_id: `skillrequest_${hash(skillName).slice(0, 8)}`,
+        kind: "skill.load",
+        component: "skill",
+        title: `Skill request: ${skillName}`,
+        status: "success",
+        data: {
+          skill_name: skillName,
+          request_source: "user_prompt",
+          request_status: requestStatus,
+          available_skill_names: available,
+          quality_flags: requestStatus === "missing" ? ["skill_request_unresolved"] : [],
+        },
+        source_refs: [`context:${sourceNodeID}`],
+      })
+    }
+  }
+
   compactionCheck(input: CompactionCheckInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const checkID = input.check_id ?? semanticID("compactioncheck", this.causalNodes.length + 1)
@@ -4315,18 +4571,26 @@ class ActiveCaseTrace {
     const scored = evidenceRefs
       .map((ref) => {
         const node = this.evidenceNodeForRef(ref)
+        const analysis = evidenceMatchAnalysis(claimText, node?.data)
         return {
           ref,
-          score: evidenceMatchScore(claimText, node?.data),
+          score: analysis.score,
+          reasons: analysis.reasons,
+          weak: analysis.weak,
         }
       })
-      .filter((item) => item.score >= 0.25)
+      .filter((item) => item.score >= 0.35)
       .sort((a, b) => b.score - a.score)
-    const refs = scored.slice(0, 4).map((item) => item.ref)
+    const refs = scored.slice(0, 3).map((item) => item.ref)
     const score = scored[0]?.score ?? 0
+    const reasons = dedupeStrings(scored.flatMap((item) => item.reasons))
+    const weak = scored.some((item) => item.weak)
     return {
       refs,
       score,
+      reasons,
+      weak,
+      candidateRefs: evidenceRefs,
       strategy: refs.length ? "structured_text_overlap" : evidenceRefs.length ? "no_direct_match" : "no_evidence_refs",
     }
   }

@@ -24,7 +24,7 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v4.7 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes trace semantic contract v4.8 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -115,13 +115,13 @@ describe("case trace", () => {
       "executed_for_claim",
     ])
 
-    expect(manifest.trace_version).toBe("4.7")
+    expect(manifest.trace_version).toBe("4.8")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
-    expect(provenance.trace_version).toBe("4.7")
+    expect(provenance.trace_version).toBe("4.8")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -150,7 +150,7 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v4.7")
+    expect(traceHtml).toContain("Trace v4.8")
     expect(traceHtml).toContain('id="overview"')
     expect(traceHtml).toContain('id="trace-health"')
     expect(traceHtml).toContain('id="agent-flow"')
@@ -166,7 +166,7 @@ describe("case trace", () => {
     expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
-  test("writes v4.7 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
+  test("writes v4.8 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-v45.ts")
@@ -207,7 +207,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.7")
+    expect(trace.trace_version).toBe("4.8")
     expect(eventTypes).toContain("prompt.assembly")
     expect(eventTypes).toContain("context.transform")
     expect(eventTypes).toContain("decision")
@@ -218,7 +218,53 @@ describe("case trace", () => {
     expect(html).toContain("llm_tool_call")
   })
 
-  test("writes v4.7 lifecycle provenance records for LLM turns, exit gates, evidence facts, and response claims", async () => {
+  test("records unresolved user-requested skills as formal skill.load facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-skill-request-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "skill-request-v48.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const prompt = CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_skill", message_id: "msg_user", agent: "build", input: { parts: [{ type: "text", text: "请使用 repo-audit skill 审计仓库" }] }, output: { part_count: 1 } })`,
+        `CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_skill", message_id: "msg_assistant", step: 1, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [] }, output: { system: ["<available_skills><skill><name>customize-opencode</name></skill></available_skills>"], model_messages: [] }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }], source_refs: prompt ? ["prompt:" + prompt.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "skill-request-v48-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "skill-request-v48-case", "trace.json"), "utf8")) as any
+    const skillRecord = trace.records.find((record: any) => record.event_type === "skill.load")
+
+    expect(skillRecord.data).toMatchObject({
+      skill_name: "repo-audit",
+      request_source: "user_prompt",
+      request_status: "missing",
+    })
+    expect(skillRecord.data.available_skill_names).toContain("customize-opencode")
+    expect(skillRecord.data.quality_flags).toContain("skill_request_unresolved")
+    expect(trace.metrics.trace_health.skill_request_unresolved).toBe(1)
+  })
+
+  test("writes v4.8 lifecycle provenance records for LLM turns, exit gates, evidence facts, and response claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-lifecycle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "lifecycle-v45.ts")
@@ -266,7 +312,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("4.7")
+    expect(trace.trace_version).toBe("4.8")
     expect(eventTypes).toContain("llm.turn")
     expect(eventTypes).toContain("agent.lifecycle")
     expect(eventTypes).toContain("exit.gate")
@@ -360,7 +406,97 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.broken_claim_fragments).toBe(0)
   })
 
-  test("writes v4.7 structurally safe trace JSON and classifies finalized lifecycle records", async () => {
+  test("emits response claims only for the final user-visible answer", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "final-claims-v48.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "## Goal\\n- Read docs/architecture.md and prepare an answer.", source_refs: ["context_snapshot:ctx_intermediate"] })`,
+        `CaseTrace.responseOutput({ text: "Owner is billing-platform. Entry point is src/pricing.mjs. Discount cap is 15%.", source_refs: ["context_snapshot:ctx_final"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "final-claims-v48-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "final-claims-v48-case", "trace.json"), "utf8")) as any
+    const responses = trace.records.filter((record: any) => record.event_type === "response.output")
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const finalResponse = responses.find((record: any) => record.data.is_final_for_case === true)
+
+    expect(responses[0].data.response_role).toBe("intermediate_summary")
+    expect(claims.length).toBeGreaterThan(0)
+    expect(claims.every((record: any) => record.data.response_segment_id === finalResponse.data.segment_id)).toBe(true)
+    expect(JSON.stringify(claims)).not.toContain("Read docs/architecture.md and prepare an answer")
+    expect(trace.metrics.trace_health.non_final_response_claims).toBe(0)
+  })
+
+  test("does not match verification-output evidence to owner claims without test-result wording", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-match-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "match-v48.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const ownerFact = CaseTrace.evidenceFact({ source: "mcp", category: "repo_fact", summary: "owner", data: { subject: "renewalQuote", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 10, line_end: 12 } })`,
+        `const verificationFact = CaseTrace.evidenceFact({ source: "tool", category: "verification", summary: "tests passed", data: { command: "node test/pricing.test.mjs", exit_code: 0, stdout: "pricing tests passed" } })`,
+        `CaseTrace.responseOutput({ text: "Owner is billing-platform.", source_refs: ownerFact && verificationFact ? ["evidence:" + ownerFact.node_id, "evidence:" + verificationFact.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "match-v48-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "match-v48-case", "trace.json"), "utf8")) as any
+    const verification = trace.records.find(
+      (record: any) => record.event_type === "evidence.fact" && record.data.fact_kind === "verification_output",
+    )
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+
+    expect(claim.data.matched_evidence_refs).not.toContain(`evidence:${verification.record_id}`)
+    expect(claim.data.match_reasons).toContain("owner_value")
+    expect(claim.data.quality_flags).not.toContain("weak_evidence_match")
+  })
+
+  test("writes v4.8 structurally safe trace JSON and classifies finalized lifecycle records", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-quality-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "quality-v45.ts")
@@ -402,7 +538,7 @@ describe("case trace", () => {
     const trace = JSON.parse(traceText) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
 
-    expect(trace.trace_version).toBe("4.7")
+    expect(trace.trace_version).toBe("4.8")
     expect(traceText).not.toContain("[Circular]")
     expect(trace.records.filter((record: any) => record.status === "running")).toHaveLength(0)
     const openTurn = trace.records.find((record: any) => record.record_id === "llmturn_open_turn")
@@ -465,7 +601,7 @@ describe("case trace", () => {
     expect(relations).not.toContain("tool_to_change")
   })
 
-  test("adds v4.7 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
+  test("adds v4.8 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -1155,11 +1291,11 @@ describe("case trace", () => {
     expect(html).toContain('class="io-scroll"')
   })
 
-  test("renders v4.7 provenance report with flow-style sections and scrollable IO panes", () => {
+  test("renders v4.8 provenance report with flow-style sections and scrollable IO panes", () => {
     const trace: ProvenanceTraceSummary = {
-      trace_version: "4.7",
+      trace_version: "4.8",
       manifest: {
-        trace_version: "4.7",
+        trace_version: "4.8",
         case_id: "viewer-v46-case",
         run_id: "run_viewer_v46",
         started_at: "2026-06-30T00:00:00.000Z",
@@ -1356,7 +1492,7 @@ describe("case trace", () => {
     ]) {
       expect(html).toContain(`id="${id}"`)
     }
-    expect(html).toContain("Trace v4.7")
+    expect(html).toContain("Trace v4.8")
     expect(html).toContain("Trace Health")
     expect(html).toContain("Claim Evidence Matrix")
     expect(html).toContain("structured_claim")
