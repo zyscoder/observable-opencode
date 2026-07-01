@@ -382,12 +382,16 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
     ],
     ["Duplicate Evidence", health.duplicate_evidence_facts, "Repeated evidence facts after canonicalization."],
     ["Generic Evidence", health.generic_evidence_facts ?? 0, "Evidence facts that fell back to generic claims."],
+    ["Generic MCP", health.generic_mcp_facts ?? 0, "MCP facts that still fell back to generic claims."],
+    ["Path Only Facts", health.path_only_evidence_facts ?? 0, "File facts that did not reach line-level semantics."],
     ["Unsupported Claims", health.unsupported_response_claims ?? 0, "Response claims without any provenance refs."],
     [
       "Context Only Claims",
       health.context_only_response_claims ?? 0,
       "Response claims supported only by context refs.",
     ],
+    ["Broken Claims", health.broken_claim_fragments ?? 0, "Claim fragments produced by sentence splitting."],
+    ["Over Attributed", health.over_attributed_claims ?? 0, "Claims whose broad refs were narrowed by matching."],
     ["Payload Dup Groups", health.payload_duplication_groups ?? 0, "Artifact payloads reused multiple times."],
     ["Missing Compaction Check", health.compaction_check_missing ?? 0, "Compactions without a check record."],
   ] as const
@@ -855,6 +859,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
             <th>Claim</th>
             <th>Support</th>
             <th>Quality Flags</th>
+            <th>Matched Evidence</th>
+            <th>Match</th>
             <th>Direct Evidence</th>
             <th>Context</th>
             <th>Execution</th>
@@ -865,6 +871,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
             .map((record) => {
               const data = record.data ?? {}
               const direct = Array.isArray(data.direct_evidence_refs) ? data.direct_evidence_refs : []
+              const matched = Array.isArray(data.matched_evidence_refs) ? data.matched_evidence_refs : []
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
@@ -872,6 +879,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
                 <td><div class="claim-text">${escapeHtml(preview(data.text, 520))}</div><code>${escapeHtml(record.record_id)}</code></td>
                 <td><span class="status">${escapeHtml(data.support_level ?? "-")}</span></td>
                 <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
+                <td><div class="refs">${escapeHtml(matched.join(", ") || "-")}</div></td>
+                <td><code>${escapeHtml(data.match_strategy ?? "-")}</code><br/><span class="muted">${escapeHtml(data.match_score ?? "-")}</span></td>
                 <td><div class="refs">${escapeHtml(direct.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(context.join(", ") || "-")}</div></td>
                 <td><div class="refs">${escapeHtml(execution.join(", ") || "-")}</div></td>
