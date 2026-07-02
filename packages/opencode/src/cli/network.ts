@@ -41,6 +41,10 @@ export const resolveNetworkOptions = Effect.fn("Cli.resolveNetworkOptions")(func
   return resolveNetworkOptionsNoConfig(args, config)
 })
 
+export function resolveNetworkOptionsAsync(args: NetworkOptions) {
+  return Effect.runPromise(resolveNetworkOptions(args).pipe(Effect.provide(Config.defaultLayer)))
+}
+
 export function resolveNetworkOptionsNoConfig(args: NetworkOptions, config?: Config.Info) {
   const portExplicitlySet = process.argv.includes("--port")
   const hostnameExplicitlySet = process.argv.includes("--hostname")
