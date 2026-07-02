@@ -1474,7 +1474,7 @@ function traceContextLedger(input: {
     token_estimate_before: input.context_ledger?.token_estimate_before ?? input.input_tokens,
     token_estimate_after:
       input.context_ledger?.token_estimate_after ??
-      (input.context_limit === undefined
+      (input.input_tokens === undefined || input.context_limit === undefined
         ? undefined
         : Math.min(safeNumber(input.input_tokens), safeNumber(input.context_limit))),
     retained_message_ids:

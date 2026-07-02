@@ -758,6 +758,47 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.duplicate_semantic_facts).toBe(0)
   })
 
+  test("does not treat missing compaction after-token estimate as zero", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v60-compaction-estimate-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "compaction-estimate-v60.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.compaction({ trigger: "auto", context_limit: 4000, output_summary: "Keep the active discount cap constraint.", auto_continue: true, result: "continue", context_ledger: { algorithm: "head-tail-summary", retained_message_ids: ["msg_a"], dropped_message_ids: [] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "compaction-estimate-v60-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "compaction-estimate-v60-case", "trace.json"), "utf8"),
+    ) as any
+    const compaction = trace.records.find((record: any) => record.event_type === "context.compaction")
+
+    expect(compaction.data.token_estimate_after).toBeUndefined()
+    expect(compaction.data.compression_loss_risks).not.toContain("zero_token_estimate_after")
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
