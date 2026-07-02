@@ -504,6 +504,47 @@ describe("case trace", () => {
     expect(values.filter((value: string) => value === "15 percent")).toHaveLength(0)
   })
 
+  test("uses the numeric value nearest to discount cap wording in long evidence text", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-cap-nearest-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "cap-nearest-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "architecture overview", data: { path: "docs/architecture.md", line_start: 3, line_end: 3, text: "Two discounts can apply -- a 10% loyalty discount and a 5% volume discount. The total renewal discount cap must be 15 percent." } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "cap-nearest-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "cap-nearest-v56-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const values = facts.map((record: any) => record.data.structured_claim?.value)
+
+    expect(values).toContain("15 percent")
+    expect(values).not.toContain("10%")
+    expect(values).not.toContain("5%")
+  })
+
   test("does not create response claims from markdown headings or code fence markers", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-fence-filter-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -546,6 +587,50 @@ describe("case trace", () => {
     expect(claimText).toContain("src/pricing.mjs")
     expect(claimText).toContain("discount cap")
     expect(claimText).toContain("15%")
+  })
+
+  test("links failed cases to finalized running LLM records for backward taint traversal", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-failed-source-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "failed-source-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "run slow provider case" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_failed", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 1, system_count: 1, tool_count: 1 } })`,
+        `CaseTrace.llmTurn({ turn_id: span?.id, span_id: span?.id, session_id: "ses_failed", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running" })`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM" } })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "failed-source-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "failed-source-v56-case", "trace.json"), "utf8")) as any
+    const failed = trace.records.find((record: any) => record.event_type === "case.failed")
+    const llmTurn = trace.records.find((record: any) => record.event_type === "llm.turn")
+
+    expect(llmTurn.data.finalized_reason).toBe("trace_cancelled")
+    expect(failed.source_refs).toContain(`node:${llmTurn.record_id}`)
+    expect(failed.data.finalized_open_record_refs).toContain(`node:${llmTurn.record_id}`)
+    expect(trace.dataflow_edges.some((edge: any) => edge.relation === "failed_before")).toBe(true)
   })
 
   test("emits response claims only for the final user-visible answer", async () => {

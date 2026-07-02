@@ -2703,13 +2703,51 @@ function structuredClaimFromLineText(
 }
 
 function explicitDiscountCapValueFromText(input: string) {
-  const decimal = input.match(/\b0\.\d+\b/)
-  if (decimal?.[0]) return decimal[0]
-  const percent = input.match(/\b(\d+(?:\.\d+)?)\s*%/)
-  if (percent?.[1]) return `${percent[1]}%`
-  const percentWord = input.match(/\b(\d+(?:\.\d+)?)\s+percent\b/i)
-  if (percentWord?.[1]) return `${percentWord[1]} percent`
-  return undefined
+  const candidates: Array<{ value: string; index: number; end: number; priority: number }> = []
+  for (const match of input.matchAll(/\b0\.\d+\b/g)) {
+    if (match.index === undefined) continue
+    candidates.push({
+      value: match[0],
+      index: match.index,
+      end: match.index + match[0].length,
+      priority: 0,
+    })
+  }
+  for (const match of input.matchAll(/\b(\d+(?:\.\d+)?)\s*%/g)) {
+    if (match.index === undefined || !match[1]) continue
+    candidates.push({
+      value: `${match[1]}%`,
+      index: match.index,
+      end: match.index + match[0].length,
+      priority: 1,
+    })
+  }
+  for (const match of input.matchAll(/\b(\d+(?:\.\d+)?)\s+percent\b/gi)) {
+    if (match.index === undefined || !match[1]) continue
+    candidates.push({
+      value: `${match[1]} percent`,
+      index: match.index,
+      end: match.index + match[0].length,
+      priority: 1,
+    })
+  }
+  if (!candidates.length) return undefined
+
+  const anchors = [
+    ...input.matchAll(/math\.min|discount\s+cap|renewal\s+discount\s+cap|cap(?:ped)?|limit|maximum|max|上限|封顶/gi),
+  ]
+    .map((match) => match.index)
+    .filter((index): index is number => index !== undefined)
+  if (!anchors.length) return candidates.sort((a, b) => a.index - b.index || a.priority - b.priority)[0]?.value
+
+  return candidates
+    .map((candidate) => ({
+      ...candidate,
+      distance: Math.min(
+        ...anchors.map((anchor) => Math.min(Math.abs(candidate.index - anchor), Math.abs(candidate.end - anchor))),
+      ),
+    }))
+    .sort((a, b) => a.distance - b.distance || a.priority - b.priority || a.index - b.index)[0]?.value
 }
 
 function structuredLineClaimsFromText(input: string, fallback?: TraceSourceLocation) {
@@ -5060,7 +5098,9 @@ class ActiveCaseTrace {
           segment.is_final_for_case === true,
       )
       .at(-1)
-    this.node({
+    const failedOpenRecordRefs = this.finalizedOpenRecordRefsForCase(caseStatus)
+    const sourceRefs = finalSegment ? [`response_segment:${finalSegment.segment_id}`] : failedOpenRecordRefs
+    const node = this.node({
       node_id: `case_${caseStatus === "success" ? "completed" : "failed"}_${hash(this.runID).slice(0, 8)}`,
       kind: caseStatus === "success" ? "case.completed" : "case.failed",
       component: "run",
@@ -5074,9 +5114,39 @@ class ActiveCaseTrace {
         final_response_segment_id: finalSegment?.segment_id,
         result: this.result,
         token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
+        finalized_open_record_refs: failedOpenRecordRefs,
+        finalized_open_record_count: failedOpenRecordRefs.length,
       },
-      source_refs: finalSegment ? [`response_segment:${finalSegment.segment_id}`] : [],
+      source_refs: sourceRefs,
     })
+    if (caseStatus !== "success") {
+      for (const ref of failedOpenRecordRefs) {
+        const source = this.traceRefFromSourceRef(ref)
+        if (!source) continue
+        this.causalEdge({
+          from: source,
+          to: { type: "node", id: node.node_id },
+          relation: "failed_before",
+          label: "Running semantic record was finalized before case failure",
+        })
+      }
+    }
+  }
+
+  private finalizedOpenRecordRefsForCase(caseStatus: TraceStatus) {
+    if (caseStatus === "success") return []
+    return dedupeStrings(
+      this.causalNodes
+        .filter((node) => node.data?.finalized_status === "finalized_without_close")
+        .slice(-16)
+        .map((node) => `node:${node.node_id}`),
+    )
+  }
+
+  private traceRefFromSourceRef(ref: string): TraceRef | undefined {
+    const parsed = this.parseSourceRef(ref)
+    if (!parsed) return undefined
+    return { type: parsed.type, id: parsed.id }
   }
 
   private finalizeOpenRecords(status: TraceStatus, caseStatus?: TraceStatus) {

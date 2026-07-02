@@ -111,51 +111,6 @@ const cors = (corsOptions?: CorsOptions) =>
 // - eventApiRoutes/rawInstanceRoutes: raw instance routes; auth and workspace routing happen as router middleware.
 // - instanceApiRoutes: schema routes; auth is declared on each group and workspace context is provided below.
 // - uiRoute: raw catch-all fallback; auth is router middleware so public static assets can bypass it.
-const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
-const httpApiAuthLayer = authorizationLayer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
-const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
-  Layer.provide([controlHandlers, globalHandlers]),
-  Layer.provide(schemaErrorLayer),
-  Layer.provide(httpApiAuthLayer),
-)
-const instanceRouterLayer = authorizationRouterMiddleware
-  .combine(instanceRouterMiddleware)
-  .combine(workspaceRouterMiddleware)
-  .layer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal), Layer.provide(ServerAuth.Config.defaultLayer))
-const eventApiRoutes = HttpApiBuilder.layer(EventApi).pipe(
-  Layer.provide(eventHandlers),
-  Layer.provide(instanceRouterLayer),
-)
-const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
-  Layer.provide([
-    configHandlers,
-    experimentalHandlers,
-    fileHandlers,
-    instanceHandlers,
-    mcpHandlers,
-    projectHandlers,
-    ptyHandlers,
-    questionHandlers,
-    permissionHandlers,
-    providerHandlers,
-    sessionHandlers,
-    syncHandlers,
-    v2Handlers,
-    tuiHandlers,
-    workspaceHandlers,
-  ]),
-)
-
-const rawInstanceRoutes = Layer.mergeAll(ptyConnectRoute).pipe(Layer.provide(instanceRouterLayer))
-const instanceRoutes = Layer.mergeAll(rawInstanceRoutes, instanceApiRoutes).pipe(
-  Layer.provide([
-    httpApiAuthLayer,
-    workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal)),
-    instanceContextLayer,
-    schemaErrorLayer,
-  ]),
-)
-
 // `OpenApi.fromApi` is non-trivial; defer until /doc is actually hit so
 // processes that never serve it (CLI, scripts) don't pay at module load.
 // `HttpServerResponse.jsonUnsafe` runs JSON.stringify eagerly, so caching
@@ -163,74 +118,129 @@ const instanceRoutes = Layer.mergeAll(rawInstanceRoutes, instanceApiRoutes).pipe
 // the same Uint8Array instead of re-stringifying the spec.
 const docResponse = lazy(() => HttpServerResponse.jsonUnsafe(OpenApi.fromApi(PublicApi)))
 
-const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effect.succeed(docResponse()))).pipe(
-  Layer.provide(authOnlyRouterLayer),
-)
+const routeTree = lazy(() => {
+  const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
+  const httpApiAuthLayer = authorizationLayer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
+  const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
+    Layer.provide([controlHandlers, globalHandlers]),
+    Layer.provide(schemaErrorLayer),
+    Layer.provide(httpApiAuthLayer),
+  )
+  const instanceRouterLayer = authorizationRouterMiddleware
+    .combine(instanceRouterMiddleware)
+    .combine(workspaceRouterMiddleware)
+    .layer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal), Layer.provide(ServerAuth.Config.defaultLayer))
+  const eventApiRoutes = HttpApiBuilder.layer(EventApi).pipe(
+    Layer.provide(eventHandlers),
+    Layer.provide(instanceRouterLayer),
+  )
+  const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
+    Layer.provide([
+      configHandlers,
+      experimentalHandlers,
+      fileHandlers,
+      instanceHandlers,
+      mcpHandlers,
+      projectHandlers,
+      ptyHandlers,
+      questionHandlers,
+      permissionHandlers,
+      providerHandlers,
+      sessionHandlers,
+      syncHandlers,
+      v2Handlers,
+      tuiHandlers,
+      workspaceHandlers,
+    ]),
+  )
 
-const uiRoute = HttpRouter.use((router) =>
-  Effect.gen(function* () {
-    const fs = yield* AppFileSystem.Service
-    const client = yield* HttpClient.HttpClient
-    yield* router.add("*", "/*", (request) => serveUIEffect(request, { fs, client }))
-  }),
-).pipe(Layer.provide(authOnlyRouterLayer))
+  const rawInstanceRoutes = Layer.mergeAll(ptyConnectRoute).pipe(Layer.provide(instanceRouterLayer))
+  const instanceRoutes = Layer.mergeAll(rawInstanceRoutes, instanceApiRoutes).pipe(
+    Layer.provide([
+      httpApiAuthLayer,
+      workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal)),
+      instanceContextLayer,
+      schemaErrorLayer,
+    ]),
+  )
+  const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effect.succeed(docResponse()))).pipe(
+    Layer.provide(authOnlyRouterLayer),
+  )
+  const uiRoute = HttpRouter.use((router) =>
+    Effect.gen(function* () {
+      const fs = yield* AppFileSystem.Service
+      const client = yield* HttpClient.HttpClient
+      yield* router.add("*", "/*", (request) => serveUIEffect(request, { fs, client }))
+    }),
+  ).pipe(Layer.provide(authOnlyRouterLayer))
+  return { docRoute, eventApiRoutes, instanceRoutes, rootApiRoutes, uiRoute }
+})
 
 export function createRoutes(corsOptions?: CorsOptions) {
-  return Layer.mergeAll(rootApiRoutes, eventApiRoutes, instanceRoutes, docRoute, uiRoute).pipe(
-    Layer.provide([
-      errorLayer,
-      compressionLayer,
-      corsVaryFix,
-      fenceLayer,
-      cors(corsOptions),
-      runtime,
-      Account.defaultLayer,
-      Agent.defaultLayer,
-      Auth.defaultLayer,
-      Command.defaultLayer,
-      Config.defaultLayer,
-      File.defaultLayer,
-      FileWatcher.defaultLayer,
-      Format.defaultLayer,
-      LSP.defaultLayer,
-      Installation.defaultLayer,
-      MCP.defaultLayer,
-      ModelsDev.defaultLayer,
-      Permission.defaultLayer,
-      Plugin.defaultLayer,
-      Project.defaultLayer,
-      ProviderAuth.defaultLayer,
-      Provider.defaultLayer,
-      Pty.defaultLayer,
-      PtyTicket.defaultLayer,
-      Question.defaultLayer,
-      Ripgrep.defaultLayer,
-      Session.defaultLayer,
-      SessionCompaction.defaultLayer,
-      SessionPrompt.defaultLayer,
-      SessionRevert.defaultLayer,
-      SessionShare.defaultLayer,
-      SessionRunState.defaultLayer,
-      SessionStatus.defaultLayer,
-      SessionSummary.defaultLayer,
-      ShareNext.defaultLayer,
-      Snapshot.defaultLayer,
-      SyncEvent.defaultLayer,
-      Skill.defaultLayer,
-      Todo.defaultLayer,
-      ToolRegistry.defaultLayer,
-      Vcs.defaultLayer,
-      Workspace.defaultLayer,
-      Worktree.appLayer,
-      Bus.layer,
-      AppFileSystem.defaultLayer,
-      FetchHttpClient.layer,
-      HttpServer.layerServices,
-    ]),
-    Layer.provideMerge(Layer.succeed(CorsConfig)(corsOptions)),
-    Layer.provideMerge(InstanceLayer.layer),
-    Layer.provideMerge(Observability.layer),
-  )
+  return Layer.suspend(() => {
+    const routes = routeTree()
+    return Layer.mergeAll(
+      routes.rootApiRoutes,
+      routes.eventApiRoutes,
+      routes.instanceRoutes,
+      routes.docRoute,
+      routes.uiRoute,
+    ).pipe(
+      Layer.provide([
+        errorLayer,
+        compressionLayer,
+        corsVaryFix,
+        fenceLayer,
+        cors(corsOptions),
+        runtime,
+        Account.defaultLayer,
+        Agent.defaultLayer,
+        Auth.defaultLayer,
+        Command.defaultLayer,
+        Config.defaultLayer,
+        File.defaultLayer,
+        FileWatcher.defaultLayer,
+        Format.defaultLayer,
+        LSP.defaultLayer,
+        Installation.defaultLayer,
+        MCP.defaultLayer,
+        ModelsDev.defaultLayer,
+        Permission.defaultLayer,
+        Plugin.defaultLayer,
+        Project.defaultLayer,
+        ProviderAuth.defaultLayer,
+        Provider.defaultLayer,
+        Pty.defaultLayer,
+        PtyTicket.defaultLayer,
+        Question.defaultLayer,
+        Ripgrep.defaultLayer,
+        Session.defaultLayer,
+        SessionCompaction.defaultLayer,
+        SessionPrompt.defaultLayer,
+        SessionRevert.defaultLayer,
+        SessionShare.defaultLayer,
+        SessionRunState.defaultLayer,
+        SessionStatus.defaultLayer,
+        SessionSummary.defaultLayer,
+        ShareNext.defaultLayer,
+        Snapshot.defaultLayer,
+        SyncEvent.defaultLayer,
+        Skill.defaultLayer,
+        Todo.defaultLayer,
+        ToolRegistry.defaultLayer,
+        Vcs.defaultLayer,
+        Workspace.defaultLayer,
+        Worktree.appLayer,
+        Bus.layer,
+        AppFileSystem.defaultLayer,
+        FetchHttpClient.layer,
+        HttpServer.layerServices,
+      ]),
+      Layer.provideMerge(Layer.succeed(CorsConfig)(corsOptions)),
+      Layer.provideMerge(InstanceLayer.layer),
+      Layer.provideMerge(Observability.layer),
+    )
+  })
 }
 
 export const routes = createRoutes()

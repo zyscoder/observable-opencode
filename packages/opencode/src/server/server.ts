@@ -1,4 +1,5 @@
 import * as Log from "@opencode-ai/core/util/log"
+import { createServer as createNetServer } from "node:net"
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
@@ -93,10 +94,12 @@ export async function listen(opts: ListenOptions): Promise<Listener> {
   }
 
   // Match the legacy adapter port-resolution behavior: explicit `0` prefers
-  // 4096 first, then any free port.
+  // 4096 first, then any free port. Probe 4096 with a lightweight TCP bind so
+  // an occupied default port does not pay a full Effect route graph build just
+  // to fail before retrying port 0.
   let resolved: Awaited<ReturnType<typeof start>> | undefined
   if (opts.port === 0) {
-    resolved = await start(4096).catch(() => undefined)
+    if (await canBindPort(opts.hostname, 4096)) resolved = await start(4096).catch(() => undefined)
     if (!resolved) resolved = await start(0)
   } else {
     resolved = await start(opts.port)
@@ -154,6 +157,20 @@ export async function listen(opts: ListenOptions): Promise<Listener> {
       return requested.then(() => stopPromise!)
     },
   }
+}
+
+function canBindPort(hostname: string, port: number) {
+  return new Promise<boolean>((resolve) => {
+    const server = createNetServer()
+    let settled = false
+    const done = (available: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(available)
+    }
+    server.once("error", () => done(false))
+    server.listen({ host: hostname, port }, () => server.close(() => done(true)))
+  })
 }
 
 export * as Server from "./server"
