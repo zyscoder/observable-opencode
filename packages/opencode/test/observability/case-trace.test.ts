@@ -715,6 +715,49 @@ describe("case trace", () => {
     expect(facts).toHaveLength(0)
   })
 
+  test("merges duplicate semantic facts while preserving source occurrences", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v59-duplicate-fact-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "duplicate-fact-v59.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "docs/requirements.md", data: { path: "docs/requirements.md", text: "The renewal discount cap is 20 percent." }, source_refs: ["tool_result:read1"] })`,
+        `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "docs/requirements.md", data: { path: "docs/requirements.md", text: "The renewal discount cap is 20 percent." }, source_refs: ["tool_result:read2"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "duplicate-fact-v59-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "duplicate-fact-v59-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+
+    expect(facts).toHaveLength(1)
+    expect(facts[0].data.occurrence_count).toBe(2)
+    expect(facts[0].source_refs).toContain("tool_result:read1")
+    expect(facts[0].source_refs).toContain("tool_result:read2")
+    expect(trace.metrics.trace_health.duplicate_semantic_facts).toBe(0)
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

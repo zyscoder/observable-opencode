@@ -3135,6 +3135,26 @@ function evidenceRecordLabel(kind: string) {
   return "evidence.semantic_fact"
 }
 
+function semanticFactDedupeKey(
+  input: EvidenceFactInput,
+  canonical: ReturnType<typeof canonicalEvidence>,
+  sourceLocations: TraceSourceLocation[],
+) {
+  const path =
+    sourceLocations.find((location) => location.path)?.path ??
+    canonical.structured_claim.source_span?.path ??
+    firstStringField(input.data, ["path", "file", "filePath", "filepath"]) ??
+    ""
+  return [
+    input.source.toLowerCase(),
+    input.category?.toLowerCase() ?? "",
+    String(canonical.canonical_subject ?? ""),
+    String(canonical.claim ?? ""),
+    String(path),
+    String(canonical.evidence_origin ?? ""),
+  ].join("|")
+}
+
 function compactionDerivedFields(input: {
   tokenBefore?: number
   tokenAfter?: number
@@ -3197,6 +3217,7 @@ class ActiveCaseTrace {
   private artifactByDedupeKey = new Map<string, TraceArtifact>()
   private causalNodes: CausalNode[] = []
   private causalEdges: CausalEdge[] = []
+  private semanticFactNodesByKey = new Map<string, CausalNode>()
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
@@ -4696,6 +4717,42 @@ class ActiveCaseTrace {
     const canonical = canonicalEvidence(input, sourceLocations)
     const recordKind = evidenceRecordKind(input, canonical)
     const planItems = recordKind === "task.plan_state" ? planStateSummary(input.data ?? input.summary) : undefined
+    const dedupeKey =
+      recordKind === "evidence.semantic_fact" ? semanticFactDedupeKey(input, canonical, sourceLocations) : undefined
+    const existing = dedupeKey ? this.semanticFactNodesByKey.get(dedupeKey) : undefined
+    if (existing) {
+      const existingData = existing.data ?? {}
+      const occurrenceCount = optionalNumber(existingData.occurrence_count) ?? 1
+      existing.source_refs = mergeRefs(existing.source_refs, sourceRefs)
+      existing.data = {
+        ...existingData,
+        occurrence_count: occurrenceCount + 1,
+        duplicate_source_refs: dedupeStrings([
+          ...(stringArrayField(existingData, ["duplicate_source_refs", "duplicateSourceRefs"]) ?? []),
+          ...sourceRefs,
+        ]),
+      }
+      existing.artifact_refs = this.collectArtifactRefs(existing.data)
+      for (const ref of sourceRefs ?? []) {
+        const parsed = this.parseSourceRef(ref)
+        if (!parsed) continue
+        this.causalEdge({
+          from: parsed,
+          to: { type: "evidence", id: existing.node_id, label: "evidence.semantic_fact" },
+          relation: "derived_from",
+          label: "Duplicate semantic evidence occurrence merged into existing fact",
+          metadata: { duplicate_suppressed: true },
+        })
+      }
+      this.writeRecord("evidence.duplicate_suppressed", {
+        duplicate_key: dedupeKey,
+        duplicate_of: existing.node_id,
+        source_refs: sourceRefs,
+      })
+      this.writeRecord("node.update", existing)
+      this.writePartial()
+      return existing
+    }
     const node = this.node({
       node_id: `evidence_${factID}`,
       kind: recordKind,
@@ -4731,6 +4788,7 @@ class ActiveCaseTrace {
       source_locations: sourceLocations,
       metadata: input.metadata,
     })
+    if (dedupeKey) this.semanticFactNodesByKey.set(dedupeKey, node)
     if (recordKind === "evidence.semantic_fact") this.remember(this.recentEvidenceNodeIDs, node.node_id)
     for (const ref of sourceRefs ?? []) {
       const parsed = this.parseSourceRef(ref)
