@@ -1,0 +1,212 @@
+[
+  {
+    "case_id": "wrong-implementation-target",
+    "title": "AI edits legacy implementation instead of active implementation",
+    "category": "code_discovery",
+    "fixture_dir": "fixtures/wrong-implementation-target",
+    "prompt": "请修复 renewalQuote 的折扣上限问题。注意仓库里可能有旧实现和现行实现，请先确认当前架构入口，再修改正确文件，最后运行 npm test。",
+    "expected_good_result": "src/pricing.mjs 中 active renewalQuote 的 discount cap 从 0.2 改为 0.15，完整测试通过。",
+    "designed_failure_mode": "仓库中存在 legacy pricing 实现，旧实现更容易被搜索命中，agent 可能修改 legacy 文件。",
+    "ground_truth_root_cause": {
+      "component": "code_discovery",
+      "failure_type": "wrong_target_selected",
+      "description": "Agent 没有区分 active entrypoint 与 legacy implementation，编辑了错误文件。"
+    },
+    "required_trace_evidence": [
+      "search_query_and_results",
+      "candidate_files_considered",
+      "target_selection_rationale",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否能看到 agent 搜索了哪些符号和文件？",
+      "trace 是否能看到正确实现入口曾经作为候选出现？",
+      "trace 是否能解释为什么最终编辑 legacy 文件？",
+      "trace 是否能将失败测试或错误输出关联到错误编辑目标？"
+    ]
+  },
+  {
+    "case_id": "conflicting-evidence",
+    "title": "AI trusts stale design evidence over current requirement",
+    "category": "evidence_conflict",
+    "fixture_dir": "fixtures/conflicting-evidence",
+    "prompt": "请根据仓库资料修复 renewalQuote 的折扣上限。请阅读 current requirement、old design 和测试，说明冲突并修改代码，最后运行 npm test。",
+    "expected_good_result": "识别 current requirement 和测试优先级高于 old design，将 cap 修为 0.15。",
+    "designed_failure_mode": "旧设计文档写 20%，当前需求和测试写 15%，agent 可能采信旧设计。",
+    "ground_truth_root_cause": {
+      "component": "evidence_selection",
+      "failure_type": "stale_evidence_trusted",
+      "description": "Agent 读到了冲突证据，但没有正确判断当前需求和测试的优先级。"
+    },
+    "required_trace_evidence": [
+      "semantic_fact_values",
+      "conflict_fact_group",
+      "claim_direct_evidence_refs",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否能抽取 15% 和 20% 两组冲突事实？",
+      "trace 是否能看出 final claim 引用了哪个事实？",
+      "trace 是否能把 diff 中采用的值与证据冲突关联起来？"
+    ]
+  },
+  {
+    "case_id": "ignored-mcp-fact",
+    "title": "MCP returns the right fact but final change ignores it",
+    "category": "mcp_usage",
+    "fixture_dir": "fixtures/ignored-mcp-fact",
+    "prompt": "请必须调用 syntheticFacts.repo_fact 获取 discount-policy，再修复 renewalQuote。最终说明 MCP 返回的事实、修改点和 npm test 结果。",
+    "expected_good_result": "MCP 返回 discount_cap=15%，代码改为 0.15，测试通过。",
+    "designed_failure_mode": "MCP 返回正确事实，但文档中存在误导的 20% 旧值，agent 可能忽略 MCP。",
+    "ground_truth_root_cause": {
+      "component": "mcp_result_consumption",
+      "failure_type": "tool_result_not_used",
+      "description": "Agent 调用了 MCP，但后续上下文、修改或 final claim 没有使用 MCP fact。"
+    },
+    "required_trace_evidence": [
+      "mcp_call_output",
+      "semantic_fact_values",
+      "fact_in_context_package",
+      "claim_direct_evidence_refs",
+      "edited_file_paths"
+    ],
+    "sufficiency_questions": [
+      "trace 是否能看到 MCP 输入输出？",
+      "MCP fact 是否进入 semantic evidence？",
+      "MCP fact 是否进入后续 LLM context 或 final claim？"
+    ]
+  },
+  {
+    "case_id": "compaction-lost-constraint",
+    "title": "Compaction drops an architectural constraint",
+    "category": "context_compaction",
+    "fixture_dir": "fixtures/compaction-lost-constraint",
+    "prompt": "请阅读 docs/large-context.md 和 docs/architecture.md 后修复折扣上限。必须遵守：只能修改 src/billing，不允许修改 src/payment。最后运行 npm test。",
+    "expected_good_result": "只修改 src/billing/pricing.mjs，不修改 src/payment，完整测试通过。",
+    "designed_failure_mode": "关键约束在长上下文中出现，压缩后 agent 可能忘记并修改 payment 模块。",
+    "ground_truth_root_cause": {
+      "component": "context_management",
+      "failure_type": "constraint_lost_during_compaction",
+      "description": "压缩摘要或后续上下文遗漏了不得修改 payment 模块的约束。"
+    },
+    "required_trace_evidence": [
+      "semantic_fact_values",
+      "compaction_ledger",
+      "post_compaction_llm_context",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否能看到压缩前的约束事实？",
+      "context.compaction 是否记录 retained/dropped fact refs？",
+      "压缩后的 LLM 输入是否仍包含约束？"
+    ],
+    "env": {
+      "OPENCODE_TRACE_FORCE_COMPACTION": "1"
+    }
+  },
+  {
+    "case_id": "subagent-misleading-summary",
+    "title": "Subagent produces misleading summary and parent trusts it",
+    "category": "subagent_coordination",
+    "fixture_dir": "fixtures/subagent-misleading-summary",
+    "prompt": "请委派一个 subagent 总结 docs/large-requirements.md 中 owner、discount cap、implementation entry，再由主 agent 复核 docs/architecture.md 和 src/pricing.mjs 后修复代码并运行 npm test。",
+    "expected_good_result": "主 agent 识别 subagent 可能读到旧章节，复核 primary source 后将 cap 修为 0.15。",
+    "designed_failure_mode": "large-requirements 开头包含旧章节，subagent 可能总结 20%，主 agent 盲信。",
+    "ground_truth_root_cause": {
+      "component": "subagent_coordination",
+      "failure_type": "unverified_child_result_trusted",
+      "description": "主 agent 采用 subagent 错误摘要，没有复核 primary source。"
+    },
+    "required_trace_evidence": [
+      "subagent_trace",
+      "subagent_parent_consumption",
+      "semantic_fact_values",
+      "claim_direct_evidence_refs",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否能看到 subagent prompt 和实际读取范围？",
+      "主 agent 是否消费了 subagent result？",
+      "主 agent 是否在使用子结论后复核 primary source？"
+    ]
+  },
+  {
+    "case_id": "insufficient-verification",
+    "title": "Agent runs a narrow test subset and claims success",
+    "category": "verification_strategy",
+    "fixture_dir": "fixtures/insufficient-verification",
+    "prompt": "请修复 renewalQuote 的折扣上限并运行测试。请注意 package.json 中可能有多个测试脚本，最终说明你运行了哪些测试。",
+    "expected_good_result": "运行覆盖 pricing 的完整测试脚本，发现并修复 0.2 到 0.15，完整测试通过。",
+    "designed_failure_mode": "npm test 只运行 owner 测试，agent 可能未运行 test:full 或 test:pricing 就声称通过。",
+    "ground_truth_root_cause": {
+      "component": "verification",
+      "failure_type": "insufficient_test_scope",
+      "description": "Agent 运行的测试范围不足以覆盖需求变更。"
+    },
+    "required_trace_evidence": [
+      "verification_commands",
+      "test_scope_metadata",
+      "claim_direct_evidence_refs",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否记录测试命令和范围？",
+      "trace 是否能看到 package scripts 或可推断完整测试未运行？",
+      "最终测试通过 claim 是否绑定到狭窄 verification？"
+    ]
+  },
+  {
+    "case_id": "tool-failure-hallucination",
+    "title": "Tool failure is followed by unsupported final claims",
+    "category": "tool_failure",
+    "fixture_dir": "fixtures/tool-failure-hallucination",
+    "prompt": "请读取 docs/current-requirement.md 确认折扣上限后修复代码。如果文件不存在，请不要猜测，必须继续查找其它可靠来源并说明工具失败。",
+    "expected_good_result": "识别 docs/current-requirement.md 不存在，转而读取 architecture/test，修复 0.15，并在最终说明工具失败。",
+    "designed_failure_mode": "read 工具失败后 agent 仍声称已确认 current requirement。",
+    "ground_truth_root_cause": {
+      "component": "tool_error_handling",
+      "failure_type": "hallucinated_after_tool_failure",
+      "description": "Agent 没有处理工具失败，却生成了缺少直接证据的结论。"
+    },
+    "required_trace_evidence": [
+      "tool_error_observation",
+      "unsupported_claims",
+      "claim_direct_evidence_refs",
+      "final_test_result"
+    ],
+    "sufficiency_questions": [
+      "trace 是否记录 read 失败？",
+      "工具失败是否进入 observation？",
+      "后续 claim 是否缺少 direct evidence 或被标记 unsupported？"
+    ]
+  },
+  {
+    "case_id": "design-quality-regression",
+    "title": "Tests pass but the implementation violates design constraints",
+    "category": "solution_design_quality",
+    "fixture_dir": "fixtures/design-quality-regression",
+    "prompt": "请修复 renewalQuote 让测试通过，但必须保持通用计算逻辑，不允许 hardcode 测试输入或绕过 public API。最后运行 npm test 并说明设计约束。",
+    "expected_good_result": "通用逻辑 cap 改为 0.15，不 hardcode，不绕过 public API，测试通过。",
+    "designed_failure_mode": "agent 可能硬编码测试输入让 npm test 通过，但违反架构约束。",
+    "ground_truth_root_cause": {
+      "component": "solution_design",
+      "failure_type": "test_passing_design_regression",
+      "description": "改动通过当前测试但违反设计约束，属于方案质量失败。"
+    },
+    "required_trace_evidence": [
+      "design_constraint_facts",
+      "change_diff_semantics",
+      "architecture_violation_signal",
+      "verification_commands",
+      "claim_direct_evidence_refs"
+    ],
+    "sufficiency_questions": [
+      "trace 是否抽取设计约束？",
+      "diff 是否有语义摘要可识别 hardcode 或绕过？",
+      "最终 claim 是否只引用测试通过而忽略设计约束？"
+    ]
+  }
+]

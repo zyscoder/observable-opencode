@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "case_id",
+      "title",
+      "category",
+      "fixture_dir",
+      "prompt",
+      "expected_good_result",
+      "designed_failure_mode",
+      "ground_truth_root_cause",
+      "required_trace_evidence",
+      "sufficiency_questions"
+    ],
+    "properties": {
+      "case_id": { "type": "string" },
+      "title": { "type": "string" },
+      "category": { "type": "string" },
+      "fixture_dir": { "type": "string" },
+      "prompt": { "type": "string" },
+      "expected_good_result": { "type": "string" },
+      "designed_failure_mode": { "type": "string" },
+      "ground_truth_root_cause": {
+        "type": "object",
+        "required": ["component", "failure_type", "description"],
+        "properties": {
+          "component": { "type": "string" },
+          "failure_type": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "required_trace_evidence": { "type": "array", "items": { "type": "string" }, "minItems": 4 },
+      "sufficiency_questions": { "type": "array", "items": { "type": "string" }, "minItems": 3 },
+      "env": { "type": "object", "additionalProperties": { "type": "string" } }
+    }
+  }
+}

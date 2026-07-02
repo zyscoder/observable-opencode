@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "scripts": {
+    "test": "node test/pricing.test.mjs",
+    "test:quality": "node test/design-quality.test.mjs",
+    "test:full": "node test/pricing.test.mjs && node test/design-quality.test.mjs"
+  }
+}

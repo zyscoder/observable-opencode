@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "scripts": {
+    "test": "node test/owner.test.mjs",
+    "test:pricing": "node test/pricing.test.mjs",
+    "test:full": "node test/owner.test.mjs && node test/pricing.test.mjs"
+  }
+}
