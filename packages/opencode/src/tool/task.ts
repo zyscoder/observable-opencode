@@ -248,21 +248,6 @@ export const TaskTool = Tool.define(
                   output: CaseTrace.summarizeText(result.output),
                 },
               })
-              CaseTrace.evidenceFact({
-                source: "subagent",
-                category: params.subagent_type,
-                summary: result.output,
-                data: {
-                  description: params.description,
-                  subagent_type: params.subagent_type,
-                  child_session_id: result.metadata.sessionId,
-                  child_message_id: result.metadata.childMessageId,
-                  output: result.output,
-                },
-                span_id: traceSpan?.id,
-                source_refs: traceSpan ? [`span:${traceSpan.id}`] : undefined,
-                confidence: "observed",
-              })
               CaseTrace.event({
                 component: "task",
                 event_type: "completed",

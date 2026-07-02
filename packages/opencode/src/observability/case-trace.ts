@@ -2953,10 +2953,12 @@ function structuredClaimFromEvidence(
 
 function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourceLocation[]) {
   const structured = structuredClaimFromEvidence(input, sourceLocations)
+  const secondarySummaryFact = isSecondarySummaryFact(input, structured.structured_claim)
   const qualityFlags = dedupeStrings([
     ...(input.quality_flags ?? []),
     ...evidenceQualityFlags(input),
     ...structured.quality_flags,
+    ...(secondarySummaryFact ? ["secondary_source_fact", "summary_derived_fact"] : []),
   ])
   const path =
     sourceLocations.find((location) => location.path)?.path ??
@@ -2986,9 +2988,22 @@ function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourc
     canonical_subject: subject,
     claim: input.claim ?? claim,
     structured_claim: structured.structured_claim,
-    support_level: input.support_level ?? (qualityFlags.includes("empty_subagent_result") ? "weak" : "direct"),
+    support_level:
+      input.support_level ??
+      (qualityFlags.includes("empty_subagent_result") ? "weak" : secondarySummaryFact ? "context" : "direct"),
     quality_flags: qualityFlags,
+    evidence_origin: secondarySummaryFact ? "secondary_summary" : "primary_observation",
   }
+}
+
+function isSecondarySummaryFact(input: EvidenceFactInput, claim: TraceStructuredClaim) {
+  const source = input.source.toLowerCase()
+  if (!source.includes("subagent") && !source.includes("task")) return false
+  return (
+    claim.extraction_method === "source_line_pattern" ||
+    claim.extraction_method === "summary_sentence" ||
+    claim.extraction_method === "fallback_summary"
+  )
 }
 
 function countCircularMarkers(input: unknown, stack = new WeakSet<object>()): number {
@@ -4687,6 +4702,7 @@ class ActiveCaseTrace {
         support_level: canonical.support_level,
         quality_flags: canonical.quality_flags,
         confidence: input.confidence ?? "observed",
+        evidence_origin: canonical.evidence_origin,
         source_locations: sourceLocations,
         evidence_class:
           recordKind === "evidence.semantic_fact"

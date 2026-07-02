@@ -633,6 +633,48 @@ describe("case trace", () => {
     expect(trace.dataflow_edges.some((edge: any) => edge.relation === "failed_before")).toBe(true)
   })
 
+  test("marks subagent summary facts as secondary evidence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v57-secondary-fact-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "secondary-fact-v57.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "subagent", category: "explore", summary: "Subagent summary says docs/architecture.md reports renewal discount cap is 20 percent.", data: { output: "Subagent summary says docs/architecture.md reports renewal discount cap is 20 percent." }, source_refs: ["span:subagent_span"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "secondary-fact-v57-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "secondary-fact-v57-case", "trace.json"), "utf8")) as any
+    const fact = trace.records.find((record: any) => record.event_type === "evidence.semantic_fact")
+
+    expect(fact.data.structured_claim.value).toBe("20 percent")
+    expect(fact.data.support_level).toBe("context")
+    expect(fact.data.evidence_origin).toBe("secondary_summary")
+    expect(fact.data.quality_flags).toContain("secondary_source_fact")
+    expect(fact.data.quality_flags).toContain("summary_derived_fact")
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
