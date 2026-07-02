@@ -675,6 +675,46 @@ describe("case trace", () => {
     expect(fact.data.quality_flags).toContain("summary_derived_fact")
   })
 
+  test("keeps task tool output as observation without duplicating subagent semantic facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v58-task-output-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "task-output-v58.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.observation({ source: "task", category: "tool_output", summary: "Task result says renewal discount cap is 20 percent.", data: { output: "Task result says renewal discount cap is 20 percent.", child_session_id: "ses_child", subagent_type: "explore" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "task-output-v58-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "task-output-v58-case", "trace.json"), "utf8")) as any
+    const observations = trace.records.filter((record: any) => record.event_type === "execution.observation")
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+
+    expect(observations.some((record: any) => record.data.source === "task")).toBe(true)
+    expect(facts).toHaveLength(0)
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

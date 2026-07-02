@@ -3044,10 +3044,24 @@ function isWeakObservation(input: ObservationInput) {
 
 function isEvidenceWorthyObservation(input: ObservationInput) {
   if (isWeakObservation(input)) return false
+  if (isTaskToolOutputObservation(input)) return false
   if (isPlanStateInput(input.source, input.category, input.data ?? input.summary)) return false
   if (/tool|mcp|skill|subagent|task|verification|grep|read|bash|file/i.test(input.source)) return true
   if (input.category && /tool|mcp|skill|subagent|verification|test|file|grep|read/i.test(input.category)) return true
   return false
+}
+
+function isTaskToolOutputObservation(input: ObservationInput) {
+  if (input.source.toLowerCase() !== "task") return false
+  if ((input.category ?? "").toLowerCase() !== "tool_output") return false
+  const data = recordFromUnknown(input.data)
+  if (!data) return true
+  return (
+    data.output !== undefined ||
+    data.child_session_id !== undefined ||
+    data.childMessageId !== undefined ||
+    data.subagent_type !== undefined
+  )
 }
 
 function isPlanStateInput(source: string | undefined, category: string | undefined, payload: unknown) {
