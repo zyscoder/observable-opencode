@@ -84,10 +84,39 @@ interface ProcessorContext extends Input {
 
 type StreamEvent = Event
 
-function isDesignLikeResponse(text: string) {
-  return /架构|模块边界|分层|方案设计|设计方案|方案|取舍|权衡|风险|测试策略|architecture|boundary|design|trade-?off|risk|test strategy/i.test(
-    text,
+export function shouldExtractDesignRecordForResponse(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  if (normalized.length < 80) return false
+  if (
+    /^(测试通过|修复总结|执行结果|验证结果|已完成|完成情况|result summary|fix summary|tests? passed)\b/i.test(
+      normalized,
+    )
   )
+    return false
+  const tableLines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.includes("|"))
+  if (tableLines.length >= 2 && tableLines.length >= text.split(/\r?\n/).filter((line) => line.trim()).length - 1) {
+    return false
+  }
+  const hasDesignIntent =
+    /方案设计|设计方案|架构|模块边界|架构边界|分层|architecture|boundary|design proposal|solution design/i.test(
+      normalized,
+    )
+  if (!hasDesignIntent) return false
+  const dimensions = [
+    /需求|目标|requirement|goal/i,
+    /架构|边界|分层|模块|architecture|boundary|layer|module/i,
+    /约束|兼容|稳定|constraint|compat|stability/i,
+    /方案|策略|实现|solution|approach|strategy/i,
+    /取舍|权衡|trade-?off/i,
+    /风险|risk/i,
+    /测试|验证|test|verification/i,
+  ]
+  const matchedDimensions = dimensions.filter((pattern) => pattern.test(normalized)).length
+  return matchedDimensions >= 3
 }
 
 function keywordExcerpt(text: string, keywords: string[]) {
@@ -232,6 +261,8 @@ export const layer: Layer.Layer<
             messageID: match.call.messageID,
             partID: match.call.partID,
             callID: toolCallID,
+            tool: match.part.tool,
+            args: match.part.state.input,
             title: output.title,
             metadata: output.metadata,
             output: CaseTrace.summarizeText(output.output),
@@ -268,6 +299,8 @@ export const layer: Layer.Layer<
             messageID: match.call.messageID,
             partID: match.call.partID,
             callID: toolCallID,
+            tool: match.part.tool,
+            args: match.part.state.input,
             error: errorMessage(error),
           },
         })
@@ -868,7 +901,7 @@ export const layer: Layer.Layer<
                 label: "Completed assistant text recorded as response output",
               })
             }
-            if (isDesignLikeResponse(ctx.currentText.text)) {
+            if (shouldExtractDesignRecordForResponse(ctx.currentText.text)) {
               const designRecord = CaseTrace.designRecord({
                 source: "final_response",
                 requirement_summary: keywordExcerpt(ctx.currentText.text, ["需求", "目标", "requirement", "goal"]),

@@ -209,6 +209,18 @@ function recordSummary(record: ProvenanceRecord) {
       .filter(Boolean)
       .join(" | ")
   }
+  if (record.event_type === "claim.support_assessment") {
+    return [
+      data.support_level ? `support=${String(data.support_level)}` : "",
+      Array.isArray(data.quality_flags) && data.quality_flags.length ? `flags=${data.quality_flags.join(",")}` : "",
+      Array.isArray(data.tool_failure_dependency_refs) && data.tool_failure_dependency_refs.length
+        ? `tool_failures=${data.tool_failure_dependency_refs.join(",")}`
+        : "",
+      data.match_score !== undefined ? `match=${String(data.match_score)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ")
+  }
   if (record.event_type === "llm.call") {
     return [data.provider_id, data.model_id, formatTokens(record.token_usage)].filter(Boolean).join(" | ")
   }
@@ -245,8 +257,13 @@ function recordSummary(record: ProvenanceRecord) {
   if (record.event_type === "task.plan_state") {
     return [data.source, data.category, preview(data.plan_items, 160)].filter(Boolean).join(" | ")
   }
-  if (record.event_type === "tool.call" || record.event_type === "mcp.call") {
-    return [data.tool_name, data.server, data.name, preview(data.output, 120)].filter(Boolean).join(" | ")
+  if (record.event_type === "tool.call" || record.event_type === "tool.result" || record.event_type === "mcp.call") {
+    return [data.tool_name, data.server, data.name, data.request_status, preview(data.output, 120)]
+      .filter(Boolean)
+      .join(" | ")
+  }
+  if (record.event_type === "tool.error") {
+    return [data.tool_name, data.error_kind, preview(data.error_message ?? data.error, 160)].filter(Boolean).join(" | ")
   }
   if (record.event_type === "context.compaction") {
     return [
@@ -571,6 +588,8 @@ function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<st
     "exit.gate",
     "decision",
     "tool.call",
+    "tool.result",
+    "tool.error",
     "mcp.call",
     "skill.load",
     "subagent.call",
@@ -580,6 +599,8 @@ function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<st
     "evidence.semantic_fact",
     "evidence.fact",
     "response.output",
+    "response.claim",
+    "claim.support_assessment",
   ])
   const records = trace.records
     .filter((record) => pipelineTypes.has(record.event_type))
@@ -641,6 +662,8 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
       "exit.gate",
       "decision",
       "tool.call",
+      "tool.result",
+      "tool.error",
       "mcp.call",
       "skill.load",
       "subagent.call",
@@ -649,6 +672,8 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
       "evidence.semantic_fact",
       "evidence.fact",
       "response.output",
+      "response.claim",
+      "claim.support_assessment",
     ].includes(record.event_type),
   )
   if (!records.length)
@@ -947,6 +972,11 @@ function renderExecutionObservations(trace: ProvenanceTraceSummary, artifacts: M
 }
 
 function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
+  const assessments = new Map(
+    trace.records
+      .filter((record) => record.event_type === "claim.support_assessment")
+      .map((record) => [String(record.data?.claim_id ?? ""), record]),
+  )
   const records = trace.records
     .filter((record) => record.event_type === "response.claim")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -966,6 +996,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
             <th>Support</th>
             <th>Quality Flags</th>
             <th>Matched Evidence</th>
+            <th>Assessment</th>
+            <th>Tool Failures</th>
             <th>Match</th>
             <th>Reasons</th>
             <th>Candidates</th>
@@ -987,6 +1019,14 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
+              const assessment = assessments.get(String(data.claim_id ?? ""))
+              const assessmentData = assessment?.data ?? {}
+              const missingEvidence = Array.isArray(assessmentData.missing_evidence_types)
+                ? assessmentData.missing_evidence_types
+                : []
+              const toolFailures = Array.isArray(assessmentData.tool_failure_dependency_refs)
+                ? assessmentData.tool_failure_dependency_refs
+                : []
               const canonical = data.canonical_text
                 ? `<div class="muted">${escapeHtml(preview(data.canonical_text, 420))}</div>`
                 : ""
@@ -997,6 +1037,8 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
                 <td><span class="status">${escapeHtml(data.support_level ?? "-")}</span></td>
                 <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
                 <td><div class="refs">${escapeHtml(matched.join(", ") || "-")}</div></td>
+                <td><code>${escapeHtml(assessment?.record_id ?? "-")}</code><br/><span class="muted">${escapeHtml(missingEvidence.join(", ") || "-")}</span></td>
+                <td><div class="refs">${escapeHtml(toolFailures.join(", ") || "-")}</div></td>
                 <td><code>${escapeHtml(data.match_strategy ?? "-")}</code><br/><span class="muted">${escapeHtml(data.match_score ?? "-")}</span></td>
                 <td>${reasons.length ? reasons.map((reason) => `<code>${escapeHtml(reason)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
                 <td><div class="refs">${escapeHtml(candidates.join(", ") || "-")}</div></td>

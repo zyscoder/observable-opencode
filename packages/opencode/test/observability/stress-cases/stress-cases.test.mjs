@@ -43,7 +43,7 @@ test("stress cases define eight grounded root-cause scenarios with fixtures", ()
 test("trace sufficiency review marks missing evidence as insufficient", () => {
   const [caseDefinition] = loadCases(rootDir)
   const trace = {
-    trace_version: "5.2",
+    trace_version: "5.3",
     manifest: { case_id: caseDefinition.case_id },
     records: [
       {
@@ -65,4 +65,51 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
   assert.equal(review.can_offline_module_identify_root_cause, false)
   assert.ok(review.missing_semantics.includes(caseDefinition.required_trace_evidence[0]))
   assert.ok(review.evidence_found.every((item) => item.status === "missing"))
+})
+
+test("trace sufficiency review requires formal tool error and claim support facts", () => {
+  const caseDefinition = {
+    ...loadCases(rootDir).find((item) => item.case_id === "tool-failure-hallucination"),
+    required_trace_evidence: ["tool_error_observation", "claim_support_assessment"],
+  }
+  const trace = {
+    trace_version: "5.3",
+    manifest: { case_id: caseDefinition.case_id, case_status: "success", server_status: "cancelled" },
+    records: [
+      {
+        record_id: "case_completed",
+        event_type: "case.completed",
+        component: "run",
+        status: "success",
+        data: { case_status: "success", server_status: "cancelled" },
+      },
+      {
+        record_id: "life_1",
+        event_type: "agent.lifecycle",
+        component: "processor",
+        status: "cancelled",
+        data: { finalized_status: "finalized_without_close", finalized_reason: "trace_cancelled" },
+      },
+      {
+        record_id: "claim_1",
+        event_type: "response.claim",
+        component: "result",
+        status: "success",
+        data: {
+          text: "docs/current-requirement.md 文件不存在（工具失败）。",
+          direct_evidence_refs: ["response_segment:seg_1"],
+        },
+      },
+    ],
+    dataflow_edges: [],
+    metrics: { trace_health: { broad_response_refs: 0 } },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.trace_sufficiency, "insufficient")
+  assert.equal(review.can_offline_module_identify_root_cause, false)
+  assert.ok(review.missing_semantics.includes("tool_error_observation"))
+  assert.ok(review.missing_semantics.includes("claim_support_assessment"))
+  assert.ok(review.redundant_or_noisy_semantics.includes("cancelled_after_case_completion"))
 })

@@ -398,6 +398,7 @@ export type TraceHealthMetrics = {
   finalized_open_records: number
   expected_lifecycle_finalized_records?: number
   unexpected_missing_close_records?: number
+  cancelled_after_case_completion_records?: number
   llm_turns_missing_token_usage: number
   llm_turns_missing_finish_reason: number
   compaction_quality_flags: Record<string, number>
@@ -443,6 +444,8 @@ export type CausalNodeKind =
   | "exit.gate"
   | "decision"
   | "tool.call"
+  | "tool.result"
+  | "tool.error"
   | "mcp.call"
   | "skill.load"
   | "subagent.call"
@@ -455,6 +458,7 @@ export type CausalNodeKind =
   | "verification"
   | "response.output"
   | "response.claim"
+  | "claim.support_assessment"
 
 export type CausalNode = {
   node_id: string
@@ -1381,6 +1385,53 @@ function dedupeSourceLocations(input: TraceSourceLocation[]) {
   })
 }
 
+function safeNodeIDPart(input: unknown) {
+  const text = stringPreview(input, 120).trim()
+  if (!text) return hash(String(input ?? "unknown"))
+  const safe = text.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "")
+  return safe.slice(0, 80) || hash(text)
+}
+
+function toolCallIDFromPayload(payload: unknown, fallback?: string) {
+  return (
+    firstStringField(payload, ["callID", "call_id", "toolCallID", "tool_call_id", "id"]) ??
+    firstStringField(objectField(payload, "metadata"), ["callID", "call_id", "toolCallID", "tool_call_id"]) ??
+    fallback
+  )
+}
+
+function toolNameFromPayload(payload: unknown) {
+  return (
+    firstStringField(payload, ["tool", "toolName", "tool_name", "name"]) ??
+    firstStringField(objectField(payload, "metadata"), ["tool", "toolName", "tool_name", "name"]) ??
+    firstStringField(objectField(payload, "input"), ["tool", "toolName", "tool_name", "name"]) ??
+    firstStringField(objectField(payload, "args"), ["tool", "toolName", "tool_name", "name"])
+  )
+}
+
+function toolArgsFromPayload(payload: unknown) {
+  return (
+    objectField(payload, "args") ??
+    objectField(payload, "input") ??
+    objectField(objectField(payload, "metadata"), "args")
+  )
+}
+
+function toolErrorKind(input: unknown) {
+  const text = stringPreview(input, 2000)
+  if (/ENOENT|not found|no such file|file does not exist|不存在|找不到/i.test(text)) return "file_not_found"
+  if (/permission|EACCES|EPERM|denied|forbidden|unauthorized|拒绝|权限/i.test(text)) return "permission_denied"
+  if (/timeout|timed out|ETIMEDOUT|超时/i.test(text)) return "timeout"
+  if (/invalid|schema|validation|参数|校验/i.test(text)) return "validation_error"
+  if (/cancel|abort|aborted|取消/i.test(text)) return "cancelled"
+  return "execution_error"
+}
+
+function toolSourceRef(kind: "tool.error" | "tool.result", callID: string | undefined) {
+  if (!callID) return undefined
+  return kind === "tool.error" ? `tool_error:${callID}` : `tool_result:${callID}`
+}
+
 function traceContextLedger(input: {
   input_tokens?: number
   context_limit?: number
@@ -1680,7 +1731,7 @@ function classifySourceRefs(input: string[] | undefined) {
   for (const ref of input ?? []) {
     const separator = ref.indexOf(":")
     const type = separator === -1 ? "" : ref.slice(0, separator)
-    if (type === "evidence") {
+    if (type === "evidence" || type === "tool_error" || type === "tool_result") {
       direct_evidence_refs.push(ref)
       continue
     }
@@ -3274,6 +3325,7 @@ class ActiveCaseTrace {
     }
     this.events.push(event)
     this.write("event", event)
+    this.promoteToolRuntimeEvent(input)
     const loopDecision = loopDecisionFromRuntimeEvent(input.component, input.event_type, input.data, {
       has_user_visible_response: this.responseSegments.some((segment) => segment.visibility === "user_visible"),
       has_final_answer: this.responseSegments.some((segment) => segment.response_role === "final_answer"),
@@ -3296,6 +3348,138 @@ class ActiveCaseTrace {
         data: input.data === undefined ? undefined : { payload: input.data },
       })
     }
+  }
+
+  private promoteToolRuntimeEvent(input: TraceEventInput) {
+    const eventType =
+      input.event_type === "execute.error" && input.component === "tool" ? "tool.error" : input.event_type
+    if (eventType !== "tool.call" && eventType !== "tool.result" && eventType !== "tool.error") return undefined
+    const payload = recordFromUnknown(input.data) ?? {}
+    const callID = toolCallIDFromPayload(payload, input.span_id)
+    const toolName = toolNameFromPayload(payload)
+    const args = toolArgsFromPayload(payload)
+    const sourceRef =
+      eventType === "tool.error" || eventType === "tool.result" ? toolSourceRef(eventType, callID) : undefined
+    const common = {
+      call_id: callID,
+      tool_name: toolName,
+      session_id: firstStringField(payload, ["sessionID", "session_id"]),
+      message_id: firstStringField(payload, ["messageID", "message_id"]),
+      part_id: firstStringField(payload, ["partID", "part_id"]),
+      args,
+      provider_executed: payload.providerExecuted,
+      source_ref: sourceRef,
+    }
+
+    if (eventType === "tool.call") {
+      const nodeID = callID ? `toolcall_${safeNodeIDPart(callID)}` : undefined
+      const existing = nodeID ? this.causalNodes.find((node) => node.node_id === nodeID) : undefined
+      if (existing) return existing
+      const node = this.node({
+        node_id: nodeID,
+        kind: "tool.call",
+        component: "tool",
+        span_id: input.span_id,
+        title: toolName ?? "tool call",
+        status: "success",
+        data: {
+          ...common,
+          input: objectField(payload, "input"),
+          provider_metadata: objectField(payload, "providerMetadata") ?? objectField(payload, "provider_metadata"),
+          request_status: "requested",
+        },
+        source_refs: callID ? [`tool_call:${callID}`] : undefined,
+        source_locations: collectSourceLocations(args ?? payload),
+        typed_resources: [
+          {
+            type: "tool_call",
+            tool_name: toolName,
+            call_id: callID,
+            path: firstStringField(args, ["path", "filePath", "filepath"]),
+            command: firstStringField(args, ["command"]),
+          },
+        ],
+      })
+      return node
+    }
+
+    const isError = eventType === "tool.error"
+    const error = isError ? errorInfo(payload.error ?? input.data) : undefined
+    const nodeID = callID ? `${isError ? "toolerror" : "toolresult"}_${safeNodeIDPart(callID)}` : undefined
+    const existing = nodeID ? this.causalNodes.find((node) => node.node_id === nodeID) : undefined
+    if (existing) return existing
+    const node = this.node({
+      node_id: nodeID,
+      kind: eventType,
+      component: "tool",
+      span_id: input.span_id,
+      title: toolName ?? (isError ? "tool error" : "tool result"),
+      status: isError ? "error" : "success",
+      data: {
+        ...common,
+        status: isError ? "error" : "success",
+        title: firstStringField(payload, ["title"]),
+        metadata: objectField(payload, "metadata"),
+        output: isError ? undefined : (objectField(payload, "output") ?? payload.output),
+        attachments: payload.attachments,
+        error,
+        error_kind: isError ? toolErrorKind(payload.error ?? input.data) : undefined,
+        error_message: isError ? error?.message : undefined,
+        result_kind: isError ? undefined : "tool_output",
+        observed_by_model: true,
+      },
+      source_refs: dedupeStrings([...(callID ? [`tool_call:${callID}`] : []), ...(sourceRef ? [sourceRef] : [])]),
+      source_locations: collectSourceLocations(args ?? payload),
+      typed_resources: [
+        {
+          type: isError ? "tool_error" : "tool_result",
+          tool_name: toolName,
+          call_id: callID,
+          error_kind: isError ? toolErrorKind(payload.error ?? input.data) : undefined,
+          path: firstStringField(args, ["path", "filePath", "filepath"]),
+          command: firstStringField(args, ["command"]),
+        },
+      ],
+    })
+    this.closeMatchingToolCall(callID, node, isError ? "error" : "success", payload.error ?? payload.output)
+    if (callID) {
+      this.causalEdge({
+        from: { type: "tool_call", id: callID, label: toolName ?? "tool.call" },
+        to: { type: isError ? "tool_error" : "tool_result", id: callID, label: eventType },
+        relation: isError ? "failed_before" : "produced",
+        label: isError ? "Tool call failed with an observed error" : "Tool call produced an observed result",
+      })
+    }
+    return node
+  }
+
+  private closeMatchingToolCall(
+    callID: string | undefined,
+    outcomeNode: CausalNode,
+    status: Exclude<TraceStatus, "running">,
+    outcome: unknown,
+  ) {
+    if (!callID) return
+    const node = this.causalNodes.find((item) => {
+      if (item.kind !== "tool.call") return false
+      if (item.status !== "running") return false
+      const input = objectField(item.data, "input")
+      return (
+        firstStringField(item.data, ["call_id", "callID"]) === callID ||
+        firstStringField(input, ["callID", "call_id", "toolCallID", "tool_call_id"]) === callID
+      )
+    })
+    if (!node) return
+    node.status = status
+    node.data = {
+      ...(node.data ?? {}),
+      outcome_record_id: outcomeNode.node_id,
+      outcome_ref: `${outcomeNode.kind === "tool.error" ? "tool_error" : "tool_result"}:${callID}`,
+      output: status === "success" ? this.summarizeCausalValue(outcome, "tool.call.output") : node.data?.output,
+      error: status === "error" ? errorInfo(outcome) : node.data?.error,
+    }
+    node.artifact_refs = this.collectArtifactRefs(node.data)
+    this.writeRecord("node.update", node)
   }
 
   usage(input: unknown, spanID?: string) {
@@ -3850,7 +4034,68 @@ class ActiveCaseTrace {
     for (const ref of claim.direct_evidence_refs) this.linkSourceToClaim(ref, node.node_id, "evidence_to_claim")
     for (const ref of claim.context_refs) this.linkSourceToClaim(ref, node.node_id, "context_to_claim")
     for (const ref of claim.execution_refs) this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
+    this.claimSupportAssessment(claim, node.node_id)
     return claim
+  }
+
+  private claimSupportAssessment(claim: TraceResponseClaimRecord, claimNodeID: string) {
+    const toolFailureRefs = claim.direct_evidence_refs.filter((ref) => ref.startsWith("tool_error:"))
+    const toolResultRefs = claim.direct_evidence_refs.filter((ref) => ref.startsWith("tool_result:"))
+    const missingEvidenceTypes = dedupeStrings([
+      ...(claim.direct_evidence_refs.length ? [] : ["direct_evidence"]),
+      ...(claim.support_level === "unsupported" && !claim.context_refs.length ? ["context"] : []),
+      ...(claim.support_level === "unsupported" && !claim.execution_refs.length ? ["execution"] : []),
+    ])
+    const weakMatchReasons = dedupeStrings([
+      ...(claim.quality_flags.includes("weak_evidence_match") ? ["weak_evidence_match"] : []),
+      ...(claim.quality_flags.includes("unmatched_direct_evidence_refs") ? ["unmatched_direct_evidence_refs"] : []),
+      ...(claim.match_score !== undefined && claim.match_score > 0 && claim.match_score < 0.5
+        ? [`low_match_score:${claim.match_score}`]
+        : []),
+    ])
+    const assessmentID = `claimsupport_${safeNodeIDPart(claim.claim_id)}`
+    const node = this.node({
+      node_id: assessmentID,
+      kind: "claim.support_assessment",
+      component: "result",
+      title: `Claim support assessment ${claim.claim_index}`,
+      status: "success",
+      data: {
+        assessment_id: assessmentID,
+        claim_id: claim.claim_id,
+        response_segment_id: claim.response_segment_id,
+        claim_node_id: claimNodeID,
+        support_level: claim.support_level,
+        quality_flags: claim.quality_flags,
+        missing_evidence_types: missingEvidenceTypes,
+        direct_evidence_refs: claim.direct_evidence_refs,
+        matched_evidence_refs: claim.matched_evidence_refs,
+        candidate_evidence_refs: claim.candidate_evidence_refs,
+        context_refs: claim.context_refs,
+        execution_refs: claim.execution_refs,
+        tool_failure_dependency_refs: toolFailureRefs,
+        tool_result_dependency_refs: toolResultRefs,
+        weak_match_reasons: weakMatchReasons,
+        match_strategy: claim.match_strategy,
+        match_score: claim.match_score,
+        match_reasons: claim.match_reasons,
+        attribution_summary: claim.attribution_summary,
+      },
+      source_refs: dedupeStrings([
+        `response_claim:${claimNodeID}`,
+        ...claim.direct_evidence_refs,
+        ...claim.context_refs,
+        ...claim.execution_refs,
+      ]),
+      source_locations: claim.source_locations,
+    })
+    this.causalEdge({
+      from: { type: "response_claim", id: claimNodeID, label: "response.claim" },
+      to: { type: "claim_support", id: node.node_id, label: "claim.support_assessment" },
+      relation: "derived_from",
+      label: "Claim support assessment derived from response claim attribution",
+    })
+    return node
   }
 
   finalEvidence(input: FinalResponseEvidenceInput) {
@@ -4378,10 +4623,10 @@ class ActiveCaseTrace {
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
     const status = input?.status ?? (error ? "error" : "success")
-    this.finalizeOpenRecords(status)
+    const caseStatus = this.inferCaseStatus(status, error)
+    this.finalizeOpenRecords(status, caseStatus)
     this.backfillCompactionEstimates()
     this.enrichInlineSubagentRefs()
-    const caseStatus = this.inferCaseStatus(status, error)
     this.emitCaseLifecycleRecord(status, caseStatus)
     this.finished = true
     const summary = this.summary(status)
@@ -4521,10 +4766,21 @@ class ActiveCaseTrace {
     })
   }
 
-  private finalizeOpenRecords(status: TraceStatus) {
-    const finalStatus: TraceStatus = status === "running" ? "cancelled" : status
-    const finalizedReason =
-      finalStatus === "cancelled" ? "trace_cancelled" : finalStatus === "error" ? "trace_error" : "trace_finished"
+  private finalizeOpenRecords(status: TraceStatus, caseStatus?: TraceStatus) {
+    const serviceShutdownAfterCompletion = status === "cancelled" && caseStatus === "success"
+    const finalStatus: TraceStatus = serviceShutdownAfterCompletion
+      ? "success"
+      : status === "running"
+        ? "cancelled"
+        : status
+    const finalizedStatus = serviceShutdownAfterCompletion ? "closed_after_case_completion" : "finalized_without_close"
+    const finalizedReason = serviceShutdownAfterCompletion
+      ? "service_shutdown_after_completion"
+      : finalStatus === "cancelled"
+        ? "trace_cancelled"
+        : finalStatus === "error"
+          ? "trace_error"
+          : "trace_finished"
     const finalizedAt = new Date().toISOString()
     for (const span of this.spans.values()) {
       if (span.status !== "running") continue
@@ -4534,7 +4790,7 @@ class ActiveCaseTrace {
       span.duration_ms = Math.max(0, span.end_ms - span.start_ms)
       span.metadata = {
         ...(span.metadata ?? {}),
-        finalized_status: "finalized_without_close",
+        finalized_status: finalizedStatus,
         finalized_reason: finalizedReason,
       }
     }
@@ -4543,7 +4799,7 @@ class ActiveCaseTrace {
       node.status = finalStatus
       node.data = {
         ...(node.data ?? {}),
-        finalized_status: "finalized_without_close",
+        finalized_status: finalizedStatus,
         finalized_reason: finalizedReason,
         finalized_at: finalizedAt,
         original_status: "running",
@@ -4656,6 +4912,14 @@ class ActiveCaseTrace {
     const circularReferenceMarkers = countCircularMarkers(records)
     const openRecords = records.filter((record) => record.status === "running")
     const finalizedOpenRecords = records.filter((record) => record.data?.finalized_status === "finalized_without_close")
+    const caseCompletedSuccessfully = records.some(
+      (record) => record.event_type === "case.completed" && record.status === "success",
+    )
+    const cancelledAfterCaseCompletionRecords = caseCompletedSuccessfully
+      ? finalizedOpenRecords.filter(
+          (record) => record.status === "cancelled" && record.data?.finalized_reason === "trace_cancelled",
+        )
+      : []
     const expectedFinalizedTypes = new Set([
       "run.start",
       "task.loop",
@@ -4677,6 +4941,15 @@ class ActiveCaseTrace {
         kind: "unexpected_missing_close_record",
         severity: "warning",
         message: "Record was open at trace finish and was finalized without an expected lifecycle close policy.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
+    for (const record of cancelledAfterCaseCompletionRecords.slice(0, 20)) {
+      issues.push({
+        kind: "cancelled_after_case_completion",
+        severity: "warning",
+        message: "Record was marked cancelled even though the case had already completed successfully.",
         record_id: record.record_id,
         event_type: record.event_type,
       })
@@ -4957,6 +5230,7 @@ class ActiveCaseTrace {
       finalized_open_records: finalizedOpenRecords.length,
       expected_lifecycle_finalized_records: expectedLifecycleFinalizedRecords.length,
       unexpected_missing_close_records: unexpectedMissingCloseRecords.length,
+      cancelled_after_case_completion_records: cancelledAfterCaseCompletionRecords.length,
       llm_turns_missing_token_usage: llmTurnsMissingTokenUsage.length,
       llm_turns_missing_finish_reason: llmTurnsMissingFinishReason.length,
       compaction_quality_flags: compactionQualityFlags,
@@ -5338,7 +5612,11 @@ class ActiveCaseTrace {
       relation,
       label:
         relation === "evidence_to_claim"
-          ? "Semantic evidence supports response claim"
+          ? parsed.type === "tool_error"
+            ? "Tool failure observation supports response claim"
+            : parsed.type === "tool_result"
+              ? "Tool result observation supports response claim"
+              : "Semantic evidence supports response claim"
           : relation === "context_to_claim"
             ? "Context record contextualizes response claim"
             : "Execution record was used for response claim",

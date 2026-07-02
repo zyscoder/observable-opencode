@@ -20,7 +20,7 @@ node packages/opencode/test/observability/stress-cases/run-stress-cases.mjs --dr
 
 ```bash
 DEEPSEEK_API_KEY=... node packages/opencode/test/observability/stress-cases/run-stress-cases.mjs \
-  --binary /tmp/observable-opencode-v52-run/bin/opencode-observable-darwin-arm64 \
+  --binary /tmp/observable-opencode-v53-run/bin/opencode-observable-darwin-arm64 \
   --out /tmp/observable-opencode-stress-run
 ```
 

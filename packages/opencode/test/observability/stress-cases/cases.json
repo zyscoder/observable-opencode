@@ -173,14 +173,15 @@
     },
     "required_trace_evidence": [
       "tool_error_observation",
+      "claim_support_assessment",
       "unsupported_claims",
       "claim_direct_evidence_refs",
       "final_test_result"
     ],
     "sufficiency_questions": [
-      "trace 是否记录 read 失败？",
-      "工具失败是否进入 observation？",
-      "后续 claim 是否缺少 direct evidence 或被标记 unsupported？"
+      "trace 是否以正式 tool.error 记录 read 失败？",
+      "后续 claim 是否生成 claim.support_assessment？",
+      "claim support assessment 是否标记 unsupported/缺少直接证据或依赖工具失败？"
     ]
   },
   {

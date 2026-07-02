@@ -147,9 +147,16 @@ function detectEvidence(name, trace) {
     tool_error_observation: (records) =>
       records.filter(
         (record) =>
-          record.status === "error" ||
-          record.error ||
-          hasAny(record, ["ENOENT", "not found", "isError", "ERR", "No such file"]),
+          record.event_type === "tool.error" &&
+          (record.status === "error" ||
+            record.data?.status === "error" ||
+            hasAny(record, ["ENOENT", "not found", "isError", "ERR", "No such file"])),
+      ),
+    claim_support_assessment: (records) =>
+      records.filter(
+        (record) =>
+          record.event_type === "claim.support_assessment" &&
+          (record.data?.support_level || record.data?.tool_failure_dependency_refs || record.data?.quality_flags),
       ),
     unsupported_claims: (records, fullTrace) => {
       const health = fullTrace?.metrics?.trace_health ?? {}
@@ -197,7 +204,20 @@ function detectNoisySemantics(trace) {
   if ((health.broad_response_refs ?? 0) > 0) noisy.push("broad_response_refs")
   if ((health.duplicate_semantic_facts ?? 0) > 0) noisy.push("duplicate_semantic_facts")
   if ((health.generic_semantic_facts ?? 0) > 0) noisy.push("generic_semantic_facts")
+  if (hasCancelledAfterCompletedCase(trace)) noisy.push("cancelled_after_case_completion")
   return noisy
+}
+
+function hasCancelledAfterCompletedCase(trace) {
+  const records = Array.isArray(trace?.records) ? trace.records : []
+  const completed = records.some((record) => record.event_type === "case.completed" && record.status === "success")
+  if (!completed) return false
+  return records.some(
+    (record) =>
+      record.status === "cancelled" &&
+      record.data?.finalized_status === "finalized_without_close" &&
+      record.data?.finalized_reason === "trace_cancelled",
+  )
 }
 
 function recommendTraceChanges(missing) {
@@ -223,6 +243,9 @@ function recommendTraceChanges(missing) {
     }
     if (item.includes("tool_error") || item.includes("unsupported")) {
       recommendations.add("Link tool failures to later unsupported or context-only response claims.")
+    }
+    if (item.includes("claim_support")) {
+      recommendations.add("Emit claim.support_assessment records with support level, quality flags, and failure refs.")
     }
     if (item.includes("design") || item.includes("change") || item.includes("architecture")) {
       recommendations.add("Extract semantic diff summaries and compare changes with design constraints.")
