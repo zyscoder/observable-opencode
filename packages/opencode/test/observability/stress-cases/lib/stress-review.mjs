@@ -158,6 +158,13 @@ function detectEvidence(name, trace) {
           record.event_type === "claim.support_assessment" &&
           (record.data?.support_level || record.data?.tool_failure_dependency_refs || record.data?.quality_flags),
       ),
+    tool_failure_claim_dependency: (records) =>
+      records.filter(
+        (record) =>
+          record.event_type === "claim.support_assessment" &&
+          Array.isArray(record.data?.tool_failure_dependency_refs) &&
+          record.data.tool_failure_dependency_refs.some((ref) => String(ref).startsWith("tool_error:")),
+      ),
     unsupported_claims: (records, fullTrace) => {
       const health = fullTrace?.metrics?.trace_health ?? {}
       if ((health.unsupported_response_claims ?? 0) > 0 || (health.context_only_response_claims ?? 0) > 0) {
@@ -204,6 +211,7 @@ function detectNoisySemantics(trace) {
   if ((health.broad_response_refs ?? 0) > 0) noisy.push("broad_response_refs")
   if ((health.duplicate_semantic_facts ?? 0) > 0) noisy.push("duplicate_semantic_facts")
   if ((health.generic_semantic_facts ?? 0) > 0) noisy.push("generic_semantic_facts")
+  if ((health.path_only_evidence_facts ?? 0) > 0) noisy.push("path_only_evidence_facts")
   if (hasCancelledAfterCompletedCase(trace)) noisy.push("cancelled_after_case_completion")
   return noisy
 }

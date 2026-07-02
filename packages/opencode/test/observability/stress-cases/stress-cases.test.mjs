@@ -43,7 +43,7 @@ test("stress cases define eight grounded root-cause scenarios with fixtures", ()
 test("trace sufficiency review marks missing evidence as insufficient", () => {
   const [caseDefinition] = loadCases(rootDir)
   const trace = {
-    trace_version: "5.3",
+    trace_version: "5.4",
     manifest: { case_id: caseDefinition.case_id },
     records: [
       {
@@ -70,10 +70,10 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
 test("trace sufficiency review requires formal tool error and claim support facts", () => {
   const caseDefinition = {
     ...loadCases(rootDir).find((item) => item.case_id === "tool-failure-hallucination"),
-    required_trace_evidence: ["tool_error_observation", "claim_support_assessment"],
+    required_trace_evidence: ["tool_error_observation", "claim_support_assessment", "tool_failure_claim_dependency"],
   }
   const trace = {
-    trace_version: "5.3",
+    trace_version: "5.4",
     manifest: { case_id: caseDefinition.case_id, case_status: "success", server_status: "cancelled" },
     records: [
       {
@@ -111,5 +111,52 @@ test("trace sufficiency review requires formal tool error and claim support fact
   assert.equal(review.can_offline_module_identify_root_cause, false)
   assert.ok(review.missing_semantics.includes("tool_error_observation"))
   assert.ok(review.missing_semantics.includes("claim_support_assessment"))
+  assert.ok(review.missing_semantics.includes("tool_failure_claim_dependency"))
   assert.ok(review.redundant_or_noisy_semantics.includes("cancelled_after_case_completion"))
+})
+
+test("trace sufficiency review recognizes tool failures linked to claim support", () => {
+  const caseDefinition = {
+    ...loadCases(rootDir).find((item) => item.case_id === "tool-failure-hallucination"),
+    required_trace_evidence: ["tool_failure_claim_dependency"],
+  }
+  const trace = {
+    trace_version: "5.4",
+    manifest: { case_id: caseDefinition.case_id },
+    records: [
+      {
+        record_id: "toolerror_call_missing",
+        event_type: "tool.error",
+        component: "tool",
+        status: "error",
+        data: {
+          call_id: "call_missing",
+          tool_name: "read",
+          error_kind: "file_not_found",
+          error_message: "No such file docs/current-requirement.md",
+        },
+        source_refs: ["tool_error:call_missing"],
+      },
+      {
+        record_id: "claimsupport_1",
+        event_type: "claim.support_assessment",
+        component: "result",
+        status: "success",
+        data: {
+          claim_id: "claim_1",
+          support_level: "direct",
+          direct_evidence_refs: ["tool_error:call_missing"],
+          tool_failure_dependency_refs: ["tool_error:call_missing"],
+        },
+      },
+    ],
+    dataflow_edges: [],
+    metrics: { trace_health: { broad_response_refs: 0 } },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.trace_sufficiency, "sufficient")
+  assert.equal(review.can_offline_module_identify_root_cause, true)
+  assert.deepEqual(review.missing_semantics, [])
 })

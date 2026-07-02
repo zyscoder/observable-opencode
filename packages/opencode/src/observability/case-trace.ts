@@ -355,6 +355,7 @@ export type TraceResponseClaimRecord = {
   match_score?: number
   match_reasons?: string[]
   original_direct_evidence_refs?: string[]
+  derived_tool_outcome_refs?: string[]
   attribution_summary?: Record<string, unknown>
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
@@ -1432,6 +1433,10 @@ function toolSourceRef(kind: "tool.error" | "tool.result", callID: string | unde
   return kind === "tool.error" ? `tool_error:${callID}` : `tool_result:${callID}`
 }
 
+function isToolOutcomeRef(ref: string | undefined) {
+  return Boolean(ref && (ref.startsWith("tool_error:") || ref.startsWith("tool_result:")))
+}
+
 function traceContextLedger(input: {
   input_tokens?: number
   context_limit?: number
@@ -2105,6 +2110,83 @@ function evidenceMatchAnalysis(claimText: unknown, evidenceData: Record<string, 
   }
 }
 
+function toolOutcomeMatchAnalysis(
+  kind: "tool_error" | "tool_result",
+  claimText: unknown,
+  data: Record<string, unknown> | undefined,
+) {
+  const reasons: string[] = []
+  if (!data) return { score: 0, reasons, weak: false }
+  const claim = normalizeMatchText(claimText)
+  if (!claim) return { score: 0, reasons, weak: false }
+  const dataRecord = recordFromUnknown(data)
+  const args = recordFromUnknown(dataRecord?.args)
+  const strings = [
+    dataRecord?.tool_name,
+    dataRecord?.title,
+    dataRecord?.error_kind,
+    dataRecord?.error_message,
+    dataRecord?.output,
+    dataRecord?.error,
+    args,
+    dataRecord?.source_locations,
+  ].filter((item) => item !== undefined)
+  const haystack = normalizeMatchText(strings.join(" "))
+  if (!haystack) return { score: 0, reasons, weak: false }
+  let score = 0
+  const sourcePaths = collectSourceLocations([dataRecord?.args, dataRecord?.source_locations, dataRecord?.output])
+    .map((location) => location.path)
+    .filter(Boolean) as string[]
+  for (const sourcePath of sourcePaths) {
+    const normalizedPath = normalizeMatchText(sourcePath)
+    const basename = normalizedPath.split("/").at(-1)
+    if (claim.includes(normalizedPath) || (basename && claim.includes(basename))) {
+      score += 0.35
+      reasons.push("tool_path")
+      break
+    }
+  }
+  const claimMentionsFailure =
+    /fail|failed|failure|error|not found|no such file|不存在|失败|错误|找不到|缺失|工具失败/i.test(claim)
+  const outcomeMentionsFailure =
+    /fail|failed|failure|error|not found|no such file|enoent|不存在|失败|错误|找不到/i.test(haystack)
+  if (kind === "tool_error") {
+    if (claimMentionsFailure) {
+      score += 0.35
+      reasons.push("claim_mentions_tool_failure")
+    }
+    if (outcomeMentionsFailure) {
+      score += 0.25
+      reasons.push("tool_error_text")
+    }
+    if (/file-not-found|file_not_found|not found|no such file|enoent|不存在|找不到/.test(haystack)) {
+      score += 0.25
+      reasons.push("tool_error_kind")
+    }
+  }
+  const claimTerms = new Set(matchTerms(claim))
+  const outcomeTerms = new Set(matchTerms(haystack))
+  const shared = [...claimTerms].filter((term) => outcomeTerms.has(term))
+  if (shared.length) {
+    score += Math.min(0.4, shared.length * (kind === "tool_error" ? 0.08 : 0.1))
+    reasons.push("shared_tool_outcome_terms")
+  }
+  if (/0\.15/.test(claim) && /0\.15/.test(haystack)) {
+    score += 0.45
+    reasons.push("discount_cap_value")
+  }
+  if (/billing-platform/.test(claim) && /billing-platform/.test(haystack)) {
+    score += 0.45
+    reasons.push("owner_value")
+  }
+  const finalScore = Math.min(1, Number(score.toFixed(2)))
+  return {
+    score: finalScore,
+    reasons: dedupeStrings(reasons),
+    weak: finalScore > 0 && finalScore < 0.45,
+  }
+}
+
 function dedupeStrings(input: string[]) {
   return input.filter((item, index, array) => array.indexOf(item) === index)
 }
@@ -2476,9 +2558,52 @@ function rawArtifactRef(input: unknown) {
 function isGenericClaimText(input: string) {
   const text = input.trim()
   if (!text) return true
+  if (isStandalonePathText(text)) return true
   if (/returned\s+\d+\s+content\s+item/i.test(text)) return true
   if (/^(result|output|response|summary|file observed|pricing file observed)\b/i.test(text)) return true
   if (text.length < 12 && !/\d/.test(text)) return true
+  return false
+}
+
+function isStandalonePathText(input: string) {
+  const text = input
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[。.!?；;:,，]+$/g, "")
+    .trim()
+  if (!text || text.length > 500) return false
+  if (/\s/.test(text)) return false
+  return /^(?:\.{0,2}\/|\/|private\/tmp\/|tmp\/)?[\w@~.-]+(?:\/[\w@~.-]+)+(?:\.[A-Za-z0-9_+-]+)?$/.test(text)
+}
+
+function isPathOnlyListingText(input: unknown) {
+  const text = stringPreview(input, 4000).trim()
+  if (!text) return false
+  const stripped = text
+    .replace(/<path>\s*([^<]+?)\s*<\/path>/gi, "$1")
+    .replace(/<content>[\s\S]*?<\/content>/gi, "")
+    .trim()
+  if (!stripped) return false
+  const lines = stripped
+    .split(/\r?\n|,/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (!lines.length || lines.length > 80) return false
+  return lines.every((line) => isStandalonePathText(line))
+}
+
+function isPathListingSource(source: string, category: string) {
+  return /glob|list|ls|find|path|file_search|search_paths/.test(`${source} ${category}`)
+}
+
+function isPathOnlyListingEvidence(input: EvidenceFactInput, source: string, category: string) {
+  if (!isPathListingSource(source, category)) return false
+  if (isPathOnlyListingText(input.summary)) return true
+  const record = recordFromUnknown(input.data)
+  if (!record) return isPathOnlyListingText(input.data)
+  for (const key of ["output", "result", "results", "matches", "paths", "files", "path", "file", "filePath"]) {
+    if (record[key] !== undefined && isPathOnlyListingText(record[key])) return true
+  }
   return false
 }
 
@@ -2616,6 +2741,8 @@ function structuredClaimFromEvidence(
   const dataRecord = recordFromUnknown(input.data)
   const source = input.source.toLowerCase()
   const category = input.category?.toLowerCase() ?? ""
+  const pathOnlyListing = isPathOnlyListingEvidence(input, source, category)
+  if (pathOnlyListing) flags.push("path_only_listing_fact", "path_only_evidence_fact")
 
   if (dataRecord) {
     const explicit = structuredClaimFromRecord(dataRecord, "explicit_structured_data", sourceSpan)
@@ -2894,6 +3021,7 @@ function planStateSummary(payload: unknown) {
 
 function evidenceRecordKind(input: EvidenceFactInput, canonical: ReturnType<typeof canonicalEvidence>) {
   if (isPlanStateInput(input.source, input.category, input.data ?? input.summary)) return "task.plan_state"
+  if (canonical.quality_flags.includes("path_only_listing_fact")) return "execution.observation"
   if (
     canonical.fact_kind === "observation" &&
     canonical.quality_flags.some((flag) =>
@@ -2993,6 +3121,8 @@ class ActiveCaseTrace {
   private recentVerificationIDs: string[] = []
   private recentChangeIDs: string[] = []
   private recentToolSpanIDs: string[] = []
+  private recentToolOutcomeRefs: string[] = []
+  private toolOutcomeRefsByCallID = new Map<string, string>()
   private requestedSkillNames = new Set<string>()
   private recordedSkillRequestNames = new Set<string>()
   private tokenUsage: TraceTokenUsage = {}
@@ -3442,6 +3572,11 @@ class ActiveCaseTrace {
       ],
     })
     this.closeMatchingToolCall(callID, node, isError ? "error" : "success", payload.error ?? payload.output)
+    if (sourceRef) {
+      this.remember(this.recentToolOutcomeRefs, sourceRef)
+      if (callID) this.toolOutcomeRefsByCallID.set(callID, sourceRef)
+      this.backfillToolOutcomeRef({ callID, sourceRef, spanID: input.span_id, outcomeKind: eventType })
+    }
     if (callID) {
       this.causalEdge({
         from: { type: "tool_call", id: callID, label: toolName ?? "tool.call" },
@@ -3480,6 +3615,90 @@ class ActiveCaseTrace {
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     this.writeRecord("node.update", node)
+  }
+
+  private backfillToolOutcomeRef(input: {
+    callID: string | undefined
+    sourceRef: string
+    spanID?: string
+    outcomeKind: "tool.result" | "tool.error"
+  }) {
+    const targetRefs = new Set<string>()
+    if (input.callID) targetRefs.add(`tool_call:${input.callID}`)
+    if (input.spanID) targetRefs.add(`span:${input.spanID}`)
+
+    for (const node of this.causalNodes) {
+      if (node.kind !== "tool.call") continue
+      const nodeInput = recordFromUnknown(node.data?.input)
+      const matchesCall =
+        input.callID !== undefined &&
+        (firstStringField(node.data, ["call_id", "callID"]) === input.callID ||
+          firstStringField(nodeInput, ["callID", "call_id", "toolCallID", "tool_call_id"]) === input.callID)
+      if (matchesCall && node.span_id) targetRefs.add(`span:${node.span_id}`)
+      if (matchesCall) targetRefs.add(`tool_call:${input.callID}`)
+    }
+
+    if (!targetRefs.size) return
+    const parsedOutcome = this.parseSourceRef(input.sourceRef)
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const node of this.causalNodes) {
+        if (!this.canBackfillToolOutcome(node)) continue
+        const sourceRefs = node.source_refs ?? []
+        if (sourceRefs.includes(input.sourceRef)) continue
+        if (!sourceRefs.some((ref) => targetRefs.has(ref))) continue
+
+        node.source_refs = dedupeStrings([...sourceRefs, input.sourceRef])
+        if (node.data && typeof node.data === "object") {
+          const existing =
+            Array.isArray(node.data.tool_outcome_refs) &&
+            node.data.tool_outcome_refs.every((item) => typeof item === "string")
+              ? (node.data.tool_outcome_refs as string[])
+              : []
+          node.data = {
+            ...node.data,
+            tool_outcome_refs: dedupeStrings([...existing, input.sourceRef]),
+          }
+        }
+        node.artifact_refs = this.collectArtifactRefs(node.data)
+        this.writeRecord("node.update", node)
+        if (parsedOutcome && !this.hasCausalEdge(parsedOutcome, node.node_id, "derived_from")) {
+          this.causalEdge({
+            from: parsedOutcome,
+            to: { type: node.kind.startsWith("evidence.") ? "evidence" : "node", id: node.node_id, label: node.kind },
+            relation: "derived_from",
+            label:
+              input.outcomeKind === "tool.error"
+                ? "Tool failure provenance was backfilled onto this semantic record"
+                : "Tool result provenance was backfilled onto this semantic record",
+          })
+        }
+        targetRefs.add(`node:${node.node_id}`)
+        targetRefs.add(`observation:${node.node_id}`)
+        targetRefs.add(`evidence:${node.node_id}`)
+        changed = true
+      }
+    }
+  }
+
+  private canBackfillToolOutcome(node: CausalNode) {
+    return (
+      node.kind === "execution.observation" ||
+      node.kind === "observation" ||
+      node.kind === "evidence.fact" ||
+      node.kind === "evidence.semantic_fact"
+    )
+  }
+
+  private hasCausalEdge(from: TraceRef, toNodeID: string, relation: string) {
+    return this.causalEdges.some(
+      (edge) =>
+        edge.relation === relation &&
+        edge.from.type === from.type &&
+        edge.from.id === from.id &&
+        edge.to.id === toNodeID,
+    )
   }
 
   usage(input: unknown, spanID?: string) {
@@ -3830,9 +4049,25 @@ class ActiveCaseTrace {
     return constraint
   }
 
+  private narrowResponseRecordSourceRefs(sourceRefs: string[], classifiedRefs: ReturnType<typeof classifySourceRefs>) {
+    if (!sourceRefs.length) return sourceRefs
+    const directRefs = classifiedRefs.direct_evidence_refs.slice(-6)
+    const strongExecutionRefs = classifiedRefs.execution_refs
+      .filter((ref) => /^(verification|change|tool_span|tool_call):/.test(ref))
+      .slice(-3)
+    const fallbackRefs = dedupeStrings([
+      ...classifiedRefs.execution_refs.slice(-4),
+      ...classifiedRefs.context_refs.slice(-3),
+      ...sourceRefs.filter(isToolOutcomeRef),
+    ])
+    const narrowed = directRefs.length ? dedupeStrings([...directRefs, ...strongExecutionRefs]) : fallbackRefs
+    return narrowed.length ? narrowed.slice(0, 8) : sourceRefs.slice(-8)
+  }
+
   responseOutput(input: ResponseOutputInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
+    const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
     const responseRole =
@@ -3857,6 +4092,7 @@ class ActiveCaseTrace {
       direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
+      candidate_source_refs: sourceRefs,
     }
     const segment: TraceResponseSegment = {
       segment_id: input.segment_id ?? semanticID("segment", this.responseSegments.length + 1),
@@ -3891,10 +4127,11 @@ class ActiveCaseTrace {
         direct_evidence_refs: classifiedRefs.direct_evidence_refs,
         context_refs: classifiedRefs.context_refs,
         execution_refs: classifiedRefs.execution_refs,
+        candidate_source_refs: sourceRefs,
         source_locations: sourceLocations,
         metadata,
       },
-      source_refs: sourceRefs,
+      source_refs: responseRecordSourceRefs,
       source_locations: sourceLocations,
     })
     for (const ref of classifiedRefs.direct_evidence_refs) {
@@ -3906,16 +4143,21 @@ class ActiveCaseTrace {
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
+    const derivedToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs(sourceRefs)
+    const candidateClassifiedRefs = {
+      ...classifiedRefs,
+      direct_evidence_refs: dedupeStrings([...classifiedRefs.direct_evidence_refs, ...derivedToolOutcomeRefs]),
+    }
     const claimText = input.canonical_text ?? input.text
-    const evidenceMatch = this.matchEvidenceForClaim(claimText, classifiedRefs.direct_evidence_refs)
+    const evidenceMatch = this.matchEvidenceForClaim(claimText, candidateClassifiedRefs.direct_evidence_refs)
     const effectiveDirectEvidenceRefs = evidenceMatch.refs.length
       ? evidenceMatch.refs
-      : classifiedRefs.direct_evidence_refs.length <= 1
-        ? classifiedRefs.direct_evidence_refs
+      : candidateClassifiedRefs.direct_evidence_refs.length <= 1
+        ? candidateClassifiedRefs.direct_evidence_refs
         : []
     const legacyContextRefs = sourceRefs.filter((ref) => !effectiveDirectEvidenceRefs.includes(ref))
     const effectiveClassifiedRefs = {
-      ...classifiedRefs,
+      ...candidateClassifiedRefs,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
     }
     const sourceLocations = dedupeSourceLocations([
@@ -3934,6 +4176,7 @@ class ActiveCaseTrace {
       context_ref_count: classifiedRefs.context_refs.length,
       execution_ref_count: classifiedRefs.execution_refs.length,
       legacy_context_count: legacyContextRefs.length,
+      derived_tool_outcome_count: derivedToolOutcomeRefs.length,
       support_level: supportLevel,
       match_strategy: evidenceMatch.strategy,
       match_score: evidenceMatch.score,
@@ -3943,7 +4186,7 @@ class ActiveCaseTrace {
       ...responseClaimQualityFlags(effectiveClassifiedRefs),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
       ...(evidenceMatch.weak ? ["weak_evidence_match"] : []),
-      ...(classifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
+      ...(candidateClassifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
         ? ["unmatched_direct_evidence_refs"]
         : []),
     ])
@@ -3972,6 +4215,7 @@ class ActiveCaseTrace {
       match_score: evidenceMatch.score,
       match_reasons: evidenceMatch.reasons,
       original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+      derived_tool_outcome_refs: derivedToolOutcomeRefs,
       attribution_summary: attributionSummary,
       source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
@@ -3980,6 +4224,7 @@ class ActiveCaseTrace {
       metadata: omitUndefined({
         ...(input.metadata ?? {}),
         original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
+        derived_tool_outcome_refs: derivedToolOutcomeRefs,
       }),
     }
     const node = this.node({
@@ -4009,6 +4254,7 @@ class ActiveCaseTrace {
         match_score: claim.match_score,
         match_reasons: claim.match_reasons,
         original_direct_evidence_refs: claim.original_direct_evidence_refs,
+        derived_tool_outcome_refs: claim.derived_tool_outcome_refs,
         attribution_summary: claim.attribution_summary,
         support_level: claim.support_level,
         quality_flags: claim.quality_flags,
@@ -4039,8 +4285,18 @@ class ActiveCaseTrace {
   }
 
   private claimSupportAssessment(claim: TraceResponseClaimRecord, claimNodeID: string) {
-    const toolFailureRefs = claim.direct_evidence_refs.filter((ref) => ref.startsWith("tool_error:"))
-    const toolResultRefs = claim.direct_evidence_refs.filter((ref) => ref.startsWith("tool_result:"))
+    const transitiveToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs([
+      ...claim.direct_evidence_refs,
+      ...(claim.matched_evidence_refs ?? []),
+      ...(claim.candidate_evidence_refs ?? []),
+    ])
+    const allToolOutcomeRefs = dedupeStrings([
+      ...claim.direct_evidence_refs.filter(isToolOutcomeRef),
+      ...(claim.derived_tool_outcome_refs ?? []),
+      ...transitiveToolOutcomeRefs,
+    ])
+    const toolFailureRefs = allToolOutcomeRefs.filter((ref) => ref.startsWith("tool_error:"))
+    const toolResultRefs = allToolOutcomeRefs.filter((ref) => ref.startsWith("tool_result:"))
     const missingEvidenceTypes = dedupeStrings([
       ...(claim.direct_evidence_refs.length ? [] : ["direct_evidence"]),
       ...(claim.support_level === "unsupported" && !claim.context_refs.length ? ["context"] : []),
@@ -4069,6 +4325,7 @@ class ActiveCaseTrace {
         quality_flags: claim.quality_flags,
         missing_evidence_types: missingEvidenceTypes,
         direct_evidence_refs: claim.direct_evidence_refs,
+        derived_tool_outcome_refs: claim.derived_tool_outcome_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
         context_refs: claim.context_refs,
@@ -4084,6 +4341,7 @@ class ActiveCaseTrace {
       source_refs: dedupeStrings([
         `response_claim:${claimNodeID}`,
         ...claim.direct_evidence_refs,
+        ...allToolOutcomeRefs,
         ...claim.context_refs,
         ...claim.execution_refs,
       ]),
@@ -4435,7 +4693,7 @@ class ActiveCaseTrace {
       })
       return undefined
     }
-    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const sourceRefs = this.observationSourceRefs(input)
     const semanticExtras = observationSemanticExtras(input.source, input.data)
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
@@ -4601,6 +4859,19 @@ class ActiveCaseTrace {
     return node
   }
 
+  private observationSourceRefs(input: ObservationInput) {
+    const provided = input.source_refs ?? input.evidence_refs
+    const refs = provided ? this.normalizeSourceRefs(provided) : []
+    if (!this.isToolOutcomeObservation(input)) return refs
+    if (refs.some(isToolOutcomeRef)) return refs
+    return dedupeStrings([...refs, ...this.recentToolOutcomeRefs.slice(-2)])
+  }
+
+  private isToolOutcomeObservation(input: ObservationInput) {
+    const text = `${input.source ?? ""} ${input.category ?? ""}`.toLowerCase()
+    return /tool|mcp|skill|subagent|task|verification|grep|read|glob|bash|file|edit|write/.test(text)
+  }
+
   currentSourceRefs() {
     return [
       ...this.recentPromptNodeIDs.slice(-2).map((id) => `prompt:${id}`),
@@ -4608,6 +4879,7 @@ class ActiveCaseTrace {
       ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
       ...this.recentLLMNodeIDs.slice(-2).map((id) => `llm:${id}`),
       ...this.recentEvidenceNodeIDs.slice(-6).map((id) => `evidence:${id}`),
+      ...this.recentToolOutcomeRefs.slice(-6),
       ...this.recentToolSpanIDs.slice(-3).map((id) => `tool_span:${id}`),
       ...this.recentVerificationIDs.slice(-3).map((id) => `verification:${id}`),
       ...this.recentChangeIDs.slice(-3).map((id) => `change:${id}`),
@@ -5551,11 +5823,60 @@ class ActiveCaseTrace {
     return this.causalNodes.find((node) => node.node_id === parsed.id || node.node_id === `evidence_${parsed.id}`)
   }
 
+  private sourceNodeForRef(ref: string) {
+    const parsed = this.parseSourceRef(ref)
+    if (!parsed) return undefined
+    if (parsed.type === "evidence") return this.evidenceNodeForRef(ref)
+    if (parsed.type === "observation" || parsed.type === "node") {
+      return this.causalNodes.find((node) => node.node_id === parsed.id)
+    }
+    if (parsed.type === "tool_error" || parsed.type === "tool_result") {
+      const expectedKind = parsed.type === "tool_error" ? "tool.error" : "tool.result"
+      return this.causalNodes.find(
+        (node) =>
+          node.kind === expectedKind &&
+          (node.source_refs?.includes(ref) ||
+            firstStringField(node.data, ["call_id", "callID"]) === parsed.id ||
+            node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`)),
+      )
+    }
+    return this.causalNodes.find((node) => node.source_refs?.includes(ref) || node.node_id === parsed.id)
+  }
+
+  private toolOutcomeRefsFromSourceRefs(refs: string[]) {
+    const output = new Set<string>()
+    const seen = new Set<string>()
+    const visit = (ref: string, depth: number) => {
+      if (depth > 4 || seen.has(ref)) return
+      seen.add(ref)
+      if (isToolOutcomeRef(ref)) {
+        output.add(ref)
+        return
+      }
+      const node = this.sourceNodeForRef(ref)
+      if (!node) return
+      for (const sourceRef of node.source_refs ?? []) visit(sourceRef, depth + 1)
+      const dataRefs =
+        Array.isArray(node.data?.tool_outcome_refs) &&
+        node.data.tool_outcome_refs.every((item) => typeof item === "string")
+          ? (node.data.tool_outcome_refs as string[])
+          : []
+      for (const sourceRef of dataRefs) visit(sourceRef, depth + 1)
+      const callID = firstStringField(node.data, ["call_id", "callID"])
+      if (callID) {
+        const outcomeRef = this.toolOutcomeRefsByCallID.get(callID)
+        if (outcomeRef) output.add(outcomeRef)
+      }
+    }
+    for (const ref of refs) visit(ref, 0)
+    return [...output]
+  }
+
   private matchEvidenceForClaim(claimText: unknown, evidenceRefs: string[]) {
     const scored = evidenceRefs
       .map((ref) => {
-        const node = this.evidenceNodeForRef(ref)
-        const analysis = evidenceMatchAnalysis(claimText, node?.data)
+        const node = this.sourceNodeForRef(ref)
+        const analysis = this.sourceRefMatchAnalysis(ref, claimText, node)
         return {
           ref,
           score: analysis.score,
@@ -5583,6 +5904,12 @@ class ActiveCaseTrace {
       candidateRefs: evidenceRefs,
       strategy: refs.length ? "structured_text_overlap" : evidenceRefs.length ? "no_direct_match" : "no_evidence_refs",
     }
+  }
+
+  private sourceRefMatchAnalysis(ref: string, claimText: unknown, node: CausalNode | undefined) {
+    if (ref.startsWith("tool_error:")) return toolOutcomeMatchAnalysis("tool_error", claimText, node?.data)
+    if (ref.startsWith("tool_result:")) return toolOutcomeMatchAnalysis("tool_result", claimText, node?.data)
+    return evidenceMatchAnalysis(claimText, node?.data)
   }
 
   private linkSourceToResponse(ref: string, responseNodeID: string) {
