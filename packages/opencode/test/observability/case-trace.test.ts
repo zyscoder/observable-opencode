@@ -631,6 +631,14 @@ describe("case trace", () => {
     expect(failed.source_refs).toContain(`node:${llmTurn.record_id}`)
     expect(failed.data.finalized_open_record_refs).toContain(`node:${llmTurn.record_id}`)
     expect(trace.dataflow_edges.some((edge: any) => edge.relation === "failed_before")).toBe(true)
+    expect(trace.metrics.trace_health.llm_turns_missing_token_usage).toBe(0)
+    expect(trace.metrics.trace_health.llm_turns_missing_finish_reason).toBe(0)
+    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
+      "llm_turn_missing_token_usage",
+    )
+    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
+      "llm_turn_missing_finish_reason",
+    )
   })
 
   test("marks subagent summary facts as secondary evidence", async () => {

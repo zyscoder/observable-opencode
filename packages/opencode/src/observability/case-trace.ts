@@ -5441,10 +5441,13 @@ class ActiveCaseTrace {
         record.data?.agent_role === "background" ||
         record.data?.is_background === true,
     )
-    const llmTurnsMissingTokenUsage = llmTurns.filter(
+    const isExpectedCancelledLlmTurn = (record: ProvenanceRecord) =>
+      record.status === "cancelled" && record.data?.finalized_reason === "trace_cancelled"
+    const llmTurnsRequiringCompletionMetadata = llmTurns.filter((record) => !isExpectedCancelledLlmTurn(record))
+    const llmTurnsMissingTokenUsage = llmTurnsRequiringCompletionMetadata.filter(
       (record) => record.data?.agent_role !== "title" && !record.token_usage?.total,
     )
-    const llmTurnsMissingFinishReason = llmTurns.filter(
+    const llmTurnsMissingFinishReason = llmTurnsRequiringCompletionMetadata.filter(
       (record) => record.data?.agent_role !== "title" && !record.data?.finish_reason,
     )
     for (const record of llmTurnsMissingTokenUsage.slice(0, 20)) {
