@@ -35,6 +35,8 @@ export type TraceFieldSummary = {
   value?: string | number | boolean | null
   keys?: string[]
   artifact_id?: string
+  payload_ref?: string
+  payload_dedupe_group_id?: string
 }
 
 export type TraceArtifact = {
@@ -336,6 +338,12 @@ export type TraceResponseClaimRecord = {
   claim_id: string
   response_segment_id?: string
   text: TraceFieldSummary
+  claim_format?: "factual_claim" | "table_fact" | string
+  raw_text?: TraceFieldSummary
+  canonical_text?: TraceFieldSummary
+  table_cells?: string[]
+  table_subject?: string
+  table_values?: string[]
   claim_index: number
   direct_evidence_refs: string[]
   context_refs: string[]
@@ -689,6 +697,12 @@ type ResponseClaimInput = Omit<
   TraceResponseClaimRecord,
   | "claim_id"
   | "text"
+  | "claim_format"
+  | "raw_text"
+  | "canonical_text"
+  | "table_cells"
+  | "table_subject"
+  | "table_values"
   | "direct_evidence_refs"
   | "context_refs"
   | "execution_refs"
@@ -699,6 +713,12 @@ type ResponseClaimInput = Omit<
 > & {
   claim_id?: string
   text: unknown
+  claim_format?: TraceResponseClaimRecord["claim_format"]
+  raw_text?: unknown
+  canonical_text?: unknown
+  table_cells?: string[]
+  table_subject?: string
+  table_values?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
@@ -797,6 +817,8 @@ type ObservationInput = {
 
 type CompactionRecordInput = {
   trigger: "manual" | "auto" | "overflow" | string
+  session_id?: string
+  message_id?: string
   provider_id?: string
   model_id?: string
   input_tokens?: number
@@ -1662,7 +1684,17 @@ function classifySourceRefs(input: string[] | undefined) {
   }
 }
 
-function splitResponseClaims(input: unknown): string[] {
+type ResponseClaimCandidate = {
+  text: string
+  claim_format: "factual_claim" | "table_fact"
+  raw_text?: string
+  canonical_text?: string
+  table_cells?: string[]
+  table_subject?: string
+  table_values?: string[]
+}
+
+function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
   const text = typeof input === "string" ? input : stringPreview(input, 8000)
   if (!text.trim()) return []
   const protectedText = protectClaimSegments(text)
@@ -1675,16 +1707,20 @@ function splitResponseClaims(input: unknown): string[] {
   const seen = new Set<string>()
   return normalized
     .map((claim) => claim.replace(/\s+/g, " ").trim())
-    .filter((claim) => {
-      if (isBrokenClaimFragment(claim)) return false
+    .flatMap((claim): ResponseClaimCandidate[] => {
+      if (isBrokenClaimFragment(claim)) return []
       const textLength = claim.replace(/\s/g, "").length
       const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
-      if (textLength < 6 && !hasFactSignal) return false
-      if (isNonFactualResponseClaim(claim)) return false
-      const key = claim.toLowerCase()
-      if (seen.has(key)) return false
+      if (textLength < 6 && !hasFactSignal) return []
+      if (isNonFactualResponseClaim(claim)) return []
+      const candidate = markdownTableFactClaim(claim) ?? {
+        text: claim,
+        claim_format: "factual_claim" as const,
+      }
+      const key = `${candidate.claim_format}:${candidate.canonical_text ?? candidate.text}`.toLowerCase()
+      if (seen.has(key)) return []
       seen.add(key)
-      return true
+      return [candidate]
     })
     .slice(0, 50)
 }
@@ -1716,6 +1752,13 @@ function isNonFactualResponseClaim(input: string) {
     )
   )
     return true
+  if (
+    /^(?:[一二三四五六七八九十]+[、.]\s*)?(各来源的关键结论对比|关键结论对比|子\s*agent\s*独立总结|子 agent 独立总结|是否需要改动|一致性判断)$/.test(
+      normalized,
+    )
+  )
+    return true
+  if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
   if (/^(以下是|下面是|这里是).*(总结|结论)$/.test(normalized)) return true
   return false
@@ -1735,9 +1778,9 @@ function isLikelyTableHeaderCell(input: string) {
   const normalized = input.trim().toLowerCase()
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
-  if (/^(项目|结果|来源|关键信息|维度|说明|文件|路径|子 agent 结论|subagent result)$/.test(normalized)) return true
+  if (/^(项目|结果|来源|关键信息|维度|说明|文件|路径|议题|子 agent 结论|subagent result)$/.test(normalized)) return true
   if (/^mcp\s+[\w-]+$/i.test(normalized)) return true
-  if (/^syntheticfacts[_\w.-]*$/i.test(normalized)) return true
+  if (/^syntheticfacts(?:\s*\(mcp\))?[_\w.-]*$/i.test(normalized)) return true
   if (/^(?:[\w@+.-]+\/)?[\w@+.-]+\.(?:md|mjs|js|ts|tsx|json|txt|py|go|rs|java|yaml|yml)$/i.test(normalized)) return true
   return false
 }
@@ -1753,6 +1796,29 @@ function isMarkdownTableStructuralRow(input: string) {
     )
   if (hasFactValue) return false
   return cells.every(isLikelyTableHeaderCell)
+}
+
+function markdownTableFactClaim(input: string): ResponseClaimCandidate | undefined {
+  const cells = markdownTableCells(input)
+  if (cells.length < 2) return undefined
+  if (isMarkdownTableStructuralRow(input)) return undefined
+  const subject = cells[0]?.trim()
+  if (!subject || isLikelyTableHeaderCell(subject)) return undefined
+  const values = cells
+    .slice(1)
+    .map((cell) => cell.trim())
+    .filter((cell) => cell && !/^[-—]+$/.test(cell))
+  if (!values.length) return undefined
+  const canonicalText = `${subject}: ${values.join(" | ")}`
+  return {
+    text: canonicalText,
+    claim_format: "table_fact",
+    raw_text: input,
+    canonical_text: canonicalText,
+    table_cells: cells,
+    table_subject: subject,
+    table_values: values,
+  }
 }
 
 function protectClaimSegments(input: string) {
@@ -2037,6 +2103,49 @@ function availableSkillNamesFromError(input: string) {
 function objectField(input: unknown, key: string) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
   return (input as Record<string, unknown>)[key]
+}
+
+function recordStringField(input: unknown, keys: string[]) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+  return firstStringField(input, keys)
+}
+
+function nearestCompactionCheck(compaction: CausalNode, checks: CausalNode[]) {
+  const sessionID = recordStringField(compaction.data, ["session_id", "sessionID"])
+  const messageID = recordStringField(compaction.data, ["message_id", "messageID"])
+  const before = checks.filter((check) => check.time_ms <= compaction.time_ms)
+  const matches = before.filter((check) => {
+    const checkSessionID = recordStringField(check.data, ["session_id", "sessionID"])
+    const checkMessageID = recordStringField(check.data, ["message_id", "messageID"])
+    if (sessionID && checkSessionID && sessionID !== checkSessionID) return false
+    if (messageID && checkMessageID && messageID !== checkMessageID) return false
+    return true
+  })
+  return (matches.length ? matches : before).at(-1)
+}
+
+function causalNodeReferencesSession(node: CausalNode, sessionID: string) {
+  const directSession =
+    recordStringField(node.data, ["session_id", "sessionID"]) ??
+    recordStringField(objectField(node.data, "metadata"), ["session_id", "sessionID"])
+  if (directSession === sessionID) return true
+  return stringPreview(node.data, 20000).includes(sessionID)
+}
+
+function applySubagentInlineFields(data: Record<string, unknown>, fields: Record<string, unknown>) {
+  Object.assign(data, fields)
+  delete data.child_trace_unavailable_reason
+  const traceRef = objectField(data, "trace_ref")
+  if (traceRef && typeof traceRef === "object" && !Array.isArray(traceRef)) {
+    Object.assign(traceRef as Record<string, unknown>, fields)
+    delete (traceRef as Record<string, unknown>).child_trace_unavailable_reason
+  }
+  const output = objectField(data, "output")
+  const outputTraceRef = objectField(output, "trace_ref")
+  if (outputTraceRef && typeof outputTraceRef === "object" && !Array.isArray(outputTraceRef)) {
+    Object.assign(outputTraceRef as Record<string, unknown>, fields)
+    delete (outputTraceRef as Record<string, unknown>).child_trace_unavailable_reason
+  }
 }
 
 function firstStringField(input: unknown, keys: string[]) {
@@ -3478,7 +3587,8 @@ class ActiveCaseTrace {
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
-    const evidenceMatch = this.matchEvidenceForClaim(input.text, classifiedRefs.direct_evidence_refs)
+    const claimText = input.canonical_text ?? input.text
+    const evidenceMatch = this.matchEvidenceForClaim(claimText, classifiedRefs.direct_evidence_refs)
     const effectiveDirectEvidenceRefs = evidenceMatch.refs.length
       ? evidenceMatch.refs
       : classifiedRefs.direct_evidence_refs.length <= 1
@@ -3507,7 +3617,17 @@ class ActiveCaseTrace {
     const claim: TraceResponseClaimRecord = {
       claim_id: input.claim_id ?? semanticID("claim", this.causalNodes.length + 1),
       response_segment_id: input.response_segment_id,
-      text: this.summarizeText(input.text, "result.response.claim"),
+      text: this.summarizeText(claimText, "result.response.claim"),
+      claim_format: input.claim_format ?? "factual_claim",
+      raw_text:
+        input.raw_text === undefined ? undefined : this.summarizeText(input.raw_text, "result.response.claim.raw"),
+      canonical_text:
+        input.canonical_text === undefined
+          ? undefined
+          : this.summarizeText(input.canonical_text, "result.response.claim"),
+      table_cells: input.table_cells,
+      table_subject: input.table_subject,
+      table_values: input.table_values,
       claim_index: input.claim_index,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
       context_refs: classifiedRefs.context_refs,
@@ -3537,7 +3657,13 @@ class ActiveCaseTrace {
       data: {
         claim_id: claim.claim_id,
         response_segment_id: claim.response_segment_id,
-        text: input.text,
+        text: claimText,
+        claim_format: claim.claim_format,
+        raw_text: input.raw_text,
+        canonical_text: input.canonical_text,
+        table_cells: claim.table_cells,
+        table_subject: claim.table_subject,
+        table_values: claim.table_values,
         claim_index: claim.claim_index,
         direct_evidence_refs: claim.direct_evidence_refs,
         context_refs: claim.context_refs,
@@ -3639,7 +3765,13 @@ class ActiveCaseTrace {
       claims.forEach((claim, index) => {
         this.responseClaim({
           response_segment_id: segment.segment_id,
-          text: claim,
+          text: claim.text,
+          claim_format: claim.claim_format,
+          raw_text: claim.raw_text,
+          canonical_text: claim.canonical_text,
+          table_cells: claim.table_cells,
+          table_subject: claim.table_subject,
+          table_values: claim.table_values,
           claim_index: index + 1,
           source_refs: segment.source_refs,
           source_locations: segment.source_locations,
@@ -3992,6 +4124,8 @@ class ActiveCaseTrace {
       status: input.result === "error" ? "error" : "success",
       data: {
         trigger: input.trigger,
+        session_id: input.session_id,
+        message_id: input.message_id,
         provider_id: input.provider_id,
         model_id: input.model_id,
         input_tokens: input.input_tokens,
@@ -4059,6 +4193,8 @@ class ActiveCaseTrace {
     this.result = input?.result ?? this.result
     const status = input?.status ?? (error ? "error" : "success")
     this.finalizeOpenRecords(status)
+    this.backfillCompactionEstimates()
+    this.enrichInlineSubagentRefs()
     this.finished = true
     const summary = this.summary(status)
     const provenance = this.provenanceSummary(summary.status)
@@ -4184,6 +4320,67 @@ class ActiveCaseTrace {
     }
   }
 
+  private backfillCompactionEstimates() {
+    const checks = this.causalNodes.filter((node) => node.kind === "context.compaction_check")
+    for (const compaction of this.causalNodes.filter((node) => node.kind === "context.compaction")) {
+      if (!compaction.data) continue
+      if (optionalNumber(compaction.data.token_estimate_before) !== undefined) continue
+      const match = nearestCompactionCheck(compaction, checks)
+      const estimate =
+        optionalNumber(match?.data?.token_estimate) ?? optionalNumber(objectField(match?.data?.token_usage, "total"))
+      if (estimate === undefined) continue
+      compaction.data.token_estimate_before = estimate
+      compaction.data.estimate_source = "nearest_compaction_check"
+      const contextLedger =
+        compaction.data.context_ledger && typeof compaction.data.context_ledger === "object"
+          ? (compaction.data.context_ledger as Record<string, unknown>)
+          : {}
+      contextLedger.token_estimate_before = contextLedger.token_estimate_before ?? estimate
+      const flags = Array.isArray(contextLedger.quality_flags)
+        ? contextLedger.quality_flags.filter((flag) => flag !== "missing_token_estimate")
+        : []
+      contextLedger.quality_flags = flags
+      compaction.data.context_ledger = contextLedger
+      compaction.artifact_refs = this.collectArtifactRefs(compaction.data)
+      this.writeRecord("node.update", compaction)
+    }
+  }
+
+  private enrichInlineSubagentRefs() {
+    const subagentNodes = this.causalNodes.filter((node) => node.kind === "subagent.call")
+    for (const subagent of subagentNodes) {
+      if (!subagent.data) continue
+      const childSessionID = firstStringField(subagent.data, ["child_session_id", "childSessionID"])
+      if (!childSessionID) continue
+      const childRecords = this.causalNodes.filter(
+        (node) => node.node_id !== subagent.node_id && causalNodeReferencesSession(node, childSessionID),
+      )
+      if (!childRecords.length) continue
+      const childRecordRefs = childRecords.map((record) => `node:${record.node_id}`)
+      const childPromptRefs = childRecords
+        .filter((record) => record.kind === "prompt.assembly")
+        .map((record) => `prompt:${record.node_id}`)
+      const childResultRefs = childRecords
+        .filter((record) => record.kind === "response.output" || record.kind === "agent.lifecycle")
+        .map((record) =>
+          record.kind === "response.output" && typeof record.data?.segment_id === "string"
+            ? `response_segment:${record.data.segment_id}`
+            : `node:${record.node_id}`,
+        )
+      const inlineFields = {
+        child_trace_available: true,
+        child_trace_mode: "inline_same_trace",
+        child_record_count: childRecords.length,
+        child_record_refs: childRecordRefs.slice(0, 100),
+        child_prompt_refs: childPromptRefs.slice(0, 20),
+        child_result_refs: childResultRefs.slice(0, 20),
+      }
+      applySubagentInlineFields(subagent.data, inlineFields)
+      subagent.artifact_refs = this.collectArtifactRefs(subagent.data)
+      this.writeRecord("node.update", subagent)
+    }
+  }
+
   private traceHealth(records: ProvenanceRecord[]): TraceHealthMetrics {
     const issues: TraceHealthIssue[] = []
     const circularReferenceMarkers = countCircularMarkers(records)
@@ -4199,7 +4396,8 @@ class ActiveCaseTrace {
       "context.transform",
     ])
     const expectedLifecycleFinalizedRecords = finalizedOpenRecords.filter(
-      (record) => record.status === "success" && expectedFinalizedTypes.has(record.event_type),
+      (record) =>
+        (record.status === "success" || record.status === "cancelled") && expectedFinalizedTypes.has(record.event_type),
     )
     const unexpectedMissingCloseRecords = finalizedOpenRecords.filter(
       (record) => !expectedLifecycleFinalizedRecords.includes(record),
@@ -4557,6 +4755,8 @@ class ActiveCaseTrace {
     return {
       ...summary,
       artifact_id: artifact.artifact_id,
+      payload_ref: artifact.artifact_id,
+      payload_dedupe_group_id: artifact.dedupe_key,
     }
   }
 
@@ -4576,6 +4776,8 @@ class ActiveCaseTrace {
     return {
       ...summary,
       artifact_id: artifact.artifact_id,
+      payload_ref: artifact.artifact_id,
+      payload_dedupe_group_id: artifact.dedupe_key,
     }
   }
 

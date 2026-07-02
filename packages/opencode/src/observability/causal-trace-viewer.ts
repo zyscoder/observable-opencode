@@ -201,6 +201,7 @@ function recordSummary(record: ProvenanceRecord) {
   }
   if (record.event_type === "response.claim") {
     return [
+      data.claim_format ? `format=${String(data.claim_format)}` : "",
       data.support_level ? `support=${String(data.support_level)}` : "",
       Array.isArray(data.quality_flags) && data.quality_flags.length ? `flags=${data.quality_flags.join(",")}` : "",
       preview(data.text, 160),
@@ -788,6 +789,15 @@ function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, T
               <div class="io-output">
                 <div class="pane-title">Returned / Output</div>
                 ${
+                  record.data?.child_trace_mode
+                    ? `<div class="refs">child trace mode: <code>${escapeHtml(record.data.child_trace_mode)}</code>${
+                        record.data.child_record_count !== undefined
+                          ? ` <span class="muted">records=${escapeHtml(record.data.child_record_count)}</span>`
+                          : ""
+                      }</div>`
+                    : ""
+                }
+                ${
                   record.data?.child_trace_unavailable_reason
                     ? `<div class="refs">child trace unavailable: <code>${escapeHtml(record.data.child_trace_unavailable_reason)}</code></div>`
                     : ""
@@ -871,6 +881,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
         <thead>
           <tr>
             <th>Claim</th>
+            <th>Format</th>
             <th>Support</th>
             <th>Quality Flags</th>
             <th>Matched Evidence</th>
@@ -895,8 +906,13 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
+              const canonical = data.canonical_text
+                ? `<div class="muted">${escapeHtml(preview(data.canonical_text, 420))}</div>`
+                : ""
+              const tableSubject = data.table_subject ? `<br/><code>${escapeHtml(data.table_subject)}</code>` : ""
               return `<tr>
-                <td><div class="claim-text">${escapeHtml(preview(data.text, 520))}</div><code>${escapeHtml(record.record_id)}</code></td>
+                <td><div class="claim-text">${escapeHtml(preview(data.text, 520))}</div>${canonical}<code>${escapeHtml(record.record_id)}</code></td>
+                <td><code>${escapeHtml(data.claim_format ?? "-")}</code>${tableSubject}</td>
                 <td><span class="status">${escapeHtml(data.support_level ?? "-")}</span></td>
                 <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
                 <td><div class="refs">${escapeHtml(matched.join(", ") || "-")}</div></td>
