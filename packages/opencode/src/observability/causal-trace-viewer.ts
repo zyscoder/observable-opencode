@@ -236,15 +236,30 @@ function recordSummary(record: ProvenanceRecord) {
       .filter(Boolean)
       .join(" | ")
   }
-  if (record.event_type === "evidence.fact") {
+  if (record.event_type === "evidence.semantic_fact" || record.event_type === "evidence.fact") {
     return [data.source, data.category, preview(data.summary, 160)].filter(Boolean).join(" | ")
+  }
+  if (record.event_type === "execution.observation") {
+    return [data.source, data.category, preview(data.summary, 160)].filter(Boolean).join(" | ")
+  }
+  if (record.event_type === "task.plan_state") {
+    return [data.source, data.category, preview(data.plan_items, 160)].filter(Boolean).join(" | ")
   }
   if (record.event_type === "tool.call" || record.event_type === "mcp.call") {
     return [data.tool_name, data.server, data.name, preview(data.output, 120)].filter(Boolean).join(" | ")
   }
   if (record.event_type === "context.compaction") {
-    return [data.algorithm, data.reason, data.before_tokens, data.after_tokens]
-      .filter((item) => item !== undefined)
+    return [
+      data.algorithm,
+      data.reason,
+      data.token_estimate_before !== undefined ? `before=${String(data.token_estimate_before)}` : "",
+      data.token_estimate_after !== undefined ? `after=${String(data.token_estimate_after)}` : "",
+      data.retention_ratio !== undefined ? `retention=${String(data.retention_ratio)}` : "",
+      Array.isArray(data.compression_loss_risks) && data.compression_loss_risks.length
+        ? `risks=${data.compression_loss_risks.join(",")}`
+        : "",
+    ]
+      .filter(Boolean)
       .join(" | ")
   }
   if (record.event_type === "context.compaction_check") {
@@ -289,6 +304,8 @@ function hasSemanticFacts(record: ProvenanceRecord) {
       record.artifact_refs?.length ||
       [
         "prompt.assembly",
+        "case.completed",
+        "case.failed",
         "context.transform",
         "context.pack",
         "context.compaction",
@@ -296,8 +313,10 @@ function hasSemanticFacts(record: ProvenanceRecord) {
         "llm.turn",
         "agent.lifecycle",
         "exit.gate",
+        "evidence.semantic_fact",
         "evidence.fact",
-        "observation",
+        "execution.observation",
+        "task.plan_state",
         "change",
         "verification",
         "response.output",
@@ -320,17 +339,18 @@ function componentStats(trace: ProvenanceTraceSummary) {
 }
 
 function renderOverview(trace: ProvenanceTraceSummary) {
-  const statusClass =
-    trace.manifest.status === "success" ? "ok" : trace.manifest.status === "running" ? "running" : "bad"
+  const caseStatus = trace.manifest.case_status ?? trace.manifest.status
+  const statusClass = caseStatus === "success" ? "ok" : caseStatus === "running" ? "running" : "bad"
   return `<section id="overview">
     <div class="section-title">
       <h2>Overview</h2>
-      <span class="status-pill ${statusClass}">${escapeHtml(trace.manifest.status)}</span>
+      <span class="status-pill ${statusClass}">case ${escapeHtml(caseStatus)}</span>
     </div>
     <div class="overview-grid">
       <div><span class="label">Case</span><strong>${escapeHtml(trace.manifest.case_id)}</strong></div>
       <div><span class="label">Run</span><code>${escapeHtml(trace.manifest.run_id)}</code></div>
       <div><span class="label">Duration</span><strong>${formatDuration(trace.manifest.duration_ms)}</strong></div>
+      <div><span class="label">Server Status</span><strong>${escapeHtml(trace.manifest.server_status ?? trace.manifest.status)}</strong></div>
       <div><span class="label">Records</span><strong>${trace.metrics.records}</strong></div>
       <div><span class="label">Dataflow</span><strong>${trace.metrics.dataflow_edges}</strong></div>
       <div><span class="label">Artifacts</span><strong>${trace.metrics.artifacts}</strong></div>
@@ -382,8 +402,22 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
       health.broad_response_refs,
       "Responses whose legacy source_refs are wider than direct evidence.",
     ],
-    ["Duplicate Evidence", health.duplicate_evidence_facts, "Repeated evidence facts after canonicalization."],
-    ["Generic Evidence", health.generic_evidence_facts ?? 0, "Evidence facts that fell back to generic claims."],
+    [
+      "Duplicate Semantic Evidence",
+      health.duplicate_semantic_facts ?? health.duplicate_evidence_facts,
+      "Repeated semantic facts after canonicalization.",
+    ],
+    [
+      "Generic Semantic Evidence",
+      health.generic_semantic_facts ?? health.generic_evidence_facts ?? 0,
+      "Semantic evidence facts that fell back to generic claims.",
+    ],
+    [
+      "Execution Observations",
+      health.execution_observations ?? 0,
+      "Routine execution observations kept out of evidence.",
+    ],
+    ["Plan States", health.task_plan_states ?? 0, "Todo and task-plan states kept out of evidence."],
     ["Generic MCP", health.generic_mcp_facts ?? 0, "MCP facts that still fell back to generic claims."],
     ["Path Only Facts", health.path_only_evidence_facts ?? 0, "File facts that did not reach line-level semantics."],
     ["Unsupported Claims", health.unsupported_response_claims ?? 0, "Response claims without any provenance refs."],
@@ -525,6 +559,8 @@ function renderDataflow(trace: ProvenanceTraceSummary) {
 function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const pipelineTypes = new Set([
     "run.start",
+    "case.completed",
+    "case.failed",
     "prompt.assembly",
     "context.transform",
     "context.pack",
@@ -539,6 +575,9 @@ function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<st
     "skill.load",
     "subagent.call",
     "loop.decision",
+    "task.plan_state",
+    "execution.observation",
+    "evidence.semantic_fact",
     "evidence.fact",
     "response.output",
   ])
@@ -605,7 +644,9 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
       "mcp.call",
       "skill.load",
       "subagent.call",
-      "observation",
+      "task.plan_state",
+      "execution.observation",
+      "evidence.semantic_fact",
       "evidence.fact",
       "response.output",
     ].includes(record.event_type),
@@ -815,14 +856,14 @@ function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, T
 
 function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
-    .filter((record) => record.event_type === "evidence.fact")
+    .filter((record) => record.event_type === "evidence.semantic_fact" || record.event_type === "evidence.fact")
     .toSorted((a, b) => a.time_ms - b.time_ms)
   if (!records.length)
-    return `<section id="evidence-facts"><h2>Evidence Facts</h2><div class="empty">No evidence facts.</div></section>`
+    return `<section id="evidence-facts"><h2>Semantic Evidence</h2><div class="empty">No semantic evidence records.</div></section>`
   return `<section id="evidence-facts">
     <div class="section-title">
-      <h2>Evidence Facts</h2>
-      <span class="muted">Observed facts extracted from tools, MCP, skills, verification, and subagents.</span>
+      <h2>Semantic Evidence</h2>
+      <span class="muted">Stable facts extracted from tools, MCP, skills, verification, and subagents.</span>
     </div>
     <div class="fact-list">
       ${records
@@ -858,6 +899,46 @@ function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
               </div>
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 2400))}</pre>
+          </article>`,
+        )
+        .join("")}
+    </div>
+  </section>`
+}
+
+function renderExecutionObservations(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+  const records = trace.records
+    .filter((record) => record.event_type === "execution.observation" || record.event_type === "task.plan_state")
+    .toSorted((a, b) => a.time_ms - b.time_ms)
+  if (!records.length)
+    return `<section id="execution-observations"><h2>Execution Observations</h2><div class="empty">No routine execution observations.</div></section>`
+  return `<section id="execution-observations">
+    <div class="section-title">
+      <h2>Execution Observations</h2>
+      <span class="muted">Routine tool observations and plan states kept separate from semantic evidence.</span>
+    </div>
+    <div class="fact-list">
+      ${records
+        .map(
+          (record) => `<article class="fact-card">
+            <div class="fact-head">
+              <span class="kind">${escapeHtml(record.event_type)}</span>
+              ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
+              <strong>${escapeHtml(recordLabel(record))}</strong>
+              <code>${escapeHtml(record.record_id)}</code>
+            </div>
+            <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
+            <div class="fact-grid">
+              <div>
+                <div class="label">Source Refs</div>
+                <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+              </div>
+              <div>
+                <div class="label">Artifacts</div>
+                <div class="refs">${artifactLinks(record.artifact_refs, artifacts)}</div>
+              </div>
+            </div>
+            <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
           </article>`,
         )
         .join("")}
@@ -1121,7 +1202,8 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
         <a href="#lifecycle">Lifecycle</a>
         <a href="#subagents">Subagents</a>
         <a href="#claim-evidence-matrix">Claim Matrix</a>
-        <a href="#evidence-facts">Evidence Facts</a>
+        <a href="#evidence-facts">Semantic Evidence</a>
+        <a href="#execution-observations">Execution Observations</a>
         <a href="#agent-flow">Agent Flow</a>
         <a href="#component-dataflow">Component Dataflow</a>
         <a href="#io-inspector">IO Inspector</a>
@@ -1140,6 +1222,7 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
     ${renderSubagents(trace, artifacts)}
     ${renderClaimEvidenceMatrix(trace)}
     ${renderEvidenceFacts(trace, artifacts)}
+    ${renderExecutionObservations(trace, artifacts)}
     ${renderAgentFlow(trace, artifacts)}
     <section id="component-dataflow">
       <h2>Component Dataflow</h2>

@@ -355,6 +355,7 @@ export type TraceResponseClaimRecord = {
   match_score?: number
   match_reasons?: string[]
   original_direct_evidence_refs?: string[]
+  attribution_summary?: Record<string, unknown>
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   support_level: "direct" | "contextual" | "execution_only" | "unsupported" | string
@@ -403,7 +404,9 @@ export type TraceHealthMetrics = {
   empty_subagent_results: number
   broad_response_refs: number
   duplicate_evidence_facts: number
+  duplicate_semantic_facts?: number
   generic_evidence_facts?: number
+  generic_semantic_facts?: number
   unsupported_response_claims?: number
   context_only_response_claims?: number
   payload_duplication_groups?: number
@@ -412,6 +415,8 @@ export type TraceHealthMetrics = {
   over_attributed_claims?: number
   generic_mcp_facts?: number
   path_only_evidence_facts?: number
+  execution_observations?: number
+  task_plan_states?: number
   non_final_response_claims?: number
   weak_evidence_matches?: number
   mcp_json_parse_shadowed?: number
@@ -423,7 +428,10 @@ export type TraceHealthMetrics = {
 
 export type CausalNodeKind =
   | "run.start"
+  | "case.completed"
+  | "case.failed"
   | "task.loop"
+  | "task.plan_state"
   | "prompt.assembly"
   | "context.transform"
   | "context.pack"
@@ -440,7 +448,9 @@ export type CausalNodeKind =
   | "subagent.call"
   | "loop.decision"
   | "observation"
+  | "execution.observation"
   | "evidence.fact"
+  | "evidence.semantic_fact"
   | "change"
   | "verification"
   | "response.output"
@@ -481,6 +491,9 @@ export type TraceManifest = {
   ended_at?: string
   duration_ms: number
   status: TraceStatus
+  server_status?: TraceStatus
+  case_status?: TraceStatus
+  case_completed_at?: string
   input?: Record<string, unknown>
   environment: Record<string, unknown>
   token_usage: TraceTokenUsage
@@ -2132,6 +2145,33 @@ function causalNodeReferencesSession(node: CausalNode, sessionID: string) {
   return stringPreview(node.data, 20000).includes(sessionID)
 }
 
+function childTimelineSummary(records: CausalNode[]) {
+  const by_type: Record<string, number> = {}
+  for (const record of records) by_type[record.kind] = (by_type[record.kind] ?? 0) + 1
+  return {
+    record_count: records.length,
+    first_event: records[0]
+      ? { record_id: records[0].node_id, event_type: records[0].kind, time_ms: records[0].time_ms }
+      : undefined,
+    last_event: records.at(-1)
+      ? { record_id: records.at(-1)?.node_id, event_type: records.at(-1)?.kind, time_ms: records.at(-1)?.time_ms }
+      : undefined,
+    by_type,
+  }
+}
+
+function childMetricSummary(records: CausalNode[]) {
+  return {
+    llm_turn_count: records.filter((record) => record.kind === "llm.turn").length,
+    tool_call_count: records.filter((record) => record.kind === "tool.call").length,
+    mcp_call_count: records.filter((record) => record.kind === "mcp.call").length,
+    semantic_evidence_count: records.filter(
+      (record) => record.kind === "evidence.semantic_fact" || record.kind === "evidence.fact",
+    ).length,
+    response_output_count: records.filter((record) => record.kind === "response.output").length,
+  }
+}
+
 function applySubagentInlineFields(data: Record<string, unknown>, fields: Record<string, unknown>) {
   Object.assign(data, fields)
   delete data.child_trace_unavailable_reason
@@ -2750,9 +2790,104 @@ function isWeakObservation(input: ObservationInput) {
 
 function isEvidenceWorthyObservation(input: ObservationInput) {
   if (isWeakObservation(input)) return false
+  if (isPlanStateInput(input.source, input.category, input.data ?? input.summary)) return false
   if (/tool|mcp|skill|subagent|task|verification|grep|read|bash|file/i.test(input.source)) return true
   if (input.category && /tool|mcp|skill|subagent|verification|test|file|grep|read/i.test(input.category)) return true
   return false
+}
+
+function isPlanStateInput(source: string | undefined, category: string | undefined, payload: unknown) {
+  const sourceText = `${source ?? ""} ${category ?? ""}`.toLowerCase()
+  if (/todowrite|todo_write|todo-list|todo list|plan_state/.test(sourceText)) return true
+  const record = recordFromUnknown(payload)
+  const todos = Array.isArray(record?.todos)
+    ? record?.todos
+    : Array.isArray(objectField(record?.args, "todos"))
+      ? (objectField(record?.args, "todos") as unknown[])
+      : undefined
+  return Boolean(todos?.length)
+}
+
+function planStateSummary(payload: unknown) {
+  const record = recordFromUnknown(payload)
+  const todos = Array.isArray(record?.todos)
+    ? record.todos
+    : Array.isArray(objectField(record?.args, "todos"))
+      ? (objectField(record?.args, "todos") as unknown[])
+      : []
+  const counts: Record<string, number> = {
+    total: todos.length,
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    cancelled: 0,
+  }
+  const items = todos
+    .map((item) => {
+      const todo = recordFromUnknown(item) ?? {}
+      const status = String(todo.status ?? "unknown")
+      if (status in counts) counts[status] = (counts[status] ?? 0) + 1
+      return {
+        content: typeof todo.content === "string" ? todo.content : stringPreview(todo.content, 200),
+        status,
+        priority: typeof todo.priority === "string" ? todo.priority : undefined,
+      }
+    })
+    .filter((item) => item.content)
+  return {
+    ...counts,
+    items: items.slice(0, 20),
+    truncated: items.length > 20,
+  }
+}
+
+function evidenceRecordKind(input: EvidenceFactInput, canonical: ReturnType<typeof canonicalEvidence>) {
+  if (isPlanStateInput(input.source, input.category, input.data ?? input.summary)) return "task.plan_state"
+  if (
+    canonical.fact_kind === "observation" &&
+    canonical.quality_flags.some((flag) =>
+      ["generic_claim", "fallback_summary_claim", "path_only_evidence_fact"].includes(flag),
+    )
+  ) {
+    return "execution.observation"
+  }
+  return "evidence.semantic_fact"
+}
+
+function evidenceRecordLabel(kind: string) {
+  if (kind === "task.plan_state") return "task.plan_state"
+  if (kind === "execution.observation") return "execution.observation"
+  return "evidence.semantic_fact"
+}
+
+function compactionDerivedFields(input: {
+  tokenBefore?: number
+  tokenAfter?: number
+  retainedFactRefs?: unknown[]
+  droppedFactRefs?: unknown[]
+  outputSummary?: unknown
+  autoContinue?: boolean
+  afterContextRefs?: string[]
+}) {
+  const retainedFactCount = input.retainedFactRefs?.length ?? 0
+  const droppedFactCount = input.droppedFactRefs?.length ?? 0
+  const retentionRatio =
+    typeof input.tokenBefore === "number" && input.tokenBefore > 0 && typeof input.tokenAfter === "number"
+      ? Number((input.tokenAfter / input.tokenBefore).toFixed(4))
+      : undefined
+  const risks: string[] = []
+  if (input.tokenBefore === undefined) risks.push("missing_token_estimate_before")
+  if (typeof input.tokenBefore === "number" && input.tokenBefore > 0 && input.tokenAfter === 0)
+    risks.push("zero_token_estimate_after")
+  if (droppedFactCount > 0) risks.push("dropped_semantic_facts")
+  if (!stringPreview(input.outputSummary, 200).trim()) risks.push("empty_compaction_summary")
+  if (input.autoContinue && !(input.afterContextRefs?.length ?? 0)) risks.push("auto_continue_without_after_refs")
+  return {
+    retention_ratio: retentionRatio,
+    retained_fact_count: retainedFactCount,
+    dropped_fact_count: droppedFactCount,
+    compression_loss_risks: risks,
+  }
 }
 
 class ActiveCaseTrace {
@@ -3605,6 +3740,20 @@ class ActiveCaseTrace {
       ...collectSourceLocations(input.metadata),
     ])
     const supportLevel = input.support_level ?? responseClaimSupportLevel(effectiveClassifiedRefs)
+    const attributionSourceRefs = effectiveDirectEvidenceRefs.length
+      ? effectiveDirectEvidenceRefs
+      : dedupeStrings([...classifiedRefs.execution_refs.slice(0, 3), ...classifiedRefs.context_refs.slice(0, 3)])
+    const attributionSummary = {
+      direct_evidence_count: effectiveDirectEvidenceRefs.length,
+      matched_evidence_count: evidenceMatch.refs.length,
+      candidate_evidence_count: evidenceMatch.candidateRefs.length,
+      context_ref_count: classifiedRefs.context_refs.length,
+      execution_ref_count: classifiedRefs.execution_refs.length,
+      legacy_context_count: legacyContextRefs.length,
+      support_level: supportLevel,
+      match_strategy: evidenceMatch.strategy,
+      match_score: evidenceMatch.score,
+    }
     const qualityFlags = dedupeStrings([
       ...(input.quality_flags ?? []),
       ...responseClaimQualityFlags(effectiveClassifiedRefs),
@@ -3639,7 +3788,8 @@ class ActiveCaseTrace {
       match_score: evidenceMatch.score,
       match_reasons: evidenceMatch.reasons,
       original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
-      source_refs: sourceRefs,
+      attribution_summary: attributionSummary,
+      source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
       support_level: supportLevel,
       quality_flags: qualityFlags,
@@ -3675,12 +3825,13 @@ class ActiveCaseTrace {
         match_score: claim.match_score,
         match_reasons: claim.match_reasons,
         original_direct_evidence_refs: claim.original_direct_evidence_refs,
+        attribution_summary: claim.attribution_summary,
         support_level: claim.support_level,
         quality_flags: claim.quality_flags,
         source_locations: sourceLocations,
         metadata: claim.metadata,
       },
-      source_refs: sourceRefs,
+      source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
       metadata: claim.metadata,
     })
@@ -3932,9 +4083,11 @@ class ActiveCaseTrace {
       ...collectSourceLocations(input.metadata),
     ])
     const canonical = canonicalEvidence(input, sourceLocations)
+    const recordKind = evidenceRecordKind(input, canonical)
+    const planItems = recordKind === "task.plan_state" ? planStateSummary(input.data ?? input.summary) : undefined
     const node = this.node({
       node_id: `evidence_${factID}`,
-      kind: "evidence.fact",
+      kind: recordKind,
       component: this.componentForObservationSource(input.source),
       span_id: input.span_id,
       title: input.category ?? input.source,
@@ -3953,21 +4106,33 @@ class ActiveCaseTrace {
         quality_flags: canonical.quality_flags,
         confidence: input.confidence ?? "observed",
         source_locations: sourceLocations,
+        evidence_class:
+          recordKind === "evidence.semantic_fact"
+            ? "semantic_fact"
+            : recordKind === "task.plan_state"
+              ? "plan_state"
+              : "execution_observation",
+        plan_items: planItems,
         metadata: input.metadata,
       },
       source_refs: sourceRefs,
       source_locations: sourceLocations,
       metadata: input.metadata,
     })
-    this.remember(this.recentEvidenceNodeIDs, node.node_id)
+    if (recordKind === "evidence.semantic_fact") this.remember(this.recentEvidenceNodeIDs, node.node_id)
     for (const ref of sourceRefs ?? []) {
       const parsed = this.parseSourceRef(ref)
       if (!parsed) continue
       this.causalEdge({
         from: parsed,
-        to: { type: "evidence", id: node.node_id, label: "evidence.fact" },
+        to: { type: "evidence", id: node.node_id, label: evidenceRecordLabel(recordKind) },
         relation: "derived_from",
-        label: "Evidence fact derived from source record",
+        label:
+          recordKind === "task.plan_state"
+            ? "Plan state derived from source record"
+            : recordKind === "execution.observation"
+              ? "Execution observation derived from source record"
+              : "Semantic evidence derived from source record",
       })
     }
     return node
@@ -4033,8 +4198,11 @@ class ActiveCaseTrace {
       ...collectSourceLocations(input.metadata),
       ...(semanticExtras.source_locations ?? []),
     ])
+    const observationKind = isPlanStateInput(input.source, input.category, input.data ?? input.summary)
+      ? "task.plan_state"
+      : "execution.observation"
     const node = this.node({
-      kind: "observation",
+      kind: observationKind,
       component: this.componentForObservationSource(input.source),
       span_id: input.span_id,
       title: input.category ?? input.source,
@@ -4044,6 +4212,8 @@ class ActiveCaseTrace {
         category: input.category,
         summary: input.summary,
         data: input.data,
+        evidence_class: observationKind === "task.plan_state" ? "plan_state" : "execution_observation",
+        plan_items: observationKind === "task.plan_state" ? planStateSummary(input.data ?? input.summary) : undefined,
         source_locations: sourceLocations,
         typed_resources: semanticExtras.typed_resources,
         metadata: input.metadata,
@@ -4058,12 +4228,15 @@ class ActiveCaseTrace {
       if (!parsed) continue
       this.causalEdge({
         from: parsed,
-        to: { type: "node", id: node.node_id, label: "observation" },
+        to: { type: "node", id: node.node_id, label: observationKind },
         relation:
           parsed.type === "compaction" || parsed.id.startsWith("compaction")
             ? "compaction_to_observation"
             : "source_to_observation",
-        label: "Observation produced from source record",
+        label:
+          observationKind === "task.plan_state"
+            ? "Plan state produced from source record"
+            : "Execution observation produced from source record",
       })
     }
     if (isEvidenceWorthyObservation(input)) {
@@ -4116,6 +4289,15 @@ class ActiveCaseTrace {
       explicitAfterContextRefs.length || !contextLedger.auto_continue_prompt_ref
         ? explicitAfterContextRefs
         : [contextLedger.auto_continue_prompt_ref]
+    const compactionDerived = compactionDerivedFields({
+      tokenBefore: contextLedger.token_estimate_before,
+      tokenAfter: contextLedger.token_estimate_after,
+      retainedFactRefs: contextLedger.retained_fact_refs,
+      droppedFactRefs: contextLedger.dropped_fact_refs,
+      outputSummary: input.output_summary,
+      autoContinue: input.auto_continue,
+      afterContextRefs,
+    })
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -4146,8 +4328,12 @@ class ActiveCaseTrace {
         dropped_message_ids: contextLedger.dropped_message_ids,
         retained_fact_refs: contextLedger.retained_fact_refs,
         dropped_fact_refs: contextLedger.dropped_fact_refs,
+        retained_fact_count: compactionDerived.retained_fact_count,
+        dropped_fact_count: compactionDerived.dropped_fact_count,
         token_estimate_before: contextLedger.token_estimate_before,
         token_estimate_after: contextLedger.token_estimate_after,
+        retention_ratio: compactionDerived.retention_ratio,
+        compression_loss_risks: compactionDerived.compression_loss_risks,
         auto_continue_prompt_ref: contextLedger.auto_continue_prompt_ref,
         context_ledger: contextLedger,
         auto_continue: input.auto_continue,
@@ -4195,9 +4381,11 @@ class ActiveCaseTrace {
     this.finalizeOpenRecords(status)
     this.backfillCompactionEstimates()
     this.enrichInlineSubagentRefs()
+    const caseStatus = this.inferCaseStatus(status, error)
+    this.emitCaseLifecycleRecord(status, caseStatus)
     this.finished = true
     const summary = this.summary(status)
-    const provenance = this.provenanceSummary(summary.status)
+    const provenance = this.provenanceSummary(summary.status, caseStatus)
     this.write("trace.finish", summary)
     this.writeRecord("finish", provenance.manifest)
     this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
@@ -4238,7 +4426,7 @@ class ActiveCaseTrace {
     }
   }
 
-  private manifest(status: TraceStatus): TraceManifest {
+  private manifest(status: TraceStatus, caseStatus?: TraceStatus): TraceManifest {
     const ended = Date.now()
     return {
       trace_version: TRACE_VERSION,
@@ -4249,6 +4437,9 @@ class ActiveCaseTrace {
       ended_at: new Date(ended).toISOString(),
       duration_ms: Math.max(0, ended - this.startedAt),
       status,
+      server_status: status,
+      case_status: caseStatus ?? status,
+      case_completed_at: caseStatus === "success" ? new Date(ended).toISOString() : undefined,
       input: this.input,
       environment: this.environment,
       token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
@@ -4265,8 +4456,8 @@ class ActiveCaseTrace {
     }
   }
 
-  private provenanceSummary(status: TraceStatus): ProvenanceTraceSummary {
-    const manifest = this.manifest(status)
+  private provenanceSummary(status: TraceStatus, caseStatus?: TraceStatus): ProvenanceTraceSummary {
+    const manifest = this.manifest(status, caseStatus)
     const records = this.provenanceRecords()
     const dataflowEdges = this.provenanceDataflowEdges()
     const traceHealth = this.traceHealth(records)
@@ -4286,6 +4477,48 @@ class ActiveCaseTrace {
         trace_health: traceHealth,
       },
     }
+  }
+
+  private inferCaseStatus(serverStatus: TraceStatus, error: TraceError | undefined): TraceStatus {
+    const resultStatus = stringField(recordFromUnknown(this.result) ?? {}, ["case_status", "caseStatus", "status"])
+    if (resultStatus === "success" || resultStatus === "error" || resultStatus === "cancelled") return resultStatus
+    if (error || this.errors.length) return "error"
+    const finalAnswer = this.responseSegments.some(
+      (segment) =>
+        segment.response_role === "final_answer" &&
+        segment.visibility === "user_visible" &&
+        segment.is_final_for_case === true,
+    )
+    if (finalAnswer) return "success"
+    return serverStatus
+  }
+
+  private emitCaseLifecycleRecord(serverStatus: TraceStatus, caseStatus: TraceStatus) {
+    const finalSegment = this.responseSegments
+      .filter(
+        (segment) =>
+          segment.response_role === "final_answer" &&
+          segment.visibility === "user_visible" &&
+          segment.is_final_for_case === true,
+      )
+      .at(-1)
+    this.node({
+      node_id: `case_${caseStatus === "success" ? "completed" : "failed"}_${hash(this.runID).slice(0, 8)}`,
+      kind: caseStatus === "success" ? "case.completed" : "case.failed",
+      component: "run",
+      title: caseStatus === "success" ? "case completed" : "case failed",
+      status: caseStatus,
+      data: {
+        run_id: this.runID,
+        case_id: this.caseID,
+        server_status: serverStatus,
+        case_status: caseStatus,
+        final_response_segment_id: finalSegment?.segment_id,
+        result: this.result,
+        token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
+      },
+      source_refs: finalSegment ? [`response_segment:${finalSegment.segment_id}`] : [],
+    })
   }
 
   private finalizeOpenRecords(status: TraceStatus) {
@@ -4341,6 +4574,21 @@ class ActiveCaseTrace {
         : []
       contextLedger.quality_flags = flags
       compaction.data.context_ledger = contextLedger
+      const derived = compactionDerivedFields({
+        tokenBefore: optionalNumber(compaction.data.token_estimate_before),
+        tokenAfter: optionalNumber(compaction.data.token_estimate_after),
+        retainedFactRefs: Array.isArray(compaction.data.retained_fact_refs) ? compaction.data.retained_fact_refs : [],
+        droppedFactRefs: Array.isArray(compaction.data.dropped_fact_refs) ? compaction.data.dropped_fact_refs : [],
+        outputSummary: compaction.data.output_summary,
+        autoContinue: compaction.data.auto_continue === true,
+        afterContextRefs: Array.isArray(compaction.data.after_context_refs)
+          ? (compaction.data.after_context_refs.filter((item) => typeof item === "string") as string[])
+          : [],
+      })
+      compaction.data.retention_ratio = derived.retention_ratio
+      compaction.data.retained_fact_count = derived.retained_fact_count
+      compaction.data.dropped_fact_count = derived.dropped_fact_count
+      compaction.data.compression_loss_risks = derived.compression_loss_risks
       compaction.artifact_refs = this.collectArtifactRefs(compaction.data)
       this.writeRecord("node.update", compaction)
     }
@@ -4367,13 +4615,35 @@ class ActiveCaseTrace {
             ? `response_segment:${record.data.segment_id}`
             : `node:${record.node_id}`,
         )
+      const childKeyEvidenceRefs = childRecords
+        .filter((record) => record.kind === "evidence.semantic_fact" || record.kind === "evidence.fact")
+        .map((record) => `evidence:${record.node_id}`)
+        .slice(0, 20)
+      const fullTraceRefArtifact = this.writeArtifact(
+        "json",
+        "subagent.child_trace_refs",
+        prettyJsonString(
+          json({
+            child_session_id: childSessionID,
+            child_record_refs: childRecordRefs,
+            child_prompt_refs: childPromptRefs,
+            child_result_refs: childResultRefs,
+            child_key_evidence_refs: childKeyEvidenceRefs,
+          }),
+        ),
+      )
       const inlineFields = {
         child_trace_available: true,
         child_trace_mode: "inline_same_trace",
         child_record_count: childRecords.length,
-        child_record_refs: childRecordRefs.slice(0, 100),
+        child_record_refs: childRecordRefs.slice(0, 20),
+        child_record_refs_truncated: childRecordRefs.length > 20,
         child_prompt_refs: childPromptRefs.slice(0, 20),
         child_result_refs: childResultRefs.slice(0, 20),
+        child_key_evidence_refs: childKeyEvidenceRefs,
+        child_timeline_summary: childTimelineSummary(childRecords),
+        child_metric_summary: childMetricSummary(childRecords),
+        child_trace_artifact_ref: fullTraceRefArtifact.artifact_id,
       }
       applySubagentInlineFields(subagent.data, inlineFields)
       subagent.artifact_refs = this.collectArtifactRefs(subagent.data)
@@ -4466,7 +4736,12 @@ class ActiveCaseTrace {
       })
     }
     const emptySubagentRecords = records.filter((record) => {
-      if (record.event_type !== "subagent.call" && record.event_type !== "evidence.fact") return false
+      if (
+        record.event_type !== "subagent.call" &&
+        record.event_type !== "evidence.fact" &&
+        record.event_type !== "evidence.semantic_fact"
+      )
+        return false
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && flags.includes("empty_subagent_result")
     })
@@ -4495,8 +4770,11 @@ class ActiveCaseTrace {
         count: record.source_refs?.length,
       })
     }
+    const semanticEvidenceRecords = records.filter(
+      (item) => item.event_type === "evidence.semantic_fact" || item.event_type === "evidence.fact",
+    )
     const evidenceKeys = new Map<string, number>()
-    for (const record of records.filter((item) => item.event_type === "evidence.fact")) {
+    for (const record of semanticEvidenceRecords) {
       const key = [record.data?.source, record.data?.category, record.data?.canonical_subject, record.data?.claim].join(
         "|",
       )
@@ -4513,7 +4791,7 @@ class ActiveCaseTrace {
         count: duplicateEvidenceFacts,
       })
     }
-    const evidenceFacts = records.filter((record) => record.event_type === "evidence.fact")
+    const evidenceFacts = semanticEvidenceRecords
     const genericEvidenceFacts = evidenceFacts.filter((record) => {
       const flags = record.data?.quality_flags
       return Array.isArray(flags) && (flags.includes("generic_claim") || flags.includes("fallback_summary_claim"))
@@ -4576,7 +4854,8 @@ class ActiveCaseTrace {
     })
     const legacyContextRefClaims = responseClaims.filter((record) => {
       const legacyRefs = record.data?.legacy_context_refs
-      return Array.isArray(legacyRefs) && legacyRefs.length > 0
+      const directRefs = record.data?.direct_evidence_refs
+      return Array.isArray(legacyRefs) && legacyRefs.length > 0 && (!Array.isArray(directRefs) || !directRefs.length)
     })
     const weakEvidenceMatches = responseClaims.filter((record) => {
       const flags = record.data?.quality_flags
@@ -4684,7 +4963,9 @@ class ActiveCaseTrace {
       empty_subagent_results: emptySubagentRecords.length,
       broad_response_refs: broadResponses.length,
       duplicate_evidence_facts: duplicateEvidenceFacts,
+      duplicate_semantic_facts: duplicateEvidenceFacts,
       generic_evidence_facts: genericEvidenceFacts.length,
+      generic_semantic_facts: genericEvidenceFacts.length,
       unsupported_response_claims: unsupportedResponseClaims.length,
       context_only_response_claims: contextOnlyResponseClaims.length,
       payload_duplication_groups: payloadDuplicationGroups,
@@ -4693,6 +4974,8 @@ class ActiveCaseTrace {
       over_attributed_claims: overAttributedClaims.length,
       generic_mcp_facts: genericMcpFacts.length,
       path_only_evidence_facts: pathOnlyEvidenceFacts.length,
+      execution_observations: records.filter((record) => record.event_type === "execution.observation").length,
+      task_plan_states: records.filter((record) => record.event_type === "task.plan_state").length,
       non_final_response_claims: nonFinalResponseClaims.length,
       weak_evidence_matches: weakEvidenceMatches.length,
       mcp_json_parse_shadowed: mcpJsonParseShadowed.length,
@@ -5037,7 +5320,7 @@ class ActiveCaseTrace {
       relation: parsed.type === "evidence" ? "evidence_to_response" : "source_to_response",
       label:
         parsed.type === "evidence"
-          ? "Evidence fact supported response output"
+          ? "Semantic evidence supported response output"
           : "Response output consumed source record",
     })
   }
@@ -5055,7 +5338,7 @@ class ActiveCaseTrace {
       relation,
       label:
         relation === "evidence_to_claim"
-          ? "Evidence fact supports response claim"
+          ? "Semantic evidence supports response claim"
           : relation === "context_to_claim"
             ? "Context record contextualizes response claim"
             : "Execution record was used for response claim",

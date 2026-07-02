@@ -1,10 +1,13 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "5.1" as const
+export const TRACE_VERSION = "5.2" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
+  "case.completed",
+  "case.failed",
   "task.loop",
+  "task.plan_state",
   "prompt.assembly",
   "context.transform",
   "context.pack",
@@ -21,7 +24,9 @@ export const FORMAL_RECORD_TYPES = [
   "subagent.call",
   "loop.decision",
   "observation",
+  "execution.observation",
   "evidence.fact",
+  "evidence.semantic_fact",
   "change",
   "verification",
   "response.output",
