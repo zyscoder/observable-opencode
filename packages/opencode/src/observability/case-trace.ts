@@ -402,6 +402,7 @@ export type TraceHealthMetrics = {
   expected_lifecycle_finalized_records?: number
   unexpected_missing_close_records?: number
   cancelled_after_case_completion_records?: number
+  closed_after_case_completion_records?: number
   llm_turns_missing_token_usage: number
   llm_turns_missing_finish_reason: number
   compaction_quality_flags: Record<string, number>
@@ -5391,6 +5392,9 @@ class ActiveCaseTrace {
           (record) => record.status === "cancelled" && record.data?.finalized_reason === "trace_cancelled",
         )
       : []
+    const closedAfterCaseCompletionRecords = records.filter(
+      (record) => record.data?.finalized_status === "closed_after_case_completion",
+    )
     const expectedFinalizedTypes = new Set([
       "run.start",
       "task.loop",
@@ -5425,6 +5429,15 @@ class ActiveCaseTrace {
         event_type: record.event_type,
       })
     }
+    for (const record of closedAfterCaseCompletionRecords.slice(0, 20)) {
+      issues.push({
+        kind: "closed_after_case_completion",
+        severity: "warning",
+        message: "Record was still running after the final case response and was closed during service shutdown.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+      })
+    }
     for (const record of openRecords.slice(0, 20)) {
       issues.push({
         kind: "open_record",
@@ -5443,7 +5456,11 @@ class ActiveCaseTrace {
     )
     const isExpectedCancelledLlmTurn = (record: ProvenanceRecord) =>
       record.status === "cancelled" && record.data?.finalized_reason === "trace_cancelled"
-    const llmTurnsRequiringCompletionMetadata = llmTurns.filter((record) => !isExpectedCancelledLlmTurn(record))
+    const isClosedAfterCaseCompletionLlmTurn = (record: ProvenanceRecord) =>
+      record.data?.finalized_status === "closed_after_case_completion"
+    const llmTurnsRequiringCompletionMetadata = llmTurns
+      .filter((record) => !isExpectedCancelledLlmTurn(record))
+      .filter((record) => !isClosedAfterCaseCompletionLlmTurn(record))
     const llmTurnsMissingTokenUsage = llmTurnsRequiringCompletionMetadata.filter(
       (record) => record.data?.agent_role !== "title" && !record.token_usage?.total,
     )
@@ -5705,6 +5722,7 @@ class ActiveCaseTrace {
       expected_lifecycle_finalized_records: expectedLifecycleFinalizedRecords.length,
       unexpected_missing_close_records: unexpectedMissingCloseRecords.length,
       cancelled_after_case_completion_records: cancelledAfterCaseCompletionRecords.length,
+      closed_after_case_completion_records: closedAfterCaseCompletionRecords.length,
       llm_turns_missing_token_usage: llmTurnsMissingTokenUsage.length,
       llm_turns_missing_finish_reason: llmTurnsMissingFinishReason.length,
       compaction_quality_flags: compactionQualityFlags,

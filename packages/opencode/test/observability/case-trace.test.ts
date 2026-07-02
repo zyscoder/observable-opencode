@@ -2163,6 +2163,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "server case" }, environment: { model: "unit-test" } })`,
         `CaseTrace.agentLifecycle({ session_id: "ses_case", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: "open http turn" })`,
+        `CaseTrace.llmTurn({ turn_id: "post_final_turn", session_id: "ses_case", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running" })`,
         `CaseTrace.responseOutput({ text: "Final answer completed over HTTP.", source_refs: ["execution:request_1"], metadata: { response_role: "final_answer", visibility: "user_visible", is_final_for_case: true } })`,
         `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGINT" } })`,
       ].join("\n"),
@@ -2193,6 +2194,7 @@ describe("case trace", () => {
     const finalizedLifecycle = trace.records.find(
       (record: any) => record.event_type === "agent.lifecycle" && record.data?.phase === "turn.started",
     )
+    const finalizedLlmTurn = trace.records.find((record: any) => record.record_id === "llmturn_post_final_turn")
 
     expect(trace.trace_version).toBe("5.5")
     expect(manifest.status).toBe("cancelled")
@@ -2205,7 +2207,17 @@ describe("case trace", () => {
     expect(finalizedLifecycle.status).toBe("success")
     expect(finalizedLifecycle.data.finalized_status).toBe("closed_after_case_completion")
     expect(finalizedLifecycle.data.finalized_reason).toBe("service_shutdown_after_completion")
+    expect(finalizedLlmTurn.status).toBe("success")
+    expect(finalizedLlmTurn.data.finalized_status).toBe("closed_after_case_completion")
+    expect(finalizedLlmTurn.data.finalized_reason).toBe("service_shutdown_after_completion")
     expect(trace.metrics.trace_health.cancelled_after_case_completion_records).toBe(0)
+    expect(trace.metrics.trace_health.closed_after_case_completion_records).toBeGreaterThan(0)
+    expect(trace.metrics.trace_health.llm_turns_missing_token_usage).toBe(0)
+    expect(trace.metrics.trace_health.llm_turns_missing_finish_reason).toBe(0)
+    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).toContain("closed_after_case_completion")
+    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
+      "llm_turn_missing_token_usage",
+    )
   })
 
   test("links recent tool errors to final claims without manual source refs", async () => {
