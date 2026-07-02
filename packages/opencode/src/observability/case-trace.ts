@@ -356,6 +356,8 @@ export type TraceResponseClaimRecord = {
   match_reasons?: string[]
   original_direct_evidence_refs?: string[]
   derived_tool_outcome_refs?: string[]
+  candidate_tool_outcome_refs?: string[]
+  dependency_tool_outcome_refs?: string[]
   attribution_summary?: Record<string, unknown>
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
@@ -2154,14 +2156,14 @@ function toolOutcomeMatchAnalysis(
     if (claimMentionsFailure) {
       score += 0.35
       reasons.push("claim_mentions_tool_failure")
-    }
-    if (outcomeMentionsFailure) {
-      score += 0.25
-      reasons.push("tool_error_text")
-    }
-    if (/file-not-found|file_not_found|not found|no such file|enoent|不存在|找不到/.test(haystack)) {
-      score += 0.25
-      reasons.push("tool_error_kind")
+      if (outcomeMentionsFailure) {
+        score += 0.25
+        reasons.push("tool_error_text")
+      }
+      if (/file-not-found|file_not_found|not found|no such file|enoent|不存在|找不到/.test(haystack)) {
+        score += 0.25
+        reasons.push("tool_error_kind")
+      }
     }
   }
   const claimTerms = new Set(matchTerms(claim))
@@ -3022,6 +3024,12 @@ function planStateSummary(payload: unknown) {
 function evidenceRecordKind(input: EvidenceFactInput, canonical: ReturnType<typeof canonicalEvidence>) {
   if (isPlanStateInput(input.source, input.category, input.data ?? input.summary)) return "task.plan_state"
   if (canonical.quality_flags.includes("path_only_listing_fact")) return "execution.observation"
+  if (
+    canonical.quality_flags.includes("path_only_evidence_fact") &&
+    canonical.quality_flags.some((flag) => flag === "generic_claim" || flag === "fallback_summary_claim")
+  ) {
+    return "execution.observation"
+  }
   if (
     canonical.fact_kind === "observation" &&
     canonical.quality_flags.some((flag) =>
@@ -4143,10 +4151,10 @@ class ActiveCaseTrace {
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
-    const derivedToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs(sourceRefs)
+    const candidateToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs(sourceRefs)
     const candidateClassifiedRefs = {
       ...classifiedRefs,
-      direct_evidence_refs: dedupeStrings([...classifiedRefs.direct_evidence_refs, ...derivedToolOutcomeRefs]),
+      direct_evidence_refs: dedupeStrings([...classifiedRefs.direct_evidence_refs, ...candidateToolOutcomeRefs]),
     }
     const claimText = input.canonical_text ?? input.text
     const evidenceMatch = this.matchEvidenceForClaim(claimText, candidateClassifiedRefs.direct_evidence_refs)
@@ -4169,6 +4177,10 @@ class ActiveCaseTrace {
     const attributionSourceRefs = effectiveDirectEvidenceRefs.length
       ? effectiveDirectEvidenceRefs
       : dedupeStrings([...classifiedRefs.execution_refs.slice(0, 3), ...classifiedRefs.context_refs.slice(0, 3)])
+    const dependencyToolOutcomeRefs = dedupeStrings([
+      ...effectiveDirectEvidenceRefs.filter(isToolOutcomeRef),
+      ...this.toolOutcomeRefsFromSourceRefs(effectiveDirectEvidenceRefs),
+    ])
     const attributionSummary = {
       direct_evidence_count: effectiveDirectEvidenceRefs.length,
       matched_evidence_count: evidenceMatch.refs.length,
@@ -4176,7 +4188,9 @@ class ActiveCaseTrace {
       context_ref_count: classifiedRefs.context_refs.length,
       execution_ref_count: classifiedRefs.execution_refs.length,
       legacy_context_count: legacyContextRefs.length,
-      derived_tool_outcome_count: derivedToolOutcomeRefs.length,
+      candidate_tool_outcome_count: candidateToolOutcomeRefs.length,
+      dependency_tool_outcome_count: dependencyToolOutcomeRefs.length,
+      derived_tool_outcome_count: dependencyToolOutcomeRefs.length,
       support_level: supportLevel,
       match_strategy: evidenceMatch.strategy,
       match_score: evidenceMatch.score,
@@ -4215,7 +4229,9 @@ class ActiveCaseTrace {
       match_score: evidenceMatch.score,
       match_reasons: evidenceMatch.reasons,
       original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
-      derived_tool_outcome_refs: derivedToolOutcomeRefs,
+      derived_tool_outcome_refs: dependencyToolOutcomeRefs,
+      candidate_tool_outcome_refs: candidateToolOutcomeRefs,
+      dependency_tool_outcome_refs: dependencyToolOutcomeRefs,
       attribution_summary: attributionSummary,
       source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
@@ -4224,7 +4240,9 @@ class ActiveCaseTrace {
       metadata: omitUndefined({
         ...(input.metadata ?? {}),
         original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
-        derived_tool_outcome_refs: derivedToolOutcomeRefs,
+        derived_tool_outcome_refs: dependencyToolOutcomeRefs,
+        candidate_tool_outcome_refs: candidateToolOutcomeRefs,
+        dependency_tool_outcome_refs: dependencyToolOutcomeRefs,
       }),
     }
     const node = this.node({
@@ -4255,6 +4273,8 @@ class ActiveCaseTrace {
         match_reasons: claim.match_reasons,
         original_direct_evidence_refs: claim.original_direct_evidence_refs,
         derived_tool_outcome_refs: claim.derived_tool_outcome_refs,
+        candidate_tool_outcome_refs: claim.candidate_tool_outcome_refs,
+        dependency_tool_outcome_refs: claim.dependency_tool_outcome_refs,
         attribution_summary: claim.attribution_summary,
         support_level: claim.support_level,
         quality_flags: claim.quality_flags,
@@ -4285,13 +4305,11 @@ class ActiveCaseTrace {
   }
 
   private claimSupportAssessment(claim: TraceResponseClaimRecord, claimNodeID: string) {
-    const transitiveToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs([
-      ...claim.direct_evidence_refs,
-      ...(claim.matched_evidence_refs ?? []),
-      ...(claim.candidate_evidence_refs ?? []),
-    ])
+    const attributionRefs = dedupeStrings([...claim.direct_evidence_refs, ...(claim.matched_evidence_refs ?? [])])
+    const transitiveToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs(attributionRefs)
     const allToolOutcomeRefs = dedupeStrings([
-      ...claim.direct_evidence_refs.filter(isToolOutcomeRef),
+      ...attributionRefs.filter(isToolOutcomeRef),
+      ...(claim.dependency_tool_outcome_refs ?? []),
       ...(claim.derived_tool_outcome_refs ?? []),
       ...transitiveToolOutcomeRefs,
     ])
@@ -4326,6 +4344,8 @@ class ActiveCaseTrace {
         missing_evidence_types: missingEvidenceTypes,
         direct_evidence_refs: claim.direct_evidence_refs,
         derived_tool_outcome_refs: claim.derived_tool_outcome_refs,
+        candidate_tool_outcome_refs: claim.candidate_tool_outcome_refs,
+        dependency_tool_outcome_refs: claim.dependency_tool_outcome_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
         context_refs: claim.context_refs,

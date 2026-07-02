@@ -175,7 +175,7 @@
       "tool_error_observation",
       "claim_support_assessment",
       "tool_failure_claim_dependency",
-      "unsupported_claims",
+      "tool_failure_handled_or_unsupported",
       "claim_direct_evidence_refs",
       "final_test_result"
     ],

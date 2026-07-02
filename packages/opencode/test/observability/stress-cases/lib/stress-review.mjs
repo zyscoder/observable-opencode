@@ -165,6 +165,17 @@ function detectEvidence(name, trace) {
           Array.isArray(record.data?.tool_failure_dependency_refs) &&
           record.data.tool_failure_dependency_refs.some((ref) => String(ref).startsWith("tool_error:")),
       ),
+    tool_failure_handled_or_unsupported: (records, fullTrace) => {
+      const unsupported = detectors.unsupported_claims(records, fullTrace)
+      if (unsupported.length) return unsupported
+      return records.filter(
+        (record) =>
+          record.event_type === "claim.support_assessment" &&
+          Array.isArray(record.data?.tool_failure_dependency_refs) &&
+          record.data.tool_failure_dependency_refs.some((ref) => String(ref).startsWith("tool_error:")) &&
+          (!Array.isArray(record.data?.missing_evidence_types) || record.data.missing_evidence_types.length === 0),
+      )
+    },
     unsupported_claims: (records, fullTrace) => {
       const health = fullTrace?.metrics?.trace_health ?? {}
       if ((health.unsupported_response_claims ?? 0) > 0 || (health.context_only_response_claims ?? 0) > 0) {

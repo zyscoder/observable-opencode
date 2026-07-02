@@ -7,7 +7,6 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Flock } from "@opencode-ai/core/util/flock"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
-import { withTransientReadRetry } from "@/util/effect-http-client"
 import { CatalogModelStatus } from "./model-status"
 
 const Cost = Schema.Struct({
@@ -101,13 +100,12 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | HttpClie
   Service,
   Effect.gen(function* () {
     const fs = yield* AppFileSystem.Service
-    const http = HttpClient.filterStatusOk(withTransientReadRetry(yield* HttpClient.HttpClient))
+    const http = HttpClient.filterStatusOk(yield* HttpClient.HttpClient)
 
     const source = Flag.OPENCODE_MODELS_URL || "https://models.dev"
-    const filepath = path.join(
-      Global.Path.cache,
-      source === "https://models.dev" ? "models.json" : `models-${Hash.fast(source)}.json`,
-    )
+    const isDefaultSource = source === "https://models.dev"
+    const fetchTimeoutMs = Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS ?? 2500
+    const filepath = path.join(Global.Path.cache, isDefaultSource ? "models.json" : `models-${Hash.fast(source)}.json`)
     const ttl = Duration.minutes(5)
     const lockKey = `models-dev:${filepath}`
 
@@ -123,7 +121,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | HttpClie
         HttpClientRequest.setHeader("User-Agent", Installation.USER_AGENT),
         http.execute,
         Effect.flatMap((res) => res.text),
-        Effect.timeout("10 seconds"),
+        Effect.timeout(fetchTimeoutMs),
       )
     })
 
@@ -132,17 +130,28 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | HttpClie
       Effect.map((v) => v as Record<string, Provider> | undefined),
     )
 
-    // Bundled at build time; absent in dev — `tryPromise` covers both.
-    const loadSnapshot = Effect.tryPromise({
-      // @ts-ignore — generated at build time, may not exist in dev
-      try: () => import("./models-snapshot.js").then((m) => m.snapshot as Record<string, Provider> | undefined),
-      catch: () => undefined,
-    }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    // Bundled at build time; absent in dev — `tryPromise` covers both. Only
+    // the default models.dev source should fall back to the bundled snapshot;
+    // custom catalogs should not silently receive unrelated default models.
+    const loadSnapshot = isDefaultSource
+      ? Effect.tryPromise({
+          // @ts-ignore — generated at build time, may not exist in dev
+          try: () => import("./models-snapshot.js").then((m) => m.snapshot as Record<string, Provider> | undefined),
+          catch: () => undefined,
+        }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      : Effect.succeed(undefined)
 
     const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {
       const text = yield* fetchApi()
       yield* fs.writeWithDirs(filepath, text)
       return text
+    })
+
+    const parseProviders = Effect.fnUntraced(function* (text: string) {
+      return yield* Effect.try({
+        try: () => JSON.parse(text) as Record<string, Provider>,
+        catch: (cause) => cause,
+      })
     })
 
     const populate = Effect.gen(function* () {
@@ -152,14 +161,23 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | HttpClie
       if (snapshot) return snapshot
       if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
       // Flock is cross-process: concurrent opencode CLIs can race on this cache file.
-      const text = yield* Effect.scoped(
+      const fetched = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Flock.effect(lockKey)
-          return yield* fetchAndWrite()
+          return yield* fetchAndWrite().pipe(Effect.flatMap(parseProviders))
         }),
+      ).pipe(
+        Effect.tapCause((cause) =>
+          Effect.logWarning("Failed to fetch models.dev catalog; continuing without remote model catalog", {
+            cause,
+            source,
+            timeout_ms: fetchTimeoutMs,
+          }),
+        ),
+        Effect.catch(() => Effect.succeed(undefined as Record<string, Provider> | undefined)),
       )
-      return JSON.parse(text) as Record<string, Provider>
-    }).pipe(Effect.withSpan("ModelsDev.populate"), Effect.orDie)
+      return fetched ?? {}
+    }).pipe(Effect.withSpan("ModelsDev.populate"))
 
     const [cachedGet, invalidate] = yield* Effect.cachedInvalidateWithTTL(populate, Duration.infinity)
 
@@ -177,7 +195,9 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | HttpClie
           yield* invalidate
         }),
       ).pipe(
-        Effect.tapCause((cause) => Effect.logError("Failed to fetch models.dev", { cause })),
+        Effect.tapCause((cause) =>
+          Effect.logWarning("Failed to refresh models.dev catalog", { cause, source, timeout_ms: fetchTimeoutMs }),
+        ),
         Effect.ignore,
       )
     })

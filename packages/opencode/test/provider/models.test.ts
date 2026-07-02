@@ -16,13 +16,19 @@ import path from "path"
 // bun process.
 const ORIGINAL_MODELS_PATH = Flag.OPENCODE_MODELS_PATH
 const ORIGINAL_DISABLE_FETCH = Flag.OPENCODE_DISABLE_MODELS_FETCH
+const ORIGINAL_MODELS_URL = Flag.OPENCODE_MODELS_URL
+const ORIGINAL_FETCH_TIMEOUT_MS = Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS
 beforeAll(() => {
   Flag.OPENCODE_MODELS_PATH = undefined
   Flag.OPENCODE_DISABLE_MODELS_FETCH = true
+  Flag.OPENCODE_MODELS_URL = undefined
+  Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS = undefined
 })
 afterAll(() => {
   Flag.OPENCODE_MODELS_PATH = ORIGINAL_MODELS_PATH
   Flag.OPENCODE_DISABLE_MODELS_FETCH = ORIGINAL_DISABLE_FETCH
+  Flag.OPENCODE_MODELS_URL = ORIGINAL_MODELS_URL
+  Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS = ORIGINAL_FETCH_TIMEOUT_MS
 })
 
 const cacheFile = path.join(Global.Path.cache, "models.json")
@@ -105,6 +111,10 @@ const provided = <A, E>(state: Ref.Ref<MockState>, eff: Effect.Effect<A, E, Mode
   eff.pipe(Effect.provide(buildLayer(state)))
 
 beforeEach(async () => {
+  Flag.OPENCODE_MODELS_PATH = undefined
+  Flag.OPENCODE_DISABLE_MODELS_FETCH = true
+  Flag.OPENCODE_MODELS_URL = undefined
+  Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS = undefined
   await rm(cacheFile, { force: true })
 })
 
@@ -133,8 +143,9 @@ describe("ModelsDev Service", () => {
     }),
   )
 
-  it.live("get() returns {} when disk empty and fetch disabled", () =>
+  it.live("get() returns {} for a custom catalog when disk empty and fetch disabled", () =>
     Effect.gen(function* () {
+      Flag.OPENCODE_MODELS_URL = "https://models.example.invalid/catalog"
       const state = yield* Ref.make(initialState)
       const result = yield* provided(
         state,
@@ -143,6 +154,24 @@ describe("ModelsDev Service", () => {
       expect(result).toEqual({})
       const final = yield* Ref.get(state)
       expect(final.calls).toEqual([])
+    }),
+  )
+
+  it.live("get() falls back to {} when custom catalog fetch fails", () =>
+    Effect.gen(function* () {
+      const customSource = "https://models.example.invalid/catalog"
+      Flag.OPENCODE_DISABLE_MODELS_FETCH = false
+      Flag.OPENCODE_MODELS_URL = customSource
+      Flag.OPENCODE_MODELS_FETCH_TIMEOUT_MS = 250
+      const state = yield* Ref.make({ ...initialState, status: 500, body: "boom" })
+      const result = yield* provided(
+        state,
+        ModelsDev.Service.use((s) => s.get()),
+      )
+      expect(result).toEqual({})
+      const final = yield* Ref.get(state)
+      expect(final.calls.length).toBe(1)
+      expect(final.calls[0].url).toBe(`${customSource}/api.json`)
     }),
   )
 
@@ -251,9 +280,8 @@ describe("ModelsDev Service", () => {
         }),
       )
       expect(result).toEqual(fixture)
-      // withTransientReadRetry retries 5xx, so calls may be > 1.
       const final = yield* Ref.get(state)
-      expect(final.calls.length).toBeGreaterThanOrEqual(1)
+      expect(final.calls.length).toBe(1)
     }),
   )
 })
