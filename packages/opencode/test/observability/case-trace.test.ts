@@ -460,6 +460,94 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.broken_claim_fragments).toBe(0)
   })
 
+  test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-discount-values-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "discount-values-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "payment discount cap", data: { path: "src/payment/discounts.mjs", line_start: 3, line_end: 3, text: "export const settlementDiscountCap = 0.2" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "old design discount cap", data: { path: "docs/old-design.md", line_start: 8, line_end: 8, text: "Legacy renewal discount cap is 20 percent." } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "current requirement discount cap", data: { path: "docs/current-requirement.md", line_start: 4, line_end: 4, text: "Current renewal discount cap is 15%." } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "discount-values-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "discount-values-v56-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const values = facts.map((record: any) => record.data.structured_claim?.value)
+
+    expect(values).toContain("0.2")
+    expect(values).toContain("20 percent")
+    expect(values).toContain("15%")
+    expect(values.filter((value: string) => value === "15 percent")).toHaveLength(0)
+  })
+
+  test("does not create response claims from markdown headings or code fence markers", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-fence-filter-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "fence-filter-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "### MCP 返回的事实\\n\\n\\\`\\\`\\\`diff\\n- const cap = 0.2\\n+ const cap = 0.15\\n\\\`\\\`\\\`\\n\\n### 修改点\\n\\nsrc/pricing.mjs 将 discount cap 调整为 15%。" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "fence-filter-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "fence-filter-v56-case", "trace.json"), "utf8")) as any
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const claimText = claims.map((record: any) => record.data.text).join("\n")
+
+    expect(claimText).not.toContain("MCP 返回的事实")
+    expect(claimText).not.toContain("```diff")
+    expect(claimText).not.toContain("### 修改点")
+    expect(claimText).toContain("src/pricing.mjs")
+    expect(claimText).toContain("discount cap")
+    expect(claimText).toContain("15%")
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

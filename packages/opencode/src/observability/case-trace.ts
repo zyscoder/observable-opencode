@@ -1766,7 +1766,7 @@ type ResponseClaimCandidate = {
 }
 
 function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
-  const text = typeof input === "string" ? input : stringPreview(input, 8000)
+  const text = stripResponseClaimScaffolding(typeof input === "string" ? input : stringPreview(input, 8000))
   if (!text.trim()) return []
   const protectedText = protectClaimSegments(text)
   const normalized = protectedText.text
@@ -1794,6 +1794,14 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
       return [candidate]
     })
     .slice(0, 50)
+}
+
+function stripResponseClaimScaffolding(input: string) {
+  return input
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*```/.test(line))
+    .join("\n")
 }
 
 function isNonFactualResponseClaim(input: string) {
@@ -1828,6 +1836,8 @@ function isNonFactualResponseClaim(input: string) {
       normalized,
     )
   )
+    return true
+  if (/^(?:(?:mcp\s*)?返回的事实|mcp facts?|facts?|修改点|改动点|变更点|changes?|changed files?)$/i.test(normalized))
     return true
   if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
@@ -2638,15 +2648,16 @@ function structuredClaimFromLineText(
   const text = input.trim()
   if (!text) return undefined
   const normalized = text.toLowerCase()
+  const explicitDiscountCapValue = explicitDiscountCapValueFromText(text)
   if (
     /(discount|折扣)/i.test(text) &&
-    /(cap|capped|limit|maximum|max|上限|封顶|math\.min|0\.15|15\s*%|15\s+percent)/i.test(text)
+    /(cap|capped|limit|maximum|max|上限|封顶|math\.min|0\.\d+|\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s+percent)/i.test(text) &&
+    explicitDiscountCapValue
   ) {
-    const value = /0\.15/.test(text) ? "0.15" : /15\s*%/.test(text) ? "15%" : "15 percent"
     return {
       subject: /renewalquote/i.test(text) ? "renewalQuote" : "discount",
       predicate: "discount_cap",
-      value,
+      value: explicitDiscountCapValue,
       source_span: sourceSpan,
       extraction_method: "source_line_pattern",
     }
@@ -2679,15 +2690,25 @@ function structuredClaimFromLineText(
       extraction_method: "source_line_pattern",
     }
   }
-  if (normalized.includes("math.min") && /0\.15/.test(text)) {
+  if (normalized.includes("math.min") && explicitDiscountCapValue) {
     return {
       subject: "renewalQuote",
       predicate: "discount_cap",
-      value: "0.15",
+      value: explicitDiscountCapValue,
       source_span: sourceSpan,
       extraction_method: "source_line_pattern",
     }
   }
+  return undefined
+}
+
+function explicitDiscountCapValueFromText(input: string) {
+  const decimal = input.match(/\b0\.\d+\b/)
+  if (decimal?.[0]) return decimal[0]
+  const percent = input.match(/\b(\d+(?:\.\d+)?)\s*%/)
+  if (percent?.[1]) return `${percent[1]}%`
+  const percentWord = input.match(/\b(\d+(?:\.\d+)?)\s+percent\b/i)
+  if (percentWord?.[1]) return `${percentWord[1]} percent`
   return undefined
 }
 
