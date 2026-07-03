@@ -26,7 +26,7 @@ import { SessionEvent } from "@/v2/session-event"
 import { Modelv2 } from "@/v2/model"
 import * as DateTime from "effect/DateTime"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { CaseTrace } from "@/observability/case-trace"
+import { CaseTrace, type TraceResponseSegment } from "@/observability/case-trace"
 
 const DOOM_LOOP_THRESHOLD = 3
 const log = Log.create({ service: "session.processor" })
@@ -117,6 +117,15 @@ export function shouldExtractDesignRecordForResponse(text: string) {
   ]
   const matchedDimensions = dimensions.filter((pattern) => pattern.test(normalized)).length
   return matchedDimensions >= 3
+}
+
+export function shouldExtractDesignRecordForResponseSegment(
+  text: string,
+  responseSegment: Pick<TraceResponseSegment, "response_role" | "is_final_for_case" | "visibility"> | undefined,
+) {
+  if (!shouldExtractDesignRecordForResponse(text)) return false
+  if (!responseSegment) return false
+  return responseSegment.is_final_for_case === true || responseSegment.response_role === "final_answer"
 }
 
 function keywordExcerpt(text: string, keywords: string[]) {
@@ -901,7 +910,7 @@ export const layer: Layer.Layer<
                 label: "Completed assistant text recorded as response output",
               })
             }
-            if (shouldExtractDesignRecordForResponse(ctx.currentText.text)) {
+            if (shouldExtractDesignRecordForResponseSegment(ctx.currentText.text, responseSegment)) {
               const designRecord = CaseTrace.designRecord({
                 source: "final_response",
                 requirement_summary: keywordExcerpt(ctx.currentText.text, ["需求", "目标", "requirement", "goal"]),

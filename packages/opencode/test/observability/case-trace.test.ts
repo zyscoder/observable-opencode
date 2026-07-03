@@ -2629,7 +2629,15 @@ describe("case trace", () => {
   })
 
   test("does not extract design records from short progress or result summaries", async () => {
-    const { shouldExtractDesignRecordForResponse } = await import("@/session/processor")
+    const { shouldExtractDesignRecordForResponse, shouldExtractDesignRecordForResponseSegment } = await import(
+      "@/session/processor"
+    )
+    const designLikeSummary = [
+      "Here is a complete summary of everything related to `renewalQuote`.",
+      "## Overall Design and Architecture",
+      "The architecture doc specifies design constraints: general discount logic, no hardcoding test inputs, and no public API bypass.",
+      "The implementation uses the pricing module and tests verify the expected result.",
+    ].join("\\n")
 
     expect(
       shouldExtractDesignRecordForResponse(
@@ -2670,6 +2678,21 @@ describe("case trace", () => {
           "禁止绕过 public API：所有逻辑通过 renewalQuote(input) 暴露。",
         ].join("\\n"),
       ),
+    ).toBe(true)
+    expect(shouldExtractDesignRecordForResponse(designLikeSummary)).toBe(true)
+    expect(
+      shouldExtractDesignRecordForResponseSegment(designLikeSummary, {
+        response_role: "intermediate_summary",
+        visibility: "user_visible",
+        is_final_for_case: false,
+      }),
+    ).toBe(false)
+    expect(
+      shouldExtractDesignRecordForResponseSegment(designLikeSummary, {
+        response_role: "final_answer",
+        visibility: "user_visible",
+        is_final_for_case: true,
+      }),
     ).toBe(true)
   })
 
