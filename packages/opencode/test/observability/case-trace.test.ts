@@ -948,6 +948,47 @@ describe("case trace", () => {
     expect(claimText).toContain("pricing tests passed")
   })
 
+  test("drops localized key-value table headers from response claims", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v58-table-header-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "table-header-v58.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "| 字段 | 值 |\\n|------|----|\\n| subject | \`renewalQuote\` |\\n| predicate | \`discount_cap\` |\\n| value | **15%** |\\n| path | \`docs/current-requirement.md:3\` |" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "table-header-v58-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "table-header-v58-case", "trace.json"), "utf8")) as any
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const claimText = claims.map((record: any) => record.data.text).join("\n")
+
+    expect(claimText).not.toContain("字段: 值")
+    expect(claimText).toContain("value: 15%")
+    expect(claimText).toContain("path: docs/current-requirement.md:3")
+  })
+
   test("canonicalizes factual markdown table rows and drops section scaffolding claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v51-table-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

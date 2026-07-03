@@ -1861,7 +1861,12 @@ function isLikelyTableHeaderCell(input: string) {
   const normalized = input.trim().toLowerCase()
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
-  if (/^(项目|结果|来源|关键信息|维度|说明|文件|路径|议题|子 agent 结论|subagent result)$/.test(normalized)) return true
+  if (
+    /^(项目|结果|来源|关键信息|维度|说明|字段|值|文件|路径|议题|子 agent 结论|subagent result|field|value)$/.test(
+      normalized,
+    )
+  )
+    return true
   if (/^mcp\s+[\w-]+$/i.test(normalized)) return true
   if (/^syntheticfacts(?:\s*\(mcp\))?[_\w.-]*$/i.test(normalized)) return true
   if (/^(?:[\w@+.-]+\/)?[\w@+.-]+\.(?:md|mjs|js|ts|tsx|json|txt|py|go|rs|java|yaml|yml)$/i.test(normalized)) return true
