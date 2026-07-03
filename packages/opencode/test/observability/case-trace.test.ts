@@ -3770,4 +3770,64 @@ describe("case trace", () => {
     expect(html).toContain("Trace Provenance")
     expect(html).toContain("Artifacts")
   })
+
+  test("drops design records attached to response segments later demoted from final", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-design-final-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "design-record-final-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const earlyDesignText = [
+      "方案设计：这是一次中间代码仓扫描总结。",
+      "架构边界：pricing 负责报价，docs 记录设计约束。",
+      "设计约束：不允许 hardcode 测试输入，不绕过 public API。",
+      "测试策略：稍后继续运行 pricing 单测。",
+    ].join("\\n")
+    const finalDesignText = [
+      "方案设计：最终采用修正折扣上限的通用计算方案。",
+      "架构边界：仅修改 pricing 内部常量，保持 public API 不变。",
+      "设计约束：不硬编码测试输入，不绕过 public API，保持通用计算逻辑。",
+      "测试策略：pricing 单测和 design-quality 测试均通过。",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const early = CaseTrace.responseOutput({ text: ${JSON.stringify(earlyDesignText)}, response_role: "final_answer", is_final_for_case: true })`,
+        `CaseTrace.designRecord({ source: "final_response", selected_solution: ${JSON.stringify(earlyDesignText)}, design_constraints: "不允许 hardcode 测试输入", test_strategy: "稍后运行单测", metadata: { source_segment_id: early?.segment_id } })`,
+        `const final = CaseTrace.responseOutput({ text: ${JSON.stringify(finalDesignText)}, response_role: "final_answer", is_final_for_case: true })`,
+        `const kept = CaseTrace.designRecord({ source: "final_response", selected_solution: ${JSON.stringify(finalDesignText)}, design_constraints: "保持通用计算逻辑", test_strategy: "pricing 单测和 design-quality 测试均通过", metadata: { source_segment_id: final?.segment_id } })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `console.log(kept?.design_id)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "design-record-final-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "96",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+    const keptDesignID = (await new Response(proc.stdout).text()).trim()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "design-record-final-case")
+    const legacyTrace = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
+    const provenanceTrace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const designRecords = provenanceTrace.records.filter((record: any) => record.event_type === "design.record")
+
+    expect(legacyTrace.design_records.map((record: any) => record.design_id)).toEqual([keptDesignID])
+    expect(designRecords.map((record: any) => record.record_id)).toEqual([keptDesignID])
+    expect(designRecords[0].data.selected_solution.preview).toContain("最终采用")
+  })
 })

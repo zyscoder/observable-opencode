@@ -4597,6 +4597,55 @@ class ActiveCaseTrace {
     }
   }
 
+  private responseSegmentIDForDesignRecord(record: TraceDesignRecord) {
+    const metadata =
+      record.metadata && typeof record.metadata === "object" ? (record.metadata as Record<string, unknown>) : {}
+    const metadataSegmentID = stringField(metadata, ["source_segment_id", "response_segment_id"])
+    if (metadataSegmentID) return metadataSegmentID
+    const responseSegmentRef = record.source_refs?.find((ref) => ref.startsWith("response_segment:"))
+    return responseSegmentRef?.slice("response_segment:".length)
+  }
+
+  private pruneDesignRecordsForFinalResponses() {
+    const finalSegmentIDs = new Set(
+      this.responseSegments
+        .filter(
+          (segment) =>
+            segment.response_role === "final_answer" &&
+            segment.visibility === "user_visible" &&
+            segment.is_final_for_case === true,
+        )
+        .map((segment) => segment.segment_id),
+    )
+    const staleDesignIDs = new Set<string>()
+    const retainedDesignRecords: TraceDesignRecord[] = []
+    for (const record of this.designRecords) {
+      if (record.source !== "final_response") {
+        retainedDesignRecords.push(record)
+        continue
+      }
+      const segmentID = this.responseSegmentIDForDesignRecord(record)
+      if (!segmentID || finalSegmentIDs.has(segmentID)) {
+        retainedDesignRecords.push(record)
+        continue
+      }
+      staleDesignIDs.add(record.design_id)
+    }
+    if (!staleDesignIDs.size) return
+
+    this.designRecords = retainedDesignRecords
+    this.causalNodes = this.causalNodes.filter((node) => !staleDesignIDs.has(node.node_id))
+    const referencesStaleDesign = (edge: { from: TraceRef; to: TraceRef }) =>
+      (edge.from.type === "design_record" && staleDesignIDs.has(edge.from.id)) ||
+      (edge.to.type === "design_record" && staleDesignIDs.has(edge.to.id))
+    this.semanticEdges = this.semanticEdges.filter((edge) => !referencesStaleDesign(edge))
+    this.causalEdges = this.causalEdges.filter((edge) => !referencesStaleDesign(edge))
+    this.write("semantic.design_record.pruned", {
+      design_ids: [...staleDesignIDs],
+      reason: "source response segment is no longer the final user-visible answer",
+    })
+  }
+
   private promoteFinalResponseFromExitGate(input: ExitGateInput): TraceResponseSegment | undefined {
     if (input.has_final_answer !== true) return undefined
     if (input.decision !== "exit") return undefined
@@ -5205,6 +5254,7 @@ class ActiveCaseTrace {
     if (this.finished) return
     this.evaluateConstraints()
     this.normalizeFinalResponseSegments()
+    this.pruneDesignRecordsForFinalResponses()
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
