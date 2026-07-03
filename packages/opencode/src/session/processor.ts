@@ -102,15 +102,15 @@ export function shouldExtractDesignRecordForResponse(text: string) {
     return false
   }
   const hasDesignIntent =
-    /方案设计|设计方案|架构|模块边界|架构边界|分层|architecture|boundary|design proposal|solution design|design constraints?/i.test(
+    /方案设计|设计方案|设计约束|设计质量|架构|模块边界|架构边界|分层|architecture|boundary|design proposal|solution design|design constraints?/i.test(
       normalized,
     )
   if (!hasDesignIntent) return false
   const dimensions = [
     /需求|目标|requirement|goal/i,
     /架构|边界|分层|模块|architecture|boundary|layer|module/i,
-    /约束|兼容|稳定|constraint|compat|stability|hardcode|public api|通用|api/i,
-    /方案|策略|实现|solution|approach|strategy|general calculation/i,
+    /约束|兼容|稳定|constraint|compat|stability|hardcode|硬编码|public api|公开接口|通用|api/i,
+    /方案|策略|实现|修复|计算逻辑|solution|approach|strategy|general calculation/i,
     /取舍|权衡|trade-?off/i,
     /风险|risk/i,
     /测试|验证|test|verification/i,

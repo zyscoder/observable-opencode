@@ -2659,6 +2659,18 @@ describe("case trace", () => {
         ].join("\\n"),
       ),
     ).toBe(true)
+    expect(
+      shouldExtractDesignRecordForResponse(
+        [
+          "Both tests pass.",
+          "修复内容：将 src/pricing.mjs:6 的折扣上限从 0.2 改为 0.15。",
+          "设计约束说明：",
+          "通用计算逻辑：根据 loyaltyYears 和 seats 动态计算折扣。",
+          "禁止硬编码：源码中不存在 baseCents === 1200 或 return 51000。",
+          "禁止绕过 public API：所有逻辑通过 renewalQuote(input) 暴露。",
+        ].join("\\n"),
+      ),
+    ).toBe(true)
   })
 
   test("routes plan state and semantic evidence to separate formal records", async () => {
