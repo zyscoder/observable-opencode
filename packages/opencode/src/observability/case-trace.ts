@@ -1800,15 +1800,24 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
 }
 
 function stripResponseClaimScaffolding(input: string) {
-  return input
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .filter((line) => !/^\s*```/.test(line))
-    .join("\n")
+  const output: string[] = []
+  let inFence = false
+  for (const line of input.replace(/\r\n/g, "\n").split("\n")) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) continue
+    output.push(line)
+  }
+  return output.join("\n")
 }
 
 function isNonFactualResponseClaim(input: string) {
   if (isMarkdownTableStructuralRow(input)) return true
+  if (/__TRACE_PROTECTED_\d+__/.test(input)) return true
+  if (/^\s*[+-]\s+/.test(input) && /(?:\b(?:const|let|var|return|function|import|export)\b|[{};=]|=>)/.test(input))
+    return true
   const normalized = input
     .trim()
     .replace(/^#+\s*/, "")
@@ -1822,6 +1831,12 @@ function isNonFactualResponseClaim(input: string) {
   if (/^\d+[.)]?$/.test(normalized)) return true
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
+  if (
+    /^(冲突总结|修复完成|完成|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果)$/.test(
+      normalized,
+    )
+  )
+    return true
   if (
     /^(goal|constraints?\s*&?\s*preferences?|progress|done|in progress|blocked|key decisions|next steps|critical context|relevant files)$/.test(
       normalized,
@@ -1863,11 +1878,12 @@ function isLikelyTableHeaderCell(input: string) {
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
   if (
-    /^(项目|结果|来源|关键信息|维度|说明|字段|值|文件|路径|议题|子 agent 结论|subagent result|field|value)$/.test(
+    /^(项目|结果|来源|状态|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
       normalized,
     )
   )
     return true
+  if (/^(折扣上限|架构规定|现行需求|当前代码|相关文件|证据|动作|原因|风险)$/.test(normalized)) return true
   if (/^mcp\s+[\w-]+$/i.test(normalized)) return true
   if (/^syntheticfacts(?:\s*\(mcp\))?[_\w.-]*$/i.test(normalized)) return true
   if (/^(?:[\w@+.-]+\/)?[\w@+.-]+\.(?:md|mjs|js|ts|tsx|json|txt|py|go|rs|java|yaml|yml)$/i.test(normalized)) return true
@@ -2698,7 +2714,9 @@ function structuredClaimFromLineText(
       extraction_method: "source_line_pattern",
     }
   }
-  if (/entry point|入口|export function renewalQuote|renewalQuote\(input\)/i.test(text)) {
+  if (
+    /implementation\s+entry|entry point|实现入口|入口|export function renewalQuote|renewalQuote\(input\)/i.test(text)
+  ) {
     return {
       subject: "renewalQuote",
       predicate: "implementation_entry",
@@ -2781,7 +2799,7 @@ function structuredLineClaimsFromText(input: string, fallback?: TraceSourceLocat
   const claims: TraceStructuredClaim[] = []
   const lines = input.split(/\r?\n/)
   for (const line of lines) {
-    const match = line.match(/^\s*(\d+):\s?(.*)$/)
+    const match = line.match(/^\s*(\d+)\s*[:.)、]\s?(.*)$/)
     const lineNumber = optionalNumber(match?.[1])
     const lineText = (match?.[2] ?? line).trim()
     if (!lineText) continue
@@ -2980,7 +2998,13 @@ function structuredClaimFromEvidence(
 
 function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourceLocation[]) {
   const structured = structuredClaimFromEvidence(input, sourceLocations)
-  const secondarySummaryFact = isSecondarySummaryFact(input, structured.structured_claim)
+  const source = input.source.toLowerCase()
+  const category = input.category?.toLowerCase() ?? ""
+  const forcedSecondarySummaryFact = Boolean(
+    recordFromUnknown(input.metadata)?.derived_from_multifact &&
+      (source.includes("subagent") || source.includes("task")),
+  )
+  const secondarySummaryFact = isSecondarySummaryFact(input, structured.structured_claim) || forcedSecondarySummaryFact
   const qualityFlags = dedupeStrings([
     ...(input.quality_flags ?? []),
     ...evidenceQualityFlags(input),
@@ -2998,8 +3022,6 @@ function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourc
   const structuredValue =
     structured.structured_claim.value === undefined ? undefined : String(structured.structured_claim.value)
   const claim = factText ?? structuredValue ?? summary
-  const source = input.source.toLowerCase()
-  const category = input.category?.toLowerCase() ?? ""
   const factKind = (() => {
     if (source.includes("mcp")) return "mcp_fact"
     if (source.includes("skill")) return "skill_instruction"
@@ -3021,6 +3043,77 @@ function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourc
     quality_flags: qualityFlags,
     evidence_origin: secondarySummaryFact ? "secondary_summary" : "primary_observation",
   }
+}
+
+function structuredClaimDedupeKey(claim: TraceStructuredClaim) {
+  const span = claim.source_span
+  return [
+    claim.subject ?? "",
+    claim.predicate ?? "",
+    claim.value === undefined ? "" : String(claim.value),
+    claim.qualifier ?? "",
+    span?.path ?? span?.uri ?? "",
+    span?.line_start === undefined ? "" : String(span.line_start),
+  ]
+    .join("|")
+    .toLowerCase()
+}
+
+function isDerivedMultifactInput(input: EvidenceFactInput) {
+  return recordFromUnknown(input.metadata)?.derived_from_multifact === true
+}
+
+function shouldDeriveMultipleStructuredFacts(input: EvidenceFactInput) {
+  if (isDerivedMultifactInput(input)) return false
+  const source = input.source.toLowerCase()
+  const category = input.category?.toLowerCase() ?? ""
+  return /subagent|task|mcp/.test(`${source} ${category}`)
+}
+
+function additionalStructuredClaimsFromEvidence(
+  input: EvidenceFactInput,
+  sourceLocations: TraceSourceLocation[],
+  primaryClaim: TraceStructuredClaim,
+) {
+  if (!shouldDeriveMultipleStructuredFacts(input)) return []
+  const fallback = claimSourceSpan(input.data, sourceLocations)
+  const seen = new Set<string>([structuredClaimDedupeKey(primaryClaim)])
+  const output: TraceStructuredClaim[] = []
+  const textCandidates = dedupeStrings([
+    stringPreview(input.summary, 6000),
+    ...collectTextCandidates(input.data).map((item) => stringPreview(item, 6000)),
+  ]).filter((item) => item.trim())
+  for (const text of textCandidates) {
+    for (const claim of structuredLineClaimsFromText(text, fallback)) {
+      const key = structuredClaimDedupeKey(claim)
+      if (seen.has(key)) continue
+      seen.add(key)
+      output.push(claim)
+      if (output.length >= 12) return output
+    }
+  }
+  return output
+}
+
+function evidenceFactDataFromStructuredClaim(claim: TraceStructuredClaim) {
+  return {
+    subject: claim.subject,
+    predicate: claim.predicate,
+    value: claim.value,
+    qualifier: claim.qualifier,
+    path: claim.source_span?.path,
+    uri: claim.source_span?.uri,
+    line_start: claim.source_span?.line_start,
+    line_end: claim.source_span?.line_end,
+    snippet: claim.source_span?.snippet_preview,
+    raw_artifact_ref: claim.raw_artifact_ref,
+  }
+}
+
+function evidenceFactSummaryFromStructuredClaim(claim: TraceStructuredClaim) {
+  return [claim.subject, claim.predicate, claim.value === undefined ? undefined : String(claim.value)]
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .join(" ")
 }
 
 function isSecondarySummaryFact(input: EvidenceFactInput, claim: TraceStructuredClaim) {
@@ -5009,6 +5102,32 @@ class ActiveCaseTrace {
               : "Semantic evidence derived from source record",
       })
     }
+    if (recordKind === "evidence.semantic_fact" && !isDerivedMultifactInput(input)) {
+      const additionalClaims = additionalStructuredClaimsFromEvidence(
+        input,
+        sourceLocations,
+        canonical.structured_claim,
+      )
+      for (const claim of additionalClaims) {
+        this.evidenceFact({
+          source: input.source,
+          category: input.category,
+          summary: evidenceFactSummaryFromStructuredClaim(claim) || input.summary,
+          data: evidenceFactDataFromStructuredClaim(claim),
+          span_id: input.span_id,
+          source_refs: dedupeStrings([...sourceRefs, `evidence:${node.node_id}`]),
+          source_locations: claim.source_span ? [claim.source_span] : sourceLocations,
+          confidence: input.confidence ?? "observed",
+          support_level: input.support_level,
+          quality_flags: dedupeStrings([...(input.quality_flags ?? []), "multi_fact_extracted"]),
+          metadata: {
+            ...(input.metadata ?? {}),
+            derived_from_multifact: true,
+            parent_fact_ref: `evidence:${node.node_id}`,
+          },
+        })
+      }
+    }
     return node
   }
 
@@ -5163,6 +5282,19 @@ class ActiveCaseTrace {
       explicitAfterContextRefs.length || !contextLedger.auto_continue_prompt_ref
         ? explicitAfterContextRefs
         : [contextLedger.auto_continue_prompt_ref]
+    const summarySemantics = compactionSummarySemantics(input.output_summary)
+    const inferredRetainedFactRefs = this.inferredRetainedFactRefsFromSummary(summarySemantics)
+    if (inferredRetainedFactRefs.length) {
+      contextLedger.retained_fact_refs = dedupeStrings([
+        ...(contextLedger.retained_fact_refs ?? []),
+        ...inferredRetainedFactRefs,
+      ])
+      contextLedger.quality_flags = dedupeStrings([
+        ...(contextLedger.quality_flags ?? []),
+        "retained_fact_refs_inferred_from_summary",
+      ])
+      if (contextLedger.ledger_id_quality === "unknown") contextLedger.ledger_id_quality = "estimated"
+    }
     const compactionDerived = compactionDerivedFields({
       tokenBefore: contextLedger.token_estimate_before,
       tokenAfter: contextLedger.token_estimate_after,
@@ -5172,7 +5304,6 @@ class ActiveCaseTrace {
       autoContinue: input.auto_continue,
       afterContextRefs,
     })
-    const summarySemantics = compactionSummarySemantics(input.output_summary)
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -5245,6 +5376,55 @@ class ActiveCaseTrace {
   private isToolOutcomeObservation(input: ObservationInput) {
     const text = `${input.source ?? ""} ${input.category ?? ""}`.toLowerCase()
     return /tool|mcp|skill|subagent|task|verification|grep|read|glob|bash|file|edit|write/.test(text)
+  }
+
+  private inferredRetainedFactRefsFromSummary(summarySemantics: ReturnType<typeof compactionSummarySemantics>) {
+    const summaryText = normalizeMatchText(
+      [
+        ...summarySemantics.summary_key_facts,
+        ...summarySemantics.summary_constraint_facts,
+        ...summarySemantics.summary_preserved_paths,
+      ].join("\n"),
+    )
+    if (!summaryText) return []
+    const summaryPaths = summarySemantics.summary_preserved_paths
+      .map((item) => normalizeSourcePath(item))
+      .filter((item): item is string => Boolean(item))
+    const refs: string[] = []
+    for (const node of this.causalNodes) {
+      if (node.kind !== "evidence.semantic_fact" && node.kind !== "evidence.fact") continue
+      const data = node.data ?? {}
+      const structured = recordFromUnknown(data.structured_claim)
+      const span = recordFromUnknown(structured?.source_span)
+      const sourcePaths = dedupeStrings([
+        typeof span?.path === "string" ? span.path : "",
+        ...((node.source_locations ?? []).map((location) => location.path).filter(Boolean) as string[]),
+      ]).filter(Boolean)
+      const pathMatch = sourcePaths.some((path) => {
+        const normalizedPath = normalizeSourcePath(path)
+        if (!normalizedPath) return false
+        const normalizedPathText = normalizeMatchText(normalizedPath)
+        return (
+          summaryText.includes(normalizedPathText) ||
+          summaryPaths.some(
+            (summaryPath) => normalizedPath.startsWith(summaryPath) || summaryPath.startsWith(normalizedPath),
+          )
+        )
+      })
+      const value =
+        structured?.value === undefined || structured?.value === null ? "" : normalizeMatchText(structured.value)
+      const predicate = typeof structured?.predicate === "string" ? structured.predicate : undefined
+      const subject = typeof structured?.subject === "string" ? normalizeMatchText(structured.subject) : ""
+      const predicateMatch = predicate ? predicateMatchesClaim(predicate, summaryText) : false
+      const subjectMatch = Boolean(subject && summaryText.includes(subject))
+      const highSignalValue = Boolean(value && value.length >= 3 && summaryText.includes(value))
+      const claimText = normalizeMatchText(data.claim)
+      const claimMatch = Boolean(claimText && claimText.length >= 16 && summaryText.includes(claimText))
+      if (pathMatch || claimMatch || (highSignalValue && (predicateMatch || subjectMatch || pathMatch))) {
+        refs.push(`evidence:${node.node_id}`)
+      }
+    }
+    return dedupeStrings(refs).slice(0, 50)
   }
 
   currentSourceRefs() {

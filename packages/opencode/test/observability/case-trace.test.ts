@@ -604,7 +604,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.responseOutput({ text: "### MCP 返回的事实\\n\\n\\\`\\\`\\\`diff\\n- const cap = 0.2\\n+ const cap = 0.15\\n\\\`\\\`\\\`\\n\\n### 修改点\\n\\nsrc/pricing.mjs 将 discount cap 调整为 15%。" })`,
+        `CaseTrace.responseOutput({ text: "### MCP 返回的事实\\n\\n\\\`\\\`\\\`diff\\n- const cap = 0.2\\n+ const cap = 0.15\\n\\\`\\\`\\\`\\n\\n## 修复完成\\n\\n### 修改点\\n\\nsrc/pricing.mjs 将 discount cap 调整为 15%。" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\\n"),
     )
@@ -631,7 +631,9 @@ describe("case trace", () => {
     const claimText = claims.map((record: any) => record.data.text).join("\n")
 
     expect(claimText).not.toContain("MCP 返回的事实")
+    expect(claimText).not.toContain("const cap =")
     expect(claimText).not.toContain("```diff")
+    expect(claimText).not.toContain("修复完成")
     expect(claimText).not.toContain("### 修改点")
     expect(claimText).toContain("src/pricing.mjs")
     expect(claimText).toContain("discount cap")
@@ -730,6 +732,55 @@ describe("case trace", () => {
     expect(fact.data.evidence_origin).toBe("secondary_summary")
     expect(fact.data.quality_flags).toContain("secondary_source_fact")
     expect(fact.data.quality_flags).toContain("summary_derived_fact")
+  })
+
+  test("extracts multiple structured facts from one subagent result", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v62-subagent-multifact-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subagent-multifact-v62.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "subagent", category: "explore", summary: "Subagent result:\\n1. owner: billing-platform\\n2. discount cap: 15 percent\\n3. implementation entry: src/pricing.mjs", data: { output: "Subagent result:\\n1. owner: billing-platform\\n2. discount cap: 15 percent\\n3. implementation entry: src/pricing.mjs", child_session_id: "ses_child" }, source_refs: ["span:subagent_span"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subagent-multifact-v62-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-multifact-v62-case", "trace.json"), "utf8"),
+    ) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const predicates = facts.map((record: any) => record.data.structured_claim?.predicate)
+    const values = facts.map((record: any) => record.data.structured_claim?.value)
+
+    expect(predicates).toContain("owner")
+    expect(predicates).toContain("discount_cap")
+    expect(predicates).toContain("implementation_entry")
+    expect(values).toContain("billing-platform")
+    expect(values).toContain("15 percent")
+    expect(values).toContain("src/pricing.mjs")
+    expect(facts.every((record: any) => record.data.fact_kind === "subagent_result")).toBe(true)
+    expect(facts.every((record: any) => record.data.evidence_origin === "secondary_summary")).toBe(true)
   })
 
   test("keeps task tool output as observation without duplicating subagent semantic facts", async () => {
@@ -866,6 +917,8 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "read", category: "requirements", summary: "The total renewal discount cap is 15 percent.", data: { subject: "renewalQuote", predicate: "discount_cap", value: "15 percent", path: "docs/architecture.md", text: "The total renewal discount cap is 15 percent." } })`,
+        `CaseTrace.evidenceFact({ source: "read", category: "code_reference", summary: "Implementation entry is src/billing/pricing.mjs.", data: { subject: "renewalQuote", predicate: "implementation_entry", value: "src/billing/pricing.mjs", path: "src/billing/pricing.mjs", text: "export function renewalQuote(input) {}" } })`,
         `CaseTrace.compaction({ trigger: "auto", input_tokens: 2400, context_limit: 1200, output_summary: "## Constraints & Preferences\\n- Only modify files under src/billing/.\\n- Do not modify src/payment/.\\n- The total renewal discount cap is 15 percent.\\n\\n## Relevant Files\\n- docs/architecture.md\\n- src/billing/pricing.mjs", auto_continue: true, result: "continue", after_context_refs: ["message:continue"] })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -893,6 +946,10 @@ describe("case trace", () => {
     ) as any
     const compaction = trace.records.find((record: any) => record.event_type === "context.compaction")
 
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const capFact = facts.find((record: any) => record.data.structured_claim?.value === "15 percent")
+    const entryFact = facts.find((record: any) => record.data.structured_claim?.value === "src/billing/pricing.mjs")
+
     expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Only modify files under src/billing/")
     expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Do not modify src/payment/")
     expect(compaction.data.summary_constraint_facts.join("\n")).not.toContain("Constraints & Preferences")
@@ -900,6 +957,12 @@ describe("case trace", () => {
     expect(compaction.data.summary_preserved_paths).toContain("src/billing/")
     expect(compaction.data.summary_preserved_paths).toContain("src/payment/")
     expect(compaction.data.summary_preserved_paths).toContain("docs/architecture.md")
+    expect(capFact).toBeTruthy()
+    expect(entryFact).toBeTruthy()
+    expect(compaction.data.retained_fact_refs).toContain(`evidence:${capFact.record_id}`)
+    expect(compaction.data.retained_fact_refs).toContain(`evidence:${entryFact.record_id}`)
+    expect(compaction.data.context_ledger.retained_fact_refs).toContain(`evidence:${capFact.record_id}`)
+    expect(compaction.data.context_ledger.quality_flags).toContain("retained_fact_refs_inferred_from_summary")
   })
 
   test("emits response claims only for the final user-visible answer", async () => {
@@ -1005,7 +1068,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.responseOutput({ text: "**总结：**\\n\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n### 使用的上下文资料" })`,
+        `CaseTrace.responseOutput({ text: "**总结：**\\n\\n**冲突总结：**\\n\\n| 来源 | 折扣上限 | 状态 |\\n|------|----------|------|\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n### 使用的上下文资料" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -1032,9 +1095,11 @@ describe("case trace", () => {
     const claimText = claims.map((record: any) => record.data.text).join("\n")
 
     expect(claimText).not.toContain("**总结")
+    expect(claimText).not.toContain("冲突总结")
     expect(claimText).not.toContain("1.")
     expect(claimText).not.toContain("2.")
     expect(claimText).not.toContain("压缩链路验证汇总")
+    expect(claimText).not.toContain("| 来源 | 折扣上限 | 状态 |")
     expect(claimText).not.toContain("| 项目 | 结果 |")
     expect(claimText).not.toContain("|------|------|")
     expect(claimText).not.toContain("使用的上下文资料")
