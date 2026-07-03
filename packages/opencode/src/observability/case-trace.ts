@@ -5499,22 +5499,22 @@ class ActiveCaseTrace {
         event_type: record.event_type,
       })
     }
-    for (const record of cancelledAfterCaseCompletionRecords.slice(0, 20)) {
+    if (cancelledAfterCaseCompletionRecords.length) {
       issues.push({
         kind: "cancelled_after_case_completion",
         severity: "warning",
-        message: "Record was marked cancelled even though the case had already completed successfully.",
-        record_id: record.record_id,
-        event_type: record.event_type,
+        message: "Records were marked cancelled even though the case had already completed successfully.",
+        count: cancelledAfterCaseCompletionRecords.length,
+        refs: cancelledAfterCaseCompletionRecords.slice(0, 10).map((record) => `node:${record.record_id}`),
       })
     }
-    for (const record of closedAfterCaseCompletionRecords.slice(0, 20)) {
+    if (closedAfterCaseCompletionRecords.length) {
       issues.push({
         kind: "closed_after_case_completion",
         severity: "warning",
-        message: "Record was still running after the final case response and was closed during service shutdown.",
-        record_id: record.record_id,
-        event_type: record.event_type,
+        message: "Records were still running after the final case response and were closed during service shutdown.",
+        count: closedAfterCaseCompletionRecords.length,
+        refs: closedAfterCaseCompletionRecords.slice(0, 10).map((record) => `node:${record.record_id}`),
       })
     }
     for (const record of openRecords.slice(0, 20)) {
