@@ -3192,6 +3192,42 @@ function compactionDerivedFields(input: {
   }
 }
 
+function compactionSummarySemantics(input: unknown) {
+  const text = stringPreview(input, 12000)
+  if (!text.trim()) {
+    return {
+      summary_key_facts: [] as string[],
+      summary_constraint_facts: [] as string[],
+      summary_preserved_paths: [] as string[],
+    }
+  }
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) =>
+      line
+        .replace(/^#+\s*/, "")
+        .replace(/^[-*]\s*/, "")
+        .replace(/^\d+[.)]\s*/, "")
+        .replace(/\*\*/g, "")
+        .trim(),
+    )
+    .filter((line) => line && !/^[-=]{3,}$/.test(line))
+  const constraintPattern =
+    /must|do not|don't|only modify|forbidden|constraint|不允许|不能|禁止|只能|必须|不得|out of scope|must stay/i
+  const factPattern = /owner|cap|percent|%|discount|renewalQuote|entry|target|负责人|上限|折扣|入口|目标|归属/i
+  const pathPattern = /(?:src|docs|test|packages)\/[\w@+./-]+/g
+  const summaryConstraintFacts = dedupeStrings(lines.filter((line) => constraintPattern.test(line))).slice(0, 12)
+  const summaryKeyFacts = dedupeStrings(
+    lines.filter((line) => constraintPattern.test(line) || factPattern.test(line) || pathPattern.test(line)),
+  ).slice(0, 20)
+  const summaryPreservedPaths = dedupeStrings([...text.matchAll(pathPattern)].map((match) => match[0])).slice(0, 20)
+  return {
+    summary_key_facts: summaryKeyFacts,
+    summary_constraint_facts: summaryConstraintFacts,
+    summary_preserved_paths: summaryPreservedPaths,
+  }
+}
+
 class ActiveCaseTrace {
   readonly caseID: string
   readonly runID = crypto.randomUUID()
@@ -5039,6 +5075,7 @@ class ActiveCaseTrace {
       autoContinue: input.auto_continue,
       afterContextRefs,
     })
+    const summarySemantics = compactionSummarySemantics(input.output_summary)
     const node = this.node({
       kind: "context.compaction",
       component: "context",
@@ -5071,6 +5108,9 @@ class ActiveCaseTrace {
         dropped_fact_refs: contextLedger.dropped_fact_refs,
         retained_fact_count: compactionDerived.retained_fact_count,
         dropped_fact_count: compactionDerived.dropped_fact_count,
+        summary_key_facts: summarySemantics.summary_key_facts,
+        summary_constraint_facts: summarySemantics.summary_constraint_facts,
+        summary_preserved_paths: summarySemantics.summary_preserved_paths,
         token_estimate_before: contextLedger.token_estimate_before,
         token_estimate_after: contextLedger.token_estimate_after,
         retention_ratio: compactionDerived.retention_ratio,

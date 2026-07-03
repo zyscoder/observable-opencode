@@ -807,6 +807,51 @@ describe("case trace", () => {
     expect(compaction.data.compression_loss_risks).not.toContain("zero_token_estimate_after")
   })
 
+  test("extracts preserved constraints and paths from compaction summaries", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v61-compaction-facts-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "compaction-facts-v61.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.compaction({ trigger: "auto", input_tokens: 2400, context_limit: 1200, output_summary: "## Constraints & Preferences\\n- Only modify files under src/billing/.\\n- Do not modify src/payment/.\\n- The total renewal discount cap is 15 percent.\\n\\n## Relevant Files\\n- docs/architecture.md\\n- src/billing/pricing.mjs", auto_continue: true, result: "continue", after_context_refs: ["message:continue"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "compaction-facts-v61-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "compaction-facts-v61-case", "trace.json"), "utf8"),
+    ) as any
+    const compaction = trace.records.find((record: any) => record.event_type === "context.compaction")
+
+    expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Only modify files under src/billing/")
+    expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Do not modify src/payment/")
+    expect(compaction.data.summary_key_facts.join("\n")).toContain("15 percent")
+    expect(compaction.data.summary_preserved_paths).toContain("src/billing/")
+    expect(compaction.data.summary_preserved_paths).toContain("src/payment/")
+    expect(compaction.data.summary_preserved_paths).toContain("docs/architecture.md")
+  })
+
   test("emits response claims only for the final user-visible answer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v48-final-claims-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
