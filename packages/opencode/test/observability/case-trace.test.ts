@@ -2647,6 +2647,18 @@ describe("case trace", () => {
         ].join("\\n"),
       ),
     ).toBe(true)
+    expect(
+      shouldExtractDesignRecordForResponse(
+        [
+          "All tests pass. Here's the summary:",
+          "Design constraints satisfied:",
+          "General calculation logic -- the cap is a constant applied uniformly; no special-casing.",
+          "No hardcoded test inputs -- the source contains no test fixture values.",
+          "Public API intact -- renewalQuote(input) signature unchanged.",
+          "Cap at 15% -- per docs/architecture.md.",
+        ].join("\\n"),
+      ),
+    ).toBe(true)
   })
 
   test("routes plan state and semantic evidence to separate formal records", async () => {

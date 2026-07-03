@@ -102,15 +102,15 @@ export function shouldExtractDesignRecordForResponse(text: string) {
     return false
   }
   const hasDesignIntent =
-    /方案设计|设计方案|架构|模块边界|架构边界|分层|architecture|boundary|design proposal|solution design/i.test(
+    /方案设计|设计方案|架构|模块边界|架构边界|分层|architecture|boundary|design proposal|solution design|design constraints?/i.test(
       normalized,
     )
   if (!hasDesignIntent) return false
   const dimensions = [
     /需求|目标|requirement|goal/i,
     /架构|边界|分层|模块|architecture|boundary|layer|module/i,
-    /约束|兼容|稳定|constraint|compat|stability/i,
-    /方案|策略|实现|solution|approach|strategy/i,
+    /约束|兼容|稳定|constraint|compat|stability|hardcode|public api|通用|api/i,
+    /方案|策略|实现|solution|approach|strategy|general calculation/i,
     /取舍|权衡|trade-?off/i,
     /风险|risk/i,
     /测试|验证|test|verification/i,
@@ -920,6 +920,11 @@ export const layer: Layer.Layer<
                   "constraint",
                   "compat",
                   "stability",
+                  "hardcode",
+                  "public api",
+                  "general calculation",
+                  "通用",
+                  "api",
                 ]),
                 selected_solution: ctx.currentText.text,
                 tradeoffs: keywordExcerpt(ctx.currentText.text, ["取舍", "权衡", "trade", "tradeoff"]),
