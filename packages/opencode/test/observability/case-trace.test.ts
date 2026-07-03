@@ -2270,6 +2270,59 @@ describe("case trace", () => {
     expect(trace.records.some((record: any) => record.event_type === "case.completed")).toBe(false)
   })
 
+  test("promotes an inferred final response when the exit gate confirms completion before shutdown", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v57-exit-finality-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "exit-finality-v57.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "server completed case" }, environment: { model: "unit-test" } })`,
+        `const response = CaseTrace.responseOutput({ text: "Final answer: src/pricing.mjs uses a 15% cap and npm test passed.", metadata: { sessionID: "ses_exit", messageID: "msg_final", partID: "part_final" } })`,
+        `CaseTrace.exitGate({ session_id: "ses_exit", message_id: "msg_final", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "assistant_finished_without_pending_tools", source_refs: response ? ["response_segment:" + response.segment_id] : [] })`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM" } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "exit-finality-v57-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "exit-finality-v57-case", "trace.json"), "utf8")) as any
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dir, "exit-finality-v57-case", "manifest.json"), "utf8"),
+    ) as any
+    const caseRecord = trace.records.find((record: any) => record.event_type === "case.completed")
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const exitGate = trace.records.find((record: any) => record.event_type === "exit.gate")
+
+    expect(manifest.server_status).toBe("cancelled")
+    expect(manifest.case_status).toBe("success")
+    expect(caseRecord).toBeTruthy()
+    expect(response.data.finality_source).toBe("explicit")
+    expect(response.data.metadata.finality_reason).toBe("exit_gate_has_final_answer")
+    expect(exitGate.source_refs).toContain(`response_segment:${response.data.segment_id}`)
+    expect(claims.length).toBeGreaterThan(0)
+    expect(claims.every((record: any) => record.data.metadata.finality_source === "explicit")).toBe(true)
+  })
+
   test("links recent tool errors to final claims without manual source refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v54-tool-error-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

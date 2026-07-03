@@ -4542,6 +4542,50 @@ class ActiveCaseTrace {
     }
   }
 
+  private promoteFinalResponseFromExitGate(input: ExitGateInput): TraceResponseSegment | undefined {
+    if (input.has_final_answer !== true) return undefined
+    if (input.decision !== "exit") return undefined
+    const candidates = this.responseSegments.filter((segment) => {
+      if (segment.visibility !== "user_visible") return false
+      const metadata = segment.metadata ?? {}
+      if (!input.message_id) return true
+      return metadata.messageID === input.message_id || metadata.message_id === input.message_id
+    })
+    const segment =
+      candidates.at(-1) ?? this.responseSegments.filter((item) => item.visibility === "user_visible").at(-1)
+    if (!segment) return undefined
+    segment.response_role = "final_answer"
+    segment.is_final_for_case = true
+    segment.finality_source = "explicit"
+    segment.metadata = {
+      ...(segment.metadata ?? {}),
+      response_role: "final_answer",
+      is_final_for_case: true,
+      finality_source: "explicit",
+      finality_reason: "exit_gate_has_final_answer",
+      finality_gate_message_id: input.message_id,
+    }
+    const node = this.causalNodes.find((item) => item.node_id === `responsenode_${segment.segment_id}`)
+    if (node?.data) {
+      node.data.response_role = "final_answer"
+      node.data.is_final_for_case = true
+      node.data.finality_source = "explicit"
+      const metadata =
+        node.data.metadata && typeof node.data.metadata === "object"
+          ? (node.data.metadata as Record<string, unknown>)
+          : {}
+      node.data.metadata = {
+        ...metadata,
+        response_role: "final_answer",
+        is_final_for_case: true,
+        finality_source: "explicit",
+        finality_reason: "exit_gate_has_final_answer",
+        finality_gate_message_id: input.message_id,
+      }
+    }
+    return segment
+  }
+
   private emitFinalResponseClaims(caseStatus: TraceStatus) {
     for (const segment of this.responseSegments) {
       if (this.claimedResponseSegmentIDs.has(segment.segment_id)) continue
@@ -4689,8 +4733,12 @@ class ActiveCaseTrace {
 
   exitGate(input: ExitGateInput) {
     const gateID = input.gate_id ?? semanticID("gate", this.causalNodes.length + 1)
-    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
-    return this.node({
+    const finalSegment = this.promoteFinalResponseFromExitGate(input)
+    const sourceRefs = mergeRefs(
+      this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs),
+      finalSegment ? [`response_segment:${finalSegment.segment_id}`] : [],
+    )
+    const node = this.node({
       node_id: `exitgate_${gateID}`,
       kind: "exit.gate",
       component: "processor",
@@ -4713,6 +4761,15 @@ class ActiveCaseTrace {
       source_refs: sourceRefs,
       metadata: input.metadata,
     })
+    if (finalSegment) {
+      this.edge({
+        from: { type: "response_segment", id: finalSegment.segment_id },
+        to: { type: "exit_gate", id: gateID },
+        relation: "selected_by",
+        label: "Exit gate marked this response as the final user-visible answer",
+      })
+    }
+    return node
   }
 
   evidenceFact(input: EvidenceFactInput) {
