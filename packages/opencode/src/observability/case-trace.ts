@@ -3296,6 +3296,7 @@ class ActiveCaseTrace {
   private recentChangeIDs: string[] = []
   private recentToolSpanIDs: string[] = []
   private recentToolOutcomeRefs: string[] = []
+  private recentToolFailureRefs: string[] = []
   private toolOutcomeRefsByCallID = new Map<string, string>()
   private requestedSkillNames = new Set<string>()
   private recordedSkillRequestNames = new Set<string>()
@@ -3748,6 +3749,7 @@ class ActiveCaseTrace {
     this.closeMatchingToolCall(callID, node, isError ? "error" : "success", payload.error ?? payload.output)
     if (sourceRef) {
       this.remember(this.recentToolOutcomeRefs, sourceRef)
+      if (isError) this.remember(this.recentToolFailureRefs, sourceRef, 24)
       if (callID) this.toolOutcomeRefsByCallID.set(callID, sourceRef)
       this.backfillToolOutcomeRef({ callID, sourceRef, spanID: input.span_id, outcomeKind: eventType })
     }
@@ -4319,7 +4321,10 @@ class ActiveCaseTrace {
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
-    const candidateToolOutcomeRefs = this.toolOutcomeRefsFromSourceRefs(sourceRefs)
+    const candidateToolOutcomeRefs = dedupeStrings([
+      ...this.toolOutcomeRefsFromSourceRefs(sourceRefs),
+      ...this.recentToolFailureRefs,
+    ])
     const candidateClassifiedRefs = {
       ...classifiedRefs,
       direct_evidence_refs: dedupeStrings([...classifiedRefs.direct_evidence_refs, ...candidateToolOutcomeRefs]),
