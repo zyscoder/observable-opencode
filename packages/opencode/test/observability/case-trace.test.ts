@@ -3680,6 +3680,106 @@ describe("case trace", () => {
     })
   })
 
+  test("marks verification as failed when failure output is masked by shell exit code", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-masked-verification-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "masked-verification-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const stdout = [
+      "file:///tmp/project/test/pricing.test.mjs:4:8",
+      "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:",
+      "48000 !== 51000",
+      "Error: expected 51000, got 48000",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ command: "npm test 2>&1 || true", exit_code: 0, stdout: ${JSON.stringify(stdout)}, stderr: "" })`,
+        `CaseTrace.evidenceFact({ source: "bash", category: "verification_output", summary: "Run failing tests", data: { command: "npm test 2>&1 || true", exit_code: 0, output: ${JSON.stringify(stdout)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "masked-verification-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(dir, "masked-verification-case", "legacy-trace.json"), "utf8"),
+    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "masked-verification-case", "trace.json"), "utf8")) as any
+    const verificationRecord = trace.records.find((record: any) => record.event_type === "verification")
+    const verificationFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.fact_kind === "verification_output",
+    )
+
+    expect(legacy.verification_records[0].status).toBe("failed")
+    expect(legacy.verification_records[0].quality_flags).toContain("failure_output_masked_by_exit_code")
+    expect(legacy.verification_records[0].quality_flags).toContain("shell_failure_masked")
+    expect(verificationRecord.status).toBe("failed")
+    expect(verificationRecord.data.quality_flags).toContain("failure_output_masked_by_exit_code")
+    expect(verificationFact.data.structured_claim.value).toBe("failed")
+    expect(verificationFact.data.quality_flags).toContain("failure_output_masked_by_exit_code")
+  })
+
+  test("reports missing verification after repository changes", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-missing-verification-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "missing-verification-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix discount cap", diff: "- 0.2\\n+ 0.15" })`,
+        `CaseTrace.responseOutput({ text: "Changed src/pricing.mjs but did not run tests." })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "missing-verification-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "missing-verification-case", "trace.json"), "utf8"),
+    ) as any
+    const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+
+    expect(trace.metrics.trace_health.missing_verification_after_change).toBe(1)
+    expect(issues).toContain("missing_verification_after_change")
+  })
+
   test("evaluates read-only constraints at trace finish", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-constraint-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

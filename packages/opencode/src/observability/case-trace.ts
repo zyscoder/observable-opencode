@@ -189,6 +189,7 @@ export type TraceVerificationRecord = {
   parsed_failures: TraceParsedFailure[]
   stdout?: TraceFieldSummary
   stderr?: TraceFieldSummary
+  quality_flags?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -429,6 +430,7 @@ export type TraceHealthMetrics = {
   skill_request_unresolved?: number
   background_llm_turns?: number
   legacy_context_ref_claims?: number
+  missing_verification_after_change?: number
   issues: TraceHealthIssue[]
 }
 
@@ -1131,6 +1133,24 @@ function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }
   }
 
   return failures
+}
+
+function inferredVerificationStatus(input: {
+  explicitStatus?: TraceVerificationRecord["status"]
+  exitCode?: number
+  parsedFailures?: TraceParsedFailure[]
+  command?: string
+}) {
+  const qualityFlags: string[] = []
+  const hasFailures = Boolean(input.parsedFailures?.length)
+  if (hasFailures && input.exitCode === 0) qualityFlags.push("failure_output_masked_by_exit_code")
+  if (hasFailures && /\|\|\s*true\b/.test(input.command ?? "")) qualityFlags.push("shell_failure_masked")
+  const status =
+    hasFailures && input.explicitStatus !== "failed"
+      ? "failed"
+      : (input.explicitStatus ??
+        (input.exitCode === undefined ? "unknown" : input.exitCode === 0 ? "passed" : "failed"))
+  return { status, quality_flags: qualityFlags }
 }
 
 function isTestLikeCommand(command: string | undefined) {
@@ -2909,18 +2929,34 @@ function structuredClaimFromEvidence(
       return { structured_claim: locationClaim, quality_flags: flags }
     }
     if (/verification|test|command|bash/.test(source) || /verification|test|command/.test(category)) {
+      const parsedFailures = parseVerificationFailures({
+        stdout: firstPresentField(dataRecord, ["stdout", "output", "message"]),
+        stderr: firstPresentField(dataRecord, ["stderr"]),
+      })
+      const rawExit = optionalNumber(firstPresentField(dataRecord, ["exit_code", "exitCode"]))
+      const inferred = inferredVerificationStatus({
+        explicitStatus: primitiveClaimValue(firstPresentField(dataRecord, ["status", "result"])) as
+          | TraceVerificationRecord["status"]
+          | undefined,
+        exitCode: rawExit,
+        parsedFailures,
+        command: firstStringField(dataRecord, ["command", "cmd"]),
+      })
       const verificationClaim = structuredClaimFromRecord(
         {
           subject:
             firstPresentField(dataRecord, ["command", "cmd", "tool_name", "name"]) ?? input.category ?? input.source,
           predicate: "exit_status",
-          value: firstPresentField(dataRecord, ["status", "exit_code", "exitCode", "result"]),
+          value: parsedFailures.length
+            ? "failed"
+            : (firstPresentField(dataRecord, ["status", "exit_code", "exitCode", "result"]) ?? inferred.status),
           reason: firstPresentField(dataRecord, ["message", "stderr", "stdout"]),
         },
         "verification_output",
         sourceSpan,
       )
       flags.push("weak_verification_claim")
+      flags.push(...inferred.quality_flags)
       if (verificationClaim) {
         if (!verificationClaim.source_span) flags.push("missing_source_span")
         return { structured_claim: verificationClaim, quality_flags: flags }
@@ -4197,7 +4233,12 @@ class ActiveCaseTrace {
   verification(input: VerificationRecordInput) {
     const parsed = input.parsed_failures ?? parseVerificationFailures({ stdout: input.stdout, stderr: input.stderr })
     const exitCode = optionalNumber(input.exit_code)
-    const status = input.status ?? (exitCode === undefined ? "unknown" : exitCode === 0 ? "passed" : "failed")
+    const statusInference = inferredVerificationStatus({
+      explicitStatus: input.status,
+      exitCode,
+      parsedFailures: parsed,
+      command: input.command,
+    })
     const sourceLocations = dedupeSourceLocations(
       parsed
         .filter((failure) => failure.file)
@@ -4217,10 +4258,11 @@ class ActiveCaseTrace {
       purpose: input.purpose,
       stage: input.stage ?? "unknown",
       exit_code: exitCode,
-      status,
+      status: statusInference.status,
       parsed_failures: parsed,
       stdout: input.stdout === undefined ? undefined : this.summarizeText(input.stdout, "verification.stdout"),
       stderr: input.stderr === undefined ? undefined : this.summarizeText(input.stderr, "verification.stderr"),
+      quality_flags: dedupeStrings([...(input.quality_flags ?? []), ...statusInference.quality_flags]),
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
@@ -4240,6 +4282,7 @@ class ActiveCaseTrace {
         purpose: input.purpose,
         stage: verification.stage,
         exit_code: verification.exit_code,
+        quality_flags: verification.quality_flags,
         parsed_failures: verification.parsed_failures,
         stdout: input.stdout,
         stderr: input.stderr,
@@ -6108,12 +6151,24 @@ class ActiveCaseTrace {
     const compactionCheckRecords = records.filter((record) => record.event_type === "context.compaction_check")
     const compactionCheckMissing =
       compactionRecords.length && !compactionCheckRecords.length ? compactionRecords.length : 0
+    const changeRecords = records.filter((record) => record.event_type === "change")
+    const verificationRecords = records.filter((record) => record.event_type === "verification")
+    const missingVerificationAfterChange = changeRecords.length && !verificationRecords.length ? changeRecords : []
     if (compactionCheckMissing) {
       issues.push({
         kind: "compaction_check_missing",
         severity: "warning",
         message: "Compaction record was observed without a preceding compaction check record.",
         count: compactionCheckMissing,
+      })
+    }
+    if (missingVerificationAfterChange.length) {
+      issues.push({
+        kind: "missing_verification_after_change",
+        severity: "warning",
+        message: "Repository changes were recorded but no verification command was observed before finalization.",
+        count: missingVerificationAfterChange.length,
+        refs: missingVerificationAfterChange.slice(0, 10).map((record) => `change:${record.record_id}`),
       })
     }
     return {
@@ -6137,6 +6192,7 @@ class ActiveCaseTrace {
       context_only_response_claims: contextOnlyResponseClaims.length,
       payload_duplication_groups: payloadDuplicationGroups,
       compaction_check_missing: compactionCheckMissing,
+      missing_verification_after_change: missingVerificationAfterChange.length,
       broken_claim_fragments: brokenClaimFragments.length,
       over_attributed_claims: overAttributedClaims.length,
       generic_mcp_facts: genericMcpFacts.length,
