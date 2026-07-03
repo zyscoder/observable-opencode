@@ -464,6 +464,7 @@ export type CausalNodeKind =
   | "response.output"
   | "response.claim"
   | "claim.support_assessment"
+  | "design.record"
 
 export type CausalNode = {
   node_id: string
@@ -4694,6 +4695,29 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.designRecords.push(design)
+    this.node({
+      node_id: design.design_id,
+      kind: "design.record",
+      component: "processor",
+      span_id: design.span_id,
+      title: "Design record",
+      status: "success",
+      data: {
+        design_id: design.design_id,
+        source: design.source,
+        requirement_summary: design.requirement_summary,
+        existing_boundaries: design.existing_boundaries,
+        design_constraints: design.design_constraints,
+        candidate_solutions: design.candidate_solutions,
+        selected_solution: design.selected_solution,
+        tradeoffs: design.tradeoffs,
+        risks: design.risks,
+        test_strategy: design.test_strategy,
+        metadata: design.metadata,
+      },
+      source_refs: design.source_refs,
+      metadata: design.metadata,
+    })
     this.write("semantic.design_record", design)
     return design
   }

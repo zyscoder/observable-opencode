@@ -34,6 +34,7 @@ export const FORMAL_RECORD_TYPES = [
   "response.output",
   "response.claim",
   "claim.support_assessment",
+  "design.record",
 ] as const
 
 export type FormalRecordType = (typeof FORMAL_RECORD_TYPES)[number]

@@ -3736,6 +3736,13 @@ describe("case trace", () => {
     expect(trace.design_records).toHaveLength(1)
     expect(trace.design_records[0].selected_solution.artifact_id).toBeTruthy()
 
+    const provenanceTrace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const designRecords = provenanceTrace.records.filter((record: any) => record.event_type === "design.record")
+    expect(designRecords).toHaveLength(1)
+    expect(designRecords[0].record_id).toBe(trace.design_records[0].design_id)
+    expect(designRecords[0].data.selected_solution.artifact_id).toBeTruthy()
+    expect(designRecords[0].data.test_strategy.preview).toContain("pricing")
+
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     expect(html).toContain("Trace Provenance")
     expect(html).toContain("Artifacts")
