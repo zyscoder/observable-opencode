@@ -5614,6 +5614,9 @@ class ActiveCaseTrace {
       (record) =>
         (record.status === "success" || record.status === "cancelled") && expectedFinalizedTypes.has(record.event_type),
     )
+    const unexpectedClosedAfterCaseCompletionRecords = closedAfterCaseCompletionRecords.filter(
+      (record) => !expectedFinalizedTypes.has(record.event_type),
+    )
     const unexpectedMissingCloseRecords = finalizedOpenRecords.filter(
       (record) => !expectedLifecycleFinalizedRecords.includes(record),
     )
@@ -5635,13 +5638,14 @@ class ActiveCaseTrace {
         refs: cancelledAfterCaseCompletionRecords.slice(0, 10).map((record) => `node:${record.record_id}`),
       })
     }
-    if (closedAfterCaseCompletionRecords.length) {
+    if (unexpectedClosedAfterCaseCompletionRecords.length) {
       issues.push({
         kind: "closed_after_case_completion",
         severity: "warning",
-        message: "Records were still running after the final case response and were closed during service shutdown.",
-        count: closedAfterCaseCompletionRecords.length,
-        refs: closedAfterCaseCompletionRecords.slice(0, 10).map((record) => `node:${record.record_id}`),
+        message:
+          "Unexpected record types were still running after the final case response and were closed during service shutdown.",
+        count: unexpectedClosedAfterCaseCompletionRecords.length,
+        refs: unexpectedClosedAfterCaseCompletionRecords.slice(0, 10).map((record) => `node:${record.record_id}`),
       })
     }
     for (const record of openRecords.slice(0, 20)) {

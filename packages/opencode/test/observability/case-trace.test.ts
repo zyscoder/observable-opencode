@@ -2350,10 +2350,9 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.closed_after_case_completion_records).toBeGreaterThan(0)
     expect(trace.metrics.trace_health.llm_turns_missing_token_usage).toBe(0)
     expect(trace.metrics.trace_health.llm_turns_missing_finish_reason).toBe(0)
-    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).toContain("closed_after_case_completion")
-    expect(
-      trace.metrics.trace_health.issues.filter((issue: any) => issue.kind === "closed_after_case_completion"),
-    ).toHaveLength(1)
+    expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
+      "closed_after_case_completion",
+    )
     expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
       "llm_turn_missing_token_usage",
     )
