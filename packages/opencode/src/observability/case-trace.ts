@@ -2649,6 +2649,10 @@ function lineSourceSpanFromText(
 }
 
 function implementationEntryValueFromText(input: string, sourceSpan?: TraceSourceLocation) {
+  const inlineCodePath = input.match(
+    /`((?:\.{0,2}\/|\/|~\/|[\w@+.-]+\/)?[\w@+.-]+\.(?:mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|yaml|yml))`/,
+  )
+  if (inlineCodePath?.[1]) return inlineCodePath[1]
   const explicitPath = sourceLocationsFromText(input).find((location) => location.path)?.path
   if (explicitPath) return explicitPath
   if (/^\s*export\s+function\b/i.test(input) && sourceSpan?.path) return sourceSpan.path
