@@ -2220,6 +2220,56 @@ describe("case trace", () => {
     )
   })
 
+  test("does not infer case success from an implicit final response after cancellation", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-cancelled-finality-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "cancelled-finality-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "server timeout case" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.responseOutput({ text: "Now let me read all relevant files before answering.", source_refs: ["tool_call:call_read"] })`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM" } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "cancelled-finality-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "cancelled-finality-v56-case", "trace.json"), "utf8"),
+    ) as any
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dir, "cancelled-finality-v56-case", "manifest.json"), "utf8"),
+    ) as any
+    const caseRecord = trace.records.find((record: any) => record.event_type === "case.failed")
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+
+    expect(manifest.server_status).toBe("cancelled")
+    expect(manifest.case_status).toBe("cancelled")
+    expect(caseRecord).toBeTruthy()
+    expect(caseRecord.data.case_status).toBe("cancelled")
+    expect(response.data.metadata.finality_source).toBe("inferred")
+    expect(trace.records.some((record: any) => record.event_type === "case.completed")).toBe(false)
+  })
+
   test("links recent tool errors to final claims without manual source refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v54-tool-error-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -2615,6 +2665,97 @@ describe("case trace", () => {
     ) as TraceSummary
     expect(trace.status).toBe("success")
     expect(trace.events.some((event) => event.event_type === "turn.start")).toBe(true)
+  })
+
+  test("finalizes trace.json and trace.html when a traced process receives SIGTERM", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigterm-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "sigterm-with-active-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigterm" } })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "sigterm-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    expect(await waitForExists(path.join(dir, "sigterm-case", "events.jsonl"))).toBe(true)
+    proc.kill("SIGTERM")
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(143)
+    expect(await exists(path.join(dir, "sigterm-case", "trace.json"))).toBe(true)
+    expect(await exists(path.join(dir, "sigterm-case", "legacy-trace.json"))).toBe(true)
+    expect(await exists(path.join(dir, "sigterm-case", "trace.html"))).toBe(true)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "sigterm-case", "legacy-trace.json"), "utf8"),
+    ) as TraceSummary
+    const provenance = JSON.parse(
+      await fs.readFile(path.join(dir, "sigterm-case", "trace.json"), "utf8"),
+    ) as ProvenanceTraceSummary
+
+    expect(trace.status).toBe("cancelled")
+    expect(provenance.manifest.server_status).toBe("cancelled")
+    expect(provenance.manifest.case_status).toBe("cancelled")
+  })
+
+  test("keeps a partial trace.html snapshot available before an uncapturable SIGKILL", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigkill-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "sigkill-with-active-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigkill" } })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "sigkill-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    expect(await waitForExists(path.join(dir, "sigkill-case", "partial", "latest.json"))).toBe(true)
+    expect(await waitForExists(path.join(dir, "sigkill-case", "trace.html"))).toBe(true)
+    proc.kill("SIGKILL")
+    await proc.exited.catch(() => undefined)
+
+    const html = await fs.readFile(path.join(dir, "sigkill-case", "trace.html"), "utf8")
+    const partial = JSON.parse(
+      await fs.readFile(path.join(dir, "sigkill-case", "partial", "latest.json"), "utf8"),
+    ) as ProvenanceTraceSummary
+
+    expect(html).toContain("Trace v5.5")
+    expect(partial.manifest.server_status).toBe("running")
   })
 
   test("renders component data flow and agent process sections", () => {

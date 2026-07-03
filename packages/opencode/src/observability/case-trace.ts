@@ -221,6 +221,7 @@ export type TraceResponseSegment = {
   visibility?: "user_visible" | "internal_continue" | "compaction_followup" | "debug" | string
   turn_index?: number
   is_final_for_case?: boolean
+  finality_source?: "explicit" | "inferred"
   direct_evidence_refs?: string[]
   context_refs?: string[]
   execution_refs?: string[]
@@ -4188,15 +4189,14 @@ class ActiveCaseTrace {
     const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
-    const responseRole =
-      input.response_role ??
-      (input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined) ??
-      this.inferResponseRole(visibility)
-    const isFinalForCase =
-      input.is_final_for_case ??
-      (typeof input.metadata?.is_final_for_case === "boolean"
-        ? input.metadata.is_final_for_case
-        : responseRole === "final_answer")
+    const metadataResponseRole = input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined
+    const responseRoleExplicit = input.response_role !== undefined || metadataResponseRole !== undefined
+    const metadataFinality =
+      typeof input.metadata?.is_final_for_case === "boolean" ? input.metadata.is_final_for_case : undefined
+    const finalityExplicit = input.is_final_for_case !== undefined || metadataFinality !== undefined
+    const responseRole = input.response_role ?? metadataResponseRole ?? this.inferResponseRole(visibility)
+    const isFinalForCase = input.is_final_for_case ?? metadataFinality ?? responseRole === "final_answer"
+    const finalitySource = finalityExplicit || responseRoleExplicit ? "explicit" : "inferred"
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.metadata),
@@ -4207,6 +4207,7 @@ class ActiveCaseTrace {
       turn_index: turnIndex,
       response_role: responseRole,
       is_final_for_case: isFinalForCase,
+      finality_source: finalitySource,
       direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
@@ -4220,6 +4221,7 @@ class ActiveCaseTrace {
       visibility,
       turn_index: turnIndex,
       is_final_for_case: isFinalForCase,
+      finality_source: finalitySource,
       direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
@@ -4242,6 +4244,7 @@ class ActiveCaseTrace {
         visibility,
         turn_index: turnIndex,
         is_final_for_case: isFinalForCase,
+        finality_source: finalitySource,
         direct_evidence_refs: classifiedRefs.direct_evidence_refs,
         context_refs: classifiedRefs.context_refs,
         execution_refs: classifiedRefs.execution_refs,
@@ -4519,11 +4522,13 @@ class ActiveCaseTrace {
         ...(segment.metadata ?? {}),
         response_role: segment.response_role,
         is_final_for_case: segment.is_final_for_case,
+        finality_source: segment.finality_source,
       }
       const node = this.causalNodes.find((item) => item.node_id === `responsenode_${segment.segment_id}`)
       if (!node?.data) continue
       node.data.response_role = segment.response_role
       node.data.is_final_for_case = segment.is_final_for_case
+      node.data.finality_source = segment.finality_source
       const metadata =
         node.data.metadata && typeof node.data.metadata === "object"
           ? (node.data.metadata as Record<string, unknown>)
@@ -4532,16 +4537,18 @@ class ActiveCaseTrace {
         ...metadata,
         response_role: segment.response_role,
         is_final_for_case: segment.is_final_for_case,
+        finality_source: segment.finality_source,
       }
     }
   }
 
-  private emitFinalResponseClaims() {
+  private emitFinalResponseClaims(caseStatus: TraceStatus) {
     for (const segment of this.responseSegments) {
       if (this.claimedResponseSegmentIDs.has(segment.segment_id)) continue
       if (segment.response_role !== "final_answer") continue
       if (segment.visibility !== "user_visible") continue
       if (segment.is_final_for_case !== true) continue
+      if (caseStatus !== "success" && segment.finality_source !== "explicit") continue
       const responseNodeID = `responsenode_${segment.segment_id}`
       const responseNode = this.causalNodes.find((item) => item.node_id === responseNodeID)
       const responseText = responseNode?.data?.text ?? fieldSummaryText(segment.text)
@@ -4564,6 +4571,7 @@ class ActiveCaseTrace {
             response_role: segment.response_role,
             turn_index: segment.turn_index,
             is_final_for_case: segment.is_final_for_case,
+            finality_source: segment.finality_source,
           },
         })
       })
@@ -5058,12 +5066,12 @@ class ActiveCaseTrace {
     if (this.finished) return
     this.evaluateConstraints()
     this.normalizeFinalResponseSegments()
-    this.emitFinalResponseClaims()
     const error = input?.error ? errorInfo(input.error) : undefined
     if (error) this.errors.push(error)
     this.result = input?.result ?? this.result
     const status = input?.status ?? (error ? "error" : "success")
     const caseStatus = this.inferCaseStatus(status, error)
+    this.emitFinalResponseClaims(caseStatus)
     this.finalizeOpenRecords(status, caseStatus)
     this.backfillCompactionEstimates()
     this.enrichInlineSubagentRefs()
@@ -5174,7 +5182,15 @@ class ActiveCaseTrace {
         segment.visibility === "user_visible" &&
         segment.is_final_for_case === true,
     )
-    if (finalAnswer) return "success"
+    if (finalAnswer && serverStatus === "success") return "success"
+    const explicitFinalAnswer = this.responseSegments.some(
+      (segment) =>
+        segment.response_role === "final_answer" &&
+        segment.visibility === "user_visible" &&
+        segment.is_final_for_case === true &&
+        segment.finality_source === "explicit",
+    )
+    if (explicitFinalAnswer) return "success"
     return serverStatus
   }
 
@@ -5184,7 +5200,8 @@ class ActiveCaseTrace {
         (segment) =>
           segment.response_role === "final_answer" &&
           segment.visibility === "user_visible" &&
-          segment.is_final_for_case === true,
+          segment.is_final_for_case === true &&
+          (caseStatus === "success" || segment.finality_source === "explicit"),
       )
       .at(-1)
     const failedOpenRecordRefs = this.finalizedOpenRecordRefsForCase(caseStatus)
@@ -6305,7 +6322,9 @@ class ActiveCaseTrace {
     const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
     if (!force && now < this.nextPartialWrite) return
     this.nextPartialWrite = now + interval
-    this.safeWrite(this.partialFile, jsonPretty(summary ?? this.provenanceSummary("running")))
+    const provenance = summary ?? this.provenanceSummary("running")
+    this.safeWrite(this.partialFile, jsonPretty(provenance))
+    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
 
   private safeWrite(target: string, content: string) {
