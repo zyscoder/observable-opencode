@@ -3211,7 +3211,7 @@ function compactionSummarySemantics(input: unknown) {
         .replace(/\*\*/g, "")
         .trim(),
     )
-    .filter((line) => line && !/^[-=]{3,}$/.test(line))
+    .filter((line) => line && !/^[-=]{3,}$/.test(line) && !isNonFactualResponseClaim(line))
   const constraintPattern =
     /must|do not|don't|only modify|forbidden|constraint|不允许|不能|禁止|只能|必须|不得|out of scope|must stay/i
   const factPattern = /owner|cap|percent|%|discount|renewalQuote|entry|target|负责人|上限|折扣|入口|目标|归属/i

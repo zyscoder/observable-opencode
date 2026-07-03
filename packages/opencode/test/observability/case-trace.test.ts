@@ -846,6 +846,7 @@ describe("case trace", () => {
 
     expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Only modify files under src/billing/")
     expect(compaction.data.summary_constraint_facts.join("\n")).toContain("Do not modify src/payment/")
+    expect(compaction.data.summary_constraint_facts.join("\n")).not.toContain("Constraints & Preferences")
     expect(compaction.data.summary_key_facts.join("\n")).toContain("15 percent")
     expect(compaction.data.summary_preserved_paths).toContain("src/billing/")
     expect(compaction.data.summary_preserved_paths).toContain("src/payment/")
