@@ -2648,6 +2648,15 @@ function lineSourceSpanFromText(
   } satisfies TraceSourceLocation
 }
 
+function implementationEntryValueFromText(input: string, sourceSpan?: TraceSourceLocation) {
+  const explicitPath = sourceLocationsFromText(input).find((location) => location.path)?.path
+  if (explicitPath) return explicitPath
+  if (/^\s*export\s+function\b/i.test(input) && sourceSpan?.path) return sourceSpan.path
+  const functionCall = input.match(/\b([A-Za-z_$][\w$]*)\s*\(([^)]*)\)/)
+  if (functionCall?.[1]) return `${functionCall[1]}(${functionCall[2] ?? ""})`
+  return sourceSpan?.path ?? "renewalQuote(input)"
+}
+
 function structuredClaimFromLineText(
   input: string,
   sourceSpan?: TraceSourceLocation,
@@ -2682,7 +2691,7 @@ function structuredClaimFromLineText(
     return {
       subject: "renewalQuote",
       predicate: "implementation_entry",
-      value: sourceSpan?.path ?? "renewalQuote(input)",
+      value: implementationEntryValueFromText(text, sourceSpan),
       source_span: sourceSpan,
       extraction_method: "source_line_pattern",
     }

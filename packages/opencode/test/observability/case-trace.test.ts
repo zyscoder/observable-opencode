@@ -504,6 +504,55 @@ describe("case trace", () => {
     expect(values.filter((value: string) => value === "15 percent")).toHaveLength(0)
   })
 
+  test("extracts implementation entry path from documentation text instead of the evidence file path", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v62-entry-path-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "entry-path-v62.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "docs/architecture.md", data: { path: "docs/architecture.md", line_start: 3, line_end: 3, text: "The active implementation entry point is \`src/pricing.mjs\`." } })`,
+        `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "src/pricing.mjs", data: { path: "src/pricing.mjs", line_start: 1, line_end: 1, text: "export function renewalQuote(input) {" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "entry-path-v62-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "entry-path-v62-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const docFact = facts.find((record: any) => record.data.source_locations?.[0]?.path === "docs/architecture.md")
+    const codeFact = facts.find((record: any) => record.data.source_locations?.[0]?.path === "src/pricing.mjs")
+
+    expect(docFact.data.structured_claim).toMatchObject({
+      predicate: "implementation_entry",
+      value: "src/pricing.mjs",
+    })
+    expect(docFact.data.structured_claim.source_span.path).toBe("docs/architecture.md")
+    expect(codeFact.data.structured_claim).toMatchObject({
+      predicate: "implementation_entry",
+      value: "src/pricing.mjs",
+    })
+  })
+
   test("uses the numeric value nearest to discount cap wording in long evidence text", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-cap-nearest-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
