@@ -2040,6 +2040,12 @@ function isVerificationClaimText(input: string) {
   )
 }
 
+function isToolFailureClaimText(input: string) {
+  return /tool|工具|read|grep|glob|bash|edit|fail|failed|failure|error|not found|no such file|enoent|不存在|失败|错误|找不到|缺失/i.test(
+    input,
+  )
+}
+
 function predicateMatchesClaim(predicate: string | undefined, claim: string) {
   if (!predicate) return false
   if (claim.includes(predicate)) return true
@@ -6322,9 +6328,11 @@ class ActiveCaseTrace {
       })
       .filter((item) => item.score >= 0.35)
       .sort((a, b) => b.score - a.score)
-    const isVerificationClaim = isVerificationClaimText(stringPreview(claimText, 2000))
+    const claimPreview = stringPreview(claimText, 2000)
+    const isVerificationClaim = isVerificationClaimText(claimPreview)
+    const mentionsToolFailure = isToolFailureClaimText(claimPreview)
     const preferred =
-      isVerificationClaim && scored.some((item) => item.factKind === "verification_output")
+      isVerificationClaim && !mentionsToolFailure && scored.some((item) => item.factKind === "verification_output")
         ? scored.filter((item) => item.factKind === "verification_output")
         : scored
     const refs = preferred.slice(0, 3).map((item) => item.ref)

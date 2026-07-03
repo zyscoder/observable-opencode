@@ -2474,7 +2474,7 @@ describe("case trace", () => {
         `CaseTrace.configure({ input: { prompt: "read current requirement" }, environment: { model: "unit-test" } })`,
         `CaseTrace.event({ component: "tool", event_type: "tool.error", data: { tool: "read", callID: "call_missing", sessionID: "ses_tool", messageID: "msg_tool", args: { filePath: "docs/current-requirement.md" }, error: "ENOENT: no such file or directory, open 'docs/current-requirement.md'" } })`,
         `for (let i = 0; i < 14; i++) CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_success_" + i, sessionID: "ses_tool", messageID: "msg_tool", args: { filePath: "docs/source-" + i + ".md" }, output: "irrelevant source " + i } })`,
-        `CaseTrace.responseOutput({ text: "docs/current-requirement.md 文件不存在（工具失败）。", metadata: { response_role: "final_answer", visibility: "user_visible", is_final_for_case: true } })`,
+        `CaseTrace.responseOutput({ text: "docs/current-requirement.md 文件不存在（工具失败），但测试通过。", metadata: { response_role: "final_answer", visibility: "user_visible", is_final_for_case: true } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
