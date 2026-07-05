@@ -1068,7 +1068,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.responseOutput({ text: "以下是最终报告：\\n\\n**总结：**\\n\\n**冲突总结：**\\n\\n| 来源 | 折扣上限 | 状态 |\\n|------|----------|------|\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 设计约束\\n\\n| 约束 | 描述 |\\n|------|------|\\n| 忠诚折扣 | 使用年限 ≥ 3 年享 10% 折扣 |\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n## 修改文件\\n\\n### 使用的上下文资料\\n\\n## 额外通用性检查" })`,
+        `CaseTrace.responseOutput({ text: "以下是最终报告：\\n\\n## 最终答案\\n\\n**总结：**\\n\\n**冲突总结：**\\n\\n| 来源 | 折扣上限 | 状态 |\\n|------|----------|------|\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 设计约束\\n\\n| 约束 | 描述 |\\n|------|------|\\n| 忠诚折扣 | 使用年限 ≥ 3 年享 10% 折扣 |\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n## 修改文件\\n\\n### 使用的上下文资料\\n\\n## 额外通用性检查\\n\\n### 额外通用性检查结果" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -1096,6 +1096,7 @@ describe("case trace", () => {
 
     expect(claimText).not.toContain("**总结")
     expect(claimText).not.toContain("以下是最终报告")
+    expect(claimText).not.toContain("最终答案")
     expect(claimText).not.toContain("冲突总结")
     expect(claimText).not.toContain("1.")
     expect(claimText).not.toContain("2.")
@@ -1108,6 +1109,7 @@ describe("case trace", () => {
     expect(claimText).not.toContain("修改文件")
     expect(claimText).not.toContain("使用的上下文资料")
     expect(claimText).not.toContain("额外通用性检查")
+    expect(claimText).not.toContain("额外通用性检查结果")
     expect(claimText).toContain("billing-platform")
     expect(claimText).toContain("忠诚折扣")
     expect(claimText).toContain("renewalQuote(input)")
@@ -1399,6 +1401,53 @@ describe("case trace", () => {
     expect(claim.data.direct_evidence_refs).toContain(`evidence:${verificationFact.record_id}`)
     expect(claim.data.direct_evidence_refs).not.toContain(`evidence:${codeFact.record_id}`)
     expect(claim.data.execution_refs).toContain("verification:ver_passed")
+    expect(claim.data.match_reasons).toContain("verification_result")
+  })
+
+  test("matches genericity check numeric result claims to verification evidence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v60-genericity-match-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "genericity-match-v60.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const verificationFact = CaseTrace.evidenceFact({ source: "tool", category: "verification", summary: "Extra genericity check", data: { command: "node -e renewalQuote", exit_code: 0, output: "extra check result: 850000\\\\nextra check passed: true\\\\n" } })`,
+        `CaseTrace.responseOutput({ text: "\`renewalQuote({ baseCents: 10000, seats: 100, loyaltyYears: 10 })\` = **850000** ✅", source_refs: verificationFact ? ["evidence:" + verificationFact.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "genericity-match-v60-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "genericity-match-v60-case", "trace.json"), "utf8"),
+    ) as any
+    const verification = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.fact_kind === "verification_output",
+    )
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+
+    expect(claim.data.direct_evidence_refs).toContain(`evidence:${verification.record_id}`)
+    expect(claim.data.quality_flags).not.toContain("context_only_claim")
     expect(claim.data.match_reasons).toContain("verification_result")
   })
 

@@ -1873,7 +1873,7 @@ function isNonFactualResponseClaim(input: string) {
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
   if (
-    /^(冲突总结|修复完成|完成|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查)$/.test(
+    /^(冲突总结|修复完成|完成|最终答案|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查|额外通用性检查结果)$/.test(
       normalized,
     )
   )
@@ -2092,7 +2092,7 @@ function evidenceMatchStrings(data: Record<string, unknown> | undefined) {
 }
 
 function isVerificationClaimText(input: string) {
-  return /test|测试|passed|failed|pass|fail|assert|断言|exit|退出码|验证|pricing tests|expected|actual|通过|失败|\b48000\b|\b51000\b/i.test(
+  return /test|测试|passed|failed|pass|fail|assert|断言|exit|退出码|验证|genericity|extra check|通用性检查|pricing tests|expected|actual|通过|失败|\b48000\b|\b51000\b|\b850000\b/i.test(
     input,
   )
 }
