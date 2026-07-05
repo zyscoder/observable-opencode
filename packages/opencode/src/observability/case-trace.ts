@@ -1873,7 +1873,7 @@ function isNonFactualResponseClaim(input: string) {
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
   if (
-    /^(冲突总结|修复完成|完成|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果)$/.test(
+    /^(冲突总结|修复完成|完成|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查)$/.test(
       normalized,
     )
   )
@@ -1900,7 +1900,7 @@ function isNonFactualResponseClaim(input: string) {
     return true
   if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
-  if (/^(以下是|下面是|这里是).*(总结|结论)$/.test(normalized)) return true
+  if (/^(以下是|下面是|这里是).*(总结|结论|报告)$/.test(normalized)) return true
   return false
 }
 
@@ -1919,7 +1919,7 @@ function isLikelyTableHeaderCell(input: string) {
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
   if (
-    /^(项目|结果|来源|状态|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
+    /^(项目|结果|来源|状态|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
       normalized,
     )
   )
