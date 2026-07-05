@@ -1068,7 +1068,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.responseOutput({ text: "以下是最终报告：\\n\\n## 最终答案\\n\\n**总结：**\\n\\n**冲突总结：**\\n\\n| 来源 | 折扣上限 | 状态 |\\n|------|----------|------|\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 设计约束\\n\\n| 约束 | 描述 |\\n|------|------|\\n| 忠诚折扣 | 使用年限 ≥ 3 年享 10% 折扣 |\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n## 修改文件\\n\\n### 使用的上下文资料\\n\\n## 额外通用性检查\\n\\n### 额外通用性检查结果" })`,
+        `CaseTrace.responseOutput({ text: "以下是最终报告：\\n\\n## 最终答案\\n\\n**总结：**\\n\\n**冲突总结：**\\n\\n| 来源 | 折扣上限 | 状态 |\\n|------|----------|------|\\n1. \`renewalQuote\` 负责人为 \`billing-platform\` 团队。\\n2. 实现入口为 \`src/pricing.mjs\` 中的 \`renewalQuote(input)\` 函数。\\n\\n## 设计约束\\n\\n| 约束 | 描述 |\\n|------|------|\\n| 忠诚折扣 | 使用年限 ≥ 3 年享 10% 折扣 |\\n\\n## 压缩链路验证汇总\\n\\n| 项目 | 结果 |\\n|------|------|\\n| **Owner** | \`billing-platform\` |\\n| **测试结果** | 全部通过（\`npm test\` -> \`pricing tests passed\`） |\\n\\n**计算推导**（两种输入一致）：\\n\\n| 输入 | 计算 | 结果 |\\n|------|------|------|\\n\\n## npm test 结果\\n\\n## 修改文件\\n\\n### 使用的上下文资料\\n\\n## 额外通用性检查\\n\\n### 额外通用性检查结果" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -1106,6 +1106,9 @@ describe("case trace", () => {
     expect(claimText).not.toContain("| 来源 | 折扣上限 | 状态 |")
     expect(claimText).not.toContain("| 项目 | 结果 |")
     expect(claimText).not.toContain("|------|------|")
+    expect(claimText).not.toContain("计算推导")
+    expect(claimText).not.toContain("输入: 计算 | 结果")
+    expect(claimText).not.toContain("npm test 结果")
     expect(claimText).not.toContain("修改文件")
     expect(claimText).not.toContain("使用的上下文资料")
     expect(claimText).not.toContain("额外通用性检查")

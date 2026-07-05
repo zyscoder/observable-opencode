@@ -1873,7 +1873,7 @@ function isNonFactualResponseClaim(input: string) {
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
   if (
-    /^(冲突总结|修复完成|完成|最终答案|最终结果|根因分析|问题定位|验证结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查|额外通用性检查结果)$/.test(
+    /^(冲突总结|修复完成|完成|最终答案|最终结果|根因分析|问题定位|验证结果|npm test 结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查|额外通用性检查结果)$/.test(
       normalized,
     )
   )
@@ -1896,6 +1896,7 @@ function isNonFactualResponseClaim(input: string) {
     )
   )
     return true
+  if (/^计算推导(?:\s*[（(].*[）)])?$/.test(normalized)) return true
   if (/^(?:(?:mcp\s*)?返回的事实|mcp facts?|facts?|修改点|改动点|变更点|changes?|changed files?)$/i.test(normalized))
     return true
   if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
@@ -1919,7 +1920,7 @@ function isLikelyTableHeaderCell(input: string) {
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
   if (
-    /^(项目|结果|来源|状态|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
+    /^(项目|结果|来源|状态|输入|计算|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
       normalized,
     )
   )
