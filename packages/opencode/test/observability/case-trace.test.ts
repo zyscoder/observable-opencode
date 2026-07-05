@@ -3780,6 +3780,67 @@ describe("case trace", () => {
     expect(issues).toContain("missing_verification_after_change")
   })
 
+  test("derives structured semantic facts from repository change diffs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-change-semantics-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "change-semantics-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const capDiff = [
+      "Index: src/pricing.mjs",
+      "@@",
+      "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
+      "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
+    ].join("\\n")
+    const hardcodeDiff = [
+      "@@",
+      "-  return Math.round(base * seats * (1 - discount))",
+      "+  if (input.baseCents === 1200 && input.seats === 50) return 51000",
+      "+  return Math.round(base * seats * (1 - discount))",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix discount cap", diff: ${JSON.stringify(capDiff)} })`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Special-case failing pricing test", diff: ${JSON.stringify(hardcodeDiff)} })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "change-semantics-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(dir, "change-semantics-case", "legacy-trace.json"), "utf8"),
+    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "change-semantics-case", "trace.json"), "utf8")) as any
+    const changeRecords = trace.records.filter((record: any) => record.event_type === "change")
+
+    expect(legacy.change_records[0].change_semantics.numeric_constant_changes).toContainEqual(
+      expect.objectContaining({ from: "0.2", to: "0.15" }),
+    )
+    expect(changeRecords[0].data.change_semantics.operation_kinds).toContain("numeric_constant_update")
+    expect(changeRecords[0].data.change_semantics.risk_flags).toContain("numeric_constant_changed")
+    expect(changeRecords[0].data.change_semantics.changed_identifiers).toContain("discount")
+    expect(changeRecords[1].data.change_semantics.operation_kinds).toContain("conditional_logic_change")
+    expect(changeRecords[1].data.change_semantics.risk_flags).toContain("hardcode_candidate")
+  })
+
   test("evaluates read-only constraints at trace finish", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-constraint-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

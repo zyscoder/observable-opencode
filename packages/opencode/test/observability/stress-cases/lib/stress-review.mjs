@@ -194,9 +194,19 @@ function detectEvidence(name, trace) {
           hasAny(record, ["architecture", "design", "constraint", "hardcode", "public API"]),
       ),
     change_diff_semantics: (records) =>
-      records.filter((record) => record.event_type === "change" && hasAny(record, ["diff", "hardcode", "return"])),
+      records.filter(
+        (record) =>
+          record.event_type === "change" &&
+          (record.data?.change_semantics ||
+            hasAny(record, ["numeric_constant_update", "hardcode_candidate", "conditional_logic_change"])),
+      ),
     architecture_violation_signal: (records) =>
-      records.filter((record) => hasAny(record, ["hardcode", "bypass", "violat", "architecture", "constraint"])),
+      records.filter(
+        (record) =>
+          semanticRiskFlags(record).some((flag) =>
+            ["hardcode_candidate", "test_fixture_value_added", "test_coupling_candidate"].includes(flag),
+          ) || hasAny(record, ["hardcode", "bypass", "violat", "architecture", "constraint"]),
+      ),
   }
   const records = Array.isArray(trace?.records) ? trace.records : []
   const detector = detectors[name] ?? (() => [])
@@ -214,6 +224,11 @@ function recordRef(record) {
 function hasAny(input, needles) {
   const text = JSON.stringify(input).toLowerCase()
   return needles.some((needle) => text.includes(String(needle).toLowerCase()))
+}
+
+function semanticRiskFlags(record) {
+  const flags = record?.data?.change_semantics?.risk_flags
+  return Array.isArray(flags) ? flags.map(String) : []
 }
 
 function detectNoisySemantics(trace) {

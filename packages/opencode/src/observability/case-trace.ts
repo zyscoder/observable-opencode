@@ -193,6 +193,25 @@ export type TraceVerificationRecord = {
   metadata?: Record<string, unknown>
 }
 
+export type TraceNumericConstantChange = {
+  from: string
+  to: string
+  before?: string
+  after?: string
+}
+
+export type TraceChangeSemantics = {
+  changed_line_count: number
+  added_line_count: number
+  removed_line_count: number
+  changed_identifiers?: string[]
+  numeric_constant_changes?: TraceNumericConstantChange[]
+  touched_symbols?: string[]
+  operation_kinds?: string[]
+  risk_flags?: string[]
+  summary?: string
+}
+
 export type TraceChangeRecord = {
   change_id: string
   span_id?: string
@@ -200,6 +219,8 @@ export type TraceChangeRecord = {
   files: string[]
   intent?: string
   diff?: TraceFieldSummary
+  change_semantics?: TraceChangeSemantics
+  quality_flags?: string[]
   source_refs?: string[]
   verification_refs?: string[]
   metadata?: Record<string, unknown>
@@ -2273,6 +2294,185 @@ function fieldSummaryText(input: unknown) {
   return stringPreview(input, 8000)
 }
 
+function changeSemanticsFromDiff(diff: unknown): TraceChangeSemantics | undefined {
+  const text = fieldSummaryText(diff)
+  if (!text.trim()) return undefined
+  const lines = parseChangedDiffLines(text)
+  const changedLineCount = lines.added.length + lines.removed.length
+  if (!changedLineCount) return undefined
+
+  const allChangedLines = [...lines.added, ...lines.removed]
+  const changedIdentifiers = identifiersFromLines(allChangedLines)
+  const numericChanges = numericConstantChangesFromLines(lines.removed, lines.added)
+  const operationKinds = new Set<string>()
+  const riskFlags = new Set<string>()
+
+  if (numericChanges.length) {
+    operationKinds.add("numeric_constant_update")
+    riskFlags.add("numeric_constant_changed")
+  }
+  if (lines.added.concat(lines.removed).some((line) => /\breturn\b/.test(line)))
+    operationKinds.add("return_logic_change")
+  if (lines.added.concat(lines.removed).some((line) => /\b(if|switch|case|else)\b/.test(line))) {
+    operationKinds.add("conditional_logic_change")
+  }
+  if (lines.added.some((line) => /\b(import|export|require)\b/.test(line)))
+    operationKinds.add("dependency_or_api_change")
+  if (lines.added.some((line) => /\b(class|function|const|let|var)\b/.test(line)) || lines.removed.length) {
+    operationKinds.add("file_edit")
+  }
+  if (lines.added.some(isHardcodeCandidateLine)) riskFlags.add("hardcode_candidate")
+  if (lines.added.some((line) => /\b(48000|51000|850000|1200)\b/.test(line))) {
+    riskFlags.add("test_fixture_value_added")
+  }
+  if (lines.added.some((line) => /\b(test|spec|fixture|mock)\b/i.test(line))) riskFlags.add("test_coupling_candidate")
+
+  const summaryParts = []
+  if (numericChanges.length) {
+    summaryParts.push(
+      `numeric constants changed: ${numericChanges
+        .slice(0, 5)
+        .map((change) => `${change.from} -> ${change.to}`)
+        .join(", ")}`,
+    )
+  }
+  if (changedIdentifiers.length) summaryParts.push(`touched identifiers: ${changedIdentifiers.slice(0, 8).join(", ")}`)
+  if (riskFlags.size) summaryParts.push(`risk flags: ${[...riskFlags].join(", ")}`)
+
+  return {
+    changed_line_count: changedLineCount,
+    added_line_count: lines.added.length,
+    removed_line_count: lines.removed.length,
+    ...(changedIdentifiers.length ? { changed_identifiers: changedIdentifiers.slice(0, 40) } : {}),
+    ...(numericChanges.length ? { numeric_constant_changes: numericChanges.slice(0, 20) } : {}),
+    ...(changedIdentifiers.length ? { touched_symbols: changedIdentifiers.slice(0, 20) } : {}),
+    ...(operationKinds.size ? { operation_kinds: [...operationKinds] } : {}),
+    ...(riskFlags.size ? { risk_flags: [...riskFlags] } : {}),
+    ...(summaryParts.length ? { summary: summaryParts.join("; ") } : {}),
+  }
+}
+
+function parseChangedDiffLines(diffText: string): { added: string[]; removed: string[] } {
+  const added: string[] = []
+  const removed: string[] = []
+  for (const rawLine of diffText.split(/\r?\n/)) {
+    if (!rawLine) continue
+    if (
+      rawLine.startsWith("+++") ||
+      rawLine.startsWith("---") ||
+      rawLine.startsWith("@@") ||
+      rawLine.startsWith("Index:") ||
+      rawLine.startsWith("diff ") ||
+      rawLine.startsWith("new file mode") ||
+      rawLine.startsWith("deleted file mode")
+    ) {
+      continue
+    }
+    if (rawLine.startsWith("+")) added.push(rawLine.slice(1))
+    if (rawLine.startsWith("-")) removed.push(rawLine.slice(1))
+  }
+  return { added, removed }
+}
+
+function identifiersFromLines(lines: string[]) {
+  const ignored = new Set([
+    "and",
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "else",
+    "export",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "undefined",
+    "var",
+    "while",
+  ])
+  const identifiers: string[] = []
+  for (const line of lines) {
+    for (const match of line.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]{1,80}\b/g)) {
+      const value = match[0]
+      if (ignored.has(value)) continue
+      if (/^[A-Z_]+$/.test(value) && value.length <= 2) continue
+      identifiers.push(value)
+    }
+  }
+  return dedupeStrings(identifiers)
+}
+
+function numericConstantChangesFromLines(removedLines: string[], addedLines: string[]): TraceNumericConstantChange[] {
+  const changes: TraceNumericConstantChange[] = []
+  const usedAdded = new Set<number>()
+  for (const removed of removedLines) {
+    const removedNumbers = numericConstantsFromLine(removed)
+    if (!removedNumbers.length) continue
+    const removedShape = numericShape(removed)
+    const addedIndex = addedLines.findIndex((added, index) => {
+      if (usedAdded.has(index)) return false
+      if (!numericConstantsFromLine(added).length) return false
+      return numericShape(added) === removedShape
+    })
+    if (addedIndex === -1) continue
+    usedAdded.add(addedIndex)
+    const added = addedLines[addedIndex]
+    const addedNumbers = numericConstantsFromLine(added)
+    for (let index = 0; index < Math.min(removedNumbers.length, addedNumbers.length); index++) {
+      if (removedNumbers[index] === addedNumbers[index]) continue
+      changes.push({
+        from: removedNumbers[index]!,
+        to: addedNumbers[index]!,
+        before: removed.trim(),
+        after: added.trim(),
+      })
+    }
+  }
+  return changes
+}
+
+function numericConstantsFromLine(line: string) {
+  return [...line.matchAll(/(^|[^A-Za-z0-9_$])(-?\d+(?:\.\d+)?%?)(?=$|[^A-Za-z0-9_$])/g)].map((match) => match[2]!)
+}
+
+function numericShape(line: string) {
+  return line
+    .replace(/(^|[^A-Za-z0-9_$])-?\d+(?:\.\d+)?%?(?=$|[^A-Za-z0-9_$])/g, "$1#")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isHardcodeCandidateLine(line: string) {
+  const trimmed = line.trim()
+  if (!trimmed) return false
+  if (/\bif\s*\(.+\b(input|req|args|params|case|scenario)\b.+(?:={2,3}|!==|!=).+\)\s*return\b/.test(trimmed))
+    return true
+  if (/\breturn\s+["'`][^"'`]{1,120}["'`]\s*;?$/.test(trimmed)) return true
+  if (/\breturn\s+-?\d+(?:\.\d+)?\s*;?$/.test(trimmed)) return true
+  return /\b(if|switch|case)\b/.test(trimmed) && /\b(48000|51000|850000|1200)\b/.test(trimmed)
+}
+
 function requestedSkillNames(input: unknown) {
   const names = new Set<string>()
   const text = collectTextCandidates(input).join("\n")
@@ -4309,6 +4509,12 @@ class ActiveCaseTrace {
       input.source_refs ??
       input.evidence_refs ??
       (this.recentFailedVerificationID ? [`verification:${this.recentFailedVerificationID}`] : undefined)
+    const changeSemantics = input.change_semantics ?? changeSemanticsFromDiff(input.diff)
+    const qualityFlags = dedupeStrings([
+      ...(input.quality_flags ?? []),
+      ...(input.diff === undefined ? ["missing_diff"] : []),
+      ...(input.diff !== undefined && !changeSemantics ? ["change_semantics_unavailable"] : []),
+    ])
     const change: TraceChangeRecord = {
       change_id: input.change_id ?? semanticID("chg", this.changeRecords.length + 1),
       span_id: input.span_id,
@@ -4316,6 +4522,8 @@ class ActiveCaseTrace {
       files: input.files,
       intent: input.intent,
       diff: input.diff === undefined ? undefined : this.summarizeText(input.diff, "change.diff"),
+      change_semantics: changeSemantics,
+      quality_flags: qualityFlags,
       source_refs: sourceRefs,
       verification_refs: input.verification_refs,
       metadata: input.metadata,
@@ -4334,6 +4542,8 @@ class ActiveCaseTrace {
         files: input.files,
         intent: input.intent,
         diff: input.diff,
+        change_semantics: changeSemantics,
+        quality_flags: qualityFlags,
         source_refs: sourceRefs,
         verification_refs: input.verification_refs,
         metadata: input.metadata,
