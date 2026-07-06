@@ -5723,6 +5723,29 @@ class ActiveCaseTrace {
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
 
+  flushForSignal(signal: NodeJS.Signals) {
+    const result = {
+      ...(recordFromUnknown(this.result) ?? {}),
+      reason: signal,
+      signal,
+      trace_html_flush: "process_signal",
+    }
+    if (!this.finished) {
+      this.finish({ status: "cancelled", result })
+      return
+    }
+    this.result = result
+    const caseStatus = this.observedCaseStatus() ?? this.inferCaseStatus("cancelled", undefined)
+    const summary = this.summary("cancelled")
+    const provenance = this.provenanceSummary("cancelled", caseStatus)
+    this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
+    this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
+    this.writePartial(true, provenance)
+    this.safeWrite(this.traceFile, jsonPretty(provenance))
+    this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
+    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
+  }
+
   private summary(status: TraceStatus): TraceSummary {
     const ended = Date.now()
     return {
@@ -5826,6 +5849,14 @@ class ActiveCaseTrace {
     )
     if (explicitFinalAnswer) return "success"
     return serverStatus
+  }
+
+  private observedCaseStatus(): TraceStatus | undefined {
+    const caseRecord = [...this.causalNodes]
+      .reverse()
+      .find((node) => node.kind === "case.completed" || node.kind === "case.failed")
+    const status = caseRecord?.data?.case_status ?? caseRecord?.status
+    return status === "success" || status === "error" || status === "cancelled" ? status : undefined
   }
 
   private emitCaseLifecycleRecord(serverStatus: TraceStatus, caseStatus: TraceStatus) {
@@ -7019,13 +7050,7 @@ function finishActiveFromProcessExit(code: number | undefined) {
 function finishActiveFromSignal(signal: NodeJS.Signals) {
   const current = active || undefined
   if (!current) return
-  current.finish({
-    status: "cancelled",
-    result: {
-      reason: signal,
-      signal,
-    },
-  })
+  current.flushForSignal(signal)
   active = false
 }
 

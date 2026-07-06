@@ -2531,6 +2531,60 @@ describe("case trace", () => {
     expect(trace.records.some((record: any) => record.event_type === "case.completed")).toBe(false)
   })
 
+  test("flushes trace.html from current trace state when the process receives SIGTERM", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v58-signal-flush-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "signal-flush-v58.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "long running signal case" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_signal", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGTERM arrives" })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "observed pricing file before signal", data: { path: "src/pricing.mjs", line_start: 1, line_end: 1, text: "export function renewalQuote(input) {}" } })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "signal-flush-v58-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const caseDir = path.join(dir, "signal-flush-v58-case")
+    expect(await waitForExists(path.join(caseDir, "partial", "latest.json"), 3000)).toBe(true)
+
+    proc.kill("SIGTERM")
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(143)
+    expect(await exists(path.join(caseDir, "trace.html"))).toBe(true)
+    expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
+
+    const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    const caseRecord = trace.records.find((record: any) => record.event_type === "case.failed")
+
+    expect(manifest.server_status).toBe("cancelled")
+    expect(manifest.case_status).toBe("cancelled")
+    expect(caseRecord).toBeTruthy()
+    expect(caseRecord.data.case_status).toBe("cancelled")
+    expect(trace.records.some((record: any) => record.event_type === "evidence.semantic_fact")).toBe(true)
+    expect(html).toContain("case cancelled")
+    expect(html).toContain("observed pricing file before signal")
+  })
+
   test("promotes an inferred final response when the exit gate confirms completion before shutdown", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v57-exit-finality-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
