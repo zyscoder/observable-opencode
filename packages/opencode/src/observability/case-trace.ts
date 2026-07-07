@@ -2579,8 +2579,16 @@ function semanticFactSourcePath(data: Record<string, unknown> | undefined) {
 function semanticFactText(data: Record<string, unknown> | undefined) {
   const structured = recordFromUnknown(data?.structured_claim)
   const span = recordFromUnknown(structured?.source_span)
+  const snippet = span?.snippet_preview
   return normalizeMatchText(
-    [span?.snippet_preview, span?.path, data?.summary, data?.claim, data?.data, data?.metadata, data?.source_locations]
+    [
+      snippet,
+      data?.summary,
+      data?.claim,
+      snippet ? undefined : data?.data,
+      snippet ? undefined : data?.metadata,
+      snippet ? undefined : data?.source_locations,
+    ]
       .map((item) => fieldSummaryText(item))
       .join("\n"),
   )
