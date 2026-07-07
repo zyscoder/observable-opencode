@@ -2393,15 +2393,25 @@ function changeTargetRole(files: string[]) {
 
 function changeTargetRoleForFile(file: string) {
   const normalized = file.replace(/\\/g, "/").toLowerCase()
-  if (/(^|\/)(__tests__|tests?|spec|fixtures?|mocks?)(\/|$)/.test(normalized)) return "test_code"
-  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(normalized)) return "test_code"
-  if (/\/test[-_.]/.test(normalized) || /[-_.]test\./.test(normalized)) return "test_code"
-  if (/(^|\/)(docs?|requirements?|design|architecture)(\/|$)/.test(normalized)) return "docs"
+  const segments = normalized.split("/").filter(Boolean)
+  const basename = segments.at(-1) ?? normalized
+  if (
+    segments.some((segment) =>
+      ["__tests__", "test", "tests", "spec", "specs", "fixture", "fixtures", "mock", "mocks"].includes(segment),
+    )
+  )
+    return "test_code"
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(basename) || /^test[-_.].+\.[cm]?[jt]sx?$/.test(basename)) return "test_code"
+  if (
+    segments.some((segment) =>
+      ["doc", "docs", "requirement", "requirements", "design", "architecture"].includes(segment),
+    )
+  )
+    return "docs"
   if (/(^|\/)(package\.json|tsconfig\.json|vite\.config|rollup\.config|webpack\.config|bunfig\.toml)$/.test(normalized))
     return "config"
-  if (/(^|\/)(src|lib|packages|app)(\/|$)/.test(normalized)) return "production_code"
-  if (/\.[cm]?[jt]sx?$|\.py$|\.go$|\.rs$|\.java$|\.kt$|\.swift$|\.mjs$|\.cjs$/.test(normalized))
-    return "production_code"
+  if (segments.some((segment) => ["src", "lib", "packages", "app"].includes(segment))) return "production_code"
+  if (/\.[cm]?[jt]sx?$|\.py$|\.go$|\.rs$|\.java$|\.kt$|\.swift$|\.mjs$|\.cjs$/.test(basename)) return "production_code"
   return "unknown"
 }
 
@@ -2441,21 +2451,42 @@ function enrichChangeSemanticsForTarget(input: {
 }
 
 function semanticFactApplicability(data: Record<string, unknown> | undefined) {
+  const structured = recordFromUnknown(data?.structured_claim)
+  const span = recordFromUnknown(structured?.source_span)
+  const spanPath = typeof span?.path === "string" ? span.path : ""
+  const snippet = typeof span?.snippet_preview === "string" ? span.snippet_preview : ""
+  const factKind = typeof data?.fact_kind === "string" ? data.fact_kind : ""
+  if (factKind === "verification_output") return { status: "unknown", reasons: [] }
   const text = normalizeMatchText(
-    [data?.summary, data?.claim, data?.data, data?.structured_claim, data?.source_locations, data?.metadata]
+    [
+      snippet,
+      spanPath,
+      data?.summary,
+      data?.claim,
+      snippet ? undefined : data?.data,
+      snippet ? undefined : data?.source_locations,
+      data?.metadata,
+    ]
       .map((item) => fieldSummaryText(item))
       .join("\n"),
   )
   const reasons: string[] = []
-  const legacy =
-    /legacy|deprecated|obsolete|retained\s+(only\s+)?for\s+migration|migration\s+comparison|old\s+implementation|historical|遗留|旧实现|废弃|历史/.test(
+  const pathLegacy = /(^|\/)(legacy|old|deprecated)(\/|$)/.test(normalizeMatchText(spanPath))
+  const legacyStrong =
+    pathLegacy ||
+    /(^|[\s.:;])legacy\s+(implementation|code|file|migration|note)|deprecated|obsolete|retained\s+(only\s+)?for\s+migration|migration\s+comparison|old\s+implementation|historical|遗留|旧实现|废弃|历史/.test(
       text,
     )
-  const active = /\b(active|current|canonical|source\s+of\s+truth|must|should|now)\b|当前|现行|必须|应当/.test(text)
-  if (legacy) reasons.push("legacy_context_terms")
-  if (active) reasons.push("active_context_terms")
-  if (legacy) return { status: "legacy", reasons }
-  if (active) return { status: "active", reasons }
+  const activeStrong = /\b(active|current|canonical|source\s+of\s+truth|must|should|now)\b|当前|现行|必须|应当/.test(
+    text,
+  )
+  const activeContrast = /\bnot\b.{0,40}\b(legacy|old|20\s*percent|20\s*%)|old\s+legacy\s+behavior/.test(text)
+  if (pathLegacy) reasons.push("legacy_path")
+  if (legacyStrong) reasons.push("legacy_context_terms")
+  if (activeStrong || activeContrast) reasons.push("active_context_terms")
+  if (pathLegacy) return { status: "legacy", reasons }
+  if (activeStrong || activeContrast) return { status: "active", reasons }
+  if (legacyStrong) return { status: "legacy", reasons }
   return { status: "unknown", reasons }
 }
 
@@ -2465,6 +2496,11 @@ function semanticFactConflictKey(data: Record<string, unknown> | undefined) {
   const predicate = normalizeMatchText(structured?.predicate)
   const value = structured?.value
   if (!subject || !predicate || value === undefined) return undefined
+  const span = recordFromUnknown(structured?.source_span)
+  const snippet = normalizeMatchText(span?.snippet_preview)
+  if (predicate === "discount-cap" && /\b(loyalty|volume|seat|component)\b/.test(snippet) && !/\bcap\b/.test(snippet)) {
+    return undefined
+  }
   return {
     key: `${subject}|${predicate}`,
     subject,

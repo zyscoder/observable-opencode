@@ -4024,6 +4024,8 @@ describe("case trace", () => {
       "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
       "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
     ].join("\\n")
+    const productionFile = path.join(dir, "test-oracle-trap", "src", "pricing.mjs")
+    const testFile = path.join(dir, "test-oracle-trap", "test", "pricing.test.mjs")
     const testDiff = [
       "Index: test/pricing.test.mjs",
       "@@",
@@ -4035,8 +4037,8 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `const prod = CaseTrace.change({ files: ["src/pricing.mjs"], intent: "change production cap", diff: ${JSON.stringify(productionDiff)} })`,
-        `const test = CaseTrace.change({ files: ["test/pricing.test.mjs"], intent: "update pricing assertion", diff: ${JSON.stringify(testDiff)} })`,
+        `const prod = CaseTrace.change({ files: [${JSON.stringify(productionFile)}], intent: "change production cap", diff: ${JSON.stringify(productionDiff)} })`,
+        `const test = CaseTrace.change({ files: [${JSON.stringify(testFile)}], intent: "update pricing assertion", diff: ${JSON.stringify(testDiff)} })`,
         `const verification = CaseTrace.verification({ command: "npm test", exit_code: 0, stdout: "pricing tests passed", status: "passed" })`,
         `CaseTrace.responseOutput({ text: "npm test passed after updating pricing.", source_refs: verification ? ["verification:" + verification.verification_id] : [] })`,
         `CaseTrace.finish({ status: "success" })`,
@@ -4066,9 +4068,9 @@ describe("case trace", () => {
     const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
     const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
 
-    const productionChange = changes.find((record: any) => record.data.files.includes("src/pricing.mjs"))
+    const productionChange = changes.find((record: any) => record.data.files.includes(productionFile))
     expect(productionChange.data.change_target_role).toBe("production_code")
-    const testChange = changes.find((record: any) => record.data.files.includes("test/pricing.test.mjs"))
+    const testChange = changes.find((record: any) => record.data.files.includes(testFile))
     expect(testChange.data.change_target_role).toBe("test_code")
     expect(testChange.data.change_semantics.risk_flags).toContain("test_oracle_changed")
     expect(verification.data.changed_test_refs).toContain(`change:${testChange.data.change_id}`)
@@ -4155,6 +4157,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `const active = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "docs/architecture.md says the active renewal discount cap must be 15 percent", data: { subject: "renewalQuote", predicate: "discount_cap", value: "15 percent", path: "docs/architecture.md", line_start: 7, line_end: 7, output: "The active renewal discount cap must be 15 percent." } })`,
         `const legacy = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "legacy implementation still uses 20 percent cap", data: { subject: "renewalQuote", predicate: "discount_cap", value: "20 percent", path: "docs/architecture.md", line_start: 10, line_end: 10, output: "Legacy implementation retained for migration comparison still uses a 20 percent cap." } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "loyalty discount is 10 percent, not cap", data: { subject: "discount", predicate: "discount_cap", value: "10 percent", path: "docs/architecture.md", line_start: 11, line_end: 11, output: "Loyalty discount: 10 percent when loyaltyYears >= 3." } })`,
         `CaseTrace.responseOutput({ text: "renewalQuote discount cap is 20 percent.", source_refs: legacy ? ["evidence:" + legacy.node_id] : [] })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -4186,12 +4189,17 @@ describe("case trace", () => {
       (record: any) =>
         record.event_type === "evidence.semantic_fact" && record.data.structured_claim?.value === "20 percent",
     )
+    const loyaltyFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.structured_claim?.value === "10 percent",
+    )
     const claim = trace.records.find((record: any) => record.event_type === "response.claim")
     const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
     const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
 
     expect(activeFact.data.applicability_status).toBe("active")
     expect(legacyFact.data.applicability_status).toBe("legacy")
+    expect(loyaltyFact.data.conflict_group_id).toBeUndefined()
     expect(activeFact.data.conflict_group_id).toBeTruthy()
     expect(legacyFact.data.conflict_group_id).toBe(activeFact.data.conflict_group_id)
     expect(claim.data.conflicting_evidence_refs).toContain(`evidence:${activeFact.record_id}`)
