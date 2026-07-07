@@ -4211,6 +4211,74 @@ describe("case trace", () => {
     expect(issues).toContain("legacy_fact_used_in_final_claim")
   })
 
+  test("classifies semantic conflict roles for attribution", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-fact-roles-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "fact-role-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "architecture says current discount cap must be 15 percent", data: { subject: "discount", predicate: "discount_cap", value: "15 percent", path: "docs/architecture.md", line_start: 7, line_end: 7, output: "The current renewal discount cap must be 15 percent." } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "active pricing code caps discount at 20 percent before edit", data: { subject: "discount", predicate: "discount_cap", value: "0.2", path: "src/pricing.mjs", line_start: 6, line_end: 6, output: "const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "legacy implementation retained only for migration comparison uses 20 percent cap", data: { subject: "discount", predicate: "discount_cap", value: "20 percent", path: "src/legacy/pricing.mjs", line_start: 6, line_end: 6, output: "Legacy implementation retained only for migration comparison uses a 20 percent cap." } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "stale pricing test expects 20 percent cap", data: { subject: "discount", predicate: "discount_cap", value: "20 percent", path: "test/pricing.test.mjs", line_start: 4, line_end: 4, output: "assert.equal(renewalQuote({ baseCents: 1200, seats: 50, loyaltyYears: 4 }), 48000)" } })`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix current implementation cap", diff: "- const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)\\\\n+ const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)" })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "active pricing code caps discount at 15 percent after edit", data: { subject: "discount", predicate: "discount_cap", value: "0.15", path: "src/pricing.mjs", line_start: 6, line_end: 6, output: "const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "fact-role-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "fact-role-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const byValue = (value: string) => facts.find((record: any) => record.data.structured_claim?.value === value)
+    const requirementFact = byValue("15 percent")
+    const preChangeCodeFact = byValue("0.2")
+    const legacyFact = facts.find(
+      (record: any) =>
+        record.data.structured_claim?.value === "20 percent" &&
+        record.data.structured_claim?.source_span?.path === "src/legacy/pricing.mjs",
+    )
+    const testFact = facts.find(
+      (record: any) =>
+        record.data.structured_claim?.value === "20 percent" &&
+        record.data.structured_claim?.source_span?.path === "test/pricing.test.mjs",
+    )
+    const postChangeCodeFact = byValue("0.15")
+    const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+
+    expect(requirementFact.data.semantic_role).toBe("requirement_rule")
+    expect(preChangeCodeFact.data.semantic_role).toBe("observed_pre_change_code")
+    expect(legacyFact.data.semantic_role).toBe("legacy_historical")
+    expect(testFact.data.semantic_role).toBe("test_expectation")
+    expect(postChangeCodeFact.data.semantic_role).toBe("observed_post_change_code")
+    expect(requirementFact.data.conflict_kind).toBe("requirement_code_mismatch")
+    expect(preChangeCodeFact.data.conflict_severity).toBe("high")
+    expect(preChangeCodeFact.data.conflict_issue).toBe(true)
+    expect(legacyFact.data.conflict_issue).toBe(false)
+    expect(trace.metrics.trace_health.actionable_semantic_conflict_groups).toBe(1)
+    expect(issues).toContain("requirement_code_mismatch")
+  })
+
   test("evaluates read-only constraints at trace finish", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-constraint-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

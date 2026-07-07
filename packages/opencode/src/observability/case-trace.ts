@@ -342,9 +342,40 @@ export type TraceEvidenceFact = {
   quality_flags?: string[]
   applicability_status?: "active" | "legacy" | "contrast" | "unknown" | string
   applicability_reasons?: string[]
+  semantic_role?:
+    | "requirement_rule"
+    | "observed_pre_change_code"
+    | "observed_post_change_code"
+    | "observed_intermediate_code"
+    | "observed_current_code"
+    | "legacy_historical"
+    | "test_expectation"
+    | "verification_result"
+    | "secondary_summary"
+    | "unknown"
+    | string
+  fact_scope?:
+    | "requirement"
+    | "current_code"
+    | "legacy_code"
+    | "test_oracle"
+    | "verification"
+    | "summary"
+    | "unknown"
+    | string
   conflict_group_id?: string
   conflict_refs?: string[]
   conflict_role?: "active_candidate" | "legacy_candidate" | "conflicting_candidate" | string
+  conflict_kind?:
+    | "requirement_code_mismatch"
+    | "post_change_requirement_mismatch"
+    | "stale_test_expectation"
+    | "legacy_contrast"
+    | "secondary_summary_conflict"
+    | "generic_fact_conflict"
+    | string
+  conflict_severity?: "high" | "medium" | "low" | string
+  conflict_issue?: boolean
   confidence?: "observed" | "inferred" | string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
@@ -468,6 +499,8 @@ export type TraceHealthMetrics = {
   missing_verification_after_change?: number
   verification_after_test_change?: number
   conflicting_semantic_fact_groups?: number
+  actionable_semantic_conflict_groups?: number
+  low_value_semantic_conflict_members?: number
   legacy_fact_used_in_final_claim?: number
   raw_stream_delta_events?: number
   issues: TraceHealthIssue[]
@@ -2505,8 +2538,169 @@ function semanticFactConflictKey(data: Record<string, unknown> | undefined) {
     key: `${subject}|${predicate}`,
     subject,
     predicate,
-    value: normalizeMatchText(value),
+    value: semanticFactComparableValue(value),
   }
+}
+
+function semanticFactComparableValue(value: unknown) {
+  const text = normalizeMatchText(value)
+  if (!text) return text
+  const percent = text.match(/\b(-?\d+(?:\.\d+)?)\s*(?:percent|%)\b/)
+  if (percent) return `${formatComparableNumber(Number(percent[1]))}%`
+  const numeric = Number(text)
+  if (Number.isFinite(numeric) && Math.abs(numeric) > 0 && Math.abs(numeric) < 1) {
+    return `${formatComparableNumber(numeric * 100)}%`
+  }
+  return text
+}
+
+function formatComparableNumber(value: number) {
+  return Number(value.toFixed(6)).toString()
+}
+
+type SemanticFactChangePoint = {
+  time_ms: number
+  files: string[]
+}
+
+function semanticFactSourcePath(data: Record<string, unknown> | undefined) {
+  const structured = recordFromUnknown(data?.structured_claim)
+  const span = recordFromUnknown(structured?.source_span)
+  const spanPath = typeof span?.path === "string" ? span.path : undefined
+  if (spanPath) return spanPath
+  const locations = Array.isArray(data?.source_locations) ? data.source_locations : []
+  for (const location of locations) {
+    const record = recordFromUnknown(location)
+    if (typeof record?.path === "string") return record.path
+  }
+  return undefined
+}
+
+function semanticFactText(data: Record<string, unknown> | undefined) {
+  const structured = recordFromUnknown(data?.structured_claim)
+  const span = recordFromUnknown(structured?.source_span)
+  return normalizeMatchText(
+    [span?.snippet_preview, span?.path, data?.summary, data?.claim, data?.data, data?.metadata, data?.source_locations]
+      .map((item) => fieldSummaryText(item))
+      .join("\n"),
+  )
+}
+
+function sourcePathMatchesChangedFile(sourcePath: string, changedFile: string) {
+  const source = sourcePath.replace(/\\/g, "/").toLowerCase()
+  const changed = changedFile.replace(/\\/g, "/").toLowerCase()
+  return source === changed || source.endsWith(`/${changed}`) || changed.endsWith(`/${source}`)
+}
+
+function semanticFactRole(
+  data: Record<string, unknown> | undefined,
+  node: Pick<CausalNode, "time_ms">,
+  changes: SemanticFactChangePoint[],
+) {
+  const factKind = typeof data?.fact_kind === "string" ? data.fact_kind : ""
+  const sourcePath = semanticFactSourcePath(data)
+  const text = semanticFactText(data)
+  if (factKind === "verification_output") {
+    return { semantic_role: "verification_result", fact_scope: "verification" }
+  }
+  if (factKind === "subagent_result") {
+    return { semantic_role: "secondary_summary", fact_scope: "summary" }
+  }
+  const sourceRole = sourcePath ? changeTargetRoleForFile(sourcePath) : "unknown"
+  const pathLegacy = sourcePath
+    ? /(^|\/)(legacy|old|deprecated)(\/|$)/.test(sourcePath.replace(/\\/g, "/").toLowerCase())
+    : false
+  const legacyText =
+    /\blegacy\b|deprecated|obsolete|retained\s+(only\s+)?for\s+migration|migration\s+comparison|historical|遗留|旧实现|废弃|历史/.test(
+      text,
+    )
+  if (pathLegacy || (legacyText && sourceRole !== "test_code")) {
+    return { semantic_role: "legacy_historical", fact_scope: "legacy_code" }
+  }
+  if (sourceRole === "test_code") {
+    return { semantic_role: "test_expectation", fact_scope: "test_oracle" }
+  }
+  const requirementText =
+    /\b(must|should|required|requirement|source\s+of\s+truth|canonical|current|active)\b|必须|应当|需求|现行|当前/.test(
+      text,
+    )
+  if (sourceRole === "docs" && requirementText) {
+    return { semantic_role: "requirement_rule", fact_scope: "requirement" }
+  }
+  if (sourceRole === "production_code") {
+    const relatedChanges = sourcePath
+      ? changes.filter((change) => change.files.some((file) => sourcePathMatchesChangedFile(sourcePath, file)))
+      : []
+    const priorChange = relatedChanges.some((change) => change.time_ms <= node.time_ms)
+    const laterChange = relatedChanges.some((change) => change.time_ms > node.time_ms)
+    if (priorChange && laterChange) return { semantic_role: "observed_intermediate_code", fact_scope: "current_code" }
+    if (priorChange) return { semantic_role: "observed_post_change_code", fact_scope: "current_code" }
+    if (laterChange) return { semantic_role: "observed_pre_change_code", fact_scope: "current_code" }
+    return { semantic_role: "observed_current_code", fact_scope: "current_code" }
+  }
+  if (requirementText) {
+    return { semantic_role: "requirement_rule", fact_scope: "requirement" }
+  }
+  return { semantic_role: "unknown", fact_scope: "unknown" }
+}
+
+type SemanticFactConflictMember = {
+  node: CausalNode
+  value: string
+  semantic_role: string
+}
+
+function semanticFactConflictClassification(members: SemanticFactConflictMember[]) {
+  const valuesByRole = new Map<string, Set<string>>()
+  for (const member of members) {
+    const current = valuesByRole.get(member.semantic_role) ?? new Set<string>()
+    current.add(member.value)
+    valuesByRole.set(member.semantic_role, current)
+  }
+  const requirementValues = valuesByRole.get("requirement_rule") ?? new Set<string>()
+  const preChangeValues = valuesByRole.get("observed_pre_change_code") ?? new Set<string>()
+  const currentCodeValues = new Set<string>([
+    ...(valuesByRole.get("observed_current_code") ?? []),
+    ...(valuesByRole.get("observed_intermediate_code") ?? []),
+  ])
+  const postChangeValues = valuesByRole.get("observed_post_change_code") ?? new Set<string>()
+  const testValues = valuesByRole.get("test_expectation") ?? new Set<string>()
+  const legacyValues = valuesByRole.get("legacy_historical") ?? new Set<string>()
+  const secondaryValues = valuesByRole.get("secondary_summary") ?? new Set<string>()
+
+  if (hasValueOutside(requirementValues, postChangeValues)) {
+    return { conflict_kind: "post_change_requirement_mismatch", conflict_severity: "high", conflict_issue: true }
+  }
+  if (hasValueOutside(requirementValues, preChangeValues) || hasValueOutside(requirementValues, currentCodeValues)) {
+    return { conflict_kind: "requirement_code_mismatch", conflict_severity: "high", conflict_issue: true }
+  }
+  if (hasValueOutside(requirementValues, testValues)) {
+    return { conflict_kind: "stale_test_expectation", conflict_severity: "medium", conflict_issue: true }
+  }
+  if (hasValueOutside(requirementValues, legacyValues)) {
+    return { conflict_kind: "legacy_contrast", conflict_severity: "low", conflict_issue: false }
+  }
+  if (secondaryValues.size && new Set(members.map((member) => member.value)).size > 1) {
+    return { conflict_kind: "secondary_summary_conflict", conflict_severity: "low", conflict_issue: false }
+  }
+  return { conflict_kind: "generic_fact_conflict", conflict_severity: "medium", conflict_issue: true }
+}
+
+function hasValueOutside(reference: Set<string>, candidate: Set<string>) {
+  if (!reference.size || !candidate.size) return false
+  for (const value of candidate) {
+    if (!reference.has(value)) return true
+  }
+  return false
+}
+
+function semanticConflictMemberIssue(
+  role: string,
+  classification: ReturnType<typeof semanticFactConflictClassification>,
+) {
+  if (!classification.conflict_issue) return false
+  if (role === "legacy_historical" || role === "secondary_summary") return false
+  return true
 }
 
 function parseChangedDiffLines(diffText: string): { added: string[]; removed: string[] } {
@@ -6067,10 +6261,17 @@ class ActiveCaseTrace {
 
   private enrichSemanticFactApplicabilityAndConflicts() {
     const facts = this.causalNodes.filter((node) => node.kind === "evidence.semantic_fact")
+    const changePoints: SemanticFactChangePoint[] = this.causalNodes
+      .filter((node) => node.kind === "change")
+      .map((node) => ({
+        time_ms: node.time_ms,
+        files: stringArrayField(node.data ?? {}, ["files"]) ?? [],
+      }))
     const updated = new Set<string>()
     for (const fact of facts) {
       if (!fact.data) continue
       const applicability = semanticFactApplicability(fact.data)
+      const role = semanticFactRole(fact.data, fact, changePoints)
       fact.data = {
         ...fact.data,
         applicability_status: fact.data.applicability_status ?? applicability.status,
@@ -6078,16 +6279,22 @@ class ActiveCaseTrace {
           ...(stringArrayField(fact.data, ["applicability_reasons", "applicabilityReasons"]) ?? []),
           ...applicability.reasons,
         ]),
+        semantic_role: fact.data.semantic_role ?? role.semantic_role,
+        fact_scope: fact.data.fact_scope ?? role.fact_scope,
       }
       updated.add(fact.node_id)
     }
 
-    const groups = new Map<string, Array<{ node: CausalNode; value: string }>>()
+    const groups = new Map<string, SemanticFactConflictMember[]>()
     for (const fact of facts) {
       const conflictKey = semanticFactConflictKey(fact.data)
       if (!conflictKey?.value) continue
       const current = groups.get(conflictKey.key) ?? []
-      current.push({ node: fact, value: conflictKey.value })
+      current.push({
+        node: fact,
+        value: conflictKey.value,
+        semantic_role: typeof fact.data?.semantic_role === "string" ? fact.data.semantic_role : "unknown",
+      })
       groups.set(conflictKey.key, current)
     }
 
@@ -6097,12 +6304,14 @@ class ActiveCaseTrace {
       if (values.size <= 1) continue
       groupIndex += 1
       const groupID = `fact_conflict_${groupIndex}_${safeNodeIDPart(key)}`
+      const classification = semanticFactConflictClassification(members)
       for (const member of members) {
         const otherRefs = members
           .filter((candidate) => candidate.node.node_id !== member.node.node_id)
           .map((candidate) => `evidence:${candidate.node.node_id}`)
         const status =
           typeof member.node.data?.applicability_status === "string" ? member.node.data.applicability_status : "unknown"
+        const role = typeof member.node.data?.semantic_role === "string" ? member.node.data.semantic_role : "unknown"
         member.node.data = {
           ...(member.node.data ?? {}),
           conflict_group_id: member.node.data?.conflict_group_id ?? groupID,
@@ -6117,6 +6326,12 @@ class ActiveCaseTrace {
               : status === "legacy"
                 ? "legacy_candidate"
                 : "conflicting_candidate"),
+          conflict_kind: member.node.data?.conflict_kind ?? classification.conflict_kind,
+          conflict_severity: member.node.data?.conflict_severity ?? classification.conflict_severity,
+          conflict_issue:
+            typeof member.node.data?.conflict_issue === "boolean"
+              ? member.node.data.conflict_issue
+              : semanticConflictMemberIssue(role, classification),
         }
         updated.add(member.node.node_id)
       }
@@ -6981,6 +7196,12 @@ class ActiveCaseTrace {
       current.push(record)
       semanticFactConflictGroups.set(groupID, current)
     }
+    const actionableSemanticConflictGroups = [...semanticFactConflictGroups.values()].filter((group) =>
+      group.some((record) => record.data?.conflict_issue === true),
+    )
+    const lowValueSemanticConflictMembers = [...semanticFactConflictGroups.values()]
+      .flat()
+      .filter((record) => record.data?.conflict_issue === false)
     const legacyFactUsedInFinalClaim = records.filter(
       (record) =>
         record.event_type === "response.claim" &&
@@ -7017,14 +7238,35 @@ class ActiveCaseTrace {
       })
     }
     for (const [groupID, group] of [...semanticFactConflictGroups.entries()].slice(0, 20)) {
+      const conflictKind =
+        group.map((record) => record.data?.conflict_kind).find((kind): kind is string => typeof kind === "string") ??
+        "conflicting_semantic_fact_group"
+      const conflictSeverity =
+        group
+          .map((record) => record.data?.conflict_severity)
+          .find((severity): severity is string => typeof severity === "string") ?? "medium"
+      const conflictIssue = group.some((record) => record.data?.conflict_issue === true)
       issues.push({
         kind: "conflicting_semantic_fact_group",
-        severity: "warning",
+        severity: conflictIssue ? "warning" : "info",
         message: "Semantic facts with the same subject and predicate report conflicting values.",
         count: group.length,
         refs: group.slice(0, 20).map((record) => `evidence:${record.record_id}`),
-        metadata: { conflict_group_id: groupID },
+        metadata: { conflict_group_id: groupID, conflict_kind: conflictKind, conflict_severity: conflictSeverity },
       })
+      if (conflictIssue) {
+        issues.push({
+          kind: conflictKind,
+          severity: conflictSeverity === "high" ? "warning" : "info",
+          message: `Semantic fact conflict classified as ${conflictKind}.`,
+          count: group.length,
+          refs: group
+            .filter((record) => record.data?.conflict_issue === true)
+            .slice(0, 20)
+            .map((record) => `evidence:${record.record_id}`),
+          metadata: { conflict_group_id: groupID, conflict_kind: conflictKind, conflict_severity: conflictSeverity },
+        })
+      }
     }
     for (const record of legacyFactUsedInFinalClaim.slice(0, 20)) {
       issues.push({
@@ -7063,6 +7305,8 @@ class ActiveCaseTrace {
       missing_verification_after_change: missingVerificationAfterChange.length,
       verification_after_test_change: verificationAfterTestChange.length,
       conflicting_semantic_fact_groups: semanticFactConflictGroups.size,
+      actionable_semantic_conflict_groups: actionableSemanticConflictGroups.length,
+      low_value_semantic_conflict_members: lowValueSemanticConflictMembers.length,
       legacy_fact_used_in_final_claim: legacyFactUsedInFinalClaim.length,
       broken_claim_fragments: brokenClaimFragments.length,
       over_attributed_claims: overAttributedClaims.length,
