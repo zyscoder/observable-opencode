@@ -190,6 +190,10 @@ export type TraceVerificationRecord = {
   stdout?: TraceFieldSummary
   stderr?: TraceFieldSummary
   quality_flags?: string[]
+  changed_test_refs?: string[]
+  changed_production_refs?: string[]
+  changed_docs_refs?: string[]
+  verification_scope_risk_flags?: string[]
   metadata?: Record<string, unknown>
 }
 
@@ -217,6 +221,8 @@ export type TraceChangeRecord = {
   span_id?: string
   tool_call_id?: string
   files: string[]
+  change_target_role?: "production_code" | "test_code" | "docs" | "config" | "mixed" | "unknown" | string
+  changed_test_oracle?: boolean
   intent?: string
   diff?: TraceFieldSummary
   change_semantics?: TraceChangeSemantics
@@ -334,6 +340,11 @@ export type TraceEvidenceFact = {
   structured_claim?: TraceStructuredClaim
   support_level?: "direct" | "context" | "execution" | "weak" | string
   quality_flags?: string[]
+  applicability_status?: "active" | "legacy" | "contrast" | "unknown" | string
+  applicability_reasons?: string[]
+  conflict_group_id?: string
+  conflict_refs?: string[]
+  conflict_role?: "active_candidate" | "legacy_candidate" | "conflicting_candidate" | string
   confidence?: "observed" | "inferred" | string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
@@ -382,6 +393,9 @@ export type TraceResponseClaimRecord = {
   candidate_tool_outcome_refs?: string[]
   dependency_tool_outcome_refs?: string[]
   attribution_summary?: Record<string, unknown>
+  conflicting_evidence_refs?: string[]
+  support_conflict_status?: "conflicted" | "unconflicted" | "unknown" | string
+  verification_after_test_change_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   support_level: "direct" | "contextual" | "execution_only" | "unsupported" | string
@@ -452,6 +466,9 @@ export type TraceHealthMetrics = {
   background_llm_turns?: number
   legacy_context_ref_claims?: number
   missing_verification_after_change?: number
+  verification_after_test_change?: number
+  conflicting_semantic_fact_groups?: number
+  legacy_fact_used_in_final_claim?: number
   raw_stream_delta_events?: number
   issues: TraceHealthIssue[]
 }
@@ -2363,6 +2380,96 @@ function changeSemanticsFromDiff(diff: unknown): TraceChangeSemantics | undefine
     ...(operationKinds.size ? { operation_kinds: [...operationKinds] } : {}),
     ...(riskFlags.size ? { risk_flags: [...riskFlags] } : {}),
     ...(summaryParts.length ? { summary: summaryParts.join("; ") } : {}),
+  }
+}
+
+function changeTargetRole(files: string[]) {
+  const roles = new Set(files.map(changeTargetRoleForFile))
+  roles.delete("unknown")
+  if (!roles.size) return "unknown"
+  if (roles.size === 1) return [...roles][0]
+  return "mixed"
+}
+
+function changeTargetRoleForFile(file: string) {
+  const normalized = file.replace(/\\/g, "/").toLowerCase()
+  if (/(^|\/)(__tests__|tests?|spec|fixtures?|mocks?)(\/|$)/.test(normalized)) return "test_code"
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(normalized)) return "test_code"
+  if (/\/test[-_.]/.test(normalized) || /[-_.]test\./.test(normalized)) return "test_code"
+  if (/(^|\/)(docs?|requirements?|design|architecture)(\/|$)/.test(normalized)) return "docs"
+  if (/(^|\/)(package\.json|tsconfig\.json|vite\.config|rollup\.config|webpack\.config|bunfig\.toml)$/.test(normalized))
+    return "config"
+  if (/(^|\/)(src|lib|packages|app)(\/|$)/.test(normalized)) return "production_code"
+  if (/\.[cm]?[jt]sx?$|\.py$|\.go$|\.rs$|\.java$|\.kt$|\.swift$|\.mjs$|\.cjs$/.test(normalized))
+    return "production_code"
+  return "unknown"
+}
+
+function isTestOracleChange(diff: unknown, role: string | undefined, semantics: TraceChangeSemantics | undefined) {
+  if (role !== "test_code" && role !== "mixed") return false
+  if (!semantics?.numeric_constant_changes?.length) return false
+  const text = fieldSummaryText(diff)
+  const lines = parseChangedDiffLines(text)
+  const changedLines = [...lines.added, ...lines.removed].join("\n")
+  return /\b(assert|expect|toBe|toEqual|equal|strictEqual|should|matcher|断言|期望)\b/i.test(changedLines)
+}
+
+function enrichChangeSemanticsForTarget(input: {
+  semantics: TraceChangeSemantics | undefined
+  diff: unknown
+  role: string
+  changedTestOracle: boolean
+}) {
+  if (!input.semantics) return undefined
+  const riskFlags = new Set(input.semantics.risk_flags ?? [])
+  const operationKinds = new Set(input.semantics.operation_kinds ?? [])
+  if (input.role === "test_code" || input.role === "mixed") riskFlags.add("test_code_changed")
+  if (input.role === "production_code" || input.role === "mixed") riskFlags.add("production_code_changed")
+  if (input.changedTestOracle) {
+    riskFlags.add("test_oracle_changed")
+    riskFlags.add("test_fixture_value_changed")
+    operationKinds.add("test_oracle_update")
+  }
+  const summaryParts = [input.semantics.summary].filter((item): item is string => Boolean(item))
+  if (input.changedTestOracle) summaryParts.push("test oracle changed before verification")
+  return {
+    ...input.semantics,
+    ...(operationKinds.size ? { operation_kinds: [...operationKinds] } : {}),
+    ...(riskFlags.size ? { risk_flags: [...riskFlags] } : {}),
+    ...(summaryParts.length ? { summary: dedupeStrings(summaryParts).join("; ") } : {}),
+  }
+}
+
+function semanticFactApplicability(data: Record<string, unknown> | undefined) {
+  const text = normalizeMatchText(
+    [data?.summary, data?.claim, data?.data, data?.structured_claim, data?.source_locations, data?.metadata]
+      .map((item) => fieldSummaryText(item))
+      .join("\n"),
+  )
+  const reasons: string[] = []
+  const legacy =
+    /legacy|deprecated|obsolete|retained\s+(only\s+)?for\s+migration|migration\s+comparison|old\s+implementation|historical|遗留|旧实现|废弃|历史/.test(
+      text,
+    )
+  const active = /\b(active|current|canonical|source\s+of\s+truth|must|should|now)\b|当前|现行|必须|应当/.test(text)
+  if (legacy) reasons.push("legacy_context_terms")
+  if (active) reasons.push("active_context_terms")
+  if (legacy) return { status: "legacy", reasons }
+  if (active) return { status: "active", reasons }
+  return { status: "unknown", reasons }
+}
+
+function semanticFactConflictKey(data: Record<string, unknown> | undefined) {
+  const structured = recordFromUnknown(data?.structured_claim)
+  const subject = normalizeMatchText(structured?.subject ?? data?.canonical_subject)
+  const predicate = normalizeMatchText(structured?.predicate)
+  const value = structured?.value
+  if (!subject || !predicate || value === undefined) return undefined
+  return {
+    key: `${subject}|${predicate}`,
+    subject,
+    predicate,
+    value: normalizeMatchText(value),
   }
 }
 
@@ -4444,6 +4551,35 @@ class ActiveCaseTrace {
     return edge
   }
 
+  private verificationScopeContext() {
+    const changedTestRefs: string[] = []
+    const changedProductionRefs: string[] = []
+    const changedDocsRefs: string[] = []
+    let oracleChanged = false
+    for (const change of this.changeRecords) {
+      const ref = `change:${change.change_id}`
+      const role = change.change_target_role ?? changeTargetRole(change.files)
+      const riskFlags = change.change_semantics?.risk_flags ?? []
+      if (role === "test_code" || role === "mixed") changedTestRefs.push(ref)
+      if (role === "production_code" || role === "mixed") changedProductionRefs.push(ref)
+      if (role === "docs") changedDocsRefs.push(ref)
+      if (change.changed_test_oracle || riskFlags.includes("test_oracle_changed")) oracleChanged = true
+    }
+    const riskFlags = dedupeStrings([
+      ...(changedTestRefs.length ? ["tests_modified_before_verification"] : []),
+      ...(oracleChanged ? ["test_oracle_modified_before_verification"] : []),
+      ...(changedTestRefs.length && changedProductionRefs.length
+        ? ["production_and_tests_modified_before_verification"]
+        : []),
+    ])
+    return {
+      changedTestRefs: dedupeStrings(changedTestRefs),
+      changedProductionRefs: dedupeStrings(changedProductionRefs),
+      changedDocsRefs: dedupeStrings(changedDocsRefs),
+      riskFlags,
+    }
+  }
+
   verification(input: VerificationRecordInput) {
     const parsed = input.parsed_failures ?? parseVerificationFailures({ stdout: input.stdout, stderr: input.stderr })
     const exitCode = optionalNumber(input.exit_code)
@@ -4453,6 +4589,7 @@ class ActiveCaseTrace {
       parsedFailures: parsed,
       command: input.command,
     })
+    const verificationScope = this.verificationScopeContext()
     const sourceLocations = dedupeSourceLocations(
       parsed
         .filter((failure) => failure.file)
@@ -4476,7 +4613,15 @@ class ActiveCaseTrace {
       parsed_failures: parsed,
       stdout: input.stdout === undefined ? undefined : this.summarizeText(input.stdout, "verification.stdout"),
       stderr: input.stderr === undefined ? undefined : this.summarizeText(input.stderr, "verification.stderr"),
-      quality_flags: dedupeStrings([...(input.quality_flags ?? []), ...statusInference.quality_flags]),
+      quality_flags: dedupeStrings([
+        ...(input.quality_flags ?? []),
+        ...statusInference.quality_flags,
+        ...verificationScope.riskFlags,
+      ]),
+      changed_test_refs: verificationScope.changedTestRefs,
+      changed_production_refs: verificationScope.changedProductionRefs,
+      changed_docs_refs: verificationScope.changedDocsRefs,
+      verification_scope_risk_flags: verificationScope.riskFlags,
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
@@ -4497,6 +4642,10 @@ class ActiveCaseTrace {
         stage: verification.stage,
         exit_code: verification.exit_code,
         quality_flags: verification.quality_flags,
+        changed_test_refs: verification.changed_test_refs,
+        changed_production_refs: verification.changed_production_refs,
+        changed_docs_refs: verification.changed_docs_refs,
+        verification_scope_risk_flags: verification.verification_scope_risk_flags,
         parsed_failures: verification.parsed_failures,
         stdout: input.stdout,
         stderr: input.stderr,
@@ -4507,9 +4656,20 @@ class ActiveCaseTrace {
         .filter((item): item is string => Boolean(item)),
     })
     if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
-    if (verification.status === "passed" && this.recentChangeID) {
+    const linkedChangeRefs =
+      verification.status === "passed"
+        ? dedupeStrings([
+            ...verificationScope.changedTestRefs,
+            ...verificationScope.changedProductionRefs,
+            ...verificationScope.changedDocsRefs,
+            ...(this.recentChangeID ? [`change:${this.recentChangeID}`] : []),
+          ])
+        : []
+    for (const ref of linkedChangeRefs) {
+      const parsedRef = this.parseSourceRef(ref)
+      if (!parsedRef?.id) continue
       this.edge({
-        from: { type: "change", id: this.recentChangeID },
+        from: { type: "change", id: parsedRef.id },
         to: { type: "verification", id: verification.verification_id },
         relation: "change_to_verification",
         label: "Verification ran after repository change",
@@ -4523,9 +4683,19 @@ class ActiveCaseTrace {
       input.source_refs ??
       input.evidence_refs ??
       (this.recentFailedVerificationID ? [`verification:${this.recentFailedVerificationID}`] : undefined)
-    const changeSemantics = input.change_semantics ?? changeSemanticsFromDiff(input.diff)
+    const targetRole = input.change_target_role ?? changeTargetRole(input.files)
+    const baseChangeSemantics = input.change_semantics ?? changeSemanticsFromDiff(input.diff)
+    const changedTestOracle =
+      input.changed_test_oracle ?? isTestOracleChange(input.diff, targetRole, baseChangeSemantics)
+    const changeSemantics = enrichChangeSemanticsForTarget({
+      semantics: baseChangeSemantics,
+      diff: input.diff,
+      role: targetRole,
+      changedTestOracle,
+    })
     const qualityFlags = dedupeStrings([
       ...(input.quality_flags ?? []),
+      ...(changedTestOracle ? ["test_oracle_changed"] : []),
       ...(input.diff === undefined ? ["missing_diff"] : []),
       ...(input.diff !== undefined && !changeSemantics ? ["change_semantics_unavailable"] : []),
     ])
@@ -4534,6 +4704,8 @@ class ActiveCaseTrace {
       span_id: input.span_id,
       tool_call_id: input.tool_call_id,
       files: input.files,
+      change_target_role: targetRole,
+      changed_test_oracle: changedTestOracle,
       intent: input.intent,
       diff: input.diff === undefined ? undefined : this.summarizeText(input.diff, "change.diff"),
       change_semantics: changeSemantics,
@@ -4554,6 +4726,8 @@ class ActiveCaseTrace {
       data: {
         change_id: change.change_id,
         files: input.files,
+        change_target_role: targetRole,
+        changed_test_oracle: changedTestOracle,
         intent: input.intent,
         diff: input.diff,
         change_semantics: changeSemantics,
@@ -4684,6 +4858,43 @@ class ActiveCaseTrace {
     return segment
   }
 
+  private evidenceConflictInfo(refs: string[]) {
+    const directEvidenceRefs = refs.filter((ref) => ref.startsWith("evidence:"))
+    const conflictRefs: string[] = []
+    const legacyEvidenceRefs: string[] = []
+    for (const ref of directEvidenceRefs) {
+      const node = this.evidenceNodeForRef(ref)
+      const data = node?.data
+      if (!data) continue
+      if (data.applicability_status === "legacy") legacyEvidenceRefs.push(ref)
+      conflictRefs.push(...(stringArrayField(data, ["conflict_refs", "conflictRefs"]) ?? []))
+    }
+    const conflictingEvidenceRefs = dedupeStrings(conflictRefs.filter((ref) => !directEvidenceRefs.includes(ref)))
+    return {
+      conflictingEvidenceRefs,
+      legacyEvidenceRefs: dedupeStrings(legacyEvidenceRefs),
+      supportConflictStatus: conflictingEvidenceRefs.length ? "conflicted" : "unconflicted",
+    }
+  }
+
+  private verificationAfterTestChangeRefsForRefs(refs: string[]) {
+    const output: string[] = []
+    for (const ref of refs) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed || parsed.type !== "verification") continue
+      const node = this.causalNodes.find(
+        (item) => item.kind === "verification" && item.data?.verification_id === parsed.id,
+      )
+      const riskFlags = stringArrayField(node?.data ?? {}, [
+        "verification_scope_risk_flags",
+        "verificationScopeRiskFlags",
+      ])
+      if (riskFlags?.includes("test_oracle_modified_before_verification")) output.push(ref)
+      else if (riskFlags?.includes("tests_modified_before_verification")) output.push(ref)
+    }
+    return dedupeStrings(output)
+  }
+
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
@@ -4707,6 +4918,11 @@ class ActiveCaseTrace {
       ...candidateClassifiedRefs,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
     }
+    const conflictInfo = this.evidenceConflictInfo(effectiveDirectEvidenceRefs)
+    const verificationAfterTestChangeRefs = this.verificationAfterTestChangeRefsForRefs([
+      ...effectiveDirectEvidenceRefs,
+      ...classifiedRefs.execution_refs,
+    ])
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.text),
@@ -4730,6 +4946,8 @@ class ActiveCaseTrace {
       candidate_tool_outcome_count: candidateToolOutcomeRefs.length,
       dependency_tool_outcome_count: dependencyToolOutcomeRefs.length,
       derived_tool_outcome_count: dependencyToolOutcomeRefs.length,
+      conflicting_evidence_count: conflictInfo.conflictingEvidenceRefs.length,
+      verification_after_test_change_count: verificationAfterTestChangeRefs.length,
       support_level: supportLevel,
       match_strategy: evidenceMatch.strategy,
       match_score: evidenceMatch.score,
@@ -4742,6 +4960,9 @@ class ActiveCaseTrace {
       ...(candidateClassifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
         ? ["unmatched_direct_evidence_refs"]
         : []),
+      ...(conflictInfo.conflictingEvidenceRefs.length ? ["conflicting_evidence"] : []),
+      ...(conflictInfo.legacyEvidenceRefs.length ? ["legacy_evidence_used"] : []),
+      ...(verificationAfterTestChangeRefs.length ? ["verification_after_test_change"] : []),
     ])
     const claim: TraceResponseClaimRecord = {
       claim_id: input.claim_id ?? semanticID("claim", this.causalNodes.length + 1),
@@ -4772,6 +4993,9 @@ class ActiveCaseTrace {
       candidate_tool_outcome_refs: candidateToolOutcomeRefs,
       dependency_tool_outcome_refs: dependencyToolOutcomeRefs,
       attribution_summary: attributionSummary,
+      conflicting_evidence_refs: conflictInfo.conflictingEvidenceRefs,
+      support_conflict_status: conflictInfo.supportConflictStatus,
+      verification_after_test_change_refs: verificationAfterTestChangeRefs,
       source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
       support_level: supportLevel,
@@ -4815,6 +5039,9 @@ class ActiveCaseTrace {
         candidate_tool_outcome_refs: claim.candidate_tool_outcome_refs,
         dependency_tool_outcome_refs: claim.dependency_tool_outcome_refs,
         attribution_summary: claim.attribution_summary,
+        conflicting_evidence_refs: claim.conflicting_evidence_refs,
+        support_conflict_status: claim.support_conflict_status,
+        verification_after_test_change_refs: claim.verification_after_test_change_refs,
         support_level: claim.support_level,
         quality_flags: claim.quality_flags,
         source_locations: sourceLocations,
@@ -4904,6 +5131,9 @@ class ActiveCaseTrace {
         tool_failure_handled_status: toolFailureHandledStatus,
         replacement_evidence_refs: replacementEvidenceRefs,
         tool_result_dependency_refs: toolResultRefs,
+        conflicting_evidence_refs: claim.conflicting_evidence_refs,
+        support_conflict_status: claim.support_conflict_status,
+        verification_after_test_change_refs: claim.verification_after_test_change_refs,
         weak_match_reasons: weakMatchReasons,
         match_strategy: claim.match_strategy,
         match_score: claim.match_score,
@@ -4913,6 +5143,8 @@ class ActiveCaseTrace {
       source_refs: dedupeStrings([
         `response_claim:${claimNodeID}`,
         ...claim.direct_evidence_refs,
+        ...(claim.conflicting_evidence_refs ?? []),
+        ...(claim.verification_after_test_change_refs ?? []),
         ...allToolOutcomeRefs,
         ...claim.context_refs,
         ...claim.execution_refs,
@@ -5797,6 +6029,70 @@ class ActiveCaseTrace {
     ].filter((item, index, array) => array.indexOf(item) === index)
   }
 
+  private enrichSemanticFactApplicabilityAndConflicts() {
+    const facts = this.causalNodes.filter((node) => node.kind === "evidence.semantic_fact")
+    const updated = new Set<string>()
+    for (const fact of facts) {
+      if (!fact.data) continue
+      const applicability = semanticFactApplicability(fact.data)
+      fact.data = {
+        ...fact.data,
+        applicability_status: fact.data.applicability_status ?? applicability.status,
+        applicability_reasons: dedupeStrings([
+          ...(stringArrayField(fact.data, ["applicability_reasons", "applicabilityReasons"]) ?? []),
+          ...applicability.reasons,
+        ]),
+      }
+      updated.add(fact.node_id)
+    }
+
+    const groups = new Map<string, Array<{ node: CausalNode; value: string }>>()
+    for (const fact of facts) {
+      const conflictKey = semanticFactConflictKey(fact.data)
+      if (!conflictKey?.value) continue
+      const current = groups.get(conflictKey.key) ?? []
+      current.push({ node: fact, value: conflictKey.value })
+      groups.set(conflictKey.key, current)
+    }
+
+    let groupIndex = 0
+    for (const [key, members] of groups) {
+      const values = new Set(members.map((member) => member.value))
+      if (values.size <= 1) continue
+      groupIndex += 1
+      const groupID = `fact_conflict_${groupIndex}_${safeNodeIDPart(key)}`
+      for (const member of members) {
+        const otherRefs = members
+          .filter((candidate) => candidate.node.node_id !== member.node.node_id)
+          .map((candidate) => `evidence:${candidate.node.node_id}`)
+        const status =
+          typeof member.node.data?.applicability_status === "string" ? member.node.data.applicability_status : "unknown"
+        member.node.data = {
+          ...(member.node.data ?? {}),
+          conflict_group_id: member.node.data?.conflict_group_id ?? groupID,
+          conflict_refs: dedupeStrings([
+            ...(stringArrayField(member.node.data ?? {}, ["conflict_refs", "conflictRefs"]) ?? []),
+            ...otherRefs,
+          ]),
+          conflict_role:
+            member.node.data?.conflict_role ??
+            (status === "active"
+              ? "active_candidate"
+              : status === "legacy"
+                ? "legacy_candidate"
+                : "conflicting_candidate"),
+        }
+        updated.add(member.node.node_id)
+      }
+    }
+
+    for (const fact of facts) {
+      if (!updated.has(fact.node_id)) continue
+      fact.artifact_refs = this.collectArtifactRefs(fact.data)
+      this.writeRecord("node.update", fact)
+    }
+  }
+
   finish(input?: FinishTraceInput) {
     if (this.finished) return
     this.evaluateConstraints()
@@ -5807,6 +6103,7 @@ class ActiveCaseTrace {
     this.result = input?.result ?? this.result
     const status = input?.status ?? (error ? "error" : "success")
     const caseStatus = this.inferCaseStatus(status, error)
+    this.enrichSemanticFactApplicabilityAndConflicts()
     this.emitFinalResponseClaims(caseStatus)
     this.finalizeOpenRecords(status, caseStatus)
     this.backfillCompactionEstimates()
@@ -6222,7 +6519,7 @@ class ActiveCaseTrace {
   private parentConsumersForSubagent(subagent: CausalNode) {
     const refs = dedupeStrings([
       `node:${subagent.node_id}`,
-      ...(subagent.span_id ? [`span:${subagent.span_id}`] : []),
+      ...(subagent.span_id ? [`span:${subagent.span_id}`, `tool_span:${subagent.span_id}`] : []),
       ...(subagent.source_refs ?? []),
     ])
     const childSessionID = firstStringField(subagent.data, ["child_session_id", "childSessionID"])
@@ -6634,6 +6931,25 @@ class ActiveCaseTrace {
     const changeRecords = records.filter((record) => record.event_type === "change")
     const verificationRecords = records.filter((record) => record.event_type === "verification")
     const missingVerificationAfterChange = changeRecords.length && !verificationRecords.length ? changeRecords : []
+    const verificationAfterTestChange = verificationRecords.filter((record) =>
+      stringArrayField(record.data ?? {}, ["verification_scope_risk_flags", "verificationScopeRiskFlags"])?.some(
+        (flag) => flag === "tests_modified_before_verification" || flag === "test_oracle_modified_before_verification",
+      ),
+    )
+    const semanticFactConflictGroups = new Map<string, ProvenanceRecord[]>()
+    for (const record of records) {
+      if (record.event_type !== "evidence.semantic_fact") continue
+      const groupID = typeof record.data?.conflict_group_id === "string" ? record.data.conflict_group_id : undefined
+      if (!groupID) continue
+      const current = semanticFactConflictGroups.get(groupID) ?? []
+      current.push(record)
+      semanticFactConflictGroups.set(groupID, current)
+    }
+    const legacyFactUsedInFinalClaim = records.filter(
+      (record) =>
+        record.event_type === "response.claim" &&
+        stringArrayField(record.data ?? {}, ["quality_flags", "qualityFlags"])?.includes("legacy_evidence_used"),
+    )
     if (compactionCheckMissing) {
       issues.push({
         kind: "compaction_check_missing",
@@ -6649,6 +6965,42 @@ class ActiveCaseTrace {
         message: "Repository changes were recorded but no verification command was observed before finalization.",
         count: missingVerificationAfterChange.length,
         refs: missingVerificationAfterChange.slice(0, 10).map((record) => `change:${record.record_id}`),
+      })
+    }
+    for (const record of verificationAfterTestChange.slice(0, 20)) {
+      issues.push({
+        kind: "verification_after_test_change",
+        severity: "warning",
+        message: "Verification ran after test files or test oracle values were modified.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+        refs: [
+          ...(stringArrayField(record.data ?? {}, ["changed_test_refs", "changedTestRefs"]) ?? []),
+          ...(stringArrayField(record.data ?? {}, ["changed_production_refs", "changedProductionRefs"]) ?? []),
+        ].slice(0, 20),
+      })
+    }
+    for (const [groupID, group] of [...semanticFactConflictGroups.entries()].slice(0, 20)) {
+      issues.push({
+        kind: "conflicting_semantic_fact_group",
+        severity: "warning",
+        message: "Semantic facts with the same subject and predicate report conflicting values.",
+        count: group.length,
+        refs: group.slice(0, 20).map((record) => `evidence:${record.record_id}`),
+        metadata: { conflict_group_id: groupID },
+      })
+    }
+    for (const record of legacyFactUsedInFinalClaim.slice(0, 20)) {
+      issues.push({
+        kind: "legacy_fact_used_in_final_claim",
+        severity: "warning",
+        message: "A final response claim used evidence marked as legacy while conflicting evidence was available.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+        refs: [
+          ...(stringArrayField(record.data ?? {}, ["direct_evidence_refs", "directEvidenceRefs"]) ?? []),
+          ...(stringArrayField(record.data ?? {}, ["conflicting_evidence_refs", "conflictingEvidenceRefs"]) ?? []),
+        ].slice(0, 20),
       })
     }
     return {
@@ -6673,6 +7025,9 @@ class ActiveCaseTrace {
       payload_duplication_groups: payloadDuplicationGroups,
       compaction_check_missing: compactionCheckMissing,
       missing_verification_after_change: missingVerificationAfterChange.length,
+      verification_after_test_change: verificationAfterTestChange.length,
+      conflicting_semantic_fact_groups: semanticFactConflictGroups.size,
+      legacy_fact_used_in_final_claim: legacyFactUsedInFinalClaim.length,
       broken_claim_fragments: brokenClaimFragments.length,
       over_attributed_claims: overAttributedClaims.length,
       generic_mcp_facts: genericMcpFacts.length,

@@ -3112,7 +3112,7 @@ describe("case trace", () => {
         `CaseTrace.promptAssembly({ stage: "subagent_prompt", session_id: "ses_child_summary", agent: "general", input: { prompt: "summarize" }, output: { message_id: "msg_child_user" } })`,
         `CaseTrace.evidenceFact({ source: "mcp", category: "syntheticFacts:repo_fact", summary: "child owner fact", data: { session_id: "ses_child_summary", subject: "renewalQuote", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 10, line_end: 12 } })`,
         `CaseTrace.responseOutput({ response_role: "subagent_result", text: "Child result: owner is billing-platform.", metadata: { session_id: "ses_child_summary", message_id: "msg_child_assistant" } })`,
-        `CaseTrace.responseOutput({ text: "Parent answer consumed child result: owner is billing-platform.", source_refs: span ? ["span:" + span.id] : [] })`,
+        `CaseTrace.responseOutput({ text: "Parent answer consumed child result: owner is billing-platform.", source_refs: span ? ["tool_span:" + span.id] : [] })`,
         `CaseTrace.compaction({ trigger: "auto", provider_id: "deepseek", model_id: "unit-test", output_summary: "summary", serialized_tail: "tail", auto_continue: true, source_refs: ["context:ctx_before"], context_ledger: { algorithm: "head-tail-summary", token_estimate_before: 1200, token_estimate_after: 300, retained_message_ids: ["msg_keep"], dropped_message_ids: ["msg_drop"], retained_fact_refs: ["evidence:fact_keep"], dropped_fact_refs: ["evidence:fact_drop"], auto_continue_prompt_ref: "message:msg_continue" } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -4013,6 +4013,75 @@ describe("case trace", () => {
     expect(issues).toContain("missing_verification_after_change")
   })
 
+  test("marks verification risk when test oracles were changed before tests passed", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-test-oracle-risk-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "test-oracle-risk-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const productionDiff = [
+      "Index: src/pricing.mjs",
+      "@@",
+      "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
+      "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
+    ].join("\\n")
+    const testDiff = [
+      "Index: test/pricing.test.mjs",
+      "@@",
+      "-assert.equal(renewalQuote({ baseCents: 1200, seats: 50, loyaltyYears: 5 }), 51000)",
+      "+assert.equal(renewalQuote({ baseCents: 1200, seats: 50, loyaltyYears: 5 }), 48000)",
+    ].join("\\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const prod = CaseTrace.change({ files: ["src/pricing.mjs"], intent: "change production cap", diff: ${JSON.stringify(productionDiff)} })`,
+        `const test = CaseTrace.change({ files: ["test/pricing.test.mjs"], intent: "update pricing assertion", diff: ${JSON.stringify(testDiff)} })`,
+        `const verification = CaseTrace.verification({ command: "npm test", exit_code: 0, stdout: "pricing tests passed", status: "passed" })`,
+        `CaseTrace.responseOutput({ text: "npm test passed after updating pricing.", source_refs: verification ? ["verification:" + verification.verification_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "test-oracle-risk-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "test-oracle-risk-case", "trace.json"), "utf8")) as any
+    const changes = trace.records.filter((record: any) => record.event_type === "change")
+    const verification = trace.records.find((record: any) => record.event_type === "verification")
+    const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
+    const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+
+    const productionChange = changes.find((record: any) => record.data.files.includes("src/pricing.mjs"))
+    expect(productionChange.data.change_target_role).toBe("production_code")
+    const testChange = changes.find((record: any) => record.data.files.includes("test/pricing.test.mjs"))
+    expect(testChange.data.change_target_role).toBe("test_code")
+    expect(testChange.data.change_semantics.risk_flags).toContain("test_oracle_changed")
+    expect(verification.data.changed_test_refs).toContain(`change:${testChange.data.change_id}`)
+    expect(verification.data.changed_production_refs).toContain(`change:${productionChange.data.change_id}`)
+    expect(verification.data.verification_scope_risk_flags).toContain("tests_modified_before_verification")
+    expect(verification.data.verification_scope_risk_flags).toContain("test_oracle_modified_before_verification")
+    expect(assessment.data.verification_after_test_change_refs).toContain(
+      `verification:${verification.data.verification_id}`,
+    )
+    expect(trace.metrics.trace_health.verification_after_test_change).toBe(1)
+    expect(issues).toContain("verification_after_test_change")
+  })
+
   test("derives structured semantic facts from repository change diffs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-change-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -4072,6 +4141,66 @@ describe("case trace", () => {
     expect(changeRecords[0].data.change_semantics.changed_identifiers).toContain("discount")
     expect(changeRecords[1].data.change_semantics.operation_kinds).toContain("conditional_logic_change")
     expect(changeRecords[1].data.change_semantics.risk_flags).toContain("hardcode_candidate")
+  })
+
+  test("annotates semantic fact conflicts and active versus legacy applicability", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-fact-conflicts-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "fact-conflicts-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const active = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "docs/architecture.md says the active renewal discount cap must be 15 percent", data: { subject: "renewalQuote", predicate: "discount_cap", value: "15 percent", path: "docs/architecture.md", line_start: 7, line_end: 7, output: "The active renewal discount cap must be 15 percent." } })`,
+        `const legacy = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "legacy implementation still uses 20 percent cap", data: { subject: "renewalQuote", predicate: "discount_cap", value: "20 percent", path: "docs/architecture.md", line_start: 10, line_end: 10, output: "Legacy implementation retained for migration comparison still uses a 20 percent cap." } })`,
+        `CaseTrace.responseOutput({ text: "renewalQuote discount cap is 20 percent.", source_refs: legacy ? ["evidence:" + legacy.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "fact-conflicts-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "fact-conflicts-case", "trace.json"), "utf8")) as any
+    const activeFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.structured_claim?.value === "15 percent",
+    )
+    const legacyFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.structured_claim?.value === "20 percent",
+    )
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+    const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
+    const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+
+    expect(activeFact.data.applicability_status).toBe("active")
+    expect(legacyFact.data.applicability_status).toBe("legacy")
+    expect(activeFact.data.conflict_group_id).toBeTruthy()
+    expect(legacyFact.data.conflict_group_id).toBe(activeFact.data.conflict_group_id)
+    expect(claim.data.conflicting_evidence_refs).toContain(`evidence:${activeFact.record_id}`)
+    expect(claim.data.support_conflict_status).toBe("conflicted")
+    expect(assessment.data.conflicting_evidence_refs).toContain(`evidence:${activeFact.record_id}`)
+    expect(trace.metrics.trace_health.conflicting_semantic_fact_groups).toBe(1)
+    expect(trace.metrics.trace_health.legacy_fact_used_in_final_claim).toBe(1)
+    expect(issues).toContain("conflicting_semantic_fact_group")
+    expect(issues).toContain("legacy_fact_used_in_final_claim")
   })
 
   test("evaluates read-only constraints at trace finish", async () => {
