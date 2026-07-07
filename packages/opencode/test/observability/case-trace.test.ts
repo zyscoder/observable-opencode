@@ -1557,6 +1557,9 @@ describe("case trace", () => {
     expect(JSON.stringify(provenance.records)).not.toContain("prompt.parts.resolved")
     expect(relations).toContain("modified_by")
     expect(relations).not.toContain("tool_to_change")
+    expect(provenance.metrics.stream_summary.tool_input_delta_events).toBe(1)
+    expect(provenance.metrics.stream_summary.prompt_parts_resolved_events).toBe(1)
+    expect(provenance.metrics.trace_health.raw_stream_delta_events).toBe(1)
   })
 
   test("adds v5.5 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
@@ -1679,6 +1682,14 @@ describe("case trace", () => {
       line_end: 20,
     })
     expect(observation.typed_resources[0]).toMatchObject(mcpCall.typed_resources[0])
+    expect(mcpCall.data.output_preview).toContain("pricing.mjs owns coupon math")
+    expect(mcpCall.data.consumed_by_refs).toContain(`observation:${observation.record_id}`)
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.id === mcpCall.record_id && edge.to.id === observation.record_id && edge.relation === "returned_by",
+      ),
+    ).toBe(true)
   })
 
   test("records loop decisions as formal facts when processor loop events are observed", async () => {
@@ -2456,8 +2467,9 @@ describe("case trace", () => {
     const finalizedLlmTurn = trace.records.find((record: any) => record.record_id === "llmturn_post_final_turn")
 
     expect(trace.trace_version).toBe("5.5")
-    expect(manifest.status).toBe("cancelled")
+    expect(manifest.status).toBe("success")
     expect(manifest.server_status).toBe("cancelled")
+    expect(manifest.process_status).toBe("cancelled")
     expect(manifest.case_status).toBe("success")
     expect(caseRecord).toBeTruthy()
     expect(caseRecord.status).toBe("success")
@@ -2479,6 +2491,55 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.issues.map((issue: any) => issue.kind)).not.toContain(
       "llm_turn_missing_token_usage",
     )
+  })
+
+  test("keeps process-signal shutdown separate from successful case status in manifest", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v59-case-process-status-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "case-process-status-v59.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "server completed over HTTP" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.responseOutput({ text: "Final answer completed over HTTP.", metadata: { response_role: "final_answer", visibility: "user_visible", is_final_for_case: true, finality_source: "explicit" } })`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGINT", signal: "SIGINT", trace_html_flush: "process_signal" } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "case-process-status-v59-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "case-process-status-v59-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
+    const caseRecord = trace.records.find((record: any) => record.event_type === "case.completed")
+
+    expect(manifest.status).toBe("success")
+    expect(manifest.case_status).toBe("success")
+    expect(manifest.server_status).toBe("cancelled")
+    expect(manifest.process_status).toBe("cancelled")
+    expect(manifest.server_shutdown_reason).toBe("process_signal")
+    expect(caseRecord.data.case_status).toBe("success")
+    expect(caseRecord.data.server_status).toBe("cancelled")
+    expect(caseRecord.data.process_status).toBe("cancelled")
+    expect(caseRecord.data.server_shutdown_reason).toBe("process_signal")
   })
 
   test("does not infer case success from an implicit final response after cancellation", async () => {
@@ -2693,6 +2754,56 @@ describe("case trace", () => {
     expect(assessment.data.claim_id).toBe(claim.data.claim_id)
     expect(assessment.data.tool_failure_dependency_refs).toContain("tool_error:call_missing")
     expect(assessment.data.support_level).toBe("direct")
+  })
+
+  test("records tool failure handling provenance when replacement evidence supports a claim", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v59-tool-failure-handling-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "tool-failure-handling-v59.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "read the current requirement and report cap" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.error", data: { tool: "read", callID: "call_missing", sessionID: "ses_tool", messageID: "msg_tool", args: { filePath: "docs/current-requirement.md" }, error: "ENOENT: no such file or directory, open 'docs/current-requirement.md'" } })`,
+        `const replacement = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "docs/architecture.md says the renewal discount cap is 15 percent", data: { path: "docs/architecture.md", output: "docs/current-requirement.md moved to docs/architecture.md. The renewal discount cap is 15 percent." } })`,
+        `CaseTrace.responseOutput({ text: "docs/current-requirement.md was missing, so I used docs/architecture.md; the renewal discount cap is 15 percent.", source_refs: replacement ? ["evidence:" + replacement.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "tool-failure-handling-v59-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "tool-failure-handling-v59-case", "trace.json"), "utf8"),
+    ) as any
+    const toolError = trace.records.find((record: any) => record.event_type === "tool.error")
+    const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
+
+    expect(toolError.data.handled_status).toBe("recovered_with_replacement_evidence")
+    expect(toolError.data.replacement_evidence_refs.length).toBeGreaterThan(0)
+    expect(toolError.data.downstream_claim_refs.length).toBeGreaterThan(0)
+    expect(assessment.data.tool_failure_dependency_refs).toContain("tool_error:call_missing")
+    expect(assessment.data.tool_failure_handled_status).toBe("recovered_with_replacement_evidence")
+    expect(assessment.data.tool_failure_context_refs).toContain("tool_error:call_missing")
+    expect(assessment.data.replacement_evidence_refs.length).toBeGreaterThan(0)
   })
 
   test("backfills tool result provenance through observations and claim support", async () => {
@@ -3001,6 +3112,7 @@ describe("case trace", () => {
         `CaseTrace.promptAssembly({ stage: "subagent_prompt", session_id: "ses_child_summary", agent: "general", input: { prompt: "summarize" }, output: { message_id: "msg_child_user" } })`,
         `CaseTrace.evidenceFact({ source: "mcp", category: "syntheticFacts:repo_fact", summary: "child owner fact", data: { session_id: "ses_child_summary", subject: "renewalQuote", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 10, line_end: 12 } })`,
         `CaseTrace.responseOutput({ response_role: "subagent_result", text: "Child result: owner is billing-platform.", metadata: { session_id: "ses_child_summary", message_id: "msg_child_assistant" } })`,
+        `CaseTrace.responseOutput({ text: "Parent answer consumed child result: owner is billing-platform.", source_refs: span ? ["span:" + span.id] : [] })`,
         `CaseTrace.compaction({ trigger: "auto", provider_id: "deepseek", model_id: "unit-test", output_summary: "summary", serialized_tail: "tail", auto_continue: true, source_refs: ["context:ctx_before"], context_ledger: { algorithm: "head-tail-summary", token_estimate_before: 1200, token_estimate_after: 300, retained_message_ids: ["msg_keep"], dropped_message_ids: ["msg_drop"], retained_fact_refs: ["evidence:fact_keep"], dropped_fact_refs: ["evidence:fact_drop"], auto_continue_prompt_ref: "message:msg_continue" } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -3034,6 +3146,15 @@ describe("case trace", () => {
     expect(subagent.data.child_timeline_summary.record_count).toBeGreaterThan(0)
     expect(subagent.data.child_metric_summary.semantic_evidence_count).toBeGreaterThan(0)
     expect(subagent.data.child_key_evidence_refs.length).toBeGreaterThan(0)
+    expect(subagent.data.child_output_preview).toContain("child result")
+    expect(subagent.data.child_key_fact_refs.length).toBeGreaterThan(0)
+    expect(subagent.data.parent_consumption_refs.length).toBeGreaterThan(0)
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.id === subagent.record_id && edge.to.type === "response_segment" && edge.relation === "reported_to",
+      ),
+    ).toBe(true)
     expect(compaction.data.retention_ratio).toBe(0.25)
     expect(compaction.data.retained_fact_count).toBe(1)
     expect(compaction.data.dropped_fact_count).toBe(1)
