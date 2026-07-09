@@ -102,10 +102,7 @@
       "trace 是否能看到压缩前的约束事实？",
       "context.compaction 是否记录 retained/dropped fact refs？",
       "压缩后的 LLM 输入是否仍包含约束？"
-    ],
-    "env": {
-      "OPENCODE_TRACE_FORCE_COMPACTION": "1"
-    }
+    ]
   },
   {
     "case_id": "subagent-misleading-summary",

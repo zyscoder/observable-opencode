@@ -80,15 +80,6 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 
 const log = Log.create({ service: "session.prompt" })
 const elog = EffectLogger.create({ service: "session.prompt" })
-const forcedTraceCompactionSessions = new Set<string>()
-
-function shouldForceTraceCompaction(sessionID: string) {
-  if (!CaseTrace.isEnabled()) return false
-  if (process.env.OPENCODE_TRACE_FORCE_COMPACTION !== "1") return false
-  if (forcedTraceCompactionSessions.has(sessionID)) return false
-  forcedTraceCompactionSessions.add(sessionID)
-  return true
-}
 
 type ReferencePromptMetadata = {
   name: string
@@ -1970,8 +1961,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           if (lastFinished && lastFinished.summary !== true) {
             const naturalOverflow = yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })
-            const forcedOverflow = shouldForceTraceCompaction(sessionID)
-            const needsCompaction = naturalOverflow || forcedOverflow
             CaseTrace.compactionCheck({
               session_id: sessionID,
               message_id: lastFinished.id,
@@ -1985,18 +1974,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   lastFinished.tokens.cache.read +
                   lastFinished.tokens.cache.write,
               context_limit: model.limit.context,
-              overflow: needsCompaction,
+              overflow: naturalOverflow,
               selected_algorithm: "head-tail-summary",
-              trigger_reason: forcedOverflow ? "forced_trace_compaction" : "last_finished_overflow_check",
+              trigger_reason: "last_finished_overflow_check",
               metadata: {
                 step,
                 finish: lastFinished.finish,
                 natural_overflow: naturalOverflow,
-                forced_overflow: forcedOverflow,
-                quality_flags: forcedOverflow ? ["deterministic_forced_compaction"] : undefined,
               },
             })
-            if (needsCompaction) {
+            if (naturalOverflow) {
               CaseTrace.exitGate({
                 session_id: sessionID,
                 message_id: lastFinished.id,
@@ -2010,7 +1997,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 metadata: {
                   step,
                   finish: lastFinished.finish,
-                  forced_overflow: forcedOverflow,
                 },
               })
               yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })

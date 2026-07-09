@@ -580,6 +580,8 @@ export type TraceManifest = {
   server_shutdown_reason?: string
   case_status?: TraceStatus
   case_completed_at?: string
+  collection_mode: "passive_sidecar"
+  behavior_impact: "none" | "modified"
   input?: Record<string, unknown>
   environment: Record<string, unknown>
   token_usage: TraceTokenUsage
@@ -6453,6 +6455,8 @@ class ActiveCaseTrace {
       server_shutdown_reason: shutdownReason,
       case_status: caseStatus ?? status,
       case_completed_at: caseStatus === "success" ? new Date(ended).toISOString() : undefined,
+      collection_mode: "passive_sidecar",
+      behavior_impact: "none",
       input: this.input,
       environment: this.environment,
       token_usage: cloneTokenUsage(this.tokenUsage) ?? {},

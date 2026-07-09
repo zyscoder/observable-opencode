@@ -3426,6 +3426,8 @@ describe("case trace", () => {
         ended_at: "2026-06-30T00:00:01.000Z",
         duration_ms: 1000,
         status: "success",
+        collection_mode: "passive_sidecar",
+        behavior_impact: "none",
         input: { prompt: "fix pricing" },
         environment: { model: "deepseek/deepseek-v4-pro" },
         token_usage: { input: 10, output: 5, total: 15 },
@@ -4375,6 +4377,61 @@ describe("case trace", () => {
     expect(refs).toContain(`verification:${trace.verification_records[0].verification_id}`)
     expect(refs).toContain(`change:${trace.change_records[0].change_id}`)
     expect(refs.some((item: string) => item.startsWith("recent_"))).toBe(false)
+  })
+
+  test("does not let trace-only controls alter compaction behavior", async () => {
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const checkedText = (
+      await Promise.all([
+        fs.readFile(path.join(packageDir, "src/session/prompt.ts"), "utf8"),
+        fs.readFile(path.join(packageDir, "test/observability/stress-cases/cases.json"), "utf8"),
+      ])
+    ).join("\n")
+
+    expect(checkedText).not.toContain("OPENCODE_TRACE_FORCE_COMPACTION")
+    expect(checkedText).not.toContain("forced_trace_compaction")
+    expect(checkedText).not.toContain("deterministic_forced_compaction")
+  })
+
+  test("declares passive sidecar collection with no behavior impact", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-passive-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "passive-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "passive-sidecar-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const manifest = JSON.parse(await fs.readFile(path.join(dir, "passive-sidecar-case", "manifest.json"), "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "passive-sidecar-case", "trace.json"), "utf8")) as any
+
+    expect(manifest.collection_mode).toBe("passive_sidecar")
+    expect(manifest.behavior_impact).toBe("none")
+    expect(trace.manifest.collection_mode).toBe("passive_sidecar")
+    expect(trace.manifest.behavior_impact).toBe("none")
   })
 
   test("persists and renders design records", async () => {
