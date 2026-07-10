@@ -172,6 +172,80 @@ describe("case trace", () => {
     expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
+  test("links response generation provenance back to LLM, message transform, and context nodes", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-generation-chain-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "generation-chain.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_gen", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 2, system_count: 1, tool_count: 1 } })`,
+        `const prompt = CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_gen", input: { parts: [{ type: "text", text: "Explain the pricing risk." }] }, output: { part_count: 1 } })`,
+        `const transform = CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_gen", message_id: "msg_gen", step: 1, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [{ role: "user", id: "msg_user" }] }, output: { model_messages: [{ role: "user", content: "Explain the pricing risk." }], tools: { grep: { description: "search" } } }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }], source_refs: prompt ? ["node:" + prompt.node_id] : [] })`,
+        `CaseTrace.llmTurn({ span_id: span?.id, session_id: "ses_gen", message_id: "msg_gen", agent: "build", provider_id: "deepseek", model_id: "unit-test", input_context_refs: transform ? ["node:" + transform.node_id] : [], prompt_transform_refs: transform ? ["node:" + transform.node_id] : [], status: "success", finish_reason: "stop", token_usage: { inputTokens: 10, outputTokens: 8, totalTokens: 18 }, source_refs: transform ? ["node:" + transform.node_id] : [] })`,
+        `const fact = CaseTrace.evidenceFact({ source: "tool", category: "repo_fact", summary: "pricing risk belongs to billing-platform", data: { subject: "pricing risk", predicate: "owner", value: "billing-platform" } })`,
+        `CaseTrace.responseOutput({ text: "Pricing risk belongs to billing-platform.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
+        `span?.end({ output: { completed: true, finish_reason: "stop" }, tokenUsage: { inputTokens: 10, outputTokens: 8, totalTokens: 18 } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "generation-chain-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "generation-chain-case", "trace.json"), "utf8")) as any
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+    const llmCall = trace.records.find((record: any) => record.event_type === "llm.call")
+    const transform = trace.records.find((record: any) => record.event_type === "context.transform")
+
+    expect(response.data.generation_provenance_refs).toContain(`node:${llmCall.record_id}`)
+    expect(response.data.generation_provenance_refs).toContain(`node:${transform.record_id}`)
+    expect(response.source_refs).toContain(`node:${llmCall.record_id}`)
+    expect(response.source_refs).toContain(`node:${transform.record_id}`)
+    expect(claim.data.generation_provenance_refs).toContain(`node:${llmCall.record_id}`)
+    expect(claim.data.generation_provenance_refs).toContain(`node:${transform.record_id}`)
+    expect(llmCall.data.message_transforms[0].node_ref).toBe(`node:${transform.record_id}`)
+    expect(llmCall.data.input_messages).toBeTruthy()
+    expect(llmCall.data.selected_context_refs).toContain(`node:${transform.record_id}`)
+    expect(llmCall.data.output_text).toBeTruthy()
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.type === "node" &&
+          edge.from.id === llmCall.record_id &&
+          edge.to.id === response.record_id &&
+          edge.relation === "produced",
+      ),
+    ).toBe(true)
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.type === "node" &&
+          edge.from.id === transform.record_id &&
+          edge.to.id === response.record_id &&
+          edge.relation === "used_as_context",
+      ),
+    ).toBe(true)
+  })
+
   test("writes v5.5 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

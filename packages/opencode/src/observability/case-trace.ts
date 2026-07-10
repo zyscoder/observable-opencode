@@ -253,6 +253,7 @@ export type TraceResponseSegment = {
   direct_evidence_refs?: string[]
   context_refs?: string[]
   execution_refs?: string[]
+  generation_provenance_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
@@ -413,6 +414,7 @@ export type TraceResponseClaimRecord = {
   direct_evidence_refs: string[]
   context_refs: string[]
   execution_refs: string[]
+  generation_provenance_refs?: string[]
   legacy_context_refs?: string[]
   matched_evidence_refs?: string[]
   candidate_evidence_refs?: string[]
@@ -713,6 +715,16 @@ type CaseTraceConfig = {
   environment?: Record<string, unknown>
 }
 
+type GenerationProvenance = {
+  refs: string[]
+  promptRefs: string[]
+  contextRefs: string[]
+  llmRefs: string[]
+  messageTransforms: Record<string, unknown>[]
+  inputMessages?: unknown
+  selectedContextRefs: string[]
+}
+
 type StartSpanInput = {
   component: TraceComponent
   operation: string
@@ -811,6 +823,7 @@ type ResponseClaimInput = Omit<
   | "direct_evidence_refs"
   | "context_refs"
   | "execution_refs"
+  | "generation_provenance_refs"
   | "source_refs"
   | "source_locations"
   | "support_level"
@@ -827,6 +840,7 @@ type ResponseClaimInput = Omit<
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
+  generation_provenance_refs?: string[]
   support_level?: TraceResponseClaimRecord["support_level"]
   quality_flags?: string[]
 }
@@ -5130,10 +5144,117 @@ class ActiveCaseTrace {
     return narrowed.length ? narrowed.slice(0, 8) : sourceRefs.slice(-8)
   }
 
+  private currentGenerationProvenance(): GenerationProvenance {
+    const promptNodeIDs = this.recentPromptNodeIDs.slice(-2)
+    const contextNodeIDs = this.recentContextNodeIDs.slice(-4)
+    const llmNodeIDs = this.recentLLMNodeIDs.slice(-2)
+    const nodeIDs = dedupeStrings([...promptNodeIDs, ...contextNodeIDs, ...llmNodeIDs])
+    const refs = nodeIDs.map((id) => `node:${id}`)
+    const promptRefs = promptNodeIDs.map((id) => `node:${id}`)
+    const contextRefs = contextNodeIDs.map((id) => `node:${id}`)
+    const llmRefs = llmNodeIDs.map((id) => `node:${id}`)
+    const contextNodes = contextNodeIDs
+      .map((id) => this.causalNodes.find((node) => node.node_id === id))
+      .filter((node): node is CausalNode => Boolean(node))
+    const messageTransforms = contextNodes
+      .map((node) => ({
+        node_ref: `node:${node.node_id}`,
+        event_type: node.kind,
+        stage: stringField(node.data ?? {}, ["stage"]) ?? node.title,
+        transforms: node.data?.transforms,
+      }))
+    const inputMessages = contextNodes
+      .map((node) => {
+        const output = recordFromUnknown(node.data?.output)
+        return output?.model_messages ?? output?.messages ?? node.data?.messages
+      })
+      .find((value) => value !== undefined)
+    const selectedContextRefs = dedupeStrings([
+      ...contextRefs,
+      ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
+    ])
+    return {
+      refs,
+      promptRefs,
+      contextRefs,
+      llmRefs,
+      messageTransforms,
+      inputMessages,
+      selectedContextRefs,
+    }
+  }
+
+  private linkGenerationProvenanceToResponse(input: {
+    responseNode: CausalNode
+    responseSegmentID: string
+    responseText: unknown
+    provenance: GenerationProvenance
+  }) {
+    if (!input.provenance.refs.length) return
+    const responseRef = { type: "node", id: input.responseNode.node_id, label: "response.output" }
+    for (const ref of input.provenance.promptRefs) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed || this.hasCausalEdge(parsed, input.responseNode.node_id, "prompted")) continue
+      this.causalEdge({
+        from: { ...parsed, label: "prompt.assembly" },
+        to: responseRef,
+        relation: "prompted",
+        label: "Prompt assembly contributed to generated response output",
+      })
+    }
+    for (const ref of input.provenance.contextRefs) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed || this.hasCausalEdge(parsed, input.responseNode.node_id, "used_as_context")) continue
+      this.causalEdge({
+        from: { ...parsed, label: "context" },
+        to: responseRef,
+        relation: "used_as_context",
+        label: "Context/message transform was selected for generated response output",
+      })
+    }
+    for (const ref of input.provenance.llmRefs) {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed) continue
+      if (!this.hasCausalEdge(parsed, input.responseNode.node_id, "produced")) {
+        this.causalEdge({
+          from: { ...parsed, label: "llm.call" },
+          to: responseRef,
+          relation: "produced",
+          label: "LLM generation produced response output",
+        })
+      }
+      const llmNode = this.causalNodes.find((node) => node.node_id === parsed.id)
+      if (!llmNode) continue
+      const currentData = llmNode.data ?? {}
+      llmNode.data = {
+        ...currentData,
+        generation_provenance_version: "v1",
+        generated_response_refs: dedupeStrings([
+          ...(stringArrayField(currentData, ["generated_response_refs", "generatedResponseRefs"]) ?? []),
+          `response_segment:${input.responseSegmentID}`,
+        ]),
+        message_transforms:
+          input.provenance.messageTransforms.length > 0
+            ? input.provenance.messageTransforms
+            : currentData.message_transforms,
+        input_messages: currentData.input_messages ?? input.provenance.inputMessages,
+        selected_context_refs:
+          input.provenance.selectedContextRefs.length > 0
+            ? input.provenance.selectedContextRefs
+            : currentData.selected_context_refs,
+        compaction_provenance: currentData.compaction_provenance ?? { status: "not_observed_for_response" },
+        output_text: currentData.output_text ?? this.summarizeText(input.responseText, "llm.generated_output"),
+      }
+      llmNode.artifact_refs = this.collectArtifactRefs(llmNode.data)
+      this.writeRecord("node.update", llmNode)
+    }
+  }
+
   responseOutput(input: ResponseOutputInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
     const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
+    const generationProvenance = this.currentGenerationProvenance()
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
     const metadataResponseRole = input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined
@@ -5158,6 +5279,10 @@ class ActiveCaseTrace {
       direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
+      generation_provenance_refs: generationProvenance.refs,
+      generation_context_refs: generationProvenance.contextRefs,
+      generation_llm_refs: generationProvenance.llmRefs,
+      message_transform_refs: generationProvenance.contextRefs,
       candidate_source_refs: sourceRefs,
     }
     const segment: TraceResponseSegment = {
@@ -5172,6 +5297,7 @@ class ActiveCaseTrace {
       direct_evidence_refs: classifiedRefs.direct_evidence_refs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
+      generation_provenance_refs: generationProvenance.refs,
       source_refs: sourceRefs,
       source_locations: sourceLocations,
       metadata,
@@ -5195,12 +5321,22 @@ class ActiveCaseTrace {
         direct_evidence_refs: classifiedRefs.direct_evidence_refs,
         context_refs: classifiedRefs.context_refs,
         execution_refs: classifiedRefs.execution_refs,
+        generation_provenance_refs: generationProvenance.refs,
+        generation_context_refs: generationProvenance.contextRefs,
+        generation_llm_refs: generationProvenance.llmRefs,
+        message_transform_refs: generationProvenance.contextRefs,
         candidate_source_refs: sourceRefs,
         source_locations: sourceLocations,
         metadata,
       },
-      source_refs: responseRecordSourceRefs,
+      source_refs: dedupeStrings([...responseRecordSourceRefs, ...generationProvenance.refs]),
       source_locations: sourceLocations,
+    })
+    this.linkGenerationProvenanceToResponse({
+      responseNode: record,
+      responseSegmentID: segment.segment_id,
+      responseText: input.text,
+      provenance: generationProvenance,
     })
     for (const ref of classifiedRefs.direct_evidence_refs) {
       this.linkSourceToResponse(ref, record.node_id)
@@ -5282,6 +5418,10 @@ class ActiveCaseTrace {
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
+    const generationProvenanceRefs = dedupeStrings([
+      ...(input.generation_provenance_refs ?? []),
+      ...sourceRefs.filter((ref) => ref.startsWith("node:")),
+    ])
     const claimText = input.canonical_text ?? input.text
     const changeScopeExclusionRefs = this.changeScopeExclusionEvidenceRefsForClaim(claimText, sourceRefs)
     const candidateToolOutcomeRefs = dedupeStrings([
@@ -5371,6 +5511,7 @@ class ActiveCaseTrace {
       direct_evidence_refs: effectiveDirectEvidenceRefs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
+      generation_provenance_refs: generationProvenanceRefs,
       legacy_context_refs: legacyContextRefs,
       matched_evidence_refs: evidenceMatch.refs,
       candidate_evidence_refs: evidenceMatch.candidateRefs,
@@ -5395,6 +5536,7 @@ class ActiveCaseTrace {
         derived_tool_outcome_refs: dependencyToolOutcomeRefs,
         candidate_tool_outcome_refs: candidateToolOutcomeRefs,
         dependency_tool_outcome_refs: dependencyToolOutcomeRefs,
+        generation_provenance_refs: generationProvenanceRefs,
       }),
     }
     const node = this.node({
@@ -5417,6 +5559,7 @@ class ActiveCaseTrace {
         direct_evidence_refs: claim.direct_evidence_refs,
         context_refs: claim.context_refs,
         execution_refs: claim.execution_refs,
+        generation_provenance_refs: claim.generation_provenance_refs,
         legacy_context_refs: claim.legacy_context_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
@@ -5795,12 +5938,14 @@ class ActiveCaseTrace {
           claim_index: index + 1,
           source_refs: segment.source_refs,
           source_locations: segment.source_locations,
+          generation_provenance_refs: segment.generation_provenance_refs,
           metadata: {
             response_node_id: responseNodeID,
             response_role: segment.response_role,
             turn_index: segment.turn_index,
             is_final_for_case: segment.is_final_for_case,
             finality_source: segment.finality_source,
+            generation_provenance_refs: segment.generation_provenance_refs,
           },
         })
       })
