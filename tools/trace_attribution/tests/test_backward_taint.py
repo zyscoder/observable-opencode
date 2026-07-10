@@ -13,6 +13,7 @@ from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence
 from trace_attribution.models import TraceNode
 from trace_attribution.quality_review import inject_quality_gap_records
+from trace_attribution.trace_improvement import build_trace_improvement_report
 
 
 class FakeJudge:
@@ -194,6 +195,130 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:evidence_old"])
         self.assertEqual(report.node_judgments["record:change_bad"].defect_type, "wrong_change")
         self.assertEqual(report.taint_paths[0], ["record:claim_bad", "record:change_bad", "record:evidence_old"])
+
+    def test_reports_trace_gaps_when_root_cause_stops_at_thin_llm_call(self):
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "llm_thin",
+                "component": "llm",
+                "event_type": "llm.call",
+                "data": {"model": "deepseek-v4-pro", "output_tokens": 34},
+            }
+        )
+        trace["records"].append(
+            {
+                "record_id": "quality_gap",
+                "component": "evaluation",
+                "event_type": "case.quality_gap",
+                "source_refs": ["record:claim_bad"],
+                "data": {
+                    "dimension": "solution_design",
+                    "missing_evidence": ["risk_assessment"],
+                    "score": 17,
+                    "max_score": 25,
+                },
+            }
+        )
+        trace["dataflow_edges"].append(
+            {
+                "from": {"type": "record", "id": "llm_thin"},
+                "to": {"type": "record", "id": "claim_bad"},
+                "relation": "generated_claim",
+            }
+        )
+        fake = FakeJudge(
+            {
+                "record:quality_gap": NodeJudgment(
+                    node_ref="record:quality_gap",
+                    component="evaluation",
+                    event_type="case.quality_gap",
+                    has_defect=True,
+                    defect_type="missing_evidence",
+                    defect_reason="The quality gap is caused by a final claim that omits risk assessment.",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:claim_bad",
+                            reason="The final claim omitted risk assessment.",
+                            confidence=0.9,
+                        )
+                    ],
+                ),
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_type="missing_risk_assessment",
+                    defect_reason="The final claim omitted risk assessment.",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:llm_thin",
+                            reason="The LLM generated the incomplete final claim.",
+                            confidence=0.8,
+                        )
+                    ],
+                ),
+                "record:llm_thin": NodeJudgment(
+                    node_ref="record:llm_thin",
+                    component="llm",
+                    event_type="llm.call",
+                    has_defect=True,
+                    defect_type="missing_risk_assessment",
+                    defect_reason="The LLM call appears to have generated the incomplete response.",
+                    influenced_by=[],
+                    is_root_cause=True,
+                    confidence=0.55,
+                ),
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=8).analyze(
+            graph,
+            start_refs=["record:quality_gap"],
+            objective="Explain the solution design quality gap.",
+        )
+
+        improvement = build_trace_improvement_report(graph, report)
+        report_dict = report.to_dict()
+
+        self.assertIn("trace_improvement_report", report_dict)
+        self.assertEqual(report_dict["trace_improvement_report"], improvement)
+        self.assertIn("llm_call_missing_generation_semantics", [gap["gap_type"] for gap in improvement["blocking_gaps"]])
+        self.assertIn("low_confidence_root_cause", [gap["gap_type"] for gap in improvement["blocking_gaps"]])
+        llm_gap = next(gap for gap in improvement["blocking_gaps"] if gap["gap_type"] == "llm_call_missing_generation_semantics")
+        self.assertEqual(llm_gap["node_ref"], "record:llm_thin")
+        self.assertIn("message_transforms", llm_gap["missing_semantic_fields"])
+        self.assertIn("output_text", llm_gap["missing_semantic_fields"])
+        self.assertIn("llm", [item["component"] for item in improvement["recommended_trace_changes"]])
+
+    def test_answer_surface_roots_make_improvement_confidence_limited(self):
+        fake = FakeJudge(
+            {
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_type="unsupported_final_claim",
+                    defect_reason="The final claim is unsupported by the trace.",
+                    influenced_by=[],
+                    is_root_cause=True,
+                    confidence=0.9,
+                ),
+            }
+        )
+        graph = TraceGraph.from_trace(sample_trace())
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=8).analyze(
+            graph,
+            start_refs=["record:claim_bad"],
+            objective="Explain the unsupported final claim.",
+        )
+
+        improvement = report.trace_improvement_report
+
+        self.assertIn("answer_surface_root_cause", [gap["gap_type"] for gap in improvement["blocking_gaps"]])
+        self.assertEqual(improvement["summary"]["analysis_confidence"], "limited")
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):

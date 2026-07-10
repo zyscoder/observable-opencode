@@ -88,6 +88,7 @@ class AttributionReport:
     node_judgments: Dict[str, NodeJudgment]
     visited_order: List[str]
     unresolved_refs: List[str]
+    trace_improvement_report: JsonDict = field(default_factory=dict)
     metadata: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:

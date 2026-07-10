@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .graph import TraceGraph
 from .models import AttributionReport, NodeJudgment, RootCauseCandidate, TraceNode
+from .trace_improvement import build_trace_improvement_report
 
 
 class JudgeClient:
@@ -93,7 +95,7 @@ class BackwardTaintAnalyzer:
                 )
                 taint_paths.append(path)
 
-        return AttributionReport(
+        report = AttributionReport(
             case_id=graph.case_id,
             objective=objective,
             start_refs=starts,
@@ -108,6 +110,7 @@ class BackwardTaintAnalyzer:
                 "max_nodes": self.max_nodes,
             },
         )
+        return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))
 
     def _resolve_influences(self, graph: TraceGraph, judgment: NodeJudgment, current_ref: str) -> List[str]:
         explicit = []

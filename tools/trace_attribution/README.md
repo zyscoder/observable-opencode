@@ -14,6 +14,10 @@ to perform backward semantic taint analysis:
 The module is offline with respect to opencode execution. It never writes back to trace
 files and never feeds attribution results back into the agent.
 
+Each attribution JSON also includes `trace_improvement_report`. This report describes
+where backward taint analysis became weak or blocked, which trace facts were missing,
+and which component should emit richer semantics in the next trace iteration.
+
 ## Install
 
 ```bash
@@ -76,6 +80,27 @@ python3 -m trace_attribution \
 The injected quality-gap records are not written back to the original trace and are never
 fed back into opencode. They only give the offline analyzer a precise starting point for
 backward semantic taint analysis.
+
+## Trace Improvement Feedback
+
+`trace_improvement_report` is generated deterministically from the attribution graph and
+judgments. It does not make extra model calls. Typical entries include:
+
+- `llm_call_missing_generation_semantics`: attribution reached an `llm.call`, but the
+  trace lacks normalized input messages, message transform stages, selected context refs,
+  compaction provenance, or output text.
+- `answer_surface_root_cause`: attribution stopped at `response.output` or
+  `response.claim`, so the trace needs stronger links from final answer content back to
+  LLM calls, tools, context, and claim-support checks.
+- `defective_node_points_to_nondefective_upstream`: a provenance edge was too broad or
+  missing an intermediate semantic node, causing the taint path to point at an upstream
+  node that was not itself defective.
+- `unresolved_trace_refs`: a source ref or dataflow endpoint did not resolve to a trace
+  node.
+
+Use this report as the feedback loop between the reasoning module and semantic tracing:
+when attribution can only say "the defect is somewhere around LLM generation", the report
+spells out which LLM/context/message fields need to be added to future traces.
 
 ## Test
 
