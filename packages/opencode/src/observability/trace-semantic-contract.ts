@@ -8,6 +8,7 @@ export const FORMAL_RECORD_TYPES = [
   "case.failed",
   "task.loop",
   "task.plan_state",
+  "task.obligation",
   "prompt.assembly",
   "context.transform",
   "context.pack",

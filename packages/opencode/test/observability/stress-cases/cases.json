@@ -66,6 +66,7 @@
       "description": "Agent 调用了 MCP，但后续上下文、修改或 final claim 没有使用 MCP fact。"
     },
     "required_trace_evidence": [
+      "required_action_obligations",
       "mcp_call_output",
       "semantic_fact_values",
       "fact_in_context_package",
@@ -95,6 +96,7 @@
       "description": "压缩摘要或后续上下文遗漏了不得修改 payment 模块的约束。"
     },
     "required_trace_evidence": [
+      "required_action_obligations",
       "semantic_fact_values",
       "compaction_ledger",
       "post_compaction_llm_context",
@@ -124,6 +126,7 @@
       "description": "主 agent 采用 subagent 错误摘要，没有复核 primary source。"
     },
     "required_trace_evidence": [
+      "required_action_obligations",
       "subagent_trace",
       "subagent_parent_consumption",
       "semantic_fact_values",
@@ -153,6 +156,7 @@
       "description": "Agent 运行的测试范围不足以覆盖需求变更。"
     },
     "required_trace_evidence": [
+      "required_action_obligations",
       "verification_commands",
       "test_scope_metadata",
       "claim_direct_evidence_refs",

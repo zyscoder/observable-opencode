@@ -212,6 +212,13 @@ function detectEvidence(name, trace) {
           (!Array.isArray(record.data?.missing_evidence_types) || record.data.missing_evidence_types.length === 0),
       )
     },
+    required_action_obligations: (records) =>
+      records.filter(
+        (record) =>
+          record.event_type === "task.obligation" &&
+          hasAny(record, ["obligation_type", "status"]) &&
+          (record.data?.obligation_type || record.data?.status),
+      ),
     unsupported_claims: (records, fullTrace) => {
       const health = fullTrace?.metrics?.trace_health ?? {}
       if ((health.unsupported_response_claims ?? 0) > 0 || (health.context_only_response_claims ?? 0) > 0) {
@@ -274,8 +281,20 @@ function detectNoisySemantics(trace) {
   if ((health.duplicate_semantic_facts ?? 0) > 0) noisy.push("duplicate_semantic_facts")
   if ((health.generic_semantic_facts ?? 0) > 0) noisy.push("generic_semantic_facts")
   if ((health.path_only_evidence_facts ?? 0) > 0) noisy.push("path_only_evidence_facts")
+  if ((health.broad_legacy_context_refs ?? 0) > 0 || hasBroadLegacyContextRefs(trace)) {
+    noisy.push("broad_legacy_context_refs")
+  }
   if (hasCancelledAfterCompletedCase(trace)) noisy.push("cancelled_after_case_completion")
   return noisy
+}
+
+function hasBroadLegacyContextRefs(trace) {
+  const records = Array.isArray(trace?.records) ? trace.records : []
+  return records.some(
+    (record) =>
+      Array.isArray(record.data?.legacy_context_refs) &&
+      record.data.legacy_context_refs.length > 20,
+  )
 }
 
 function hasCancelledAfterCompletedCase(trace) {
@@ -318,6 +337,9 @@ function recommendTraceChanges(missing, missingMechanisms = []) {
     }
     if (item.includes("tool_error") || item.includes("unsupported")) {
       recommendations.add("Link tool failures to later unsupported or context-only response claims.")
+    }
+    if (item.includes("obligation")) {
+      recommendations.add("Emit task.obligation records for user-required actions and path constraints.")
     }
     if (item.includes("claim_support")) {
       recommendations.add("Emit claim.support_assessment records with support level, quality flags, and failure refs.")

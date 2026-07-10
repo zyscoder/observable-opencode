@@ -502,6 +502,8 @@ export type TraceHealthMetrics = {
   actionable_semantic_conflict_groups?: number
   low_value_semantic_conflict_members?: number
   legacy_fact_used_in_final_claim?: number
+  task_obligations?: number
+  unmet_task_obligations?: number
   raw_stream_delta_events?: number
   issues: TraceHealthIssue[]
 }
@@ -512,6 +514,7 @@ export type CausalNodeKind =
   | "case.failed"
   | "task.loop"
   | "task.plan_state"
+  | "task.obligation"
   | "prompt.assembly"
   | "context.transform"
   | "context.pack"
@@ -1955,6 +1958,8 @@ function isNonFactualResponseClaim(input: string) {
   if (/^计算推导(?:\s*[（(].*[）)])?$/.test(normalized)) return true
   if (/^(?:(?:mcp\s*)?返回的事实|mcp facts?|facts?|修改点|改动点|变更点|changes?|changed files?)$/i.test(normalized))
     return true
+  if (/^(design constraints?|design constraints honored|verification results?|implementation summary|change summary)$/.test(normalized))
+    return true
   if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
   if (/^(以下是|下面是|这里是).*(总结|结论|报告)$/.test(normalized)) return true
@@ -2046,9 +2051,12 @@ function protectClaimSegments(input: string) {
 
 function restoreClaimSegments(input: string, segments: string[]) {
   let output = input
-  segments.forEach((segment, index) => {
-    output = output.replaceAll(`__TRACE_PROTECTED_${index}__`, segment)
-  })
+  segments
+    .map((segment, index) => ({ segment, index }))
+    .reverse()
+    .forEach(({ segment, index }) => {
+      output = output.replaceAll(`__TRACE_PROTECTED_${index}__`, segment)
+    })
   return output
 }
 
@@ -2108,6 +2116,67 @@ function pathWithinScope(path: string, scope: string) {
   if (!normalizedPath || !normalizedScope) return false
   const scopePrefix = normalizedScope.endsWith("/") ? normalizedScope : `${normalizedScope}/`
   return normalizedPath === normalizedScope || normalizedPath.startsWith(scopePrefix)
+}
+
+type TaskObligationDraft = {
+  obligation_type: "verification_required" | "mcp_required" | "subagent_required" | "path_scope_exclusion"
+  requirement_text: string
+  target_path?: string
+}
+
+function taskObligationsFromInput(input: unknown) {
+  const text = fieldSummaryText(input)
+  const obligations: TaskObligationDraft[] = []
+  if (/npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|运行[^。.\n]*测试|执行[^。.\n]*测试|run[^.\n]*tests?/i.test(text)) {
+    obligations.push({
+      obligation_type: "verification_required",
+      requirement_text: "Run the requested verification tests.",
+    })
+  }
+  if (
+    /(?:必须|需要|must|should|请).*?(?:调用|call).*?(?:mcp|syntheticfacts|repo_fact)|(?:mcp|syntheticfacts|repo_fact).*?(?:必须|需要|must|should|调用|call)/i.test(
+      text,
+    )
+  ) {
+    obligations.push({
+      obligation_type: "mcp_required",
+      requirement_text: "Call the requested MCP/tool fact source.",
+    })
+  }
+  if (/(?:委派|调用|使用|spawn|delegate).*?(?:subagent|子\s*agent)|(?:subagent|子\s*agent).*?(?:总结|复核|调用|委派|delegate)/i.test(text)) {
+    obligations.push({
+      obligation_type: "subagent_required",
+      requirement_text: "Use the requested subagent workflow.",
+    })
+  }
+  const pathPatterns = [
+    /(?:不允许修改|不得修改|不要修改|禁止修改)\s+`?((?:\.{0,2}\/)?[\w@~-]+(?:\/[\w@~.-]+)+\/?)`?/gi,
+    /(?:do not modify|must not modify|should not modify)\s+`?((?:\.{0,2}\/)?[\w@~-]+(?:\/[\w@~.-]+)+\/?)`?/gi,
+  ]
+  for (const pattern of pathPatterns) {
+    for (const match of text.matchAll(pattern)) {
+      const target = normalizeScopePath(match[1])
+      if (!target) continue
+      obligations.push({
+        obligation_type: "path_scope_exclusion",
+        requirement_text: `Do not modify ${target}.`,
+        target_path: target,
+      })
+    }
+  }
+  return dedupeTaskObligations(obligations)
+}
+
+function dedupeTaskObligations(input: TaskObligationDraft[]) {
+  const seen = new Set<string>()
+  const output: TaskObligationDraft[] = []
+  for (const item of input) {
+    const key = `${item.obligation_type}:${item.target_path ?? ""}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    output.push(item)
+  }
+  return output
 }
 
 function normalizeMatchText(input: unknown) {
@@ -6436,6 +6505,7 @@ class ActiveCaseTrace {
     const caseStatus = this.inferCaseStatus(status, error)
     this.enrichSemanticFactApplicabilityAndConflicts()
     this.emitFinalResponseClaims(caseStatus)
+    this.emitTaskObligations()
     this.finalizeOpenRecords(status, caseStatus)
     this.backfillCompactionEstimates()
     this.enrichInlineSubagentRefs()
@@ -6672,6 +6742,75 @@ class ActiveCaseTrace {
         .slice(-16)
         .map((node) => `node:${node.node_id}`),
     )
+  }
+
+  private emitTaskObligations() {
+    const obligations = taskObligationsFromInput(this.input)
+    for (const obligation of obligations) {
+      const evaluation = this.evaluateTaskObligation(obligation)
+      const obligationID = `obl_${hash(`${obligation.obligation_type}:${obligation.target_path ?? ""}:${this.caseID}`).slice(0, 10)}`
+      this.node({
+        node_id: `obligation_${obligationID}`,
+        kind: "task.obligation",
+        component: "processor",
+        title: obligation.requirement_text,
+        status: evaluation.status === "fulfilled" ? "success" : "error",
+        data: {
+          obligation_id: obligationID,
+          obligation_type: obligation.obligation_type,
+          requirement_text: obligation.requirement_text,
+          target_path: obligation.target_path,
+          status: evaluation.status,
+          evaluation_refs: evaluation.refs,
+          missing_action: evaluation.missing_action,
+          quality_flags: evaluation.status === "unmet" ? ["task_obligation_unmet"] : [],
+        },
+        source_refs: evaluation.refs,
+      })
+    }
+  }
+
+  private evaluateTaskObligation(obligation: TaskObligationDraft) {
+    if (obligation.obligation_type === "verification_required") {
+      const refs = this.verificationRecords
+        .filter((record) => isTestLikeCommand(record.command))
+        .map((record) => `verification:${record.verification_id}`)
+      return {
+        status: refs.length ? "fulfilled" : "unmet",
+        refs,
+        missing_action: refs.length ? undefined : "No test-like verification command was recorded.",
+      }
+    }
+    if (obligation.obligation_type === "mcp_required") {
+      const refs = this.causalNodes
+        .filter((node) => node.kind === "mcp.call")
+        .map((node) => this.recordRefForNode(node))
+      return {
+        status: refs.length ? "fulfilled" : "unmet",
+        refs,
+        missing_action: refs.length ? undefined : "No mcp.call record was observed.",
+      }
+    }
+    if (obligation.obligation_type === "subagent_required") {
+      const refs = this.causalNodes
+        .filter((node) => node.kind === "subagent.call")
+        .map((node) => this.recordRefForNode(node))
+      return {
+        status: refs.length ? "fulfilled" : "unmet",
+        refs,
+        missing_action: refs.length ? undefined : "No subagent.call record was observed.",
+      }
+    }
+    const target = obligation.target_path
+    const changeRefs = this.changeRecords.map((record) => `change:${record.change_id}`)
+    const violatingChanges = target
+      ? this.changeRecords.filter((record) => record.files.some((file) => pathWithinScope(file, target)))
+      : []
+    return {
+      status: violatingChanges.length ? "unmet" : "fulfilled",
+      refs: violatingChanges.length ? violatingChanges.map((record) => `change:${record.change_id}`) : changeRefs,
+      missing_action: violatingChanges.length ? `Recorded change touched forbidden path ${target}.` : undefined,
+    }
   }
 
   private traceRefFromSourceRef(ref: string): TraceRef | undefined {
@@ -7205,6 +7344,8 @@ class ActiveCaseTrace {
         record.data?.request_status === "requested"
       )
     })
+    const taskObligations = records.filter((record) => record.event_type === "task.obligation")
+    const unmetTaskObligations = taskObligations.filter((record) => record.data?.status === "unmet")
     for (const record of unsupportedResponseClaims.slice(0, 20)) {
       issues.push({
         kind: "unsupported_response_claim",
@@ -7257,6 +7398,21 @@ class ActiveCaseTrace {
         message: "User requested a skill that was not observed as loaded in the model context.",
         record_id: record.record_id,
         event_type: record.event_type,
+      })
+    }
+    for (const record of unmetTaskObligations.slice(0, 20)) {
+      issues.push({
+        kind: "task_obligation_unmet",
+        severity: "warning",
+        message: "A user-requested task obligation was not fulfilled by the observed trace.",
+        record_id: record.record_id,
+        event_type: record.event_type,
+        refs: stringArrayField(record.data ?? {}, ["evaluation_refs", "evaluationRefs"]) ?? [],
+        metadata: {
+          obligation_type: record.data?.obligation_type,
+          target_path: record.data?.target_path,
+          missing_action: record.data?.missing_action,
+        },
       })
     }
     const payloadDuplicationGroups = this.artifacts.filter((artifact) => (artifact.occurrences ?? 1) > 1).length
@@ -7394,6 +7550,8 @@ class ActiveCaseTrace {
       actionable_semantic_conflict_groups: actionableSemanticConflictGroups.length,
       low_value_semantic_conflict_members: lowValueSemanticConflictMembers.length,
       legacy_fact_used_in_final_claim: legacyFactUsedInFinalClaim.length,
+      task_obligations: taskObligations.length,
+      unmet_task_obligations: unmetTaskObligations.length,
       broken_claim_fragments: brokenClaimFragments.length,
       over_attributed_claims: overAttributedClaims.length,
       generic_mcp_facts: genericMcpFacts.length,

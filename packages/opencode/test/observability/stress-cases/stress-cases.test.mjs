@@ -247,3 +247,44 @@ test("trace sufficiency review accepts handled tool failures without unsupported
   assert.equal(review.trace_sufficiency, "sufficient")
   assert.deepEqual(review.missing_semantics, [])
 })
+
+test("trace sufficiency review recognizes task obligations and broad legacy context noise", () => {
+  const caseDefinition = {
+    ...loadCases(rootDir).find((item) => item.case_id === "insufficient-verification"),
+    required_trace_evidence: ["required_action_obligations"],
+  }
+  const trace = {
+    trace_version: "5.5",
+    manifest: { case_id: caseDefinition.case_id },
+    records: [
+      {
+        record_id: "obl_test",
+        event_type: "task.obligation",
+        component: "processor",
+        data: {
+          obligation_type: "verification_required",
+          status: "unmet",
+          quality_flags: ["task_obligation_unmet"],
+        },
+      },
+      {
+        record_id: "claim_legacy_wide",
+        event_type: "response.claim",
+        component: "result",
+        data: {
+          text: "Legacy file left untouched.",
+          direct_evidence_refs: [],
+          legacy_context_refs: Array.from({ length: 24 }, (_, index) => `evidence:legacy_${index}`),
+        },
+      },
+    ],
+    dataflow_edges: [],
+    metrics: { trace_health: { broad_response_refs: 0 } },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.trace_sufficiency, "sufficient")
+  assert.deepEqual(review.missing_semantics, [])
+  assert.ok(review.redundant_or_noisy_semantics.includes("broad_legacy_context_refs"))
+})
