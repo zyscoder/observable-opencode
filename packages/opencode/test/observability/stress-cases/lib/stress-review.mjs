@@ -22,6 +22,16 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
   const ratio = foundCount / total
   const traceSufficiency = ratio === 1 ? "sufficient" : ratio >= 0.5 ? "partial" : "insufficient"
   const missingSemantics = found.filter((item) => item.status === "missing").map((item) => item.required)
+  const mechanismFound = requiredTraceMechanisms(caseDefinition).map((name) => {
+    const refs = detectMechanism(name, trace)
+    return {
+      required: name,
+      status: refs.length ? "found" : "missing",
+      record_refs: refs,
+    }
+  })
+  const missingMechanisms = mechanismFound.filter((item) => item.status === "missing").map((item) => item.required)
+  const caseEffectiveness = missingMechanisms.length ? "ineffective" : "effective"
   const noisy = detectNoisySemantics(trace)
 
   return {
@@ -30,34 +40,60 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
     category: caseDefinition.category,
     ground_truth_root_cause: caseDefinition.ground_truth_root_cause,
     trace_sufficiency: traceSufficiency,
+    case_effectiveness: caseEffectiveness,
     evidence_found: found,
-    can_offline_module_identify_root_cause: traceSufficiency === "sufficient",
+    mechanism_evidence_found: mechanismFound,
+    can_offline_module_identify_root_cause: traceSufficiency === "sufficient" && caseEffectiveness === "effective",
     missing_semantics: missingSemantics,
+    missing_mechanisms: missingMechanisms,
     redundant_or_noisy_semantics: noisy,
-    recommended_trace_changes: recommendTraceChanges(missingSemantics),
+    recommended_trace_changes: recommendTraceChanges(missingSemantics, missingMechanisms),
   }
 }
 
 export function summarizeReviews(reviews) {
   const counts = { sufficient: 0, partial: 0, insufficient: 0 }
   for (const review of reviews) counts[review.trace_sufficiency] = (counts[review.trace_sufficiency] ?? 0) + 1
+  const effectivenessCounts = { effective: 0, ineffective: 0 }
+  for (const review of reviews)
+    effectivenessCounts[review.case_effectiveness] = (effectivenessCounts[review.case_effectiveness] ?? 0) + 1
   const lines = [
     "# Trace Stress Case Sufficiency Summary",
     "",
     `- sufficient: ${counts.sufficient}`,
     `- partial: ${counts.partial}`,
     `- insufficient: ${counts.insufficient}`,
+    `- effective cases: ${effectivenessCounts.effective}`,
+    `- ineffective cases: ${effectivenessCounts.ineffective}`,
     "",
-    "| Case | Root Cause | Sufficiency | Missing Semantics |",
-    "|---|---|---|---|",
+    "| Case | Root Cause | Sufficiency | Effectiveness | Missing Semantics | Missing Mechanisms |",
+    "|---|---|---|---|---|---|",
   ]
   for (const review of reviews) {
     lines.push(
-      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.missing_semantics.join(", ") || "-"} |`,
+      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness} | ${review.missing_semantics.join(", ") || "-"} | ${review.missing_mechanisms.join(", ") || "-"} |`,
     )
   }
   lines.push("")
   return lines.join("\n")
+}
+
+function requiredTraceMechanisms(caseDefinition) {
+  if (Array.isArray(caseDefinition.required_trace_mechanisms)) {
+    return caseDefinition.required_trace_mechanisms.map(String).filter(Boolean)
+  }
+  const byCategory = {
+    context_compaction: ["context.compaction"],
+    subagent_coordination: ["subagent.call"],
+    mcp_usage: ["mcp.call"],
+    tool_failure: ["tool.error"],
+  }
+  return byCategory[caseDefinition.category] ?? []
+}
+
+function detectMechanism(name, trace) {
+  const records = Array.isArray(trace?.records) ? trace.records : []
+  return records.filter((record) => record.event_type === name).map((record) => recordRef(record))
 }
 
 function detectEvidence(name, trace) {
@@ -254,8 +290,13 @@ function hasCancelledAfterCompletedCase(trace) {
   )
 }
 
-function recommendTraceChanges(missing) {
+function recommendTraceChanges(missing, missingMechanisms = []) {
   const recommendations = new Set()
+  for (const item of missingMechanisms) {
+    recommendations.add(
+      `Stress case did not trigger ${item}; redesign the case or runner so this mechanism occurs before judging trace sufficiency.`,
+    )
+  }
   for (const item of missing) {
     if (item.includes("candidate") || item.includes("search") || item.includes("target")) {
       recommendations.add("Record search result candidate sets, rankings, and selected target rationale.")

@@ -72,6 +72,9 @@
       "claim_direct_evidence_refs",
       "edited_file_paths"
     ],
+    "required_trace_mechanisms": [
+      "mcp.call"
+    ],
     "sufficiency_questions": [
       "trace 是否能看到 MCP 输入输出？",
       "MCP fact 是否进入 semantic evidence？",
@@ -98,6 +101,9 @@
       "edited_file_paths",
       "final_test_result"
     ],
+    "required_trace_mechanisms": [
+      "context.compaction"
+    ],
     "sufficiency_questions": [
       "trace 是否能看到压缩前的约束事实？",
       "context.compaction 是否记录 retained/dropped fact refs？",
@@ -123,6 +129,9 @@
       "semantic_fact_values",
       "claim_direct_evidence_refs",
       "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "subagent.call"
     ],
     "sufficiency_questions": [
       "trace 是否能看到 subagent prompt 和实际读取范围？",
@@ -175,6 +184,9 @@
       "tool_failure_handled_or_unsupported",
       "claim_direct_evidence_refs",
       "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "tool.error"
     ],
     "sufficiency_questions": [
       "trace 是否以正式 tool.error 记录 read 失败？",

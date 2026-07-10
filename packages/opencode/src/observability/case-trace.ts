@@ -2079,6 +2079,37 @@ function responseClaimQualityFlags(classifiedRefs: ReturnType<typeof classifySou
   return flags
 }
 
+function unchangedPathTargetsFromClaim(input: unknown) {
+  const text = fieldSummaryText(input)
+  const targets = new Set<string>()
+  const afterPattern =
+    /(?:未修改|没有修改|未变更|没有变更|不修改|不要修改|did not modify|not modify|left|kept|keep)\s+`?((?:\.{0,2}\/)?[\w@~-]+(?:\/[\w@~.-]+)+\/?)`?/gi
+  const beforePattern = /`?((?:\.{0,2}\/)?[\w@~-]+(?:\/[\w@~.-]+)+\/?)`?\s*(?:未修改|未变更|unchanged|untouched)/gi
+  for (const pattern of [afterPattern, beforePattern]) {
+    for (const match of text.matchAll(pattern)) {
+      const target = normalizeScopePath(match[1])
+      if (target) targets.add(target)
+    }
+  }
+  return [...targets]
+}
+
+function normalizeScopePath(input: unknown) {
+  const path = typeof input === "string" ? input.trim() : ""
+  if (!path) return undefined
+  const cleaned = path.replace(/^`+|`+$/g, "").replace(/[.,，。；;:：)）\]]+$/g, "")
+  if (!cleaned.includes("/")) return undefined
+  return cleaned.replace(/^\.\//, "")
+}
+
+function pathWithinScope(path: string, scope: string) {
+  const normalizedPath = normalizeScopePath(path)
+  const normalizedScope = normalizeScopePath(scope)
+  if (!normalizedPath || !normalizedScope) return false
+  const scopePrefix = normalizedScope.endsWith("/") ? normalizedScope : `${normalizedScope}/`
+  return normalizedPath === normalizedScope || normalizedPath.startsWith(scopePrefix)
+}
+
 function normalizeMatchText(input: unknown) {
   return stringPreview(input, 6000)
     .toLowerCase()
@@ -5135,18 +5166,57 @@ class ActiveCaseTrace {
     return dedupeStrings(output)
   }
 
+  private changeScopeExclusionEvidenceRefsForClaim(claimText: unknown, sourceRefs: string[]) {
+    const targets = unchangedPathTargetsFromClaim(claimText)
+    if (!targets.length) return []
+    const changeRefs = dedupeStrings(sourceRefs.filter((ref) => ref.startsWith("change:")))
+    if (!changeRefs.length) return []
+    const changeRefSet = new Set(changeRefs)
+    const changes = this.changeRecords.filter((change) => changeRefSet.has(`change:${change.change_id}`))
+    if (!changes.length) return []
+    const changedFiles = dedupeStrings(changes.flatMap((change) => change.files ?? []))
+    const evidenceRefs: string[] = []
+    for (const target of targets) {
+      if (changedFiles.some((file) => pathWithinScope(file, target))) continue
+      const fact = this.evidenceFact({
+        source: "trace",
+        category: "change_scope_exclusion",
+        summary: `No recorded changes under ${target}`,
+        data: {
+          subject: "repository_change_scope",
+          predicate: "change_scope_excludes",
+          value: target,
+          path: target,
+          target_path: target,
+          changed_files: changedFiles,
+        },
+        source_refs: changeRefs,
+        confidence: "derived",
+        support_level: "inferred",
+        quality_flags: ["absence_evidence", "derived_from_change_scope"],
+      })
+      if (fact) evidenceRefs.push(`evidence:${fact.node_id}`)
+    }
+    return dedupeStrings(evidenceRefs)
+  }
+
   responseClaim(input: ResponseClaimInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
+    const claimText = input.canonical_text ?? input.text
+    const changeScopeExclusionRefs = this.changeScopeExclusionEvidenceRefsForClaim(claimText, sourceRefs)
     const candidateToolOutcomeRefs = dedupeStrings([
       ...this.toolOutcomeRefsFromSourceRefs(sourceRefs),
       ...this.recentToolFailureRefs,
     ])
     const candidateClassifiedRefs = {
       ...classifiedRefs,
-      direct_evidence_refs: dedupeStrings([...classifiedRefs.direct_evidence_refs, ...candidateToolOutcomeRefs]),
+      direct_evidence_refs: dedupeStrings([
+        ...classifiedRefs.direct_evidence_refs,
+        ...candidateToolOutcomeRefs,
+        ...changeScopeExclusionRefs,
+      ]),
     }
-    const claimText = input.canonical_text ?? input.text
     const evidenceMatch = this.matchEvidenceForClaim(claimText, candidateClassifiedRefs.direct_evidence_refs)
     const effectiveDirectEvidenceRefs = evidenceMatch.refs.length
       ? evidenceMatch.refs
@@ -6719,7 +6789,10 @@ class ActiveCaseTrace {
         .filter((record) => record.kind === "evidence.semantic_fact" || record.kind === "evidence.fact")
         .map((record) => `evidence:${record.node_id}`)
         .slice(0, 20)
-      const parentConsumers = this.parentConsumersForSubagent(subagent)
+      const parentConsumers = this.parentConsumersForSubagent(
+        subagent,
+        dedupeStrings([...childRecordRefs, ...childPromptRefs, ...childResultRefs, ...childKeyEvidenceRefs]),
+      )
       const parentConsumptionRefs = parentConsumers.map((record) => this.recordRefForNode(record))
       const fullTraceRefArtifact = this.writeArtifact(
         "json",
@@ -6779,11 +6852,12 @@ class ActiveCaseTrace {
     }
   }
 
-  private parentConsumersForSubagent(subagent: CausalNode) {
+  private parentConsumersForSubagent(subagent: CausalNode, childRefs: string[] = []) {
     const refs = dedupeStrings([
       `node:${subagent.node_id}`,
       ...(subagent.span_id ? [`span:${subagent.span_id}`, `tool_span:${subagent.span_id}`] : []),
       ...(subagent.source_refs ?? []),
+      ...childRefs,
     ])
     const childSessionID = firstStringField(subagent.data, ["child_session_id", "childSessionID"])
     return this.causalNodes.filter((node) => {

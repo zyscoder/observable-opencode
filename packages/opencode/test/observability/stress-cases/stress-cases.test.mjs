@@ -67,6 +67,48 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
   assert.ok(review.evidence_found.every((item) => item.status === "missing"))
 })
 
+test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {
+  const caseDefinition = {
+    ...loadCases(rootDir).find((item) => item.case_id === "compaction-lost-constraint"),
+    required_trace_evidence: ["semantic_fact_values"],
+    required_trace_mechanisms: ["context.compaction"],
+  }
+  const trace = {
+    trace_version: "5.5",
+    manifest: { case_id: caseDefinition.case_id },
+    records: [
+      {
+        record_id: "fact_constraint",
+        event_type: "evidence.semantic_fact",
+        component: "processor",
+        data: {
+          structured_claim: {
+            subject: "src/payment",
+            predicate: "must_not_modify",
+            value: true,
+          },
+        },
+      },
+    ],
+    dataflow_edges: [],
+    metrics: { trace_health: {} },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.trace_sufficiency, "sufficient")
+  assert.equal(review.case_effectiveness, "ineffective")
+  assert.equal(review.can_offline_module_identify_root_cause, false)
+  assert.deepEqual(review.missing_mechanisms, ["context.compaction"])
+  assert.deepEqual(review.mechanism_evidence_found, [
+    {
+      required: "context.compaction",
+      status: "missing",
+      record_refs: [],
+    },
+  ])
+})
+
 test("trace sufficiency review requires formal tool error and claim support facts", () => {
   const caseDefinition = {
     ...loadCases(rootDir).find((item) => item.case_id === "tool-failure-hallucination"),

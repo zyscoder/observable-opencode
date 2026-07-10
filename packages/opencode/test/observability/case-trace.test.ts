@@ -23,6 +23,11 @@ async function waitForExists(file: string, timeoutMs = 2000) {
   return exists(file)
 }
 
+function changeIdFromTrace(trace: any) {
+  const record = trace.records.find((item: any) => item.event_type === "change")
+  return record?.data?.change_id ?? record?.record_id
+}
+
 describe("case trace", () => {
   test("writes trace semantic contract v5.5 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
@@ -2377,6 +2382,59 @@ describe("case trace", () => {
     expect(html).toContain("inline_same_trace")
   })
 
+  test("links parent consumption when parent response references child evidence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-subagent-evidence-consumed-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subagent-evidence-consumed-v56.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner" } })`,
+        `span?.end({ output: { child_session_id: "ses_child_evidence", child_status: "success", output: "owner is billing-platform" } })`,
+        `const childFact = CaseTrace.evidenceFact({ source: "mcp", category: "repo_fact", summary: "owner fact from child", data: { session_id: "ses_child_evidence", subject: "renewalQuote", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 10, line_end: 12 } })`,
+        `CaseTrace.responseOutput({ response_role: "subagent_result", text: "Child result: owner is billing-platform.", metadata: { session_id: "ses_child_evidence" } })`,
+        `CaseTrace.responseOutput({ text: "The parent answer uses the child evidence: renewalQuote owner is billing-platform.", source_refs: childFact ? ["evidence:" + childFact.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subagent-evidence-consumed-v56-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-evidence-consumed-v56-case", "trace.json"), "utf8"),
+    ) as any
+    const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
+
+    expect(subagent.data.child_key_evidence_refs.length).toBeGreaterThan(0)
+    expect(subagent.data.parent_consumption_refs.length).toBeGreaterThan(0)
+    expect(subagent.data.parent_consumption_refs.some((ref: string) => ref.startsWith("response_segment:"))).toBe(true)
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.id === subagent.record_id && edge.to.type === "response_segment" && edge.relation === "reported_to",
+      ),
+    ).toBe(true)
+  })
+
   test("treats run and lifecycle records cancelled at trace finish as expected finalization", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v51-lifecycle-cancelled-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -4279,6 +4337,103 @@ describe("case trace", () => {
     expect(legacyFact.data.conflict_issue).toBe(false)
     expect(trace.metrics.trace_health.actionable_semantic_conflict_groups).toBe(1)
     expect(issues).toContain("requirement_code_mismatch")
+  })
+
+  test("supports unchanged path claims with change-scope exclusion facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-unchanged-path-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "unchanged-path-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const change = CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix current pricing cap", diff: "- 0.2\\\\n+ 0.15" })`,
+        `CaseTrace.responseOutput({ text: "Left src/legacy/ untouched.", source_refs: change ? ["change:" + change.change_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "unchanged-path-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "unchanged-path-claim-case", "trace.json"), "utf8")) as any
+    const exclusionFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" &&
+        record.data.structured_claim?.predicate === "change_scope_excludes" &&
+        record.data.structured_claim?.value === "src/legacy/",
+    )
+    const unchangedClaim = trace.records.find(
+      (record: any) =>
+        record.event_type === "response.claim" &&
+        String(record.data.text.preview ?? record.data.text).includes("src/legacy/ untouched"),
+    )
+
+    expect(exclusionFact).toBeTruthy()
+    expect(exclusionFact.source_refs).toContain(`change:${changeIdFromTrace(trace)}`)
+    expect(unchangedClaim.data.direct_evidence_refs).toContain(`evidence:${exclusionFact.record_id}`)
+    expect(unchangedClaim.data.quality_flags).not.toContain("context_only_claim")
+    expect(unchangedClaim.data.quality_flags).not.toContain("execution_only_claim")
+  })
+
+  test("does not flag legacy evidence noise when final claim is directly supported by current evidence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-legacy-noise-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "legacy-noise-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const current = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "current architecture says discount cap is 15 percent", data: { subject: "discount", predicate: "discount_cap", value: "15 percent", path: "docs/architecture.md", line_start: 7, line_end: 7, output: "The current renewal discount cap must be 15 percent." } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "legacy implementation retained only for migration comparison uses 20 percent", data: { subject: "discount", predicate: "discount_cap", value: "20 percent", path: "src/legacy/pricing.mjs", line_start: 6, line_end: 6, output: "Legacy implementation retained only for migration comparison uses a 20 percent cap." } })`,
+        `CaseTrace.responseOutput({ text: "The current discount cap is 15 percent.", source_refs: current ? ["evidence:" + current.node_id, "context:legacy_scan"] : ["context:legacy_scan"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "legacy-noise-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "legacy-noise-case", "trace.json"), "utf8")) as any
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+    const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+
+    expect(claim.data.direct_evidence_refs.length).toBeGreaterThan(0)
+    expect(claim.data.quality_flags).not.toContain("legacy_evidence_used")
+    expect(trace.metrics.trace_health.legacy_fact_used_in_final_claim).toBe(0)
+    expect(issues).not.toContain("legacy_fact_used_in_final_claim")
   })
 
   test("evaluates read-only constraints at trace finish", async () => {
