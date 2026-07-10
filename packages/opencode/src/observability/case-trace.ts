@@ -2122,15 +2122,18 @@ type TaskObligationDraft = {
   obligation_type: "verification_required" | "mcp_required" | "subagent_required" | "path_scope_exclusion"
   requirement_text: string
   target_path?: string
+  source_refs?: string[]
 }
 
-function taskObligationsFromInput(input: unknown) {
+function taskObligationsFromInput(input: unknown, sourceRefs: string[] = []) {
   const text = fieldSummaryText(input)
   const obligations: TaskObligationDraft[] = []
+  const source_refs = dedupeStrings(sourceRefs)
   if (/npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|运行[^。.\n]*测试|执行[^。.\n]*测试|run[^.\n]*tests?/i.test(text)) {
     obligations.push({
       obligation_type: "verification_required",
       requirement_text: "Run the requested verification tests.",
+      source_refs,
     })
   }
   if (
@@ -2141,12 +2144,14 @@ function taskObligationsFromInput(input: unknown) {
     obligations.push({
       obligation_type: "mcp_required",
       requirement_text: "Call the requested MCP/tool fact source.",
+      source_refs,
     })
   }
   if (/(?:委派|调用|使用|spawn|delegate).*?(?:subagent|子\s*agent)|(?:subagent|子\s*agent).*?(?:总结|复核|调用|委派|delegate)/i.test(text)) {
     obligations.push({
       obligation_type: "subagent_required",
       requirement_text: "Use the requested subagent workflow.",
+      source_refs,
     })
   }
   const pathPatterns = [
@@ -2161,6 +2166,7 @@ function taskObligationsFromInput(input: unknown) {
         obligation_type: "path_scope_exclusion",
         requirement_text: `Do not modify ${target}.`,
         target_path: target,
+        source_refs,
       })
     }
   }
@@ -2172,7 +2178,11 @@ function dedupeTaskObligations(input: TaskObligationDraft[]) {
   const output: TaskObligationDraft[] = []
   for (const item of input) {
     const key = `${item.obligation_type}:${item.target_path ?? ""}`
-    if (seen.has(key)) continue
+    if (seen.has(key)) {
+      const existing = output.find((candidate) => `${candidate.obligation_type}:${candidate.target_path ?? ""}` === key)
+      if (existing) existing.source_refs = dedupeStrings([...(existing.source_refs ?? []), ...(item.source_refs ?? [])])
+      continue
+    }
     seen.add(key)
     output.push(item)
   }
@@ -6745,10 +6755,12 @@ class ActiveCaseTrace {
   }
 
   private emitTaskObligations() {
-    const obligations = taskObligationsFromInput(this.input)
+    const obligations = this.taskObligations()
     for (const obligation of obligations) {
       const evaluation = this.evaluateTaskObligation(obligation)
       const obligationID = `obl_${hash(`${obligation.obligation_type}:${obligation.target_path ?? ""}:${this.caseID}`).slice(0, 10)}`
+      const requirementSourceRefs = dedupeStrings(obligation.source_refs ?? [])
+      const sourceRefs = dedupeStrings([...requirementSourceRefs, ...evaluation.refs])
       this.node({
         node_id: `obligation_${obligationID}`,
         kind: "task.obligation",
@@ -6760,14 +6772,34 @@ class ActiveCaseTrace {
           obligation_type: obligation.obligation_type,
           requirement_text: obligation.requirement_text,
           target_path: obligation.target_path,
+          requirement_source_refs: requirementSourceRefs,
           status: evaluation.status,
           evaluation_refs: evaluation.refs,
           missing_action: evaluation.missing_action,
           quality_flags: evaluation.status === "unmet" ? ["task_obligation_unmet"] : [],
         },
-        source_refs: evaluation.refs,
+        source_refs: sourceRefs,
       })
     }
+  }
+
+  private taskObligations() {
+    const obligations = [...taskObligationsFromInput(this.input)]
+    for (const node of this.causalNodes) {
+      if (node.kind !== "prompt.assembly") continue
+      const stage = typeof node.data?.stage === "string" ? node.data.stage : ""
+      if (!["initial_user_request", "user_message_created"].includes(stage)) continue
+      obligations.push(
+        ...taskObligationsFromInput(
+          {
+            input: node.data?.input,
+            parts: node.data?.parts,
+          },
+          [this.recordRefForNode(node)],
+        ),
+      )
+    }
+    return dedupeTaskObligations(obligations)
   }
 
   private evaluateTaskObligation(obligation: TaskObligationDraft) {
@@ -7057,6 +7089,7 @@ class ActiveCaseTrace {
   private recordRefForNode(node: CausalNode) {
     if (node.kind === "response.output" && typeof node.data?.segment_id === "string")
       return `response_segment:${node.data.segment_id}`
+    if (node.kind === "prompt.assembly") return `prompt:${node.node_id}`
     if (node.kind === "response.claim") return `response_claim:${node.node_id}`
     if (node.kind === "evidence.semantic_fact" || node.kind === "evidence.fact") return `evidence:${node.node_id}`
     if (node.kind === "execution.observation" || node.kind === "observation") return `observation:${node.node_id}`

@@ -4483,6 +4483,54 @@ describe("case trace", () => {
     expect(issues).toContain("task_obligation_unmet")
   })
 
+  test("emits task obligations from prompt assembly records on HTTP session path", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-obligation-prompt-assembly-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "obligation-prompt-assembly-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_unit", input: { parts: [{ type: "text", text: "请必须调用 syntheticFacts.repo_fact 获取 discount-policy，再修复 renewalQuote。最终说明 MCP 返回的事实、修改点和 npm test 结果。" }] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "obligation-prompt-assembly-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "obligation-prompt-assembly-case", "trace.json"), "utf8"),
+    ) as any
+    const prompt = trace.records.find((record: any) => record.event_type === "prompt.assembly")
+    const obligations = trace.records.filter((record: any) => record.event_type === "task.obligation")
+    const mcp = obligations.find((record: any) => record.data.obligation_type === "mcp_required")
+    const verification = obligations.find((record: any) => record.data.obligation_type === "verification_required")
+
+    expect(prompt).toBeTruthy()
+    expect(mcp.data.status).toBe("unmet")
+    expect(mcp.data.requirement_source_refs).toContain(`prompt:${prompt.record_id}`)
+    expect(mcp.source_refs).toContain(`prompt:${prompt.record_id}`)
+    expect(verification.data.status).toBe("unmet")
+    expect(trace.metrics.trace_health.task_obligations).toBeGreaterThanOrEqual(2)
+  })
+
   test("does not create response claims from English design section headings", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-design-heading-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
