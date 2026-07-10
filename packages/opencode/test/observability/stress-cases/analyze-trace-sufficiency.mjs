@@ -7,12 +7,13 @@ import { loadCases, reviewTraceSufficiency, summarizeReviews } from "./lib/stres
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 
 function parseArgs(argv) {
-  const args = { cases: path.join(rootDir, "cases.json"), traces: "", out: "" }
+  const args = { cases: path.join(rootDir, "cases.json"), traces: "", out: "", caseIDs: [] }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (arg === "--cases") args.cases = argv[++index]
     else if (arg === "--traces") args.traces = argv[++index]
     else if (arg === "--out") args.out = argv[++index]
+    else if (arg === "--case") args.caseIDs.push(argv[++index])
     else if (arg === "--help" || arg === "-h") args.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
@@ -21,7 +22,7 @@ function parseArgs(argv) {
 
 function usage() {
   return [
-    "Usage: node analyze-trace-sufficiency.mjs --traces <trace-dir> --out <report-dir> [--cases cases.json]",
+    "Usage: node analyze-trace-sufficiency.mjs --traces <trace-dir> --out <report-dir> [--cases cases.json] [--case case-id]",
     "",
     "Example:",
     "  node packages/opencode/test/observability/stress-cases/analyze-trace-sufficiency.mjs \\",
@@ -35,8 +36,9 @@ function readCases(casesFile) {
   return loadCases(casesRoot)
 }
 
-export function analyzeTraceDirectory({ casesFile, tracesDir, outDir }) {
-  const cases = readCases(casesFile)
+export function analyzeTraceDirectory({ casesFile, tracesDir, outDir, caseIDs = [] }) {
+  const wanted = new Set(caseIDs)
+  const cases = wanted.size ? readCases(casesFile).filter((item) => wanted.has(item.case_id)) : readCases(casesFile)
   fs.mkdirSync(outDir, { recursive: true })
   const reviews = []
   for (const item of cases) {
@@ -47,18 +49,10 @@ export function analyzeTraceDirectory({ casesFile, tracesDir, outDir }) {
       review = reviewTraceSufficiency({ caseDefinition: item, trace })
     } else {
       review = {
-        case_id: item.case_id,
-        title: item.title,
-        category: item.category,
-        ground_truth_root_cause: item.ground_truth_root_cause,
-        trace_sufficiency: "insufficient",
-        evidence_found: item.required_trace_evidence.map((required) => ({
-          required,
-          status: "missing",
-          record_refs: [],
-        })),
-        can_offline_module_identify_root_cause: false,
-        missing_semantics: item.required_trace_evidence,
+        ...reviewTraceSufficiency({
+          caseDefinition: item,
+          trace: { trace_version: "missing", records: [], dataflow_edges: [], metrics: { trace_health: {} } },
+        }),
         redundant_or_noisy_semantics: [],
         recommended_trace_changes: ["Trace file was not generated for this case."],
       }
@@ -84,6 +78,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     casesFile: path.resolve(args.cases),
     tracesDir: path.resolve(args.traces),
     outDir: path.resolve(args.out),
+    caseIDs: args.caseIDs,
   })
   console.log(summarizeReviews(reviews))
 }

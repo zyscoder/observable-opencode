@@ -56,7 +56,8 @@ export function summarizeReviews(reviews) {
   for (const review of reviews) counts[review.trace_sufficiency] = (counts[review.trace_sufficiency] ?? 0) + 1
   const effectivenessCounts = { effective: 0, ineffective: 0 }
   for (const review of reviews)
-    effectivenessCounts[review.case_effectiveness] = (effectivenessCounts[review.case_effectiveness] ?? 0) + 1
+    effectivenessCounts[review.case_effectiveness ?? "ineffective"] =
+      (effectivenessCounts[review.case_effectiveness ?? "ineffective"] ?? 0) + 1
   const lines = [
     "# Trace Stress Case Sufficiency Summary",
     "",
@@ -70,8 +71,10 @@ export function summarizeReviews(reviews) {
     "|---|---|---|---|---|---|",
   ]
   for (const review of reviews) {
+    const missingSemantics = Array.isArray(review.missing_semantics) ? review.missing_semantics : []
+    const missingMechanisms = Array.isArray(review.missing_mechanisms) ? review.missing_mechanisms : []
     lines.push(
-      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness} | ${review.missing_semantics.join(", ") || "-"} | ${review.missing_mechanisms.join(", ") || "-"} |`,
+      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness ?? "ineffective"} | ${missingSemantics.join(", ") || "-"} | ${missingMechanisms.join(", ") || "-"} |`,
     )
   }
   lines.push("")

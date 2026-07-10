@@ -1,9 +1,11 @@
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
-import { loadCases, reviewTraceSufficiency } from "./lib/stress-review.mjs"
+import { analyzeTraceDirectory } from "./analyze-trace-sufficiency.mjs"
+import { loadCases, reviewTraceSufficiency, summarizeReviews } from "./lib/stress-review.mjs"
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 
@@ -65,6 +67,27 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
   assert.equal(review.can_offline_module_identify_root_cause, false)
   assert.ok(review.missing_semantics.includes(caseDefinition.required_trace_evidence[0]))
   assert.ok(review.evidence_found.every((item) => item.status === "missing"))
+})
+
+test("trace summary handles missing trace reviews and subset analysis", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-stress-subset-"))
+  const traces = path.join(temp, "traces")
+  const reports = path.join(temp, "reports")
+
+  const reviews = analyzeTraceDirectory({
+    casesFile: path.join(rootDir, "cases.json"),
+    tracesDir: traces,
+    outDir: reports,
+    caseIDs: ["ignored-mcp-fact"],
+  })
+  const summary = summarizeReviews(reviews)
+
+  assert.equal(reviews.length, 1)
+  assert.equal(reviews[0].case_id, "ignored-mcp-fact")
+  assert.equal(reviews[0].case_effectiveness, "ineffective")
+  assert.deepEqual(reviews[0].missing_mechanisms, ["mcp.call"])
+  assert.ok(summary.includes("| ignored-mcp-fact |"))
+  assert.ok(!summary.includes("| wrong-implementation-target |"))
 })
 
 test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {

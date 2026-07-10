@@ -175,6 +175,7 @@ export async function runStressCases(args) {
     casesFile: path.join(rootDir, "cases.json"),
     tracesDir: path.join(path.resolve(args.out), "traces"),
     outDir: reportsDir,
+    caseIDs: cases.map((item) => item.case_id),
   })
 }
 
