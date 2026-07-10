@@ -90,6 +90,36 @@ test("trace summary handles missing trace reviews and subset analysis", () => {
   assert.ok(!summary.includes("| wrong-implementation-target |"))
 })
 
+test("stress runner supports explicit multi-step HTTP flows for compaction scenarios", async () => {
+  const runner = await import("./run-stress-cases.mjs")
+  assert.equal(typeof runner.planCaseActions, "function")
+
+  const defaultActions = runner.planCaseActions({
+    case_id: "single-turn",
+    prompt: "Fix the bug and run npm test.",
+  })
+
+  assert.deepEqual(defaultActions, [
+    {
+      type: "prompt",
+      text: "Fix the bug and run npm test.",
+    },
+  ])
+
+  const compactionCase = loadCases(rootDir).find((item) => item.case_id === "compaction-lost-constraint")
+  const flowActions = runner.planCaseActions(compactionCase)
+
+  assert.deepEqual(
+    flowActions.map((item) => item.type),
+    ["prompt", "summarize", "prompt"],
+  )
+  assert.match(flowActions[0].text, /docs\/large-context\.md/)
+  assert.match(flowActions[0].text, /src\/payment/)
+  assert.equal(flowActions[1].auto, false)
+  assert.match(flowActions[2].text, /上一轮|前一轮/)
+  assert.doesNotMatch(flowActions[2].text, /src\/payment/)
+})
+
 test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {
   const caseDefinition = {
     ...loadCases(rootDir).find((item) => item.case_id === "compaction-lost-constraint"),

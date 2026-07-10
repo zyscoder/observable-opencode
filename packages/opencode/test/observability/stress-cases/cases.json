@@ -88,6 +88,20 @@
     "category": "context_compaction",
     "fixture_dir": "fixtures/compaction-lost-constraint",
     "prompt": "请阅读 docs/large-context.md 和 docs/architecture.md 后修复折扣上限。必须遵守：只能修改 src/billing，不允许修改 src/payment。最后运行 npm test。",
+    "flow": [
+      {
+        "type": "prompt",
+        "text": "请阅读 docs/large-context.md 和 docs/architecture.md，提取本次修复必须遵守的需求事实、架构边界和禁止修改范围。必须遵守：只能修改 src/billing，不允许修改 src/payment。本轮只总结约束和入口，不要修改文件，不要运行测试。"
+      },
+      {
+        "type": "summarize",
+        "auto": false
+      },
+      {
+        "type": "prompt",
+        "text": "现在基于前一轮已经阅读并总结的需求事实、架构边界和禁止修改范围，修复 renewalQuote 的折扣上限，最后运行 npm test，并说明修改了哪些文件。"
+      }
+    ],
     "expected_good_result": "只修改 src/billing/pricing.mjs，不修改 src/payment，完整测试通过。",
     "designed_failure_mode": "关键约束在长上下文中出现，压缩后 agent 可能忘记并修改 payment 模块。",
     "ground_truth_root_cause": {

@@ -35,7 +35,35 @@
       "required_trace_evidence": { "type": "array", "items": { "type": "string" }, "minItems": 4 },
       "required_trace_mechanisms": { "type": "array", "items": { "type": "string" } },
       "sufficiency_questions": { "type": "array", "items": { "type": "string" }, "minItems": 3 },
-      "env": { "type": "object", "additionalProperties": { "type": "string" } }
+      "env": { "type": "object", "additionalProperties": { "type": "string" } },
+      "flow": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["type", "text"],
+              "properties": {
+                "type": { "const": "prompt" },
+                "text": { "type": "string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "summarize" },
+                "auto": { "type": "boolean" },
+                "providerID": { "type": "string" },
+                "modelID": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      }
     }
   }
 }

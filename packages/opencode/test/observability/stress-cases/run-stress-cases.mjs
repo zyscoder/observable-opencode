@@ -106,6 +106,34 @@ async function postJson(url, body) {
   return text ? JSON.parse(text) : {}
 }
 
+export function planCaseActions(caseDef) {
+  if (!Array.isArray(caseDef.flow) || !caseDef.flow.length) {
+    return [
+      {
+        type: "prompt",
+        text: caseDef.prompt,
+      },
+    ]
+  }
+  return caseDef.flow.map((action) => {
+    if (action.type === "prompt") {
+      return {
+        type: "prompt",
+        text: action.text,
+      }
+    }
+    if (action.type === "summarize") {
+      return {
+        type: "summarize",
+        auto: action.auto ?? false,
+        providerID: action.providerID,
+        modelID: action.modelID,
+      }
+    }
+    throw new Error(`unsupported stress flow action for ${caseDef.case_id}: ${action.type}`)
+  })
+}
+
 async function runOneCase(caseDef, args) {
   const outDir = path.resolve(args.out)
   const repoDir = copyFixture(caseDef, outDir)
@@ -142,14 +170,24 @@ async function runOneCase(caseDef, args) {
     const session = await postJson(`http://127.0.0.1:${port}/session?directory=${directory}`, {
       title: caseDef.case_id,
     })
-    await postJson(`http://127.0.0.1:${port}/session/${session.id}/message?directory=${directory}`, {
-      model: {
-        providerID: "deepseek",
-        modelID: process.env.OPENCODE_STRESS_MODEL ?? "deepseek-v4-pro",
-      },
-      agent: "build",
-      parts: [{ type: "text", text: caseDef.prompt }],
-    })
+    for (const action of planCaseActions(caseDef)) {
+      const model = {
+        providerID: action.providerID ?? "deepseek",
+        modelID: action.modelID ?? process.env.OPENCODE_STRESS_MODEL ?? "deepseek-v4-pro",
+      }
+      if (action.type === "prompt") {
+        await postJson(`http://127.0.0.1:${port}/session/${session.id}/message?directory=${directory}`, {
+          model,
+          agent: "build",
+          parts: [{ type: "text", text: action.text }],
+        })
+      } else if (action.type === "summarize") {
+        await postJson(`http://127.0.0.1:${port}/session/${session.id}/summarize?directory=${directory}`, {
+          ...model,
+          auto: action.auto,
+        })
+      }
+    }
   } finally {
     await stopServer(child)
   }
