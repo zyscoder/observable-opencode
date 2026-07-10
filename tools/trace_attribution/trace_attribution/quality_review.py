@@ -73,7 +73,66 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
                 },
             }
         )
+    if not gaps and not missing_semantics:
+        inject_observed_defect_record(enriched, records, review, root_cause)
     return enriched
+
+
+def inject_observed_defect_record(
+    enriched: JsonDict,
+    records: List[Any],
+    review: JsonDict,
+    root_cause: JsonDict,
+) -> None:
+    component = str(root_cause.get("component") or "").strip()
+    failure_type = str(root_cause.get("failure_type") or "").strip()
+    if not component or not failure_type:
+        return
+    record_id = f"observed_defect_{slugify(component)}_{slugify(failure_type)}"
+    if any(isinstance(record, dict) and record.get("record_id") == record_id for record in records):
+        return
+    all_refs = review_evidence_refs(review)
+    included_refs = all_refs[:24]
+    records.append(
+        {
+            "record_id": record_id,
+            "event_type": "case.observed_defect",
+            "component": "evaluation",
+            "status": "warning",
+            "source_refs": included_refs,
+            "data": {
+                "case_id": review.get("case_id") or enriched.get("manifest", {}).get("case_id"),
+                "component": component,
+                "failure_type": failure_type,
+                "defect_type": failure_type,
+                "description": root_cause.get("description"),
+                "trace_sufficiency": review.get("trace_sufficiency"),
+                "case_effectiveness": review.get("case_effectiveness"),
+                "can_offline_module_identify_root_cause": review.get("can_offline_module_identify_root_cause"),
+                "source_ref_count_total": len(all_refs),
+                "source_ref_count_included": len(included_refs),
+                "source_refs_truncated": len(included_refs) < len(all_refs),
+                "offline_only": True,
+                "reason": "Stress review declares an observed defect; injected only for offline backward taint attribution.",
+            },
+        }
+    )
+
+
+def review_evidence_refs(review: JsonDict) -> List[str]:
+    refs: List[str] = []
+    for field in ("mechanism_evidence_found", "evidence_found"):
+        value = review.get(field)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip()
+            if status and status not in ("found", "partial"):
+                continue
+            refs.extend(normalize_refs(item.get("record_refs")))
+    return dedupe(refs)
 
 
 def evidence_refs_by_required_name(value: Any) -> Dict[str, List[str]]:
@@ -94,6 +153,17 @@ def normalize_refs(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item)]
+
+
+def dedupe(values: List[str]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def slugify(value: str) -> str:

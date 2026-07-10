@@ -170,6 +170,64 @@ class TraceGraphTest(unittest.TestCase):
             ["record:missing_semantic_final_test_result", "record:missing_semantic_change_diff_semantics"],
         )
 
+    def test_review_root_cause_becomes_offline_observed_defect_start_ref(self):
+        trace = sample_trace()
+        review = {
+            "case_id": "unit-case",
+            "trace_sufficiency": "sufficient",
+            "case_effectiveness": "effective",
+            "ground_truth_root_cause": {
+                "component": "evidence_selection",
+                "failure_type": "stale_evidence_trusted",
+                "description": "The agent trusted stale evidence.",
+            },
+            "evidence_found": [
+                {"required": "conflict_fact_group", "status": "found", "record_refs": ["record:evidence_old"]},
+                {"required": "claim_direct_evidence_refs", "status": "found", "record_refs": ["record:claim_bad"]},
+            ],
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        graph = TraceGraph.from_trace(enriched)
+
+        self.assertIn("record:observed_defect_evidence_selection_stale_evidence_trusted", graph.nodes)
+        defect = graph.nodes["record:observed_defect_evidence_selection_stale_evidence_trusted"]
+        self.assertEqual(defect.event_type, "case.observed_defect")
+        self.assertEqual(defect.data["component"], "evidence_selection")
+        self.assertEqual(defect.data["failure_type"], "stale_evidence_trusted")
+        self.assertEqual(defect.source_refs, ["record:evidence_old", "record:claim_bad"])
+        self.assertEqual(graph.default_start_refs(), ["record:observed_defect_evidence_selection_stale_evidence_trusted"])
+        self.assertIn("record:evidence_old", graph.upstream_refs("record:observed_defect_evidence_selection_stale_evidence_trusted"))
+
+    def test_review_observed_defect_caps_broad_evidence_refs(self):
+        trace = sample_trace()
+        review = {
+            "case_id": "unit-case",
+            "ground_truth_root_cause": {
+                "component": "tool_error_handling",
+                "failure_type": "hallucinated_after_tool_failure",
+            },
+            "mechanism_evidence_found": [
+                {"required": "tool.error", "status": "found", "record_refs": ["record:evidence_old"]},
+            ],
+            "evidence_found": [
+                {
+                    "required": "broad_context",
+                    "status": "found",
+                    "record_refs": [f"record:broad_{index}" for index in range(80)],
+                }
+            ],
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        graph = TraceGraph.from_trace(enriched)
+        defect = graph.nodes["record:observed_defect_tool_error_handling_hallucinated_after_tool_failure"]
+
+        self.assertLessEqual(len(defect.source_refs), 24)
+        self.assertEqual(defect.source_refs[0], "record:evidence_old")
+        self.assertEqual(defect.data["source_ref_count_total"], 81)
+        self.assertEqual(defect.data["source_ref_count_included"], len(defect.source_refs))
+
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
     def test_backtracks_until_defect_introduction_node(self):
