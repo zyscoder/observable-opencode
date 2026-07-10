@@ -23,7 +23,15 @@ Return a single JSON object. No markdown.
 
 
 class ClaudeJudgeClient(JudgeClient):
-    def __init__(self, *, model: str = "", api_key_env: str = "ANTHROPIC_API_KEY", max_tokens: int = 1200):
+    def __init__(
+        self,
+        *,
+        model: str = "",
+        api_key_env: str = "ANTHROPIC_API_KEY",
+        base_url: str = "",
+        base_url_env: str = "ANTHROPIC_BASE_URL",
+        max_tokens: int = 4096,
+    ):
         try:
             from anthropic import Anthropic
         except ImportError as exc:
@@ -35,7 +43,11 @@ class ClaudeJudgeClient(JudgeClient):
         if not api_key:
             raise RuntimeError(f"Missing Claude API key. Set {api_key_env} before running trace attribution.")
         self.model = model or os.environ.get("CLAUDE_MODEL") or "claude-sonnet-4-5"
-        self.client = Anthropic(api_key=api_key)
+        self.base_url = base_url or os.environ.get(base_url_env) or ""
+        client_kwargs: Dict[str, Any] = {"api_key": api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
 
     def judge_node(

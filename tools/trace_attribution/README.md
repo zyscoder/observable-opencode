@@ -33,10 +33,20 @@ python3 -m trace_attribution \
   --objective "Find why the final answer quality was poor."
 ```
 
+For DeepSeek's Anthropic-compatible endpoint:
+
+```bash
+export ANTHROPIC_API_KEY="$DEEPSEEK_API_KEY"
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+export CLAUDE_MODEL="deepseek-v4-pro"
+```
+
 Optional:
 
 ```bash
 --start-ref record:responseclaim_claim_147_e7906af6
+--base-url https://api.deepseek.com/anthropic
+--judge-max-tokens 4096
 --max-depth 8
 --max-nodes 48
 --model claude-sonnet-4-5

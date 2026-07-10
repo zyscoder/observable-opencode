@@ -17,6 +17,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-ref", action="append", default=[], help="Trace ref to start from; repeatable")
     parser.add_argument("--model", default="", help="Claude model id; defaults to CLAUDE_MODEL or claude-sonnet-4-5")
     parser.add_argument("--api-key-env", default="ANTHROPIC_API_KEY")
+    parser.add_argument("--base-url", default="", help="Anthropic-compatible API base URL; defaults to ANTHROPIC_BASE_URL")
+    parser.add_argument("--base-url-env", default="ANTHROPIC_BASE_URL")
+    parser.add_argument(
+        "--judge-max-tokens",
+        type=int,
+        default=4096,
+        help="Max output tokens for each judge call; reasoning models may need extra room for JSON text.",
+    )
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--max-nodes", type=int, default=48)
     return parser.parse_args()
@@ -25,7 +33,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     graph = TraceGraph.from_file(Path(args.trace))
-    judge = ClaudeJudgeClient(model=args.model, api_key_env=args.api_key_env)
+    judge = ClaudeJudgeClient(
+        model=args.model,
+        api_key_env=args.api_key_env,
+        base_url=args.base_url,
+        base_url_env=args.base_url_env,
+        max_tokens=args.judge_max_tokens,
+    )
     report = BackwardTaintAnalyzer(judge=judge, max_depth=args.max_depth, max_nodes=args.max_nodes).analyze(
         graph,
         start_refs=args.start_ref or None,

@@ -1,9 +1,14 @@
 import json
+import os
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from trace_attribution.analyzer import BackwardTaintAnalyzer
+from trace_attribution.claude import ClaudeJudgeClient
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence
 
@@ -158,6 +163,30 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:evidence_old"])
         self.assertEqual(report.node_judgments["record:change_bad"].defect_type, "wrong_change")
         self.assertEqual(report.taint_paths[0], ["record:claim_bad", "record:change_bad", "record:evidence_old"])
+
+
+class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_passes_base_url_to_anthropic_compatible_client(self):
+        calls = []
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": "test-key",
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                },
+            ):
+                client = ClaudeJudgeClient()
+
+        self.assertEqual(client.base_url, "https://api.deepseek.com/anthropic")
+        self.assertEqual(client.max_tokens, 4096)
+        self.assertEqual(calls, [{"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic"}])
 
 
 if __name__ == "__main__":
