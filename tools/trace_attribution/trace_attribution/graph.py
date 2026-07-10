@@ -102,9 +102,13 @@ class TraceGraph:
         return [self.nodes[item] for item in self.upstream_refs(ref)[:limit] if item in self.nodes]
 
     def default_start_refs(self) -> List[str]:
-        quality_gaps = [ref for ref, node in self.nodes.items() if node.event_type == "case.quality_gap"]
-        if quality_gaps:
-            return dedupe(quality_gaps)
+        offline_defect_starts = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type in ("case.missing_semantic", "case.observed_defect", "case.quality_gap")
+        ]
+        if offline_defect_starts:
+            return dedupe(offline_defect_starts)
         starts: List[str] = []
         for ref, node in self.nodes.items():
             flags = node.data.get("quality_flags")

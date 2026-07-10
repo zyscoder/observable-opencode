@@ -94,6 +94,11 @@ export const WriteTool = Tool.define(
             metadata: {
               diagnostics,
               filepath,
+              diff,
+              filediff: {
+                file: filepath,
+                patch: diff,
+              },
               exists: exists,
             },
             output,

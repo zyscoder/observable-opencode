@@ -6,6 +6,8 @@ export const FORMAL_RECORD_TYPES = [
   "run.start",
   "case.completed",
   "case.failed",
+  "case.observed_defect",
+  "case.missing_semantic",
   "task.loop",
   "task.plan_state",
   "task.obligation",

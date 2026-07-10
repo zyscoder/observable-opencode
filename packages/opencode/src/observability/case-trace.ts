@@ -194,6 +194,8 @@ export type TraceVerificationRecord = {
   changed_production_refs?: string[]
   changed_docs_refs?: string[]
   verification_scope_risk_flags?: string[]
+  final_test_result?: Record<string, unknown>
+  coverage_semantics?: Record<string, unknown>
   metadata?: Record<string, unknown>
 }
 
@@ -226,6 +228,7 @@ export type TraceChangeRecord = {
   intent?: string
   diff?: TraceFieldSummary
   change_semantics?: TraceChangeSemantics
+  diff_semantics?: Record<string, unknown>
   quality_flags?: string[]
   source_refs?: string[]
   verification_refs?: string[]
@@ -514,6 +517,8 @@ export type CausalNodeKind =
   | "run.start"
   | "case.completed"
   | "case.failed"
+  | "case.observed_defect"
+  | "case.missing_semantic"
   | "task.loop"
   | "task.plan_state"
   | "task.obligation"
@@ -1245,6 +1250,60 @@ function inferredVerificationStatus(input: {
       : (input.explicitStatus ??
         (input.exitCode === undefined ? "unknown" : input.exitCode === 0 ? "passed" : "failed"))
   return { status, quality_flags: qualityFlags }
+}
+
+function finalTestResultSemantics(input: {
+  command?: string
+  exitCode?: number
+  status: TraceVerificationRecord["status"]
+  parsedFailures: TraceParsedFailure[]
+}) {
+  return omitUndefined({
+    command: input.command,
+    status: input.status,
+    exit_code: input.exitCode,
+    parsed_failure_count: input.parsedFailures.length,
+    first_failure: input.parsedFailures[0],
+    result_kind: isTestLikeCommand(input.command) ? "test_result" : "command_result",
+  })
+}
+
+function verificationCoverageSemantics(input: {
+  command?: string
+  changedTestRefs: string[]
+  changedProductionRefs: string[]
+  changedDocsRefs: string[]
+  riskFlags: string[]
+}) {
+  const command = input.command ?? ""
+  const executedScripts = dedupeStrings([
+    ...[...command.matchAll(/(?:node|bun)\s+([^\s;&|]+test[^\s;&|]*)/gi)].map((match) => match[1] ?? ""),
+    ...[...command.matchAll(/\bnpm\s+run\s+([A-Za-z0-9:_-]+)/g)].map((match) => `npm:${match[1]}`),
+    ...(command.includes("npm test") ? ["npm:test"] : []),
+    ...(command.includes("test:full") ? ["npm:test:full"] : []),
+  ].filter(Boolean))
+  const coveredRisks = new Set<string>()
+  if (/pricing|renewal|discount|quote/i.test(command)) coveredRisks.add("pricing_behavior")
+  if (/owner|ownership/i.test(command)) coveredRisks.add("ownership_metadata")
+  if (/quality|generic|hardcode|design/i.test(command)) coveredRisks.add("design_quality")
+  if (/\b(full|all|coverage)\b|test:full/i.test(command)) coveredRisks.add("full_regression")
+  if (isTestLikeCommand(command)) coveredRisks.add("regression_tests")
+  return omitUndefined({
+    command,
+    executed_scripts: executedScripts,
+    covered_risks: [...coveredRisks],
+    changed_test_refs: input.changedTestRefs,
+    changed_production_refs: input.changedProductionRefs,
+    changed_docs_refs: input.changedDocsRefs,
+    risk_flags: input.riskFlags,
+    scope_summary: [
+      executedScripts.length ? `executed ${executedScripts.join(", ")}` : undefined,
+      coveredRisks.size ? `covered ${[...coveredRisks].join(", ")}` : undefined,
+      input.riskFlags.length ? `risk flags: ${input.riskFlags.join(", ")}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("; "),
+  })
 }
 
 function isTestLikeCommand(command: string | undefined) {
@@ -2540,6 +2599,29 @@ function changeSemanticsFromDiff(diff: unknown): TraceChangeSemantics | undefine
     ...(riskFlags.size ? { risk_flags: [...riskFlags] } : {}),
     ...(summaryParts.length ? { summary: summaryParts.join("; ") } : {}),
   }
+}
+
+function diffSemanticsFromChangeSemantics(semantics: TraceChangeSemantics | undefined) {
+  if (!semantics) return undefined
+  const operationKinds = semantics.operation_kinds ?? []
+  const riskFlags = semantics.risk_flags ?? []
+  return omitUndefined({
+    changed_line_count: semantics.changed_line_count,
+    added_line_count: semantics.added_line_count,
+    removed_line_count: semantics.removed_line_count,
+    changed_symbols: semantics.touched_symbols ?? semantics.changed_identifiers,
+    changed_identifiers: semantics.changed_identifiers,
+    numeric_constant_changes: semantics.numeric_constant_changes,
+    operation_kinds: operationKinds,
+    risk_flags: riskFlags,
+    semantic_summary: [
+      operationKinds.length ? `operations: ${operationKinds.join(", ")}` : undefined,
+      riskFlags.length ? `risks: ${riskFlags.join(", ")}` : undefined,
+      semantics.summary,
+    ]
+      .filter(Boolean)
+      .join("; "),
+  })
 }
 
 function changeTargetRole(files: string[]) {
@@ -4954,6 +5036,19 @@ class ActiveCaseTrace {
       command: input.command,
     })
     const verificationScope = this.verificationScopeContext()
+    const finalTestResult = finalTestResultSemantics({
+      command: input.command,
+      exitCode,
+      status: statusInference.status,
+      parsedFailures: parsed,
+    })
+    const coverageSemantics = verificationCoverageSemantics({
+      command: input.command,
+      changedTestRefs: verificationScope.changedTestRefs,
+      changedProductionRefs: verificationScope.changedProductionRefs,
+      changedDocsRefs: verificationScope.changedDocsRefs,
+      riskFlags: verificationScope.riskFlags,
+    })
     const sourceLocations = dedupeSourceLocations(
       parsed
         .filter((failure) => failure.file)
@@ -4986,6 +5081,8 @@ class ActiveCaseTrace {
       changed_production_refs: verificationScope.changedProductionRefs,
       changed_docs_refs: verificationScope.changedDocsRefs,
       verification_scope_risk_flags: verificationScope.riskFlags,
+      final_test_result: finalTestResult,
+      coverage_semantics: coverageSemantics,
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
@@ -5010,6 +5107,8 @@ class ActiveCaseTrace {
         changed_production_refs: verification.changed_production_refs,
         changed_docs_refs: verification.changed_docs_refs,
         verification_scope_risk_flags: verification.verification_scope_risk_flags,
+        final_test_result: verification.final_test_result,
+        coverage_semantics: verification.coverage_semantics,
         parsed_failures: verification.parsed_failures,
         stdout: input.stdout,
         stderr: input.stderr,
@@ -5057,6 +5156,7 @@ class ActiveCaseTrace {
       role: targetRole,
       changedTestOracle,
     })
+    const diffSemantics = diffSemanticsFromChangeSemantics(changeSemantics)
     const qualityFlags = dedupeStrings([
       ...(input.quality_flags ?? []),
       ...(changedTestOracle ? ["test_oracle_changed"] : []),
@@ -5073,6 +5173,7 @@ class ActiveCaseTrace {
       intent: input.intent,
       diff: input.diff === undefined ? undefined : this.summarizeText(input.diff, "change.diff"),
       change_semantics: changeSemantics,
+      diff_semantics: diffSemantics,
       quality_flags: qualityFlags,
       source_refs: sourceRefs,
       verification_refs: input.verification_refs,
@@ -5095,6 +5196,7 @@ class ActiveCaseTrace {
         intent: input.intent,
         diff: input.diff,
         change_semantics: changeSemantics,
+        diff_semantics: diffSemantics,
         quality_flags: qualityFlags,
         source_refs: sourceRefs,
         verification_refs: input.verification_refs,
@@ -5329,7 +5431,7 @@ class ActiveCaseTrace {
         source_locations: sourceLocations,
         metadata,
       },
-      source_refs: dedupeStrings([...responseRecordSourceRefs, ...generationProvenance.refs]),
+      source_refs: responseRecordSourceRefs,
       source_locations: sourceLocations,
     })
     this.linkGenerationProvenanceToResponse({
@@ -6773,17 +6875,19 @@ class ActiveCaseTrace {
     const records = this.provenanceRecords()
     const dataflowEdges = this.provenanceDataflowEdges()
     const traceHealth = this.traceHealth(records)
+    const diagnosticRecords = this.caseDiagnosticRecords(traceHealth)
+    const allRecords = [...records, ...diagnosticRecords]
     const streamSummary = this.streamSummary()
     return {
       trace_version: TRACE_VERSION,
       manifest,
-      records,
+      records: allRecords,
       dataflow_edges: dataflowEdges,
       artifacts: this.artifacts,
       metrics: {
         spans: this.spans.size,
         events: this.events.length,
-        records: records.length,
+        records: allRecords.length,
         dataflow_edges: dataflowEdges.length,
         artifacts: this.artifacts.length,
         token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
@@ -6791,6 +6895,74 @@ class ActiveCaseTrace {
         trace_health: traceHealth,
       },
     }
+  }
+
+  private caseDiagnosticRecords(traceHealth: TraceHealthMetrics): ProvenanceRecord[] {
+    const records: ProvenanceRecord[] = []
+    const timestamp = nowIso()
+    const timeMs = Date.now() - this.startedAt
+    const missingVerification = traceHealth.issues.find((issue) => issue.kind === "missing_verification_after_change")
+    if (missingVerification) {
+      const missingID = "missing_semantic_final_test_result"
+      const sourceRefs = dedupeStrings(missingVerification.refs ?? [])
+      records.push({
+        record_id: missingID,
+        component: "trace",
+        event_type: "case.missing_semantic",
+        timestamp,
+        time_ms: timeMs,
+        title: "Missing final test result",
+        status: "error",
+        source_refs: sourceRefs,
+        data: {
+          semantic_name: "final_test_result",
+          gap_kind: "required_trace_semantic_missing",
+          reason: "No test-like verification command was recorded after repository changes.",
+          issue_kind: missingVerification.kind,
+          issue_refs: sourceRefs,
+        },
+      })
+      records.push({
+        record_id: "observed_defect_missing_verification_after_change",
+        component: "trace",
+        event_type: "case.observed_defect",
+        timestamp,
+        time_ms: timeMs,
+        title: "Observed defect: missing verification after change",
+        status: "error",
+        source_refs: dedupeStrings([`record:${missingID}`, ...sourceRefs]),
+        data: {
+          defect_type: "missing_verification_after_change",
+          component: "verification",
+          failure_type: "final_test_result_missing",
+          reason: missingVerification.message,
+          issue_kind: missingVerification.kind,
+          issue_refs: sourceRefs,
+        },
+      })
+    }
+    for (const issue of traceHealth.issues.filter((item) => item.kind === "verification_after_test_change")) {
+      const id = `observed_defect_${safeNodeIDPart(`${issue.kind}_${issue.record_id ?? records.length}`)}`
+      records.push({
+        record_id: id,
+        component: "trace",
+        event_type: "case.observed_defect",
+        timestamp,
+        time_ms: timeMs,
+        title: "Observed defect: verification after test change",
+        status: "error",
+        source_refs: dedupeStrings(issue.refs ?? []),
+        data: {
+          defect_type: "verification_after_test_change",
+          component: "verification",
+          failure_type: "verification_scope_risk",
+          reason: issue.message,
+          issue_kind: issue.kind,
+          issue_refs: issue.refs ?? [],
+        },
+      })
+    }
+    return records
   }
 
   private serverShutdownReason() {
@@ -7641,7 +7813,9 @@ class ActiveCaseTrace {
         severity: "warning",
         message: "Repository changes were recorded but no verification command was observed before finalization.",
         count: missingVerificationAfterChange.length,
-        refs: missingVerificationAfterChange.slice(0, 10).map((record) => `change:${record.record_id}`),
+        refs: missingVerificationAfterChange
+          .slice(0, 10)
+          .map((record) => `change:${record.data?.change_id ?? record.record_id}`),
       })
     }
     for (const record of verificationAfterTestChange.slice(0, 20)) {

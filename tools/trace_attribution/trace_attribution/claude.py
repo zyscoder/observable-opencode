@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .analyzer import JudgeClient
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
@@ -32,6 +32,7 @@ class ClaudeJudgeClient(JudgeClient):
         base_url_env: str = "ANTHROPIC_BASE_URL",
         max_tokens: int = 4096,
         repair_max_tokens: int = 1024,
+        timeout_seconds: Optional[float] = None,
     ):
         try:
             from anthropic import Anthropic
@@ -48,6 +49,9 @@ class ClaudeJudgeClient(JudgeClient):
         client_kwargs: Dict[str, Any] = {"api_key": api_key}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
+        timeout = timeout_seconds if timeout_seconds is not None else env_float("CLAUDE_TIMEOUT_SECONDS")
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
         self.repair_max_tokens = repair_max_tokens
@@ -197,3 +201,14 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     if not match:
         raise ValueError(f"Claude response did not contain a JSON object: {text[:200]}")
     return json.loads(match.group(0))
+
+
+def env_float(name: str) -> Optional[float]:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None

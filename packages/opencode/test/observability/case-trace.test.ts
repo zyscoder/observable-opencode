@@ -4045,6 +4045,18 @@ describe("case trace", () => {
       line: 11,
       column: 13,
     })
+    const provenance = JSON.parse(
+      await fs.readFile(path.join(dir, "failure-parse-case", "trace.json"), "utf8"),
+    ) as any
+    const verification = provenance.records.find((record: any) => record.event_type === "verification")
+    expect(verification.data.final_test_result).toMatchObject({
+      command: "node test/pricing.test.mjs",
+      status: "failed",
+      exit_code: 1,
+      parsed_failure_count: 1,
+    })
+    expect(verification.data.coverage_semantics.executed_scripts).toContain("test/pricing.test.mjs")
+    expect(verification.data.coverage_semantics.covered_risks).toContain("pricing_behavior")
   })
 
   test("marks verification as failed when failure output is masked by shell exit code", async () => {
@@ -4142,9 +4154,21 @@ describe("case trace", () => {
       await fs.readFile(path.join(dir, "missing-verification-case", "trace.json"), "utf8"),
     ) as any
     const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
+    const missingSemantic = trace.records.find(
+      (record: any) =>
+        record.event_type === "case.missing_semantic" && record.data.semantic_name === "final_test_result",
+    )
+    const observedDefect = trace.records.find(
+      (record: any) =>
+        record.event_type === "case.observed_defect" &&
+        record.data.defect_type === "missing_verification_after_change",
+    )
 
     expect(trace.metrics.trace_health.missing_verification_after_change).toBe(1)
     expect(issues).toContain("missing_verification_after_change")
+    expect(missingSemantic.data.reason).toContain("No test-like verification command")
+    expect(missingSemantic.source_refs).toEqual(expect.arrayContaining([expect.stringMatching(/^change:chg_1_/)]))
+    expect(observedDefect.source_refs).toContain(`record:${missingSemantic.record_id}`)
   })
 
   test("marks verification risk when test oracles were changed before tests passed", async () => {
@@ -4275,8 +4299,14 @@ describe("case trace", () => {
     expect(changeRecords[0].data.change_semantics.operation_kinds).toContain("numeric_constant_update")
     expect(changeRecords[0].data.change_semantics.risk_flags).toContain("numeric_constant_changed")
     expect(changeRecords[0].data.change_semantics.changed_identifiers).toContain("discount")
+    expect(changeRecords[0].data.diff_semantics.numeric_constant_changes).toContainEqual(
+      expect.objectContaining({ from: "0.2", to: "0.15" }),
+    )
+    expect(changeRecords[0].data.diff_semantics.changed_symbols).toContain("discount")
+    expect(changeRecords[0].data.diff_semantics.semantic_summary).toContain("numeric_constant_update")
     expect(changeRecords[1].data.change_semantics.operation_kinds).toContain("conditional_logic_change")
     expect(changeRecords[1].data.change_semantics.risk_flags).toContain("hardcode_candidate")
+    expect(changeRecords[1].data.diff_semantics.risk_flags).toContain("hardcode_candidate")
   })
 
   test("annotates semantic fact conflicts and active versus legacy applicability", async () => {

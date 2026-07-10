@@ -52,6 +52,7 @@ Optional:
 --start-ref record:responseclaim_claim_147_e7906af6
 --base-url https://api.deepseek.com/anthropic
 --judge-max-tokens 4096
+--judge-timeout-sec 60
 --max-depth 8
 --max-nodes 48
 --model claude-sonnet-4-5
@@ -81,6 +82,12 @@ The injected quality-gap records are not written back to the original trace and 
 fed back into opencode. They only give the offline analyzer a precise starting point for
 backward semantic taint analysis.
 
+Stress-case reviews that report `missing_semantics` also inject offline-only
+`case.missing_semantic` nodes. Runtime traces may additionally contain passive
+`case.observed_defect` / `case.missing_semantic` records for health findings such as
+"repository changed but no final test result was observed". These records are derived
+after the agent run and are never fed back into the agent.
+
 ## Trace Improvement Feedback
 
 `trace_improvement_report` is generated deterministically from the attribution graph and
@@ -97,6 +104,8 @@ judgments. It does not make extra model calls. Typical entries include:
   node that was not itself defective.
 - `unresolved_trace_refs`: a source ref or dataflow endpoint did not resolve to a trace
   node.
+- `judge_error`: the attribution judge timed out or failed on a node; the analyzer keeps
+  the node as a low-confidence boundary candidate and still writes a partial report.
 
 Use this report as the feedback loop between the reasoning module and semantic tracing:
 when attribution can only say "the defect is somewhere around LLM generation", the report

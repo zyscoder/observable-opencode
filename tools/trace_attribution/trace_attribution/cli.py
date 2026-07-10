@@ -23,6 +23,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default="", help="Anthropic-compatible API base URL; defaults to ANTHROPIC_BASE_URL")
     parser.add_argument("--base-url-env", default="ANTHROPIC_BASE_URL")
     parser.add_argument(
+        "--judge-timeout-sec",
+        type=float,
+        default=None,
+        help="HTTP timeout in seconds for each judge/repair request; defaults to CLAUDE_TIMEOUT_SECONDS or SDK default.",
+    )
+    parser.add_argument(
         "--judge-max-tokens",
         type=int,
         default=4096,
@@ -42,6 +48,7 @@ def main() -> int:
         base_url=args.base_url,
         base_url_env=args.base_url_env,
         max_tokens=args.judge_max_tokens,
+        timeout_seconds=args.judge_timeout_sec,
     )
     report = BackwardTaintAnalyzer(judge=judge, max_depth=args.max_depth, max_nodes=args.max_nodes).analyze(
         graph,

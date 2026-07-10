@@ -13,6 +13,30 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
         node = graph.nodes.get(root.node_ref)
         if not node:
             continue
+        if root.defect_type == "judge_error":
+            add_gap(
+                blocking_gaps,
+                gap_type="judge_error",
+                node=node,
+                why=(
+                    "The offline attribution judge failed or timed out on this node. "
+                    "The analyzer preserved a partial boundary candidate, but the root cause "
+                    "needs a smaller prompt, stricter timeout, or retry with more compact trace context."
+                ),
+                missing_semantic_fields=["judge_response", "completed_node_judgment"],
+                related_refs=[root.node_ref],
+                confidence=root.confidence,
+            )
+            add_recommendation(
+                recommendations,
+                component="attribution",
+                priority="high",
+                change=(
+                    "Use per-node timeouts, compact node prompts, partial report checkpoints, and a fallback "
+                    "non-LLM boundary judgment when the judge request fails."
+                ),
+                unblocks=["judge_error"],
+            )
         if root.confidence < 0.7:
             add_gap(
                 blocking_gaps,

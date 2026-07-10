@@ -46,7 +46,48 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
                 },
             }
         )
+    missing_semantics = review.get("missing_semantics") if isinstance(review.get("missing_semantics"), list) else []
+    evidence_by_name = evidence_refs_by_required_name(review.get("evidence_found"))
+    root_cause = review.get("ground_truth_root_cause") if isinstance(review.get("ground_truth_root_cause"), dict) else {}
+    for name in missing_semantics:
+        semantic_name = str(name or "").strip()
+        if not semantic_name:
+            continue
+        record_id = f"missing_semantic_{slugify(semantic_name)}"
+        if any(isinstance(record, dict) and record.get("record_id") == record_id for record in records):
+            continue
+        records.append(
+            {
+                "record_id": record_id,
+                "event_type": "case.missing_semantic",
+                "component": "evaluation",
+                "status": "warning",
+                "source_refs": evidence_by_name.get(semantic_name, []),
+                "data": {
+                    "case_id": review.get("case_id") or enriched.get("manifest", {}).get("case_id"),
+                    "semantic_name": semantic_name,
+                    "gap_kind": "required_trace_semantic_missing",
+                    "reason": f"Stress review did not find required trace semantic: {semantic_name}.",
+                    "ground_truth_component": root_cause.get("component"),
+                    "ground_truth_failure_type": root_cause.get("failure_type"),
+                },
+            }
+        )
     return enriched
+
+
+def evidence_refs_by_required_name(value: Any) -> Dict[str, List[str]]:
+    if not isinstance(value, list):
+        return {}
+    output: Dict[str, List[str]] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        required = str(item.get("required") or "").strip()
+        if not required:
+            continue
+        output[required] = normalize_refs(item.get("record_refs"))
+    return output
 
 
 def normalize_refs(value: Any) -> List[str]:

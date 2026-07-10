@@ -137,6 +137,39 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(graph.default_start_refs(), ["record:quality_gap_architecture_reasoning"])
         self.assertIn("record:claim_bad", graph.upstream_refs("record:quality_gap_architecture_reasoning"))
 
+    def test_review_missing_semantics_become_default_start_refs(self):
+        trace = sample_trace()
+        review = {
+            "case_id": "unit-case",
+            "missing_semantics": ["final_test_result", "change_diff_semantics"],
+            "evidence_found": [
+                {"required": "final_test_result", "status": "missing", "record_refs": []},
+                {
+                    "required": "change_diff_semantics",
+                    "status": "missing",
+                    "record_refs": ["record:change_bad"],
+                },
+            ],
+            "ground_truth_root_cause": {
+                "component": "verification",
+                "failure_type": "insufficient_test_scope",
+            },
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        graph = TraceGraph.from_trace(enriched)
+
+        self.assertIn("record:missing_semantic_final_test_result", graph.nodes)
+        self.assertIn("record:missing_semantic_change_diff_semantics", graph.nodes)
+        missing = graph.nodes["record:missing_semantic_change_diff_semantics"]
+        self.assertEqual(missing.event_type, "case.missing_semantic")
+        self.assertEqual(missing.data["semantic_name"], "change_diff_semantics")
+        self.assertEqual(missing.source_refs, ["record:change_bad"])
+        self.assertEqual(
+            graph.default_start_refs(),
+            ["record:missing_semantic_final_test_result", "record:missing_semantic_change_diff_semantics"],
+        )
+
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
     def test_backtracks_until_defect_introduction_node(self):
@@ -320,6 +353,83 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("answer_surface_root_cause", [gap["gap_type"] for gap in improvement["blocking_gaps"]])
         self.assertEqual(improvement["summary"]["analysis_confidence"], "limited")
 
+    def test_preserves_defective_boundary_when_upstream_is_nondefective(self):
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "quality_gap",
+                "component": "evaluation",
+                "event_type": "case.quality_gap",
+                "source_refs": ["record:claim_bad"],
+                "data": {
+                    "dimension": "solution_design",
+                    "missing_evidence": ["risk_assessment"],
+                },
+            }
+        )
+        fake = FakeJudge(
+            {
+                "record:quality_gap": NodeJudgment(
+                    node_ref="record:quality_gap",
+                    component="evaluation",
+                    event_type="case.quality_gap",
+                    has_defect=True,
+                    defect_type="missing_risk_assessment",
+                    defect_reason="The answer lacks risk assessment.",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:claim_bad",
+                            reason="The final claim did not include risk assessment.",
+                            confidence=0.9,
+                        )
+                    ],
+                    confidence=0.9,
+                ),
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=False,
+                    defect_reason="The claim is factually correct within its narrow scope.",
+                    confidence=0.8,
+                ),
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=4).analyze(
+            graph,
+            start_refs=["record:quality_gap"],
+            objective="Explain the solution design quality gap.",
+        )
+
+        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:quality_gap"])
+        self.assertEqual(report.root_causes[0].defect_type, "missing_risk_assessment")
+        self.assertEqual(report.taint_paths, [["record:quality_gap"]])
+        gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
+        self.assertIn("defective_node_points_to_nondefective_upstream", gap_types)
+
+    def test_judge_errors_become_partial_boundary_roots(self):
+        class ErrorJudge(FakeJudge):
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                raise TimeoutError("judge timed out")
+
+        graph = TraceGraph.from_trace(sample_trace())
+
+        report = BackwardTaintAnalyzer(judge=ErrorJudge({}), max_depth=4).analyze(
+            graph,
+            start_refs=["record:claim_bad"],
+            objective="Explain the final claim.",
+        )
+
+        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:claim_bad"])
+        self.assertEqual(report.root_causes[0].defect_type, "judge_error")
+        self.assertEqual(report.metadata["judge_error_count"], 1)
+        self.assertIn("record:claim_bad", report.metadata["judge_errors"][0]["node_ref"])
+        gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
+        self.assertIn("judge_error", gap_types)
+
 
 class ClaudeJudgeClientTest(unittest.TestCase):
     def test_passes_base_url_to_anthropic_compatible_client(self):
@@ -338,11 +448,14 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                     "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
                 },
             ):
-                client = ClaudeJudgeClient()
+                client = ClaudeJudgeClient(timeout_seconds=12)
 
         self.assertEqual(client.base_url, "https://api.deepseek.com/anthropic")
         self.assertEqual(client.max_tokens, 4096)
-        self.assertEqual(calls, [{"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic"}])
+        self.assertEqual(
+            calls,
+            [{"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "timeout": 12}],
+        )
 
     def test_quality_gap_prompt_treats_gap_as_defect_to_explain(self):
         prompt = build_judgment_prompt(

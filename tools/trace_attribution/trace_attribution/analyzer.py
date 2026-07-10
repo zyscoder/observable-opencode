@@ -43,6 +43,8 @@ class BackwardTaintAnalyzer:
         root_causes: Dict[str, RootCauseCandidate] = {}
         taint_paths: List[List[str]] = []
         unresolved_refs: List[str] = []
+        visited_paths: Dict[str, List[str]] = {}
+        judge_errors: List[Dict[str, str]] = []
 
         while queue and len(visited_order) < self.max_nodes:
             ref, path, depth = queue.popleft()
@@ -50,14 +52,34 @@ class BackwardTaintAnalyzer:
                 continue
             visited.add(ref)
             visited_order.append(ref)
+            visited_paths[ref] = path
             node = graph.nodes[ref]
             upstream_nodes = graph.upstream_nodes(ref)
-            judgment = self.judge.judge_node(
-                node=node,
-                upstream_nodes=upstream_nodes,
-                downstream_context=path,
-                objective=objective,
-            )
+            try:
+                judgment = self.judge.judge_node(
+                    node=node,
+                    upstream_nodes=upstream_nodes,
+                    downstream_context=path,
+                    objective=objective,
+                )
+            except Exception as exc:
+                judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
+                judgment = NodeJudgment(
+                    node_ref=ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=True,
+                    defect_type="judge_error",
+                    defect_reason=(
+                        "The attribution judge failed while evaluating this node, so the analyzer "
+                        "kept it as a partial boundary candidate instead of dropping the trace."
+                    ),
+                    influenced_by=[],
+                    is_root_cause=True,
+                    severity="unknown",
+                    confidence=0.1,
+                    model_notes=f"{type(exc).__name__}: {exc}",
+                )
             judgments[ref] = judgment
             if not judgment.has_defect:
                 continue
@@ -95,6 +117,34 @@ class BackwardTaintAnalyzer:
                 )
                 taint_paths.append(path)
 
+        for ref, judgment in list(judgments.items()):
+            if not judgment.has_defect or ref in root_causes:
+                continue
+            next_refs = self._resolve_influences(graph, judgment, ref)
+            if not next_refs:
+                continue
+            resolved = [item for item in next_refs if item in judgments]
+            if not resolved:
+                continue
+            if any(judgments[item].has_defect for item in resolved):
+                continue
+            node = graph.nodes.get(ref)
+            if not node:
+                continue
+            root_causes[ref] = RootCauseCandidate(
+                node_ref=ref,
+                component=node.component,
+                event_type=node.event_type,
+                defect_type=judgment.defect_type or "defect_boundary",
+                reason=(
+                    judgment.defect_reason
+                    + " Upstream refs were judged non-defective, so this node is preserved as the "
+                    "defect-introduction boundary for partial attribution."
+                ).strip(),
+                confidence=judgment.confidence,
+            )
+            taint_paths.append(visited_paths.get(ref, [ref]))
+
         report = AttributionReport(
             case_id=graph.case_id,
             objective=objective,
@@ -108,6 +158,8 @@ class BackwardTaintAnalyzer:
                 "analysis": "backward_semantic_taint",
                 "max_depth": self.max_depth,
                 "max_nodes": self.max_nodes,
+                "judge_error_count": len(judge_errors),
+                "judge_errors": judge_errors,
             },
         )
         return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))
