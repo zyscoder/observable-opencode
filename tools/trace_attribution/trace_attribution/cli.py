@@ -3,15 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 from .analyzer import BackwardTaintAnalyzer
 from .claude import ClaudeJudgeClient
 from .graph import TraceGraph
+from .quality_review import inject_quality_gap_records
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run backward semantic taint attribution on trace.json.")
     parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
+    parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
     parser.add_argument("--out", required=True, help="Path to write attribution JSON report")
     parser.add_argument("--objective", default="Find the root cause of the observed bad final result.")
     parser.add_argument("--start-ref", action="append", default=[], help="Trace ref to start from; repeatable")
@@ -32,7 +35,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    graph = TraceGraph.from_file(Path(args.trace))
+    graph = load_graph(Path(args.trace), Path(args.review) if args.review else None)
     judge = ClaudeJudgeClient(
         model=args.model,
         api_key_env=args.api_key_env,
@@ -50,6 +53,14 @@ def main() -> int:
     out.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(str(out))
     return 0
+
+
+def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGraph:
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    if review_path:
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        trace = inject_quality_gap_records(trace, review)
+    return TraceGraph.from_trace(trace)
 
 
 if __name__ == "__main__":

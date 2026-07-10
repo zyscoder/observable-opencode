@@ -44,6 +44,7 @@ export CLAUDE_MODEL="deepseek-v4-pro"
 Optional:
 
 ```bash
+--review /tmp/observable-opencode-loop-auto/reports/tool-failure-hallucination.trace-review.json
 --start-ref record:responseclaim_claim_147_e7906af6
 --base-url https://api.deepseek.com/anthropic
 --judge-max-tokens 4096
@@ -51,6 +52,30 @@ Optional:
 --max-nodes 48
 --model claude-sonnet-4-5
 ```
+
+## Quality Gap Attribution
+
+Stress-case reviews can include `quality_review.quality_gaps` for semantic-understanding
+cases that are not outright failures but still miss important reasoning. Pass the review
+file with `--review` to inject offline-only `case.quality_gap` nodes into the attribution
+graph:
+
+```bash
+node packages/opencode/test/observability/stress-cases/analyze-trace-sufficiency.mjs \
+  --traces /tmp/observable-opencode-loop2-quality/semantic-run/traces \
+  --out /tmp/observable-opencode-loop2-quality/semantic-run/reports
+
+PYTHONPATH=tools/trace_attribution \
+python3 -m trace_attribution \
+  --trace /tmp/observable-opencode-loop2-quality/semantic-run/traces/semantic-requirement-priority/trace.json \
+  --review /tmp/observable-opencode-loop2-quality/semantic-run/reports/semantic-requirement-priority.trace-review.json \
+  --out /tmp/observable-opencode-attribution/semantic-requirement-priority.attribution.json \
+  --objective "Find why the semantic quality score missed the target."
+```
+
+The injected quality-gap records are not written back to the original trace and are never
+fed back into opencode. They only give the offline analyzer a precise starting point for
+backward semantic taint analysis.
 
 ## Test
 

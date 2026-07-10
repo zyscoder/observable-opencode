@@ -5,14 +5,14 @@ import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { analyzeTraceDirectory } from "./analyze-trace-sufficiency.mjs"
-import { loadCases, reviewTraceSufficiency, summarizeReviews } from "./lib/stress-review.mjs"
+import { loadCases, reviewTraceSufficiency, scoreTraceQuality, summarizeReviews } from "./lib/stress-review.mjs"
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 
-test("stress cases define eight grounded root-cause scenarios with fixtures", () => {
+test("stress cases define grounded root-cause and semantic quality scenarios with fixtures", () => {
   const cases = loadCases(rootDir)
 
-  assert.equal(cases.length, 8)
+  assert.equal(cases.length, 11)
   assert.deepEqual(
     cases.map((item) => item.case_id),
     [
@@ -24,6 +24,9 @@ test("stress cases define eight grounded root-cause scenarios with fixtures", ()
       "insufficient-verification",
       "tool-failure-hallucination",
       "design-quality-regression",
+      "semantic-requirement-priority",
+      "semantic-architecture-boundary",
+      "semantic-verification-depth",
     ],
   )
 
@@ -39,6 +42,12 @@ test("stress cases define eight grounded root-cause scenarios with fixtures", ()
     assert.ok(item.sufficiency_questions.length >= 3, item.case_id)
     assert.ok(fs.existsSync(path.join(rootDir, item.fixture_dir, "package.json")), item.case_id)
     assert.ok(fs.existsSync(path.join(rootDir, item.fixture_dir, "opencode.json")), item.case_id)
+    if (item.category === "semantic_quality") {
+      assert.ok(Array.isArray(item.quality_rubric), item.case_id)
+      assert.ok(item.quality_rubric.length >= 3, item.case_id)
+      assert.equal(typeof item.target_score, "number", item.case_id)
+      assert.equal(typeof item.minimum_acceptable_score, "number", item.case_id)
+    }
   }
 })
 
@@ -88,6 +97,67 @@ test("trace summary handles missing trace reviews and subset analysis", () => {
   assert.deepEqual(reviews[0].missing_mechanisms, ["mcp.call"])
   assert.ok(summary.includes("| ignored-mcp-fact |"))
   assert.ok(!summary.includes("| wrong-implementation-target |"))
+})
+
+test("quality rubric scores semantic understanding gaps", () => {
+  const caseDefinition = {
+    case_id: "semantic-unit",
+    title: "Semantic unit",
+    category: "semantic_quality",
+    target_score: 80,
+    minimum_acceptable_score: 60,
+    quality_rubric: [
+      {
+        dimension: "requirement_understanding",
+        weight: 30,
+        evidence: ["semantic_fact_values", "claim_direct_evidence_refs"],
+      },
+      {
+        dimension: "architecture_reasoning",
+        weight: 30,
+        evidence: ["architecture_boundary_reasoning"],
+      },
+      {
+        dimension: "solution_tradeoff",
+        weight: 40,
+        evidence: ["alternative_solution_comparison", "risk_assessment"],
+      },
+    ],
+  }
+  const trace = {
+    records: [
+      {
+        record_id: "fact_req",
+        event_type: "evidence.semantic_fact",
+        component: "processor",
+        data: { structured_claim: { subject: "discount", predicate: "cap", value: "15%" } },
+      },
+      {
+        record_id: "claim_req",
+        event_type: "response.claim",
+        component: "result",
+        data: { text: "需求为 15% 上限。", direct_evidence_refs: ["evidence:fact_req"] },
+      },
+      {
+        record_id: "claim_arch",
+        event_type: "response.claim",
+        component: "result",
+        data: { text: "架构边界是 billing 负责报价，payment 不应修改。" },
+      },
+    ],
+    metrics: { trace_health: {} },
+  }
+
+  const quality = scoreTraceQuality({ caseDefinition, trace })
+
+  assert.equal(quality.total_score, 60)
+  assert.equal(quality.status, "meets_minimum")
+  assert.deepEqual(
+    quality.quality_gaps.map((item) => item.dimension),
+    ["solution_tradeoff"],
+  )
+  assert.deepEqual(quality.quality_gaps[0].gap_context_refs, ["record:claim_req", "record:claim_arch"])
+  assert.match(quality.attribution_objective, /solution_tradeoff/)
 })
 
 test("stress runner supports explicit multi-step HTTP flows for compaction scenarios", async () => {

@@ -31,6 +31,7 @@ class ClaudeJudgeClient(JudgeClient):
         base_url: str = "",
         base_url_env: str = "ANTHROPIC_BASE_URL",
         max_tokens: int = 4096,
+        repair_max_tokens: int = 1024,
     ):
         try:
             from anthropic import Anthropic
@@ -49,6 +50,7 @@ class ClaudeJudgeClient(JudgeClient):
             client_kwargs["base_url"] = self.base_url
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
+        self.repair_max_tokens = repair_max_tokens
 
     def judge_node(
         self,
@@ -72,8 +74,64 @@ class ClaudeJudgeClient(JudgeClient):
             messages=[{"role": "user", "content": prompt}],
         )
         text = response_text(response)
-        payload = parse_json_object(text)
+        try:
+            payload = parse_json_object(text)
+        except ValueError:
+            payload = self._repair_json_response(text=text, node=node)
         return judgment_from_dict(payload, node)
+
+    def _repair_json_response(self, *, text: str, node: TraceNode) -> Dict[str, Any]:
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.repair_max_tokens,
+            temperature=0,
+            system=(
+                "You repair malformed JSON emitted by an offline trace attribution reviewer. "
+                "Return exactly one valid compact JSON object and no markdown. "
+                "Do not introduce new trace facts."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": stable_json(
+                        {
+                            "malformed_output": text[:8000],
+                            "fallback_node": {
+                                "node_ref": node.ref,
+                                "component": node.component,
+                                "event_type": node.event_type,
+                            },
+                            "required_fields": [
+                                "node_ref",
+                                "component",
+                                "event_type",
+                                "has_defect",
+                                "defect_type",
+                                "defect_reason",
+                                "influenced_by",
+                                "is_root_cause",
+                                "severity",
+                                "confidence",
+                                "model_notes",
+                            ],
+                            "repair_rules": [
+                                "Preserve any clear judgment already present in malformed_output.",
+                                "If a field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
+                                "Use fallback_node values for node_ref, component, and event_type when missing.",
+                            ],
+                        }
+                    ),
+                }
+            ],
+        )
+        repaired = response_text(response)
+        try:
+            return parse_json_object(repaired)
+        except ValueError as exc:
+            raise ValueError(
+                "Claude response did not contain a valid JSON object after repair. "
+                f"Original: {text[:200]} Repaired: {repaired[:200]}"
+            ) from exc
 
 
 def build_judgment_prompt(
@@ -108,6 +166,8 @@ def build_judgment_prompt(
         "upstream_nodes": [item.compact(max_chars=1200) for item in upstream_nodes],
         "downstream_taint_path": downstream_context,
         "rules": [
+            "If current_node.event_type is case.quality_gap, treat the quality gap as the defect to explain; do not answer that the evaluator itself is non-defective.",
+            "For case.quality_gap, use missing_evidence, score, max_score, and upstream_nodes to decide which upstream component most likely introduced the quality gap.",
             "If the current node has no relevant semantic defect, set has_defect=false and influenced_by=[].",
             "If the current node is defective because upstream semantics are already defective, list only those upstream refs.",
             "If the current node first introduces the defect, set influenced_by=[] and is_root_cause=true.",

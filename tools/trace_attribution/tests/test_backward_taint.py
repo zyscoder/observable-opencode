@@ -8,9 +8,11 @@ from unittest import mock
 from pathlib import Path
 
 from trace_attribution.analyzer import BackwardTaintAnalyzer
-from trace_attribution.claude import ClaudeJudgeClient
+from trace_attribution.claude import ClaudeJudgeClient, build_judgment_prompt
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence
+from trace_attribution.models import TraceNode
+from trace_attribution.quality_review import inject_quality_gap_records
 
 
 class FakeJudge:
@@ -105,6 +107,35 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(graph.case_id, "unit-case")
         self.assertEqual(graph.nodes["record:evidence_old"].event_type, "evidence.semantic_fact")
 
+    def test_quality_review_gaps_become_default_start_refs(self):
+        trace = sample_trace()
+        review = {
+            "case_id": "unit-case",
+            "quality_review": {
+                "total_score": 55,
+                "target_score": 80,
+                "quality_gaps": [
+                    {
+                        "dimension": "architecture_reasoning",
+                        "score": 5,
+                        "max_score": 20,
+                        "missing_evidence": ["architecture_boundary_reasoning"],
+                        "record_refs": ["record:claim_bad"],
+                    }
+                ],
+            },
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        graph = TraceGraph.from_trace(enriched)
+
+        self.assertIn("record:quality_gap_architecture_reasoning", graph.nodes)
+        gap = graph.nodes["record:quality_gap_architecture_reasoning"]
+        self.assertEqual(gap.data["gap_kind"], "quality_dimension_under_target")
+        self.assertEqual(gap.data["score_ratio"], 0.25)
+        self.assertEqual(graph.default_start_refs(), ["record:quality_gap_architecture_reasoning"])
+        self.assertIn("record:claim_bad", graph.upstream_refs("record:quality_gap_architecture_reasoning"))
+
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
     def test_backtracks_until_defect_introduction_node(self):
@@ -187,6 +218,90 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertEqual(client.base_url, "https://api.deepseek.com/anthropic")
         self.assertEqual(client.max_tokens, 4096)
         self.assertEqual(calls, [{"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic"}])
+
+    def test_quality_gap_prompt_treats_gap_as_defect_to_explain(self):
+        prompt = build_judgment_prompt(
+            node=TraceNode(
+                ref="record:quality_gap_solution_design",
+                record_id="quality_gap_solution_design",
+                component="evaluation",
+                event_type="case.quality_gap",
+                data={
+                    "dimension": "solution_design",
+                    "missing_evidence": ["risk_assessment"],
+                    "score": 17,
+                    "max_score": 25,
+                },
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:quality_gap_solution_design"],
+            objective="Explain the quality gap.",
+        )
+
+        self.assertIn("case.quality_gap", prompt)
+        self.assertIn("treat the quality gap as the defect to explain", prompt)
+
+    def test_repairs_malformed_json_judgment_once(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return types.SimpleNamespace(
+                        content=[
+                            types.SimpleNamespace(
+                                text='{"has_defect": true, "defect_type": "missing_risk", "defect_reason": "truncated"'
+                            )
+                        ]
+                    )
+                return types.SimpleNamespace(
+                    content=[
+                        types.SimpleNamespace(
+                            text=json.dumps(
+                                {
+                                    "node_ref": "record:quality_gap_solution_design",
+                                    "component": "evaluation",
+                                    "event_type": "case.quality_gap",
+                                    "has_defect": True,
+                                    "defect_type": "missing_risk",
+                                    "defect_reason": "The response omitted risk assessment.",
+                                    "influenced_by": [],
+                                    "is_root_cause": True,
+                                    "severity": "medium",
+                                    "confidence": 0.7,
+                                    "model_notes": "repaired from malformed output",
+                                }
+                            )
+                        )
+                    ]
+                )
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+
+        judgment = client.judge_node(
+            node=TraceNode(
+                ref="record:quality_gap_solution_design",
+                record_id="quality_gap_solution_design",
+                component="evaluation",
+                event_type="case.quality_gap",
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:quality_gap_solution_design"],
+            objective="Explain the quality gap.",
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(judgment.has_defect)
+        self.assertEqual(judgment.defect_type, "missing_risk")
+        self.assertEqual(judgment.model_notes, "repaired from malformed output")
 
 
 if __name__ == "__main__":

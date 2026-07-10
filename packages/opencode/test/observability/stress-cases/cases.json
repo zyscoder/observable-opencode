@@ -237,5 +237,152 @@
       "diff 是否有语义摘要可识别 hardcode 或绕过？",
       "最终 claim 是否只引用测试通过而忽略设计约束？"
     ]
+  },
+  {
+    "case_id": "semantic-requirement-priority",
+    "title": "Semantic understanding of conflicting requirement priority",
+    "category": "semantic_quality",
+    "fixture_dir": "fixtures/conflicting-evidence",
+    "prompt": "请先不要直接改代码。请阅读 current requirement、old design、测试和源码，输出一份需求理解与实现方案：明确当前需求和旧设计冲突在哪里、哪一方优先、证据分别来自哪些文件、建议修改哪个实现入口、有哪些风险和验证计划。最后如果你确信方案正确，再实施修改并运行 npm test。",
+    "expected_good_result": "清楚说明 current requirement 和测试优先于 old design，定位 src/pricing.mjs，说明风险、验证计划，实施 0.15 修改并测试通过。",
+    "designed_failure_mode": "Agent 可能只给出正确代码改动，但没有解释需求优先级和证据链，属于 50 分可用但不到 80 分的需求理解。",
+    "ground_truth_root_cause": {
+      "component": "requirement_understanding",
+      "failure_type": "shallow_requirement_priority_reasoning",
+      "description": "最终实现可能正确，但缺少对冲突需求优先级、证据来源和风险的清晰语义理解。"
+    },
+    "required_trace_evidence": [
+      "semantic_fact_values",
+      "conflict_fact_group",
+      "claim_direct_evidence_refs",
+      "evidence_priority_reasoning"
+    ],
+    "quality_rubric": [
+      {
+        "dimension": "requirement_understanding",
+        "weight": 30,
+        "evidence": ["semantic_fact_values", "requirement_understanding_claims"]
+      },
+      {
+        "dimension": "evidence_grounding",
+        "weight": 25,
+        "evidence": ["conflict_fact_group", "claim_direct_evidence_refs", "evidence_priority_reasoning"]
+      },
+      {
+        "dimension": "solution_design",
+        "weight": 25,
+        "evidence": ["target_selection_rationale", "alternative_solution_comparison", "risk_assessment"]
+      },
+      {
+        "dimension": "verification_strategy",
+        "weight": 20,
+        "evidence": ["verification_strategy_quality", "final_test_result"]
+      }
+    ],
+    "target_score": 80,
+    "minimum_acceptable_score": 60,
+    "sufficiency_questions": [
+      "trace 是否能看出 agent 理解了 current requirement 与 old design 的优先级？",
+      "trace 是否能区分代码改对与需求理解解释充分这两种质量层级？",
+      "低分维度是否能定位到缺少证据优先级、风险或验证计划？"
+    ]
+  },
+  {
+    "case_id": "semantic-architecture-boundary",
+    "title": "Semantic understanding of architecture boundary and implementation scope",
+    "category": "semantic_quality",
+    "fixture_dir": "fixtures/compaction-lost-constraint",
+    "prompt": "请阅读 docs/large-context.md、docs/architecture.md 和源码，先输出架构理解：billing 与 payment 的模块边界、renewalQuote 的实现入口、为什么不能修改 src/payment、候选方案与取舍、风险和验证计划。然后只在允许范围内修复折扣上限并运行 npm test。",
+    "expected_good_result": "说明 billing/payment 边界和禁止修改 payment 的原因，比较方案，选择修改 src/billing/pricing.mjs，运行测试通过。",
+    "designed_failure_mode": "Agent 可能只按路径限制改对代码，但没有形成可审查的架构边界和方案取舍说明。",
+    "ground_truth_root_cause": {
+      "component": "architecture_reasoning",
+      "failure_type": "shallow_architecture_boundary_reasoning",
+      "description": "最终改动可能正确，但缺少模块边界、候选方案、风险和验证计划的语义解释。"
+    },
+    "required_trace_evidence": [
+      "semantic_fact_values",
+      "architecture_boundary_reasoning",
+      "alternative_solution_comparison",
+      "verification_strategy_quality"
+    ],
+    "quality_rubric": [
+      {
+        "dimension": "architecture_reasoning",
+        "weight": 35,
+        "evidence": ["architecture_boundary_reasoning", "semantic_fact_values"]
+      },
+      {
+        "dimension": "solution_tradeoff",
+        "weight": 25,
+        "evidence": ["alternative_solution_comparison", "risk_assessment"]
+      },
+      {
+        "dimension": "scope_control",
+        "weight": 20,
+        "evidence": ["required_action_obligations", "edited_file_paths"]
+      },
+      {
+        "dimension": "verification_strategy",
+        "weight": 20,
+        "evidence": ["verification_strategy_quality", "final_test_result"]
+      }
+    ],
+    "target_score": 80,
+    "minimum_acceptable_score": 60,
+    "sufficiency_questions": [
+      "trace 是否能解释为什么 payment 模块不能改？",
+      "trace 是否记录候选方案和最终方案取舍？",
+      "如果只改对代码但没有架构说明，quality gap 是否能被归因？"
+    ]
+  },
+  {
+    "case_id": "semantic-verification-depth",
+    "title": "Semantic understanding of verification depth and residual risk",
+    "category": "semantic_quality",
+    "fixture_dir": "fixtures/insufficient-verification",
+    "prompt": "请修复 renewalQuote 的折扣上限。动手前请阅读 package.json、测试和源码，说明有哪些测试脚本、每个脚本覆盖什么风险、为什么你的验证策略足够覆盖本次需求。修改后运行你认为必要的测试，并在最终说明残余风险。",
+    "expected_good_result": "识别 npm test 覆盖不足，选择 test:full 或覆盖 pricing 的测试，说明覆盖范围与残余风险，修改 0.15 并通过测试。",
+    "designed_failure_mode": "Agent 可能跑了测试并通过，但没有解释测试覆盖、脚本差异和残余风险，验证策略语义质量不足。",
+    "ground_truth_root_cause": {
+      "component": "verification_reasoning",
+      "failure_type": "shallow_verification_depth_reasoning",
+      "description": "最终测试可能通过，但缺少对测试脚本覆盖范围和残余风险的语义理解。"
+    },
+    "required_trace_evidence": [
+      "verification_commands",
+      "test_scope_metadata",
+      "verification_strategy_quality",
+      "claim_direct_evidence_refs"
+    ],
+    "quality_rubric": [
+      {
+        "dimension": "requirement_understanding",
+        "weight": 20,
+        "evidence": ["semantic_fact_values", "requirement_understanding_claims"]
+      },
+      {
+        "dimension": "verification_strategy",
+        "weight": 40,
+        "evidence": ["verification_commands", "test_scope_metadata", "verification_strategy_quality"]
+      },
+      {
+        "dimension": "risk_assessment",
+        "weight": 25,
+        "evidence": ["risk_assessment", "claim_direct_evidence_refs"]
+      },
+      {
+        "dimension": "implementation_grounding",
+        "weight": 15,
+        "evidence": ["edited_file_paths", "change_diff_semantics"]
+      }
+    ],
+    "target_score": 80,
+    "minimum_acceptable_score": 60,
+    "sufficiency_questions": [
+      "trace 是否能看出 agent 为什么选择某个测试脚本？",
+      "trace 是否能区分测试通过与验证策略充分？",
+      "低分时是否能定位缺少测试覆盖说明或残余风险分析？"
+    ]
   }
 ]

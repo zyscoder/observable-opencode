@@ -33,6 +33,7 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
   const missingMechanisms = mechanismFound.filter((item) => item.status === "missing").map((item) => item.required)
   const caseEffectiveness = missingMechanisms.length ? "ineffective" : "effective"
   const noisy = detectNoisySemantics(trace)
+  const qualityReview = scoreTraceQuality({ caseDefinition, trace })
 
   return {
     case_id: caseDefinition.case_id,
@@ -47,7 +48,59 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
     missing_semantics: missingSemantics,
     missing_mechanisms: missingMechanisms,
     redundant_or_noisy_semantics: noisy,
+    quality_review: qualityReview,
     recommended_trace_changes: recommendTraceChanges(missingSemantics, missingMechanisms),
+  }
+}
+
+export function scoreTraceQuality({ caseDefinition, trace }) {
+  const rubric = Array.isArray(caseDefinition.quality_rubric) ? caseDefinition.quality_rubric : []
+  if (!rubric.length) return undefined
+  const dimensions = rubric.map((item) => {
+    const evidence = Array.isArray(item.evidence) ? item.evidence.map(String).filter(Boolean) : []
+    const found = evidence.map((name) => {
+      const refs = detectEvidence(name, trace)
+      return {
+        required: name,
+        status: refs.length ? "found" : "missing",
+        record_refs: refs,
+      }
+    })
+    const foundCount = found.filter((entry) => entry.status === "found").length
+    const ratio = evidence.length ? foundCount / evidence.length : 0
+    const maxScore = Number(item.weight ?? 0)
+    const score = Math.round(maxScore * ratio)
+    return {
+      dimension: String(item.dimension ?? "unknown"),
+      score,
+      max_score: maxScore,
+      weight: maxScore,
+      evidence_found: found,
+      missing_evidence: found.filter((entry) => entry.status === "missing").map((entry) => entry.required),
+      record_refs: dedupe(found.flatMap((entry) => entry.record_refs)),
+      gap_context_refs: qualityGapContextRefs(trace, String(item.dimension ?? "unknown")),
+    }
+  })
+  const totalScore = dimensions.reduce((sum, item) => sum + item.score, 0)
+  const targetScore = Number(caseDefinition.target_score ?? 80)
+  const minimumAcceptableScore = Number(caseDefinition.minimum_acceptable_score ?? 60)
+  const qualityGaps = dimensions.filter((item) => item.score < item.max_score)
+  const status =
+    totalScore >= targetScore
+      ? "meets_target"
+      : totalScore >= minimumAcceptableScore
+        ? "meets_minimum"
+        : "below_minimum"
+  return {
+    total_score: totalScore,
+    target_score: targetScore,
+    minimum_acceptable_score: minimumAcceptableScore,
+    status,
+    dimensions,
+    quality_gaps: qualityGaps,
+    attribution_objective: qualityGaps.length
+      ? `Find why quality dimensions underperformed: ${qualityGaps.map((item) => item.dimension).join(", ")}.`
+      : "No major quality gap found; explain the successful semantic understanding chain.",
   }
 }
 
@@ -67,14 +120,15 @@ export function summarizeReviews(reviews) {
     `- effective cases: ${effectivenessCounts.effective}`,
     `- ineffective cases: ${effectivenessCounts.ineffective}`,
     "",
-    "| Case | Root Cause | Sufficiency | Effectiveness | Missing Semantics | Missing Mechanisms |",
-    "|---|---|---|---|---|---|",
+    "| Case | Root Cause | Sufficiency | Effectiveness | Quality | Missing Semantics | Missing Mechanisms |",
+    "|---|---|---|---|---|---|---|",
   ]
   for (const review of reviews) {
     const missingSemantics = Array.isArray(review.missing_semantics) ? review.missing_semantics : []
     const missingMechanisms = Array.isArray(review.missing_mechanisms) ? review.missing_mechanisms : []
+    const quality = review.quality_review ? `${review.quality_review.total_score}/${review.quality_review.target_score}` : "-"
     lines.push(
-      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness ?? "ineffective"} | ${missingSemantics.join(", ") || "-"} | ${missingMechanisms.join(", ") || "-"} |`,
+      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness ?? "ineffective"} | ${quality} | ${missingSemantics.join(", ") || "-"} | ${missingMechanisms.join(", ") || "-"} |`,
     )
   }
   lines.push("")
@@ -253,6 +307,51 @@ function detectEvidence(name, trace) {
             ["hardcode_candidate", "test_fixture_value_added", "test_coupling_candidate"].includes(flag),
           ) || hasAny(record, ["hardcode", "bypass", "violat", "architecture", "constraint"]),
       ),
+    requirement_understanding_claims: (records) =>
+      records.filter(
+        (record) =>
+          (record.event_type === "response.claim" ||
+            record.event_type === "evidence.semantic_fact" ||
+            record.event_type === "decision") &&
+          hasAny(record, ["requirement", "需求", "constraint", "约束", "acceptance", "验收", "15%", "0.15"]),
+      ),
+    evidence_priority_reasoning: (records, fullTrace) => {
+      const conflictRefs = detectors.conflict_fact_group(records, fullTrace)
+      if (!conflictRefs.length) return []
+      return records.filter(
+        (record) =>
+          (record.event_type === "response.claim" || record.event_type === "decision") &&
+          hasAny(record, ["current", "当前", "old", "旧", "stale", "废弃", "priority", "优先", "supersede", "覆盖"]),
+      )
+    },
+    architecture_boundary_reasoning: (records) =>
+      records.filter(
+        (record) =>
+          (record.event_type === "response.claim" ||
+            record.event_type === "evidence.semantic_fact" ||
+            record.event_type === "decision" ||
+            record.event_type === "design.record") &&
+          hasAny(record, ["architecture", "架构", "boundary", "边界", "module", "模块", "src/billing", "src/payment"]),
+      ),
+    alternative_solution_comparison: (records) =>
+      records.filter(
+        (record) =>
+          (record.event_type === "response.claim" || record.event_type === "decision" || record.event_type === "design.record") &&
+          hasAny(record, ["alternative", "option", "tradeoff", "方案", "取舍", "比较", "选择"]),
+      ),
+    risk_assessment: (records) =>
+      records.filter(
+        (record) =>
+          (record.event_type === "response.claim" || record.event_type === "decision" || record.event_type === "design.record") &&
+          hasAny(record, ["risk", "风险", "impact", "影响", "assumption", "假设", "regression", "回归"]),
+      ),
+    verification_strategy_quality: (records) =>
+      records.filter(
+        (record) =>
+          record.event_type === "verification" ||
+          ((record.event_type === "response.claim" || record.event_type === "decision") &&
+            hasAny(record, ["test:full", "test:quality", "coverage", "覆盖", "verification", "验证", "npm test"])),
+      ),
   }
   const records = Array.isArray(trace?.records) ? trace.records : []
   const detector = detectors[name] ?? (() => [])
@@ -277,6 +376,17 @@ function semanticRiskFlags(record) {
   return Array.isArray(flags) ? flags.map(String) : []
 }
 
+function dedupe(items) {
+  const seen = new Set()
+  const result = []
+  for (const item of items) {
+    if (seen.has(item)) continue
+    seen.add(item)
+    result.push(item)
+  }
+  return result
+}
+
 function detectNoisySemantics(trace) {
   const noisy = []
   const health = trace?.metrics?.trace_health ?? {}
@@ -289,6 +399,27 @@ function detectNoisySemantics(trace) {
   }
   if (hasCancelledAfterCompletedCase(trace)) noisy.push("cancelled_after_case_completion")
   return noisy
+}
+
+function qualityGapContextRefs(trace, dimension) {
+  const records = Array.isArray(trace?.records) ? trace.records : []
+  const dimensionText = String(dimension).toLowerCase()
+  const answerBearing = records.filter((record) =>
+    ["response.claim", "response.output", "design.record"].includes(record.event_type),
+  )
+  if (answerBearing.length > 0) return answerBearing.slice(-8).map((record) => recordRef(record))
+
+  const fallbackDecisionRefs = records.filter((record) => {
+    if (["response.claim", "response.output", "design.record"].includes(record.event_type)) return true
+    if (record.event_type !== "decision") return false
+    if (dimensionText.includes("verification")) return hasAny(record, ["verification", "test", "npm"])
+    if (dimensionText.includes("architecture")) return hasAny(record, ["architecture", "boundary", "module", "src/"])
+    if (dimensionText.includes("solution") || dimensionText.includes("risk")) {
+      return hasAny(record, ["solution", "design", "方案", "tradeoff", "risk", "风险"])
+    }
+    return false
+  })
+  return fallbackDecisionRefs.slice(-8).map((record) => recordRef(record))
 }
 
 function hasBroadLegacyContextRefs(trace) {

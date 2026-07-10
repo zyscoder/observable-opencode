@@ -34,6 +34,21 @@
       },
       "required_trace_evidence": { "type": "array", "items": { "type": "string" }, "minItems": 4 },
       "required_trace_mechanisms": { "type": "array", "items": { "type": "string" } },
+      "quality_rubric": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["dimension", "weight", "evidence"],
+          "properties": {
+            "dimension": { "type": "string" },
+            "weight": { "type": "number" },
+            "evidence": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "target_score": { "type": "number" },
+      "minimum_acceptable_score": { "type": "number" },
       "sufficiency_questions": { "type": "array", "items": { "type": "string" }, "minItems": 3 },
       "env": { "type": "object", "additionalProperties": { "type": "string" } },
       "flow": {
