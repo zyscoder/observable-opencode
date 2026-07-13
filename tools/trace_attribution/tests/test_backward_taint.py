@@ -670,6 +670,21 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                 "answer_surface_observed",
                 ["Changed src/billing/pricing.mjs", "direct_evidence_refs=2", "missing_tradeoff"],
             ),
+            (
+                {
+                    "record_id": "obligation",
+                    "component": "processor",
+                    "event_type": "task.obligation",
+                    "data": {
+                        "obligation_type": "path_scope_exclusion",
+                        "requirement_text": "Do not modify src/payment.",
+                        "target_path": "src/payment",
+                        "status": "fulfilled",
+                    },
+                },
+                "task_obligation_boundary",
+                ["path_scope_exclusion", "Do not modify src/payment", "status=fulfilled"],
+            ),
         ]
 
         for record, expected_defect_type, expected_fragments in cases:

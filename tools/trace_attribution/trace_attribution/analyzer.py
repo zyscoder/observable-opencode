@@ -327,6 +327,20 @@ def readable_semantic_fallback_judgment(*, node: TraceNode, error_text: str) -> 
             confidence=0.3,
             model_notes=error_text,
         )
+    if node.event_type == "task.obligation":
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type="task_obligation_boundary",
+            defect_reason=task_obligation_fallback_reason(node),
+            influenced_by=[],
+            is_root_cause=True,
+            severity="unknown",
+            confidence=0.35,
+            model_notes=error_text,
+        )
     return None
 
 
@@ -372,6 +386,21 @@ def response_surface_fallback_reason(node: TraceNode) -> str:
     context_refs = data.get("context_refs")
     if isinstance(context_refs, list):
         parts.append(f"context_refs={len(context_refs)}")
+    quality_flags = data.get("quality_flags")
+    if isinstance(quality_flags, list) and quality_flags:
+        parts.append(f"quality_flags={','.join(str(item) for item in quality_flags[:8])}")
+    return ". ".join(parts) + "."
+
+
+def task_obligation_fallback_reason(node: TraceNode) -> str:
+    data = node.data if isinstance(node.data, dict) else {}
+    parts = ["Task obligation boundary observed"]
+    for key in ("obligation_type", "status", "target_path"):
+        if key in data:
+            parts.append(f"{key}={data[key]}")
+    requirement_text = short_text(data.get("requirement_text") or "")
+    if requirement_text:
+        parts.append(f"requirement_text={requirement_text}")
     quality_flags = data.get("quality_flags")
     if isinstance(quality_flags, list) and quality_flags:
         parts.append(f"quality_flags={','.join(str(item) for item in quality_flags[:8])}")
