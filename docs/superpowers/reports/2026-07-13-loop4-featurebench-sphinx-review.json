@@ -1,0 +1,66 @@
+{
+  "case_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1",
+  "benchmark": {
+    "name": "FeatureBench Lite",
+    "dataset": "LiberCoders/FeatureBench",
+    "instance_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1"
+  },
+  "trace_sufficiency": "to_be_measured",
+  "case_effectiveness": "effective_open_source_semantic_implementation_case",
+  "observed_defects": [
+    {
+      "component": "feature_implementation",
+      "failure_type": "incorrect_declaration_parser_contract",
+      "description": "After restoring the official FeatureBench hidden C-domain test file, the independently runnable parser and AST subset passed 8 tests and failed 6. The implementation incorrectly requires struct, union, and enum declarations to repeat their keyword in the input even though objectType already supplies the directive type, and it accepts at least one invalid macro declaration. The remaining 21 setup errors are excluded because they are caused by a missing host dependency, not by the implementation.",
+      "record_refs": [
+        "record:decisionnode_dec_160_d3011460",
+        "record:decisionnode_dec_162_d4c07ef3",
+        "record:chgnode_chg_2_1ee08ab1"
+      ]
+    },
+    {
+      "component": "verification_strategy",
+      "failure_type": "self_test_does_not_match_interface_contract",
+      "description": "The agent's handwritten comprehensive smoke test used inputs such as 'struct MyStruct' and therefore failed to exercise the official parser contract where parse_declaration('struct', ...) receives a declaration body without a repeated directive keyword. It printed ALL TESTS PASSED and was treated as sufficient evidence despite not covering the hidden-test semantics that later produced six functional failures.",
+      "record_refs": [
+        "record:decisionnode_dec_360_0d63baad",
+        "record:decisionnode_dec_362_abbf250d",
+        "record:toolresult_call_00_u9lT7eb9H0EFRCR1AKHb9088"
+      ]
+    },
+    {
+      "component": "scope_management",
+      "failure_type": "host_compatibility_changes_outside_feature_scope",
+      "description": "The agent changed unrelated logging, datetime, and types compatibility code to accommodate the macOS host's Python 3.9 runtime, even though the benchmark repository targets a newer Python and the official harness provides its own environment. These edits increased blast radius without resolving the C-domain feature contract.",
+      "record_refs": [
+        "record:decisionnode_dec_346_dac72e2f",
+        "record:chgnode_chg_8_8d17dba4",
+        "record:chgnode_chg_13_398dab5b"
+      ]
+    }
+  ],
+  "host_evaluation": {
+    "status": "unofficial",
+    "fail_to_pass": {
+      "test_file": "tests/test_domains/test_domain_c.py",
+      "independently_runnable_subset": {
+        "passed": 8,
+        "failed": 6,
+        "total": 14,
+        "pass_rate": 0.5714285714
+      },
+      "environment_setup_errors": 21,
+      "environment_error_reason": "The host environment lacks roman_numerals; these setup errors are excluded from feature correctness."
+    },
+    "official_harness": {
+      "status": "not_run",
+      "reason": "docker_unavailable_on_host"
+    }
+  },
+  "run_termination": {
+    "status": "cancelled_after_stall",
+    "signal": "SIGTERM",
+    "trace_preserved": true,
+    "interpretation": "The signal-finalized case status is not itself treated as an agent semantic defect."
+  }
+}
