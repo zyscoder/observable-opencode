@@ -523,14 +523,14 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
 
         report = BackwardTaintAnalyzer(judge=ErrorJudge({}), max_depth=4).analyze(
             graph,
-            start_refs=["record:claim_bad"],
+            start_refs=["record:change_bad"],
             objective="Explain the final claim.",
         )
 
-        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:claim_bad"])
+        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:change_bad"])
         self.assertEqual(report.root_causes[0].defect_type, "judge_error")
         self.assertEqual(report.metadata["judge_error_count"], 1)
-        self.assertIn("record:claim_bad", report.metadata["judge_errors"][0]["node_ref"])
+        self.assertIn("record:change_bad", report.metadata["judge_errors"][0]["node_ref"])
         gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
         self.assertIn("judge_error", gap_types)
 
@@ -613,6 +613,80 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("read", root.reason)
         self.assertIn("File not found", root.reason)
         self.assertEqual(report.node_judgments["record:tool_error"].model_notes, "TimeoutError: judge timed out")
+
+    def test_common_semantic_nodes_use_readable_judge_error_fallbacks(self):
+        class ErrorJudge(FakeJudge):
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                raise TimeoutError("judge timed out")
+
+        cases = [
+            (
+                {
+                    "record_id": "compaction",
+                    "component": "context",
+                    "event_type": "context.compaction",
+                    "data": {
+                        "trigger": "manual",
+                        "model_id": "deepseek-v4-pro",
+                        "selected_tail_messages": 5,
+                        "output_summary": "Constraint: do not modify src/payment.",
+                    },
+                },
+                "context_compaction_boundary",
+                ["manual", "deepseek-v4-pro", "do not modify src/payment"],
+            ),
+            (
+                {
+                    "record_id": "fact",
+                    "component": "tool",
+                    "event_type": "evidence.semantic_fact",
+                    "data": {
+                        "canonical_subject": "renewalQuote",
+                        "semantic_role": "observed_pre_change_code",
+                        "structured_claim": {
+                            "subject": "renewalQuote",
+                            "predicate": "discount_cap",
+                            "value": "20 percent",
+                        },
+                        "conflict_group_id": "fact_conflict_1",
+                        "applicability_status": "unknown",
+                    },
+                },
+                "semantic_fact_boundary",
+                ["renewalQuote", "discount_cap", "fact_conflict_1"],
+            ),
+            (
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "text": "Changed src/billing/pricing.mjs and npm test passed.",
+                        "direct_evidence_refs": ["evidence:fact_1", "verification:ver_1"],
+                        "quality_flags": ["missing_tradeoff"],
+                    },
+                },
+                "answer_surface_observed",
+                ["Changed src/billing/pricing.mjs", "direct_evidence_refs=2", "missing_tradeoff"],
+            ),
+        ]
+
+        for record, expected_defect_type, expected_fragments in cases:
+            with self.subTest(record_id=record["record_id"]):
+                graph = TraceGraph.from_trace({"case_id": "fallback-case", "records": [record]})
+
+                report = BackwardTaintAnalyzer(judge=ErrorJudge({}), max_depth=2).analyze(
+                    graph,
+                    start_refs=[f"record:{record['record_id']}"],
+                    objective="Explain the observed semantic defect.",
+                )
+                root = report.root_causes[0]
+
+                self.assertEqual(root.defect_type, expected_defect_type)
+                self.assertGreater(root.confidence, 0.1)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, root.reason)
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):

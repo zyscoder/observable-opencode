@@ -231,6 +231,9 @@ def fallback_judgment_after_error(
             confidence=0.45,
             model_notes=error_text,
         )
+    semantic_fallback = readable_semantic_fallback_judgment(node=node, error_text=error_text)
+    if semantic_fallback:
+        return semantic_fallback
     return NodeJudgment(
         node_ref=node.ref,
         component=node.component,
@@ -279,3 +282,104 @@ def tool_error_fallback_reason(node: TraceNode) -> str:
     if handled_status:
         parts.append(f"handled_status={handled_status}")
     return ". ".join(parts) + "."
+
+
+def readable_semantic_fallback_judgment(*, node: TraceNode, error_text: str) -> Optional[NodeJudgment]:
+    if node.event_type == "context.compaction":
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type="context_compaction_boundary",
+            defect_reason=context_compaction_fallback_reason(node),
+            influenced_by=[],
+            is_root_cause=True,
+            severity="medium",
+            confidence=0.4,
+            model_notes=error_text,
+        )
+    if node.event_type in ("evidence.semantic_fact", "evidence.fact", "execution.observation"):
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type="semantic_fact_boundary",
+            defect_reason=semantic_fact_fallback_reason(node),
+            influenced_by=[],
+            is_root_cause=True,
+            severity="unknown",
+            confidence=0.35,
+            model_notes=error_text,
+        )
+    if node.event_type in ("response.claim", "response.output"):
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type="answer_surface_observed",
+            defect_reason=response_surface_fallback_reason(node),
+            influenced_by=[],
+            is_root_cause=True,
+            severity="unknown",
+            confidence=0.3,
+            model_notes=error_text,
+        )
+    return None
+
+
+def context_compaction_fallback_reason(node: TraceNode) -> str:
+    data = node.data if isinstance(node.data, dict) else {}
+    parts = ["Context compaction boundary observed"]
+    for key in ("trigger", "provider_id", "model_id", "selected_head_messages", "selected_tail_messages"):
+        if key in data:
+            parts.append(f"{key}={data[key]}")
+    summary = short_text(data.get("output_summary") or data.get("summary") or "")
+    if summary:
+        parts.append(f"output_summary={summary}")
+    return ". ".join(parts) + "."
+
+
+def semantic_fact_fallback_reason(node: TraceNode) -> str:
+    data = node.data if isinstance(node.data, dict) else {}
+    parts = ["Semantic evidence boundary observed"]
+    for key in ("canonical_subject", "semantic_role", "fact_scope", "applicability_status", "conflict_group_id"):
+        if key in data:
+            parts.append(f"{key}={data[key]}")
+    structured = data.get("structured_claim")
+    if isinstance(structured, dict):
+        subject = structured.get("subject")
+        predicate = structured.get("predicate")
+        value = structured.get("value")
+        parts.append(f"structured_claim={subject}.{predicate}={value}")
+    summary = short_text(data.get("summary") or data.get("claim") or "")
+    if summary:
+        parts.append(f"summary={summary}")
+    return ". ".join(parts) + "."
+
+
+def response_surface_fallback_reason(node: TraceNode) -> str:
+    data = node.data if isinstance(node.data, dict) else {}
+    parts = ["Answer surface boundary observed"]
+    text = short_text(data.get("text") or "")
+    if text:
+        parts.append(f"text={text}")
+    direct_refs = data.get("direct_evidence_refs")
+    if isinstance(direct_refs, list):
+        parts.append(f"direct_evidence_refs={len(direct_refs)}")
+    context_refs = data.get("context_refs")
+    if isinstance(context_refs, list):
+        parts.append(f"context_refs={len(context_refs)}")
+    quality_flags = data.get("quality_flags")
+    if isinstance(quality_flags, list) and quality_flags:
+        parts.append(f"quality_flags={','.join(str(item) for item in quality_flags[:8])}")
+    return ". ".join(parts) + "."
+
+
+def short_text(value: object, limit: int = 240) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
