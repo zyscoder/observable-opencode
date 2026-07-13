@@ -92,7 +92,20 @@ class TraceGraph:
 
     def upstream_refs(self, ref: str) -> List[str]:
         resolved = self.resolve(ref) or ref
-        return sorted(self._upstream.get(resolved, set()))
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        node = self.nodes.get(resolved)
+        if node:
+            for source_ref in node.source_refs:
+                source = resolve_ref(source_ref, self.aliases)
+                if source and source != resolved and source not in seen:
+                    ordered.append(source)
+                    seen.add(source)
+        for source in sorted(self._upstream.get(resolved, set())):
+            if source not in seen:
+                ordered.append(source)
+                seen.add(source)
+        return ordered
 
     def downstream_refs(self, ref: str) -> List[str]:
         resolved = self.resolve(ref) or ref

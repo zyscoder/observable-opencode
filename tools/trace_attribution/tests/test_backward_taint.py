@@ -104,6 +104,29 @@ class TraceGraphTest(unittest.TestCase):
         self.assertIn("record:change_bad", upstream)
         self.assertIn("record:evidence_old", upstream)
 
+    def test_upstream_refs_preserve_explicit_source_ref_order(self):
+        trace = {
+            "case_id": "order-case",
+            "records": [
+                {"record_id": "a", "component": "tool", "event_type": "tool.result"},
+                {"record_id": "b", "component": "tool", "event_type": "tool.result"},
+                {"record_id": "c", "component": "tool", "event_type": "tool.error"},
+                {
+                    "record_id": "target",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:c", "record:a"],
+                },
+            ],
+            "dataflow_edges": [
+                {"from": {"type": "record", "id": "b"}, "to": {"type": "record", "id": "target"}}
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.upstream_refs("record:target"), ["record:c", "record:a", "record:b"])
+
     def test_loads_trace_from_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace_file = Path(tmp) / "trace.json"
