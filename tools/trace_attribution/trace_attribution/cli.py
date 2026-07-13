@@ -16,6 +16,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
     parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
     parser.add_argument("--out", required=True, help="Path to write attribution JSON report")
+    parser.add_argument(
+        "--lineage-out",
+        default="",
+        help="Optional message-lineage JSON path; defaults next to --out as <stem>.message-lineage.json",
+    )
     parser.add_argument("--objective", default="Find the root cause of the observed bad final result.")
     parser.add_argument("--start-ref", action="append", default=[], help="Trace ref to start from; repeatable")
     parser.add_argument("--model", default="", help="Claude model id; defaults to CLAUDE_MODEL or claude-sonnet-4-5")
@@ -65,8 +70,20 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    lineage_out = lineage_output_path(out, args.lineage_out)
+    lineage_out.parent.mkdir(parents=True, exist_ok=True)
+    lineage_out.write_text(
+        json.dumps(graph.message_lineage, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(str(out))
     return 0
+
+
+def lineage_output_path(attribution_out: Path, configured: str) -> Path:
+    if configured:
+        return Path(configured)
+    return attribution_out.with_name(f"{attribution_out.stem}.message-lineage.json")
 
 
 def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGraph:

@@ -23,6 +23,10 @@ Each attribution JSON also includes `trace_improvement_report`. This report desc
 where backward taint analysis became weak or blocked, which trace facts were missing,
 and which component should emit richer semantics in the next trace iteration.
 
+The analyzer also reconstructs agent turns and message-context lineage from existing trace
+records and artifact payloads. Reconstruction is an offline passive sidecar: it does not
+replay requests, modify trace input, or feed findings back into the agent.
+
 ## Install
 
 ```bash
@@ -59,6 +63,7 @@ Optional:
 --judge-max-tokens 4096
 --judge-timeout-sec 3600
 --thinking-mode auto
+--lineage-out /tmp/observable-opencode-attribution/message-lineage.json
 --max-depth 8
 --max-nodes 48
 --model claude-sonnet-4-5
@@ -69,6 +74,17 @@ Each judge or JSON-repair request waits up to 3600 seconds by default. Override 
 `--thinking-mode auto` disables thinking on DeepSeek's Anthropic-compatible endpoint so the output
 budget is spent on the structured judgment; use `enabled` explicitly when deeper online reasoning is
 worth the additional latency and token cost.
+
+When `--lineage-out` is omitted, the CLI writes `<attribution-output-stem>.message-lineage.json`
+next to the attribution report. The lineage output contains normalized agent turns, prompt/context/
+compaction/LLM snapshots, and reconstructed edges. Edge evidence is classified as:
+
+- `confirmed` for explicit IDs or same-message deterministic relationships;
+- `content_matched` for exact normalized decision text retained in an LLM request artifact;
+- `temporal_inferred` for same-session ordering without direct identity or content proof.
+
+Only confirmed and content-matched edges are eligible for backward attribution. Temporal-only
+edges remain visible for review but cannot establish a root cause.
 
 ## Quality Gap Attribution
 

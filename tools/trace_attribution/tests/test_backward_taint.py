@@ -18,7 +18,7 @@ from trace_attribution.claude import (
     run_worker_with_timeout,
     validate_judgment_payload,
 )
-from trace_attribution.cli import parse_args
+from trace_attribution.cli import lineage_output_path, parse_args
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence, judgment_from_dict, stable_json
 from trace_attribution.models import TraceNode
@@ -104,6 +104,138 @@ def slow_worker(payload, result_queue):
 
 
 class TraceGraphTest(unittest.TestCase):
+    def test_reconstructs_same_message_reasoning_before_action_decision(self):
+        trace = {
+            "case_id": "same-message-lineage-case",
+            "records": [
+                {
+                    "record_id": "reasoning_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-13T10:00:00.000Z",
+                    "data": {
+                        "decision_id": "dec_reasoning",
+                        "decision_type": "reasoning_block",
+                        "rationale": "The broad failures are outside the requested scope.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-13T10:00:01.000Z",
+                    "data": {
+                        "decision_id": "dec_action",
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "bash",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1", "callID": "call_1"},
+                    },
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "timestamp": "2026-07-13T10:00:02.000Z",
+                    "data": {"call_id": "call_1", "tool_name": "bash", "session_id": "ses_1"},
+                },
+                {
+                    "record_id": "tool_result",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "timestamp": "2026-07-13T10:00:03.000Z",
+                    "source_refs": ["tool_call:call_1"],
+                    "data": {"call_id": "call_1", "output": "smoke check passed"},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "decision", "id": "dec_action"},
+                    "to": {"type": "tool_call", "id": "call_1"},
+                    "relation": "selected_by",
+                }
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertIn("record:reasoning_decision", graph.upstream_refs("record:action_decision"))
+        self.assertIn("record:action_decision", graph.upstream_refs("record:tool_call"))
+        self.assertIn("record:tool_call", graph.upstream_refs("record:tool_result"))
+        self.assertEqual(graph.message_lineage["turns"][0]["message_id"], "msg_1")
+
+    def test_reconstructs_decision_retained_in_later_llm_request_artifact(self):
+        rationale = (
+            "The three broad test failures are edge cases outside the requested interfaces, "
+            "so a narrow smoke verification is sufficient."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "artifacts" / "sha256" / "request.json"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text(
+                json.dumps([{"role": "assistant", "content": rationale}, {"role": "user", "content": "continue"}]),
+                encoding="utf-8",
+            )
+            trace = {
+                "case_id": "retained-decision-case",
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_request",
+                        "path": "artifacts/sha256/request.json",
+                        "kind": "json",
+                        "hash": "request-hash",
+                    }
+                ],
+                "records": [
+                    {
+                        "record_id": "scope_decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "timestamp": "2026-07-13T10:00:00.000Z",
+                        "data": {
+                            "decision_id": "dec_scope",
+                            "decision_type": "reasoning_block",
+                            "rationale": rationale,
+                            "metadata": {"sessionID": "ses_1", "messageID": "msg_old"},
+                        },
+                    },
+                    {
+                        "record_id": "final_llm",
+                        "component": "llm",
+                        "event_type": "llm.call",
+                        "timestamp": "2026-07-13T10:00:05.000Z",
+                        "data": {
+                            "input": {"sessionID": "ses_1"},
+                            "input_messages": {
+                                "artifact_id": "artifact_request",
+                                "hash": "request-hash",
+                            },
+                            "generated_response_refs": ["response_segment:final"],
+                        },
+                    },
+                    {
+                        "record_id": "final_output",
+                        "component": "result",
+                        "event_type": "response.output",
+                        "timestamp": "2026-07-13T10:00:06.000Z",
+                        "data": {"segment_id": "final", "is_final_for_case": True, "text": "All work is verified."},
+                    },
+                ],
+            }
+
+            graph = TraceGraph.from_trace(trace, artifact_root=root)
+
+        self.assertIn("record:scope_decision", graph.upstream_refs("record:final_llm"))
+        retained = [
+            edge
+            for edge in graph.message_lineage["edges"]
+            if edge["relation"] == "retained_in_context" and edge["to_ref"] == "record:final_llm"
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["evidence_type"], "content_matched")
+        self.assertTrue(retained[0]["eligible_for_attribution"])
+
     def test_resolves_source_refs_and_dataflow_edges(self):
         graph = TraceGraph.from_trace(sample_trace())
 
@@ -541,6 +673,16 @@ class TraceGraphTest(unittest.TestCase):
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_report_records_message_lineage_summary(self):
+        report = BackwardTaintAnalyzer(judge=FakeJudge({})).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertIn("message_lineage", report.metadata)
+        self.assertEqual(report.metadata["message_lineage"]["behavior_impact"], "none")
+        self.assertGreaterEqual(report.metadata["message_lineage"]["stats"]["snapshot_count"], 0)
+
     def test_present_nonroot_dead_end_is_not_promoted_to_root(self):
         trace = {
             "case_id": "truthful-evidence-case",
@@ -1317,6 +1459,16 @@ class NodeJudgmentTest(unittest.TestCase):
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_cli_derives_lineage_output_next_to_attribution_report(self):
+        self.assertEqual(
+            lineage_output_path(Path("/tmp/result.json"), ""),
+            Path("/tmp/result.message-lineage.json"),
+        )
+        self.assertEqual(
+            lineage_output_path(Path("/tmp/result.json"), "/tmp/custom-lineage.json"),
+            Path("/tmp/custom-lineage.json"),
+        )
+
     def test_parses_defect_evidence_causal_role(self):
         node = TraceNode(ref="record:test", record_id="test", component="tool", event_type="tool.result")
 

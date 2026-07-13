@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .models import JsonDict, TraceNode
+from .reconstruction import reconstruct_message_lineage
 
 
 class TraceGraph:
@@ -23,6 +24,7 @@ class TraceGraph:
         artifact_index: Dict[str, JsonDict],
         artifact_root: Optional[Path],
         artifact_records: Dict[str, JsonDict],
+        message_lineage: JsonDict,
     ):
         self.case_id = case_id
         self.nodes = nodes
@@ -35,6 +37,8 @@ class TraceGraph:
         self._artifact_root = artifact_root
         self._artifact_records = artifact_records
         self._hydrated_refs: Set[str] = set()
+        self.message_lineage = message_lineage
+        self._positions = {ref: index for index, ref in enumerate(nodes)}
 
     @classmethod
     def from_file(cls, trace_file: Path) -> "TraceGraph":
@@ -106,6 +110,21 @@ class TraceGraph:
                 upstream[target].add(source)
                 downstream[source].add(target)
 
+        message_lineage = reconstruct_message_lineage(
+            trace=trace,
+            nodes=nodes,
+            aliases=aliases,
+            artifact_root=artifact_root,
+        )
+        for edge in message_lineage.get("edges") or []:
+            if not isinstance(edge, dict) or not edge.get("eligible_for_attribution"):
+                continue
+            source = str(edge.get("from_ref") or "")
+            target = str(edge.get("to_ref") or "")
+            if source in nodes and target in nodes and source != target:
+                upstream[target].add(source)
+                downstream[source].add(target)
+
         manifest = trace.get("manifest") if isinstance(trace.get("manifest"), dict) else {}
         return cls(
             case_id=str(manifest.get("case_id") or trace.get("case_id") or ""),
@@ -118,6 +137,7 @@ class TraceGraph:
             artifact_index=artifact_index,
             artifact_root=artifact_root,
             artifact_records=artifact_records,
+            message_lineage=message_lineage,
         )
 
     def hydrate_node(self, ref: str) -> TraceNode:
@@ -217,6 +237,13 @@ class TraceGraph:
                     else 1
                     if self.nodes[item].event_type == "response.output"
                     else 2
+                )
+            )
+        elif current and current.event_type in ("llm.call", "llm.turn"):
+            refs.sort(
+                key=lambda item: (
+                    0 if self.nodes[item].event_type == "decision" else 1,
+                    -self._positions.get(item, 0),
                 )
             )
         return [self.hydrate_node(item) for item in refs[:limit]]

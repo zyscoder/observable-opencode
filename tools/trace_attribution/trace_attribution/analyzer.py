@@ -217,6 +217,12 @@ class BackwardTaintAnalyzer:
                 "analysis_outcome": analysis_outcome,
                 "termination_reason": termination_reason,
                 "artifact_hydration": graph.artifact_hydration,
+                "message_lineage": {
+                    "version": graph.message_lineage.get("version"),
+                    "collection_mode": graph.message_lineage.get("collection_mode"),
+                    "behavior_impact": graph.message_lineage.get("behavior_impact"),
+                    "stats": graph.message_lineage.get("stats") or {},
+                },
             },
         )
         return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))

@@ -66,12 +66,12 @@
 - Produces: `MessageLineage` JSON with `turns`, `snapshots`, `edges`, and `stats`
 - Produces: attribution-eligible reconstructed edges
 
-- [ ] Add a failing test for same-message reasoning-to-action reconstruction.
-- [ ] Add a failing test for session/message/call identifier extraction.
-- [ ] Implement deterministic indexes and turn grouping.
-- [ ] Emit normalized prompt/context/compaction/LLM snapshots.
-- [ ] Merge confirmed reconstructed edges into `TraceGraph`.
-- [ ] Run focused and complete Python tests.
+- [x] Add a failing test for same-message reasoning-to-action reconstruction.
+- [x] Add a failing test for session/message/call identifier extraction.
+- [x] Implement deterministic indexes and turn grouping.
+- [x] Emit normalized prompt/context/compaction/LLM snapshots.
+- [x] Merge confirmed reconstructed edges into `TraceGraph`.
+- [x] Run focused and complete Python tests.
 
 ### Task 4: Artifact-Backed Context Retention
 
@@ -84,11 +84,11 @@
 - Consumes: LLM request message artifacts and earlier decision rationale text
 - Produces: `retained_in_context` content-matched edges
 
-- [ ] Add a failing artifact test containing a prior reasoning decision in a later LLM request.
-- [ ] Implement safe artifact loading under the trace root.
-- [ ] Match normalized exact decision content and reject short/ambiguous snippets.
-- [ ] Prioritize recent matched decisions in LLM upstream context.
-- [ ] Verify truncated or missing artifacts produce gaps instead of edges.
+- [x] Add a failing artifact test containing a prior reasoning decision in a later LLM request.
+- [x] Implement safe artifact loading under the trace root.
+- [x] Match normalized exact decision content and reject short/ambiguous snippets.
+- [x] Prioritize recent matched decisions in LLM upstream context.
+- [x] Verify truncated or missing artifacts produce gaps instead of edges.
 
 ### Task 5: Lineage Output And CLI
 
@@ -103,10 +103,10 @@
 - Produces: default `<attribution-output-stem>.message-lineage.json`
 - Produces: attribution metadata `message_lineage`
 
-- [ ] Add CLI parsing and report-metadata tests.
-- [ ] Write the reconstructed lineage without altering the source trace.
-- [ ] Document edge evidence tiers and passive behavior.
-- [ ] Run the complete Python unit suite.
+- [x] Add CLI parsing and report-metadata tests.
+- [x] Write the reconstructed lineage without altering the source trace.
+- [x] Document edge evidence tiers and passive behavior.
+- [x] Run the complete Python unit suite.
 
 ### Task 6: Prior Trace Regression
 
