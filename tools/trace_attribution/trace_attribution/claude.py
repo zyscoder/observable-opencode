@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import queue
 import re
-from typing import Any, Dict, List, Optional
+import signal
+import threading
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from .analyzer import JudgeClient
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
+
+T = TypeVar("T")
 
 
 SYSTEM_PROMPT = """You are an offline root-cause attribution reviewer for agent semantic traces.
@@ -52,6 +58,8 @@ class ClaudeJudgeClient(JudgeClient):
         timeout = timeout_seconds if timeout_seconds is not None else env_float("CLAUDE_TIMEOUT_SECONDS")
         if timeout is not None:
             client_kwargs["timeout"] = timeout
+        self.api_key = api_key
+        self.timeout_seconds = timeout
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
         self.repair_max_tokens = repair_max_tokens
@@ -70,14 +78,11 @@ class ClaudeJudgeClient(JudgeClient):
             downstream_context=downstream_context,
             objective=objective,
         )
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=0,
+        text = self._create_message_text(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            max_tokens=self.max_tokens,
         )
-        text = response_text(response)
         try:
             payload = parse_json_object(text)
         except ValueError:
@@ -85,10 +90,7 @@ class ClaudeJudgeClient(JudgeClient):
         return judgment_from_dict(payload, node)
 
     def _repair_json_response(self, *, text: str, node: TraceNode) -> Dict[str, Any]:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.repair_max_tokens,
-            temperature=0,
+        repaired = self._create_message_text(
             system=(
                 "You repair malformed JSON emitted by an offline trace attribution reviewer. "
                 "Return exactly one valid compact JSON object and no markdown. "
@@ -127,8 +129,8 @@ class ClaudeJudgeClient(JudgeClient):
                     ),
                 }
             ],
+            max_tokens=self.repair_max_tokens,
         )
-        repaired = response_text(response)
         try:
             return parse_json_object(repaired)
         except ValueError as exc:
@@ -136,6 +138,32 @@ class ClaudeJudgeClient(JudgeClient):
                 "Claude response did not contain a valid JSON object after repair. "
                 f"Original: {text[:200]} Repaired: {repaired[:200]}"
             ) from exc
+
+    def _create_message_text(self, *, system: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
+        if self.timeout_seconds is not None and self.timeout_seconds > 0:
+            result = run_worker_with_timeout(
+                anthropic_request_worker,
+                {
+                    "api_key": self.api_key,
+                    "base_url": self.base_url,
+                    "timeout_seconds": self.timeout_seconds,
+                    "model": self.model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                    "system": system,
+                    "messages": messages,
+                },
+                self.timeout_seconds,
+            )
+            return str(result.get("text") or "")
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=0,
+            system=system,
+            messages=messages,
+        )
+        return response_text(response)
 
 
 def build_judgment_prompt(
@@ -201,6 +229,85 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     if not match:
         raise ValueError(f"Claude response did not contain a JSON object: {text[:200]}")
     return json.loads(match.group(0))
+
+
+def call_with_wall_timeout(func: Callable[[], T], timeout_seconds: Optional[float]) -> T:
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return func()
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
+        return func()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(signum: int, frame: Any) -> None:
+        raise TimeoutError(f"judge request exceeded wall timeout: {timeout_seconds}s")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return func()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def run_worker_with_timeout(
+    worker: Callable[[Dict[str, Any], Any], None],
+    payload: Dict[str, Any],
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(target=worker, args=(payload, result_queue))
+    process.daemon = True
+    process.start()
+    process.join(timeout_seconds)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(1)
+        raise TimeoutError(f"judge worker exceeded wall timeout: {timeout_seconds}s")
+
+    try:
+        result = result_queue.get_nowait()
+    except queue.Empty as exc:
+        if process.exitcode and process.exitcode != 0:
+            raise RuntimeError(f"judge worker exited with code {process.exitcode} without result") from exc
+        raise RuntimeError("judge worker finished without result") from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("judge worker returned invalid result")
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or "judge worker failed"))
+    return result
+
+
+def anthropic_request_worker(payload: Dict[str, Any], result_queue: Any) -> None:
+    try:
+        from anthropic import Anthropic
+
+        client_kwargs: Dict[str, Any] = {"api_key": payload["api_key"]}
+        if payload.get("base_url"):
+            client_kwargs["base_url"] = payload["base_url"]
+        if payload.get("timeout_seconds"):
+            client_kwargs["timeout"] = payload["timeout_seconds"]
+        client = Anthropic(**client_kwargs)
+        response = client.messages.create(
+            model=payload["model"],
+            max_tokens=payload["max_tokens"],
+            temperature=payload.get("temperature", 0),
+            system=payload["system"],
+            messages=payload["messages"],
+        )
+        result_queue.put({"ok": True, "text": response_text(response)})
+    except BaseException as exc:
+        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 def env_float(name: str) -> Optional[float]:

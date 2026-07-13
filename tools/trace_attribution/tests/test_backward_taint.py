@@ -2,13 +2,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
 from pathlib import Path
 
 from trace_attribution.analyzer import BackwardTaintAnalyzer
-from trace_attribution.claude import ClaudeJudgeClient, build_judgment_prompt
+from trace_attribution.claude import ClaudeJudgeClient, build_judgment_prompt, call_with_wall_timeout, run_worker_with_timeout
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence
 from trace_attribution.models import TraceNode
@@ -86,6 +87,11 @@ def sample_trace():
         ],
         "metrics": {"trace_health": {"legacy_fact_used_in_final_claim": 1}},
     }
+
+
+def slow_worker(payload, result_queue):
+    time.sleep(payload["sleep"])
+    result_queue.put({"ok": True, "text": "done"})
 
 
 class TraceGraphTest(unittest.TestCase):
@@ -490,6 +496,22 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_call_with_wall_timeout_raises_timeout_error(self):
+        started = time.time()
+
+        with self.assertRaises(TimeoutError):
+            call_with_wall_timeout(lambda: time.sleep(1), 0.05)
+
+        self.assertLess(time.time() - started, 0.5)
+
+    def test_run_worker_with_timeout_terminates_blocked_worker(self):
+        started = time.time()
+
+        with self.assertRaises(TimeoutError):
+            run_worker_with_timeout(slow_worker, {"sleep": 1}, 0.05)
+
+        self.assertLess(time.time() - started, 0.5)
+
     def test_passes_base_url_to_anthropic_compatible_client(self):
         calls = []
 
