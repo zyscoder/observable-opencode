@@ -573,6 +573,47 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("record:claim_bad", report.visited_order)
         self.assertIn("record:evidence_old", report.visited_order)
 
+    def test_tool_error_judge_error_uses_semantic_fallback(self):
+        class ErrorJudge(FakeJudge):
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                raise TimeoutError("judge timed out")
+
+        trace = {
+            "case_id": "tool-error-case",
+            "records": [
+                {
+                    "record_id": "tool_error",
+                    "component": "tool",
+                    "event_type": "tool.error",
+                    "data": {
+                        "tool_name": "read",
+                        "call_id": "call_123",
+                        "error_kind": "file_not_found",
+                        "error_message": "File not found: docs/current-requirement.md",
+                        "observed_by_model": True,
+                        "handled_status": "recovered_with_replacement_evidence",
+                    },
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+
+        report = BackwardTaintAnalyzer(judge=ErrorJudge({}), max_depth=2).analyze(
+            graph,
+            start_refs=["record:tool_error"],
+            objective="Explain the observed tool failure defect.",
+        )
+
+        root = report.root_causes[0]
+
+        self.assertEqual(root.node_ref, "record:tool_error")
+        self.assertEqual(root.defect_type, "tool_error_observed")
+        self.assertGreater(root.confidence, 0.1)
+        self.assertIn("read", root.reason)
+        self.assertIn("File not found", root.reason)
+        self.assertEqual(report.node_judgments["record:tool_error"].model_notes, "TimeoutError: judge timed out")
+
 
 class ClaudeJudgeClientTest(unittest.TestCase):
     def test_call_with_wall_timeout_raises_timeout_error(self):

@@ -217,6 +217,20 @@ def fallback_judgment_after_error(
             confidence=0.2,
             model_notes=error_text,
         )
+    if node.event_type == "tool.error":
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type="tool_error_observed",
+            defect_reason=tool_error_fallback_reason(node),
+            influenced_by=[],
+            is_root_cause=True,
+            severity="medium",
+            confidence=0.45,
+            model_notes=error_text,
+        )
     return NodeJudgment(
         node_ref=node.ref,
         component=node.component,
@@ -241,3 +255,27 @@ def offline_boundary_name(event_type: str) -> str:
         "case.quality_gap": "quality_gap",
         "case.missing_semantic": "missing_semantic",
     }.get(event_type, "offline_defect")
+
+
+def tool_error_fallback_reason(node: TraceNode) -> str:
+    data = node.data if isinstance(node.data, dict) else {}
+    tool_name = str(data.get("tool_name") or data.get("name") or "unknown_tool")
+    call_id = str(data.get("call_id") or data.get("callID") or "")
+    error_kind = str(data.get("error_kind") or "")
+    error_message = str(data.get("error_message") or "")
+    if not error_message and isinstance(data.get("error"), dict):
+        error_message = str(data["error"].get("message") or "")
+    handled_status = str(data.get("handled_status") or "")
+    observed_by_model = data.get("observed_by_model")
+    parts = [f"Tool call failed while running {tool_name}"]
+    if call_id:
+        parts.append(f"call_id={call_id}")
+    if error_kind:
+        parts.append(f"error_kind={error_kind}")
+    if error_message:
+        parts.append(f"error_message={error_message}")
+    if observed_by_model is not None:
+        parts.append(f"observed_by_model={bool(observed_by_model)}")
+    if handled_status:
+        parts.append(f"handled_status={handled_status}")
+    return ". ".join(parts) + "."
