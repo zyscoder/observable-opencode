@@ -14,6 +14,9 @@ from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
 T = TypeVar("T")
 
+CURRENT_NODE_PROMPT_CHARS = 1600
+UPSTREAM_NODE_PROMPT_CHARS = 700
+
 
 SYSTEM_PROMPT = """You are an offline root-cause attribution reviewer for agent semantic traces.
 You must perform backward semantic taint analysis.
@@ -173,6 +176,8 @@ def build_judgment_prompt(
     downstream_context: List[str],
     objective: str,
 ) -> str:
+    current_node = node.compact(max_chars=CURRENT_NODE_PROMPT_CHARS)
+    compact_upstream_nodes = [item.compact(max_chars=UPSTREAM_NODE_PROMPT_CHARS) for item in upstream_nodes]
     schema = {
         "node_ref": node.ref,
         "component": node.component,
@@ -194,9 +199,19 @@ def build_judgment_prompt(
     }
     payload = {
         "objective": objective,
-        "current_node": node.compact(),
-        "upstream_nodes": [item.compact(max_chars=1200) for item in upstream_nodes],
+        "current_node": current_node,
+        "upstream_nodes": compact_upstream_nodes,
         "downstream_taint_path": downstream_context,
+        "prompt_compaction": {
+            "current_node_max_chars": CURRENT_NODE_PROMPT_CHARS,
+            "upstream_node_max_chars": UPSTREAM_NODE_PROMPT_CHARS,
+            "upstream_node_count": len(upstream_nodes),
+            "truncated_refs": [
+                item.get("ref")
+                for item in [current_node] + compact_upstream_nodes
+                if isinstance(item, dict) and item.get("truncated")
+            ],
+        },
         "rules": [
             "If current_node.event_type is case.quality_gap, treat the quality gap as the defect to explain; do not answer that the evaluator itself is non-defective.",
             "For case.quality_gap, use missing_evidence, score, max_score, and upstream_nodes to decide which upstream component most likely introduced the quality gap.",

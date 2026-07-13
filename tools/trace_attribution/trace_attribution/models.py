@@ -33,15 +33,28 @@ class TraceNode:
         text = stable_json(payload)
         if len(text) <= max_chars:
             return payload
+        for source_limit in (20, 12, 6, 3, 0):
+            candidate = compact_truncated_payload(
+                base={
+                    "ref": self.ref,
+                    "record_id": self.record_id,
+                    "component": self.component,
+                    "event_type": self.event_type,
+                    "title": self.title,
+                    "status": self.status,
+                    "source_refs": self.source_refs[:source_limit],
+                    "truncated": True,
+                },
+                source_text=text,
+                max_chars=max_chars,
+            )
+            if len(stable_json(candidate)) <= max_chars:
+                return candidate
         return {
             "ref": self.ref,
             "record_id": self.record_id,
             "component": self.component,
             "event_type": self.event_type,
-            "title": self.title,
-            "status": self.status,
-            "source_refs": self.source_refs[:20],
-            "data_preview": text[:max_chars],
             "truncated": True,
         }
 
@@ -99,6 +112,22 @@ def stable_json(value: Any) -> str:
     import json
 
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def compact_truncated_payload(*, base: JsonDict, source_text: str, max_chars: int) -> JsonDict:
+    candidate = dict(base)
+    candidate["data_preview"] = ""
+    preview_budget = max(0, max_chars - len(stable_json(candidate)))
+    while preview_budget >= 0:
+        candidate["data_preview"] = source_text[:preview_budget]
+        size = len(stable_json(candidate))
+        if size <= max_chars:
+            return candidate
+        if preview_budget == 0:
+            break
+        preview_budget = max(0, preview_budget - (size - max_chars) - 1)
+    candidate["data_preview"] = ""
+    return candidate
 
 
 def judgment_from_dict(value: JsonDict, fallback_node: TraceNode) -> NodeJudgment:

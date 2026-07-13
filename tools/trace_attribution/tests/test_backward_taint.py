@@ -11,7 +11,7 @@ from pathlib import Path
 from trace_attribution.analyzer import BackwardTaintAnalyzer
 from trace_attribution.claude import ClaudeJudgeClient, build_judgment_prompt, call_with_wall_timeout, run_worker_with_timeout
 from trace_attribution.graph import TraceGraph
-from trace_attribution.models import NodeJudgment, TaintInfluence
+from trace_attribution.models import NodeJudgment, TaintInfluence, stable_json
 from trace_attribution.models import TraceNode
 from trace_attribution.quality_review import inject_quality_gap_records
 from trace_attribution.trace_improvement import build_trace_improvement_report
@@ -233,6 +233,23 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(defect.source_refs[0], "record:evidence_old")
         self.assertEqual(defect.data["source_ref_count_total"], 81)
         self.assertEqual(defect.data["source_ref_count_included"], len(defect.source_refs))
+
+    def test_trace_node_compact_respects_character_budget(self):
+        node = TraceNode(
+            ref="record:large_context",
+            record_id="large_context",
+            component="context",
+            event_type="context.snapshot",
+            source_refs=[f"record:source_{index}" for index in range(40)],
+            data={"large_text": "x" * 5000, "decision": "keep only budgeted semantic preview"},
+        )
+
+        compact = node.compact(max_chars=700)
+
+        self.assertLessEqual(len(stable_json(compact)), 700)
+        self.assertTrue(compact["truncated"])
+        self.assertEqual(compact["ref"], "record:large_context")
+        self.assertIn("data_preview", compact)
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
@@ -558,6 +575,39 @@ class ClaudeJudgeClientTest(unittest.TestCase):
 
         self.assertIn("case.quality_gap", prompt)
         self.assertIn("treat the quality gap as the defect to explain", prompt)
+
+    def test_judgment_prompt_keeps_semantics_under_budget(self):
+        node = TraceNode(
+            ref="record:observed_defect_tool_error",
+            record_id="observed_defect_tool_error",
+            component="evaluation",
+            event_type="case.observed_defect",
+            data={"failure_type": "hallucinated_after_tool_failure", "description": "The answer ignored tool errors."},
+        )
+        upstream_nodes = [
+            TraceNode(
+                ref=f"record:upstream_{index}",
+                record_id=f"upstream_{index}",
+                component="tool",
+                event_type="tool.result",
+                data={"text": "important result " + ("x" * 4000), "call_id": f"call_{index}"},
+            )
+            for index in range(12)
+        ]
+
+        prompt = build_judgment_prompt(
+            node=node,
+            upstream_nodes=upstream_nodes,
+            downstream_context=[node.ref],
+            objective="Find the first component that introduced the observed defect.",
+        )
+
+        self.assertLess(len(prompt), 14000)
+        self.assertIn("record:observed_defect_tool_error", prompt)
+        self.assertIn("hallucinated_after_tool_failure", prompt)
+        self.assertIn("record:upstream_0", prompt)
+        self.assertIn("tool.result", prompt)
+        self.assertIn("prompt_compaction", prompt)
 
     def test_repairs_malformed_json_judgment_once(self):
         calls = []
