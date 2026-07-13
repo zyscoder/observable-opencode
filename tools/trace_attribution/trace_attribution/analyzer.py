@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .graph import TraceGraph
-from .models import AttributionReport, NodeJudgment, RootCauseCandidate, TraceNode
+from .models import AttributionReport, NodeJudgment, RootCauseCandidate, TaintInfluence, TraceNode
 from .trace_improvement import build_trace_improvement_report
 
 
@@ -64,22 +64,7 @@ class BackwardTaintAnalyzer:
                 )
             except Exception as exc:
                 judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
-                judgment = NodeJudgment(
-                    node_ref=ref,
-                    component=node.component,
-                    event_type=node.event_type,
-                    has_defect=True,
-                    defect_type="judge_error",
-                    defect_reason=(
-                        "The attribution judge failed while evaluating this node, so the analyzer "
-                        "kept it as a partial boundary candidate instead of dropping the trace."
-                    ),
-                    influenced_by=[],
-                    is_root_cause=True,
-                    severity="unknown",
-                    confidence=0.1,
-                    model_notes=f"{type(exc).__name__}: {exc}",
-                )
+                judgment = fallback_judgment_after_error(node=node, upstream_nodes=upstream_nodes, error=exc)
             judgments[ref] = judgment
             if not judgment.has_defect:
                 continue
@@ -198,3 +183,61 @@ def dedupe_paths(paths: Iterable[List[str]]) -> List[List[str]]:
         seen.add(key)
         output.append(path)
     return output
+
+
+def fallback_judgment_after_error(
+    *,
+    node: TraceNode,
+    upstream_nodes: List[TraceNode],
+    error: Exception,
+) -> NodeJudgment:
+    error_text = f"{type(error).__name__}: {error}"
+    if node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic") and upstream_nodes:
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_type=f"judge_unavailable_{offline_boundary_name(node.event_type)}_boundary",
+            defect_reason=(
+                "The attribution judge failed on an offline defect boundary node. The analyzer used the "
+                "node's explicit source_refs as a conservative fallback path instead of treating the "
+                "evaluation boundary itself as the root cause."
+            ),
+            influenced_by=[
+                TaintInfluence(
+                    upstream_ref=item.ref,
+                    reason="Fallback propagation through the offline defect node's explicit source_refs.",
+                    confidence=0.2,
+                )
+                for item in upstream_nodes
+            ],
+            is_root_cause=False,
+            severity="unknown",
+            confidence=0.2,
+            model_notes=error_text,
+        )
+    return NodeJudgment(
+        node_ref=node.ref,
+        component=node.component,
+        event_type=node.event_type,
+        has_defect=True,
+        defect_type="judge_error",
+        defect_reason=(
+            "The attribution judge failed while evaluating this node, so the analyzer "
+            "kept it as a partial boundary candidate instead of dropping the trace."
+        ),
+        influenced_by=[],
+        is_root_cause=True,
+        severity="unknown",
+        confidence=0.1,
+        model_notes=error_text,
+    )
+
+
+def offline_boundary_name(event_type: str) -> str:
+    return {
+        "case.observed_defect": "observed_defect",
+        "case.quality_gap": "quality_gap",
+        "case.missing_semantic": "missing_semantic",
+    }.get(event_type, "offline_defect")

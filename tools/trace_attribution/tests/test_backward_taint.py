@@ -511,6 +511,45 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
         self.assertIn("judge_error", gap_types)
 
+    def test_observed_defect_judge_error_falls_back_to_source_refs(self):
+        class ErrorJudge(FakeJudge):
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                raise TimeoutError("judge timed out")
+
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "observed_defect_tool_failure",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": ["record:claim_bad", "record:evidence_old"],
+                "data": {
+                    "component": "tool_error_handling",
+                    "failure_type": "hallucinated_after_tool_failure",
+                },
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+
+        report = BackwardTaintAnalyzer(judge=ErrorJudge({}), max_depth=2, max_nodes=8).analyze(
+            graph,
+            start_refs=["record:observed_defect_tool_failure"],
+            objective="Explain the observed tool failure defect.",
+        )
+
+        observed = report.node_judgments["record:observed_defect_tool_failure"]
+        root_refs = [candidate.node_ref for candidate in report.root_causes]
+
+        self.assertEqual(observed.defect_type, "judge_unavailable_observed_defect_boundary")
+        self.assertEqual(
+            sorted(influence.upstream_ref for influence in observed.influenced_by),
+            ["record:claim_bad", "record:evidence_old"],
+        )
+        self.assertNotIn("record:observed_defect_tool_failure", root_refs)
+        self.assertIn("record:claim_bad", report.visited_order)
+        self.assertIn("record:evidence_old", report.visited_order)
+
 
 class ClaudeJudgeClientTest(unittest.TestCase):
     def test_call_with_wall_timeout_raises_timeout_error(self):
