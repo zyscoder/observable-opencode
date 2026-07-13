@@ -6,6 +6,13 @@ from typing import Any, Dict, List, Optional
 
 JsonDict = Dict[str, Any]
 DEFECT_STATUSES = {"present", "absent", "unknown"}
+CAUSAL_ROLES = {
+    "defect_introduction",
+    "defect_propagation",
+    "defect_evidence",
+    "non_defective",
+    "unknown",
+}
 
 
 @dataclass(frozen=True)
@@ -199,6 +206,7 @@ class NodeJudgment:
     defect_status: str = ""
     defect_type: str = ""
     defect_reason: str = ""
+    causal_role: str = ""
     influenced_by: List[TaintInfluence] = field(default_factory=list)
     is_root_cause: bool = False
     severity: str = "unknown"
@@ -209,8 +217,21 @@ class NodeJudgment:
         status = self.defect_status.strip().lower()
         if status not in DEFECT_STATUSES:
             status = "present" if self.has_defect else "absent"
+        role = self.causal_role.strip().lower()
+        if role not in CAUSAL_ROLES:
+            if status == "absent":
+                role = "non_defective"
+            elif status == "unknown":
+                role = "unknown"
+            elif self.is_root_cause:
+                role = "defect_introduction"
+            elif self.influenced_by:
+                role = "defect_propagation"
+            else:
+                role = "unknown"
         object.__setattr__(self, "defect_status", status)
         object.__setattr__(self, "has_defect", status == "present")
+        object.__setattr__(self, "causal_role", role)
 
 
 @dataclass(frozen=True)
@@ -221,6 +242,7 @@ class RootCauseCandidate:
     defect_type: str
     reason: str
     confidence: float
+    causal_role: str = "defect_introduction"
 
 
 @dataclass(frozen=True)
@@ -292,6 +314,7 @@ def judgment_from_dict(value: JsonDict, fallback_node: TraceNode) -> NodeJudgmen
         defect_status=raw_status,
         defect_type=str(value.get("defect_type") or ""),
         defect_reason=str(value.get("defect_reason") or value.get("reason") or ""),
+        causal_role=str(value.get("causal_role") or ""),
         influenced_by=influences,
         is_root_cause=bool(value.get("is_root_cause")),
         severity=str(value.get("severity") or "unknown"),

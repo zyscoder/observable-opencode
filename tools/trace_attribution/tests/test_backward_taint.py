@@ -541,6 +541,70 @@ class TraceGraphTest(unittest.TestCase):
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_present_nonroot_dead_end_is_not_promoted_to_root(self):
+        trace = {
+            "case_id": "truthful-evidence-case",
+            "records": [
+                {
+                    "record_id": "pytest_result",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {"output": "2 failed, 10 passed"},
+                }
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:pytest_result": NodeJudgment(
+                    node_ref="record:pytest_result",
+                    component="tool",
+                    event_type="tool.result",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="test_failure_evidence",
+                    defect_reason="The tool faithfully reports failures but did not introduce them.",
+                    influenced_by=[],
+                    is_root_cause=False,
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:pytest_result"],
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+
+    def test_missing_semantic_does_not_taint_cited_code_changes(self):
+        trace = {
+            "case_id": "missing-semantic-isolation-case",
+            "records": [
+                {
+                    "record_id": "change_1",
+                    "component": "tool",
+                    "event_type": "change",
+                    "data": {"files": ["src/feature.py"]},
+                },
+                {
+                    "record_id": "missing_verification",
+                    "component": "evaluation",
+                    "event_type": "case.missing_semantic",
+                    "source_refs": ["record:change_1"],
+                    "data": {"gap_kind": "final_test_result"},
+                },
+            ],
+        }
+        judge = FakeJudge({})
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls, [])
+        self.assertNotIn("record:change_1", report.visited_order)
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+
     def test_judge_receives_semantic_context_for_the_active_defect_branch(self):
         class ContextJudge(FakeJudge):
             def __init__(self):
@@ -1253,6 +1317,46 @@ class NodeJudgmentTest(unittest.TestCase):
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_parses_defect_evidence_causal_role(self):
+        node = TraceNode(ref="record:test", record_id="test", component="tool", event_type="tool.result")
+
+        judgment = judgment_from_dict(
+            {
+                "node_ref": node.ref,
+                "component": node.component,
+                "event_type": node.event_type,
+                "defect_status": "present",
+                "has_defect": True,
+                "defect_type": "test_failure_evidence",
+                "defect_reason": "The result truthfully exposes a failure.",
+                "causal_role": "defect_evidence",
+                "influenced_by": [],
+                "is_root_cause": False,
+                "confidence": 0.9,
+            },
+            node,
+        )
+
+        self.assertEqual(getattr(judgment, "causal_role", None), "defect_evidence")
+
+    def test_rejects_evidence_role_marked_as_root_cause(self):
+        with self.assertRaisesRegex(ValueError, "defect_evidence"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:test",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "test_failure_evidence",
+                    "defect_reason": "The result truthfully exposes a failure.",
+                    "causal_role": "defect_evidence",
+                    "influenced_by": [],
+                    "is_root_cause": True,
+                    "confidence": 0.9,
+                }
+            )
+
     def test_rejects_absent_judgment_with_nonempty_defect_type(self):
         with self.assertRaises(ValueError):
             validate_judgment_payload(

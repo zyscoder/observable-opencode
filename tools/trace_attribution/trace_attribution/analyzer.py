@@ -56,7 +56,25 @@ class BackwardTaintAnalyzer:
             visited_paths[ref] = path
             node = graph.hydrate_node(ref)
             upstream_nodes = graph.upstream_nodes(ref)
-            if is_evaluation_assertion(node):
+            if node.event_type == "case.missing_semantic":
+                judgment = NodeJudgment(
+                    node_ref=ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_status="unknown",
+                    defect_type="trace_semantic_gap",
+                    defect_reason=(
+                        "This offline record declares an observability gap. It does not prove that any cited "
+                        "execution or change node introduced a behavioral defect."
+                    ),
+                    causal_role="unknown",
+                    influenced_by=[],
+                    is_root_cause=False,
+                    severity="unknown",
+                    confidence=1.0,
+                )
+            elif is_evaluation_assertion(node):
                 evaluation_refs = graph.upstream_refs(ref)
                 judgment = NodeJudgment(
                     node_ref=ref,
@@ -69,6 +87,7 @@ class BackwardTaintAnalyzer:
                         "This offline evaluation boundary declares an observed defect or quality gap. "
                         "Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer."
                     ),
+                    causal_role="defect_evidence",
                     influenced_by=[
                         TaintInfluence(
                             upstream_ref=item,
@@ -102,6 +121,8 @@ class BackwardTaintAnalyzer:
                 continue
             if not next_refs:
                 if is_evaluation_assertion(node):
+                    continue
+                if judgment.causal_role != "defect_introduction" or not judgment.is_root_cause:
                     continue
                 root_causes[ref] = RootCauseCandidate(
                     node_ref=ref,
@@ -140,6 +161,8 @@ class BackwardTaintAnalyzer:
             if is_evaluation_assertion(node):
                 continue
             if any(status == "unknown" for status in upstream_statuses):
+                continue
+            if judgment.causal_role != "defect_introduction" or not judgment.is_root_cause:
                 continue
             root_causes[ref] = RootCauseCandidate(
                 node_ref=ref,

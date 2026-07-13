@@ -26,7 +26,8 @@ You must perform backward semantic taint analysis.
 For the current node/component:
 1. Decide whether this node's semantics contain a defect relevant to the objective.
 2. If defective, decide whether the defect was mainly introduced by upstream nodes/components.
-3. If not mainly caused by upstream defects, mark this node as a root-cause candidate.
+3. Classify the node as defect introduction, propagation, evidence, non-defective, or unknown.
+4. Only a defect-introduction node may be marked as a root-cause candidate.
 
 Only use the trace facts provided. Do not invent unavailable trace facts.
 Return a single JSON object. No markdown.
@@ -183,6 +184,7 @@ class ClaudeJudgeClient(JudgeClient):
                                 "has_defect",
                                 "defect_type",
                                 "defect_reason",
+                                "causal_role",
                                 "influenced_by",
                                 "is_root_cause",
                                 "severity",
@@ -194,6 +196,8 @@ class ClaudeJudgeClient(JudgeClient):
                                 "defect_status must be present, absent, or unknown; use unknown when the evidence is insufficient.",
                                 "When defect_status is absent, defect_type must be an empty string and the reason must not describe the current node as defective.",
                                 "defect_reason must explain the judgment or the uncertainty and must not be empty.",
+                                "causal_role must be defect_introduction, defect_propagation, defect_evidence, non_defective, or unknown.",
+                                "A faithful test or tool result that exposes a failure is defect_evidence, not defect_introduction.",
                                 "If another field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
                                 "Use fallback_node values for node_ref, component, and event_type when missing.",
                             ],
@@ -262,6 +266,7 @@ def build_judgment_prompt(
         "has_defect": True,
         "defect_type": "short_snake_case_or_empty",
         "defect_reason": "why this node is or is not defective",
+        "causal_role": "defect_introduction|defect_propagation|defect_evidence|non_defective|unknown",
         "influenced_by": [
             {
                 "upstream_ref": "record:...",
@@ -295,6 +300,10 @@ def build_judgment_prompt(
             "For an evaluation assertion, use its dimensions and upstream_nodes to determine whether the asserted defect is present, absent, or unknown.",
             "If the current node has no relevant semantic defect, set defect_status=absent, has_defect=false, and influenced_by=[].",
             "defect_status classifies the current node's semantics, not whether it is the code-level root. A false or unsupported response claim is present even when an earlier code change caused the underlying failure.",
+            "Use defect_evidence for a truthful verification, tool result, benchmark result, or observation that exposes a defect without introducing it.",
+            "Use defect_propagation when the node carries or acts on an already introduced defect.",
+            "Use defect_introduction only when this node first introduces the defect and no earlier supplied causal node did so.",
+            "A defect_evidence or defect_propagation node must never be marked is_root_cause=true.",
             "Never set defect_status=absent while using a non-empty defect_type or while describing the current node as a semantic defect.",
             "If the supplied facts are insufficient to decide, set defect_status=unknown, has_defect=false, is_root_cause=false, and explain what is missing.",
             "Treat hydrated_artifacts as the full cited trace payload within its recorded truncation boundary; do not discard it in favor of a shorter preview.",
@@ -377,6 +386,16 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
             raise ValueError("defect_status and has_defect are inconsistent")
     if status == "absent" and str(value.get("defect_type") or "").strip():
         raise ValueError("absent judgments must use an empty defect_type")
+    causal_role = str(value.get("causal_role") or "").strip().lower()
+    valid_roles = {
+        "defect_introduction",
+        "defect_propagation",
+        "defect_evidence",
+        "non_defective",
+        "unknown",
+    }
+    if causal_role and causal_role not in valid_roles:
+        raise ValueError("invalid causal_role")
     reason = value.get("defect_reason") or value.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("judgment requires a non-empty defect_reason")
@@ -384,6 +403,17 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
         raise ValueError("judgment requires influenced_by as a list")
     if not isinstance(value.get("is_root_cause"), bool):
         raise ValueError("judgment requires is_root_cause as a boolean")
+    if causal_role in {"defect_evidence", "defect_propagation", "non_defective", "unknown"} and value.get(
+        "is_root_cause"
+    ):
+        raise ValueError(f"{causal_role} cannot be marked as a root cause")
+    if causal_role == "defect_introduction":
+        if status != "present" or not value.get("is_root_cause") or value.get("influenced_by"):
+            raise ValueError("defect_introduction requires a present root with no upstream influence")
+    if causal_role == "non_defective" and status != "absent":
+        raise ValueError("non_defective requires defect_status=absent")
+    if causal_role == "unknown" and status != "unknown":
+        raise ValueError("unknown causal_role requires defect_status=unknown")
     if not isinstance(value.get("confidence"), (int, float)) or isinstance(value.get("confidence"), bool):
         raise ValueError("judgment requires numeric confidence")
 

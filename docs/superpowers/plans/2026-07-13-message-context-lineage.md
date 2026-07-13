@@ -31,11 +31,11 @@
 - Produces: `CAUSAL_ROLES`
 - Consumes: legacy `defect_status`, `influenced_by`, and `is_root_cause`
 
-- [ ] Add failing tests proving evidence nodes and present non-root dead ends are never promoted to roots.
-- [ ] Add failing validation tests for contradictory causal roles.
-- [ ] Implement causal-role parsing and conservative legacy mapping.
-- [ ] Require root candidates to be explicit `defect_introduction` nodes.
-- [ ] Run the complete Python unit suite.
+- [x] Add failing tests proving evidence nodes and present non-root dead ends are never promoted to roots.
+- [x] Add failing validation tests for contradictory causal roles.
+- [x] Implement causal-role parsing and conservative legacy mapping.
+- [x] Require root candidates to be explicit `defect_introduction` nodes.
+- [x] Run the complete Python unit suite.
 
 ### Task 2: Missing-Semantic Isolation
 
@@ -48,11 +48,11 @@
 - Consumes: `case.missing_semantic` start records
 - Produces: inconclusive trace-gap judgments with no defect propagation
 
-- [ ] Add a failing test where a missing-semantic record cites code changes.
-- [ ] Verify the current analyzer incorrectly visits or roots the changes.
-- [ ] Treat missing semantics as an unknown observability boundary.
-- [ ] Preserve the corresponding trace-improvement recommendation.
-- [ ] Run focused and complete Python tests.
+- [x] Add a failing test where a missing-semantic record cites code changes.
+- [x] Verify the current analyzer incorrectly visits or roots the changes.
+- [x] Treat missing semantics as an unknown observability boundary.
+- [x] Preserve the corresponding trace-improvement recommendation.
+- [x] Run focused and complete Python tests.
 
 ### Task 3: Turn And Message Reconstruction
 
