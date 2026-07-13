@@ -44,6 +44,7 @@ class BackwardTaintAnalyzer:
         taint_paths: List[List[str]] = []
         unresolved_refs: List[str] = []
         visited_paths: Dict[str, List[str]] = {}
+        provisional_surface_roots: Dict[str, Tuple[RootCauseCandidate, List[str], List[str]]] = {}
         judge_errors: List[Dict[str, str]] = []
         depth_limit_hit = False
 
@@ -56,7 +57,7 @@ class BackwardTaintAnalyzer:
             visited_paths[ref] = path
             node = graph.hydrate_node(ref)
             upstream_nodes = graph.upstream_nodes(ref)
-            if node.event_type == "case.missing_semantic":
+            if is_observability_gap(node):
                 judgment = NodeJudgment(
                     node_ref=ref,
                     component=node.component,
@@ -124,7 +125,7 @@ class BackwardTaintAnalyzer:
                     continue
                 if judgment.causal_role != "defect_introduction" or not judgment.is_root_cause:
                     continue
-                root_causes[ref] = RootCauseCandidate(
+                candidate = RootCauseCandidate(
                     node_ref=ref,
                     component=node.component,
                     event_type=node.event_type,
@@ -132,6 +133,17 @@ class BackwardTaintAnalyzer:
                     reason=judgment.defect_reason,
                     confidence=judgment.confidence,
                 )
+                decision_refs = (
+                    graph.causal_decision_refs(ref)
+                    if node.event_type in ("llm.call", "llm.turn", "response.output", "response.claim")
+                    else []
+                )
+                if decision_refs:
+                    provisional_surface_roots[ref] = (candidate, path, decision_refs)
+                    for decision_ref in decision_refs:
+                        queue.append((decision_ref, path + [decision_ref], depth + 1))
+                    continue
+                root_causes[ref] = candidate
                 taint_paths.append(path)
                 continue
 
@@ -177,6 +189,20 @@ class BackwardTaintAnalyzer:
                 confidence=judgment.confidence,
             )
             taint_paths.append(visited_paths.get(ref, [ref]))
+
+        for ref, (candidate, path, decision_refs) in provisional_surface_roots.items():
+            decision_judgments = [judgments.get(item) for item in decision_refs]
+            if any(
+                item
+                and item.defect_status == "present"
+                and item.causal_role in ("defect_introduction", "defect_propagation")
+                for item in decision_judgments
+            ):
+                continue
+            if not decision_judgments or any(item is None or item.defect_status == "unknown" for item in decision_judgments):
+                continue
+            root_causes[ref] = candidate
+            taint_paths.append(path)
 
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
@@ -265,6 +291,16 @@ def dedupe_paths(paths: Iterable[List[str]]) -> List[List[str]]:
 
 def is_evaluation_assertion(node: TraceNode) -> bool:
     return node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic")
+
+
+def is_observability_gap(node: TraceNode) -> bool:
+    if node.event_type == "case.missing_semantic":
+        return True
+    if node.component != "trace":
+        return False
+    issue_kind = str(node.data.get("issue_kind") or "")
+    failure_type = str(node.data.get("failure_type") or "")
+    return issue_kind.startswith("missing_") or failure_type.endswith("_missing")
 
 
 def semantic_downstream_context(graph: TraceGraph, path: List[str]) -> List[str]:

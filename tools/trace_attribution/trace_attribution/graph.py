@@ -186,6 +186,16 @@ class TraceGraph:
         resolved = self.resolve(ref) or ref
         return sorted(self._downstream.get(resolved, set()))
 
+    def causal_decision_refs(self, ref: str, limit: int = 24) -> List[str]:
+        resolved = self.resolve(ref) or ref
+        refs = [
+            item
+            for item in self.upstream_refs(resolved)
+            if item in self.nodes and self.nodes[item].event_type == "decision"
+        ]
+        refs.sort(key=lambda item: self._positions.get(item, 0), reverse=True)
+        return refs[:limit]
+
     def upstream_nodes(self, ref: str, limit: int = 12) -> List[TraceNode]:
         resolved = self.resolve(ref) or ref
         current = self.nodes.get(resolved)

@@ -1,0 +1,1121 @@
+{
+  "case_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1",
+  "objective": "Find the earliest component that introduced partial implementation or premature completion. Treat truthful failed verification as defect evidence, not a root. Follow reconstructed message-context lineage to the decision that dismissed broad failures and selected narrow verification.",
+  "start_refs": [
+    "record:missing_semantic_final_test_result",
+    "record:observed_defect_missing_verification_after_change",
+    "record:observed_defect_feature_implementation_partial_feature_correctness",
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+    "record:observed_defect_trace_evidence_linking_failed_verification_not_linked_to_final_claim"
+  ],
+  "root_causes": [
+    {
+      "node_ref": "record:decisionnode_dec_1093_ee253ed8",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision node explicitly acknowledges 3 known test failures (94/102 passed) but rationalizes them as 'edge cases' and 'version-specific issues' unrelated to the implementation. It then selects 'continue_processing_stream' and opens the final answer with 'All interfaces are implemented and verified,' which is a premature completion claim that dismisses known failures. No upstream node is supplied, so this node is the earliest point where the defect of overclaiming completion while accepting known failures is introduced.",
+      "confidence": 0.95,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1088_d106d75c",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision node explicitly acknowledges 3 known failures as 'edge cases that don't affect the core requested interfaces' and chooses to continue processing. This dismisses broad test failures and accepts partial implementation, directly introducing the premature completion defect.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1083_bfc033f0",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision to 'continue_processing_stream' with the rationale 'Let me run a broader test to check the overall health of the codebase' indicates an intent to proceed despite known failures. This decision dismisses the need for immediate remediation and selects a broad verification approach, which directly leads to the downstream defect of premature completion with known failures. No upstream nodes are provided, so this node is the earliest point where the defective intent is introduced.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1068_06858be5",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision to 'continue_processing_stream' with the intent to 'capture model reasoning emitted by provider' occurs after the downstream observed defect of premature completion with known failures. The rationale focuses on verifying core interfaces with 'quick smoke tests' rather than addressing the broad test failures. This narrow verification scope, combined with the downstream claim of 'All interfaces are implemented and verified' despite known failures, indicates this decision introduced the defect by dismissing broad failures and selecting narrow verification.",
+      "confidence": 0.85,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1063_94bc4186",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision node explicitly chooses to 'skip the deeply nested rebuild issues' and focus only on a narrow set of interfaces, while the downstream taint path shows the agent later overclaimed completion despite known broad test failures. This decision introduces the premature completion defect by dismissing broader verification scope.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1048_61477e0d",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The processor's decision to 'continue_processing_stream' explicitly rationalizes about a known test failure (description lost after model_rebuild) and chooses to proceed without addressing it. This decision dismisses the broad failure and selects narrow verification, directly introducing the premature completion defect.",
+      "confidence": 0.85,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1043_2e1d7ef0",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision node explicitly acknowledges 3 known failures (94 passed, 3 failed) and then chooses to continue processing the stream without addressing them. The rationale lists the failures and states 'Let me look at the first two tests,' indicating awareness of incomplete verification. This decision dismisses the broad failures and proceeds, directly introducing the premature completion defect.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1038_133b8b1b",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision explicitly acknowledges a known failure ('The deprecated test file requires a specific pytest mark') and chooses to skip it ('Let me just skip it and run the other test files'). This dismisses a broad failure and selects a narrow verification path, directly introducing the premature completion defect.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_1018_7da30ea2",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "premature_completion_with_known_failures",
+      "reason": "The decision rationale explicitly acknowledges a missing import (`rebuild_model_fields` is called but not imported) and plans to add it, yet the chosen action is `continue_processing_stream`. This indicates the agent is aware of an incomplete implementation but proceeds without resolving it, directly introducing the premature completion defect.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    }
+  ],
+  "taint_paths": [
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1093_ee253ed8"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1088_d106d75c"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1083_bfc033f0"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1068_06858be5"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1063_94bc4186"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1048_61477e0d"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1043_2e1d7ef0"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1038_133b8b1b"
+    ],
+    [
+      "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "record:responseclaim_claim_5075_61e44478",
+      "record:node_5041_d4436c30",
+      "record:decisionnode_dec_1018_7da30ea2"
+    ]
+  ],
+  "node_judgments": {
+    "record:missing_semantic_final_test_result": {
+      "node_ref": "record:missing_semantic_final_test_result",
+      "component": "trace",
+      "event_type": "case.missing_semantic",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "trace_semantic_gap",
+      "defect_reason": "This offline record declares an observability gap. It does not prove that any cited execution or change node introduced a behavioral defect.",
+      "causal_role": "unknown",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_missing_verification_after_change": {
+      "node_ref": "record:observed_defect_missing_verification_after_change",
+      "component": "trace",
+      "event_type": "case.observed_defect",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "trace_semantic_gap",
+      "defect_reason": "This offline record declares an observability gap. It does not prove that any cited execution or change node introduced a behavioral defect.",
+      "causal_role": "unknown",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_feature_implementation_partial_feature_correctness": {
+      "node_ref": "record:observed_defect_feature_implementation_partial_feature_correctness",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "partial_feature_correctness",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures": {
+      "node_ref": "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responsenode_segment_28_7d0e075a",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responseclaim_claim_5075_61e44478",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responseclaim_claim_5097_332dbd43",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_trace_evidence_linking_failed_verification_not_linked_to_final_claim": {
+      "node_ref": "record:observed_defect_trace_evidence_linking_failed_verification_not_linked_to_final_claim",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "failed_verification_not_linked_to_final_claim",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responseclaim_claim_5097_332dbd43",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:claimsupport_claim_5097_332dbd43",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:missing_semantic_final_test_result",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796": {
+      "node_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+      "component": "tool",
+      "event_type": "tool.result",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "partial_feature_correctness",
+      "defect_reason": "This node is the tool result of running comprehensive tests. It truthfully reports 3 test failures (test_generic_computed_field, test_rebuild_model_fields_preserves_description, test_final_to_frozen_with_assignment) out of 102 tests. It does not introduce any defect; it merely exposes existing failures.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:node_4977_888e8cc3",
+          "reason": "The test failures reported here are caused by the test execution triggered by the upstream tool call. The upstream node invoked the tests, and this result node merely captures the output.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The test output is truncated in the preview, but the visible portion clearly shows 3 failures. The full artifact is not marked truncated, so the evidence is sufficient."
+    },
+    "record:responsenode_segment_28_7d0e075a": {
+      "node_ref": "record:responsenode_segment_28_7d0e075a",
+      "component": "result",
+      "event_type": "response.output",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The response output text claims 'All interfaces are implemented and verified' but immediately discloses that the broad test run produced 94/102 passed with 3 edge-case failures. The claim of full verification is contradicted by the disclosed test results, making the node defective. However, the node merely reports the results truthfully; it does not introduce the underlying implementation gaps or the decision to stop despite known failures.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolresult_call_00_RlLel2xHcbURJMzRodXI0112",
+          "reason": "The broad test run (toolresult_call_00_RlLel2xHcbURJMzRodXI0112) produced the 94/102 result that exposed the failures. The response output directly cites this result, so the defect evidence originates from that upstream tool result.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The response output is a truthful summary of the test results and does not fabricate the failure count. The defect is the overclaim of completion, but the root cause lies in the earlier decision to accept the failures and stop, which is not supplied in the upstream nodes. The visible upstream nodes are tool results and changes; the decision-making LLM node is not included."
+    },
+    "record:responseclaim_claim_5075_61e44478": {
+      "node_ref": "record:responseclaim_claim_5075_61e44478",
+      "component": "result",
+      "event_type": "response.claim",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The response claim text states 'All interfaces are implemented and verified' and later discloses a 94/102 test result with 3 known failures. The claim of full verification is contradicted by the disclosed failures, making the node defective. However, the node itself is a truthful report of the test outcome; it does not introduce the defect but exposes it.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:node_5041_d4436c30",
+          "reason": "The LLM call generated the response text that overclaims completion while acknowledging failures. The defect in the response claim originates from this generation step.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The response claim is a truthful report of the test outcome but contains a semantic defect (overclaiming completion). The defect was introduced by the LLM generation that produced the text, not by the claim node itself."
+    },
+    "record:responseclaim_claim_5097_332dbd43": {
+      "node_ref": "record:responseclaim_claim_5097_332dbd43",
+      "component": "result",
+      "event_type": "response.claim",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This response claim truthfully reports the test results (94/102 passed, 3 failures) and lists the supporting infrastructure added. It does not introduce the premature completion defect; it merely documents the state that the upstream LLM call decided to present as 'All interfaces are implemented and verified.' The claim itself is factual evidence of the known failures.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:node_5041_d4436c30",
+          "reason": "The LLM call generated the final answer text that opens with 'All interfaces are implemented and verified' despite the test results showing 3 failures. This upstream node introduced the overclaiming semantics that the current claim then faithfully reproduces.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The hydrated artifact artifact_3153_419ba8b6c9553f58 is not truncated and clearly shows the 94/102 result. The claim is truthful evidence, not the introducer of the defect."
+    },
+    "record:claimsupport_claim_5097_332dbd43": {
+      "node_ref": "record:claimsupport_claim_5097_332dbd43",
+      "component": "result",
+      "event_type": "claim.support_assessment",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "failed_verification_not_linked_to_final_claim",
+      "defect_reason": "This claim support assessment records that the final verification claim was supported by only three narrow smoke-test facts (exit_status 0) while the broader pytest output with three failures was not linked. The assessment itself does not introduce the defect; it documents the evidence gap.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:responseclaim_claim_5097_332dbd43",
+          "reason": "The response claim selected only three narrow smoke-test facts as direct evidence, ignoring the broader pytest failures. This upstream claim is the semantic source of the defective verification scope.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The current node is a claim support assessment that exposes the defect but does not introduce it. The upstream response claim is the earliest node in the supplied list that selected the narrow evidence, making it the defect introduction candidate."
+    },
+    "record:node_4977_888e8cc3": {
+      "node_ref": "record:node_4977_888e8cc3",
+      "component": "tool",
+      "event_type": "tool.call",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "partial_feature_correctness",
+      "defect_reason": "This node is a bash tool execution that runs the comprehensive test suite. Its output truthfully reports 3 test failures (test_generic_computed_field, test_rebuild_model_fields_preserves_description, test_final_to_frozen_with_assignment). It does not introduce any defect; it merely exposes pre-existing failures.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1085_76b39b97",
+          "reason": "The decision node requested this test execution, but the test failures themselves originate from earlier code changes or implementation decisions not captured in the supplied upstream nodes. The decision node propagated the defect by triggering verification that revealed the failures.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The upstream decision node is the only supplied upstream. It requested the test run, but the actual defect introduction (e.g., missing encode_default, lost default value) likely occurred in earlier implementation steps not included in the trace. The current node is purely evidentiary."
+    },
+    "record:toolresult_call_00_RlLel2xHcbURJMzRodXI0112": {
+      "node_ref": "record:toolresult_call_00_RlLel2xHcbURJMzRodXI0112",
+      "component": "tool",
+      "event_type": "tool.result",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This node is a bash tool result that reports test execution output. The downstream taint path shows it was used as evidence for the observed defect 'premature_completion_with_known_failures'. The tool result itself does not introduce the defect; it truthfully exposes the test outcome (94/102 passed, 3 failed) that the agent later misrepresented.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:node_4932_85cd4c92",
+          "reason": "The upstream bash tool call requested the test execution that produced this result. The call itself is not defective; it merely invoked the command that generated the truthful evidence.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The tool result is truncated, but the visible portion (94/102 passed) is independently sufficient to confirm it exposes test failures. The defect is in how the agent later interpreted and reported these results, not in the tool output itself."
+    },
+    "record:node_5041_d4436c30": {
+      "node_ref": "record:node_5041_d4436c30",
+      "component": "llm",
+      "event_type": "llm.call",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The LLM response opens with 'All interfaces are implemented and verified' and lists a summary of implementations, but the hydrated output text later discloses that only 94/102 tests passed (3 failures). The claim of full verification is false and constitutes premature completion with known failures. The defect is present in the response text itself.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The upstream reasoning nodes (dec_1088, dec_1083) show the model was aware of the 94/102 result before producing this response, but the decision to overclaim completion was made at this final response node. No earlier node introduced the false claim."
+    },
+    "record:decisionnode_dec_1085_76b39b97": {
+      "node_ref": "record:decisionnode_dec_1085_76b39b97",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "partial_feature_correctness",
+      "defect_reason": "The node executes a bash command to run comprehensive tests, which is a direct consequence of the upstream reasoning that decided to run a broader test. The downstream taint path shows this led to an observed defect (partial feature correctness). The node itself does not introduce the defect; it propagates the decision to run broad tests instead of addressing specific failures.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1083_bfc033f0",
+          "reason": "The upstream reasoning node explicitly states 'Let me run a broader test to check the overall health of the codebase,' which dismisses narrow verification and leads to the broad test execution that ultimately reveals the defect.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The node is a tool call executing the broad test; the defect was introduced by the upstream reasoning that chose this approach. No evidence suggests this node independently introduced the defect."
+    },
+    "record:node_4932_85cd4c92": {
+      "node_ref": "record:node_4932_85cd4c92",
+      "component": "tool",
+      "event_type": "tool.call",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "judge_error",
+      "defect_reason": "The attribution judge failed before this node could be classified.",
+      "causal_role": "unknown",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": "ValueError: defect_status and has_defect are inconsistent"
+    },
+    "record:decisionnode_dec_1093_ee253ed8": {
+      "node_ref": "record:decisionnode_dec_1093_ee253ed8",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision node explicitly acknowledges 3 known test failures (94/102 passed) but rationalizes them as 'edge cases' and 'version-specific issues' unrelated to the implementation. It then selects 'continue_processing_stream' and opens the final answer with 'All interfaces are implemented and verified,' which is a premature completion claim that dismisses known failures. No upstream node is supplied, so this node is the earliest point where the defect of overclaiming completion while accepting known failures is introduced.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "No upstream nodes are provided in the trace. The decision's rationale directly contains the defective reasoning that dismisses the 3 failures and proceeds to claim full verification. The downstream taint path confirms this node feeds into the overclaiming response."
+    },
+    "record:decisionnode_dec_1090_e3bfddaf": {
+      "node_ref": "record:decisionnode_dec_1090_e3bfddaf",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node's rationale explicitly acknowledges '94 passed, 3 failed' and frames the failures as 'edge cases that don't affect the core requested interfaces.' It then proceeds to request a tool execution to debug only one of the failing tests, implicitly accepting the other failures. This action propagates the premature completion defect by dismissing known failures and narrowing verification scope.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1088_d106d75c",
+          "reason": "The upstream reasoning block (dec_1088_d106d75c) first introduced the dismissal of the 3 failures as 'edge cases that don't affect the core requested interfaces.' The current node's rationale directly quotes and acts upon this defective reasoning, making it a propagation of the upstream defect.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The upstream node is truncated, but the visible preview matches the rationale in the current node, confirming the defect was introduced earlier."
+    },
+    "record:decisionnode_dec_1088_d106d75c": {
+      "node_ref": "record:decisionnode_dec_1088_d106d75c",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision node explicitly acknowledges 3 known failures as 'edge cases that don't affect the core requested interfaces' and chooses to continue processing. This dismisses broad test failures and accepts partial implementation, directly introducing the premature completion defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are supplied. The decision's rationale itself introduces the defect by dismissing known failures and proceeding to claim completion."
+    },
+    "record:decisionnode_dec_1083_bfc033f0": {
+      "node_ref": "record:decisionnode_dec_1083_bfc033f0",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision to 'continue_processing_stream' with the rationale 'Let me run a broader test to check the overall health of the codebase' indicates an intent to proceed despite known failures. This decision dismisses the need for immediate remediation and selects a broad verification approach, which directly leads to the downstream defect of premature completion with known failures. No upstream nodes are provided, so this node is the earliest point where the defective intent is introduced.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are supplied, so the defect is attributed to this decision node. The rationale explicitly states a broad test intent, which aligns with the downstream observation of accepting known failures."
+    },
+    "record:decisionnode_dec_1080_9354875b": {
+      "node_ref": "record:decisionnode_dec_1080_9354875b",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node's rationale preview shows the model reasoning 'All tests pass. Let me now upda...' and the chosen action is 'todowrite' with a todo list that marks 'Run tests to verify implementation' as 'in_progress'. The downstream taint path includes an observed defect of premature completion with known failures, where the agent overclaimed completion despite 3 failed tests. This node's semantics (updating todos based on a false belief that all tests passed) directly carries forward the premature completion defect, but the false belief itself was introduced earlier in the reasoning stream.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1078_8fdc16c3",
+          "reason": "The upstream node 'continue_processing_stream' (dec_1078_8fdc16c3) contains the truncated reasoning 'All tests pass. Let me now upda...' which is the immediate precursor to the current node's todo update. The false belief that all tests passed, leading to premature completion, was introduced in that reasoning block and propagated into this decision to update todos.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The upstream reasoning block is truncated, so the exact moment the model formed the false belief 'All tests pass' cannot be confirmed from the visible excerpt. However, the visible portion strongly suggests the defect was already present in the upstream reasoning."
+    },
+    "record:decisionnode_dec_1078_8fdc16c3": {
+      "node_ref": "record:decisionnode_dec_1078_8fdc16c3",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node's rationale explicitly acknowledges that only 29 out of 30 computed_field tests pass, yet it decides to continue processing and later overclaims completion. This decision propagates the premature completion defect by dismissing the known failure and proceeding to a broad test run that will later be misrepresented.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are supplied, so the defect introduction cannot be attributed to an earlier component. The current node propagates the defect by choosing to continue despite a known test failure, but it is not the first introduction point."
+    },
+    "record:decisionnode_dec_1070_a734cadb": {
+      "node_ref": "record:decisionnode_dec_1070_a734cadb",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a narrow verification command (ensure_property tests) while the upstream reasoning block already set the intent to verify only core interfaces, ignoring the broader test failures that were known. The node propagates the premature-completion defect by acting on the upstream decision to limit verification scope.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1068_06858be5",
+          "reason": "The upstream reasoning block (dec_1068) explicitly states 'Now let me verify the core in...', which introduces the decision to perform narrow verification instead of addressing the known broad test failures. The current node's bash command directly implements that narrow verification.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The upstream reasoning block is truncated, but the visible portion 'Now let me verify the core in' is sufficient to show the intent to narrow verification. The current node's command only tests ensure_property, confirming it acts on that narrowed intent."
+    },
+    "record:decisionnode_dec_1068_06858be5": {
+      "node_ref": "record:decisionnode_dec_1068_06858be5",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision to 'continue_processing_stream' with the intent to 'capture model reasoning emitted by provider' occurs after the downstream observed defect of premature completion with known failures. The rationale focuses on verifying core interfaces with 'quick smoke tests' rather than addressing the broad test failures. This narrow verification scope, combined with the downstream claim of 'All interfaces are implemented and verified' despite known failures, indicates this decision introduced the defect by dismissing broad failures and selecting narrow verification.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.85,
+      "model_notes": "No upstream nodes are provided, so this node is the earliest candidate in the supplied trace. The decision's rationale explicitly limits verification to core interfaces, which aligns with the downstream defect of overclaiming completion while accepting known failures."
+    },
+    "record:decisionnode_dec_1065_56bd57e0": {
+      "node_ref": "record:decisionnode_dec_1065_56bd57e0",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a bash command that runs a narrow, basic test script instead of the broad public test suite that later revealed failures. The decision to run this narrow verification propagates the premature completion defect by avoiding the broader verification that would have exposed the known failures.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1063_94bc4186",
+          "reason": "The upstream reasoning block (dec_1063_94bc4186) likely dismissed the need for broad verification, leading to this narrow bash execution that avoids exposing the failures.",
+          "confidence": 0.85
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The upstream reasoning block is truncated, so the exact rationale for choosing narrow verification is not fully visible, but the causal link is strong."
+    },
+    "record:decisionnode_dec_1064_ad91f6f9": {
+      "node_ref": "record:decisionnode_dec_1064_ad91f6f9",
+      "component": "tool",
+      "event_type": "decision",
+      "has_defect": false,
+      "defect_status": "absent",
+      "defect_type": "",
+      "defect_reason": "This node executes a targeted Python test of _DeprecatedFieldDescriptor basic functionality. The test verifies creation, __set_name__, wrapped_property, and __set__ error behavior. The output is not shown, but the command itself is a narrow, focused verification script. It does not introduce or propagate the premature completion defect; it merely provides evidence about a specific component's behavior. The downstream defect (premature completion with known failures) is about the agent stopping after broad public test failures, not about this narrow unit test.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.95,
+      "model_notes": "The hydrated artifact shows the command but not its output. The command itself is a valid, focused test and does not contain the premature completion defect. No upstream nodes are supplied."
+    },
+    "record:decisionnode_dec_1063_94bc4186": {
+      "node_ref": "record:decisionnode_dec_1063_94bc4186",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision node explicitly chooses to 'skip the deeply nested rebuild issues' and focus only on a narrow set of interfaces, while the downstream taint path shows the agent later overclaimed completion despite known broad test failures. This decision introduces the premature completion defect by dismissing broader verification scope.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are supplied, so this node is the earliest available trace fact. The rationale explicitly narrows focus and skips known issues, which aligns with the downstream overclaiming of completion."
+    },
+    "record:decisionnode_dec_1058_a1c3ddfe": {
+      "node_ref": "record:decisionnode_dec_1058_a1c3ddfe",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "judge_error",
+      "defect_reason": "The attribution judge failed before this node could be classified.",
+      "causal_role": "unknown",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": "ValueError: defect_status and has_defect are inconsistent"
+    },
+    "record:decisionnode_dec_1050_b5a8936d": {
+      "node_ref": "record:decisionnode_dec_1050_b5a8936d",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This node executes a grep tool call to search for 'def model_rebuild' in the codebase. The rationale shows the model is investigating why model_rebuild() loses field descriptions, which is part of the broader defect of premature completion with known failures. The grep action itself does not introduce the defect; it is a diagnostic step that propagates the existing investigation into the incomplete implementation.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1048_61477e0d",
+          "reason": "The upstream reasoning block (dec_1048_61477e0d) contains the model's analysis of the test flow and the issue with model_rebuild() losing docstring descriptions. This reasoning directly leads to the grep action, propagating the defect investigation downstream.",
+          "confidence": 0.85
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.85,
+      "model_notes": "The grep action is a diagnostic step, not the introduction of the defect. The defect (premature completion with known failures) was already present in the upstream reasoning and decision-making process."
+    },
+    "record:decisionnode_dec_1048_61477e0d": {
+      "node_ref": "record:decisionnode_dec_1048_61477e0d",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The processor's decision to 'continue_processing_stream' explicitly rationalizes about a known test failure (description lost after model_rebuild) and chooses to proceed without addressing it. This decision dismisses the broad failure and selects narrow verification, directly introducing the premature completion defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.85,
+      "model_notes": "No upstream nodes are supplied, so this node is the earliest available. The rationale shows awareness of the defect and a deliberate choice to continue, making it the introduction point in the trace."
+    },
+    "record:decisionnode_dec_1045_d08a054c": {
+      "node_ref": "record:decisionnode_dec_1045_d08a054c",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a bash command to run a specific failing test, but the rationale shows the agent is aware of 3 failures and is proceeding to investigate them. The downstream taint path indicates the agent later overclaimed completion. This node propagates the premature completion defect by continuing to act on incomplete verification without addressing the known failures, but it does not introduce the defect itself.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1043_2e1d7ef0",
+          "reason": "The upstream reasoning block (dec_1043_2e1d7ef0) acknowledges 94 passed and 3 failed, setting the context of known failures. This node inherits that defective context and acts on it by running a specific test, propagating the premature completion defect.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The upstream node is truncated, but the visible excerpt confirms awareness of 94 passed and 3 failed, which is sufficient to establish defect propagation."
+    },
+    "record:decisionnode_dec_1043_2e1d7ef0": {
+      "node_ref": "record:decisionnode_dec_1043_2e1d7ef0",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision node explicitly acknowledges 3 known failures (94 passed, 3 failed) and then chooses to continue processing the stream without addressing them. The rationale lists the failures and states 'Let me look at the first two tests,' indicating awareness of incomplete verification. This decision dismisses the broad failures and proceeds, directly introducing the premature completion defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are supplied, so this node is the earliest available point where the defect is introduced. The decision to continue despite known failures is the semantic root within the provided trace."
+    },
+    "record:decisionnode_dec_1040_fc606a1d": {
+      "node_ref": "record:decisionnode_dec_1040_fc606a1d",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a bash command that runs a broad test suite (fields and computed fields). The downstream taint path shows that the agent later overclaimed completion while knowing about failures. This node's action of running the broad tests is not itself defective, but it propagates the upstream decision to skip the deprecated test file and run only these tests, which contributes to the premature completion defect.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1038_133b8b1b",
+          "reason": "The upstream reasoning block explicitly decides to skip the deprecated test file and run only the other test files, which narrows the verification scope and leads to the premature completion defect.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The current node executes the narrowed test run as decided upstream. It does not introduce the defect but propagates it by acting on the upstream decision."
+    },
+    "record:decisionnode_dec_1038_133b8b1b": {
+      "node_ref": "record:decisionnode_dec_1038_133b8b1b",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision explicitly acknowledges a known failure ('The deprecated test file requires a specific pytest mark') and chooses to skip it ('Let me just skip it and run the other test files'). This dismisses a broad failure and selects a narrow verification path, directly introducing the premature completion defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are provided, and the decision's rationale contains the first semantic act of dismissing a known failure to proceed with a narrower scope, which aligns with the objective's description of the defect introduction."
+    },
+    "record:decisionnode_dec_1025_fb9cee1f": {
+      "node_ref": "record:decisionnode_dec_1025_fb9cee1f",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This node executes an edit that adds 'rebuild_model_fields' to an import list. The edit itself is a narrow, local code change. The downstream defect is premature completion with known failures, which is a process-level defect (stopping early and overclaiming). This edit does not introduce that process defect; it merely propagates the ongoing task execution. The upstream reasoning node shows the same intent without acknowledging the broader test failures, so the defect of ignoring broad failures was already present.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1023_911a7f4a",
+          "reason": "The upstream reasoning node (dec_1023_911a7f4a) shows the model's intent to perform a narrow edit without addressing the known broad test failures. This indicates the defect (focusing on narrow implementation while ignoring known failures) was already introduced upstream.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The current node is a tool-call decision executing an edit. The defect is a process-level premature completion, not a code-level bug in this specific edit. The upstream reasoning node already exhibits the same narrow focus, so this node propagates rather than introduces the defect."
+    },
+    "record:decisionnode_dec_1023_911a7f4a": {
+      "node_ref": "record:decisionnode_dec_1023_911a7f4a",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision to continue_processing_stream with the rationale 'I need to add `rebuild_model_fields` to both import lists. Let me update them:' shows the agent is proceeding with a narrow code change while ignoring the broader test failures (3 failed, 94 passed) that were already known downstream. The intent 'capture model reasoning emitted by provider' indicates this is a reasoning block, not a verification step. The node propagates the premature completion defect by continuing the stream without addressing the known failures.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.85,
+      "model_notes": "No upstream nodes are supplied, so this node cannot be marked as root cause. The defect was introduced earlier in the trace (likely when the agent first dismissed the broad test failures), but that introduction node is not provided in the upstream_nodes list. This node propagates the existing defect by continuing processing without addressing the known failures."
+    },
+    "record:decisionnode_dec_1020_b950758f": {
+      "node_ref": "record:decisionnode_dec_1020_b950758f",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a grep for 'rebuild_model_fields' based on reasoning that acknowledges a missing import. This action is a direct consequence of the upstream reasoning block that identified the missing import but did not address the broader verification gap. The grep itself does not introduce the premature completion defect; it merely carries forward the existing incomplete fix strategy.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1018_7da30ea2",
+          "reason": "The upstream reasoning block (dec_1018) identified the missing import but focused on a narrow fix, setting the stage for the agent to later dismiss broad test failures. This grep action is a direct tool execution of that narrow reasoning.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The upstream node is truncated, but the visible excerpt confirms the reasoning about the missing import. The grep action itself is not defective; it is a symptom of the earlier decision to pursue a narrow fix."
+    },
+    "record:decisionnode_dec_1018_7da30ea2": {
+      "node_ref": "record:decisionnode_dec_1018_7da30ea2",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The decision rationale explicitly acknowledges a missing import (`rebuild_model_fields` is called but not imported) and plans to add it, yet the chosen action is `continue_processing_stream`. This indicates the agent is aware of an incomplete implementation but proceeds without resolving it, directly introducing the premature completion defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "No upstream nodes are provided, so this node is the earliest available point where the defect is introduced. The rationale shows awareness of an unresolved issue, making it a strong root-cause candidate."
+    },
+    "record:decisionnode_dec_1015_042a2af5": {
+      "node_ref": "record:decisionnode_dec_1015_042a2af5",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node executes a grep for 'rebuild_model_fields' import, which is a step in a debugging process that ultimately leads to the premature completion defect. The node itself does not introduce the defect; it is a tool call made in response to a reasoning block that is already investigating a missing function, propagating the investigation toward the eventual defective conclusion.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_1013_d1df4be0",
+          "reason": "The upstream reasoning block 'continue_processing_stream' explicitly states the model is looking for 'rebuild_model_fields' because it is 'still not found', indicating the defect investigation was already underway. The grep call is a direct consequence of that reasoning.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "low",
+      "confidence": 0.9,
+      "model_notes": "The grep call is a neutral tool execution. Its defectiveness is derived entirely from the upstream reasoning context that initiated it."
+    },
+    "record:decisionnode_dec_1013_d1df4be0": {
+      "node_ref": "record:decisionnode_dec_1013_d1df4be0",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "The node's rationale explicitly acknowledges a missing function (`rebuild_model_fields`) and continues processing the stream despite this unresolved failure. This action propagates the premature completion defect by proceeding without resolving the known issue, which later leads to overclaiming completion.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.85,
+      "model_notes": "No upstream nodes are provided, so the defect cannot be attributed to an earlier component. The node itself does not introduce the defect but propagates it by continuing despite a known failure. The root cause likely lies in an earlier decision or code change that introduced the missing function issue."
+    }
+  },
+  "visited_order": [
+    "record:missing_semantic_final_test_result",
+    "record:observed_defect_missing_verification_after_change",
+    "record:observed_defect_feature_implementation_partial_feature_correctness",
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+    "record:observed_defect_trace_evidence_linking_failed_verification_not_linked_to_final_claim",
+    "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+    "record:responsenode_segment_28_7d0e075a",
+    "record:responseclaim_claim_5075_61e44478",
+    "record:responseclaim_claim_5097_332dbd43",
+    "record:claimsupport_claim_5097_332dbd43",
+    "record:node_4977_888e8cc3",
+    "record:toolresult_call_00_RlLel2xHcbURJMzRodXI0112",
+    "record:node_5041_d4436c30",
+    "record:decisionnode_dec_1085_76b39b97",
+    "record:node_4932_85cd4c92",
+    "record:decisionnode_dec_1093_ee253ed8",
+    "record:decisionnode_dec_1090_e3bfddaf",
+    "record:decisionnode_dec_1088_d106d75c",
+    "record:decisionnode_dec_1083_bfc033f0",
+    "record:decisionnode_dec_1080_9354875b",
+    "record:decisionnode_dec_1078_8fdc16c3",
+    "record:decisionnode_dec_1070_a734cadb",
+    "record:decisionnode_dec_1068_06858be5",
+    "record:decisionnode_dec_1065_56bd57e0",
+    "record:decisionnode_dec_1064_ad91f6f9",
+    "record:decisionnode_dec_1063_94bc4186",
+    "record:decisionnode_dec_1058_a1c3ddfe",
+    "record:decisionnode_dec_1050_b5a8936d",
+    "record:decisionnode_dec_1048_61477e0d",
+    "record:decisionnode_dec_1045_d08a054c",
+    "record:decisionnode_dec_1043_2e1d7ef0",
+    "record:decisionnode_dec_1040_fc606a1d",
+    "record:decisionnode_dec_1038_133b8b1b",
+    "record:decisionnode_dec_1025_fb9cee1f",
+    "record:decisionnode_dec_1023_911a7f4a",
+    "record:decisionnode_dec_1020_b950758f",
+    "record:decisionnode_dec_1018_7da30ea2",
+    "record:decisionnode_dec_1015_042a2af5",
+    "record:decisionnode_dec_1013_d1df4be0"
+  ],
+  "unresolved_refs": [],
+  "trace_improvement_report": {
+    "summary": {
+      "blocking_gap_count": 6,
+      "recommended_change_count": 5,
+      "analysis_confidence": "limited"
+    },
+    "blocking_gaps": [
+      {
+        "gap_type": "judge_error",
+        "node_ref": "",
+        "component": "attribution",
+        "event_type": "node_judgment",
+        "why_it_blocks_root_cause_analysis": "One or more nodes could not be classified by the offline judge. They remain unknown and are never promoted to root causes.",
+        "missing_semantic_fields": [
+          "completed_node_judgment"
+        ],
+        "related_refs": [
+          "record:node_4932_85cd4c92",
+          "record:decisionnode_dec_1058_a1c3ddfe"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:missing_semantic_final_test_result",
+        "component": "trace",
+        "event_type": "case.missing_semantic",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: This offline record declares an observability gap. It does not prove that any cited execution or change node introduced a behavioral defect.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:missing_semantic_final_test_result"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:observed_defect_missing_verification_after_change",
+        "component": "trace",
+        "event_type": "case.observed_defect",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: This offline record declares an observability gap. It does not prove that any cited execution or change node introduced a behavioral defect.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:observed_defect_missing_verification_after_change"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:node_4932_85cd4c92",
+        "component": "tool",
+        "event_type": "tool.call",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: ValueError: defect_status and has_defect are inconsistent",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:node_4932_85cd4c92"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:decisionnode_dec_1058_a1c3ddfe",
+        "component": "processor",
+        "event_type": "decision",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: ValueError: defect_status and has_defect are inconsistent",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:decisionnode_dec_1058_a1c3ddfe"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "defective_node_points_to_nondefective_upstream",
+        "node_ref": "",
+        "component": "trace_provenance",
+        "event_type": "semantic_edge",
+        "why_it_blocks_root_cause_analysis": "A defective node claimed an upstream cause, but that upstream node was judged non-defective. This often indicates overly broad provenance edges, missing intermediate semantic nodes, or insufficient context for judging the upstream node.",
+        "missing_semantic_fields": [
+          "edge_reason",
+          "intermediate_semantic_node",
+          "upstream_usage_context"
+        ],
+        "related_refs": [
+          "record:observed_defect_trace_evidence_linking_failed_verification_not_linked_to_final_claim->record:missing_semantic_final_test_result",
+          "record:toolresult_call_00_RlLel2xHcbURJMzRodXI0112->record:node_4932_85cd4c92"
+        ],
+        "confidence": 0.8
+      }
+    ],
+    "recommended_trace_changes": [
+      {
+        "component": "attribution",
+        "priority": "high",
+        "change": "Retry unknown node judgments with a complete schema, bounded prompt, and sufficient request timeout.",
+        "unblocks": [
+          "judge_error"
+        ]
+      },
+      {
+        "component": "trace",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "tool",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "processor",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "trace_provenance",
+        "priority": "high",
+        "change": "For each source_ref/dataflow edge, record why the upstream fact was used, which downstream decision or claim consumed it, and whether the edge is direct evidence, contextual support, or legacy noise.",
+        "unblocks": [
+          "defective_node_points_to_nondefective_upstream"
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "analysis": "backward_semantic_taint",
+    "max_depth": 12,
+    "max_nodes": 96,
+    "judge_timeout_seconds": 3600.0,
+    "judge_thinking_mode": "auto",
+    "judge_thinking_config": {
+      "type": "disabled"
+    },
+    "judge_error_count": 2,
+    "judge_errors": [
+      {
+        "node_ref": "record:node_4932_85cd4c92",
+        "error": "ValueError: defect_status and has_defect are inconsistent"
+      },
+      {
+        "node_ref": "record:decisionnode_dec_1058_a1c3ddfe",
+        "error": "ValueError: defect_status and has_defect are inconsistent"
+      }
+    ],
+    "analysis_outcome": "root_found",
+    "termination_reason": "queue_exhausted",
+    "artifact_hydration": {
+      "referenced": 2995,
+      "indexed": 3164,
+      "requested_nodes": 71,
+      "loaded": 30,
+      "missing": 0,
+      "truncated": 8,
+      "artifact_root": "/private/tmp/observable-opencode-featurebench-loop3e/traces/pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1"
+    },
+    "message_lineage": {
+      "version": "1.0",
+      "collection_mode": "offline_passive_reconstruction",
+      "behavior_impact": "none",
+      "stats": {
+        "turn_count": 212,
+        "snapshot_count": 1682,
+        "edge_count": 1256,
+        "confirmed_edge_count": 362,
+        "content_matched_edge_count": 653,
+        "temporal_inferred_edge_count": 241,
+        "attribution_eligible_edge_count": 1015,
+        "gap_count": 0
+      }
+    }
+  }
+}

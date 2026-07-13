@@ -118,8 +118,8 @@
 - Consumes: prior Pydantic `trace.json` and review JSON
 - Produces: old/new attribution comparison and acceptance result
 
-- [ ] Build lineage for the prior trace and verify `dec_1093` is reachable.
-- [ ] Run DeepSeek V4 Pro attribution with one-hour per-request timeout.
-- [ ] Confirm pytest evidence and missing-semantic code changes are not roots.
-- [ ] Confirm the analyzer visits `dec_1093` or report the precise remaining blocker.
-- [ ] Run `git diff --check`, all Python tests, TypeScript typecheck, and focused trace tests.
+- [x] Build lineage for the prior trace and verify `dec_1093` is reachable.
+- [x] Run DeepSeek V4 Pro attribution with one-hour per-request timeout.
+- [x] Confirm pytest evidence and missing-semantic code changes are not roots.
+- [x] Confirm the analyzer visits `dec_1093` or report the precise remaining blocker.
+- [x] Run `git diff --check`, all Python tests, TypeScript typecheck, and focused trace tests.

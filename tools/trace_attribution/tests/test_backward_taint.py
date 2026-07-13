@@ -673,6 +673,106 @@ class TraceGraphTest(unittest.TestCase):
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_defers_llm_surface_root_until_reconstructed_decisions_are_judged(self):
+        trace = {
+            "case_id": "deferred-surface-root-case",
+            "records": [
+                {
+                    "record_id": "scope_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_id": "dec_scope",
+                        "decision_type": "reasoning_block",
+                        "rationale": "Known failures are outside scope, so narrow verification is sufficient.",
+                    },
+                },
+                {
+                    "record_id": "final_llm",
+                    "component": "llm",
+                    "event_type": "llm.call",
+                    "data": {"output_text": "All requested behavior is implemented and verified."},
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:final_llm"],
+                    "data": {"failure_type": "premature_completion"},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "decision", "id": "dec_scope"},
+                    "to": {"type": "record", "id": "final_llm"},
+                    "relation": "retained_in_context",
+                }
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:final_llm": NodeJudgment(
+                    node_ref="record:final_llm",
+                    component="llm",
+                    event_type="llm.call",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="premature_completion",
+                    defect_reason="The model emitted an overclaim.",
+                    causal_role="defect_introduction",
+                    influenced_by=[],
+                    is_root_cause=True,
+                ),
+                "record:scope_decision": NodeJudgment(
+                    node_ref="record:scope_decision",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="incorrect_scope_assessment",
+                    defect_reason="The decision incorrectly dismissed relevant failures.",
+                    causal_role="defect_introduction",
+                    influenced_by=[],
+                    is_root_cause=True,
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertIn("record:scope_decision", report.visited_order)
+        self.assertEqual([item.node_ref for item in report.root_causes], ["record:scope_decision"])
+        self.assertIn(
+            ["record:observed", "record:final_llm", "record:scope_decision"],
+            report.taint_paths,
+        )
+
+    def test_trace_health_missing_verification_observation_is_a_gap_not_a_behavioral_defect(self):
+        trace = {
+            "case_id": "trace-health-gap-case",
+            "records": [
+                {"record_id": "change_1", "component": "tool", "event_type": "change"},
+                {
+                    "record_id": "trace_gap",
+                    "component": "trace",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change_1"],
+                    "data": {
+                        "issue_kind": "missing_verification_after_change",
+                        "failure_type": "final_test_result_missing",
+                    },
+                },
+            ],
+        }
+        judge = FakeJudge({})
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls, [])
+        self.assertNotIn("record:change_1", report.visited_order)
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:trace_gap"].causal_role, "unknown")
+
     def test_report_records_message_lineage_summary(self):
         report = BackwardTaintAnalyzer(judge=FakeJudge({})).analyze(
             TraceGraph.from_trace(sample_trace()),
