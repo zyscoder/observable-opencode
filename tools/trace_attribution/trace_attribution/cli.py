@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Optional
 
 from .analyzer import BackwardTaintAnalyzer
-from .claude import ClaudeJudgeClient
+from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
 from .graph import TraceGraph
 from .quality_review import inject_quality_gap_records
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run backward semantic taint attribution on trace.json.")
     parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
     parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
@@ -25,8 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--judge-timeout-sec",
         type=float,
-        default=None,
-        help="HTTP timeout in seconds for each judge/repair request; defaults to CLAUDE_TIMEOUT_SECONDS or SDK default.",
+        default=default_judge_timeout_seconds(),
+        help="Timeout in seconds for each judge/repair request; defaults to CLAUDE_TIMEOUT_SECONDS or 3600.",
     )
     parser.add_argument(
         "--judge-max-tokens",
@@ -34,9 +34,15 @@ def parse_args() -> argparse.Namespace:
         default=4096,
         help="Max output tokens for each judge call; reasoning models may need extra room for JSON text.",
     )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("auto", "enabled", "disabled"),
+        default="auto",
+        help="Judge thinking mode. Auto disables thinking for the DeepSeek Anthropic endpoint.",
+    )
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--max-nodes", type=int, default=48)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -49,6 +55,7 @@ def main() -> int:
         base_url_env=args.base_url_env,
         max_tokens=args.judge_max_tokens,
         timeout_seconds=args.judge_timeout_sec,
+        thinking_mode=args.thinking_mode,
     )
     report = BackwardTaintAnalyzer(judge=judge, max_depth=args.max_depth, max_nodes=args.max_nodes).analyze(
         graph,
@@ -67,7 +74,7 @@ def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGra
     if review_path:
         review = json.loads(review_path.read_text(encoding="utf-8"))
         trace = inject_quality_gap_records(trace, review)
-    return TraceGraph.from_trace(trace)
+    return TraceGraph.from_trace(trace, artifact_root=trace_path.parent)
 
 
 if __name__ == "__main__":

@@ -9,34 +9,34 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
     blocking_gaps: List[JsonDict] = []
     recommendations: List[JsonDict] = []
 
+    if not report.start_refs:
+        blocking_gaps.append(
+            {
+                "gap_type": "no_analysis_start",
+                "node_ref": "",
+                "component": "trace_graph",
+                "event_type": "analysis_start",
+                "why_it_blocks_root_cause_analysis": (
+                    "The trace contains no final response, explicit observed defect, quality gap, "
+                    "missing-semantic assertion, failed case, or response claim that can start backward analysis."
+                ),
+                "missing_semantic_fields": ["analysis_start_node"],
+                "related_refs": [],
+                "confidence": 1.0,
+            }
+        )
+        add_recommendation(
+            recommendations,
+            component="trace_graph",
+            priority="high",
+            change="Record a final response or explicit offline evaluation assertion before running attribution.",
+            unblocks=["no_analysis_start"],
+        )
+
     for root in report.root_causes:
         node = graph.nodes.get(root.node_ref)
         if not node:
             continue
-        if root.defect_type == "judge_error":
-            add_gap(
-                blocking_gaps,
-                gap_type="judge_error",
-                node=node,
-                why=(
-                    "The offline attribution judge failed or timed out on this node. "
-                    "The analyzer preserved a partial boundary candidate, but the root cause "
-                    "needs a smaller prompt, stricter timeout, or retry with more compact trace context."
-                ),
-                missing_semantic_fields=["judge_response", "completed_node_judgment"],
-                related_refs=[root.node_ref],
-                confidence=root.confidence,
-            )
-            add_recommendation(
-                recommendations,
-                component="attribution",
-                priority="high",
-                change=(
-                    "Use per-node timeouts, compact node prompts, partial report checkpoints, and a fallback "
-                    "non-LLM boundary judgment when the judge request fails."
-                ),
-                unblocks=["judge_error"],
-            )
         if root.confidence < 0.7:
             add_gap(
                 blocking_gaps,
@@ -108,6 +108,101 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
                 ),
                 unblocks=["answer_surface_root_cause"],
             )
+
+    if report.metadata.get("judge_error_count", 0):
+        judge_error_refs = [
+            str(item.get("node_ref") or "")
+            for item in report.metadata.get("judge_errors", [])
+            if isinstance(item, dict) and item.get("node_ref")
+        ]
+        blocking_gaps.append(
+            {
+                "gap_type": "judge_error",
+                "node_ref": "",
+                "component": "attribution",
+                "event_type": "node_judgment",
+                "why_it_blocks_root_cause_analysis": (
+                    "One or more nodes could not be classified by the offline judge. "
+                    "They remain unknown and are never promoted to root causes."
+                ),
+                "missing_semantic_fields": ["completed_node_judgment"],
+                "related_refs": judge_error_refs,
+                "confidence": 1.0,
+            }
+        )
+        add_recommendation(
+            recommendations,
+            component="attribution",
+            priority="high",
+            change="Retry unknown node judgments with a complete schema, bounded prompt, and sufficient request timeout.",
+            unblocks=["judge_error"],
+        )
+
+    for ref, judgment in report.node_judgments.items():
+        if judgment.defect_status != "unknown":
+            continue
+        node = graph.nodes.get(ref)
+        if not node:
+            continue
+        serialized = str(node.data)
+        has_artifact_reference = "artifact_id" in serialized or "payload_ref" in serialized
+        has_hydrated_artifact = bool(node.data.get("hydrated_artifacts"))
+        gap_component = "attribution_hydration" if has_artifact_reference and not has_hydrated_artifact else node.component
+        missing_fields = (
+            ["hydrated_artifact_content"]
+            if gap_component == "attribution_hydration"
+            else ["decisive_semantic_evidence"]
+        )
+        detail = judgment.model_notes or judgment.defect_reason or "The judge could not classify this node."
+        add_gap(
+            blocking_gaps,
+            gap_type="unknown_node_judgment",
+            node=node,
+            why=(
+                "Backward analysis could not classify this node as defective or non-defective. "
+                f"Blocking detail: {detail}"
+            ),
+            missing_semantic_fields=missing_fields,
+            related_refs=[ref],
+            confidence=1.0,
+        )
+        blocking_gaps[-1]["component"] = gap_component
+        add_recommendation(
+            recommendations,
+            component=gap_component or "trace",
+            priority="high",
+            change=(
+                "Hydrate the cited trace artifact before judging this node."
+                if gap_component == "attribution_hydration"
+                else "Record or expose the decisive semantic evidence needed to classify this node."
+            ),
+            unblocks=["unknown_node_judgment"],
+        )
+
+    termination_reason = report.metadata.get("termination_reason")
+    if termination_reason in ("depth_limit", "node_limit"):
+        blocking_gaps.append(
+            {
+                "gap_type": "analysis_search_limit",
+                "node_ref": "",
+                "component": "attribution",
+                "event_type": "analysis_boundary",
+                "why_it_blocks_root_cause_analysis": (
+                    f"Backward traversal stopped at the configured {termination_reason}; "
+                    "unvisited upstream nodes may still contain the defect-introduction point."
+                ),
+                "missing_semantic_fields": [],
+                "related_refs": report.visited_order,
+                "confidence": 1.0,
+            }
+        )
+        add_recommendation(
+            recommendations,
+            component="attribution",
+            priority="high",
+            change="Increase traversal bounds or narrow the start set while preserving every causal predecessor.",
+            unblocks=["analysis_search_limit"],
+        )
 
     if report.unresolved_refs:
         blocking_gaps.append(
@@ -292,6 +387,11 @@ def add_recommendation(
 
 
 def analysis_confidence(blocking_gaps: List[JsonDict], report: AttributionReport) -> str:
+    outcome = report.metadata.get("analysis_outcome")
+    if outcome == "no_defect":
+        return "no_defect"
+    if outcome == "inconclusive":
+        return "blocked"
     if not report.root_causes:
         return "blocked"
     limited_gap_types = {

@@ -1198,6 +1198,95 @@ describe("case trace", () => {
     expect(claimText).toContain("pricing tests passed")
   })
 
+  test("keeps short verification conclusions as atomic response claims", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-short-verification-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "short-verification-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "全部通过。\\n\\n## 测试脚本说明\\n\\n| 脚本 | 命令 | 覆盖风险 |\\n|---|---|---|\\n| owner.test.mjs | npm test | 模块归属 |" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "short-verification-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "short-verification-claim-case", "trace.json"), "utf8"),
+    ) as any
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const claimText = claims.map((record: any) => record.data.text).join("\n")
+
+    expect(claimText).toContain("全部通过。")
+    expect(claimText).not.toContain("测试脚本说明")
+    expect(claimText).not.toContain("脚本: 命令")
+  })
+
+  test("binds verification claims to the effective repository revision", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-revision-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "revision-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ verification_id: "baseline", command: "npm test", exit_code: 1, status: "failed", stderr: "1 test failed" })`,
+        `CaseTrace.change({ change_id: "implementation", files: ["src/owner.mjs"], diff: "-return 'legacy'\\n+return 'billing-platform'" })`,
+        `CaseTrace.verification({ verification_id: "post_change", command: "npm test", exit_code: 0, status: "passed", stdout: "all tests passed" })`,
+        `CaseTrace.responseOutput({ text: "全部通过。", source_refs: ["verification:baseline", "change:implementation", "verification:post_change"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "revision-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "revision-claim-case", "trace.json"), "utf8")) as any
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+
+    expect(claim.data.claim_kind).toBe("verification")
+    expect(claim.data.temporal_scope).toBe("current_revision")
+    expect(claim.data.repository_revision).toBe(1)
+    expect(claim.data.direct_support_refs).toContain("verification:post_change")
+    expect(claim.data.direct_support_refs).not.toContain("verification:baseline")
+    expect(claim.data.superseded_evidence_refs).toContain("verification:baseline")
+  })
+
   test("drops localized key-value table headers from response claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v58-table-header-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -1990,6 +2079,136 @@ describe("case trace", () => {
     expect(JSON.stringify(trace.records)).not.toContain("private/tmp/project/src/pricing.mjs")
   })
 
+  test("converges tool span and lifecycle events into one canonical tool record", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-canonical-tool-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "canonical-tool.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "read", input: { callID: "call_canonical", tool: "read", args: { path: "src/owner.mjs" } } })`,
+        `span?.event({ event_type: "tool.call", data: { callID: "call_canonical", tool: "read", args: { path: "src/owner.mjs" } } })`,
+        `span?.event({ event_type: "tool.result", data: { callID: "call_canonical", tool: "read", args: { path: "src/owner.mjs" }, output: "export const owner = 'billing-platform'" } })`,
+        `span?.end({ output: { content: "export const owner = 'billing-platform'" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "canonical-tool-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "canonical-tool-case", "trace.json"), "utf8")) as any
+    const calls = trace.records.filter(
+      (record: any) =>
+        record.event_type === "tool.call" &&
+        (record.data.call_id === "call_canonical" || record.data.input?.callID === "call_canonical"),
+    )
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].status).toBe("success")
+    expect(calls[0].data.request_status).toBe("completed")
+    expect(calls[0].data.output).toBeDefined()
+  })
+
+  test("keeps path-only directory listings out of semantic facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-path-listing-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "path-listing.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "directory_listing", summary: "src/owner.mjs\\nsrc/pricing.mjs", data: { output: "src/owner.mjs\\nsrc/pricing.mjs" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "path-listing-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "path-listing-case", "trace.json"), "utf8")) as any
+    expect(trace.records.some((record: any) => record.event_type === "evidence.semantic_fact")).toBe(false)
+    expect(trace.records.some((record: any) => record.event_type === "execution.observation")).toBe(true)
+  })
+
+  test("aggregates repeated no-op compaction checks", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-compaction-check-aggregate-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "compaction-check-aggregate.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.compactionCheck({ session_id: "ses_aggregate", model_id: "deepseek-v4-pro", token_estimate: 100, context_limit: 1000, overflow: false, selected_algorithm: "head-tail-summary" })`,
+        `CaseTrace.compactionCheck({ session_id: "ses_aggregate", model_id: "deepseek-v4-pro", token_estimate: 140, context_limit: 1000, overflow: false, selected_algorithm: "head-tail-summary" })`,
+        `CaseTrace.compactionCheck({ session_id: "ses_aggregate", model_id: "deepseek-v4-pro", token_estimate: 180, context_limit: 1000, overflow: false, selected_algorithm: "head-tail-summary" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "compaction-check-aggregate-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "compaction-check-aggregate-case", "trace.json"), "utf8"),
+    ) as any
+    const checks = trace.records.filter((record: any) => record.event_type === "context.compaction_check")
+
+    expect(checks).toHaveLength(1)
+    expect(checks[0].data.check_count).toBe(3)
+    expect(checks[0].data.first_token_estimate).toBe(100)
+    expect(checks[0].data.token_estimate).toBe(180)
+  })
+
   test("downgrades earlier default user-visible responses to intermediate summaries", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-response-roles-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -2190,7 +2409,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.compaction({ trigger: "auto", provider_id: "deepseek", model_id: "unit-test", input_tokens: 1200, context_limit: 1000, selected_head_messages: 1, selected_tail_messages: 2, serialized_tail: "tail " + "x".repeat(1000), output_summary: "summary " + "y".repeat(1000), auto_continue: true, result: "continue", source_refs: ["context:ctx_before"], context_ledger: { algorithm: "head-tail-summary", token_estimate_before: 1200, token_estimate_after: 300, retained_message_ids: ["msg_head", "msg_tail"], dropped_message_ids: ["msg_old"], retained_fact_refs: ["evidence:fact_keep"], dropped_fact_refs: ["evidence:fact_drop"], auto_continue_prompt_ref: "message:msg_continue" }, metadata: { after_context_refs: ["context:ctx_after"] } })`,
+        `CaseTrace.compaction({ trigger: "auto", provider_id: "deepseek", model_id: "unit-test", input_tokens: 1200, context_limit: 1000, selected_head_messages: 1, selected_tail_messages: 2, input_message_count: 12, compaction_request_message_count: 4, output_message_count: 3, serialized_tail: "tail " + "x".repeat(1000), output_summary: "summary " + "y".repeat(1000), auto_continue: true, result: "continue", source_refs: ["context:ctx_before"], context_ledger: { algorithm: "head-tail-summary", algorithm_version: "head-tail-summary/v1", token_estimate_before: 1200, token_estimate_after: 300, retained_message_ids: ["msg_head", "msg_tail"], dropped_message_ids: ["msg_old"], retained_fact_refs: ["evidence:fact_keep"], dropped_fact_refs: ["evidence:fact_drop"], auto_continue_prompt_ref: "message:msg_continue" }, metadata: { after_context_refs: ["context:ctx_after"] } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -2219,6 +2438,10 @@ describe("case trace", () => {
     const compaction = trace.records.find((record: any) => record.event_type === "context.compaction")
 
     expect(compaction.data.algorithm).toBe("head-tail-summary")
+    expect(compaction.data.algorithm_version).toBe("head-tail-summary/v1")
+    expect(compaction.data.input_message_count).toBe(12)
+    expect(compaction.data.compaction_request_message_count).toBe(4)
+    expect(compaction.data.output_message_count).toBe(3)
     expect(compaction.data.before_context_refs).toEqual(["context:ctx_before"])
     expect(compaction.data.after_context_refs).toEqual(["context:ctx_after"])
     expect(compaction.data.serialized_tail_artifact_ref).toBeTruthy()
@@ -2668,10 +2891,14 @@ describe("case trace", () => {
     expect(manifest.server_status).toBe("cancelled")
     expect(manifest.process_status).toBe("cancelled")
     expect(manifest.server_shutdown_reason).toBe("process_signal")
+    expect(manifest.shutdown_signal).toBe("SIGINT")
+    expect(manifest.shutdown_disposition).toBe("graceful_after_case_completion")
     expect(caseRecord.data.case_status).toBe("success")
     expect(caseRecord.data.server_status).toBe("cancelled")
     expect(caseRecord.data.process_status).toBe("cancelled")
     expect(caseRecord.data.server_shutdown_reason).toBe("process_signal")
+    expect(caseRecord.data.shutdown_signal).toBe("SIGINT")
+    expect(caseRecord.data.shutdown_disposition).toBe("graceful_after_case_completion")
   })
 
   test("does not infer case success from an implicit final response after cancellation", async () => {
@@ -2718,8 +2945,12 @@ describe("case trace", () => {
 
     expect(manifest.server_status).toBe("cancelled")
     expect(manifest.case_status).toBe("cancelled")
+    expect(manifest.shutdown_signal).toBe("SIGTERM")
+    expect(manifest.shutdown_disposition).toBe("interrupted_before_case_completion")
     expect(caseRecord).toBeTruthy()
     expect(caseRecord.data.case_status).toBe("cancelled")
+    expect(caseRecord.data.shutdown_signal).toBe("SIGTERM")
+    expect(caseRecord.data.shutdown_disposition).toBe("interrupted_before_case_completion")
     expect(response.data.metadata.finality_source).toBe("inferred")
     expect(trace.records.some((record: any) => record.event_type === "case.completed")).toBe(false)
   })
@@ -4045,9 +4276,7 @@ describe("case trace", () => {
       line: 11,
       column: 13,
     })
-    const provenance = JSON.parse(
-      await fs.readFile(path.join(dir, "failure-parse-case", "trace.json"), "utf8"),
-    ) as any
+    const provenance = JSON.parse(await fs.readFile(path.join(dir, "failure-parse-case", "trace.json"), "utf8")) as any
     const verification = provenance.records.find((record: any) => record.event_type === "verification")
     expect(verification.data.final_test_result).toMatchObject({
       command: "node test/pricing.test.mjs",
@@ -4069,6 +4298,7 @@ describe("case trace", () => {
       "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:",
       "48000 !== 51000",
       "Error: expected 51000, got 48000",
+      "---EXIT: 1",
     ].join("\\n")
 
     await fs.writeFile(
@@ -4113,8 +4343,116 @@ describe("case trace", () => {
     expect(legacy.verification_records[0].quality_flags).toContain("shell_failure_masked")
     expect(verificationRecord.status).toBe("failed")
     expect(verificationRecord.data.quality_flags).toContain("failure_output_masked_by_exit_code")
+    expect(verificationRecord.data.process_exit_code).toBe(0)
+    expect(verificationRecord.data.exit_masked_by_shell).toBe(true)
+    expect(verificationRecord.data.parsed_command_outcomes).toContainEqual({
+      source: "reported_exit_marker",
+      exit_code: 1,
+      status: "failed",
+    })
     expect(verificationFact.data.structured_claim.value).toBe("failed")
     expect(verificationFact.data.quality_flags).toContain("failure_output_masked_by_exit_code")
+  })
+
+  test("tracks repository revisions and supersedes pre-change verification results", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-revision-verification-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "revision-verification-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ command: "npm test", exit_code: 1, stdout: "Error: expected 51000, got 48000" })`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix discount cap", diff: "- 0.2\\n+ 0.15" })`,
+        `CaseTrace.verification({ command: "npm test", exit_code: 0, stdout: "pricing tests passed" })`,
+        `CaseTrace.responseOutput({ text: "全部通过。" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "revision-verification-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "revision-verification-case", "trace.json"), "utf8"),
+    ) as any
+    const change = trace.records.find((record: any) => record.event_type === "change")
+    const verifications = trace.records.filter((record: any) => record.event_type === "verification")
+
+    expect(change.data.revision_before).toBe(0)
+    expect(change.data.revision_after).toBe(1)
+    expect(verifications[0].data.repository_revision).toBe(0)
+    expect(verifications[0].data.verification_phase).toBe("baseline")
+    expect(verifications[0].data.effective_for_final_state).toBe(false)
+    expect(verifications[0].data.superseded_by_refs).toContain(`verification:${verifications[1].data.verification_id}`)
+    expect(verifications[1].data.repository_revision).toBe(1)
+    expect(verifications[1].data.verification_phase).toBe("post_change")
+    expect(verifications[1].data.effective_for_final_state).toBe(true)
+    expect(verifications[1].data.supersedes_refs).toContain(`verification:${verifications[0].data.verification_id}`)
+  })
+
+  test("links failed verification to the repository changes it observed", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-failed-verification-change-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "failed-verification-change-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.change({ change_id: "shell_write", tool_call_id: "call_shell", source_refs: ["tool_call:call_shell"], files: ["src/pricing.mjs"], intent: "Shell rewrote pricing", diff: "- 0.2\\n+ 0.25" })`,
+        `CaseTrace.verification({ verification_id: "failed_after_shell", tool_call_id: "call_test", command: "npm test", exit_code: 1, stdout: "Error: expected 20, got 25" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "failed-verification-change-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "failed-verification-change-case", "trace.json"), "utf8"),
+    ) as any
+    const verification = trace.records.find(
+      (record: any) => record.event_type === "verification" && record.data.verification_id === "failed_after_shell",
+    )
+    expect(verification.source_refs).toContain("change:shell_write")
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.type === "change" &&
+          edge.from.id === "shell_write" &&
+          edge.to.type === "verification" &&
+          edge.to.id === "failed_after_shell",
+      ),
+    ).toBe(true)
   })
 
   test("reports missing verification after repository changes", async () => {
@@ -4160,8 +4498,7 @@ describe("case trace", () => {
     )
     const observedDefect = trace.records.find(
       (record: any) =>
-        record.event_type === "case.observed_defect" &&
-        record.data.defect_type === "missing_verification_after_change",
+        record.event_type === "case.observed_defect" && record.data.defect_type === "missing_verification_after_change",
     )
 
     expect(trace.metrics.trace_health.missing_verification_after_change).toBe(1)
@@ -4476,7 +4813,9 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "unchanged-path-claim-case", "trace.json"), "utf8")) as any
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "unchanged-path-claim-case", "trace.json"), "utf8"),
+    ) as any
     const exclusionFact = trace.records.find(
       (record: any) =>
         record.event_type === "evidence.semantic_fact" &&
@@ -4819,7 +5158,9 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const manifest = JSON.parse(await fs.readFile(path.join(dir, "passive-sidecar-case", "manifest.json"), "utf8")) as any
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dir, "passive-sidecar-case", "manifest.json"), "utf8"),
+    ) as any
     const trace = JSON.parse(await fs.readFile(path.join(dir, "passive-sidecar-case", "trace.json"), "utf8")) as any
 
     expect(manifest.collection_mode).toBe("passive_sidecar")

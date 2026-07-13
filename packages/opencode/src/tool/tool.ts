@@ -95,10 +95,65 @@ function numberValue(input: unknown, key: string) {
 function isVerificationCommand(command: string | undefined) {
   return Boolean(
     command &&
-      /\b(test|pytest|jest|vitest|mocha)\b|bun test|npm test|pnpm test|yarn test|go test|cargo test|node .*test|xcodebuild/i.test(
+      /(?:^|[;&|]\s*)(?:python\d*(?:\.\d+)?\s+-m\s+pytest|uv\s+run\s+(?:[^\s;&|]\/)?pytest|(?:[^\s;&|]*\/)?pytest|bun\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|go\s+test|cargo\s+test|node\s+[^;&|]*test|(?:[^\s;&|]*\/)?(?:jest|vitest|mocha)|xcodebuild\b)/i.test(
         command,
       ),
   )
+}
+
+export type VerificationStatus = "passed" | "failed" | "unknown"
+
+export function inferVerificationStatus(
+  command: string,
+  exitCode: number | undefined,
+  stdout: unknown,
+  stderr: unknown,
+): VerificationStatus {
+  if (exitCode !== undefined && exitCode !== 0) return "failed"
+  if (!command.includes("|")) return exitCode === 0 ? "passed" : "unknown"
+
+  const output = `${typeof stdout === "string" ? stdout : ""}\n${typeof stderr === "string" ? stderr : ""}`
+  if (
+    /(?:^|[\s,])(?:[1-9]\d*)\s+(?:failed|errors?)\b|(?:^|\n)(?:FAILURES|ERRORS)(?:\n|$)|\btest result:\s*FAILED\b/i.test(
+      output,
+    )
+  ) {
+    return "failed"
+  }
+  if (/(?:^|[\s,])(?:[1-9]\d*)\s+passed\b|\btest result:\s*ok\b/i.test(output)) return "passed"
+  return "unknown"
+}
+
+export type ShellOperationKind =
+  | "verification"
+  | "environment_setup"
+  | "repository_change"
+  | "code_inspection"
+  | "general_execution"
+
+export function classifyShellOperation(command: string): ShellOperationKind {
+  const text = command.trim()
+  if (
+    /(?:^|[;&|]\s*)(?:python\d*(?:\.\d+)?\s+-m\s+pip\s+install|pip\d*\s+install|uv\s+(?:sync|pip\s+install)|poetry\s+install|npm\s+(?:install|ci)|pnpm\s+install|yarn\s+install|bun\s+install|apt(?:-get)?\s+install|brew\s+install)\b/i.test(
+      text,
+    )
+  )
+    return "environment_setup"
+  if (isVerificationCommand(text)) return "verification"
+  if (
+    /(?:open\s*\([^\n]*,[^\n]*["'][wax+][^"']*["']|\.write_(?:text|bytes)\s*\(|\bsed\s+-[^\n]*i\b|\bperl\s+-[^\n]*i\b|\b(?:tee|cp|mv|rm|touch|mkdir|install)\b|\b(?:git\s+(?:apply|checkout|restore|reset|clean)|apply_patch|patch)\b|(?:^|[^<>])>{1,2}(?!&))/i.test(
+      text,
+    )
+  )
+    return "repository_change"
+  if (
+    /(?:^|[;&|]\s*)(?:git\s+(?:show|diff|status|log|grep|ls-files|rev-parse)|cat|rg|grep|find|fd|ls|pwd|head|tail|wc|stat|sed\s+-n|awk)\b/i.test(
+      text,
+    ) ||
+    /open\s*\([^\n]*(?:["']r[bt]?["']|\)\.read)/i.test(text)
+  )
+    return "code_inspection"
+  return "general_execution"
 }
 
 function toolIntent(id: string, args: unknown) {
@@ -106,8 +161,14 @@ function toolIntent(id: string, args: unknown) {
   if (id === "read") return "read repository context"
   if (id === "grep" || id === "glob") return "search repository context"
   if (id === "edit" || id === "write") return "modify repository files"
-  if (isVerificationCommand(command)) return "run verification command"
-  if (command) return "run shell command"
+  if (command) {
+    const operation = classifyShellOperation(command)
+    if (operation === "verification") return "run verification command"
+    if (operation === "environment_setup") return "prepare execution environment"
+    if (operation === "repository_change") return "modify repository through shell"
+    if (operation === "code_inspection") return "inspect repository through shell"
+    return "run shell command"
+  }
   return "execute tool"
 }
 
@@ -125,23 +186,32 @@ function semanticToolResult(input: {
     typeof filediff === "object" && filediff ? stringValue(filediff, "file") : stringValue(input.args, "filePath")
 
   if (command) {
+    const operationKind = classifyShellOperation(command)
     const exitCode = numberValue(input.result.metadata, "exit")
-    const verification = CaseTrace.verification({
-      span_id: input.spanID,
-      tool_call_id: input.ctx.callID,
-      command,
-      cwd: stringValue(input.args, "workdir"),
-      purpose: stringValue(input.args, "description") ?? input.result.title,
-      stage: isVerificationCommand(command) ? "unknown" : "exploration",
-      exit_code: exitCode,
-      status: exitCode === undefined ? "unknown" : exitCode === 0 ? "passed" : "failed",
-      stdout: objectValue(input.result.metadata, "output") ?? input.result.output,
-      stderr: objectValue(input.result.metadata, "stderr"),
-      metadata: {
-        tool: input.id,
-        truncated: input.result.metadata.truncated,
-      },
-    })
+    const stdout = objectValue(input.result.metadata, "output") ?? input.result.output
+    const stderr = objectValue(input.result.metadata, "stderr")
+    const verificationStatus = inferVerificationStatus(command, exitCode, stdout, stderr)
+    const verification =
+      operationKind === "verification"
+        ? CaseTrace.verification({
+            span_id: input.spanID,
+            tool_call_id: input.ctx.callID,
+            command,
+            cwd: stringValue(input.args, "workdir"),
+            purpose: stringValue(input.args, "description") ?? input.result.title,
+            stage: "unknown",
+            exit_code: exitCode,
+            status: verificationStatus,
+            stdout,
+            stderr,
+            metadata: {
+              tool: input.id,
+              operation_kind: operationKind,
+              status_inference: command.includes("|") ? "pipeline_output_summary" : "process_exit_code",
+              truncated: input.result.metadata.truncated,
+            },
+          })
+        : undefined
     if (verification && input.spanID) {
       CaseTrace.edge({
         from: { type: "span", id: input.spanID, label: input.id },
@@ -152,14 +222,15 @@ function semanticToolResult(input: {
     }
     CaseTrace.observation({
       source: input.id,
-      category: isVerificationCommand(command) ? "verification_output" : "command_output",
+      category: operationKind === "verification" ? "verification_output" : operationKind,
       summary: input.result.title,
       data: {
+        operation_kind: operationKind,
         command,
         cwd: stringValue(input.args, "workdir"),
         exit_code: exitCode,
-        output: objectValue(input.result.metadata, "output") ?? input.result.output,
-        stderr: objectValue(input.result.metadata, "stderr"),
+        output: stdout,
+        stderr,
         metadata: input.result.metadata,
       },
       span_id: input.spanID,

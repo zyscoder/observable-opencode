@@ -16,6 +16,8 @@ T = TypeVar("T")
 
 CURRENT_NODE_PROMPT_CHARS = 1600
 UPSTREAM_NODE_PROMPT_CHARS = 700
+ARTIFACT_EVIDENCE_PROMPT_CHARS = 32000
+DEFAULT_JUDGE_TIMEOUT_SECONDS = 60 * 60
 
 
 SYSTEM_PROMPT = """You are an offline root-cause attribution reviewer for agent semantic traces.
@@ -31,6 +33,21 @@ Return a single JSON object. No markdown.
 """
 
 
+def resolve_thinking_config(base_url: str, thinking_mode: str, *, max_tokens: int) -> Optional[Dict[str, Any]]:
+    mode = (thinking_mode or "auto").strip().lower()
+    if mode not in {"auto", "enabled", "disabled"}:
+        raise ValueError("thinking_mode must be auto, enabled, or disabled")
+    if mode == "auto":
+        if "api.deepseek.com" not in (base_url or "").lower():
+            return None
+        mode = "disabled"
+    if mode == "disabled":
+        return {"type": "disabled"}
+    if max_tokens <= 1024:
+        raise ValueError("thinking_mode=enabled requires max_tokens greater than 1024")
+    return {"type": "enabled", "budget_tokens": min(4096, max_tokens - 1)}
+
+
 class ClaudeJudgeClient(JudgeClient):
     def __init__(
         self,
@@ -42,6 +59,7 @@ class ClaudeJudgeClient(JudgeClient):
         max_tokens: int = 4096,
         repair_max_tokens: int = 1024,
         timeout_seconds: Optional[float] = None,
+        thinking_mode: str = "auto",
     ):
         try:
             from anthropic import Anthropic
@@ -58,7 +76,7 @@ class ClaudeJudgeClient(JudgeClient):
         client_kwargs: Dict[str, Any] = {"api_key": api_key}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
-        timeout = timeout_seconds if timeout_seconds is not None else env_float("CLAUDE_TIMEOUT_SECONDS")
+        timeout = timeout_seconds if timeout_seconds is not None else default_judge_timeout_seconds()
         if timeout is not None:
             client_kwargs["timeout"] = timeout
         self.api_key = api_key
@@ -66,6 +84,12 @@ class ClaudeJudgeClient(JudgeClient):
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
         self.repair_max_tokens = repair_max_tokens
+        self.thinking_mode = thinking_mode or os.environ.get("CLAUDE_THINKING_MODE") or "auto"
+        self.thinking_config = resolve_thinking_config(
+            self.base_url,
+            self.thinking_mode,
+            max_tokens=self.max_tokens,
+        )
 
     def judge_node(
         self,
@@ -88,9 +112,50 @@ class ClaudeJudgeClient(JudgeClient):
         )
         try:
             payload = parse_json_object(text)
-        except ValueError:
-            payload = self._repair_json_response(text=text, node=node)
+            validate_judgment_payload(payload)
+        except (TypeError, ValueError):
+            try:
+                payload = self._repair_json_response(text=text, node=node)
+            except ValueError as repair_error:
+                payload = self._retry_json_response(
+                    prompt=prompt,
+                    node=node,
+                    malformed_text=text,
+                    repair_error=repair_error,
+                )
         return judgment_from_dict(payload, node)
+
+    def _retry_json_response(
+        self,
+        *,
+        prompt: str,
+        node: TraceNode,
+        malformed_text: str,
+        repair_error: Exception,
+    ) -> Dict[str, Any]:
+        retried = self._create_message_text(
+            system=(
+                SYSTEM_PROMPT
+                + "\nA previous response and its repair were malformed. Return all required fields in one complete JSON object."
+            ),
+            messages=[
+                {"role": "user", "content": prompt},
+                {
+                    "role": "user",
+                    "content": stable_json(
+                        {
+                            "retry_reason": f"{type(repair_error).__name__}: {repair_error}",
+                            "malformed_output_preview": malformed_text[:1000],
+                            "required_node_ref": node.ref,
+                        }
+                    ),
+                },
+            ],
+            max_tokens=self.max_tokens,
+        )
+        payload = parse_json_object(retried)
+        validate_judgment_payload(payload)
+        return payload
 
     def _repair_json_response(self, *, text: str, node: TraceNode) -> Dict[str, Any]:
         repaired = self._create_message_text(
@@ -114,6 +179,7 @@ class ClaudeJudgeClient(JudgeClient):
                                 "node_ref",
                                 "component",
                                 "event_type",
+                                "defect_status",
                                 "has_defect",
                                 "defect_type",
                                 "defect_reason",
@@ -125,7 +191,10 @@ class ClaudeJudgeClient(JudgeClient):
                             ],
                             "repair_rules": [
                                 "Preserve any clear judgment already present in malformed_output.",
-                                "If a field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
+                                "defect_status must be present, absent, or unknown; use unknown when the evidence is insufficient.",
+                                "When defect_status is absent, defect_type must be an empty string and the reason must not describe the current node as defective.",
+                                "defect_reason must explain the judgment or the uncertainty and must not be empty.",
+                                "If another field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
                                 "Use fallback_node values for node_ref, component, and event_type when missing.",
                             ],
                         }
@@ -135,10 +204,12 @@ class ClaudeJudgeClient(JudgeClient):
             max_tokens=self.repair_max_tokens,
         )
         try:
-            return parse_json_object(repaired)
-        except ValueError as exc:
+            payload = parse_json_object(repaired)
+            validate_judgment_payload(payload)
+            return payload
+        except (TypeError, ValueError) as exc:
             raise ValueError(
-                "Claude response did not contain a valid JSON object after repair. "
+                "Claude response did not contain a complete judgment object after repair. "
                 f"Original: {text[:200]} Repaired: {repaired[:200]}"
             ) from exc
 
@@ -153,19 +224,23 @@ class ClaudeJudgeClient(JudgeClient):
                     "model": self.model,
                     "max_tokens": max_tokens,
                     "temperature": 0,
+                    "thinking": self.thinking_config,
                     "system": system,
                     "messages": messages,
                 },
                 self.timeout_seconds,
             )
             return str(result.get("text") or "")
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            temperature=0,
-            system=system,
-            messages=messages,
-        )
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "system": system,
+            "messages": messages,
+        }
+        if self.thinking_config is not None:
+            request["thinking"] = self.thinking_config
+        response = self.client.messages.create(**request)
         return response_text(response)
 
 
@@ -178,10 +253,12 @@ def build_judgment_prompt(
 ) -> str:
     current_node = node.compact(max_chars=CURRENT_NODE_PROMPT_CHARS)
     compact_upstream_nodes = [item.compact(max_chars=UPSTREAM_NODE_PROMPT_CHARS) for item in upstream_nodes]
+    artifact_evidence = compact_artifact_evidence([node] + upstream_nodes)
     schema = {
         "node_ref": node.ref,
         "component": node.component,
         "event_type": node.event_type,
+        "defect_status": "present|absent|unknown",
         "has_defect": True,
         "defect_type": "short_snake_case_or_empty",
         "defect_reason": "why this node is or is not defective",
@@ -201,6 +278,7 @@ def build_judgment_prompt(
         "objective": objective,
         "current_node": current_node,
         "upstream_nodes": compact_upstream_nodes,
+        "artifact_evidence": artifact_evidence,
         "downstream_taint_path": downstream_context,
         "prompt_compaction": {
             "current_node_max_chars": CURRENT_NODE_PROMPT_CHARS,
@@ -213,16 +291,54 @@ def build_judgment_prompt(
             ],
         },
         "rules": [
-            "If current_node.event_type is case.quality_gap, treat the quality gap as the defect to explain; do not answer that the evaluator itself is non-defective.",
-            "For case.quality_gap, use missing_evidence, score, max_score, and upstream_nodes to decide which upstream component most likely introduced the quality gap.",
-            "If the current node has no relevant semantic defect, set has_defect=false and influenced_by=[].",
+            "A case.quality_gap, case.observed_defect, or case.missing_semantic node is an evaluation assertion to validate against supplied upstream trace facts; the assertion may be rejected when those facts contradict it.",
+            "For an evaluation assertion, use its dimensions and upstream_nodes to determine whether the asserted defect is present, absent, or unknown.",
+            "If the current node has no relevant semantic defect, set defect_status=absent, has_defect=false, and influenced_by=[].",
+            "defect_status classifies the current node's semantics, not whether it is the code-level root. A false or unsupported response claim is present even when an earlier code change caused the underlying failure.",
+            "Never set defect_status=absent while using a non-empty defect_type or while describing the current node as a semantic defect.",
+            "If the supplied facts are insufficient to decide, set defect_status=unknown, has_defect=false, is_root_cause=false, and explain what is missing.",
+            "Treat hydrated_artifacts as the full cited trace payload within its recorded truncation boundary; do not discard it in favor of a shorter preview.",
+            "When a hydrated artifact is marked truncated, you must not infer a defect or root cause from the missing portion; return unknown if the visible excerpt is not independently decisive.",
+            "Compare verification results only within the relevant repository_revision. A superseded or historical failure does not contradict an effective current-revision pass.",
+            "For response.claim nodes, inspect direct_support_refs before candidate_context_refs and inspect superseded_evidence_refs last.",
             "If the current node is defective because upstream semantics are already defective, list only those upstream refs.",
-            "If the current node first introduces the defect, set influenced_by=[] and is_root_cause=true.",
+            "If the current node first introduces the defect, set defect_status=present, has_defect=true, influenced_by=[], and is_root_cause=true.",
             "Prefer concrete trace refs from upstream_nodes. Do not cite refs that are absent from the supplied upstream list.",
         ],
         "required_json_schema": schema,
     }
     return stable_json(payload)
+
+
+def compact_artifact_evidence(nodes: List[TraceNode], max_chars: int = ARTIFACT_EVIDENCE_PROMPT_CHARS) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    remaining = max_chars
+    for node in nodes:
+        artifacts = node.data.get("hydrated_artifacts") if isinstance(node.data, dict) else None
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or remaining <= 0:
+                continue
+            content = str(artifact.get("content") or "")
+            limit = min(16000, remaining)
+            excerpt = content[:limit]
+            output.append(
+                {
+                    "node_ref": node.ref,
+                    "artifact_id": artifact.get("artifact_id"),
+                    "kind": artifact.get("kind"),
+                    "label": artifact.get("label"),
+                    "path": artifact.get("path"),
+                    "hash": artifact.get("hash"),
+                    "content": excerpt,
+                    "content_length": artifact.get("content_length"),
+                    "trace_artifact_truncated": bool(artifact.get("truncated")),
+                    "prompt_excerpt_truncated": len(content) > len(excerpt),
+                }
+            )
+            remaining -= len(excerpt)
+    return output
 
 
 def response_text(response: Any) -> str:
@@ -244,6 +360,32 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     if not match:
         raise ValueError(f"Claude response did not contain a JSON object: {text[:200]}")
     return json.loads(match.group(0))
+
+
+def validate_judgment_payload(value: Dict[str, Any]) -> None:
+    if not isinstance(value, dict):
+        raise TypeError("judgment payload must be an object")
+    raw_status = value.get("defect_status")
+    status = str(raw_status or "").strip().lower()
+    if raw_status is not None and status not in {"present", "absent", "unknown"}:
+        raise ValueError("defect_status must be present, absent, or unknown")
+    if status not in {"present", "absent", "unknown"} and not isinstance(value.get("has_defect"), bool):
+        raise ValueError("judgment requires defect_status or a legacy boolean has_defect")
+    if status in {"present", "absent", "unknown"} and isinstance(value.get("has_defect"), bool):
+        expected_has_defect = status == "present"
+        if value["has_defect"] != expected_has_defect:
+            raise ValueError("defect_status and has_defect are inconsistent")
+    if status == "absent" and str(value.get("defect_type") or "").strip():
+        raise ValueError("absent judgments must use an empty defect_type")
+    reason = value.get("defect_reason") or value.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("judgment requires a non-empty defect_reason")
+    if not isinstance(value.get("influenced_by"), list):
+        raise ValueError("judgment requires influenced_by as a list")
+    if not isinstance(value.get("is_root_cause"), bool):
+        raise ValueError("judgment requires is_root_cause as a boolean")
+    if not isinstance(value.get("confidence"), (int, float)) or isinstance(value.get("confidence"), bool):
+        raise ValueError("judgment requires numeric confidence")
 
 
 def call_with_wall_timeout(func: Callable[[], T], timeout_seconds: Optional[float]) -> T:
@@ -313,13 +455,16 @@ def anthropic_request_worker(payload: Dict[str, Any], result_queue: Any) -> None
         if payload.get("timeout_seconds"):
             client_kwargs["timeout"] = payload["timeout_seconds"]
         client = Anthropic(**client_kwargs)
-        response = client.messages.create(
-            model=payload["model"],
-            max_tokens=payload["max_tokens"],
-            temperature=payload.get("temperature", 0),
-            system=payload["system"],
-            messages=payload["messages"],
-        )
+        request: Dict[str, Any] = {
+            "model": payload["model"],
+            "max_tokens": payload["max_tokens"],
+            "temperature": payload.get("temperature", 0),
+            "system": payload["system"],
+            "messages": payload["messages"],
+        }
+        if payload.get("thinking") is not None:
+            request["thinking"] = payload["thinking"]
+        response = client.messages.create(**request)
         result_queue.put({"ok": True, "text": response_text(response)})
     except BaseException as exc:
         result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
@@ -334,3 +479,7 @@ def env_float(name: str) -> Optional[float]:
     except ValueError:
         return None
     return parsed if parsed > 0 else None
+
+
+def default_judge_timeout_seconds() -> float:
+    return env_float("CLAUDE_TIMEOUT_SECONDS") or DEFAULT_JUDGE_TIMEOUT_SECONDS

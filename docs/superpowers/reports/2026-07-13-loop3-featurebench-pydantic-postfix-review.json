@@ -1,0 +1,60 @@
+{
+  "case_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1",
+  "benchmark": {
+    "name": "FeatureBench Lite",
+    "dataset": "LiberCoders/FeatureBench",
+    "instance_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1"
+  },
+  "trace_sufficiency": "partially_sufficient",
+  "case_effectiveness": "effective_partial_quality_open_source_benchmark_case",
+  "observed_defects": [
+    {
+      "component": "feature_implementation",
+      "failure_type": "partial_feature_correctness",
+      "description": "An isolated host-side restoration of the official FeatureBench hidden test file passed 10 of 12 tests. The two remaining failures show that GenerateJsonSchema.encode_default is absent and rebuild_model_fields loses a default value while rebuilding a forward annotation. The official Docker harness was unavailable, so this is an unofficial offline score rather than the official benchmark result.",
+      "record_refs": [
+        "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796"
+      ]
+    },
+    {
+      "component": "task_loop_and_result_processing",
+      "failure_type": "premature_completion_with_known_failures",
+      "description": "The agent stopped after a broad public test run reported 3 failed and 94 passed, yet opened the final answer with 'All interfaces are implemented and verified.' The answer later disclosed the 94/102 result, so the defect is overclaiming completion and accepting known failures rather than fabricating the test count.",
+      "record_refs": [
+        "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+        "record:responsenode_segment_28_7d0e075a",
+        "record:responseclaim_claim_5075_61e44478",
+        "record:responseclaim_claim_5097_332dbd43"
+      ]
+    },
+    {
+      "component": "trace_evidence_linking",
+      "failure_type": "failed_verification_not_linked_to_final_claim",
+      "description": "The trace contains the broad pytest output with three failures, but the run produced no verification records because absolute-path pytest commands were not classified as verification. The final verification claim was instead supported by narrow smoke-test facts, so the claim support layer missed the strongest conflicting evidence.",
+      "record_refs": [
+        "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+        "record:responseclaim_claim_5097_332dbd43",
+        "record:claimsupport_claim_5097_332dbd43",
+        "record:missing_semantic_final_test_result"
+      ]
+    }
+  ],
+  "host_evaluation": {
+    "status": "unofficial",
+    "fail_to_pass": {
+      "test_file": "tests/test_deprecated_fields.py",
+      "passed": 10,
+      "failed": 2,
+      "total": 12,
+      "pass_rate": 0.8333333333
+    },
+    "pass_to_pass": {
+      "status": "not_assessable",
+      "reason": "The macOS host only provides Python 3.9; one official pass-to-pass file fails collection on unsupported typing syntax and two remaining failures are environment compatibility failures."
+    },
+    "official_harness": {
+      "status": "not_run",
+      "reason": "docker_unavailable_on_host"
+    }
+  }
+}

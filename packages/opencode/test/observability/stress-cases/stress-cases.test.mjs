@@ -160,6 +160,43 @@ test("quality rubric scores semantic understanding gaps", () => {
   assert.match(quality.attribution_objective, /solution_tradeoff/)
 })
 
+test("quality rubric recognizes risk assessment in response output", () => {
+  const caseDefinition = {
+    case_id: "response-output-risk",
+    category: "semantic_quality",
+    target_score: 80,
+    minimum_acceptable_score: 60,
+    quality_rubric: [
+      {
+        dimension: "solution_tradeoff",
+        weight: 100,
+        evidence: ["risk_assessment"],
+      },
+    ],
+  }
+  const trace = {
+    records: [
+      {
+        record_id: "response_with_risk",
+        event_type: "response.output",
+        component: "result",
+        data: {
+          text: "风险：不能把 billing 的 15% 折扣上限与 payment 的 20% 结算常量混用。",
+          response_role: "intermediate_summary",
+        },
+      },
+    ],
+    metrics: { trace_health: {} },
+  }
+
+  const quality = scoreTraceQuality({ caseDefinition, trace })
+
+  assert.equal(quality.total_score, 100)
+  assert.equal(quality.status, "meets_target")
+  assert.deepEqual(quality.quality_gaps, [])
+  assert.deepEqual(quality.dimensions[0].record_refs, ["record:response_with_risk"])
+})
+
 test("stress runner supports explicit multi-step HTTP flows for compaction scenarios", async () => {
   const runner = await import("./run-stress-cases.mjs")
   assert.equal(typeof runner.planCaseActions, "function")
@@ -230,6 +267,88 @@ test("trace sufficiency review marks mechanism-missing cases as ineffective", ()
       record_refs: [],
     },
   ])
+})
+
+test("stress review separates designed failure target from actual case outcome", () => {
+  const caseDefinition = {
+    case_id: "separated-outcome",
+    title: "Separated outcome",
+    category: "semantic_quality",
+    ground_truth_root_cause: {
+      component: "verification",
+      failure_type: "insufficient_scope",
+      description: "The fixture is designed to tempt a narrow verification.",
+    },
+    required_trace_evidence: ["final_test_result", "edited_file_paths"],
+    required_trace_mechanisms: [],
+    acceptance_assertions: [
+      { id: "tests", type: "verification_passed", command_contains: "npm test" },
+      { id: "target", type: "changed_path", path: "src/owner.mjs", should_change: true },
+    ],
+  }
+  const trace = {
+    manifest: { case_status: "success" },
+    records: [
+      {
+        record_id: "change_1",
+        event_type: "change",
+        component: "tool",
+        data: { files: ["src/owner.mjs"] },
+      },
+      {
+        record_id: "verification_1",
+        event_type: "verification",
+        component: "tool",
+        status: "passed",
+        data: { command: "npm test", status: "passed", effective_for_final_state: true },
+      },
+    ],
+    metrics: { trace_health: {} },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+  const summary = summarizeReviews([review])
+
+  assert.equal(review.designed_failure_target.failure_type, "insufficient_scope")
+  assert.equal(review.actual_case_outcome.status, "pass")
+  assert.equal(review.mechanism_coverage.status, "sufficient")
+  assert.equal(review.ground_truth_root_cause, undefined)
+  assert.match(summary, /Designed Failure Target/)
+  assert.doesNotMatch(summary, /\| Root Cause \|/)
+})
+
+test("stress review reports unknown actual outcome without executable acceptance assertions", () => {
+  const caseDefinition = {
+    case_id: "unknown-outcome",
+    title: "Unknown outcome",
+    category: "semantic_quality",
+    ground_truth_root_cause: {
+      component: "result",
+      failure_type: "possible_quality_gap",
+      description: "This is only a designed failure target.",
+    },
+    required_trace_evidence: ["final_test_result"],
+    required_trace_mechanisms: [],
+  }
+  const trace = {
+    manifest: { case_status: "success" },
+    records: [
+      {
+        record_id: "verification_1",
+        event_type: "verification",
+        component: "tool",
+        status: "passed",
+        data: { command: "npm test", status: "passed", effective_for_final_state: true },
+      },
+    ],
+    metrics: { trace_health: {} },
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.mechanism_coverage.status, "sufficient")
+  assert.equal(review.actual_case_outcome.status, "unknown")
+  assert.equal(review.actual_case_outcome.reason, "no_executable_acceptance_assertions")
 })
 
 test("trace sufficiency review requires formal tool error and claim support facts", () => {

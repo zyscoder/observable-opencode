@@ -48,7 +48,6 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
         )
     missing_semantics = review.get("missing_semantics") if isinstance(review.get("missing_semantics"), list) else []
     evidence_by_name = evidence_refs_by_required_name(review.get("evidence_found"))
-    root_cause = review.get("ground_truth_root_cause") if isinstance(review.get("ground_truth_root_cause"), dict) else {}
     for name in missing_semantics:
         semantic_name = str(name or "").strip()
         if not semantic_name:
@@ -68,13 +67,14 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
                     "semantic_name": semantic_name,
                     "gap_kind": "required_trace_semantic_missing",
                     "reason": f"Stress review did not find required trace semantic: {semantic_name}.",
-                    "ground_truth_component": root_cause.get("component"),
-                    "ground_truth_failure_type": root_cause.get("failure_type"),
                 },
             }
         )
-    if not gaps and not missing_semantics:
-        inject_observed_defect_record(enriched, records, review, root_cause)
+    observed_defects = review.get("observed_defects") if isinstance(review.get("observed_defects"), list) else []
+    for observed_defect in observed_defects:
+        if not isinstance(observed_defect, dict):
+            continue
+        inject_observed_defect_record(enriched, records, review, observed_defect)
     return enriched
 
 
@@ -82,16 +82,16 @@ def inject_observed_defect_record(
     enriched: JsonDict,
     records: List[Any],
     review: JsonDict,
-    root_cause: JsonDict,
+    observed_defect: JsonDict,
 ) -> None:
-    component = str(root_cause.get("component") or "").strip()
-    failure_type = str(root_cause.get("failure_type") or "").strip()
+    component = str(observed_defect.get("component") or "").strip()
+    failure_type = str(observed_defect.get("failure_type") or "").strip()
     if not component or not failure_type:
         return
     record_id = f"observed_defect_{slugify(component)}_{slugify(failure_type)}"
     if any(isinstance(record, dict) and record.get("record_id") == record_id for record in records):
         return
-    all_refs = review_evidence_refs(review)
+    all_refs = normalize_refs(observed_defect.get("record_refs")) or review_evidence_refs(review)
     included_refs = all_refs[:24]
     records.append(
         {
@@ -105,7 +105,7 @@ def inject_observed_defect_record(
                 "component": component,
                 "failure_type": failure_type,
                 "defect_type": failure_type,
-                "description": root_cause.get("description"),
+                "description": observed_defect.get("description"),
                 "trace_sufficiency": review.get("trace_sufficiency"),
                 "case_effectiveness": review.get("case_effectiveness"),
                 "can_offline_module_identify_root_cause": review.get("can_offline_module_identify_root_cause"),
@@ -113,7 +113,7 @@ def inject_observed_defect_record(
                 "source_ref_count_included": len(included_refs),
                 "source_refs_truncated": len(included_refs) < len(all_refs),
                 "offline_only": True,
-                "reason": "Stress review declares an observed defect; injected only for offline backward taint attribution.",
+                "reason": "Stress review explicitly declares an observed execution defect with evidence refs.",
             },
         }
     )

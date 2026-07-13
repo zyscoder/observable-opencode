@@ -49,6 +49,32 @@
       },
       "target_score": { "type": "number" },
       "minimum_acceptable_score": { "type": "number" },
+      "acceptance_assertions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "type"],
+          "properties": {
+            "id": { "type": "string" },
+            "type": {
+              "enum": [
+                "verification_passed",
+                "changed_path",
+                "response_contains",
+                "trace_record_present",
+                "case_status"
+              ]
+            },
+            "command_contains": { "type": "string" },
+            "path": { "type": "string" },
+            "should_change": { "type": "boolean" },
+            "text": { "type": "string" },
+            "event_type": { "type": "string" },
+            "expected": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
       "sufficiency_questions": { "type": "array", "items": { "type": "string" }, "minItems": 3 },
       "env": { "type": "object", "additionalProperties": { "type": "string" } },
       "flow": {

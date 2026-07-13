@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "source": {
+    "benchmark": "FeatureBench",
+    "dataset": "LiberCoders/FeatureBench",
+    "dataset_url": "https://huggingface.co/datasets/LiberCoders/FeatureBench",
+    "code_url": "https://github.com/LiberCoders/FeatureBench",
+    "code_version": "0.2.1",
+    "code_commit": "445dcbaec0b2e136061b0acb54e753c0a9f1888e",
+    "split": "lite",
+    "license": "MIT",
+    "dataset_rows_sha256": "413fe3087fb640dba675ce1e2816ae18b081747e6e67c38cd04f146f6b328188",
+    "selection_policy": "Cross-repository Level 1 feature tasks with F2P and P2P tests and multi-file production changes."
+  },
+  "instances": [
+    {
+      "instance_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1",
+      "repo": "pydantic/pydantic",
+      "base_commit": "e1dcaf9e68fc89731b45235e53245447edf35084",
+      "level": 1,
+      "image_name": "libercoders/featurebench-specs_pydantic-instance_78693714",
+      "problem_statement_sha256": "eb85a24c5a3e7b81ed9460fab49e9230b6b2126516d90a199e5ba5670b39c716",
+      "fail_to_pass": ["tests/test_deprecated_fields.py"],
+      "pass_to_pass": [
+        "tests/test_typing.py",
+        "tests/test_missing_sentinel.py",
+        "tests/test_strict.py",
+        "tests/test_model_validator.py",
+        "tests/test_serialize_as_any.py"
+      ],
+      "capabilities": ["requirement_understanding", "cross_module_impact", "descriptor_design"]
+    },
+    {
+      "instance_id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1",
+      "repo": "mwaskom/seaborn",
+      "base_commit": "7001ebe72423238e99c0434a2ef0a0ebc9cb55c1",
+      "level": 1,
+      "image_name": "libercoders/featurebench-specs_seaborn-instance_52738fbb",
+      "problem_statement_sha256": "b059796a53af3423a78fca1c43276dc86f8a68e2278420e0f6c3f3a9a2fda947",
+      "fail_to_pass": ["tests/test_regression.py"],
+      "pass_to_pass": [
+        "tests/_marks/test_bar.py",
+        "tests/test_algorithms.py",
+        "tests/test_objects.py",
+        "tests/test_base.py",
+        "tests/_stats/test_density.py"
+      ],
+      "capabilities": ["requirement_understanding", "statistical_design", "multi_module_implementation"]
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "e347e59ccc27a646c974526252e39a63870f6ea3",
+      "level": 1,
+      "image_name": "libercoders/featurebench-specs_sphinx-instance_6191afb1",
+      "problem_statement_sha256": "e8a9c4c70d6eb1e01d67b04e6b5cc8df21e24d1979a753932e9cd06fdff85be7",
+      "fail_to_pass": ["tests/test_domains/test_domain_c.py"],
+      "pass_to_pass": [
+        "tests/test_ext_napoleon/test_ext_napoleon_docstring.py",
+        "tests/test_util/test_util_inventory.py",
+        "tests/test_util/test_util_logging.py",
+        "tests/test_util/test_util_docstrings.py",
+        "tests/test_intl/test_catalogs.py"
+      ],
+      "capabilities": ["architecture_understanding", "symbol_graph_design", "cross_reference_resolution"]
+    }
+  ]
+}

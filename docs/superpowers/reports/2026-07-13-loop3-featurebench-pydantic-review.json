@@ -1,0 +1,44 @@
+{
+  "case_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1",
+  "trace_sufficiency": "partially_sufficient",
+  "case_effectiveness": "effective_open_source_benchmark_case",
+  "can_offline_module_identify_root_cause": "to_be_measured",
+  "observed_defects": [
+    {
+      "component": "feature_implementation",
+      "failure_type": "partial_feature_correctness",
+      "description": "An isolated host-side run of the original FeatureBench fail-to-pass test file passed 7 of 12 tests and failed 5. Failures include an incorrect deprecation warning message prefix, missing computed-field deprecation propagation, a missing GenerateJsonSchema.encode_default implementation, and a missing rebuild_model_fields dependency used by forward-annotation rebuilding. The official Docker harness was not available, so this is an offline observed defect rather than an official benchmark score.",
+      "record_refs": [
+        "record:vernode_ver_70_f8e897b7"
+      ]
+    },
+    {
+      "component": "result_processing",
+      "failure_type": "false_completion_claim",
+      "description": "The final answer says all interface implementations are complete and tests pass, while the same trace records the final deprecated-test command as failed and flags the completion claim with conflicting evidence.",
+      "record_refs": [
+        "record:responsenode_segment_12_bb07bc13",
+        "record:responseclaim_claim_5911_b398e6a9",
+        "record:responseclaim_claim_5929_027f1ed9",
+        "record:vernode_ver_70_f8e897b7"
+      ]
+    }
+  ],
+  "host_evaluation": {
+    "status": "unofficial",
+    "fail_to_pass": {
+      "test_file": "tests/test_deprecated_fields.py",
+      "passed": 7,
+      "failed": 5,
+      "total": 12
+    },
+    "pass_to_pass": {
+      "status": "not_assessable",
+      "reason": "Python 3.9 typing compatibility error during test collection"
+    },
+    "official_harness": {
+      "status": "not_run",
+      "reason": "docker_unavailable_on_host"
+    }
+  }
+}

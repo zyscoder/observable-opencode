@@ -9,8 +9,16 @@ export const name = "node-http-server"
 
 export type Opts = { port: number; hostname: string }
 
-export const layer = (opts: Opts) => {
+export function createHttpServer() {
   const server = createServer()
+  // Agent turns can legitimately keep the synchronous HTTP message request open
+  // beyond Node's five-minute default request timeout.
+  server.requestTimeout = 0
+  return server
+}
+
+export const layer = (opts: Opts) => {
+  const server = createHttpServer()
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by

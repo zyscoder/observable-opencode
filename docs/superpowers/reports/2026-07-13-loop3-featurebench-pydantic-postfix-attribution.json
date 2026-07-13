@@ -1,0 +1,266 @@
+{
+  "case_id": "pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1",
+  "objective": "Find why the agent stopped and claimed completion after known FeatureBench-adjacent pytest failures.",
+  "start_refs": [
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures"
+  ],
+  "root_causes": [],
+  "taint_paths": [],
+  "node_judgments": {
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures": {
+      "node_ref": "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "premature_completion_with_known_failures",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responsenode_segment_28_7d0e075a",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responseclaim_claim_5075_61e44478",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:responseclaim_claim_5097_332dbd43",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796": {
+      "node_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+      "component": "tool",
+      "event_type": "tool.result",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "",
+      "defect_reason": "Insufficient evidence to determine defect status.",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": ""
+    },
+    "record:responsenode_segment_28_7d0e075a": {
+      "node_ref": "record:responsenode_segment_28_7d0e075a",
+      "component": "result",
+      "event_type": "response.output",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "",
+      "defect_reason": "Insufficient evidence to determine defect status.",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": ""
+    },
+    "record:responseclaim_claim_5075_61e44478": {
+      "node_ref": "record:responseclaim_claim_5075_61e44478",
+      "component": "result",
+      "event_type": "response.claim",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "",
+      "defect_reason": "Insufficient evidence to determine defect status.",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": ""
+    },
+    "record:responseclaim_claim_5097_332dbd43": {
+      "node_ref": "record:responseclaim_claim_5097_332dbd43",
+      "component": "result",
+      "event_type": "response.claim",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "",
+      "defect_reason": "Insufficient evidence to determine defect status.",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": ""
+    }
+  },
+  "visited_order": [
+    "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+    "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+    "record:responsenode_segment_28_7d0e075a",
+    "record:responseclaim_claim_5075_61e44478",
+    "record:responseclaim_claim_5097_332dbd43"
+  ],
+  "unresolved_refs": [],
+  "trace_improvement_report": {
+    "summary": {
+      "blocking_gap_count": 6,
+      "recommended_change_count": 4,
+      "analysis_confidence": "blocked"
+    },
+    "blocking_gaps": [
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+        "component": "tool",
+        "event_type": "tool.result",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: Insufficient evidence to determine defect status.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:responsenode_segment_28_7d0e075a",
+        "component": "result",
+        "event_type": "response.output",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: Insufficient evidence to determine defect status.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:responsenode_segment_28_7d0e075a"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:responseclaim_claim_5075_61e44478",
+        "component": "result",
+        "event_type": "response.claim",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: Insufficient evidence to determine defect status.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:responseclaim_claim_5075_61e44478"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:responseclaim_claim_5097_332dbd43",
+        "component": "result",
+        "event_type": "response.claim",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: Insufficient evidence to determine defect status.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:responseclaim_claim_5097_332dbd43"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "defective_node_points_to_nondefective_upstream",
+        "node_ref": "",
+        "component": "trace_provenance",
+        "event_type": "semantic_edge",
+        "why_it_blocks_root_cause_analysis": "A defective node claimed an upstream cause, but that upstream node was judged non-defective. This often indicates overly broad provenance edges, missing intermediate semantic nodes, or insufficient context for judging the upstream node.",
+        "missing_semantic_fields": [
+          "edge_reason",
+          "intermediate_semantic_node",
+          "upstream_usage_context"
+        ],
+        "related_refs": [
+          "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures->record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures->record:responsenode_segment_28_7d0e075a",
+          "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures->record:responseclaim_claim_5075_61e44478",
+          "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures->record:responseclaim_claim_5097_332dbd43"
+        ],
+        "confidence": 0.8
+      },
+      {
+        "gap_type": "taint_path_stopped_without_root",
+        "node_ref": "",
+        "component": "attribution",
+        "event_type": "analysis_boundary",
+        "why_it_blocks_root_cause_analysis": "The analyzer found defective semantics but no root-cause candidate. The trace or judgments do not provide a usable backward path to a defect-introduction node.",
+        "missing_semantic_fields": [
+          "causal_upstream_ref",
+          "defect_introduction_boundary"
+        ],
+        "related_refs": [
+          "record:observed_defect_task_loop_and_result_processing_premature_completion_with_known_failures",
+          "record:toolresult_call_00_ofUPraVc5SZpMFUyrHfV2796",
+          "record:responsenode_segment_28_7d0e075a",
+          "record:responseclaim_claim_5075_61e44478",
+          "record:responseclaim_claim_5097_332dbd43"
+        ],
+        "confidence": 0.9
+      }
+    ],
+    "recommended_trace_changes": [
+      {
+        "component": "tool",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "result",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "trace_provenance",
+        "priority": "high",
+        "change": "For each source_ref/dataflow edge, record why the upstream fact was used, which downstream decision or claim consumed it, and whether the edge is direct evidence, contextual support, or legacy noise.",
+        "unblocks": [
+          "defective_node_points_to_nondefective_upstream"
+        ]
+      },
+      {
+        "component": "attribution",
+        "priority": "high",
+        "change": "When a defective node has no defective upstream, preserve that node as a boundary candidate and record which missing trace facts prevent deeper attribution.",
+        "unblocks": [
+          "taint_path_stopped_without_root"
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "analysis": "backward_semantic_taint",
+    "max_depth": 6,
+    "max_nodes": 16,
+    "judge_timeout_seconds": 3600.0,
+    "judge_error_count": 0,
+    "judge_errors": [],
+    "analysis_outcome": "inconclusive",
+    "termination_reason": "queue_exhausted",
+    "artifact_hydration": {
+      "referenced": 2995,
+      "indexed": 3164,
+      "requested_nodes": 25,
+      "loaded": 19,
+      "missing": 0,
+      "truncated": 8,
+      "artifact_root": "/private/tmp/observable-opencode-featurebench-loop3e/traces/pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1"
+    }
+  }
+}

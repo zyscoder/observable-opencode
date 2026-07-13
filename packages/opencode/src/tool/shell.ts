@@ -22,6 +22,8 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { CaseTrace } from "@/observability/case-trace"
+import { captureRepositorySnapshot, repositorySnapshotDelta } from "@/observability/repository-snapshot"
 
 export { Parameters } from "./shell/prompt"
 
@@ -602,6 +604,9 @@ export const ShellTool = Tool.define(
               }
               const timeout = params.timeout ?? DEFAULT_TIMEOUT
               const ps = Shell.ps(shell)
+              const operationKind = Tool.classifyShellOperation(params.command)
+              const captureMutation = Boolean(CaseTrace.get()) && operationKind !== "code_inspection"
+              const repositoryBefore = captureMutation ? captureRepositorySnapshot(cwd) : undefined
               yield* Effect.scoped(
                 Effect.gen(function* () {
                   const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
@@ -613,7 +618,7 @@ export const ShellTool = Tool.define(
                 }),
               )
 
-              return yield* run(
+              const result = yield* run(
                 {
                   shell,
                   command: params.command,
@@ -624,6 +629,39 @@ export const ShellTool = Tool.define(
                 },
                 ctx,
               )
+              if (repositoryBefore) {
+                const repositoryAfter = captureRepositorySnapshot(cwd)
+                const delta = repositorySnapshotDelta(repositoryBefore, repositoryAfter)
+                if (delta.changed) {
+                  const change = CaseTrace.change({
+                    tool_call_id: ctx.callID,
+                    files: delta.files,
+                    intent: params.description || "Shell command changed repository files",
+                    diff: delta.diff,
+                    source_refs: ctx.callID ? [`tool_call:${ctx.callID}`] : undefined,
+                    metadata: {
+                      tool: "bash",
+                      operation_kind: operationKind,
+                      command: params.command,
+                      repository_root: repositoryAfter.root,
+                      before_fingerprint: delta.before_fingerprint,
+                      after_fingerprint: delta.after_fingerprint,
+                      status_before: delta.status_before,
+                      status_after: delta.status_after,
+                      capture_mode: "passive_git_worktree_snapshot",
+                    },
+                  })
+                  if (change && ctx.callID) {
+                    CaseTrace.edge({
+                      from: { type: "tool_call", id: ctx.callID, label: "bash" },
+                      to: { type: "change", id: change.change_id },
+                      relation: "tool_to_change",
+                      label: "Shell execution changed the repository worktree",
+                    })
+                  }
+                }
+              }
+              return result
             }),
         }
       })

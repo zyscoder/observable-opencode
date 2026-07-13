@@ -1,0 +1,144 @@
+import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
+import crypto from "node:crypto"
+import fs from "node:fs"
+import { createServer } from "node:http"
+import os from "node:os"
+import path from "node:path"
+import test from "node:test"
+import * as featureBenchRunner from "./run-featurebench-cases.mjs"
+import manifest from "./open-source-benchmarks.json" with { type: "json" }
+
+const { buildAgentPrompt, officialEvaluationStatus, selectFeatureBenchRows } = featureBenchRunner
+
+function git(cwd, args) {
+  return spawnSync("git", args, { cwd, encoding: "utf8" })
+}
+
+test("source manifest pins real FeatureBench instances without embedding benchmark patches", () => {
+  assert.equal(manifest.source.dataset, "LiberCoders/FeatureBench")
+  assert.equal(manifest.source.split, "lite")
+  assert.equal(manifest.source.license, "MIT")
+  assert.equal(manifest.instances.length, 3)
+  assert.ok(manifest.instances.every((item) => item.repo.includes("/")))
+  assert.ok(manifest.instances.every((item) => /^[a-f0-9]{40}$/.test(item.base_commit)))
+  assert.ok(manifest.instances.every((item) => /^[a-f0-9]{64}$/.test(item.problem_statement_sha256)))
+  assert.ok(manifest.instances.every((item) => !("patch" in item)))
+  assert.ok(manifest.instances.every((item) => !("test_patch" in item)))
+  assert.ok(manifest.instances.every((item) => !("gold_patch" in item)))
+  assert.doesNotMatch(JSON.stringify(manifest), /questions\.json|requirement_understanding\.json/)
+})
+
+test("adapter selects exact pinned rows and rejects problem statement drift", () => {
+  const instance = manifest.instances[0]
+  const row = {
+    ...instance,
+    problem_statement: "Pinned open-source feature request",
+    patch: "MASK_PATCH_CONTENT",
+    test_patch: "OFFICIAL_TEST_PATCH",
+    FAIL_TO_PASS: instance.fail_to_pass,
+    PASS_TO_PASS: instance.pass_to_pass,
+  }
+  const matchingManifest = {
+    ...manifest,
+    instances: [
+      {
+        ...instance,
+        problem_statement_sha256: crypto.createHash("sha256").update(row.problem_statement).digest("hex"),
+      },
+    ],
+  }
+
+  const selected = selectFeatureBenchRows({ rows: [{ row }] }, matchingManifest)
+
+  assert.equal(selected.length, 1)
+  assert.equal(selected[0].instance_id, instance.instance_id)
+  assert.throws(
+    () => selectFeatureBenchRows({ rows: [{ row: { ...row, problem_statement: "drifted" } }] }, matchingManifest),
+    /problem statement hash mismatch/,
+  )
+})
+
+test("agent prompt contains the official task but never exposes mask or test patches", () => {
+  const row = {
+    problem_statement: "Implement the complete feature in the current open-source repository.",
+    patch: "SECRET_MASK_PATCH_SHOULD_NOT_BE_IN_PROMPT",
+    test_patch: "SECRET_TEST_PATCH_SHOULD_NOT_BE_IN_PROMPT",
+  }
+
+  const prompt = buildAgentPrompt(row, "/tmp/featurebench/repo")
+
+  assert.match(prompt, /Implement the complete feature/)
+  assert.match(prompt, /\/tmp\/featurebench\/repo/)
+  assert.doesNotMatch(prompt, /SECRET_MASK_PATCH/)
+  assert.doesNotMatch(prompt, /SECRET_TEST_PATCH/)
+  assert.doesNotMatch(prompt, /questions\.json/)
+})
+
+test("official evaluation is explicitly not run when Docker is unavailable", () => {
+  assert.deepEqual(officialEvaluationStatus({ dockerAvailable: false }), {
+    status: "not_run",
+    reason: "docker_unavailable_on_host",
+    evaluator: "FeatureBench official harness",
+  })
+})
+
+test("HTTP case requests do not inherit global fetch's hidden response-header timeout", async () => {
+  assert.equal(typeof featureBenchRunner.postJson, "function")
+  const server = createServer((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end('{"ok":true}')
+    }, 20)
+  })
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const address = server.address()
+  assert.ok(address && typeof address === "object")
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    throw new TypeError("simulated fetch transport timeout")
+  }
+  try {
+    const result = await featureBenchRunner.postJson(
+      `http://127.0.0.1:${address.port}/long-agent-turn`,
+      { prompt: "run a long case" },
+      1000,
+    )
+    assert.deepEqual(result, { ok: true })
+  } finally {
+    globalThis.fetch = originalFetch
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
+  }
+})
+
+test("runner waits for trace finalization after the server process exits", async () => {
+  assert.equal(typeof featureBenchRunner.waitForGeneratedFile, "function")
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-trace-finalize-"))
+  const traceFile = path.join(directory, "trace.json")
+  setTimeout(() => fs.writeFileSync(traceFile, '{"status":"success"}\n'), 30)
+
+  const result = await featureBenchRunner.waitForGeneratedFile(traceFile, { timeoutMs: 1000, intervalMs: 10 })
+
+  assert.equal(result, traceFile)
+  assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).status, "success")
+})
+
+test("masked repositories expose no parent commit or unreachable original implementation", () => {
+  assert.equal(typeof featureBenchRunner.sealMaskedRepositoryHistory, "function")
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-sealed-history-"))
+  assert.equal(git(repo, ["init", "-q"]).status, 0)
+  assert.equal(git(repo, ["config", "user.email", "benchmark@localhost"]).status, 0)
+  assert.equal(git(repo, ["config", "user.name", "benchmark"]).status, 0)
+  fs.writeFileSync(path.join(repo, "implementation.py"), "SECRET_ORIGINAL_IMPLEMENTATION = True\n")
+  assert.equal(git(repo, ["add", "-A"]).status, 0)
+  assert.equal(git(repo, ["commit", "-q", "-m", "original"]).status, 0)
+  const originalCommit = git(repo, ["rev-parse", "HEAD"]).stdout.trim()
+  fs.rmSync(path.join(repo, "implementation.py"))
+
+  featureBenchRunner.sealMaskedRepositoryHistory(repo)
+
+  assert.equal(git(repo, ["rev-list", "--count", "HEAD"]).stdout.trim(), "1")
+  assert.notEqual(git(repo, ["cat-file", "-e", `${originalCommit}^{commit}`]).status, 0)
+  assert.notEqual(git(repo, ["show", "HEAD~1:implementation.py"]).status, 0)
+})

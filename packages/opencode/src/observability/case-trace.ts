@@ -115,6 +115,10 @@ export type TraceSourceLocation = {
 }
 
 export type TraceContextLedger = {
+  algorithm_version?: string
+  input_message_count?: number
+  compaction_request_message_count?: number
+  output_message_count?: number
   token_estimate_before?: number
   token_estimate_after?: number
   retained_message_ids?: string[]
@@ -184,7 +188,19 @@ export type TraceVerificationRecord = {
   cwd?: string
   purpose?: string
   stage?: "baseline" | "post_change" | "exploration" | "unknown"
+  repository_revision?: number
+  verification_phase?: "baseline" | "post_change" | "post_test_change" | "unknown"
+  effective_for_final_state?: boolean
+  supersedes_refs?: string[]
+  superseded_by_refs?: string[]
   exit_code?: number
+  process_exit_code?: number
+  parsed_command_outcomes?: Array<{
+    source: "reported_exit_marker" | string
+    exit_code: number
+    status: "passed" | "failed"
+  }>
+  exit_masked_by_shell?: boolean
   status: "passed" | "failed" | "unknown"
   parsed_failures: TraceParsedFailure[]
   stdout?: TraceFieldSummary
@@ -223,6 +239,8 @@ export type TraceChangeRecord = {
   span_id?: string
   tool_call_id?: string
   files: string[]
+  revision_before?: number
+  revision_after?: number
   change_target_role?: "production_code" | "test_code" | "docs" | "config" | "mixed" | "unknown" | string
   changed_test_oracle?: boolean
   intent?: string
@@ -408,6 +426,9 @@ export type TraceResponseClaimRecord = {
   response_segment_id?: string
   text: TraceFieldSummary
   claim_format?: "factual_claim" | "table_fact" | string
+  claim_kind?: "verification" | "change" | "requirement" | "architecture" | "risk" | "fact" | string
+  temporal_scope?: "baseline" | "current_revision" | "historical" | "future" | string
+  repository_revision?: number
   raw_text?: TraceFieldSummary
   canonical_text?: TraceFieldSummary
   table_cells?: string[]
@@ -415,6 +436,9 @@ export type TraceResponseClaimRecord = {
   table_values?: string[]
   claim_index: number
   direct_evidence_refs: string[]
+  direct_support_refs?: string[]
+  candidate_context_refs?: string[]
+  superseded_evidence_refs?: string[]
   context_refs: string[]
   execution_refs: string[]
   generation_provenance_refs?: string[]
@@ -588,6 +612,8 @@ export type TraceManifest = {
   server_status?: TraceStatus
   process_status?: TraceStatus
   server_shutdown_reason?: string
+  shutdown_signal?: string
+  shutdown_disposition?: string
   case_status?: TraceStatus
   case_completed_at?: string
   collection_mode: "passive_sidecar"
@@ -951,6 +977,9 @@ type CompactionRecordInput = {
   selected_head_messages?: number
   selected_tail_messages?: number
   hidden_compaction_messages?: number
+  input_message_count?: number
+  compaction_request_message_count?: number
+  output_message_count?: number
   previous_summary?: unknown
   serialized_tail?: unknown
   output_summary?: unknown
@@ -1250,6 +1279,18 @@ function inferredVerificationStatus(input: {
       : (input.explicitStatus ??
         (input.exitCode === undefined ? "unknown" : input.exitCode === 0 ? "passed" : "failed"))
   return { status, quality_flags: qualityFlags }
+}
+
+function parsedCommandOutcomes(stdout: unknown, stderr: unknown) {
+  const text = [stdout, stderr].filter((item): item is string => typeof item === "string").join("\n")
+  return [...text.matchAll(/(?:---\s*)?EXIT(?:\s+CODE)?\s*:\s*(-?\d+)/gi)].map((match) => {
+    const exitCode = Number(match[1])
+    return {
+      source: "reported_exit_marker" as const,
+      exit_code: exitCode,
+      status: exitCode === 0 ? ("passed" as const) : ("failed" as const),
+    }
+  })
 }
 
 function finalTestResultSemantics(input: {
@@ -1621,6 +1662,9 @@ function traceContextLedger(input: {
   selected_head_messages?: number
   selected_tail_messages?: number
   hidden_compaction_messages?: number
+  input_message_count?: number
+  compaction_request_message_count?: number
+  output_message_count?: number
   output_summary?: unknown
   auto_continue?: boolean
   context_ledger?: TraceContextLedger
@@ -1642,11 +1686,20 @@ function traceContextLedger(input: {
   if (input.auto_continue) qualityFlags.add("auto_continue_enabled")
   if (!input.context_ledger?.summary_artifact_id && input.output_summary !== undefined)
     qualityFlags.add("summary_artifact_pending")
+  const algorithm =
+    stringField(metadata, ["algorithm", "compaction_algorithm"]) ??
+    input.context_ledger?.algorithm ??
+    "head-tail-summary"
   return {
-    algorithm:
-      stringField(metadata, ["algorithm", "compaction_algorithm"]) ??
-      input.context_ledger?.algorithm ??
-      "head-tail-summary",
+    algorithm,
+    algorithm_version:
+      input.context_ledger?.algorithm_version ??
+      stringField(metadata, ["algorithm_version", "compaction_algorithm_version"]) ??
+      (algorithm === "head-tail-summary" ? "head-tail-summary/v1" : undefined),
+    input_message_count: input.context_ledger?.input_message_count ?? input.input_message_count,
+    compaction_request_message_count:
+      input.context_ledger?.compaction_request_message_count ?? input.compaction_request_message_count,
+    output_message_count: input.context_ledger?.output_message_count ?? input.output_message_count,
     token_estimate_before: input.context_ledger?.token_estimate_before ?? input.input_tokens,
     token_estimate_after:
       input.context_ledger?.token_estimate_after ??
@@ -1958,7 +2011,10 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
       if (isBrokenClaimFragment(claim)) return []
       const textLength = claim.replace(/\s/g, "").length
       const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
-      if (textLength < 6 && !hasFactSignal) return []
+      const hasAtomicVerdict = /^(?:全部|所有)?(?:测试|检查|验证|用例)?(?:均|都|已)?(?:通过|失败|成功|完成)[。.!?]?$/.test(
+        claim,
+      )
+      if (textLength < 6 && !hasFactSignal && !hasAtomicVerdict) return []
       if (isNonFactualResponseClaim(claim)) return []
       const candidate = markdownTableFactClaim(claim) ?? {
         text: claim,
@@ -1981,6 +2037,7 @@ function stripResponseClaimScaffolding(input: string) {
       continue
     }
     if (inFence) continue
+    if (/^\s*#{1,6}\s+/.test(line)) continue
     output.push(line)
   }
   return output.join("\n")
@@ -2054,7 +2111,7 @@ function isLikelyTableHeaderCell(input: string) {
   if (!normalized) return true
   if (/^:?-{2,}:?$/.test(normalized)) return true
   if (
-    /^(项目|结果|来源|状态|输入|计算|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|子 agent 结论|subagent result|field|value|status)$/.test(
+    /^(项目|结果|来源|状态|输入|计算|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|脚本|命令|覆盖风险|子 agent 结论|subagent result|field|value|status)$/.test(
       normalized,
     )
   )
@@ -2084,7 +2141,7 @@ function markdownTableFactClaim(input: string): ResponseClaimCandidate | undefin
   if (cells.length < 2) return undefined
   if (isMarkdownTableStructuralRow(input)) return undefined
   const subject = cells[0]?.trim()
-  if (!subject || isLikelyTableHeaderCell(subject)) return undefined
+  if (!subject) return undefined
   const values = cells
     .slice(1)
     .map((cell) => cell.trim())
@@ -2158,6 +2215,24 @@ function responseClaimQualityFlags(classifiedRefs: ReturnType<typeof classifySou
     else flags.push("unsupported_response_claim")
   }
   return flags
+}
+
+function responseClaimKind(input: unknown): TraceResponseClaimRecord["claim_kind"] {
+  const text = fieldSummaryText(input).toLowerCase()
+  if (/(?:测试|验证|检查|用例|test|verify|verification|lint|build|构建).*(?:通过|失败|成功|passed|failed)|^(?:全部|所有).*(?:通过|失败)/i.test(text))
+    return "verification"
+  if (/(?:修改|变更|修复|实现|changed?|modified|fixed|implemented)/i.test(text)) return "change"
+  if (/(?:需求|requirement|acceptance criteria)/i.test(text)) return "requirement"
+  if (/(?:架构|模块边界|调用链|architecture|module boundary|call chain)/i.test(text)) return "architecture"
+  if (/(?:风险|限制|隐患|risk|limitation)/i.test(text)) return "risk"
+  return "fact"
+}
+
+function responseClaimTemporalScope(input: unknown, repositoryRevision: number) {
+  const text = fieldSummaryText(input).toLowerCase()
+  if (/(?:基线|修改前|变更前|此前|baseline|before (?:the )?change|previously)/i.test(text)) return "historical" as const
+  if (/(?:计划|后续|将会|待办|未来|will|todo|future)/i.test(text)) return "future" as const
+  return repositoryRevision === 0 ? ("baseline" as const) : ("current_revision" as const)
 }
 
 function unchangedPathTargetsFromClaim(input: unknown) {
@@ -4189,6 +4264,7 @@ class ActiveCaseTrace {
   private designRecords: TraceDesignRecord[] = []
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
+  private repositoryRevision = 0
   private recentContextSnapshotIDs: string[] = []
   private recentPromptNodeIDs: string[] = []
   private recentContextNodeIDs: string[] = []
@@ -4580,8 +4656,46 @@ class ActiveCaseTrace {
 
     if (eventType === "tool.call") {
       const nodeID = callID ? `toolcall_${safeNodeIDPart(callID)}` : undefined
-      const existing = nodeID ? this.causalNodes.find((node) => node.node_id === nodeID) : undefined
-      if (existing) return existing
+      const existing = this.causalNodes.find((node) => {
+        if (node.kind !== "tool.call") return false
+        if (nodeID && node.node_id === nodeID) return true
+        if (input.span_id && node.span_id === input.span_id) return true
+        const nodeInput = recordFromUnknown(node.data?.input)
+        return Boolean(
+          callID &&
+            (firstStringField(node.data, ["call_id", "callID"]) === callID ||
+              firstStringField(nodeInput, ["callID", "call_id", "toolCallID", "tool_call_id"]) === callID),
+        )
+      })
+      if (existing) {
+        existing.data = {
+          ...(existing.data ?? {}),
+          ...common,
+          input: objectField(payload, "input") ?? existing.data?.input,
+          provider_metadata:
+            objectField(payload, "providerMetadata") ??
+            objectField(payload, "provider_metadata") ??
+            existing.data?.provider_metadata,
+          request_status: "requested",
+        }
+        existing.source_refs = mergeRefs(existing.source_refs, callID ? [`tool_call:${callID}`] : undefined)
+        existing.source_locations = dedupeSourceLocations([
+          ...(existing.source_locations ?? []),
+          ...collectSourceLocations(args ?? payload),
+        ])
+        existing.typed_resources = mergeTypedResources(existing.typed_resources, [
+          {
+            type: "tool_call",
+            tool_name: toolName,
+            call_id: callID,
+            path: firstStringField(args, ["path", "filePath", "filepath"]),
+            command: firstStringField(args, ["command"]),
+          },
+        ])
+        existing.artifact_refs = this.collectArtifactRefs(existing.data)
+        this.writeRecord("node.update", existing)
+        return existing
+      }
       const node = this.node({
         node_id: nodeID,
         kind: "tool.call",
@@ -4686,6 +4800,7 @@ class ActiveCaseTrace {
     node.status = status
     node.data = {
       ...(node.data ?? {}),
+      request_status: "completed",
       outcome_record_id: outcomeNode.node_id,
       outcome_ref: `${outcomeNode.kind === "tool.error" ? "tool_error" : "tool_result"}:${callID}`,
       output: status === "success" ? this.summarizeCausalValue(outcome, "tool.call.output") : node.data?.output,
@@ -5026,9 +5141,25 @@ class ActiveCaseTrace {
     }
   }
 
+  private syncVerificationNode(verification: TraceVerificationRecord) {
+    const node = this.causalNodes.find((item) => item.node_id === `vernode_${verification.verification_id}`)
+    if (!node) return
+    node.data = {
+      ...(node.data ?? {}),
+      repository_revision: verification.repository_revision,
+      verification_phase: verification.verification_phase,
+      effective_for_final_state: verification.effective_for_final_state,
+      supersedes_refs: verification.supersedes_refs,
+      superseded_by_refs: verification.superseded_by_refs,
+    }
+    node.artifact_refs = this.collectArtifactRefs(node.data)
+    this.writeRecord("node.update", node)
+  }
+
   verification(input: VerificationRecordInput) {
     const parsed = input.parsed_failures ?? parseVerificationFailures({ stdout: input.stdout, stderr: input.stderr })
     const exitCode = optionalNumber(input.exit_code)
+    const commandOutcomes = parsedCommandOutcomes(input.stdout, input.stderr)
     const statusInference = inferredVerificationStatus({
       explicitStatus: input.status,
       exitCode,
@@ -5036,6 +5167,15 @@ class ActiveCaseTrace {
       command: input.command,
     })
     const verificationScope = this.verificationScopeContext()
+    const verificationPhase =
+      this.repositoryRevision === 0
+        ? "baseline"
+        : verificationScope.changedTestRefs.length
+          ? "post_test_change"
+          : "post_change"
+    const superseded = this.verificationRecords.filter(
+      (item) => item.command?.trim() === input.command?.trim(),
+    )
     const finalTestResult = finalTestResultSemantics({
       command: input.command,
       exitCode,
@@ -5067,7 +5207,16 @@ class ActiveCaseTrace {
       cwd: input.cwd,
       purpose: input.purpose,
       stage: input.stage ?? "unknown",
+      repository_revision: this.repositoryRevision,
+      verification_phase: verificationPhase,
+      effective_for_final_state: true,
+      supersedes_refs: superseded.map((item) => `verification:${item.verification_id}`),
       exit_code: exitCode,
+      process_exit_code: exitCode,
+      parsed_command_outcomes: commandOutcomes,
+      exit_masked_by_shell:
+        exitCode === 0 &&
+        (commandOutcomes.some((outcome) => outcome.status === "failed") || Boolean(parsed.length)),
       status: statusInference.status,
       parsed_failures: parsed,
       stdout: input.stdout === undefined ? undefined : this.summarizeText(input.stdout, "verification.stdout"),
@@ -5086,8 +5235,22 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
+    for (const previous of superseded) {
+      previous.effective_for_final_state = false
+      previous.superseded_by_refs = dedupeStrings([
+        ...(previous.superseded_by_refs ?? []),
+        `verification:${verification.verification_id}`,
+      ])
+      this.syncVerificationNode(previous)
+    }
     this.remember(this.recentVerificationIDs, verification.verification_id)
     this.write("semantic.verification", verification)
+    const linkedChangeRefs = dedupeStrings([
+      ...verificationScope.changedTestRefs,
+      ...verificationScope.changedProductionRefs,
+      ...verificationScope.changedDocsRefs,
+      ...(this.recentChangeID ? [`change:${this.recentChangeID}`] : []),
+    ])
     this.node({
       node_id: `vernode_${verification.verification_id}`,
       kind: "verification",
@@ -5101,7 +5264,15 @@ class ActiveCaseTrace {
         cwd: input.cwd,
         purpose: input.purpose,
         stage: verification.stage,
+        repository_revision: verification.repository_revision,
+        verification_phase: verification.verification_phase,
+        effective_for_final_state: verification.effective_for_final_state,
+        supersedes_refs: verification.supersedes_refs,
+        superseded_by_refs: verification.superseded_by_refs,
         exit_code: verification.exit_code,
+        process_exit_code: verification.process_exit_code,
+        parsed_command_outcomes: verification.parsed_command_outcomes,
+        exit_masked_by_shell: verification.exit_masked_by_shell,
         quality_flags: verification.quality_flags,
         changed_test_refs: verification.changed_test_refs,
         changed_production_refs: verification.changed_production_refs,
@@ -5114,20 +5285,15 @@ class ActiveCaseTrace {
         stderr: input.stderr,
       },
       source_locations: sourceLocations,
-      source_refs: sourceLocations
-        .map((location) => location.uri ?? location.path)
-        .filter((item): item is string => Boolean(item)),
+      source_refs: dedupeStrings([
+        ...(input.tool_call_id ? [`tool_call:${input.tool_call_id}`] : []),
+        ...linkedChangeRefs,
+        ...sourceLocations
+          .map((location) => location.uri ?? location.path)
+          .filter((item): item is string => Boolean(item)),
+      ]),
     })
     if (verification.status === "failed") this.recentFailedVerificationID = verification.verification_id
-    const linkedChangeRefs =
-      verification.status === "passed"
-        ? dedupeStrings([
-            ...verificationScope.changedTestRefs,
-            ...verificationScope.changedProductionRefs,
-            ...verificationScope.changedDocsRefs,
-            ...(this.recentChangeID ? [`change:${this.recentChangeID}`] : []),
-          ])
-        : []
     for (const ref of linkedChangeRefs) {
       const parsedRef = this.parseSourceRef(ref)
       if (!parsedRef?.id) continue
@@ -5142,6 +5308,8 @@ class ActiveCaseTrace {
   }
 
   change(input: ChangeRecordInput) {
+    const revisionBefore = this.repositoryRevision
+    const revisionAfter = revisionBefore + 1
     const sourceRefs =
       input.source_refs ??
       input.evidence_refs ??
@@ -5168,6 +5336,8 @@ class ActiveCaseTrace {
       span_id: input.span_id,
       tool_call_id: input.tool_call_id,
       files: input.files,
+      revision_before: revisionBefore,
+      revision_after: revisionAfter,
       change_target_role: targetRole,
       changed_test_oracle: changedTestOracle,
       intent: input.intent,
@@ -5191,6 +5361,8 @@ class ActiveCaseTrace {
       data: {
         change_id: change.change_id,
         files: input.files,
+        revision_before: revisionBefore,
+        revision_after: revisionAfter,
         change_target_role: targetRole,
         changed_test_oracle: changedTestOracle,
         intent: input.intent,
@@ -5205,6 +5377,12 @@ class ActiveCaseTrace {
       source_refs: sourceRefs,
       source_locations: collectSourceLocations(input.files),
     })
+    this.repositoryRevision = revisionAfter
+    for (const verification of this.verificationRecords) {
+      if (verification.effective_for_final_state === false) continue
+      verification.effective_for_final_state = false
+      this.syncVerificationNode(verification)
+    }
     this.recentChangeID = change.change_id
     if (this.recentFailedVerificationID) {
       this.edge({
@@ -5544,6 +5722,22 @@ class ActiveCaseTrace {
       : candidateClassifiedRefs.direct_evidence_refs.length <= 1
         ? candidateClassifiedRefs.direct_evidence_refs
         : []
+    const claimKind = responseClaimKind(claimText)
+    const temporalScope = responseClaimTemporalScope(claimText, this.repositoryRevision)
+    const verificationSourceRefs = classifiedRefs.execution_refs.filter((ref) => ref.startsWith("verification:"))
+    const effectiveVerificationRefs = verificationSourceRefs.filter((ref) => {
+      const verificationID = ref.slice("verification:".length)
+      const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
+      return (
+        verification?.effective_for_final_state === true &&
+        verification.repository_revision === this.repositoryRevision
+      )
+    })
+    const supersededEvidenceRefs = verificationSourceRefs.filter((ref) => !effectiveVerificationRefs.includes(ref))
+    const directSupportRefs = dedupeStrings([
+      ...effectiveDirectEvidenceRefs,
+      ...(claimKind === "verification" ? effectiveVerificationRefs : []),
+    ])
     const legacyContextRefs = sourceRefs.filter((ref) => !effectiveDirectEvidenceRefs.includes(ref))
     const effectiveClassifiedRefs = {
       ...candidateClassifiedRefs,
@@ -5559,9 +5753,10 @@ class ActiveCaseTrace {
       ...collectSourceLocations(input.text),
       ...collectSourceLocations(input.metadata),
     ])
-    const supportLevel = input.support_level ?? responseClaimSupportLevel(effectiveClassifiedRefs)
-    const attributionSourceRefs = effectiveDirectEvidenceRefs.length
-      ? effectiveDirectEvidenceRefs
+    const supportLevel =
+      input.support_level ?? (directSupportRefs.length ? "direct" : responseClaimSupportLevel(effectiveClassifiedRefs))
+    const attributionSourceRefs = directSupportRefs.length
+      ? directSupportRefs
       : dedupeStrings([...classifiedRefs.execution_refs.slice(0, 3), ...classifiedRefs.context_refs.slice(0, 3)])
     const dependencyToolOutcomeRefs = dedupeStrings([
       ...effectiveDirectEvidenceRefs.filter(isToolOutcomeRef),
@@ -5585,7 +5780,7 @@ class ActiveCaseTrace {
     }
     const qualityFlags = dedupeStrings([
       ...(input.quality_flags ?? []),
-      ...responseClaimQualityFlags(effectiveClassifiedRefs),
+      ...(directSupportRefs.length ? [] : responseClaimQualityFlags(effectiveClassifiedRefs)),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
       ...(evidenceMatch.weak ? ["weak_evidence_match"] : []),
       ...(candidateClassifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
@@ -5600,6 +5795,9 @@ class ActiveCaseTrace {
       response_segment_id: input.response_segment_id,
       text: this.summarizeText(claimText, "result.response.claim"),
       claim_format: input.claim_format ?? "factual_claim",
+      claim_kind: claimKind,
+      temporal_scope: temporalScope,
+      repository_revision: this.repositoryRevision,
       raw_text:
         input.raw_text === undefined ? undefined : this.summarizeText(input.raw_text, "result.response.claim.raw"),
       canonical_text:
@@ -5611,6 +5809,9 @@ class ActiveCaseTrace {
       table_values: input.table_values,
       claim_index: input.claim_index,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
+      direct_support_refs: directSupportRefs,
+      candidate_context_refs: classifiedRefs.context_refs,
+      superseded_evidence_refs: supersededEvidenceRefs,
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
       generation_provenance_refs: generationProvenanceRefs,
@@ -5652,6 +5853,9 @@ class ActiveCaseTrace {
         response_segment_id: claim.response_segment_id,
         text: claimText,
         claim_format: claim.claim_format,
+        claim_kind: claim.claim_kind,
+        temporal_scope: claim.temporal_scope,
+        repository_revision: claim.repository_revision,
         raw_text: input.raw_text,
         canonical_text: input.canonical_text,
         table_cells: claim.table_cells,
@@ -5659,6 +5863,9 @@ class ActiveCaseTrace {
         table_values: claim.table_values,
         claim_index: claim.claim_index,
         direct_evidence_refs: claim.direct_evidence_refs,
+        direct_support_refs: claim.direct_support_refs,
+        candidate_context_refs: claim.candidate_context_refs,
+        superseded_evidence_refs: claim.superseded_evidence_refs,
         context_refs: claim.context_refs,
         execution_refs: claim.execution_refs,
         generation_provenance_refs: claim.generation_provenance_refs,
@@ -6550,6 +6757,10 @@ class ActiveCaseTrace {
         serialized_tail: serializedTail,
         output_summary: outputSummary,
         algorithm: contextLedger.algorithm,
+        algorithm_version: contextLedger.algorithm_version,
+        input_message_count: contextLedger.input_message_count,
+        compaction_request_message_count: contextLedger.compaction_request_message_count,
+        output_message_count: contextLedger.output_message_count,
         before_context_refs: sourceRefs ?? [],
         after_context_refs: afterContextRefs,
         serialized_tail_artifact_ref: serializedTailArtifactRef,
@@ -6838,6 +7049,7 @@ class ActiveCaseTrace {
     const ended = Date.now()
     const shutdownReason = this.serverShutdownReason()
     const manifestStatus = caseStatus ?? status
+    const shutdown = this.shutdownLifecycle(manifestStatus)
     return {
       trace_version: TRACE_VERSION,
       case_id: this.caseID,
@@ -6850,6 +7062,8 @@ class ActiveCaseTrace {
       server_status: status,
       process_status: status,
       server_shutdown_reason: shutdownReason,
+      shutdown_signal: shutdown.signal,
+      shutdown_disposition: shutdown.disposition,
       case_status: caseStatus ?? status,
       case_completed_at: caseStatus === "success" ? new Date(ended).toISOString() : undefined,
       collection_mode: "passive_sidecar",
@@ -6974,6 +7188,23 @@ class ActiveCaseTrace {
     return stringField(result, ["reason"])
   }
 
+  private shutdownLifecycle(caseStatus: TraceStatus) {
+    const result = recordFromUnknown(this.result) ?? {}
+    const explicitSignal = stringField(result, ["signal"])
+    const reason = stringField(result, ["reason"])
+    const signal = explicitSignal ?? (reason && /^SIG[A-Z0-9]+$/.test(reason) ? reason : undefined)
+    if (signal && caseStatus === "success") {
+      return { signal, disposition: "graceful_after_case_completion" }
+    }
+    if (signal) {
+      return { signal, disposition: "interrupted_before_case_completion" }
+    }
+    return {
+      signal: undefined,
+      disposition: caseStatus === "success" ? "normal_case_completion" : "case_ended_without_signal",
+    }
+  }
+
   private streamSummary() {
     const counts: Record<string, number> = {}
     for (const event of this.events) {
@@ -7015,6 +7246,7 @@ class ActiveCaseTrace {
 
   private emitCaseLifecycleRecord(serverStatus: TraceStatus, caseStatus: TraceStatus) {
     const shutdownReason = this.serverShutdownReason()
+    const shutdown = this.shutdownLifecycle(caseStatus)
     const finalSegment = this.responseSegments
       .filter(
         (segment) =>
@@ -7038,6 +7270,8 @@ class ActiveCaseTrace {
         server_status: serverStatus,
         process_status: serverStatus,
         server_shutdown_reason: shutdownReason,
+        shutdown_signal: shutdown.signal,
+        shutdown_disposition: shutdown.disposition,
         case_status: caseStatus,
         final_response_segment_id: finalSegment?.segment_id,
         result: this.result,
@@ -8158,6 +8392,40 @@ class ActiveCaseTrace {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const checkID = input.check_id ?? semanticID("compactioncheck", this.causalNodes.length + 1)
     const usage = input.token_usage ? normalizeTokenUsage(input.token_usage) : undefined
+    const previousContextRecord = [...this.causalNodes]
+      .reverse()
+      .find((node) => node.kind === "context.compaction_check" || node.kind === "context.compaction")
+    if (
+      input.overflow === false &&
+      previousContextRecord?.kind === "context.compaction_check" &&
+      previousContextRecord.data?.overflow === false &&
+      firstStringField(previousContextRecord.data, ["session_id", "sessionID"]) === input.session_id &&
+      firstStringField(previousContextRecord.data, ["model_id", "modelID"]) === input.model_id &&
+      firstStringField(previousContextRecord.data, ["selected_algorithm", "selectedAlgorithm"]) ===
+        input.selected_algorithm
+    ) {
+      const previousData = previousContextRecord.data ?? {}
+      previousContextRecord.data = omitUndefined({
+        ...previousData,
+        check_count: (optionalNumber(previousData.check_count) ?? 1) + 1,
+        aggregated_noop_checks: true,
+        first_token_estimate:
+          optionalNumber(previousData.first_token_estimate) ?? optionalNumber(previousData.token_estimate),
+        last_check_id: checkID,
+        message_id: input.message_id ?? previousData.message_id,
+        token_usage: usage ?? previousData.token_usage,
+        token_estimate: input.token_estimate,
+        context_limit: input.context_limit,
+        reserved_tokens: input.reserved_tokens,
+        trigger_reason: input.trigger_reason ?? previousData.trigger_reason,
+        metadata: input.metadata ?? previousData.metadata,
+      })
+      previousContextRecord.source_refs = mergeRefs(previousContextRecord.source_refs, sourceRefs)
+      previousContextRecord.artifact_refs = this.collectArtifactRefs(previousContextRecord.data)
+      this.writeRecord("node.update", previousContextRecord)
+      this.writePartial()
+      return previousContextRecord
+    }
     const data = omitUndefined({
       check_id: checkID,
       session_id: input.session_id,
@@ -8171,6 +8439,7 @@ class ActiveCaseTrace {
       overflow: input.overflow,
       selected_algorithm: input.selected_algorithm,
       trigger_reason: input.trigger_reason,
+      check_count: 1,
       metadata: input.metadata,
     })
     const node = this.node({

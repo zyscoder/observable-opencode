@@ -11,6 +11,11 @@ to perform backward semantic taint analysis:
 3. Continue backward until a defective node has no defective upstream cause; that node is
    reported as a root-cause candidate.
 
+Each node is classified as `present`, `absent`, or `unknown`. Judge failures, incomplete
+responses, unresolved refs, and traversal limits remain `unknown`/`inconclusive`; they are
+never promoted to root causes. Reports expose `analysis_outcome` as `root_found`,
+`no_defect`, or `inconclusive`, plus a separate `termination_reason`.
+
 The module is offline with respect to opencode execution. It never writes back to trace
 files and never feeds attribution results back into the agent.
 
@@ -52,11 +57,18 @@ Optional:
 --start-ref record:responseclaim_claim_147_e7906af6
 --base-url https://api.deepseek.com/anthropic
 --judge-max-tokens 4096
---judge-timeout-sec 60
+--judge-timeout-sec 3600
+--thinking-mode auto
 --max-depth 8
 --max-nodes 48
 --model claude-sonnet-4-5
 ```
+
+Each judge or JSON-repair request waits up to 3600 seconds by default. Override it with
+`--judge-timeout-sec` or `CLAUDE_TIMEOUT_SECONDS` when a different per-request budget is required.
+`--thinking-mode auto` disables thinking on DeepSeek's Anthropic-compatible endpoint so the output
+budget is spent on the structured judgment; use `enabled` explicitly when deeper online reasoning is
+worth the additional latency and token cost.
 
 ## Quality Gap Attribution
 
@@ -80,13 +92,19 @@ python3 -m trace_attribution \
 
 The injected quality-gap records are not written back to the original trace and are never
 fed back into opencode. They only give the offline analyzer a precise starting point for
-backward semantic taint analysis.
+backward semantic taint analysis. These evaluation records are assertions to validate,
+not guaranteed defects: the analyzer rejects them when their cited upstream facts are
+non-defective.
 
 Stress-case reviews that report `missing_semantics` also inject offline-only
 `case.missing_semantic` nodes. Runtime traces may additionally contain passive
 `case.observed_defect` / `case.missing_semantic` records for health findings such as
 "repository changed but no final test result was observed". These records are derived
 after the agent run and are never fed back into the agent.
+
+Ground Truth root-cause labels are retained for external scoring only. They are not injected
+as observed defects or copied into semantic-gap nodes. Only an explicit `observed_defects`
+entry can create an offline `case.observed_defect` start node.
 
 ## Trace Improvement Feedback
 
@@ -104,8 +122,10 @@ judgments. It does not make extra model calls. Typical entries include:
   node that was not itself defective.
 - `unresolved_trace_refs`: a source ref or dataflow endpoint did not resolve to a trace
   node.
-- `judge_error`: the attribution judge timed out or failed on a node; the analyzer keeps
-  the node as a low-confidence boundary candidate and still writes a partial report.
+- `judge_error`: the attribution judge timed out, failed, or returned an irreparable
+  incomplete judgment; the affected node remains `unknown` and the report is inconclusive.
+- `analysis_search_limit`: `max_depth` or `max_nodes` stopped traversal before all cited
+  upstream nodes were evaluated.
 
 Use this report as the feedback loop between the reasoning module and semantic tracing:
 when attribution can only say "the defect is somewhere around LLM generation", the report

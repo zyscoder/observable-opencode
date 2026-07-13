@@ -34,12 +34,33 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
   const caseEffectiveness = missingMechanisms.length ? "ineffective" : "effective"
   const noisy = detectNoisySemantics(trace)
   const qualityReview = scoreTraceQuality({ caseDefinition, trace })
+  const mechanismCoverage = {
+    status:
+      traceSufficiency === "sufficient" && !missingMechanisms.length
+        ? "sufficient"
+        : traceSufficiency === "insufficient" ||
+            (mechanismFound.length > 0 && mechanismFound.every((item) => item.status === "missing"))
+          ? "insufficient"
+          : "partial",
+    semantic_evidence: found,
+    mechanism_evidence: mechanismFound,
+    missing_semantics: missingSemantics,
+    missing_mechanisms: missingMechanisms,
+  }
+  const actualCaseOutcome = evaluateActualCaseOutcome({ caseDefinition, trace })
 
   return {
     case_id: caseDefinition.case_id,
     title: caseDefinition.title,
     category: caseDefinition.category,
-    ground_truth_root_cause: caseDefinition.ground_truth_root_cause,
+    designed_failure_target: {
+      ...(caseDefinition.ground_truth_root_cause ?? {}),
+      designed_failure_mode: caseDefinition.designed_failure_mode,
+      provenance: "fixture_design_only",
+      observed_in_actual_run: false,
+    },
+    mechanism_coverage: mechanismCoverage,
+    actual_case_outcome: actualCaseOutcome,
     trace_sufficiency: traceSufficiency,
     case_effectiveness: caseEffectiveness,
     evidence_found: found,
@@ -51,6 +72,99 @@ export function reviewTraceSufficiency({ caseDefinition, trace }) {
     quality_review: qualityReview,
     recommended_trace_changes: recommendTraceChanges(missingSemantics, missingMechanisms),
   }
+}
+
+export function evaluateActualCaseOutcome({ caseDefinition, trace }) {
+  const assertions = Array.isArray(caseDefinition.acceptance_assertions)
+    ? caseDefinition.acceptance_assertions
+    : []
+  const caseStatus =
+    trace?.manifest?.case_status ??
+    [...(Array.isArray(trace?.records) ? trace.records : [])]
+      .reverse()
+      .find((record) => record.event_type === "case.completed" || record.event_type === "case.failed")?.data
+      ?.case_status
+  if (caseStatus === "error" || caseStatus === "cancelled") {
+    return {
+      status: "fail",
+      reason: `case_status_${caseStatus}`,
+      case_status: caseStatus,
+      assertions: [],
+    }
+  }
+  if (!assertions.length) {
+    return {
+      status: "unknown",
+      reason: "no_executable_acceptance_assertions",
+      case_status: caseStatus ?? "unknown",
+      assertions: [],
+    }
+  }
+  const results = assertions.map((assertion, index) => evaluateAcceptanceAssertion(assertion, trace, index))
+  const status = results.some((item) => item.status === "fail")
+    ? "fail"
+    : results.some((item) => item.status === "unknown")
+      ? "unknown"
+      : "pass"
+  return {
+    status,
+    reason: status === "pass" ? "all_acceptance_assertions_passed" : "acceptance_assertion_not_satisfied",
+    case_status: caseStatus ?? "unknown",
+    assertions: results,
+  }
+}
+
+function evaluateAcceptanceAssertion(assertion, trace, index) {
+  const records = Array.isArray(trace?.records) ? trace.records : []
+  const id = String(assertion?.id ?? `assertion_${index + 1}`)
+  const type = String(assertion?.type ?? "")
+  if (type === "verification_passed") {
+    const commandContains = String(assertion.command_contains ?? "")
+    const matches = records.filter(
+      (record) =>
+        record.event_type === "verification" &&
+        (!commandContains || String(record.data?.command ?? record.title ?? "").includes(commandContains)),
+    )
+    const passed = matches.some(
+      (record) =>
+        (record.status === "passed" || record.data?.status === "passed") &&
+        record.data?.effective_for_final_state !== false,
+    )
+    return { id, type, status: passed ? "pass" : "fail", record_refs: matches.map(recordRef) }
+  }
+  if (type === "changed_path") {
+    const target = normalizePath(String(assertion.path ?? ""))
+    const changed = records.filter((record) => record.event_type === "change").filter((record) =>
+      (Array.isArray(record.data?.files) ? record.data.files : []).some((file) => {
+        const normalized = normalizePath(String(file))
+        return normalized === target || normalized.startsWith(`${target}/`)
+      }),
+    )
+    const shouldChange = assertion.should_change !== false
+    return {
+      id,
+      type,
+      status: Boolean(changed.length) === shouldChange ? "pass" : "fail",
+      record_refs: changed.map(recordRef),
+    }
+  }
+  if (type === "response_contains") {
+    const expected = String(assertion.text ?? "")
+    const matches = records.filter(
+      (record) => isAnswerSemanticRecord(record) && JSON.stringify(record.data ?? {}).includes(expected),
+    )
+    return { id, type, status: matches.length ? "pass" : "fail", record_refs: matches.map(recordRef) }
+  }
+  if (type === "trace_record_present") {
+    const eventType = String(assertion.event_type ?? "")
+    const matches = records.filter((record) => record.event_type === eventType)
+    return { id, type, status: matches.length ? "pass" : "fail", record_refs: matches.map(recordRef) }
+  }
+  if (type === "case_status") {
+    const actual = trace?.manifest?.case_status ?? "unknown"
+    return { id, type, status: actual === assertion.expected ? "pass" : "fail", actual }
+  }
+  return { id, type, status: "unknown", reason: "unsupported_acceptance_assertion" }
 }
 
 export function scoreTraceQuality({ caseDefinition, trace }) {
@@ -106,29 +220,35 @@ export function scoreTraceQuality({ caseDefinition, trace }) {
 
 export function summarizeReviews(reviews) {
   const counts = { sufficient: 0, partial: 0, insufficient: 0 }
-  for (const review of reviews) counts[review.trace_sufficiency] = (counts[review.trace_sufficiency] ?? 0) + 1
-  const effectivenessCounts = { effective: 0, ineffective: 0 }
-  for (const review of reviews)
-    effectivenessCounts[review.case_effectiveness ?? "ineffective"] =
-      (effectivenessCounts[review.case_effectiveness ?? "ineffective"] ?? 0) + 1
+  for (const review of reviews) {
+    const status = review.mechanism_coverage?.status ?? review.trace_sufficiency ?? "insufficient"
+    counts[status] = (counts[status] ?? 0) + 1
+  }
+  const outcomeCounts = { pass: 0, fail: 0, unknown: 0 }
+  for (const review of reviews) {
+    const status = review.actual_case_outcome?.status ?? "unknown"
+    outcomeCounts[status] = (outcomeCounts[status] ?? 0) + 1
+  }
   const lines = [
-    "# Trace Stress Case Sufficiency Summary",
+    "# Trace Stress Case Review Summary",
     "",
-    `- sufficient: ${counts.sufficient}`,
-    `- partial: ${counts.partial}`,
-    `- insufficient: ${counts.insufficient}`,
-    `- effective cases: ${effectivenessCounts.effective}`,
-    `- ineffective cases: ${effectivenessCounts.ineffective}`,
+    `- mechanism coverage sufficient: ${counts.sufficient}`,
+    `- mechanism coverage partial: ${counts.partial}`,
+    `- mechanism coverage insufficient: ${counts.insufficient}`,
+    `- actual outcome pass: ${outcomeCounts.pass}`,
+    `- actual outcome fail: ${outcomeCounts.fail}`,
+    `- actual outcome unknown: ${outcomeCounts.unknown}`,
     "",
-    "| Case | Root Cause | Sufficiency | Effectiveness | Quality | Missing Semantics | Missing Mechanisms |",
+    "| Case | Designed Failure Target | Mechanism Coverage | Actual Outcome | Quality | Missing Semantics | Missing Mechanisms |",
     "|---|---|---|---|---|---|---|",
   ]
   for (const review of reviews) {
     const missingSemantics = Array.isArray(review.missing_semantics) ? review.missing_semantics : []
     const missingMechanisms = Array.isArray(review.missing_mechanisms) ? review.missing_mechanisms : []
     const quality = review.quality_review ? `${review.quality_review.total_score}/${review.quality_review.target_score}` : "-"
+    const target = review.designed_failure_target ?? {}
     lines.push(
-      `| ${review.case_id} | ${review.ground_truth_root_cause.component}/${review.ground_truth_root_cause.failure_type} | ${review.trace_sufficiency} | ${review.case_effectiveness ?? "ineffective"} | ${quality} | ${missingSemantics.join(", ") || "-"} | ${missingMechanisms.join(", ") || "-"} |`,
+      `| ${review.case_id} | ${target.component ?? "-"}/${target.failure_type ?? "-"} | ${review.mechanism_coverage?.status ?? review.trace_sufficiency ?? "insufficient"} | ${review.actual_case_outcome?.status ?? "unknown"} | ${quality} | ${missingSemantics.join(", ") || "-"} | ${missingMechanisms.join(", ") || "-"} |`,
     )
   }
   lines.push("")
@@ -310,9 +430,7 @@ function detectEvidence(name, trace) {
     requirement_understanding_claims: (records) =>
       records.filter(
         (record) =>
-          (record.event_type === "response.claim" ||
-            record.event_type === "evidence.semantic_fact" ||
-            record.event_type === "decision") &&
+          (isAnswerSemanticRecord(record) || record.event_type === "evidence.semantic_fact") &&
           hasAny(record, ["requirement", "需求", "constraint", "约束", "acceptance", "验收", "15%", "0.15"]),
       ),
     evidence_priority_reasoning: (records, fullTrace) => {
@@ -320,42 +438,50 @@ function detectEvidence(name, trace) {
       if (!conflictRefs.length) return []
       return records.filter(
         (record) =>
-          (record.event_type === "response.claim" || record.event_type === "decision") &&
+          isAnswerSemanticRecord(record) &&
           hasAny(record, ["current", "当前", "old", "旧", "stale", "废弃", "priority", "优先", "supersede", "覆盖"]),
       )
     },
     architecture_boundary_reasoning: (records) =>
       records.filter(
         (record) =>
-          (record.event_type === "response.claim" ||
-            record.event_type === "evidence.semantic_fact" ||
-            record.event_type === "decision" ||
-            record.event_type === "design.record") &&
+          (isAnswerSemanticRecord(record) || record.event_type === "evidence.semantic_fact") &&
           hasAny(record, ["architecture", "架构", "boundary", "边界", "module", "模块", "src/billing", "src/payment"]),
       ),
     alternative_solution_comparison: (records) =>
       records.filter(
         (record) =>
-          (record.event_type === "response.claim" || record.event_type === "decision" || record.event_type === "design.record") &&
+          isAnswerSemanticRecord(record) &&
           hasAny(record, ["alternative", "option", "tradeoff", "方案", "取舍", "比较", "选择"]),
       ),
     risk_assessment: (records) =>
       records.filter(
         (record) =>
-          (record.event_type === "response.claim" || record.event_type === "decision" || record.event_type === "design.record") &&
+          isAnswerSemanticRecord(record) &&
           hasAny(record, ["risk", "风险", "impact", "影响", "assumption", "假设", "regression", "回归"]),
       ),
     verification_strategy_quality: (records) =>
       records.filter(
         (record) =>
           record.event_type === "verification" ||
-          ((record.event_type === "response.claim" || record.event_type === "decision") &&
+          (isAnswerSemanticRecord(record) &&
             hasAny(record, ["test:full", "test:quality", "coverage", "覆盖", "verification", "验证", "npm test"])),
       ),
   }
   const records = Array.isArray(trace?.records) ? trace.records : []
   const detector = detectors[name] ?? (() => [])
   return detector(records, trace).map((record) => recordRef(record))
+}
+
+function isAnswerSemanticRecord(record) {
+  return ["response.output", "response.claim", "decision", "design.record"].includes(record?.event_type)
+}
+
+function normalizePath(input) {
+  return String(input ?? "")
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/\/$/, "")
 }
 
 function recordRef(record) {

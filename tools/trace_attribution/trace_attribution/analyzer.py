@@ -45,6 +45,7 @@ class BackwardTaintAnalyzer:
         unresolved_refs: List[str] = []
         visited_paths: Dict[str, List[str]] = {}
         judge_errors: List[Dict[str, str]] = []
+        depth_limit_hit = False
 
         while queue and len(visited_order) < self.max_nodes:
             ref, path, depth = queue.popleft()
@@ -53,26 +54,55 @@ class BackwardTaintAnalyzer:
             visited.add(ref)
             visited_order.append(ref)
             visited_paths[ref] = path
-            node = graph.nodes[ref]
+            node = graph.hydrate_node(ref)
             upstream_nodes = graph.upstream_nodes(ref)
-            try:
-                judgment = self.judge.judge_node(
-                    node=node,
-                    upstream_nodes=upstream_nodes,
-                    downstream_context=path,
-                    objective=objective,
+            if is_evaluation_assertion(node):
+                evaluation_refs = graph.upstream_refs(ref)
+                judgment = NodeJudgment(
+                    node_ref=ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type=str(node.data.get("failure_type") or node.data.get("gap_kind") or "evaluated_defect"),
+                    defect_reason=(
+                        "This offline evaluation boundary declares an observed defect or quality gap. "
+                        "Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer."
+                    ),
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref=item,
+                            reason="The offline evaluation cites this trace record as outcome evidence.",
+                            confidence=1.0,
+                        )
+                        for item in evaluation_refs
+                    ],
+                    is_root_cause=False,
+                    severity="unknown",
+                    confidence=1.0,
                 )
-            except Exception as exc:
-                judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
-                judgment = fallback_judgment_after_error(node=node, upstream_nodes=upstream_nodes, error=exc)
+            else:
+                try:
+                    judgment = self.judge.judge_node(
+                        node=node,
+                        upstream_nodes=upstream_nodes,
+                        downstream_context=semantic_downstream_context(graph, path),
+                        objective=objective,
+                    )
+                except Exception as exc:
+                    judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
+                    judgment = fallback_judgment_after_error(node=node, upstream_nodes=upstream_nodes, error=exc)
             judgments[ref] = judgment
-            if not judgment.has_defect:
+            if judgment.defect_status != "present":
                 continue
 
             next_refs = self._resolve_influences(graph, judgment, ref)
-            if depth >= self.max_depth:
-                next_refs = []
+            if next_refs and depth >= self.max_depth:
+                depth_limit_hit = True
+                continue
             if not next_refs:
+                if is_evaluation_assertion(node):
+                    continue
                 root_causes[ref] = RootCauseCandidate(
                     node_ref=ref,
                     component=node.component,
@@ -84,26 +114,14 @@ class BackwardTaintAnalyzer:
                 taint_paths.append(path)
                 continue
 
-            enqueued = False
             for next_ref in next_refs:
                 if next_ref not in graph.nodes:
                     unresolved_refs.append(next_ref)
                     continue
                 queue.append((next_ref, path + [next_ref], depth + 1))
-                enqueued = True
-            if not enqueued:
-                root_causes[ref] = RootCauseCandidate(
-                    node_ref=ref,
-                    component=node.component,
-                    event_type=node.event_type,
-                    defect_type=judgment.defect_type,
-                    reason=judgment.defect_reason,
-                    confidence=judgment.confidence,
-                )
-                taint_paths.append(path)
 
         for ref, judgment in list(judgments.items()):
-            if not judgment.has_defect or ref in root_causes:
+            if judgment.defect_status != "present" or ref in root_causes:
                 continue
             next_refs = self._resolve_influences(graph, judgment, ref)
             if not next_refs:
@@ -111,10 +129,17 @@ class BackwardTaintAnalyzer:
             resolved = [item for item in next_refs if item in judgments]
             if not resolved:
                 continue
-            if any(judgments[item].has_defect for item in resolved):
+            if len(resolved) != len(next_refs):
+                continue
+            upstream_statuses = [judgments[item].defect_status for item in resolved]
+            if any(status == "present" for status in upstream_statuses):
                 continue
             node = graph.nodes.get(ref)
             if not node:
+                continue
+            if is_evaluation_assertion(node):
+                continue
+            if any(status == "unknown" for status in upstream_statuses):
                 continue
             root_causes[ref] = RootCauseCandidate(
                 node_ref=ref,
@@ -130,6 +155,24 @@ class BackwardTaintAnalyzer:
             )
             taint_paths.append(visited_paths.get(ref, [ref]))
 
+        node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
+        termination_reason = (
+            "node_limit" if node_limit_hit else "depth_limit" if depth_limit_hit else "queue_exhausted"
+        )
+        if root_causes:
+            analysis_outcome = "root_found"
+        elif (
+            not starts
+            or node_limit_hit
+            or depth_limit_hit
+            or unresolved_refs
+            or judge_errors
+            or any(item.defect_status in ("present", "unknown") for item in judgments.values())
+        ):
+            analysis_outcome = "inconclusive"
+        else:
+            analysis_outcome = "no_defect"
+
         report = AttributionReport(
             case_id=graph.case_id,
             objective=objective,
@@ -143,8 +186,14 @@ class BackwardTaintAnalyzer:
                 "analysis": "backward_semantic_taint",
                 "max_depth": self.max_depth,
                 "max_nodes": self.max_nodes,
+                "judge_timeout_seconds": getattr(self.judge, "timeout_seconds", None),
+                "judge_thinking_mode": getattr(self.judge, "thinking_mode", None),
+                "judge_thinking_config": getattr(self.judge, "thinking_config", None),
                 "judge_error_count": len(judge_errors),
                 "judge_errors": judge_errors,
+                "analysis_outcome": analysis_outcome,
+                "termination_reason": termination_reason,
+                "artifact_hydration": graph.artifact_hydration,
             },
         )
         return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))
@@ -185,6 +234,33 @@ def dedupe_paths(paths: Iterable[List[str]]) -> List[List[str]]:
     return output
 
 
+def is_evaluation_assertion(node: TraceNode) -> bool:
+    return node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic")
+
+
+def semantic_downstream_context(graph: TraceGraph, path: List[str]) -> List[str]:
+    output: List[str] = []
+    keys = (
+        "failure_type",
+        "gap_kind",
+        "dimension",
+        "description",
+        "text",
+        "status",
+        "defect_type",
+        "reason",
+    )
+    for ref in path:
+        node = graph.nodes.get(ref)
+        if not node:
+            output.append(ref)
+            continue
+        semantics = [f"{key}={node.data[key]}" for key in keys if node.data.get(key) not in (None, "", [], {})]
+        suffix = "; ".join(semantics)
+        output.append(f"{ref} event_type={node.event_type}" + (f"; {suffix}" if suffix else ""))
+    return output
+
+
 def fallback_judgment_after_error(
     *,
     node: TraceNode,
@@ -192,72 +268,33 @@ def fallback_judgment_after_error(
     error: Exception,
 ) -> NodeJudgment:
     error_text = f"{type(error).__name__}: {error}"
-    if node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic") and upstream_nodes:
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type=f"judge_unavailable_{offline_boundary_name(node.event_type)}_boundary",
-            defect_reason=(
-                "The attribution judge failed on an offline defect boundary node. The analyzer used the "
-                "node's explicit source_refs as a conservative fallback path instead of treating the "
-                "evaluation boundary itself as the root cause."
-            ),
-            influenced_by=[
-                TaintInfluence(
-                    upstream_ref=item.ref,
-                    reason="Fallback propagation through the offline defect node's explicit source_refs.",
-                    confidence=0.2,
-                )
-                for item in upstream_nodes
-            ],
-            is_root_cause=False,
-            severity="unknown",
-            confidence=0.2,
-            model_notes=error_text,
-        )
+    reason = "The attribution judge failed before this node could be classified."
     if node.event_type == "tool.error":
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type="tool_error_observed",
-            defect_reason=tool_error_fallback_reason(node),
-            influenced_by=[],
-            is_root_cause=True,
-            severity="medium",
-            confidence=0.45,
-            model_notes=error_text,
-        )
-    semantic_fallback = readable_semantic_fallback_judgment(node=node, error_text=error_text)
-    if semantic_fallback:
-        return semantic_fallback
+        reason = tool_error_fallback_reason(node)
+    elif node.event_type == "context.compaction":
+        reason = context_compaction_fallback_reason(node)
+    elif node.event_type in ("evidence.semantic_fact", "evidence.fact", "execution.observation"):
+        reason = semantic_fact_fallback_reason(node)
+    elif node.event_type in ("response.claim", "response.output"):
+        reason = response_surface_fallback_reason(node)
+    elif node.event_type == "task.obligation":
+        reason = task_obligation_fallback_reason(node)
+    elif is_evaluation_assertion(node):
+        reason = "The attribution judge failed before the offline evaluation assertion could be validated."
     return NodeJudgment(
         node_ref=node.ref,
         component=node.component,
         event_type=node.event_type,
-        has_defect=True,
+        has_defect=False,
+        defect_status="unknown",
         defect_type="judge_error",
-        defect_reason=(
-            "The attribution judge failed while evaluating this node, so the analyzer "
-            "kept it as a partial boundary candidate instead of dropping the trace."
-        ),
+        defect_reason=reason,
         influenced_by=[],
-        is_root_cause=True,
+        is_root_cause=False,
         severity="unknown",
-        confidence=0.1,
+        confidence=0.0,
         model_notes=error_text,
     )
-
-
-def offline_boundary_name(event_type: str) -> str:
-    return {
-        "case.observed_defect": "observed_defect",
-        "case.quality_gap": "quality_gap",
-        "case.missing_semantic": "missing_semantic",
-    }.get(event_type, "offline_defect")
 
 
 def tool_error_fallback_reason(node: TraceNode) -> str:
@@ -282,66 +319,6 @@ def tool_error_fallback_reason(node: TraceNode) -> str:
     if handled_status:
         parts.append(f"handled_status={handled_status}")
     return ". ".join(parts) + "."
-
-
-def readable_semantic_fallback_judgment(*, node: TraceNode, error_text: str) -> Optional[NodeJudgment]:
-    if node.event_type == "context.compaction":
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type="context_compaction_boundary",
-            defect_reason=context_compaction_fallback_reason(node),
-            influenced_by=[],
-            is_root_cause=True,
-            severity="medium",
-            confidence=0.4,
-            model_notes=error_text,
-        )
-    if node.event_type in ("evidence.semantic_fact", "evidence.fact", "execution.observation"):
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type="semantic_fact_boundary",
-            defect_reason=semantic_fact_fallback_reason(node),
-            influenced_by=[],
-            is_root_cause=True,
-            severity="unknown",
-            confidence=0.35,
-            model_notes=error_text,
-        )
-    if node.event_type in ("response.claim", "response.output"):
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type="answer_surface_observed",
-            defect_reason=response_surface_fallback_reason(node),
-            influenced_by=[],
-            is_root_cause=True,
-            severity="unknown",
-            confidence=0.3,
-            model_notes=error_text,
-        )
-    if node.event_type == "task.obligation":
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=True,
-            defect_type="task_obligation_boundary",
-            defect_reason=task_obligation_fallback_reason(node),
-            influenced_by=[],
-            is_root_cause=True,
-            severity="unknown",
-            confidence=0.35,
-            model_notes=error_text,
-        )
-    return None
 
 
 def context_compaction_fallback_reason(node: TraceNode) -> str:

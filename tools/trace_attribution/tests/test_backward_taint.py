@@ -9,9 +9,18 @@ from unittest import mock
 from pathlib import Path
 
 from trace_attribution.analyzer import BackwardTaintAnalyzer
-from trace_attribution.claude import ClaudeJudgeClient, build_judgment_prompt, call_with_wall_timeout, run_worker_with_timeout
+from trace_attribution import claude as claude_module
+from trace_attribution.claude import (
+    ClaudeJudgeClient,
+    build_judgment_prompt,
+    call_with_wall_timeout,
+    resolve_thinking_config,
+    run_worker_with_timeout,
+    validate_judgment_payload,
+)
+from trace_attribution.cli import parse_args
 from trace_attribution.graph import TraceGraph
-from trace_attribution.models import NodeJudgment, TaintInfluence, stable_json
+from trace_attribution.models import NodeJudgment, TaintInfluence, judgment_from_dict, stable_json
 from trace_attribution.models import TraceNode
 from trace_attribution.quality_review import inject_quality_gap_records
 from trace_attribution.trace_improvement import build_trace_improvement_report
@@ -127,6 +136,76 @@ class TraceGraphTest(unittest.TestCase):
 
         self.assertEqual(graph.upstream_refs("record:target"), ["record:c", "record:a", "record:b"])
 
+    def test_resolves_semantic_decision_id_in_tool_call_dataflow_edge(self):
+        trace = {
+            "case_id": "decision-tool-case",
+            "records": [
+                {
+                    "record_id": "decisionnode_dec_1",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"decision_id": "dec_1", "chosen_action": "bash"},
+                },
+                {
+                    "record_id": "toolcall_call_1",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"call_id": "call_1", "tool_name": "bash"},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "decision", "id": "dec_1"},
+                    "to": {"type": "tool_call", "id": "call_1"},
+                    "relation": "selected_by",
+                }
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.upstream_refs("record:toolcall_call_1"), ["record:decisionnode_dec_1"])
+
+    def test_response_claim_upstream_nodes_prioritize_parent_output(self):
+        records = [
+            {"record_id": f"fact_{index}", "component": "tool", "event_type": "evidence.semantic_fact"}
+            for index in range(15)
+        ]
+        records.extend(
+            [
+                {
+                    "record_id": "full_output",
+                    "component": "result",
+                    "event_type": "response.output",
+                    "data": {"text": "Complete answer with the necessary qualification."},
+                },
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "source_refs": [f"record:fact_{index}" for index in range(15)],
+                    "data": {"text": "Short claim."},
+                },
+            ]
+        )
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "parent-output-case",
+                "records": records,
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": "full_output"},
+                        "to": {"type": "record", "id": "claim"},
+                    }
+                ],
+            }
+        )
+
+        upstream = graph.upstream_nodes("record:claim", limit=12)
+
+        self.assertEqual(upstream[0].ref, "record:full_output")
+        self.assertEqual(len(upstream), 12)
+
     def test_loads_trace_from_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace_file = Path(tmp) / "trace.json"
@@ -136,6 +215,148 @@ class TraceGraphTest(unittest.TestCase):
 
         self.assertEqual(graph.case_id, "unit-case")
         self.assertEqual(graph.nodes["record:evidence_old"].event_type, "evidence.semantic_fact")
+
+    def test_hydrates_artifact_backed_semantics_from_trace_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "artifacts" / "sha256" / "tool-output.txt"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text(
+                "The decisive architecture boundary is billing-core, which owns renewalQuote end to end.",
+                encoding="utf-8",
+            )
+            trace = {
+                "case_id": "artifact-case",
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_tool_output",
+                        "path": "artifacts/sha256/tool-output.txt",
+                        "kind": "text",
+                        "hash": "unit-hash",
+                    }
+                ],
+                "records": [
+                    {
+                        "record_id": "tool_result",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "artifact_refs": ["artifact_tool_output"],
+                        "data": {
+                            "output": {
+                                "type": "text",
+                                "preview": "The decisive architecture boundary is bill...",
+                                "artifact_id": "artifact_tool_output",
+                            }
+                        },
+                    }
+                ],
+            }
+            trace_file = root / "trace.json"
+            trace_file.write_text(json.dumps(trace), encoding="utf-8")
+
+            graph = TraceGraph.from_file(trace_file)
+            node = graph.nodes["record:tool_result"]
+
+            self.assertNotIn("hydrated_artifacts", node.data)
+            self.assertEqual(graph.artifact_hydration["loaded"], 0)
+            node = graph.hydrate_node("record:tool_result")
+
+        hydrated = node.data["hydrated_artifacts"]
+        self.assertEqual(hydrated[0]["artifact_id"], "artifact_tool_output")
+        self.assertIn("billing-core", hydrated[0]["content"])
+        self.assertEqual(graph.artifact_hydration["loaded"], 1)
+
+    def test_response_claim_upstream_prioritizes_current_revision_direct_support(self):
+        trace = {
+            "case_id": "revision-order-case",
+            "records": [
+                {
+                    "record_id": "baseline",
+                    "component": "tool",
+                    "event_type": "verification",
+                    "data": {
+                        "verification_id": "baseline",
+                        "repository_revision": 0,
+                        "effective_for_final_state": False,
+                    },
+                },
+                {
+                    "record_id": "change",
+                    "component": "tool",
+                    "event_type": "change",
+                    "data": {"change_id": "change", "revision_after": 1},
+                },
+                {
+                    "record_id": "post_change",
+                    "component": "tool",
+                    "event_type": "verification",
+                    "data": {
+                        "verification_id": "post_change",
+                        "repository_revision": 1,
+                        "effective_for_final_state": True,
+                    },
+                },
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "source_refs": [
+                        "verification:baseline",
+                        "change:change",
+                        "verification:post_change",
+                    ],
+                    "data": {
+                        "claim_kind": "verification",
+                        "repository_revision": 1,
+                        "direct_support_refs": ["verification:post_change"],
+                        "superseded_evidence_refs": ["verification:baseline"],
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        refs = [node.ref for node in graph.upstream_nodes("record:claim")]
+
+        self.assertEqual(refs[0], "record:post_change")
+        self.assertLess(refs.index("record:change"), refs.index("record:baseline"))
+        self.assertEqual(refs[-1], "record:baseline")
+
+    def test_completed_trace_prefers_atomic_claims_over_full_response_output(self):
+        trace = {
+            "case_id": "claim-first-case",
+            "records": [
+                {
+                    "record_id": "final_output",
+                    "component": "result",
+                    "event_type": "response.output",
+                    "data": {"text": "Full answer", "is_final_for_case": True},
+                },
+                {
+                    "record_id": "claim_verification",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "All tests passed.", "claim_kind": "verification"},
+                },
+                {
+                    "record_id": "claim_architecture",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "text": "billing-core owns renewalQuote.",
+                        "claim_kind": "architecture",
+                        "quality_flags": ["weak_evidence_match"],
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(
+            graph.default_start_refs(),
+            ["record:claim_architecture", "record:claim_verification"],
+        )
 
     def test_quality_review_gaps_become_default_start_refs(self):
         trace = sample_trace()
@@ -194,12 +415,14 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(missing.event_type, "case.missing_semantic")
         self.assertEqual(missing.data["semantic_name"], "change_diff_semantics")
         self.assertEqual(missing.source_refs, ["record:change_bad"])
+        self.assertNotIn("ground_truth_component", missing.data)
+        self.assertNotIn("ground_truth_failure_type", missing.data)
         self.assertEqual(
             graph.default_start_refs(),
             ["record:missing_semantic_final_test_result", "record:missing_semantic_change_diff_semantics"],
         )
 
-    def test_review_root_cause_becomes_offline_observed_defect_start_ref(self):
+    def test_review_ground_truth_does_not_become_observed_defect(self):
         trace = sample_trace()
         review = {
             "case_id": "unit-case",
@@ -219,31 +442,20 @@ class TraceGraphTest(unittest.TestCase):
         enriched = inject_quality_gap_records(trace, review)
         graph = TraceGraph.from_trace(enriched)
 
-        self.assertIn("record:observed_defect_evidence_selection_stale_evidence_trusted", graph.nodes)
-        defect = graph.nodes["record:observed_defect_evidence_selection_stale_evidence_trusted"]
-        self.assertEqual(defect.event_type, "case.observed_defect")
-        self.assertEqual(defect.data["component"], "evidence_selection")
-        self.assertEqual(defect.data["failure_type"], "stale_evidence_trusted")
-        self.assertEqual(defect.source_refs, ["record:evidence_old", "record:claim_bad"])
-        self.assertEqual(graph.default_start_refs(), ["record:observed_defect_evidence_selection_stale_evidence_trusted"])
-        self.assertIn("record:evidence_old", graph.upstream_refs("record:observed_defect_evidence_selection_stale_evidence_trusted"))
+        self.assertNotIn("record:observed_defect_evidence_selection_stale_evidence_trusted", graph.nodes)
+        self.assertEqual(graph.default_start_refs(), ["record:claim_bad"])
 
-    def test_review_observed_defect_caps_broad_evidence_refs(self):
+    def test_explicit_review_observed_defect_caps_broad_evidence_refs(self):
         trace = sample_trace()
         review = {
             "case_id": "unit-case",
-            "ground_truth_root_cause": {
-                "component": "tool_error_handling",
-                "failure_type": "hallucinated_after_tool_failure",
-            },
-            "mechanism_evidence_found": [
-                {"required": "tool.error", "status": "found", "record_refs": ["record:evidence_old"]},
-            ],
-            "evidence_found": [
+            "observed_defects": [
                 {
-                    "required": "broad_context",
-                    "status": "found",
-                    "record_refs": [f"record:broad_{index}" for index in range(80)],
+                    "component": "tool_error_handling",
+                    "failure_type": "hallucinated_after_tool_failure",
+                    "description": "The final answer relied on a failed tool call.",
+                    "record_refs": ["record:evidence_old"]
+                    + [f"record:broad_{index}" for index in range(80)],
                 }
             ],
         }
@@ -274,8 +486,213 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(compact["ref"], "record:large_context")
         self.assertIn("data_preview", compact)
 
+    def test_trace_node_compact_preserves_semantic_text_before_large_refs(self):
+        node = TraceNode(
+            ref="record:claim",
+            record_id="claim",
+            component="result",
+            event_type="response.claim",
+            source_refs=[f"record:source_{index}" for index in range(40)],
+            data={
+                "text": "I did not guess the missing requirement value.",
+                "direct_evidence_refs": [f"evidence:fact_{index}" for index in range(50)],
+                "context_refs": [f"context:item_{index}" for index in range(80)],
+                "attribution_summary": {"support_level": "contextual", "match_score": 0},
+            },
+        )
+
+        compact = node.compact(max_chars=700)
+
+        self.assertLessEqual(len(stable_json(compact)), 700)
+        self.assertEqual(compact["data"]["text"], "I did not guess the missing requirement value.")
+        self.assertEqual(compact["data"]["attribution_summary"]["support_level"], "contextual")
+
+    def test_completed_trace_prefers_flagged_atomic_claim_over_final_response_output(self):
+        trace = sample_trace()
+        trace["records"].extend(
+            [
+                {
+                    "record_id": "final_output",
+                    "component": "result",
+                    "event_type": "response.output",
+                    "data": {"text": "Complete supported answer."},
+                }
+            ]
+        )
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.default_start_refs(), ["record:claim_bad"])
+
+    def test_completed_trace_does_not_use_explicitly_nonfinal_response_output(self):
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "progress_output",
+                "component": "result",
+                "event_type": "response.output",
+                "data": {"text": "Still investigating.", "is_final_for_case": False},
+            }
+        )
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.default_start_refs(), ["record:claim_bad"])
+
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_judge_receives_semantic_context_for_the_active_defect_branch(self):
+        class ContextJudge(FakeJudge):
+            def __init__(self):
+                super().__init__({})
+                self.contexts = []
+
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                self.contexts.append(downstream_context)
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_status="absent",
+                    defect_reason="No defect at this evidence node.",
+                )
+
+        trace = {
+            "case_id": "branch-context-case",
+            "records": [
+                {"record_id": "claim", "component": "result", "event_type": "response.claim"},
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:claim"],
+                    "data": {
+                        "failure_type": "false_completion_claim",
+                        "description": "The final answer says all tests pass while verification failed.",
+                    },
+                },
+            ],
+        }
+        judge = ContextJudge()
+
+        BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls, ["record:claim"])
+        self.assertIn("false_completion_claim", judge.contexts[0][0])
+        self.assertIn("all tests pass", judge.contexts[0][0])
+
+    def test_external_observed_defect_propagates_without_judging_the_evaluation_boundary(self):
+        trace = {
+            "case_id": "external-defect-case",
+            "records": [
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "All requested behavior is complete."},
+                },
+                {
+                    "record_id": "failed_verification",
+                    "component": "tool",
+                    "event_type": "verification",
+                    "status": "failed",
+                    "data": {"verification_id": "failed", "final_test_result": {"status": "failed"}},
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:claim", "record:failed_verification"],
+                    "data": {"description": "External benchmark tests confirmed partial correctness."},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:claim": NodeJudgment(
+                    node_ref="record:claim",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="false_completion",
+                    defect_reason="The completion claim conflicts with benchmark verification.",
+                    influenced_by=[],
+                    is_root_cause=True,
+                    confidence=0.9,
+                ),
+                "record:failed_verification": NodeJudgment(
+                    node_ref="record:failed_verification",
+                    component="tool",
+                    event_type="verification",
+                    has_defect=False,
+                    defect_status="absent",
+                    defect_reason="This node reports the failure without introducing it.",
+                    influenced_by=[],
+                    is_root_cause=False,
+                    confidence=0.9,
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertNotIn("record:observed_defect", judge.calls)
+        self.assertEqual(judge.calls, ["record:claim", "record:failed_verification"])
+        self.assertEqual(report.visited_order[0], "record:observed_defect")
+        self.assertEqual([item.node_ref for item in report.root_causes], ["record:claim"])
+
+    def test_trace_without_analysis_start_is_inconclusive(self):
+        report = BackwardTaintAnalyzer(judge=FakeJudge({}), max_depth=8).analyze(
+            TraceGraph.from_trace({"case_id": "empty-case", "records": []})
+        )
+
+        self.assertEqual(report.start_refs, [])
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertIn(
+            "no_analysis_start",
+            [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]],
+        )
+
+    def test_unknown_judgment_always_produces_a_blocking_gap(self):
+        graph = TraceGraph.from_trace(sample_trace())
+        judge = FakeJudge(
+            {
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=False,
+                    defect_status="unknown",
+                    defect_reason="The complete tool output was not available to the judge.",
+                    model_notes="Need the artifact-backed tool result.",
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge, max_depth=8).analyze(
+            graph,
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        gap_types = [item["gap_type"] for item in report.trace_improvement_report["blocking_gaps"]]
+        self.assertIn("unknown_node_judgment", gap_types)
+
+    def test_report_records_effective_judge_timeout(self):
+        judge = FakeJudge({})
+        judge.timeout_seconds = 60 * 60
+
+        report = BackwardTaintAnalyzer(judge=judge, max_depth=1).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertEqual(report.metadata["judge_timeout_seconds"], 60 * 60)
+
     def test_backtracks_until_defect_introduction_node(self):
         fake = FakeJudge(
             {
@@ -332,6 +749,77 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:evidence_old"])
         self.assertEqual(report.node_judgments["record:change_bad"].defect_type, "wrong_change")
         self.assertEqual(report.taint_paths[0], ["record:claim_bad", "record:change_bad", "record:evidence_old"])
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        self.assertEqual(report.metadata["termination_reason"], "queue_exhausted")
+
+    def test_nondefective_start_reports_no_defect(self):
+        report = BackwardTaintAnalyzer(judge=FakeJudge({}), max_depth=8).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:claim_bad"].defect_status, "absent")
+        self.assertEqual(report.metadata["analysis_outcome"], "no_defect")
+        self.assertEqual(report.metadata["termination_reason"], "queue_exhausted")
+        self.assertEqual(report.trace_improvement_report["summary"]["analysis_confidence"], "no_defect")
+
+    def test_depth_limit_is_inconclusive_instead_of_fabricating_root(self):
+        fake = FakeJudge(
+            {
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_type="wrong_final_claim",
+                    defect_reason="The final claim is wrong.",
+                    influenced_by=[TaintInfluence(upstream_ref="record:change_bad", reason="Bad change.")],
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=0).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertEqual(report.metadata["termination_reason"], "depth_limit")
+
+    def test_node_limit_is_inconclusive_instead_of_fabricating_root(self):
+        fake = FakeJudge(
+            {
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_type="wrong_final_claim",
+                    defect_reason="The final claim is wrong.",
+                    influenced_by=[TaintInfluence(upstream_ref="record:change_bad", reason="Bad change.")],
+                ),
+                "record:change_bad": NodeJudgment(
+                    node_ref="record:change_bad",
+                    component="tool",
+                    event_type="change",
+                    has_defect=True,
+                    defect_type="wrong_change",
+                    defect_reason="The change is wrong.",
+                    influenced_by=[TaintInfluence(upstream_ref="record:evidence_old", reason="Stale evidence.")],
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=8, max_nodes=1).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=["record:claim_bad"],
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertEqual(report.metadata["termination_reason"], "node_limit")
 
     def test_reports_trace_gaps_when_root_cause_stops_at_thin_llm_call(self):
         trace = sample_trace()
@@ -457,7 +945,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("answer_surface_root_cause", [gap["gap_type"] for gap in improvement["blocking_gaps"]])
         self.assertEqual(improvement["summary"]["analysis_confidence"], "limited")
 
-    def test_preserves_defective_boundary_when_upstream_is_nondefective(self):
+    def test_preserves_external_evaluation_boundary_when_upstream_is_nondefective(self):
         trace = sample_trace()
         trace["records"].append(
             {
@@ -507,13 +995,57 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
             objective="Explain the solution design quality gap.",
         )
 
-        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:quality_gap"])
-        self.assertEqual(report.root_causes[0].defect_type, "missing_risk_assessment")
-        self.assertEqual(report.taint_paths, [["record:quality_gap"]])
-        gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
-        self.assertIn("defective_node_points_to_nondefective_upstream", gap_types)
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.taint_paths, [])
+        self.assertEqual(report.node_judgments["record:quality_gap"].defect_status, "present")
+        self.assertNotIn("record:quality_gap", fake.calls)
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
 
-    def test_judge_errors_become_partial_boundary_roots(self):
+    def test_does_not_reject_evaluation_assertion_after_only_partial_upstream_review(self):
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "quality_gap",
+                "component": "evaluation",
+                "event_type": "case.quality_gap",
+                "source_refs": ["record:claim_bad", "record:change_bad"],
+                "data": {"dimension": "solution_design"},
+            }
+        )
+        fake = FakeJudge(
+            {
+                "record:quality_gap": NodeJudgment(
+                    node_ref="record:quality_gap",
+                    component="evaluation",
+                    event_type="case.quality_gap",
+                    has_defect=True,
+                    defect_reason="The answer may omit design evidence.",
+                    influenced_by=[
+                        TaintInfluence(upstream_ref="record:claim_bad", reason="Candidate answer defect."),
+                        TaintInfluence(upstream_ref="record:change_bad", reason="Candidate implementation defect."),
+                    ],
+                ),
+                "record:claim_bad": NodeJudgment(
+                    node_ref="record:claim_bad",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=False,
+                    defect_reason="The claim is supported.",
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=fake, max_depth=4, max_nodes=2).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:quality_gap"],
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:quality_gap"].defect_status, "present")
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertEqual(report.metadata["termination_reason"], "node_limit")
+
+    def test_judge_errors_become_unknown_without_roots(self):
         class ErrorJudge(FakeJudge):
             def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
                 self.calls.append(node.ref)
@@ -527,14 +1059,13 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
             objective="Explain the final claim.",
         )
 
-        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:change_bad"])
-        self.assertEqual(report.root_causes[0].defect_type, "judge_error")
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:change_bad"].defect_status, "unknown")
         self.assertEqual(report.metadata["judge_error_count"], 1)
         self.assertIn("record:change_bad", report.metadata["judge_errors"][0]["node_ref"])
-        gap_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
-        self.assertIn("judge_error", gap_types)
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
 
-    def test_observed_defect_judge_error_falls_back_to_source_refs(self):
+    def test_observed_defect_boundary_stays_present_when_upstream_judges_fail(self):
         class ErrorJudge(FakeJudge):
             def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
                 self.calls.append(node.ref)
@@ -562,18 +1093,17 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         )
 
         observed = report.node_judgments["record:observed_defect_tool_failure"]
-        root_refs = [candidate.node_ref for candidate in report.root_causes]
-
-        self.assertEqual(observed.defect_type, "judge_unavailable_observed_defect_boundary")
+        self.assertEqual(observed.defect_status, "present")
+        self.assertEqual(observed.defect_type, "hallucinated_after_tool_failure")
+        self.assertEqual(report.root_causes, [])
         self.assertEqual(
-            sorted(influence.upstream_ref for influence in observed.influenced_by),
-            ["record:claim_bad", "record:evidence_old"],
+            report.visited_order,
+            ["record:observed_defect_tool_failure", "record:claim_bad", "record:evidence_old"],
         )
-        self.assertNotIn("record:observed_defect_tool_failure", root_refs)
-        self.assertIn("record:claim_bad", report.visited_order)
-        self.assertIn("record:evidence_old", report.visited_order)
+        self.assertNotIn("record:observed_defect_tool_failure", report.metadata["judge_errors"][0]["node_ref"])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
 
-    def test_tool_error_judge_error_uses_semantic_fallback(self):
+    def test_tool_error_judge_error_uses_unknown_semantic_fallback(self):
         class ErrorJudge(FakeJudge):
             def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
                 self.calls.append(node.ref)
@@ -605,16 +1135,16 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
             objective="Explain the observed tool failure defect.",
         )
 
-        root = report.root_causes[0]
+        judgment = report.node_judgments["record:tool_error"]
 
-        self.assertEqual(root.node_ref, "record:tool_error")
-        self.assertEqual(root.defect_type, "tool_error_observed")
-        self.assertGreater(root.confidence, 0.1)
-        self.assertIn("read", root.reason)
-        self.assertIn("File not found", root.reason)
-        self.assertEqual(report.node_judgments["record:tool_error"].model_notes, "TimeoutError: judge timed out")
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(judgment.defect_status, "unknown")
+        self.assertEqual(judgment.defect_type, "judge_error")
+        self.assertIn("read", judgment.defect_reason)
+        self.assertIn("File not found", judgment.defect_reason)
+        self.assertEqual(judgment.model_notes, "TimeoutError: judge timed out")
 
-    def test_common_semantic_nodes_use_readable_judge_error_fallbacks(self):
+    def test_common_semantic_nodes_use_readable_unknown_fallbacks(self):
         class ErrorJudge(FakeJudge):
             def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
                 self.calls.append(node.ref)
@@ -633,7 +1163,6 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                         "output_summary": "Constraint: do not modify src/payment.",
                     },
                 },
-                "context_compaction_boundary",
                 ["manual", "deepseek-v4-pro", "do not modify src/payment"],
             ),
             (
@@ -653,7 +1182,6 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                         "applicability_status": "unknown",
                     },
                 },
-                "semantic_fact_boundary",
                 ["renewalQuote", "discount_cap", "fact_conflict_1"],
             ),
             (
@@ -667,7 +1195,6 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                         "quality_flags": ["missing_tradeoff"],
                     },
                 },
-                "answer_surface_observed",
                 ["Changed src/billing/pricing.mjs", "direct_evidence_refs=2", "missing_tradeoff"],
             ),
             (
@@ -682,12 +1209,11 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                         "status": "fulfilled",
                     },
                 },
-                "task_obligation_boundary",
                 ["path_scope_exclusion", "Do not modify src/payment", "status=fulfilled"],
             ),
         ]
 
-        for record, expected_defect_type, expected_fragments in cases:
+        for record, expected_fragments in cases:
             with self.subTest(record_id=record["record_id"]):
                 graph = TraceGraph.from_trace({"case_id": "fallback-case", "records": [record]})
 
@@ -696,15 +1222,98 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                     start_refs=[f"record:{record['record_id']}"],
                     objective="Explain the observed semantic defect.",
                 )
-                root = report.root_causes[0]
+                judgment = report.node_judgments[f"record:{record['record_id']}"]
 
-                self.assertEqual(root.defect_type, expected_defect_type)
-                self.assertGreater(root.confidence, 0.1)
+                self.assertEqual(report.root_causes, [])
+                self.assertEqual(judgment.defect_status, "unknown")
+                self.assertEqual(judgment.defect_type, "judge_error")
                 for fragment in expected_fragments:
-                    self.assertIn(fragment, root.reason)
+                    self.assertIn(fragment, judgment.defect_reason)
+
+
+class NodeJudgmentTest(unittest.TestCase):
+    def test_missing_defect_boolean_is_unknown(self):
+        node = TraceNode(ref="record:test", record_id="test", component="result", event_type="response.claim")
+
+        judgment = judgment_from_dict({}, node)
+
+        self.assertEqual(judgment.defect_status, "unknown")
+        self.assertFalse(judgment.has_defect)
+
+    def test_legacy_boolean_maps_to_tri_state(self):
+        node = TraceNode(ref="record:test", record_id="test", component="result", event_type="response.claim")
+
+        present = judgment_from_dict({"has_defect": True}, node)
+        absent = judgment_from_dict({"has_defect": False}, node)
+
+        self.assertEqual(present.defect_status, "present")
+        self.assertTrue(present.has_defect)
+        self.assertEqual(absent.defect_status, "absent")
+        self.assertFalse(absent.has_defect)
 
 
 class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_rejects_absent_judgment_with_nonempty_defect_type(self):
+        with self.assertRaises(ValueError):
+            validate_judgment_payload(
+                {
+                    "defect_status": "absent",
+                    "has_defect": False,
+                    "defect_type": "incorrect_claim",
+                    "defect_reason": "The claim is a semantic defect but not the code-level root cause.",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.8,
+                }
+            )
+
+    def test_rejects_invalid_explicit_defect_status(self):
+        with self.assertRaises(ValueError):
+            validate_judgment_payload(
+                {
+                    "defect_status": "maybe",
+                    "has_defect": False,
+                    "defect_reason": "Invalid status value.",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.5,
+                }
+            )
+
+    def test_rejects_inconsistent_tri_state_and_legacy_boolean(self):
+        with self.assertRaises(ValueError):
+            validate_judgment_payload(
+                {
+                    "defect_status": "absent",
+                    "has_defect": True,
+                    "defect_reason": "Contradictory schema fields.",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.5,
+                }
+            )
+
+    def test_defaults_each_judge_request_to_one_hour(self):
+        calls = []
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=True):
+                client = ClaudeJudgeClient()
+
+        self.assertEqual(claude_module.DEFAULT_JUDGE_TIMEOUT_SECONDS, 60 * 60)
+        self.assertEqual(client.timeout_seconds, 60 * 60)
+        self.assertEqual(calls, [{"api_key": "test-key", "timeout": 60 * 60}])
+
+    def test_cli_defaults_each_judge_request_to_one_hour(self):
+        args = parse_args(["--trace", "trace.json", "--out", "attribution.json"])
+
+        self.assertEqual(args.judge_timeout_sec, 60 * 60)
+
     def test_call_with_wall_timeout_raises_timeout_error(self):
         started = time.time()
 
@@ -746,7 +1355,23 @@ class ClaudeJudgeClientTest(unittest.TestCase):
             [{"api_key": "test-key", "base_url": "https://api.deepseek.com/anthropic", "timeout": 12}],
         )
 
-    def test_quality_gap_prompt_treats_gap_as_defect_to_explain(self):
+    def test_disables_thinking_by_default_for_deepseek_anthropic_endpoint(self):
+        self.assertEqual(
+            resolve_thinking_config("https://api.deepseek.com/anthropic", "auto", max_tokens=4096),
+            {"type": "disabled"},
+        )
+        self.assertIsNone(resolve_thinking_config("https://api.anthropic.com", "auto", max_tokens=4096))
+
+    def test_cli_exposes_attribution_thinking_mode(self):
+        args = parse_args(["--trace", "trace.json", "--out", "attribution.json"])
+        explicit = parse_args(
+            ["--trace", "trace.json", "--out", "attribution.json", "--thinking-mode", "enabled"]
+        )
+
+        self.assertEqual(args.thinking_mode, "auto")
+        self.assertEqual(explicit.thinking_mode, "enabled")
+
+    def test_quality_gap_prompt_treats_gap_as_assertion_to_validate(self):
         prompt = build_judgment_prompt(
             node=TraceNode(
                 ref="record:quality_gap_solution_design",
@@ -766,7 +1391,9 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         )
 
         self.assertIn("case.quality_gap", prompt)
-        self.assertIn("treat the quality gap as the defect to explain", prompt)
+        self.assertIn("evaluation assertion to validate", prompt)
+        self.assertIn("may be rejected", prompt)
+        self.assertNotIn("treat the quality gap as the defect to explain", prompt)
 
     def test_judgment_prompt_keeps_semantics_under_budget(self):
         node = TraceNode(
@@ -800,6 +1427,86 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertIn("record:upstream_0", prompt)
         self.assertIn("tool.result", prompt)
         self.assertIn("prompt_compaction", prompt)
+
+    def test_judgment_prompt_forbids_root_inference_from_truncated_artifacts(self):
+        prompt = build_judgment_prompt(
+            node=TraceNode(
+                ref="record:change",
+                record_id="change",
+                component="tool",
+                event_type="change",
+                data={
+                    "hydrated_artifacts": [
+                        {
+                            "artifact_id": "artifact_diff",
+                            "content": "partial diff",
+                            "content_length": 50000,
+                            "truncated": True,
+                        }
+                    ]
+                },
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:claim"],
+            objective="Find the first defect introduction point.",
+        )
+
+        self.assertIn("must not infer a defect or root cause from the missing portion", prompt)
+
+    def test_retries_full_judgment_after_malformed_repair(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    text = '{"defect_status": "present"'
+                elif len(calls) == 2:
+                    text = "still malformed"
+                else:
+                    text = json.dumps(
+                        {
+                            "node_ref": "record:claim",
+                            "component": "result",
+                            "event_type": "response.claim",
+                            "defect_status": "present",
+                            "has_defect": True,
+                            "defect_type": "false_completion",
+                            "defect_reason": "The claim contradicts the failed verification.",
+                            "influenced_by": [],
+                            "is_root_cause": True,
+                            "severity": "high",
+                            "confidence": 0.9,
+                            "model_notes": "fresh retry succeeded",
+                        }
+                    )
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text=text)])
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
+
+        judgment = client.judge_node(
+            node=TraceNode(
+                ref="record:claim",
+                record_id="claim",
+                component="result",
+                event_type="response.claim",
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:claim"],
+            objective="Check the completion claim.",
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(judgment.defect_status, "present")
+        self.assertEqual(judgment.model_notes, "fresh retry succeeded")
 
     def test_repairs_malformed_json_judgment_once(self):
         calls = []
@@ -845,6 +1552,7 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
             with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
                 client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
 
         judgment = client.judge_node(
             node=TraceNode(
@@ -862,6 +1570,64 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertTrue(judgment.has_defect)
         self.assertEqual(judgment.defect_type, "missing_risk")
         self.assertEqual(judgment.model_notes, "repaired from malformed output")
+
+    def test_repairs_incomplete_json_judgment_once(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    return types.SimpleNamespace(content=[types.SimpleNamespace(text='{"has_defect": false}')])
+                return types.SimpleNamespace(
+                    content=[
+                        types.SimpleNamespace(
+                            text=json.dumps(
+                                {
+                                    "node_ref": "record:claim",
+                                    "component": "result",
+                                    "event_type": "response.claim",
+                                    "defect_status": "absent",
+                                    "has_defect": False,
+                                    "defect_type": "",
+                                    "defect_reason": "The claim is supported by direct evidence.",
+                                    "influenced_by": [],
+                                    "is_root_cause": False,
+                                    "severity": "unknown",
+                                    "confidence": 0.8,
+                                    "model_notes": "repaired incomplete output",
+                                }
+                            )
+                        )
+                    ]
+                )
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
+
+        judgment = client.judge_node(
+            node=TraceNode(
+                ref="record:claim",
+                record_id="claim",
+                component="result",
+                event_type="response.claim",
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:claim"],
+            objective="Check whether the claim is defective.",
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(judgment.defect_status, "absent")
+        self.assertFalse(judgment.has_defect)
+        self.assertEqual(judgment.model_notes, "repaired incomplete output")
 
 
 if __name__ == "__main__":
