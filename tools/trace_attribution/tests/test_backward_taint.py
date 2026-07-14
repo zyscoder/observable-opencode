@@ -254,98 +254,108 @@ class TraceGraphTest(unittest.TestCase):
             "manifest": {"case_id": "causal-ir-compatibility-case"},
             "nodes": [
                 {
-                    "node_id": "decision_1",
+                    "node_id": "canonical_only",
                     "kind": "decision",
                     "component": "processor",
                     "timestamp": "2026-07-14T00:00:00.000Z",
                     "time_ms": 1,
-                    "data": {"chosen_action": "apply the compatibility projection"},
+                    "data": {"chosen_action": "this canonical-only node must not load"},
                 },
                 {
-                    "node_id": "claim_1",
-                    "kind": "response.claim",
-                    "component": "result",
+                    "node_id": "dataflow_origin",
+                    "kind": "tool.result",
+                    "component": "tool",
                     "timestamp": "2026-07-14T00:00:01.000Z",
                     "time_ms": 2,
-                    "data": {"text": "The projection preserves attribution."},
+                    "data": {"output": "This canonical edge intentionally conflicts with compatibility."},
+                },
+                {
+                    "node_id": "dataflow_target",
+                    "kind": "case.observed_defect",
+                    "component": "evaluation",
+                    "timestamp": "2026-07-14T00:00:02.000Z",
+                    "time_ms": 3,
+                    "data": {"summary": "This canonical edge is the reverse of compatibility dataflow."},
                 },
             ],
             "edges": [
                 {
-                    "edge_id": "causal_edge_1",
-                    "from": {"type": "node", "id": "decision_1"},
-                    "to": {"type": "node", "id": "claim_1"},
-                    "relation": "derived_from",
+                    "edge_id": "canonical_reverse_conflict",
+                    "from": {"type": "node", "id": "dataflow_target"},
+                    "to": {"type": "node", "id": "dataflow_origin"},
+                    "relation": "canonical_conflicting_relation",
                 }
             ],
             "records": [
                 {
-                    "record_id": "decision_1",
+                    "record_id": "source_ref_origin",
                     "component": "processor",
                     "event_type": "decision",
-                    "data": {"decision_id": "decision_1", "chosen_action": "apply the compatibility projection"},
+                    "data": {"decision_id": "source_ref_origin", "chosen_action": "provide source-ref support"},
                 },
                 {
-                    "record_id": "claim_1",
+                    "record_id": "source_ref_target",
                     "component": "result",
                     "event_type": "response.claim",
-                    "source_refs": ["decision:decision_1"],
-                    "data": {"claim_id": "claim_1", "text": "The projection preserves attribution."},
+                    "source_refs": ["decision:source_ref_origin"],
+                    "data": {"claim_id": "source_ref_target", "text": "Compatibility source refs are independent."},
+                },
+                {
+                    "record_id": "dataflow_origin",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {"call_id": "dataflow_origin", "output": "provide edge support"},
+                },
+                {
+                    "record_id": "dataflow_target",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "data": {"defect_id": "dataflow_target", "summary": "Compatibility dataflow is independent."},
                 },
             ],
             "dataflow_edges": [
                 {
-                    "edge_id": "projection_edge_1",
-                    "from": {"type": "decision", "id": "decision_1"},
-                    "to": {"type": "response_claim", "id": "claim_1"},
-                    "relation": "derived_from",
+                    "edge_id": "compatibility_dataflow_edge",
+                    "from": {"type": "tool_result", "id": "dataflow_origin"},
+                    "to": {"type": "record", "id": "dataflow_target"},
+                    "relation": "compatibility_dataflow_relation",
                 }
             ],
         }
 
         graph = TraceGraph.from_trace(trace)
-        report = BackwardTaintAnalyzer(
-            judge=FakeJudge(
-                {
-                    "record:claim_1": NodeJudgment(
-                        node_ref="record:claim_1",
-                        component="result",
-                        event_type="response.claim",
-                        has_defect=True,
-                        defect_status="present",
-                        defect_type="projection_regression",
-                        defect_reason="The final claim reflects the upstream decision.",
-                        causal_role="defect_propagation",
-                        branch_relation="same_defect",
-                        influenced_by=[
-                            TaintInfluence(
-                                upstream_ref="record:decision_1",
-                                reason="The claim propagates the decision.",
-                                relation="defect_propagated_from",
-                            )
-                        ],
-                    ),
-                    "record:decision_1": NodeJudgment(
-                        node_ref="record:decision_1",
-                        component="processor",
-                        event_type="decision",
-                        has_defect=True,
-                        defect_status="present",
-                        defect_type="projection_regression",
-                        defect_reason="The decision introduces the projection regression.",
-                        causal_role="defect_introduction",
-                        branch_relation="same_defect",
-                        is_root_cause=True,
-                    ),
-                }
-            )
-        ).analyze(graph, start_refs=["record:claim_1"])
 
-        self.assertEqual(set(graph.nodes), {"record:decision_1", "record:claim_1"})
-        self.assertEqual(graph.upstream_refs("record:claim_1"), ["record:decision_1"])
-        self.assertEqual(report.visited_order, ["record:claim_1", "record:decision_1"])
-        self.assertEqual([root.node_ref for root in report.root_causes], ["record:decision_1"])
-        self.assertEqual(report.taint_paths, [["record:claim_1", "record:decision_1"]])
+        self.assertEqual(
+            set(graph.nodes),
+            {
+                "record:source_ref_origin",
+                "record:source_ref_target",
+                "record:dataflow_origin",
+                "record:dataflow_target",
+            },
+        )
+        self.assertNotIn("record:canonical_only", graph.nodes)
+        self.assertEqual(
+            graph.nodes["record:source_ref_target"].source_refs,
+            ["decision:source_ref_origin"],
+        )
+        self.assertEqual(
+            graph.raw_trace["dataflow_edges"],
+            [
+                {
+                    "edge_id": "compatibility_dataflow_edge",
+                    "from": {"type": "tool_result", "id": "dataflow_origin"},
+                    "to": {"type": "record", "id": "dataflow_target"},
+                    "relation": "compatibility_dataflow_relation",
+                }
+            ],
+        )
+        self.assertEqual(graph.upstream_refs("record:source_ref_target"), ["record:source_ref_origin"])
+        self.assertEqual(graph.upstream_refs("record:dataflow_target"), ["record:dataflow_origin"])
+        self.assertEqual(graph.upstream_refs("record:dataflow_origin"), [])
+        self.assertEqual(graph.downstream_refs("record:source_ref_origin"), ["record:source_ref_target"])
+        self.assertEqual(graph.downstream_refs("record:dataflow_origin"), ["record:dataflow_target"])
+        self.assertEqual(graph.downstream_refs("record:dataflow_target"), [])
 
     def test_upstream_refs_preserve_explicit_source_ref_order(self):
         trace = {

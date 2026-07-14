@@ -13,8 +13,8 @@ All commands were run on 2026-07-14 from the indicated directory.
 
 | Working directory | Command | Result |
 | --- | --- | --- |
-| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 84 passed, 0 failed, 0.148 s |
-| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 147 passed, 0 failed, 1,420 expectations, 23.38 s |
+| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 84 passed, 0 failed, 0.128 s |
+| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 147 passed, 0 failed, 1,420 expectations, 23.14 s |
 | `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun typecheck` | exit 0 (`tsgo --noEmit`) |
 
 The Bun executable was the project-pinned `1.3.13` runtime. The three suites
@@ -26,11 +26,20 @@ the repository root.
 ## Trace 6.0 Python Compatibility
 
 `TraceGraphTest.test_loads_trace_6_causal_ir_with_legacy_attribution_projection`
-adds a minimal Trace 6.0 fixture with both canonical `nodes`/`edges` and the
-compatibility `records`/`dataflow_edges` projection. `TraceGraph.from_trace`
-continues to expose exactly `record:decision_1` and `record:claim_1`, resolves
-the claim's upstream reference to the decision, and supports the same backward
-taint path and root (`claim -> decision`).
+uses a minimal Trace 6.0 fixture with canonical `nodes`/`edges` plus the
+compatibility `records`/`dataflow_edges` projection. The canonical side has a
+canonical-only node and a reverse edge with a conflicting relation. The loader
+continues to expose only the four compatibility record refs, so either
+canonical-node ingestion or canonical-edge ingestion changes the asserted node
+set or upstream reachability.
+
+The compatibility `source_refs` path and `dataflow_edges` path use separate
+origin and target records. The test independently asserts each upstream and
+downstream relationship, so deleting either compatibility path fails its own
+assertion without being masked by the other. It directly checks the public
+`TraceNode.source_refs` representation and `TraceGraph.raw_trace` compatibility
+edge relation; `TraceGraph` exposes no separate parsed edge-relation collection.
+No `FakeJudge` judgment is used as relation evidence.
 
 The new test passed immediately. This is a green characterization of the
 existing records/dataflow loader, not a reason to alter Python production code.
@@ -44,14 +53,15 @@ existing records/dataflow loader, not a reason to alter Python production code.
   `manifest`, `records`, `dataflow_edges`, `artifacts`, `metrics`, and
   `trace_version` fields only. The suite asserts it has no canonical
   `causal_ir_version`, `nodes`, `edges`, `diagnostics`, or `compatibility`.
-- The verified bundle assertion requires canonical node IDs to equal projected
-  record IDs, canonical and projected record/edge/artifact collections to be
-  equal, and projected edge metadata to retain original relation,
-  normalized relation, evidence tier, attribution eligibility, and derivation
-  method.
-- Journal replay equality is checked against canonical `trace.json`: node IDs,
-  edge IDs, artifacts as `[artifact_id, hash]`, diagnostics, and the complete
-  snapshot fields match.
+- Bundle assertions verify canonical/projection graph collection equivalence:
+  canonical node IDs equal projected record IDs, and the corresponding
+  record/edge/artifact collections agree.
+- Focused Causal IR projector tests verify projected edge metadata preserves
+  the original relation, normalized relation, evidence tier, attribution
+  eligibility, and derivation method.
+- Journal replay equality is checked against canonical `trace.json` for graph
+  collections: node IDs, edge IDs, artifacts as `[artifact_id, hash]`, and
+  diagnostics. This report does not claim envelope-field equality.
 - The journal audit checks contiguous sequences, operation-to-`record_type`
   contracts, payload hashes, and each entity/category
   `previous_payload_hash` chain. Artifact tests additionally verify reuse and
