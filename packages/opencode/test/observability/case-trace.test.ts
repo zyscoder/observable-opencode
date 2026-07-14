@@ -5299,6 +5299,79 @@ describe("case trace", () => {
     expect(html).toContain("Artifacts")
   })
 
+  test("preserves nested semantic schema fields while externalizing raw causal payloads", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-semantic-boundaries-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "semantic-boundaries-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const rawSummaryLikePayload = { type: "object", value: "raw-payload-" + "x".repeat(200) }
+    const rawPayload = JSON.stringify(rawSummaryLikePayload)
+    const largeText = "raw-text-" + "y".repeat(200)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.contextSnapshot({ phase: "llm_request", context_ledger: { algorithm: "head-tail-summary", retained_message_ids: ["message:retained"], dropped_fact_refs: ["evidence:dropped"] } })`,
+        `CaseTrace.change({ span_id: "span_change", tool_call_id: "call_change", files: ["src/pricing.mjs"], diff: "- old\\n+ new\\n" + "e".repeat(200) })`,
+        `CaseTrace.llmTurn({ turn_id: "turn_semantic", status: "success" })`,
+        `CaseTrace.node({ node_id: "llm_semantic", kind: "llm.call", component: "llm", title: "semantic message transforms", data: { message_transforms: [{ node_ref: "node:transform", transform: "MessageV2.toModelMessagesEffect", nested_semantics: { preservation_flags: ["preserved"] } }] } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "repo_fact", summary: "pricing owner", data: { subject: "pricing", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 7, line_end: 7 } })`,
+        `CaseTrace.verification({ command: "bun test", exit_code: 0, stdout: ${JSON.stringify(largeText)}, stderr: ${JSON.stringify(largeText)} })`,
+        `CaseTrace.node({ node_id: "raw_boundary", kind: "llm.call", component: "llm", title: "raw causal payloads", data: { input: ${rawPayload}, output: ${rawPayload}, messages: [${rawPayload}], tools: { tool: ${rawPayload} }, diff: ${JSON.stringify(largeText)}, stdout: ${JSON.stringify(largeText)}, stderr: ${JSON.stringify(largeText)} } })`,
+        `CaseTrace.compaction({ trigger: "auto", previous_summary: ${rawPayload}, serialized_tail: ${rawPayload}, output_summary: ${rawPayload} })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "semantic-boundaries-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "semantic-boundaries-case", "trace.json"), "utf8")) as any
+    const change = trace.records.find((record: any) => record.event_type === "change")
+    const context = trace.records.find((record: any) => record.event_type === "context.pack")
+    const transforms = trace.records.find((record: any) => record.record_id === "llm_semantic")
+    const fact = trace.records.find((record: any) => record.event_type === "evidence.semantic_fact")
+    const verification = trace.records.find((record: any) => record.event_type === "verification")
+    const rawBoundary = trace.records.find((record: any) => record.record_id === "raw_boundary")
+    const compaction = trace.records.find((record: any) => record.event_type === "context.compaction")
+
+    expect(change.data.source_ref_relations[0].source_ref).toContain("tool_call:")
+    expect(change.data.source_ref_relations[0].relation).toBe("materialized_by_action")
+    expect(change.data.change_semantics.risk_flags).toBeArray()
+    expect(change.data.change_semantics.operation_kinds).toBeArray()
+    expect(context.data.context_ledger.retained_message_ids[0]).toContain("message:retained")
+    expect(context.data.context_ledger.dropped_fact_refs[0]).toContain("evidence:dropped")
+    expect(transforms.data.message_transforms[0].node_ref).toContain("node:transform")
+    expect(transforms.data.message_transforms[0].nested_semantics.preservation_flags[0]).toContain("preserved")
+    expect(fact.data.structured_claim.subject).toBe("pricing")
+    expect(fact.data.structured_claim.source_span.path).toBe("src/pricing.mjs")
+    expect(verification.data.final_test_result.status).toBe("passed")
+
+    for (const field of ["input", "output", "messages", "tools", "diff", "stdout", "stderr"]) {
+      expect(rawBoundary.data[field].artifact_id).toBeTruthy()
+      expect(rawBoundary.data[field].payload_ref).toBe(rawBoundary.data[field].artifact_id)
+    }
+    expect(compaction.data.previous_summary.artifact_id).toBeTruthy()
+    expect(compaction.data.serialized_tail.artifact_id).toBeTruthy()
+    expect(compaction.data.output_summary.artifact_id).toBeTruthy()
+  })
+
   test("drops design records attached to response segments later demoted from final", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-design-final-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

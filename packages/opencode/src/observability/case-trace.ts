@@ -42,17 +42,54 @@ export type TraceFieldSummary = {
 function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
   const summary = input as Partial<TraceFieldSummary>
-  if (!new Set(["text", "array", "object", "null", "string", "number", "boolean", "undefined"]).has(summary.type ?? "")) {
-    return false
-  }
-  return (
-    "length" in summary ||
-    "hash" in summary ||
-    "preview" in summary ||
-    "value" in summary ||
-    "artifact_id" in summary ||
-    "payload_ref" in summary
+  const keys = Object.keys(summary)
+  const allowedKeys = new Set([
+    "type",
+    "length",
+    "hash",
+    "preview",
+    "value",
+    "keys",
+    "artifact_id",
+    "payload_ref",
+    "payload_dedupe_group_id",
+  ])
+  if (keys.some((key) => !allowedKeys.has(key))) return false
+  const hasArtifactFields = ["artifact_id", "payload_ref", "payload_dedupe_group_id"].every(
+    (key) => !(key in summary) || typeof summary[key as keyof TraceFieldSummary] === "string",
   )
+  if (!hasArtifactFields) return false
+  const isSizedSummary =
+    typeof summary.length === "number" &&
+    Number.isFinite(summary.length) &&
+    summary.length >= 0 &&
+    typeof summary.hash === "string" &&
+    typeof summary.preview === "string"
+
+  switch (summary.type) {
+    case "text":
+      return isSizedSummary && !("keys" in summary) && !("value" in summary)
+    case "array":
+      return isSizedSummary && !("keys" in summary) && !("value" in summary)
+    case "object":
+      return (
+        isSizedSummary &&
+        !("value" in summary) &&
+        (!("keys" in summary) || (Array.isArray(summary.keys) && summary.keys.every((key) => typeof key === "string")))
+      )
+    case "null":
+      return summary.value === null && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+    case "string":
+      return typeof summary.value === "string" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+    case "number":
+      return typeof summary.value === "number" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+    case "boolean":
+      return typeof summary.value === "boolean" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+    case "undefined":
+      return !keys.some((key) => key !== "type")
+    default:
+      return false
+  }
 }
 
 function shouldExternalizeCausalContainer(label: string) {
@@ -62,15 +99,17 @@ function shouldExternalizeCausalContainer(label: string) {
 }
 
 function isStructuredCausalContainer(label: string) {
-  const field = label.split(".").at(-1) ?? ""
-  return (
-    field.endsWith("_refs") ||
-    field.endsWith("_flags") ||
-    field.endsWith("_semantics") ||
-    ["structured_claim", "context_ledger", "message_transforms", "source_ref_relations", "final_test_result"].includes(
-      field,
-    )
-  )
+  const schemaRoots = [
+    "change.data.change_semantics",
+    "change.data.diff_semantics",
+    "change.data.source_ref_relations",
+    "context.pack.data.context_ledger",
+    "context.compaction.data.context_ledger",
+    "evidence.semantic_fact.data.structured_claim",
+    "llm.call.data.message_transforms",
+    "verification.data.final_test_result",
+  ]
+  return schemaRoots.some((root) => label === root || label.startsWith(`${root}.`))
 }
 
 export type TraceArtifact = {
@@ -8345,27 +8384,28 @@ class ActiveCaseTrace {
   private summarizeCausalValue(input: unknown, label: string): unknown {
     if (input === undefined) return undefined
     if (input === null) return null
-    if (isTraceFieldSummary(input)) return input
     if (typeof input === "string") {
       return input.length > maxFieldLength() ? this.summarizeText(input, this.causalArtifactLabel(label)) : input
     }
     if (typeof input === "number" || typeof input === "boolean") return input
     if (Array.isArray(input)) {
       const serialized = json(input)
-      if (
-        serialized.length > maxFieldLength() &&
-        (shouldExternalizeCausalContainer(label) || !isStructuredCausalContainer(label))
-      ) {
+      if (serialized.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label))
+      }
+      if (isTraceFieldSummary(input)) return input
+      if (serialized.length > maxFieldLength() && !isStructuredCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
       return input.map((item, index) => this.summarizeCausalValue(item, `${label}.${index}`))
     }
     if (typeof input === "object") {
       const serialized = json(input)
-      if (
-        serialized.length > maxFieldLength() &&
-        (shouldExternalizeCausalContainer(label) || !isStructuredCausalContainer(label))
-      ) {
+      if (serialized.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label))
+      }
+      if (isTraceFieldSummary(input)) return input
+      if (serialized.length > maxFieldLength() && !isStructuredCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
       return this.summarizeCausalObject(input as Record<string, unknown>, label)
