@@ -2,6 +2,7 @@ import crypto from "crypto"
 import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
+import { CausalIRStore, type CausalIRJournalEntry } from "./causal-ir"
 import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
 import {
   TRACE_VERSION,
@@ -824,10 +825,17 @@ export type DataflowEdge = {
 
 export type ProvenanceTraceSummary = {
   trace_version: typeof TRACE_VERSION
+  causal_ir_version?: "1.0"
   manifest: TraceManifest
+  nodes?: CausalNode[]
+  edges?: CausalEdge[]
   records: ProvenanceRecord[]
   dataflow_edges: DataflowEdge[]
   artifacts: TraceArtifact[]
+  diagnostics?: Record<string, unknown>[]
+  compatibility?: {
+    provenance_projection: "provenance-trace.json"
+  }
   metrics: {
     spans: number
     events: number
@@ -4387,10 +4395,17 @@ class ActiveCaseTrace {
   private spans = new Map<string, TraceSpan>()
   private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
-  private artifacts: TraceArtifact[] = []
+  private readonly causalIR: CausalIRStore
+  private get causalNodes() {
+    return this.causalIR.nodes as CausalNode[]
+  }
+  private get causalEdges() {
+    return this.causalIR.edges as CausalEdge[]
+  }
+  private get artifacts() {
+    return this.causalIR.artifacts as TraceArtifact[]
+  }
   private artifactByDedupeKey = new Map<string, TraceArtifact>()
-  private causalNodes: CausalNode[] = []
-  private causalEdges: CausalEdge[] = []
   private semanticFactNodesByKey = new Map<string, CausalNode>()
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
@@ -4444,6 +4459,11 @@ class ActiveCaseTrace {
       pid: process.pid,
       ...config.environment,
     }
+    this.causalIR = new CausalIRStore({
+      runID: this.runID,
+      caseID: this.caseID,
+      append: (entry) => this.writeCausalIRRecord(entry),
+    })
     this.open()
   }
 
@@ -4588,7 +4608,7 @@ class ActiveCaseTrace {
           ...collectSourceLocations(input?.metadata),
         ])
         node.artifact_refs = this.collectArtifactRefs(node.data)
-        this.writeRecord("node.update", node)
+        this.causalIR.updateNode(node)
         this.writePartial()
       }
     }
@@ -4729,7 +4749,7 @@ class ActiveCaseTrace {
       }
     }
     skillNode.artifact_refs = this.collectArtifactRefs(skillNode.data)
-    this.writeRecord("node.update", skillNode)
+    this.causalIR.updateNode(skillNode)
   }
 
   event(input: TraceEventInput) {
@@ -4833,7 +4853,7 @@ class ActiveCaseTrace {
           },
         ])
         existing.artifact_refs = this.collectArtifactRefs(existing.data)
-        this.writeRecord("node.update", existing)
+        this.causalIR.updateNode(existing)
         return existing
       }
       const node = this.node({
@@ -4947,7 +4967,7 @@ class ActiveCaseTrace {
       error: status === "error" ? errorInfo(outcome) : node.data?.error,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
-    this.writeRecord("node.update", node)
+    this.causalIR.updateNode(node)
   }
 
   private backfillToolOutcomeRef(input: {
@@ -4995,7 +5015,7 @@ class ActiveCaseTrace {
           }
         }
         node.artifact_refs = this.collectArtifactRefs(node.data)
-        this.writeRecord("node.update", node)
+        this.causalIR.updateNode(node)
         if (parsedOutcome && !this.hasCausalEdge(parsedOutcome, node.node_id, "derived_from")) {
           this.causalEdge({
             from: parsedOutcome,
@@ -5293,7 +5313,7 @@ class ActiveCaseTrace {
       superseded_by_refs: verification.superseded_by_refs,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
-    this.writeRecord("node.update", node)
+    this.causalIR.updateNode(node)
   }
 
   verification(input: VerificationRecordInput) {
@@ -5705,7 +5725,7 @@ class ActiveCaseTrace {
         output_text: currentData.output_text ?? this.summarizeText(input.responseText, "llm.generated_output"),
       }
       llmNode.artifact_refs = this.collectArtifactRefs(llmNode.data)
-      this.writeRecord("node.update", llmNode)
+      this.causalIR.updateNode(llmNode)
     }
   }
 
@@ -6252,7 +6272,7 @@ class ActiveCaseTrace {
         handled_status: input.handledStatus,
       }
       node.artifact_refs = this.collectArtifactRefs(node.data)
-      this.writeRecord("node.update", node)
+      this.causalIR.updateNode(node)
     }
   }
 
@@ -6306,6 +6326,7 @@ class ActiveCaseTrace {
         is_final_for_case: segment.is_final_for_case,
         finality_source: segment.finality_source,
       }
+      this.causalIR.updateNode(node)
     }
   }
 
@@ -6346,12 +6367,12 @@ class ActiveCaseTrace {
     if (!staleDesignIDs.size) return
 
     this.designRecords = retainedDesignRecords
-    this.causalNodes = this.causalNodes.filter((node) => !staleDesignIDs.has(node.node_id))
+    this.causalIR.replaceNodes(this.causalNodes.filter((node) => !staleDesignIDs.has(node.node_id)))
     const referencesStaleDesign = (edge: { from: TraceRef; to: TraceRef }) =>
       (edge.from.type === "design_record" && staleDesignIDs.has(edge.from.id)) ||
       (edge.to.type === "design_record" && staleDesignIDs.has(edge.to.id))
     this.semanticEdges = this.semanticEdges.filter((edge) => !referencesStaleDesign(edge))
-    this.causalEdges = this.causalEdges.filter((edge) => !referencesStaleDesign(edge))
+    this.causalIR.replaceEdges(this.causalEdges.filter((edge) => !referencesStaleDesign(edge)))
     this.write("semantic.design_record.pruned", {
       design_ids: [...staleDesignIDs],
       reason: "source response segment is no longer the final user-visible answer",
@@ -6398,6 +6419,7 @@ class ActiveCaseTrace {
         finality_reason: "exit_gate_has_final_answer",
         finality_gate_message_id: input.message_id,
       }
+      this.causalIR.updateNode(node)
     }
     return segment
   }
@@ -6521,7 +6543,7 @@ class ActiveCaseTrace {
       }
       existing.source_refs = mergeRefs(existing.source_refs, sourceRefs)
       existing.artifact_refs = this.collectArtifactRefs(existing.data)
-      this.writeRecord("node.update", existing)
+      this.causalIR.updateNode(existing)
       this.writePartial()
       return existing
     }
@@ -6656,7 +6678,7 @@ class ActiveCaseTrace {
         duplicate_of: existing.node_id,
         source_refs: sourceRefs,
       })
-      this.writeRecord("node.update", existing)
+      this.causalIR.updateNode(existing)
       this.writePartial()
       return existing
     }
@@ -6759,12 +6781,11 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
-    this.causalNodes.push(node)
+    this.causalIR.createNode(node)
     if (node.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, node.node_id)
     if (node.kind === "context.pack" || node.kind === "context.transform")
       this.remember(this.recentContextNodeIDs, node.node_id)
     if (node.kind === "llm.call") this.remember(this.recentLLMNodeIDs, node.node_id)
-    this.writeRecord("node", node)
     this.writePartial()
     return node
   }
@@ -6778,10 +6799,9 @@ class ActiveCaseTrace {
       label: input.label,
       metadata: input.metadata,
     }
-    this.causalEdges.push(edge)
-    this.writeRecord("edge", edge)
+    const stored = this.causalIR.createEdge(edge) as CausalEdge
     this.writePartial()
-    return edge
+    return stored
   }
 
   observation(input: ObservationInput) {
@@ -7136,7 +7156,7 @@ class ActiveCaseTrace {
     for (const fact of facts) {
       if (!updated.has(fact.node_id)) continue
       fact.artifact_refs = this.collectArtifactRefs(fact.data)
-      this.writeRecord("node.update", fact)
+      this.causalIR.updateNode(fact)
     }
   }
 
@@ -7162,7 +7182,7 @@ class ActiveCaseTrace {
     const summary = this.summary(status)
     const provenance = this.provenanceSummary(summary.status, caseStatus)
     this.write("trace.finish", summary)
-    this.writeRecord("finish", provenance.manifest)
+    this.causalIR.finalize(provenance.manifest)
     this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
     this.writePartial(true, provenance)
@@ -7265,6 +7285,7 @@ class ActiveCaseTrace {
 
   private provenanceSummary(status: TraceStatus, caseStatus?: TraceStatus): ProvenanceTraceSummary {
     const manifest = this.manifest(status, caseStatus)
+    const causalIR = this.causalIR.snapshot()
     const records = this.provenanceRecords()
     const dataflowEdges = this.provenanceDataflowEdges()
     const traceHealth = this.traceHealth(records)
@@ -7273,10 +7294,17 @@ class ActiveCaseTrace {
     const streamSummary = this.streamSummary()
     return {
       trace_version: TRACE_VERSION,
+      causal_ir_version: causalIR.version,
       manifest,
+      nodes: causalIR.nodes as CausalNode[],
+      edges: causalIR.edges as CausalEdge[],
       records: allRecords,
       dataflow_edges: dataflowEdges,
-      artifacts: this.artifacts,
+      artifacts: causalIR.artifacts as TraceArtifact[],
+      diagnostics: causalIR.diagnostics,
+      compatibility: {
+        provenance_projection: "provenance-trace.json",
+      },
       metrics: {
         spans: this.spans.size,
         events: this.events.length,
@@ -7620,7 +7648,7 @@ class ActiveCaseTrace {
         original_status: "running",
       }
       node.artifact_refs = this.collectArtifactRefs(node.data)
-      this.writeRecord("node.update", node)
+      this.causalIR.updateNode(node)
     }
   }
 
@@ -7661,7 +7689,7 @@ class ActiveCaseTrace {
       compaction.data.dropped_fact_count = derived.dropped_fact_count
       compaction.data.compression_loss_risks = derived.compression_loss_risks
       compaction.artifact_refs = this.collectArtifactRefs(compaction.data)
-      this.writeRecord("node.update", compaction)
+      this.causalIR.updateNode(compaction)
     }
   }
 
@@ -7726,7 +7754,7 @@ class ActiveCaseTrace {
       }
       applySubagentInlineFields(subagent.data, inlineFields)
       subagent.artifact_refs = this.collectArtifactRefs(subagent.data)
-      this.writeRecord("node.update", subagent)
+      this.causalIR.updateNode(subagent)
       for (const consumer of parentConsumers) {
         if (
           this.hasCausalEdge(
@@ -7787,7 +7815,7 @@ class ActiveCaseTrace {
         if (outputPreview && !mcp.data.output_preview) {
           mcp.data = { ...mcp.data, output_preview: outputPreview.slice(0, 2000) }
           mcp.artifact_refs = this.collectArtifactRefs(mcp.data)
-          this.writeRecord("node.update", mcp)
+          this.causalIR.updateNode(mcp)
         }
         continue
       }
@@ -7802,7 +7830,7 @@ class ActiveCaseTrace {
         output_preview: outputPreview ? outputPreview.slice(0, 2000) : mcp.data.output_preview,
       }
       mcp.artifact_refs = this.collectArtifactRefs(mcp.data)
-      this.writeRecord("node.update", mcp)
+      this.causalIR.updateNode(mcp)
       for (const consumer of consumers) {
         if (this.hasCausalEdge({ type: "node", id: mcp.node_id, label: "mcp.call" }, consumer.node_id, "returned_by"))
           continue
@@ -8621,7 +8649,7 @@ class ActiveCaseTrace {
       })
       previousContextRecord.source_refs = mergeRefs(previousContextRecord.source_refs, sourceRefs)
       previousContextRecord.artifact_refs = this.collectArtifactRefs(previousContextRecord.data)
-      this.writeRecord("node.update", previousContextRecord)
+      this.causalIR.updateNode(previousContextRecord)
       this.writePartial()
       return previousContextRecord
     }
@@ -8835,7 +8863,7 @@ class ActiveCaseTrace {
     const existing = this.artifactByDedupeKey.get(dedupeKey)
     if (existing) {
       existing.occurrences = (existing.occurrences ?? 1) + 1
-      this.writeRecord("artifact.reuse", existing)
+      this.causalIR.reuseArtifact(existing)
       this.writePartial()
       return existing
     }
@@ -8855,13 +8883,12 @@ class ActiveCaseTrace {
       dedupe_key: dedupeKey,
       occurrences: 1,
     }
-    this.artifacts.push(artifact)
+    this.causalIR.createArtifact(artifact)
     this.artifactByDedupeKey.set(dedupeKey, artifact)
     try {
       fs.mkdirSync(path.dirname(path.join(this.caseDir, relativePath)), { recursive: true })
       fs.writeFileSync(path.join(this.caseDir, relativePath), redacted)
       this.write("artifact.write", artifact)
-      this.writeRecord("artifact", artifact)
     } catch {}
     return artifact
   }
@@ -8935,6 +8962,13 @@ class ActiveCaseTrace {
           data,
         }) + "\n",
       )
+    } catch {}
+  }
+
+  private writeCausalIRRecord(entry: CausalIRJournalEntry) {
+    if (!this.writable) return
+    try {
+      fs.appendFileSync(this.recordsFile, json(entry) + "\n")
     } catch {}
   }
 

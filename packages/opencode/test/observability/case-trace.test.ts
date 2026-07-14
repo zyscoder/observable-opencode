@@ -83,7 +83,8 @@ describe("case trace", () => {
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
-    const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")) as any
     const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
     const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
     const traceHtml = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
@@ -128,6 +129,12 @@ describe("case trace", () => {
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
     expect(provenance.trace_version).toBe("5.6")
+    expect(trace.causal_ir_version).toBe("1.0")
+    expect(trace.nodes.map((node: any) => node.node_id)).toEqual(
+      trace.records.map((record: any) => record.record_id),
+    )
+    expect(trace.artifacts).toEqual(provenance.artifacts)
+    expect(trace.compatibility.provenance_projection).toBe("provenance-trace.json")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
