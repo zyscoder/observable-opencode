@@ -7336,10 +7336,10 @@ class ActiveCaseTrace {
     const causalIR = this.causalIRSummary(summary.status, caseStatus)
     const provenance = this.projectProvenanceSummary(causalIR)
     this.write("trace.finish", summary)
-    this.causalIR.finalize(causalIR.manifest)
     this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
     this.writePartial(true, causalIR)
+    this.causalIR.finalize(causalIR.manifest)
     this.safeWrite(this.traceFile, jsonPretty(causalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
@@ -7363,7 +7363,7 @@ class ActiveCaseTrace {
     const provenance = this.projectProvenanceSummary(causalIR)
     this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.writePartial(true, causalIR)
+    this.writePartial(true, causalIR, false)
     this.safeWrite(this.traceFile, jsonPretty(causalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
@@ -9184,7 +9184,7 @@ class ActiveCaseTrace {
     } catch {}
   }
 
-  private writePartial(force = false, summary?: CausalIRTraceSummary) {
+  private writePartial(force = false, summary?: CausalIRTraceSummary, checkpoint = force) {
     if (!this.writable) return
     const now = Date.now()
     const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
@@ -9193,6 +9193,7 @@ class ActiveCaseTrace {
     const causalIR = summary ?? this.causalIRSummary("running")
     this.safeWrite(this.partialFile, jsonPretty(causalIR))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(this.projectProvenanceSummary(causalIR)))
+    if (checkpoint) this.causalIR.checkpoint(causalIR.manifest)
   }
 
   private safeWrite(target: string, content: string) {

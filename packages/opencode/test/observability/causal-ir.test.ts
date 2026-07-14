@@ -128,6 +128,32 @@ describe("causal IR store", () => {
     expect(replayCausalIRJournal(journal.slice(0, finalizations[0]!.sequence))).toEqual(store.snapshot())
   })
 
+  test("replays the complete journal lifecycle with finalization as the last operation", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_lifecycle_complete",
+      caseID: "case_lifecycle_complete",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("node_1"))
+    store.createNode(node("node_2"))
+    store.createEdge(edge("edge_1"))
+    store.createArtifact({
+      artifact_id: "artifact_1",
+      hash: "hash_1",
+      path: "artifacts/one.json",
+      occurrences: 1,
+    })
+    store.createDiagnostic({ diagnostic_id: "diagnostic_1", kind: "integrity_warning", message: "retained" })
+    store.checkpoint({ phase: "partial" })
+    store.finalize({ status: "success" })
+
+    expect(journal.filter((entry) => entry.operation === "case.checkpointed")).toHaveLength(1)
+    expect(journal.filter((entry) => entry.operation === "case.finalized")).toHaveLength(1)
+    expect(journal.at(-1)?.operation).toBe("case.finalized")
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+  })
+
   test("rebuilds node payload hashes from a replacement snapshot and clears removed node hashes", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({ runID: "run_node_hash", caseID: "case_node_hash", append: (entry) => journal.push(entry) })

@@ -169,6 +169,33 @@ function assertCausalIRJournalAudit(journal: unknown[]) {
   }
 }
 
+async function readCausalIRJournal(caseDir: string) {
+  return (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+}
+
+function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
+  const replayed = replayCausalIRJournal(journal)
+  expect(replayed.nodes.map((node) => node.node_id)).toEqual(trace.nodes.map((node: any) => node.node_id))
+  expect(replayed.edges.map((edge) => edge.edge_id)).toEqual(trace.edges.map((edge: any) => edge.edge_id))
+  expect(replayed.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash])).toEqual(
+    trace.artifacts.map((artifact: any) => [artifact.artifact_id, artifact.hash]),
+  )
+  expect(replayed.diagnostics).toEqual(trace.diagnostics)
+  expect(replayed).toMatchObject({
+    nodes: trace.nodes,
+    edges: trace.edges,
+    artifacts: trace.artifacts,
+  })
+}
+
+function assertExactlyOneFinalizationAtEnd(journal: any[]) {
+  expect(journal.filter((entry) => entry.operation === "case.finalized")).toHaveLength(1)
+  expect(journal.at(-1)?.operation).toBe("case.finalized")
+}
+
 describe("case trace", () => {
   test("writes trace semantic contract v6.0 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
@@ -2529,11 +2556,16 @@ describe("case trace", () => {
     const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")) as any
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(caseDir)
 
     expect(manifest.status).toBe("cancelled")
     expect(manifest.result.reason).toBe("SIGINT")
     expect(provenance.manifest.status).toBe("cancelled")
     assertFinalCancelledPartialMatchesTrace(partial, trace)
+    assertCausalIRJournalAudit(journal)
+    assertJournalReplaysCanonicalTrace(journal, trace)
+    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
+    assertExactlyOneFinalizationAtEnd(journal)
   })
 
   test("records observation and compaction facts for offline provenance analysis", async () => {
@@ -3194,6 +3226,7 @@ describe("case trace", () => {
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const caseRecord = trace.records.find((record: any) => record.event_type === "case.failed")
+    const journal = await readCausalIRJournal(caseDir)
 
     expect(manifest.server_status).toBe("cancelled")
     expect(manifest.case_status).toBe("cancelled")
@@ -3203,6 +3236,51 @@ describe("case trace", () => {
     expect(html).toContain("case cancelled")
     expect(html).toContain("observed pricing file before signal")
     assertFinalCancelledPartialMatchesTrace(partial, trace)
+    assertCausalIRJournalAudit(journal)
+    assertJournalReplaysCanonicalTrace(journal, trace)
+    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
+    assertExactlyOneFinalizationAtEnd(journal)
+  })
+
+  test("keeps SIGTERM journal finalization exactly once after the case already finished", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigterm-after-finish-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "sigterm-after-finish.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "finished_before_signal", kind: "verification", component: "tool", title: "finished before signal" })`,
+        `CaseTrace.finish({ status: "success", result: { answer: "complete" } })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "sigterm-after-finish-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const caseDir = path.join(dir, "sigterm-after-finish-case")
+    expect(await waitForExists(path.join(caseDir, "trace.json"), 3000)).toBe(true)
+
+    proc.kill("SIGTERM")
+    expect(await proc.exited).toBe(143)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const journal = await readCausalIRJournal(caseDir)
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    assertCausalIRJournalAudit(journal)
+    assertJournalReplaysCanonicalTrace(journal, trace)
+    assertExactlyOneFinalizationAtEnd(journal)
   })
 
   test("promotes an inferred final response when the exit gate confirms completion before shutdown", async () => {
@@ -3911,10 +3989,15 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(dir, "sigkill-case", "trace.html"), "utf8")
     const partial = JSON.parse(
       await fs.readFile(path.join(dir, "sigkill-case", "partial", "latest.json"), "utf8"),
-    ) as ProvenanceTraceSummary
+    ) as any
+    const journal = await readCausalIRJournal(path.join(dir, "sigkill-case"))
 
     expect(html).toContain("Trace v6.0")
     expect(partial.manifest.server_status).toBe("running")
+    assertCausalIRJournalAudit(journal)
+    assertJournalReplaysCanonicalTrace(journal, partial)
+    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
+    expect(journal.some((entry: any) => entry.operation === "case.finalized")).toBe(false)
   })
 
   test("renders component data flow and agent process sections", () => {
@@ -5189,11 +5272,7 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "diagnostic-reconcile-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const journal = (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line))
-    const replayed = replayCausalIRJournal(journal)
+    const journal = await readCausalIRJournal(caseDir)
     const diagnosticIDs = [
       "missing_semantic_final_test_result",
       "observed_defect_missing_verification_after_change",
@@ -5213,6 +5292,7 @@ describe("case trace", () => {
       entity_id: trace.manifest.case_id,
       previous_payload_hash: checkpoints.at(-1)?.payload_hash,
     })
+    assertExactlyOneFinalizationAtEnd(journal)
 
     for (const diagnosticID of diagnosticIDs) {
       const entries = journal.filter((entry: any) => entry.entity_id === diagnosticID)
@@ -5222,10 +5302,7 @@ describe("case trace", () => {
     expect(journal.some((entry: any) => entry.operation === "case.checkpointed")).toBe(true)
     expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
     expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
-    expect(replayed.nodes).toEqual(trace.nodes)
-    expect(replayed.edges).toEqual(trace.edges)
-    expect(replayed.artifacts).toEqual(trace.artifacts)
-    expect(replayed.diagnostics).toEqual(trace.diagnostics)
+    assertJournalReplaysCanonicalTrace(journal, trace)
   })
 
   test("marks verification risk when test oracles were changed before tests passed", async () => {
@@ -5887,6 +5964,61 @@ describe("case trace", () => {
     expect(manifest.behavior_impact).toBe("none")
     expect(trace.manifest.collection_mode).toBe("passive_sidecar")
     expect(trace.manifest.behavior_impact).toBe("none")
+  })
+
+  test("keeps agent-visible result bytes and hash unchanged when passive trace writes fail", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-passive-write-failure-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "passive-write-failure.ts")
+    const traceRoot = path.join(dir, "trace-root")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { mkdirSync } from "node:fs"`,
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const result = { answer: "stable agent result", files: ["src/pricing.mjs"], exit_code: 0 }`,
+        `CaseTrace.configure({ input: { task: "passive write failure" } })`,
+        `const trace = CaseTrace.get()`,
+        `if (trace) mkdirSync(trace.traceFile)`,
+        `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello" } })`,
+        `CaseTrace.finish({ status: "success", result })`,
+        `process.stdout.write(JSON.stringify(result))`,
+      ].join("\n"),
+    )
+
+    const run = async (enabled: boolean) => {
+      const proc = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: enabled ? "1" : "0",
+          OPENCODE_CASE_ID: "passive-write-failure-case",
+          OPENCODE_CASE_TRACE_DIR: traceRoot,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const code = await proc.exited
+      const stdout = Buffer.from(await new Response(proc.stdout).arrayBuffer())
+      const stderr = await new Response(proc.stderr).text()
+      return { code, stdout, stderr, hash: createHash("sha256").update(stdout).digest("hex") }
+    }
+
+    const baseline = await run(false)
+    const failedTrace = await run(true)
+
+    expect(baseline.code).toBe(0)
+    expect(failedTrace.code).toBe(0)
+    expect(baseline.stderr).toBe("")
+    expect(failedTrace.stderr).toBe("")
+    expect(failedTrace.stdout).toEqual(baseline.stdout)
+    expect(failedTrace.hash).toBe(baseline.hash)
+    const caseDir = path.join(traceRoot, "passive-write-failure-case")
+    expect((await fs.stat(path.join(caseDir, "trace.json"))).isDirectory()).toBe(true)
+    expect(await exists(path.join(caseDir, "manifest.json"))).toBe(true)
+    expect(await exists(path.join(caseDir, "records.jsonl"))).toBe(true)
   })
 
   test("persists and renders design records", async () => {
