@@ -13,6 +13,18 @@ CAUSAL_ROLES = {
     "non_defective",
     "unknown",
 }
+INFLUENCE_RELATIONS = {
+    "defect_propagated_from",
+    "motivated_by_evidence",
+    "derived_from",
+}
+BRANCH_RELATIONS = {
+    "same_defect",
+    "causal_precursor",
+    "outcome_evidence",
+    "unrelated",
+    "unknown",
+}
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,7 @@ class TaintInfluence:
     upstream_ref: str
     reason: str
     confidence: float = 0.0
+    relation: str = "defect_propagated_from"
 
 
 @dataclass(frozen=True)
@@ -207,6 +220,7 @@ class NodeJudgment:
     defect_type: str = ""
     defect_reason: str = ""
     causal_role: str = ""
+    branch_relation: str = ""
     influenced_by: List[TaintInfluence] = field(default_factory=list)
     is_root_cause: bool = False
     severity: str = "unknown"
@@ -232,6 +246,17 @@ class NodeJudgment:
         object.__setattr__(self, "defect_status", status)
         object.__setattr__(self, "has_defect", status == "present")
         object.__setattr__(self, "causal_role", role)
+        branch_relation = self.branch_relation.strip().lower()
+        if branch_relation not in BRANCH_RELATIONS:
+            if status == "absent":
+                branch_relation = "unrelated"
+            elif status == "unknown":
+                branch_relation = "unknown"
+            elif role == "defect_evidence":
+                branch_relation = "outcome_evidence"
+            else:
+                branch_relation = "same_defect"
+        object.__setattr__(self, "branch_relation", branch_relation)
 
 
 @dataclass(frozen=True)
@@ -297,6 +322,7 @@ def judgment_from_dict(value: JsonDict, fallback_node: TraceNode) -> NodeJudgmen
                 upstream_ref=upstream,
                 reason=str(item.get("reason") or ""),
                 confidence=float_or_zero(item.get("confidence")),
+                relation=str(item.get("relation") or "defect_propagated_from"),
             )
         )
     raw_status = str(value.get("defect_status") or "").strip().lower()
@@ -315,6 +341,7 @@ def judgment_from_dict(value: JsonDict, fallback_node: TraceNode) -> NodeJudgmen
         defect_type=str(value.get("defect_type") or ""),
         defect_reason=str(value.get("defect_reason") or value.get("reason") or ""),
         causal_role=str(value.get("causal_role") or ""),
+        branch_relation=str(value.get("branch_relation") or ""),
         influenced_by=influences,
         is_root_cause=bool(value.get("is_root_cause")),
         severity=str(value.get("severity") or "unknown"),

@@ -410,12 +410,31 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
     if causal_role == "defect_introduction":
         if status != "present" or not value.get("is_root_cause") or value.get("influenced_by"):
             raise ValueError("defect_introduction requires a present root with no upstream influence")
+        branch_relation = str(value.get("branch_relation") or "same_defect").strip().lower()
+        if branch_relation not in {"same_defect", "causal_precursor"}:
+            raise ValueError("defect_introduction requires same_defect or causal_precursor branch_relation")
+        if speculative_root_reason(reason):
+            raise ValueError("root cause reason is speculative and lacks a concrete defect mechanism")
+    if causal_role == "defect_propagation":
+        propagated = [
+            item
+            for item in value.get("influenced_by") or []
+            if isinstance(item, dict)
+            and str(item.get("relation") or "defect_propagated_from").strip().lower()
+            == "defect_propagated_from"
+        ]
+        if not propagated:
+            raise ValueError("defect_propagation requires a defect_propagated_from influence")
     if causal_role == "non_defective" and status != "absent":
         raise ValueError("non_defective requires defect_status=absent")
     if causal_role == "unknown" and status != "unknown":
         raise ValueError("unknown causal_role requires defect_status=unknown")
     if not isinstance(value.get("confidence"), (int, float)) or isinstance(value.get("confidence"), bool):
         raise ValueError("judgment requires numeric confidence")
+
+
+def speculative_root_reason(reason: str) -> bool:
+    return bool(re.search(r"\b(could|may|might|possibly|potentially|perhaps)\b", reason, flags=re.IGNORECASE))
 
 
 def call_with_wall_timeout(func: Callable[[], T], timeout_seconds: Optional[float]) -> T:

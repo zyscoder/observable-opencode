@@ -1609,6 +1609,70 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                 }
             )
 
+    def test_rejects_propagation_without_defective_upstream(self):
+        with self.assertRaisesRegex(ValueError, "defect_propagated_from"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:scope_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "out_of_scope_change",
+                    "defect_reason": "The decision applies an unrelated compatibility change.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                }
+            )
+
+    def test_rejects_propagation_motivated_only_by_evidence(self):
+        with self.assertRaisesRegex(ValueError, "defect_propagated_from"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:scope_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "out_of_scope_change",
+                    "defect_reason": "A truthful environment failure motivated an unrelated compatibility change.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [
+                        {
+                            "upstream_ref": "record:environment_failure",
+                            "reason": "The environment failure motivated the decision.",
+                            "relation": "motivated_by_evidence",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                }
+            )
+
+    def test_rejects_speculative_root_reason(self):
+        with self.assertRaisesRegex(ValueError, "speculative"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:large_change",
+                    "component": "tool",
+                    "event_type": "change",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "possible_symbol_bug",
+                    "defect_reason": "The complex branching logic could introduce a symbol resolution defect.",
+                    "causal_role": "defect_introduction",
+                    "branch_relation": "causal_precursor",
+                    "influenced_by": [],
+                    "is_root_cause": True,
+                    "confidence": 0.9,
+                }
+            )
+
     def test_rejects_absent_judgment_with_nonempty_defect_type(self):
         with self.assertRaises(ValueError):
             validate_judgment_payload(
