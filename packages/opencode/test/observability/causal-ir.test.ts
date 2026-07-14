@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { CausalIRStore, replayCausalIRJournal, type CausalIRJournalEntry } from "@/observability/causal-ir"
+import {
+  CausalIRStore,
+  projectProvenanceTrace,
+  replayCausalIRJournal,
+  type CausalIRJournalEntry,
+} from "@/observability/causal-ir"
 
 function node(nodeID: string, data: Record<string, unknown> = {}) {
   return {
@@ -235,5 +240,52 @@ describe("causal IR store", () => {
 
     expect(store.nodes[0]).toBe(created)
     expect(journal[0]?.data).toEqual(node("node_1", { chosen_action: "read" }))
+  })
+
+  test("preserves an unknown original relation without making it attribution eligible", () => {
+    const store = new CausalIRStore({ runID: "run_1", caseID: "case_1" })
+    store.createEdge({
+      edge_id: "edge_1",
+      from: { type: "node", id: "a" },
+      to: { type: "node", id: "b" },
+      relation: "custom_future_relation",
+    })
+
+    const ir = store.snapshot()
+    expect(ir.edges[0]?.original_relation).toBe("custom_future_relation")
+    expect(ir.edges[0]?.normalized_relation).toBe("derived_from")
+    expect(ir.edges[0]?.eligible_for_attribution).toBe(false)
+    expect(ir.diagnostics[0]?.kind).toBe("unknown_relation")
+  })
+
+  test("projects canonical nodes into the existing provenance record contract", () => {
+    const store = new CausalIRStore({ runID: "run_1", caseID: "case_1" })
+    store.createNode(node("node_1"))
+    store.createEdge({
+      edge_id: "edge_1",
+      from: { type: "node", id: "node_1" },
+      to: { type: "node", id: "node_2" },
+      relation: "source_to_observation",
+      evidence_tier: "direct",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_relation",
+      metadata: { retained: true },
+    })
+
+    const projection = projectProvenanceTrace(store.snapshot(), {
+      traceVersion: "6.0",
+      manifest: { case_id: "case_1", run_id: "run_1" },
+      metrics: { token_usage: {}, trace_health: { issues: [] } },
+    })
+
+    expect(projection.records[0]?.record_id).toBe("node_1")
+    expect(projection.dataflow_edges[0]?.relation).toBe("derived_from")
+    expect(projection.dataflow_edges[0]?.metadata).toEqual({
+      retained: true,
+      original_relation: "source_to_observation",
+      evidence_tier: "direct",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_relation",
+    })
   })
 })

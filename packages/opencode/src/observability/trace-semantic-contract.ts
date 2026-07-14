@@ -80,7 +80,7 @@ export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]
 const FORMAL_RECORD_TYPE_SET = new Set<string>(FORMAL_RECORD_TYPES)
 const FORMAL_RELATION_SET = new Set<string>(FORMAL_DATAFLOW_RELATIONS)
 
-const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
+export const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
   tool_to_change: "modified_by",
   tool_to_observation: "produced",
   failure_to_change: "motivated_by_evidence",
@@ -130,11 +130,19 @@ export function isFormalRecordType(type: string): type is FormalRecordType {
   return FORMAL_RECORD_TYPE_SET.has(type)
 }
 
-export function normalizeRelation(relation: string): FormalDataflowRelation {
+export function isFormalDataflowRelation(relation: string): relation is FormalDataflowRelation {
+  return FORMAL_RELATION_SET.has(relation)
+}
+
+export function normalizeRelationDetails(relation: string) {
   const migrated = RELATION_MIGRATIONS[relation]
-  if (migrated) return migrated
-  if (FORMAL_RELATION_SET.has(relation)) return relation as FormalDataflowRelation
-  return "derived_from"
+  if (migrated) return { original: relation, normalized: migrated, known: true }
+  if (isFormalDataflowRelation(relation)) return { original: relation, normalized: relation, known: true }
+  return { original: relation, normalized: "derived_from" as const, known: false }
+}
+
+export function normalizeRelation(relation: string): FormalDataflowRelation {
+  return normalizeRelationDetails(relation).normalized
 }
 
 export function shouldPromoteRuntimeEvent(component: TraceComponent, eventType: string, data?: unknown): boolean {

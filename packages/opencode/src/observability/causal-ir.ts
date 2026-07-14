@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto"
+import {
+  isFormalRecordType,
+  normalizeRelationDetails,
+  type FormalDataflowRelation,
+} from "./trace-semantic-contract"
 
 export const CAUSAL_IR_VERSION = "1.0" as const
 
@@ -24,6 +29,11 @@ export type CausalEdgeLike = {
   from: { type: string; id: string; label?: string }
   to: { type: string; id: string; label?: string }
   relation: string
+  original_relation?: string
+  normalized_relation?: FormalDataflowRelation
+  evidence_tier?: string
+  eligible_for_attribution?: boolean
+  derivation_method?: string
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -74,6 +84,60 @@ export type CausalIRStoreSnapshot = {
   diagnostics: CausalIRDiagnosticLike[]
 }
 
+export type ProvenanceProjectionInput = {
+  traceVersion: string
+  manifest: {
+    case_id: string
+    run_id: string
+    [key: string]: unknown
+  }
+  metrics: {
+    token_usage: Record<string, unknown>
+    trace_health: {
+      issues: unknown[]
+      [key: string]: unknown
+    }
+    [key: string]: unknown
+  }
+}
+
+export type ProvenanceTraceProjection = {
+  trace_version: string
+  manifest: ProvenanceProjectionInput["manifest"]
+  records: Array<{
+    record_id: string
+    component?: string
+    event_type: string
+    span_id?: string
+    timestamp: string
+    time_ms: number
+    title?: string
+    status?: string
+    source_refs?: string[]
+    source_locations?: Record<string, unknown>[]
+    typed_resources?: Record<string, unknown>[]
+    artifact_refs?: string[]
+    data?: Record<string, unknown>
+    metadata?: Record<string, unknown>
+  }>
+  dataflow_edges: Array<{
+    edge_id: string
+    from: CausalEdgeLike["from"]
+    to: CausalEdgeLike["to"]
+    relation: FormalDataflowRelation
+    label?: string
+    metadata: Record<string, unknown>
+  }>
+  artifacts: ArtifactLike[]
+  metrics: ProvenanceProjectionInput["metrics"] & {
+    spans: number
+    events: number
+    records: number
+    dataflow_edges: number
+    artifacts: number
+  }
+}
+
 type CausalIRLifecycleJournalData = {
   snapshot: CausalIRStoreSnapshot
   data: unknown
@@ -83,6 +147,33 @@ type CausalIRStoreInput = {
   runID: string
   caseID: string
   append?: (entry: CausalIRJournalEntry) => void
+}
+
+type CanonicalRelationAttributes = {
+  original_relation: string
+  normalized_relation: FormalDataflowRelation
+  evidence_tier: string
+  eligible_for_attribution: boolean
+  derivation_method: string
+}
+
+function canonicalRelationAttributes(edge: CausalEdgeLike): CanonicalRelationAttributes {
+  const details = normalizeRelationDetails(edge.original_relation ?? edge.relation)
+  const metadataEligible = edge.metadata?.eligible_for_attribution
+  const declaredEligible = edge.eligible_for_attribution ?? (typeof metadataEligible === "boolean" ? metadataEligible : undefined)
+  const metadataEvidenceTier = edge.metadata?.evidence_tier
+  const metadataDerivationMethod = edge.metadata?.derivation_method
+
+  return {
+    original_relation: details.original,
+    normalized_relation: details.normalized,
+    evidence_tier: edge.evidence_tier ?? (typeof metadataEvidenceTier === "string" ? metadataEvidenceTier : "unspecified"),
+    eligible_for_attribution: details.known && declaredEligible !== false,
+    derivation_method:
+      edge.derivation_method ??
+      (typeof metadataDerivationMethod === "string" ? metadataDerivationMethod : undefined) ??
+      (details.known ? "explicit_relation" : "unknown_relation_fallback"),
+  }
 }
 
 function canonicalJSON(input: unknown, arrayValue = false): string | undefined {
@@ -184,14 +275,18 @@ export class CausalIRStore {
   }
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
-    this.edges.push(edge)
-    this.append("edge.created", "edge", edge.edge_id, edge)
-    return edge
+    const canonical = this.canonicalEdge(edge)
+    this.edges.push(canonical)
+    this.append("edge.created", "edge", canonical.edge_id, canonical)
+    this.recordUnknownRelationDiagnostic(canonical)
+    return canonical as T
   }
 
   replaceEdges(edges: CausalEdgeLike[]): void {
-    replaceAll(this.edges, edges)
+    const canonical = edges.map((edge) => this.canonicalEdge(edge))
+    replaceAll(this.edges, canonical)
     this.rebuildPayloadHashes("edge", this.edges, "edge_id")
+    canonical.forEach((edge) => this.recordUnknownRelationDiagnostic(edge))
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
@@ -235,6 +330,27 @@ export class CausalIRStore {
 
   private appendSnapshot(operation: "case.checkpointed" | "case.finalized", recordType: string, data: unknown) {
     this.append(operation, recordType, this.input.caseID, { snapshot: this.snapshot(), data }, "case")
+  }
+
+  private canonicalEdge(edge: CausalEdgeLike): CausalEdgeLike {
+    return {
+      ...edge,
+      ...canonicalRelationAttributes(edge),
+    }
+  }
+
+  private recordUnknownRelationDiagnostic(edge: CausalEdgeLike) {
+    if (edge.eligible_for_attribution) return
+    const diagnosticID = `unknown_relation:${edge.edge_id}`
+    if (this.diagnostics.some((diagnostic) => diagnostic.diagnostic_id === diagnosticID)) return
+    this.createDiagnostic({
+      diagnostic_id: diagnosticID,
+      kind: "unknown_relation",
+      level: "warning",
+      message: `Unknown causal relation: ${edge.original_relation ?? edge.relation}`,
+      edge_id: edge.edge_id,
+      relation: edge.original_relation ?? edge.relation,
+    })
   }
 
   private rebuildPayloadHashes<T extends Record<string, unknown>>(hashType: string, items: T[], idKey: keyof T) {
@@ -329,5 +445,64 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
     edges,
     artifacts,
     diagnostics,
+  }
+}
+
+export function projectProvenanceTrace(
+  snapshot: CausalIRStoreSnapshot,
+  input: ProvenanceProjectionInput,
+): ProvenanceTraceProjection {
+  const records = snapshot.nodes
+    .filter((node) => isFormalRecordType(node.kind))
+    .map((node) => ({
+      record_id: node.node_id,
+      component: node.component,
+      event_type: node.kind,
+      span_id: node.span_id,
+      timestamp: node.timestamp,
+      time_ms: node.time_ms,
+      title: node.title,
+      status: node.status,
+      source_refs: node.source_refs,
+      source_locations: node.source_locations,
+      typed_resources: node.typed_resources,
+      artifact_refs: node.artifact_refs,
+      data: node.data,
+      metadata: node.metadata,
+    }))
+  const dataflowEdges = snapshot.edges.map((edge) => {
+    const attributes = canonicalRelationAttributes(edge)
+
+    return {
+      edge_id: edge.edge_id,
+      from: edge.from,
+      to: edge.to,
+      relation: attributes.normalized_relation,
+      label: edge.label,
+      metadata: {
+        ...edge.metadata,
+        original_relation: attributes.original_relation,
+        evidence_tier: attributes.evidence_tier,
+        eligible_for_attribution: attributes.eligible_for_attribution,
+        derivation_method: attributes.derivation_method,
+      },
+    }
+  })
+  const spans = new Set(records.flatMap((record) => (record.span_id ? [record.span_id] : []))).size
+
+  return {
+    trace_version: input.traceVersion,
+    manifest: input.manifest,
+    records,
+    dataflow_edges: dataflowEdges,
+    artifacts: snapshot.artifacts,
+    metrics: {
+      ...input.metrics,
+      spans,
+      events: records.length,
+      records: records.length,
+      dataflow_edges: dataflowEdges.length,
+      artifacts: snapshot.artifacts.length,
+    },
   }
 }
