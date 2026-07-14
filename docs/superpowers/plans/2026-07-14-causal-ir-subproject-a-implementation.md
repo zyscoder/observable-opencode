@@ -32,6 +32,94 @@
 - Modify `packages/opencode/test/observability/case-trace.test.ts`: assert Causal IR output, compatibility projection, journal operations, lifecycle recovery, and viewer parity.
 - Modify `tools/trace_attribution/tests/test_backward_taint.py`: add one compatibility assertion that Trace 6.0 records remain loadable without changing attribution semantics.
 
+### Task 0: Restore A Trustworthy Semantic Trace Baseline
+
+**Files:**
+- Modify: `packages/opencode/test/observability/case-trace.test.ts`
+- Modify: `packages/opencode/src/observability/case-trace.ts`
+
+**Interfaces:**
+- Produces: a green pre-migration CaseTrace suite whose structured semantic fields remain traversable under small artifact thresholds.
+- Preserves: existing artifact externalization for raw input/output, message bodies, tool payloads, diffs, and compaction text.
+
+- [ ] **Step 1: Preserve the observed RED baseline**
+
+Run: `bun test test/observability/case-trace.test.ts --timeout 30000`
+
+Expected pre-fix result: 76 pass and 21 fail. The failures include malformed
+generated scripts, stale source-ref assertions, and structured semantic fields
+collapsed into field-summary previews.
+
+- [ ] **Step 2: Repair malformed generated-script fixtures**
+
+Replace every script-construction `].join("\\n")` with `].join("\n")`. This
+changes test fixture syntax only; it does not alter production behavior.
+
+- [ ] **Step 3: Update stale compatibility assertions**
+
+Replace the broad JSON substring prohibition:
+
+```ts
+expect(provenanceText).not.toContain("evidence_refs")
+```
+
+with a structural check that no formal record has the removed legacy top-level
+field while allowing `data.direct_evidence_refs` and other current evidence
+fields:
+
+```ts
+expect(provenance.records.every((record: any) => record.evidence_refs === undefined)).toBe(true)
+```
+
+For generation provenance, require `generation_provenance_refs` and explicit
+`produced`/`used_as_context` edges. Do not require generation refs to remain in
+the narrowed `response.output.source_refs` list.
+
+- [ ] **Step 4: Add a focused failing semantic-structure test**
+
+Under `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH=64`, create a change and design
+record, then assert:
+
+```ts
+expect(change.data.change_semantics.risk_flags).toBeArray()
+expect(change.data.source_ref_relations).toBeArray()
+expect(design.data.test_strategy.preview).toContain("pricing")
+```
+
+Run the focused test and verify it fails because semantic containers or an
+already-created `TraceFieldSummary` are summarized a second time.
+
+- [ ] **Step 5: Preserve structured semantics while externalizing raw containers**
+
+Add `isTraceFieldSummary()` and `shouldExternalizeCausalContainer(label)`.
+`summarizeCausalValue()` must:
+
+- return an existing `TraceFieldSummary` unchanged;
+- recursively preserve schema-bearing fields such as `_refs`, `_flags`,
+  `_semantics`, `structured_claim`, `context_ledger`, `message_transforms`,
+  `source_ref_relations`, and `final_test_result`;
+- continue externalizing large raw `.input`, `.output`, `.messages`, `.tools`,
+  `.diff`, `.stdout`, `.stderr`, and compaction-text containers;
+- summarize long leaf strings through artifacts.
+
+- [ ] **Step 6: Run the full baseline and typecheck**
+
+Run from `packages/opencode`:
+
+```bash
+bun test test/observability/case-trace.test.ts --timeout 30000
+bun typecheck
+```
+
+Expected: 97 tests pass, 0 fail; typecheck exits 0.
+
+- [ ] **Step 7: Commit the baseline repair**
+
+```bash
+git add packages/opencode/src/observability/case-trace.ts packages/opencode/test/observability/case-trace.test.ts
+git commit -m "fix: preserve structured trace semantics"
+```
+
 ### Task 1: Causal IR Types, Store, And Replay
 
 **Files:**
