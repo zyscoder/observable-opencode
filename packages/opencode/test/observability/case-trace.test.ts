@@ -189,19 +189,26 @@ function isCompleteCausalIRCheckpoint(entry: any) {
   )
 }
 
-async function waitForCompleteCausalIRCheckpoint(caseDir: string, timeoutMs = 3000) {
+function checkpointIncludesNode(entry: any, markerNodeID: string) {
+  return (
+    isCompleteCausalIRCheckpoint(entry) &&
+    entry.data.snapshot.nodes.some((node: any) => node?.node_id === markerNodeID)
+  )
+}
+
+async function waitForCompleteCausalIRCheckpoint(caseDir: string, markerNodeID: string, timeoutMs = 3000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
     try {
       const journal = await readCausalIRJournal(caseDir)
-      if (journal.some(isCompleteCausalIRCheckpoint)) return journal
+      if (journal.some((entry) => checkpointIncludesNode(entry, markerNodeID))) return journal
     } catch {}
     await Bun.sleep(50)
   }
 
   try {
     const journal = await readCausalIRJournal(caseDir)
-    return journal.some(isCompleteCausalIRCheckpoint) ? journal : undefined
+    return journal.some((entry) => checkpointIncludesNode(entry, markerNodeID)) ? journal : undefined
   } catch {
     return undefined
   }
@@ -2578,6 +2585,8 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "long running" } })`,
         `CaseTrace.agentLifecycle({ session_id: "ses_sigint", message_id: "msg_sigint", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGINT arrives" })`,
+        `CaseTrace.node({ node_id: "fixture_signal_sigint_ready", kind: "verification", component: "runtime", title: "SIGINT fixture readiness marker" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -2594,7 +2603,7 @@ describe("case trace", () => {
       stderr: "pipe",
     })
     const caseDir = path.join(dir, "causal-sigint-case")
-    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigint_ready")
     expect(persistedJournal).toBeDefined()
     assertCausalIRJournalAudit(persistedJournal!)
     proc.kill("SIGINT")
@@ -3247,6 +3256,8 @@ describe("case trace", () => {
         `CaseTrace.configure({ input: { prompt: "long running signal case" }, environment: { model: "unit-test" } })`,
         `CaseTrace.agentLifecycle({ session_id: "ses_signal", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGTERM arrives" })`,
         `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "observed pricing file before signal", data: { path: "src/pricing.mjs", line_start: 1, line_end: 1, text: "export function renewalQuote(input) {}" } })`,
+        `CaseTrace.node({ node_id: "fixture_signal_sigterm_canonical_ready", kind: "verification", component: "runtime", title: "SIGTERM canonical fixture readiness marker" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -3263,7 +3274,7 @@ describe("case trace", () => {
       stderr: "pipe",
     })
     const caseDir = path.join(dir, "signal-flush-v58-case")
-    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigterm_canonical_ready")
     expect(persistedJournal).toBeDefined()
     assertCausalIRJournalAudit(persistedJournal!)
 
@@ -3968,6 +3979,8 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigterm" } })`,
+        `CaseTrace.node({ node_id: "fixture_signal_sigterm_legacy_ready", kind: "verification", component: "runtime", title: "SIGTERM legacy fixture readiness marker" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -3984,7 +3997,10 @@ describe("case trace", () => {
       stderr: "pipe",
     })
 
-    expect(await waitForExists(path.join(dir, "sigterm-case", "events.jsonl"))).toBe(true)
+    const caseDir = path.join(dir, "sigterm-case")
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigterm_legacy_ready")
+    expect(persistedJournal).toBeDefined()
+    assertCausalIRJournalAudit(persistedJournal!)
     proc.kill("SIGTERM")
     const code = await proc.exited
     const stderr = await new Response(proc.stderr).text()
@@ -4018,6 +4034,8 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigkill" } })`,
+        `CaseTrace.node({ node_id: "fixture_signal_sigkill_ready", kind: "verification", component: "runtime", title: "SIGKILL fixture readiness marker" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -4035,7 +4053,7 @@ describe("case trace", () => {
     })
 
     const caseDir = path.join(dir, "sigkill-case")
-    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigkill_ready")
     expect(persistedJournal).toBeDefined()
     assertCausalIRJournalAudit(persistedJournal!)
     expect(await waitForExists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
