@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -27,6 +28,92 @@ async function waitForExists(file: string, timeoutMs = 2000) {
 function changeIdFromTrace(trace: any) {
   const record = trace.records.find((item: any) => item.event_type === "change")
   return record?.data?.change_id ?? record?.record_id
+}
+
+const causalIRJournalContract = {
+  "node.created": { recordType: "node", category: "node", startsChain: true },
+  "node.updated": { recordType: "node.update", category: "node", requiresPrevious: true },
+  "edge.created": { recordType: "edge", category: "edge", startsChain: true },
+  "artifact.created": { recordType: "artifact", category: "artifact", startsChain: true },
+  "artifact.reused": { recordType: "artifact.reuse", category: "artifact", requiresPrevious: true },
+  "diagnostic.created": { recordType: "diagnostic", category: "diagnostic", startsChain: true },
+  "case.checkpointed": { recordType: "checkpoint", category: "case" },
+  // Finalization continues an existing checkpoint chain when one exists, but can be the first lifecycle record.
+  "case.finalized": { recordType: "finish", category: "case" },
+} as const
+
+function canonicalJSONForCausalIRAudit(input: unknown, arrayValue = false): string | undefined {
+  if (input === null) return "null"
+
+  switch (typeof input) {
+    case "boolean":
+    case "number":
+    case "string":
+      return JSON.stringify(input)
+    case "undefined":
+    case "function":
+    case "symbol":
+      return arrayValue ? "null" : undefined
+    case "bigint":
+      throw new TypeError("Do not know how to serialize a BigInt")
+  }
+
+  if (Array.isArray(input)) {
+    const values: string[] = []
+    for (let index = 0; index < input.length; index++)
+      values.push(canonicalJSONForCausalIRAudit(input[index], true) ?? "null")
+    return `[${values.join(",")}]`
+  }
+
+  const value = input as Record<string, unknown>
+  if (typeof value.toJSON === "function") return canonicalJSONForCausalIRAudit(value.toJSON(), arrayValue)
+  return `{${Object.keys(value)
+    .sort((left, right) => (left === right ? 0 : left < right ? -1 : 1))
+    .flatMap((key) => {
+      const serialized = canonicalJSONForCausalIRAudit(value[key])
+      return serialized === undefined ? [] : [`${JSON.stringify(key)}:${serialized}`]
+    })
+    .join(",")}}`
+}
+
+function causalIRPayloadHashForAudit(data: unknown) {
+  return createHash("sha256")
+    .update(canonicalJSONForCausalIRAudit(data) ?? "null")
+    .digest("hex")
+}
+
+function assertCausalIRJournalAudit(journal: unknown[]) {
+  const previousPayloadHashes = new Map<string, string>()
+
+  for (const [index, rawEntry] of journal.entries()) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry))
+      throw new Error(`journal entry ${index + 1} is not an object`)
+
+    const entry = rawEntry as Record<string, unknown>
+    const operation = entry.operation
+    if (typeof operation !== "string" || !(operation in causalIRJournalContract))
+      throw new Error(`journal entry ${index + 1} has an unsupported operation`)
+
+    const contract = causalIRJournalContract[operation as keyof typeof causalIRJournalContract]
+    if (entry.sequence !== index + 1) throw new Error(`journal entry ${index + 1} has a non-contiguous sequence`)
+    if (entry.record_type !== contract.recordType)
+      throw new Error(`journal entry ${index + 1} has an invalid record_type for ${operation}`)
+    if (typeof entry.entity_id !== "string") throw new Error(`journal entry ${index + 1} is missing an entity_id`)
+
+    const payloadHash = causalIRPayloadHashForAudit(entry.data)
+    if (entry.payload_hash !== payloadHash) throw new Error(`journal entry ${index + 1} has an invalid payload_hash`)
+
+    const chainKey = `${contract.category}:${entry.entity_id}`
+    const expectedPreviousHash = previousPayloadHashes.get(chainKey)
+    if (entry.previous_payload_hash !== expectedPreviousHash)
+      throw new Error(`journal entry ${index + 1} has an invalid previous_payload_hash chain`)
+    if ("startsChain" in contract && contract.startsChain && expectedPreviousHash !== undefined)
+      throw new Error(`journal entry ${index + 1} must start a ${contract.category} payload chain`)
+    if ("requiresPrevious" in contract && contract.requiresPrevious && expectedPreviousHash === undefined)
+      throw new Error(`journal entry ${index + 1} must continue a ${contract.category} payload chain`)
+
+    previousPayloadHashes.set(chainKey, payloadHash)
+  }
 }
 
 describe("case trace", () => {
@@ -4596,6 +4683,32 @@ describe("case trace", () => {
         record.event_type === "case.observed_defect" && record.data.defect_type === "missing_verification_after_change",
     )
 
+    expect(
+      canonicalJSONForCausalIRAudit({
+        nested: { "2": "two", "10": "ten", value: [{ z: true, a: null }, , undefined] },
+        omitted: undefined,
+      }),
+    ).toBe('{"nested":{"10":"ten","2":"two","value":[{"a":null,"z":true},null,null]}}')
+    const hashMutationIndex = journal.findIndex((entry: any) => entry.operation === "node.created")
+    const mappingMutationIndex = journal.findIndex((entry: any) => entry.operation === "artifact.reused")
+    expect(hashMutationIndex).toBeGreaterThanOrEqual(0)
+    expect(mappingMutationIndex).toBeGreaterThanOrEqual(0)
+    expect(() =>
+      assertCausalIRJournalAudit(
+        journal.map((entry: any, index: number) =>
+          index === hashMutationIndex ? { ...entry, payload_hash: "0".repeat(64) } : entry,
+        ),
+      ),
+    ).toThrow(/payload_hash/)
+    expect(() =>
+      assertCausalIRJournalAudit(
+        journal.map((entry: any, index: number) =>
+          index === mappingMutationIndex ? { ...entry, record_type: "artifact" } : entry,
+        ),
+      ),
+    ).toThrow(/record_type/)
+    assertCausalIRJournalAudit(journal)
+
     expect(trace.metrics.trace_health.missing_verification_after_change).toBe(1)
     expect(issues).toContain("missing_verification_after_change")
     expect(missingSemantic.data.reason).toContain("No test-like verification command")
@@ -4614,6 +4727,22 @@ describe("case trace", () => {
     )
     const journalOperations = journal.map((entry: any) => entry.operation)
     expect(journalOperations).toContain("artifact.reused")
+    const reusedArtifact = journal.find((entry: any) => entry.operation === "artifact.reused")
+    const createdArtifact = journal.find(
+      (entry: any) => entry.operation === "artifact.created" && entry.entity_id === reusedArtifact?.entity_id,
+    )
+    expect(createdArtifact).toMatchObject({
+      record_type: "artifact",
+      data: { occurrences: 1 },
+    })
+    expect(createdArtifact.previous_payload_hash).toBeUndefined()
+    expect(reusedArtifact).toMatchObject({
+      record_type: "artifact.reuse",
+      entity_id: createdArtifact?.entity_id,
+      previous_payload_hash: createdArtifact?.payload_hash,
+      data: { occurrences: 2 },
+    })
+    expect(reusedArtifact.payload_hash).toBe(causalIRPayloadHashForAudit(reusedArtifact.data))
     const diagnosticJournal = journal.filter((entry: any) =>
       [missingSemantic.record_id, observedDefect.record_id].includes(entry.entity_id),
     )
@@ -4692,6 +4821,21 @@ describe("case trace", () => {
       "missing_semantic_final_test_result",
       "observed_defect_missing_verification_after_change",
     ]
+
+    assertCausalIRJournalAudit(journal)
+    const checkpoints = journal.filter((entry: any) => entry.operation === "case.checkpointed")
+    const finalized = journal.find((entry: any) => entry.operation === "case.finalized")
+    expect(checkpoints.length).toBeGreaterThan(0)
+    expect(
+      checkpoints.every(
+        (entry: any) => entry.record_type === "checkpoint" && entry.entity_id === trace.manifest.case_id,
+      ),
+    ).toBe(true)
+    expect(finalized).toMatchObject({
+      record_type: "finish",
+      entity_id: trace.manifest.case_id,
+      previous_payload_hash: checkpoints.at(-1)?.payload_hash,
+    })
 
     for (const diagnosticID of diagnosticIDs) {
       const entries = journal.filter((entry: any) => entry.entity_id === diagnosticID)
