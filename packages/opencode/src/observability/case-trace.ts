@@ -4,6 +4,7 @@ import path from "path"
 import { Global } from "@opencode-ai/core/global"
 import {
   CausalIRStore,
+  projectProvenanceTrace,
   type ArtifactLike,
   type CausalEdgeLike,
   type CausalIRDiagnosticLike,
@@ -15,7 +16,6 @@ import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
 import {
   TRACE_VERSION,
   isFormalRecordType,
-  normalizeRelation,
   shouldPromoteRuntimeEvent,
 } from "./trace-semantic-contract"
 
@@ -715,11 +715,14 @@ export type CausalNode = {
   kind: CausalNodeKind | string
   component?: TraceComponent
   span_id?: string
+  parent_span_id?: string
   timestamp: string
   time_ms: number
   title?: string
   status?: TraceStatus | TraceVerificationRecord["status"]
   data?: Record<string, unknown>
+  input_refs?: string[]
+  output_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   typed_resources?: Record<string, unknown>[]
@@ -858,6 +861,21 @@ export type ProvenanceTraceSummary = {
     token_usage: TraceTokenUsage
     stream_summary?: Record<string, number>
     trace_health: TraceHealthMetrics
+  }
+}
+
+export type ProvenanceTraceView = Omit<
+  ProvenanceTraceSummary,
+  "causal_ir_version" | "nodes" | "edges" | "diagnostics" | "compatibility"
+>
+
+export type CausalIRTraceSummary = ProvenanceTraceView & {
+  causal_ir_version: "1.0"
+  nodes: CausalNode[]
+  edges: CausalEdge[]
+  diagnostics: CausalIRDiagnosticLike[]
+  compatibility: {
+    provenance_projection: "provenance-trace.json"
   }
 }
 
@@ -7315,13 +7333,14 @@ class ActiveCaseTrace {
     this.emitCaseLifecycleRecord(status, caseStatus)
     this.finished = true
     const summary = this.summary(status)
-    const provenance = this.provenanceSummary(summary.status, caseStatus)
+    const causalIR = this.causalIRSummary(summary.status, caseStatus)
+    const provenance = this.projectProvenanceSummary(causalIR)
     this.write("trace.finish", summary)
-    this.causalIR.finalize(provenance.manifest)
-    this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
+    this.causalIR.finalize(causalIR.manifest)
+    this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.writePartial(true, provenance)
-    this.safeWrite(this.traceFile, jsonPretty(provenance))
+    this.writePartial(true, causalIR)
+    this.safeWrite(this.traceFile, jsonPretty(causalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
@@ -7340,11 +7359,12 @@ class ActiveCaseTrace {
     this.result = result
     const caseStatus = this.observedCaseStatus() ?? this.inferCaseStatus("cancelled", undefined)
     const summary = this.summary("cancelled")
-    const provenance = this.provenanceSummary("cancelled", caseStatus)
-    this.safeWrite(this.manifestFile, jsonPretty(provenance.manifest))
+    const causalIR = this.causalIRSummary("cancelled", caseStatus)
+    const provenance = this.projectProvenanceSummary(causalIR)
+    this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.writePartial(true, provenance)
-    this.safeWrite(this.traceFile, jsonPretty(provenance))
+    this.writePartial(true, causalIR)
+    this.safeWrite(this.traceFile, jsonPretty(causalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
@@ -7418,23 +7438,28 @@ class ActiveCaseTrace {
     }
   }
 
-  private provenanceSummary(status: TraceStatus, caseStatus?: TraceStatus): ProvenanceTraceSummary {
+  private causalIRSummary(status: TraceStatus, caseStatus?: TraceStatus): CausalIRTraceSummary {
     const manifest = this.manifest(status, caseStatus)
     const records = this.provenanceRecords().filter((record) => !this.isCaseDiagnosticKind(record.event_type))
-    const dataflowEdges = this.provenanceDataflowEdges()
     const traceHealth = this.traceHealth(records)
     this.syncCaseDiagnosticNodes(traceHealth)
     const causalIR = this.causalIR.snapshot()
-    const allRecords = this.provenanceRecords()
     const streamSummary = this.streamSummary()
+    const provenance = this.projectCausalIRSnapshot(causalIR, manifest, {
+      spans: this.spans.size,
+      events: this.events.length,
+      token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
+      stream_summary: streamSummary,
+      trace_health: traceHealth,
+    })
     return {
       trace_version: TRACE_VERSION,
       causal_ir_version: causalIR.version,
       manifest,
       nodes: causalIR.nodes as CausalNode[],
       edges: causalIR.edges as CausalEdge[],
-      records: allRecords,
-      dataflow_edges: dataflowEdges,
+      records: provenance.records,
+      dataflow_edges: provenance.dataflow_edges,
       artifacts: causalIR.artifacts as TraceArtifact[],
       diagnostics: causalIR.diagnostics,
       compatibility: {
@@ -7443,12 +7468,57 @@ class ActiveCaseTrace {
       metrics: {
         spans: this.spans.size,
         events: this.events.length,
-        records: allRecords.length,
-        dataflow_edges: dataflowEdges.length,
-        artifacts: this.artifacts.length,
+        records: causalIR.nodes.length,
+        dataflow_edges: causalIR.edges.length,
+        artifacts: causalIR.artifacts.length,
         token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
         stream_summary: streamSummary,
         trace_health: traceHealth,
+      },
+    }
+  }
+
+  private projectProvenanceSummary(summary: CausalIRTraceSummary): ProvenanceTraceView {
+    return this.projectCausalIRSnapshot(
+      {
+        version: summary.causal_ir_version,
+        runID: summary.manifest.run_id,
+        caseID: summary.manifest.case_id,
+        nodes: summary.nodes,
+        edges: summary.edges,
+        artifacts: summary.artifacts,
+        diagnostics: summary.diagnostics,
+      },
+      summary.manifest,
+      summary.metrics,
+    )
+  }
+
+  private projectCausalIRSnapshot(
+    snapshot: CausalIRStoreSnapshot,
+    manifest: TraceManifest,
+    metrics: Pick<ProvenanceTraceSummary["metrics"], "spans" | "events" | "token_usage" | "stream_summary" | "trace_health">,
+  ): ProvenanceTraceView {
+    const projection = projectProvenanceTrace(snapshot, {
+      traceVersion: TRACE_VERSION,
+      manifest,
+      metrics,
+    })
+    return {
+      trace_version: TRACE_VERSION,
+      manifest,
+      records: projection.records,
+      dataflow_edges: projection.dataflow_edges,
+      artifacts: projection.artifacts as TraceArtifact[],
+      metrics: {
+        spans: projection.metrics.spans,
+        events: projection.metrics.events,
+        records: projection.metrics.records,
+        dataflow_edges: projection.metrics.dataflow_edges,
+        artifacts: projection.metrics.artifacts,
+        token_usage: metrics.token_usage,
+        stream_summary: metrics.stream_summary,
+        trace_health: metrics.trace_health,
       },
     }
   }
@@ -8562,17 +8632,6 @@ class ActiveCaseTrace {
       }))
   }
 
-  private provenanceDataflowEdges(): DataflowEdge[] {
-    return this.causalEdges.map((edge) => ({
-      edge_id: edge.edge_id,
-      from: this.provenanceRef(edge.from),
-      to: this.provenanceRef(edge.to),
-      relation: normalizeRelation(edge.relation),
-      label: this.provenanceLabel(edge.label),
-      metadata: edge.metadata,
-    }))
-  }
-
   summarizeText(input: unknown, label = "text"): TraceFieldSummary {
     const text = textForSummary(input)
     const summary: TraceFieldSummary = {
@@ -9009,25 +9068,6 @@ class ActiveCaseTrace {
     })
   }
 
-  private provenanceRef(ref: TraceRef): TraceRef {
-    const type = ref.type === "final_response_evidence" ? "response_segment" : ref.type
-    const label = ref.label === "final.claim" ? "response.output" : ref.label
-    return {
-      ...ref,
-      type,
-      label,
-    }
-  }
-
-  private provenanceRelation(relation: string): DataflowEdge["relation"] {
-    return normalizeRelation(relation)
-  }
-
-  private provenanceLabel(label: string | undefined) {
-    if (!label) return undefined
-    return label.replace(/final response evidence/gi, "response output").replace(/final claim/gi, "response output")
-  }
-
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact {
     const redacted = redactText(content)
     const contentHash = hash(redacted)
@@ -9144,15 +9184,15 @@ class ActiveCaseTrace {
     } catch {}
   }
 
-  private writePartial(force = false, summary?: ProvenanceTraceSummary) {
+  private writePartial(force = false, summary?: CausalIRTraceSummary) {
     if (!this.writable) return
     const now = Date.now()
     const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
     if (!force && now < this.nextPartialWrite) return
     this.nextPartialWrite = now + interval
-    const provenance = summary ?? this.provenanceSummary("running")
-    this.safeWrite(this.partialFile, jsonPretty(provenance))
-    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
+    const causalIR = summary ?? this.causalIRSummary("running")
+    this.safeWrite(this.partialFile, jsonPretty(causalIR))
+    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(this.projectProvenanceSummary(causalIR)))
   }
 
   private safeWrite(target: string, content: string) {
@@ -9250,8 +9290,8 @@ export namespace CaseTrace {
       return active
     }
     if (active) active.finish({ status: "cancelled", result: { reason: "reconfigured" } })
-    active = new ActiveCaseTrace({ ...input, caseID })
     installProcessFinalizer()
+    active = new ActiveCaseTrace({ ...input, caseID })
     return active || undefined
   }
 

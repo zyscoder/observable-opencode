@@ -1,6 +1,6 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "5.6" as const
+export const TRACE_VERSION = "6.0" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",

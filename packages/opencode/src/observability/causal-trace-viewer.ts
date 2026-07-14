@@ -1,4 +1,4 @@
-import type { ProvenanceTraceSummary, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "./case-trace"
+import type { ProvenanceTraceView, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "./case-trace"
 import { TRACE_VERSION } from "./trace-semantic-contract"
 
 function escapeHtml(input: unknown) {
@@ -342,7 +342,7 @@ function hasSemanticFacts(record: ProvenanceRecord) {
   )
 }
 
-function componentStats(trace: ProvenanceTraceSummary) {
+function componentStats(trace: ProvenanceTraceView) {
   const stats = new Map<string, { records: number; duration: number; tokens: number }>()
   for (const record of trace.records) {
     const key = record.component ?? "unknown"
@@ -355,7 +355,7 @@ function componentStats(trace: ProvenanceTraceSummary) {
   return [...stats.entries()].sort((a, b) => b[1].records - a[1].records)
 }
 
-function renderOverview(trace: ProvenanceTraceSummary) {
+function renderOverview(trace: ProvenanceTraceView) {
   const caseStatus = trace.manifest.case_status ?? trace.manifest.status
   const statusClass = caseStatus === "success" ? "ok" : caseStatus === "running" ? "running" : "bad"
   return `<section id="overview">
@@ -388,7 +388,7 @@ function renderOverview(trace: ProvenanceTraceSummary) {
   </section>`
 }
 
-function renderTraceHealth(trace: ProvenanceTraceSummary) {
+function renderTraceHealth(trace: ProvenanceTraceView) {
   const health = trace.metrics.trace_health
   const compactionFlags = Object.entries(health.compaction_quality_flags ?? {})
   const issueSeverity = health.issues.some((issue) => issue.severity === "error")
@@ -514,7 +514,7 @@ function renderTraceHealth(trace: ProvenanceTraceSummary) {
   </section>`
 }
 
-function renderAgentFlow(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderAgentFlow(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.toSorted((a, b) => a.time_ms - b.time_ms)
   if (!records.length)
     return `<section id="agent-flow"><h2>Agent Flow</h2><div class="empty">No records.</div></section>`
@@ -554,7 +554,7 @@ function renderAgentFlow(trace: ProvenanceTraceSummary, artifacts: Map<string, T
   </section>`
 }
 
-function renderDataflow(trace: ProvenanceTraceSummary) {
+function renderDataflow(trace: ProvenanceTraceView) {
   if (!trace.dataflow_edges.length) return `<div class="empty">No dataflow edges.</div>`
   return `<div class="table-scroll"><table>
     <thead><tr><th>Relation</th><th>From</th><th>To</th><th>Label</th></tr></thead>
@@ -573,7 +573,7 @@ function renderDataflow(trace: ProvenanceTraceSummary) {
   </table></div>`
 }
 
-function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderSemanticPipeline(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const pipelineTypes = new Set([
     "run.start",
     "case.completed",
@@ -649,7 +649,7 @@ function renderSemanticPipeline(trace: ProvenanceTraceSummary, artifacts: Map<st
   </section>`
 }
 
-function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderIoInspector(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter((record) =>
     [
       "prompt.assembly",
@@ -713,7 +713,7 @@ function renderIoInspector(trace: ProvenanceTraceSummary, artifacts: Map<string,
   </section>`
 }
 
-function renderSemanticFacts(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderSemanticFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(hasSemanticFacts)
   if (!records.length)
     return `<section id="semantic-facts"><h2>Semantic Facts</h2><div class="empty">No semantic facts.</div></section>`
@@ -758,7 +758,7 @@ function renderSemanticFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
   </section>`
 }
 
-function renderLlmTurns(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderLlmTurns(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "llm.turn")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -794,7 +794,7 @@ function renderLlmTurns(trace: ProvenanceTraceSummary, artifacts: Map<string, Tr
   </section>`
 }
 
-function renderLifecycle(trace: ProvenanceTraceSummary) {
+function renderLifecycle(trace: ProvenanceTraceView) {
   const records = trace.records
     .filter((record) => record.event_type === "agent.lifecycle" || record.event_type === "exit.gate")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -826,7 +826,7 @@ function renderLifecycle(trace: ProvenanceTraceSummary) {
   </section>`
 }
 
-function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderSubagents(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "subagent.call" || record.data?.agent_role === "subagent")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -879,7 +879,7 @@ function renderSubagents(trace: ProvenanceTraceSummary, artifacts: Map<string, T
   </section>`
 }
 
-function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderEvidenceFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "evidence.semantic_fact" || record.event_type === "evidence.fact")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -931,7 +931,7 @@ function renderEvidenceFacts(trace: ProvenanceTraceSummary, artifacts: Map<strin
   </section>`
 }
 
-function renderExecutionObservations(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderExecutionObservations(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "execution.observation" || record.event_type === "task.plan_state")
     .toSorted((a, b) => a.time_ms - b.time_ms)
@@ -971,7 +971,7 @@ function renderExecutionObservations(trace: ProvenanceTraceSummary, artifacts: M
   </section>`
 }
 
-function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
+function renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
   const assessments = new Map(
     trace.records
       .filter((record) => record.event_type === "claim.support_assessment")
@@ -1055,7 +1055,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceSummary) {
   </section>`
 }
 
-function renderContextAndCompaction(trace: ProvenanceTraceSummary, artifacts: Map<string, TraceArtifact>) {
+function renderContextAndCompaction(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(
     (record) =>
       record.event_type === "context.pack" ||
@@ -1100,7 +1100,7 @@ function renderContextAndCompaction(trace: ProvenanceTraceSummary, artifacts: Ma
   </section>`
 }
 
-function renderArtifacts(trace: ProvenanceTraceSummary) {
+function renderArtifacts(trace: ProvenanceTraceView) {
   if (!trace.artifacts.length) return `<div class="empty">No artifacts.</div>`
   return `<div class="table-scroll"><table>
     <thead><tr><th>Artifact</th><th>Label</th><th>Length</th><th>Occurrences</th><th>Path</th></tr></thead>
@@ -1120,7 +1120,7 @@ function renderArtifacts(trace: ProvenanceTraceSummary) {
   </table></div>`
 }
 
-export function renderProvenanceTraceHtml(trace: ProvenanceTraceSummary) {
+export function renderProvenanceTraceHtml(trace: ProvenanceTraceView) {
   const artifacts = new Map(trace.artifacts.map((artifact) => [artifact.artifact_id, artifact]))
 
   return `<!doctype html>
