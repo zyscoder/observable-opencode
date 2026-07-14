@@ -85,20 +85,38 @@ type CausalIRStoreInput = {
   append?: (entry: CausalIRJournalEntry) => void
 }
 
-function canonicalize(input: unknown): unknown {
-  if (Array.isArray(input)) return input.map(canonicalize)
-  if (!input || typeof input !== "object") return input
+function canonicalJSON(input: unknown, arrayValue = false): string | undefined {
+  if (input === null) return "null"
 
-  return Object.fromEntries(
-    Object.entries(input)
-      .filter(([, value]) => value !== undefined)
-      .sort(([left], [right]) => (left === right ? 0 : left < right ? -1 : 1))
-      .map(([key, value]) => [key, canonicalize(value)]),
-  )
+  switch (typeof input) {
+    case "boolean":
+    case "number":
+    case "string":
+      return JSON.stringify(input)
+    case "undefined":
+    case "function":
+    case "symbol":
+      return arrayValue ? "null" : undefined
+    case "bigint":
+      throw new TypeError("Do not know how to serialize a BigInt")
+  }
+
+  if (Array.isArray(input)) return `[${input.map((item) => canonicalJSON(item, true) ?? "null").join(",")}]`
+
+  const value = input as Record<string, unknown>
+  if (typeof value.toJSON === "function") return canonicalJSON(value.toJSON(), arrayValue)
+
+  return `{${Object.keys(value)
+    .sort((left, right) => (left === right ? 0 : left < right ? -1 : 1))
+    .flatMap((key) => {
+      const serialized = canonicalJSON(value[key])
+      return serialized === undefined ? [] : [`${JSON.stringify(key)}:${serialized}`]
+    })
+    .join(",")}}`
 }
 
 function payloadHash(data: unknown) {
-  const payload = JSON.stringify(canonicalize(data)) ?? "null"
+  const payload = canonicalJSON(data) ?? "null"
   return createHash("sha256").update(payload).digest("hex")
 }
 
@@ -155,6 +173,7 @@ export class CausalIRStore {
 
   replaceNodes(nodes: CausalNodeLike[]): void {
     replaceAll(this.nodes, nodes)
+    this.rebuildPayloadHashes("node", this.nodes, "node_id")
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "nodes.replaced" })
   }
 
@@ -166,6 +185,7 @@ export class CausalIRStore {
 
   replaceEdges(edges: CausalEdgeLike[]): void {
     replaceAll(this.edges, edges)
+    this.rebuildPayloadHashes("edge", this.edges, "edge_id")
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
@@ -209,6 +229,18 @@ export class CausalIRStore {
 
   private appendSnapshot(operation: "case.checkpointed" | "case.finalized", recordType: string, data: unknown) {
     this.append(operation, recordType, this.input.caseID, { snapshot: this.snapshot(), data }, "case")
+  }
+
+  private rebuildPayloadHashes<T extends Record<string, unknown>>(hashType: string, items: T[], idKey: keyof T) {
+    const prefix = `${hashType}:`
+    for (const key of this.payloadHashes.keys()) {
+      if (key.startsWith(prefix)) this.payloadHashes.delete(key)
+    }
+
+    for (const item of items) {
+      const entityID = item[idKey]
+      if (typeof entityID === "string") this.payloadHashes.set(`${hashType}:${entityID}`, payloadHash(item))
+    }
   }
 
   private append(

@@ -35,20 +35,37 @@ describe("causal IR store", () => {
     expect(journal.map((entry: any) => entry.record_type)).toEqual(["node", "node.update"])
   })
 
-  test("replays the complete final snapshot after replacements, reuse, diagnostics, and lifecycle facts", () => {
+  test("replays a node replacement journal prefix without a later lifecycle snapshot", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({
-      runID: "run_complete",
-      caseID: "case_complete",
-      append: (entry) => journal.push(entry),
-    })
+    const store = new CausalIRStore({ runID: "run_nodes", caseID: "case_nodes", append: (entry) => journal.push(entry) })
     store.createNode(node("node_removed"))
     store.createNode(node("node_retained", { chosen_action: "keep" }))
     store.replaceNodes([node("node_replacement", { chosen_action: "replace" })])
+
+    expect(journal.map((entry) => entry.operation)).toEqual(["node.created", "node.created", "case.checkpointed"])
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+    expect(replayCausalIRJournal(journal).nodes.map((item) => item.node_id)).toEqual(["node_replacement"])
+  })
+
+  test("replays an edge replacement journal prefix without a later lifecycle snapshot", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_edges", caseID: "case_edges", append: (entry) => journal.push(entry) })
     store.createEdge(edge("edge_removed"))
     store.createEdge(edge("edge_retained"))
     store.replaceEdges([edge("edge_replacement")])
 
+    expect(journal.map((entry) => entry.operation)).toEqual(["edge.created", "edge.created", "case.checkpointed"])
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+    expect(replayCausalIRJournal(journal).edges.map((item) => item.edge_id)).toEqual(["edge_replacement"])
+  })
+
+  test("replays an artifact reuse journal prefix without a lifecycle snapshot", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_artifact",
+      caseID: "case_artifact",
+      append: (entry) => journal.push(entry),
+    })
     const artifact = store.createArtifact({
       artifact_id: "artifact_1",
       hash: "hash_1",
@@ -59,22 +76,76 @@ describe("causal IR store", () => {
     artifact.occurrences = 2
     artifact.metadata = { source: "reused", reason: "same payload" }
     store.reuseArtifact(artifact)
-    store.createDiagnostic({ diagnostic_id: "diag_1", code: "reused_artifact", detail: { artifact_id: artifact.artifact_id } })
+
+    expect(journal.map((entry) => entry.operation)).toEqual(["artifact.created", "artifact.reused"])
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+    expect(replayCausalIRJournal(journal).artifacts).toEqual([artifact])
+    expect(journal[1]?.record_type).toBe("artifact.reuse")
+  })
+
+  test("replays a checkpoint prefix with the snapshot current at the checkpoint", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_checkpoint",
+      caseID: "case_checkpoint",
+      append: (entry) => journal.push(entry),
+    })
+    const created = store.createNode(node("node_1", { chosen_action: "read" }))
+    created.data = { chosen_action: "checkpointed" }
     store.checkpoint({ phase: "partial" })
+
+    const checkpoints = journal.filter((entry) => entry.operation === "case.checkpointed")
+    expect(checkpoints).toHaveLength(1)
+    expect(replayCausalIRJournal(journal.slice(0, checkpoints[0]!.sequence))).toEqual(store.snapshot())
+  })
+
+  test("replays a finalization prefix with the snapshot current at finalization", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_final", caseID: "case_final", append: (entry) => journal.push(entry) })
+    const created = store.createNode(node("node_1", { chosen_action: "read" }))
+    created.data = { chosen_action: "finalized" }
     store.finalize({ status: "success" })
 
-    const replayed = replayCausalIRJournal(journal)
-    expect(replayed).toEqual(store.snapshot())
-    expect(replayed.runID).toBe("run_complete")
-    expect(replayed.caseID).toBe("case_complete")
-    expect(replayed.nodes.map((item) => item.node_id)).toEqual(["node_replacement"])
-    expect(replayed.edges.map((item) => item.edge_id)).toEqual(["edge_replacement"])
-    expect(replayed.artifacts).toEqual([artifact])
-    expect(replayed.diagnostics).toEqual([{ diagnostic_id: "diag_1", code: "reused_artifact", detail: { artifact_id: "artifact_1" } }])
-    expect(journal.map((entry) => entry.sequence)).toEqual(Array.from({ length: journal.length }, (_, index) => index + 1))
-    expect(journal.every((entry) => entry.run_id === "run_complete" && entry.case_id === "case_complete")).toBe(true)
-    expect(journal.find((entry) => entry.operation === "artifact.reused")?.record_type).toBe("artifact.reuse")
-    expect(journal.filter((entry) => entry.operation === "case.checkpointed").every((entry) => entry.data)).toBe(true)
+    const finalizations = journal.filter((entry) => entry.operation === "case.finalized")
+    expect(finalizations).toHaveLength(1)
+    expect(replayCausalIRJournal(journal.slice(0, finalizations[0]!.sequence))).toEqual(store.snapshot())
+  })
+
+  test("rebuilds node payload hashes from a replacement snapshot and clears removed node hashes", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_node_hash", caseID: "case_node_hash", append: (entry) => journal.push(entry) })
+    store.createNode(node("node_1", { chosen_action: "original" }))
+    const replacement = node("node_1", { chosen_action: "replacement" })
+    store.replaceNodes([replacement])
+    replacement.data = { chosen_action: "updated" }
+    store.updateNode(replacement)
+
+    const expectedReplacementHash = createHash("sha256")
+      .update('{"component":"task","data":{"chosen_action":"replacement"},"kind":"decision","node_id":"node_1","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
+      .digest("hex")
+    expect(journal[2]?.previous_payload_hash).toBe(expectedReplacementHash)
+
+    const deletedJournal: CausalIRJournalEntry[] = []
+    const deletedStore = new CausalIRStore({
+      runID: "run_node_deleted",
+      caseID: "case_node_deleted",
+      append: (entry) => deletedJournal.push(entry),
+    })
+    deletedStore.createNode(node("node_deleted"))
+    deletedStore.replaceNodes([])
+    deletedStore.createNode(node("node_deleted", { chosen_action: "recreated" }))
+
+    expect(deletedJournal[2]?.previous_payload_hash).toBeUndefined()
+  })
+
+  test("clears removed edge payload hashes after replacement", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_edge_hash", caseID: "case_edge_hash", append: (entry) => journal.push(entry) })
+    store.createEdge(edge("edge_deleted"))
+    store.replaceEdges([])
+    store.createEdge(edge("edge_deleted"))
+
+    expect(journal[2]?.previous_payload_hash).toBeUndefined()
   })
 
   test("chains canonical payload hashes using locale-independent lexical key ordering", () => {
@@ -89,6 +160,23 @@ describe("causal IR store", () => {
       .digest("hex")
     expect(journal[0]?.payload_hash).toBe(expectedCreatedHash)
     expect(journal[1]?.previous_payload_hash).toBe(journal[0]?.payload_hash)
+  })
+
+  test("serializes integer-like keys in explicit lexical order for canonical payload hashes", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_integer_keys",
+      caseID: "case_integer_keys",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("node_1", { "2": "two", "10": "ten", a: "letter" }))
+
+    const expectedHash = createHash("sha256")
+      .update(
+        '{"component":"task","data":{"10":"ten","2":"two","a":"letter"},"kind":"decision","node_id":"node_1","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}',
+      )
+      .digest("hex")
+    expect(journal[0]?.payload_hash).toBe(expectedHash)
   })
 
   test("preserves caller references while isolating emitted journal payloads", () => {
