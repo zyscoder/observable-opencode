@@ -1273,8 +1273,8 @@ function sanitizeForJson(
   if (isSensitiveKey(key, path)) return "[REDACTED]"
   if (typeof input === "bigint") return String(input)
   if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
-  if (input instanceof Error) return errorInfo(input)
-  if (input instanceof URL) return input.toString()
+  if (input instanceof Error) return sanitizeForJson(errorInfo(input), key, stack, path)
+  if (input instanceof URL) return redactUrlText(input)
   if (typeof input === "string") return redactText(input)
   if (!input || typeof input !== "object") return input
   if (stack.has(input)) return "[Circular]"
@@ -1414,6 +1414,16 @@ function redactText(input: string) {
   let output = input
   for (const pattern of secretTextPatterns) output = output.replace(pattern, "[REDACTED]")
   return output
+}
+
+function redactUrlText(input: URL) {
+  const output = new URL(input.toString())
+  if (output.username) output.username = "[REDACTED]"
+  if (output.password) output.password = "[REDACTED]"
+  for (const key of new Set(output.searchParams.keys())) {
+    if (normalizeKey(key) === "token" || isSensitiveKey(key)) output.searchParams.set(key, "[REDACTED]")
+  }
+  return redactText(output.toString())
 }
 
 function maxFieldLength() {
@@ -4512,7 +4522,7 @@ class ActiveCaseTrace {
     return this.causalIR.artifacts as TraceArtifact[]
   }
   private artifactByDedupeKey = new Map<string, TraceArtifact>()
-  private semanticFactNodesByKey = new Map<string, CausalNode>()
+  private semanticFactNodeIDsByKey = new Map<string, string>()
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
@@ -6754,7 +6764,8 @@ class ActiveCaseTrace {
     const planItems = recordKind === "task.plan_state" ? planStateSummary(input.data ?? input.summary) : undefined
     const dedupeKey =
       recordKind === "evidence.semantic_fact" ? semanticFactDedupeKey(input, canonical, sourceLocations) : undefined
-    const existing = dedupeKey ? this.semanticFactNodesByKey.get(dedupeKey) : undefined
+    const existingID = dedupeKey ? this.semanticFactNodeIDsByKey.get(dedupeKey) : undefined
+    const existing = existingID ? this.causalNodes.find((node) => node.node_id === existingID) : undefined
     if (existing) {
       const existingData = existing.data ?? {}
       const occurrenceCount = optionalNumber(existingData.occurrence_count) ?? 1
@@ -6784,9 +6795,9 @@ class ActiveCaseTrace {
         duplicate_of: existing.node_id,
         source_refs: sourceRefs,
       })
-      this.causalIR.updateNode(existing)
+      const stored = this.causalIR.updateNode(existing) as CausalNode
       this.writePartial()
-      return existing
+      return stored
     }
     const node = this.node({
       node_id: `evidence_${factID}`,
@@ -6823,7 +6834,7 @@ class ActiveCaseTrace {
       source_locations: sourceLocations,
       metadata: input.metadata,
     })
-    if (dedupeKey) this.semanticFactNodesByKey.set(dedupeKey, node)
+    if (dedupeKey) this.semanticFactNodeIDsByKey.set(dedupeKey, node.node_id)
     if (recordKind === "evidence.semantic_fact") this.remember(this.recentEvidenceNodeIDs, node.node_id)
     for (const ref of sourceRefs ?? []) {
       const parsed = this.parseSourceRef(ref)
@@ -6887,13 +6898,13 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
-    this.causalIR.createNode(node)
-    if (node.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, node.node_id)
-    if (node.kind === "context.pack" || node.kind === "context.transform")
-      this.remember(this.recentContextNodeIDs, node.node_id)
-    if (node.kind === "llm.call") this.remember(this.recentLLMNodeIDs, node.node_id)
+    const stored = this.causalIR.createNode(node) as CausalNode
+    if (stored.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, stored.node_id)
+    if (stored.kind === "context.pack" || stored.kind === "context.transform")
+      this.remember(this.recentContextNodeIDs, stored.node_id)
+    if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
     this.writePartial()
-    return node
+    return stored
   }
 
   causalEdge(input: CausalEdgeInput) {

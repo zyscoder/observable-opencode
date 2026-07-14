@@ -3333,6 +3333,69 @@ describe("case trace", () => {
     expect(assessment.data.tool_result_dependency_refs).toContain("tool_result:call_read")
   })
 
+  test("preserves tool-result backfill when a semantic fact is duplicated", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-store-owned-semantic-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "store-owned-semantic.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "confirm pricing owner" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "read", input: { callID: "call_owner", args: { filePath: "src/pricing.mjs" } } })`,
+        `const data = { subject: "renewalQuote", predicate: "owner", value: "billing-platform", path: "src/pricing.mjs", line_start: 7, line_end: 7, output: "renewalQuote owner is billing-platform" }`,
+        `CaseTrace.evidenceFact({ source: "read", category: "repo_fact", summary: "pricing owner", data, source_refs: span ? ["span:" + span.id] : [] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", span_id: span?.id, data: { tool: "read", callID: "call_owner", args: { filePath: "src/pricing.mjs" }, output: data.output } })`,
+        `CaseTrace.evidenceFact({ source: "read", category: "repo_fact", summary: "pricing owner", data, source_refs: ["context:duplicate_semantic_fact"] })`,
+        `span?.end({ output: { output: data.output } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "store-owned-semantic-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "store-owned-semantic-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const journal = (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const causalJournal = journal.filter((entry: any) => entry.operation)
+    const fact = trace.nodes.find((node: any) => node.kind === "evidence.semantic_fact")
+    const factUpdates = causalJournal.filter(
+      (entry: any) => entry.operation === "node.updated" && entry.entity_id === fact.node_id,
+    )
+    const latestFact = factUpdates.at(-1)?.data
+
+    expect(fact.data.occurrence_count).toBe(2)
+    expect(fact.source_refs).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^span:/),
+        "tool_result:call_owner",
+        "context:duplicate_semantic_fact",
+      ]),
+    )
+    expect(fact.data.tool_outcome_refs).toContain("tool_result:call_owner")
+    expect(latestFact.source_refs).toEqual(expect.arrayContaining(fact.source_refs))
+    expect(latestFact.data.tool_outcome_refs).toContain("tool_result:call_owner")
+    assertCausalIRJournalAudit(causalJournal)
+    expect(replayCausalIRJournal(causalJournal).nodes).toEqual(trace.nodes)
+  })
+
   test("keeps candidate tool outcomes out of claim dependency refs when they do not match", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v55-focused-tool-result-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -4773,7 +4836,7 @@ describe("case trace", () => {
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
   })
 
-  test("hashes the sanitized trace-owned copy without mutating execution inputs", async () => {
+  test("redacts special-object secrets from every output without mutating execution inputs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sensitive-journal-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "sensitive-journal-trace.ts")
@@ -4783,23 +4846,33 @@ describe("case trace", () => {
       password: "sensitive-password-value",
       token: "sensitive-environment-token",
       accessToken: "sensitive-access-token",
+      errorText: "sk-error-message-secret",
+      urlPassword: "url-password-plain-secret",
+      urlQuery: "url-query-plain-secret",
     }
 
     await fs.writeFile(
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `const environment = ${JSON.stringify(secrets)}`,
-        `const toolInput = { command: "inspect", environment, token_usage: { input: 11, output: 7, total: 18 } }`,
-        `const toolOutput = { result: "ok", environment, tokens: 18 }`,
-        `CaseTrace.configure({ input: { task: "audit sensitive journal" }, environment })`,
+        `const secrets = ${JSON.stringify(secrets)}`,
+        `const error = new Error("request failed with " + secrets.errorText)`,
+        `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
+        `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
+        `const agentInput = { role: "build", error, endpoint }`,
+        `const modelInput = { messages: ["inspect"], error, endpoint }`,
+        `const toolInput = { command: "inspect", environment, error, endpoint, token_usage: { input: 11, output: 7, total: 18 } }`,
+        `const toolOutput = { result: "ok", environment, error, endpoint, tokens: 18 }`,
+        `CaseTrace.configure({ input: { task: "audit sensitive journal", agentInput, modelInput }, environment })`,
+        `const modelSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "generate", name: "audit-model", input: modelInput })`,
+        `modelSpan?.end({ output: modelInput })`,
         `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "inspect", input: toolInput, metadata: { environment } })`,
         `span?.end({ output: toolOutput, metadata: { environment } })`,
         `const repeated = "shared sensitive audit payload:" + "x".repeat(6000)`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
         `CaseTrace.finish({ status: "success", result: { environment } })`,
-        `process.stdout.write(JSON.stringify({ environment, toolInput, toolOutput }))`,
+        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString() }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
       ].join("\n"),
     )
 
@@ -4820,9 +4893,25 @@ describe("case trace", () => {
     expect(await new Response(proc.stderr).text()).toBe("")
 
     const originals = JSON.parse(await new Response(proc.stdout).text())
-    expect(originals.environment).toEqual(secrets)
-    expect(originals.toolInput.environment).toEqual(secrets)
-    expect(originals.toolOutput.environment).toEqual(secrets)
+    const originalError = `request failed with ${secrets.errorText}`
+    const originalEndpoint = `https://reader:${secrets.urlPassword}@example.com/audit?api_key=${secrets.urlQuery}&visible=ok`
+    expect(originals.environment).toEqual({
+      apiKey: secrets.apiKey,
+      password: secrets.password,
+      token: secrets.token,
+      accessToken: secrets.accessToken,
+      error: originalError,
+      endpoint: originalEndpoint,
+    })
+    expect(originals.agentInput).toEqual({ role: "build", error: originalError, endpoint: originalEndpoint })
+    expect(originals.modelInput).toEqual({ messages: ["inspect"], error: originalError, endpoint: originalEndpoint })
+    expect(originals.toolInput).toEqual({
+      command: "inspect",
+      error: originalError,
+      endpoint: originalEndpoint,
+      token_usage: { input: 11, output: 7, total: 18 },
+    })
+    expect(originals.toolOutput).toEqual({ result: "ok", error: originalError, endpoint: originalEndpoint, tokens: 18 })
     expect(originals.toolInput.token_usage).toEqual({ input: 11, output: 7, total: 18 })
     expect(originals.toolOutput.tokens).toBe(18)
 
