@@ -35,12 +35,19 @@ export type ArtifactLike = {
   [key: string]: unknown
 }
 
+export type CausalIRDiagnosticLike = {
+  diagnostic_id: string
+  [key: string]: unknown
+}
+
 export type CausalIRNodeInput = CausalNodeLike
 export type CausalIREdgeInput = CausalEdgeLike
 
 export type CausalIRJournalEntry = {
   sequence: number
   time: string
+  run_id: string
+  case_id: string
   operation:
     | "node.created"
     | "node.updated"
@@ -64,6 +71,12 @@ export type CausalIRStoreSnapshot = {
   nodes: CausalNodeLike[]
   edges: CausalEdgeLike[]
   artifacts: ArtifactLike[]
+  diagnostics: CausalIRDiagnosticLike[]
+}
+
+type CausalIRLifecycleJournalData = {
+  snapshot: CausalIRStoreSnapshot
+  data: unknown
 }
 
 type CausalIRStoreInput = {
@@ -79,7 +92,7 @@ function canonicalize(input: unknown): unknown {
   return Object.fromEntries(
     Object.entries(input)
       .filter(([, value]) => value !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => (left === right ? 0 : left < right ? -1 : 1))
       .map(([key, value]) => [key, canonicalize(value)]),
   )
 }
@@ -89,7 +102,7 @@ function payloadHash(data: unknown) {
   return createHash("sha256").update(payload).digest("hex")
 }
 
-function journalData(data: unknown) {
+function journalData<T>(data: T): T {
   return structuredClone(data)
 }
 
@@ -99,10 +112,29 @@ function replaceByID<T extends Record<string, unknown>>(items: T[], idKey: keyof
   else items[index] = item
 }
 
+function replaceAll<T>(target: T[], items: T[]) {
+  target.splice(0, target.length, ...items)
+}
+
+function isLifecycleJournalData(input: unknown): input is CausalIRLifecycleJournalData {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false
+  const data = input as Partial<CausalIRLifecycleJournalData>
+  const snapshot = data.snapshot
+  return (
+    !!snapshot &&
+    typeof snapshot === "object" &&
+    Array.isArray(snapshot.nodes) &&
+    Array.isArray(snapshot.edges) &&
+    Array.isArray(snapshot.artifacts) &&
+    Array.isArray(snapshot.diagnostics)
+  )
+}
+
 export class CausalIRStore {
   readonly nodes: CausalNodeLike[] = []
   readonly edges: CausalEdgeLike[] = []
   readonly artifacts: ArtifactLike[] = []
+  readonly diagnostics: CausalIRDiagnosticLike[] = []
 
   private sequence = 0
   private readonly payloadHashes = new Map<string, string>()
@@ -117,12 +149,13 @@ export class CausalIRStore {
 
   updateNode<T extends CausalNodeLike>(node: T): T {
     replaceByID(this.nodes, "node_id", node)
-    this.append("node.updated", "node", node.node_id, node)
+    this.append("node.updated", "node.update", node.node_id, node, "node")
     return node
   }
 
   replaceNodes(nodes: CausalNodeLike[]): void {
-    this.nodes.splice(0, this.nodes.length, ...nodes)
+    replaceAll(this.nodes, nodes)
+    this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "nodes.replaced" })
   }
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
@@ -132,7 +165,8 @@ export class CausalIRStore {
   }
 
   replaceEdges(edges: CausalEdgeLike[]): void {
-    this.edges.splice(0, this.edges.length, ...edges)
+    replaceAll(this.edges, edges)
+    this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
   createArtifact<T extends ArtifactLike>(artifact: T): T {
@@ -142,16 +176,23 @@ export class CausalIRStore {
   }
 
   reuseArtifact<T extends ArtifactLike>(artifact: T): T {
-    this.append("artifact.reused", "artifact", artifact.artifact_id, artifact)
+    replaceByID(this.artifacts, "artifact_id", artifact)
+    this.append("artifact.reused", "artifact.reuse", artifact.artifact_id, artifact, "artifact")
     return artifact
   }
 
+  createDiagnostic<T extends CausalIRDiagnosticLike>(diagnostic: T): T {
+    replaceByID(this.diagnostics, "diagnostic_id", diagnostic)
+    this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
+    return diagnostic
+  }
+
   checkpoint(data: unknown): void {
-    this.append("case.checkpointed", "case", this.input.caseID, data)
+    this.appendSnapshot("case.checkpointed", "checkpoint", data)
   }
 
   finalize(data: unknown): void {
-    this.append("case.finalized", "case", this.input.caseID, data)
+    this.appendSnapshot("case.finalized", "finish", data)
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -162,7 +203,12 @@ export class CausalIRStore {
       nodes: this.nodes,
       edges: this.edges,
       artifacts: this.artifacts,
+      diagnostics: this.diagnostics,
     }
+  }
+
+  private appendSnapshot(operation: "case.checkpointed" | "case.finalized", recordType: string, data: unknown) {
+    this.append(operation, recordType, this.input.caseID, { snapshot: this.snapshot(), data }, "case")
   }
 
   private append(
@@ -170,12 +216,15 @@ export class CausalIRStore {
     recordType: string,
     entityID: string | undefined,
     data: unknown,
+    hashType = recordType,
   ) {
     const payloadHashValue = payloadHash(data)
-    const hashKey = entityID ? `${recordType}:${entityID}` : undefined
+    const hashKey = entityID ? `${hashType}:${entityID}` : undefined
     const entry: CausalIRJournalEntry = {
       sequence: ++this.sequence,
       time: new Date().toISOString(),
+      run_id: this.input.runID,
+      case_id: this.input.caseID,
       operation,
       record_type: recordType,
       entity_id: entityID,
@@ -193,33 +242,54 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
   const nodes: CausalNodeLike[] = []
   const edges: CausalEdgeLike[] = []
   const artifacts: ArtifactLike[] = []
+  const diagnostics: CausalIRDiagnosticLike[] = []
+  let runID = ""
+  let caseID = ""
 
   for (const item of journal) {
     if (!item || typeof item !== "object") continue
     const entry = item as Partial<CausalIRJournalEntry>
-    if (!entry.data || typeof entry.data !== "object") continue
+    if (typeof entry.run_id === "string") runID = entry.run_id
+    if (typeof entry.case_id === "string") caseID = entry.case_id
 
-    if (entry.operation === "node.created" || entry.operation === "node.updated") {
+    if ((entry.operation === "node.created" || entry.operation === "node.updated") && entry.data && typeof entry.data === "object") {
       replaceByID(nodes, "node_id", entry.data as CausalNodeLike)
       continue
     }
 
-    if (entry.operation === "edge.created") {
+    if (entry.operation === "edge.created" && entry.data && typeof entry.data === "object") {
       replaceByID(edges, "edge_id", entry.data as CausalEdgeLike)
       continue
     }
 
-    if (entry.operation === "artifact.created") {
+    if ((entry.operation === "artifact.created" || entry.operation === "artifact.reused") && entry.data && typeof entry.data === "object") {
       replaceByID(artifacts, "artifact_id", entry.data as ArtifactLike)
+      continue
+    }
+
+    if (entry.operation === "diagnostic.created" && entry.data && typeof entry.data === "object") {
+      replaceByID(diagnostics, "diagnostic_id", entry.data as CausalIRDiagnosticLike)
+      continue
+    }
+
+    if ((entry.operation === "case.checkpointed" || entry.operation === "case.finalized") && isLifecycleJournalData(entry.data)) {
+      const snapshot = entry.data.snapshot
+      if (typeof snapshot.runID === "string") runID = snapshot.runID
+      if (typeof snapshot.caseID === "string") caseID = snapshot.caseID
+      replaceAll(nodes, journalData(snapshot.nodes))
+      replaceAll(edges, journalData(snapshot.edges))
+      replaceAll(artifacts, journalData(snapshot.artifacts))
+      replaceAll(diagnostics, journalData(snapshot.diagnostics))
     }
   }
 
   return {
     version: CAUSAL_IR_VERSION,
-    runID: "",
-    caseID: "",
+    runID,
+    caseID,
     nodes,
     edges,
     artifacts,
+    diagnostics,
   }
 }
