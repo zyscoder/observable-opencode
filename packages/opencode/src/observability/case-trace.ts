@@ -2,7 +2,15 @@ import crypto from "crypto"
 import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
-import { CausalIRStore, type CausalIRJournalEntry } from "./causal-ir"
+import {
+  CausalIRStore,
+  type ArtifactLike,
+  type CausalEdgeLike,
+  type CausalIRDiagnosticLike,
+  type CausalIRJournalEntry,
+  type CausalIRStoreSnapshot,
+  type CausalNodeLike,
+} from "./causal-ir"
 import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
 import {
   TRACE_VERSION,
@@ -1256,8 +1264,13 @@ function defaultTraceDir() {
   return process.env.OPENCODE_CASE_TRACE_DIR || path.join(Global.Path.data, "case-traces")
 }
 
-function sanitizeForJson(input: unknown, key = "", stack = new WeakSet<object>()): unknown {
-  if (isSensitiveKey(key)) return "[REDACTED]"
+function sanitizeForJson(
+  input: unknown,
+  key = "",
+  stack = new WeakSet<object>(),
+  path: readonly string[] = [],
+): unknown {
+  if (isSensitiveKey(key, path)) return "[REDACTED]"
   if (typeof input === "bigint") return String(input)
   if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
   if (input instanceof Error) return errorInfo(input)
@@ -1267,10 +1280,11 @@ function sanitizeForJson(input: unknown, key = "", stack = new WeakSet<object>()
   if (stack.has(input)) return "[Circular]"
   stack.add(input)
   try {
-    if (Array.isArray(input)) return input.map((item, index) => sanitizeForJson(item, String(index), stack))
+    if (Array.isArray(input))
+      return input.map((item, index) => sanitizeForJson(item, String(index), stack, [...path, String(index)]))
     const output: Record<string, unknown> = {}
     for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) {
-      output[childKey] = sanitizeForJson(value, childKey, stack)
+      output[childKey] = sanitizeForJson(value, childKey, stack, [...path, childKey])
     }
     return output
   } finally {
@@ -1278,8 +1292,9 @@ function sanitizeForJson(input: unknown, key = "", stack = new WeakSet<object>()
   }
 }
 
-function json(input: unknown) {
-  return JSON.stringify(sanitizeForJson(input), undefined, 0)
+function json(input: unknown, label?: string) {
+  const path = label?.split(".").filter(Boolean) ?? []
+  return JSON.stringify(sanitizeForJson(input, path.at(-1) ?? "", new WeakSet<object>(), path), undefined, 0)
 }
 
 function normalizeKey(input: string) {
@@ -1290,10 +1305,11 @@ function normalizeKey(input: string) {
     .replace(/^_+|_+$/g, "")
 }
 
-function isSensitiveKey(input: string) {
+function isSensitiveKey(input: string, path: readonly string[] = []) {
   if (!input) return false
   const key = normalizeKey(input)
   if (!key) return false
+  if (key === "token" && path.slice(0, -1).some((segment) => normalizeKey(segment) === "environment")) return true
   const safeMetricKeys = new Set([
     "token",
     "tokens",
@@ -1316,6 +1332,78 @@ function isSensitiveKey(input: string) {
   if (/(^|_)api_key($|_)/.test(key)) return true
   if (/(^|_)(access_token|refresh_token|auth_token|id_token)($|_)/.test(key)) return true
   return false
+}
+
+class TraceOwnedCausalIRStore {
+  private readonly store: CausalIRStore
+
+  constructor(input: { runID: string; caseID: string; append?: (entry: CausalIRJournalEntry) => void }) {
+    this.store = new CausalIRStore(input)
+  }
+
+  get nodes() {
+    return this.store.nodes
+  }
+
+  get edges() {
+    return this.store.edges
+  }
+
+  get artifacts() {
+    return this.store.artifacts
+  }
+
+  get diagnostics() {
+    return this.store.diagnostics
+  }
+
+  createNode<T extends CausalNodeLike>(node: T): T {
+    return this.store.createNode(this.copy(node))
+  }
+
+  updateNode<T extends CausalNodeLike>(node: T): T {
+    return this.store.updateNode(this.copy(node))
+  }
+
+  replaceNodes(nodes: CausalNodeLike[]): void {
+    this.store.replaceNodes(this.copy(nodes))
+  }
+
+  createEdge<T extends CausalEdgeLike>(edge: T): T {
+    return this.store.createEdge(this.copy(edge))
+  }
+
+  replaceEdges(edges: CausalEdgeLike[]): void {
+    this.store.replaceEdges(this.copy(edges))
+  }
+
+  createArtifact<T extends ArtifactLike>(artifact: T): T {
+    return this.store.createArtifact(this.copy(artifact))
+  }
+
+  reuseArtifact<T extends ArtifactLike>(artifact: T): T {
+    return this.store.reuseArtifact(this.copy(artifact))
+  }
+
+  createDiagnostic<T extends CausalIRDiagnosticLike>(diagnostic: T): T {
+    return this.store.createDiagnostic(this.copy(diagnostic))
+  }
+
+  checkpoint(data: unknown): void {
+    this.store.checkpoint(this.copy(data))
+  }
+
+  finalize(data: unknown): void {
+    this.store.finalize(this.copy(data))
+  }
+
+  snapshot(): CausalIRStoreSnapshot {
+    return this.store.snapshot()
+  }
+
+  private copy<T>(input: T): T {
+    return sanitizeForJson(input) as T
+  }
 }
 
 function hash(input: string) {
@@ -4413,7 +4501,7 @@ class ActiveCaseTrace {
   private spans = new Map<string, TraceSpan>()
   private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
-  private readonly causalIR: CausalIRStore
+  private readonly causalIR: TraceOwnedCausalIRStore
   private get causalNodes() {
     return this.causalIR.nodes as CausalNode[]
   }
@@ -4477,7 +4565,7 @@ class ActiveCaseTrace {
       pid: process.pid,
       ...config.environment,
     }
-    this.causalIR = new CausalIRStore({
+    this.causalIR = new TraceOwnedCausalIRStore({
       runID: this.runID,
       caseID: this.caseID,
       append: (entry) => this.writeCausalIRRecord(entry),
@@ -8481,7 +8569,7 @@ class ActiveCaseTrace {
 
   summarizeJson(input: unknown, label = "json", forceArtifact = false): TraceFieldSummary {
     if (input === null || typeof input !== "object") return summarizeScalar(input)
-    const serialized = json(input)
+    const serialized = json(input, label)
     const summary: TraceFieldSummary = {
       type: Array.isArray(input) ? "array" : "object",
       length: serialized.length,
@@ -8524,7 +8612,7 @@ class ActiveCaseTrace {
     }
     if (typeof input === "number" || typeof input === "boolean") return input
     if (Array.isArray(input)) {
-      const serialized = json(input)
+      const serialized = json(input, label)
       if (serialized.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
@@ -8538,7 +8626,7 @@ class ActiveCaseTrace {
       return input.map((item, index) => this.summarizeCausalValue(item, `${label}.${index}`))
     }
     if (typeof input === "object") {
-      const serialized = json(input)
+      const serialized = json(input, label)
       if (serialized.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
@@ -9028,7 +9116,7 @@ class ActiveCaseTrace {
   private writeCausalIRRecord(entry: CausalIRJournalEntry) {
     if (!this.writable) return
     try {
-      fs.appendFileSync(this.recordsFile, json(entry) + "\n")
+      fs.appendFileSync(this.recordsFile, JSON.stringify(entry) + "\n")
     } catch {}
   }
 

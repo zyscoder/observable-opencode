@@ -4773,6 +4773,109 @@ describe("case trace", () => {
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
   })
 
+  test("hashes the sanitized trace-owned copy without mutating execution inputs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sensitive-journal-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "sensitive-journal-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const secrets = {
+      apiKey: "sk-sensitive-api-key",
+      password: "sensitive-password-value",
+      token: "sensitive-environment-token",
+      accessToken: "sensitive-access-token",
+    }
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const environment = ${JSON.stringify(secrets)}`,
+        `const toolInput = { command: "inspect", environment, token_usage: { input: 11, output: 7, total: 18 } }`,
+        `const toolOutput = { result: "ok", environment, tokens: 18 }`,
+        `CaseTrace.configure({ input: { task: "audit sensitive journal" }, environment })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "inspect", input: toolInput, metadata: { environment } })`,
+        `span?.end({ output: toolOutput, metadata: { environment } })`,
+        `const repeated = "shared sensitive audit payload:" + "x".repeat(6000)`,
+        `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
+        `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
+        `CaseTrace.finish({ status: "success", result: { environment } })`,
+        `process.stdout.write(JSON.stringify({ environment, toolInput, toolOutput }))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "sensitive-journal-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const originals = JSON.parse(await new Response(proc.stdout).text())
+    expect(originals.environment).toEqual(secrets)
+    expect(originals.toolInput.environment).toEqual(secrets)
+    expect(originals.toolOutput.environment).toEqual(secrets)
+    expect(originals.toolInput.token_usage).toEqual({ input: 11, output: 7, total: 18 })
+    expect(originals.toolOutput.tokens).toBe(18)
+
+    const caseDir = path.join(dir, "sensitive-journal-case")
+    const recordsText = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const journal = recordsText
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const artifactDir = path.join(caseDir, "artifacts", "sha256")
+    const artifactFiles = await fs.readdir(artifactDir)
+    const persistedText = await Promise.all(
+      [
+        "events.jsonl",
+        "raw-events.jsonl",
+        "records.jsonl",
+        "trace.json",
+        "legacy-trace.json",
+        "provenance-trace.json",
+        "partial/latest.json",
+        "manifest.json",
+        "trace.html",
+      ]
+        .map((file) => path.join(caseDir, file))
+        .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
+        .map((file) => fs.readFile(file, "utf8")),
+    )
+
+    expect(journal.map((entry: any) => entry.operation)).toEqual(
+      expect.arrayContaining([
+        "node.created",
+        "node.updated",
+        "artifact.created",
+        "artifact.reused",
+        "case.finalized",
+      ]),
+    )
+    assertCausalIRJournalAudit(journal)
+    const replayed = replayCausalIRJournal(journal)
+    expect(replayed.nodes).toEqual(trace.nodes)
+    expect(replayed.edges).toEqual(trace.edges)
+    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expect(replayed.diagnostics).toEqual(trace.diagnostics)
+    for (const secret of Object.values(secrets)) {
+      expect(persistedText.every((text) => !text.includes(secret))).toBe(true)
+    }
+    expect(recordsText).toContain('"apiKey":"[REDACTED]"')
+    expect(recordsText).toContain('"password":"[REDACTED]"')
+    expect(recordsText).toContain('"token":"[REDACTED]"')
+    expect(recordsText).toContain('"accessToken":"[REDACTED]"')
+  })
+
   test("updates and removes current formal diagnostics without duplicate journal facts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-diagnostic-reconcile-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
