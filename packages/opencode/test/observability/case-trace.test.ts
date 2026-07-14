@@ -25,6 +25,59 @@ async function waitForExists(file: string, timeoutMs = 2000) {
   return exists(file)
 }
 
+function assertFinalCancelledPartialMatchesTrace(partial: any, trace: any) {
+  expect(Object.keys(partial).sort()).toEqual([
+    "artifacts",
+    "causal_ir_version",
+    "compatibility",
+    "dataflow_edges",
+    "diagnostics",
+    "edges",
+    "manifest",
+    "metrics",
+    "nodes",
+    "records",
+    "trace_version",
+  ])
+  expect(partial.trace_version).toBe("6.0")
+  expect(partial.causal_ir_version).toBe("1.0")
+  expect(partial.nodes).toEqual(trace.nodes)
+  expect(partial.edges).toEqual(trace.edges)
+  expect(partial.records).toEqual(trace.records)
+  expect(partial.dataflow_edges).toEqual(trace.dataflow_edges)
+  expect(partial.artifacts).toEqual(trace.artifacts)
+  expect(partial.diagnostics).toEqual(trace.diagnostics)
+  expect(partial.compatibility).toEqual(trace.compatibility)
+  expect(partial.metrics).toEqual(trace.metrics)
+  expect(partial.manifest).toEqual(trace.manifest)
+  expect(partial.metrics.records).toBe(partial.nodes.length)
+  expect(partial.metrics.dataflow_edges).toBe(partial.edges.length)
+  expect(partial.metrics.artifacts).toBe(partial.artifacts.length)
+  expect(partial.manifest.status).toBe("cancelled")
+  expect(partial.manifest.server_status).toBe("cancelled")
+  expect(partial.manifest.process_status).toBe("cancelled")
+  expect(partial.manifest.case_status).toBe("cancelled")
+
+  const lifecycle = partial.records.find((record: any) => record.event_type === "agent.lifecycle")
+  const caseRecord = partial.records.find((record: any) => record.event_type === "case.failed")
+
+  expect(lifecycle).toMatchObject({
+    status: "cancelled",
+    data: {
+      finalized_status: "finalized_without_close",
+      finalized_reason: "trace_cancelled",
+    },
+  })
+  expect(caseRecord).toMatchObject({
+    status: "cancelled",
+    data: {
+      case_status: "cancelled",
+      server_status: "cancelled",
+      process_status: "cancelled",
+    },
+  })
+}
+
 function changeIdFromTrace(trace: any) {
   const record = trace.records.find((item: any) => item.event_type === "change")
   return record?.data?.change_id ?? record?.record_id
@@ -227,17 +280,31 @@ describe("case trace", () => {
     expect(trace.causal_ir_version).toBe("1.0")
     expect(trace.nodes.length).toBe(trace.metrics.records)
     expect(trace.edges.length).toBe(trace.metrics.dataflow_edges)
+    expect(trace.artifacts.length).toBe(trace.metrics.artifacts)
     expect(trace.nodes.map((node: any) => node.node_id)).toEqual(
       trace.records.map((record: any) => record.record_id),
     )
+    expect(trace.records).toEqual(provenance.records)
+    expect(trace.dataflow_edges).toEqual(provenance.dataflow_edges)
     expect(trace.artifacts).toEqual(provenance.artifacts)
     expect(trace.compatibility.provenance_projection).toBe("provenance-trace.json")
+    expect(Object.keys(provenance).sort()).toEqual([
+      "artifacts",
+      "dataflow_edges",
+      "manifest",
+      "metrics",
+      "records",
+      "trace_version",
+    ])
     expect(provenance.trace_version).toBe("6.0")
     expect(provenance.causal_ir_version).toBeUndefined()
     expect(provenance.nodes).toBeUndefined()
     expect(provenance.edges).toBeUndefined()
     expect(provenance.diagnostics).toBeUndefined()
     expect(provenance.compatibility).toBeUndefined()
+    expect(provenance.metrics.records).toBe(provenance.records.length)
+    expect(provenance.metrics.dataflow_edges).toBe(provenance.dataflow_edges.length)
+    expect(provenance.metrics.artifacts).toBe(provenance.artifacts.length)
     expect(partial.trace_version).toBe("6.0")
     expect(partial.causal_ir_version).toBe("1.0")
     expect(partial.nodes).toEqual(trace.nodes)
@@ -2419,7 +2486,7 @@ describe("case trace", () => {
     expect(samePayloadArtifacts[0].path).toMatch(/^artifacts\/sha256\//)
   })
 
-  test("finalizes trace semantic contract v4 bundle when a traced process receives SIGINT", async () => {
+  test("finalizes canonical partial and trace when a traced process receives SIGINT", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-sigint-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-sigint.ts")
@@ -2430,6 +2497,7 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "long running" } })`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_sigint", message_id: "msg_sigint", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGINT arrives" })`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -2459,10 +2527,13 @@ describe("case trace", () => {
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
     const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
 
     expect(manifest.status).toBe("cancelled")
     expect(manifest.result.reason).toBe("SIGINT")
     expect(provenance.manifest.status).toBe("cancelled")
+    assertFinalCancelledPartialMatchesTrace(partial, trace)
   })
 
   test("records observation and compaction facts for offline provenance analysis", async () => {
@@ -3078,7 +3149,7 @@ describe("case trace", () => {
     expect(trace.records.some((record: any) => record.event_type === "case.completed")).toBe(false)
   })
 
-  test("flushes trace.html from current trace state when the process receives SIGTERM", async () => {
+  test("finalizes canonical partial and trace when a process receives SIGTERM", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v58-signal-flush-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "signal-flush-v58.ts")
@@ -3120,6 +3191,7 @@ describe("case trace", () => {
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const caseRecord = trace.records.find((record: any) => record.event_type === "case.failed")
 
@@ -3130,6 +3202,7 @@ describe("case trace", () => {
     expect(trace.records.some((record: any) => record.event_type === "evidence.semantic_fact")).toBe(true)
     expect(html).toContain("case cancelled")
     expect(html).toContain("observed pricing file before signal")
+    assertFinalCancelledPartialMatchesTrace(partial, trace)
   })
 
   test("promotes an inferred final response when the exit gate confirms completion before shutdown", async () => {
