@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
+import * as CausalIRModule from "@/observability/causal-ir"
 import {
   CausalIRStore,
   projectProvenanceTrace,
@@ -37,6 +38,42 @@ function relationEdge(edgeID: string, relation: string) {
     to: { type: "node", id: `${edgeID}_to` },
     relation,
   }
+}
+
+function canonicalJSONForAudit(input: unknown, arrayValue = false): string | undefined {
+  if (input === null) return "null"
+  switch (typeof input) {
+    case "boolean":
+    case "number":
+    case "string":
+      return JSON.stringify(input)
+    case "undefined":
+    case "function":
+    case "symbol":
+      return arrayValue ? "null" : undefined
+    case "bigint":
+      throw new TypeError("Do not know how to serialize a BigInt")
+  }
+  if (Array.isArray(input)) {
+    const values: string[] = []
+    for (let index = 0; index < input.length; index++) values.push(canonicalJSONForAudit(input[index], true) ?? "null")
+    return `[${values.join(",")}]`
+  }
+  const value = input as Record<string, unknown>
+  if (typeof value.toJSON === "function") return canonicalJSONForAudit(value.toJSON(), arrayValue)
+  return `{${Object.keys(value)
+    .sort((left, right) => (left === right ? 0 : left < right ? -1 : 1))
+    .flatMap((key) => {
+      const serialized = canonicalJSONForAudit(value[key])
+      return serialized === undefined ? [] : [`${JSON.stringify(key)}:${serialized}`]
+    })
+    .join(",")}}`
+}
+
+function payloadHashForAudit(input: unknown) {
+  return createHash("sha256")
+    .update(canonicalJSONForAudit(input) ?? "null")
+    .digest("hex")
 }
 
 describe("causal IR store", () => {
@@ -163,9 +200,7 @@ describe("causal IR store", () => {
     replacement.data = { chosen_action: "updated" }
     store.updateNode(replacement)
 
-    const expectedReplacementHash = createHash("sha256")
-      .update('{"component":"task","data":{"chosen_action":"replacement"},"kind":"decision","node_id":"node_1","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
-      .digest("hex")
+    const expectedReplacementHash = payloadHashForAudit((journal[1]?.data as any).snapshot.nodes[0])
     expect(journal[2]?.previous_payload_hash).toBe(expectedReplacementHash)
 
     const deletedJournal: CausalIRJournalEntry[] = []
@@ -198,9 +233,9 @@ describe("causal IR store", () => {
     created.data = { "ä": 2, a: 1, z: 3 }
     store.updateNode(created)
 
-    const expectedCreatedHash = createHash("sha256")
-      .update('{"component":"task","data":{"a":1,"z":0,"ä":2},"kind":"decision","node_id":"node_1","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
-      .digest("hex")
+    const canonicalCreated = canonicalJSONForAudit(journal[0]?.data)
+    const expectedCreatedHash = payloadHashForAudit(journal[0]?.data)
+    expect(canonicalCreated).toContain('"payload":{"a":1,"z":0,"ä":2}')
     expect(journal[0]?.payload_hash).toBe(expectedCreatedHash)
     expect(journal[1]?.previous_payload_hash).toBe(journal[0]?.payload_hash)
   })
@@ -214,11 +249,9 @@ describe("causal IR store", () => {
     })
     store.createNode(node("node_1", { "2": "two", "10": "ten", a: "letter" }))
 
-    const expectedHash = createHash("sha256")
-      .update(
-        '{"component":"task","data":{"10":"ten","2":"two","a":"letter"},"kind":"decision","node_id":"node_1","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}',
-      )
-      .digest("hex")
+    const canonicalCreated = canonicalJSONForAudit(journal[0]?.data)
+    const expectedHash = payloadHashForAudit(journal[0]?.data)
+    expect(canonicalCreated).toContain('"payload":{"10":"ten","2":"two","a":"letter"}')
     expect(journal[0]?.payload_hash).toBe(expectedHash)
   })
 
@@ -229,14 +262,12 @@ describe("causal IR store", () => {
     store.createNode(node("hole", { values: new Array(1) }))
     store.createNode(node("mixed", { values: [1, , 2] }))
 
-    const expectedHoleHash = createHash("sha256")
-      .update('{"component":"task","data":{"values":[null]},"kind":"decision","node_id":"hole","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
-      .digest("hex")
-    const expectedMixedHash = createHash("sha256")
-      .update('{"component":"task","data":{"values":[1,null,2]},"kind":"decision","node_id":"mixed","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
-      .digest("hex")
+    const expectedHoleHash = payloadHashForAudit(journal[1]?.data)
+    const expectedMixedHash = payloadHashForAudit(journal[2]?.data)
 
     expect(journal[0]?.payload_hash).not.toBe(journal[1]?.payload_hash)
+    expect(canonicalJSONForAudit((journal[1]?.data as any).payload.values)).toBe("[null]")
+    expect(canonicalJSONForAudit((journal[2]?.data as any).payload.values)).toBe("[1,null,2]")
     expect(journal[1]?.payload_hash).toBe(expectedHoleHash)
     expect(journal[2]?.payload_hash).toBe(expectedMixedHash)
   })
@@ -277,7 +308,139 @@ describe("causal IR store", () => {
     created.data!.chosen_action = "edit"
 
     expect(store.nodes[0]).toBe(created)
-    expect(journal[0]?.data).toEqual(node("node_1", { chosen_action: "read" }))
+    expect(journal[0]?.data).toMatchObject({
+      node_id: "node_1",
+      schema_version: "1.0",
+      payload: { chosen_action: "read" },
+      data: { chosen_action: "read" },
+    })
+  })
+
+  test("emits the complete Causal IR 1.0 node and edge envelopes", () => {
+    const store = new CausalIRStore({ runID: "run_envelope", caseID: "case_envelope" })
+    store.createNode({
+      ...node("node_envelope", { chosen_action: "inspect" }),
+      span_id: "span_child",
+      parent_span_id: "span_parent",
+      input_refs: ["tool_call:call_1"],
+      output_refs: ["tool_result:result_1"],
+      source_refs: ["evidence:fact_1"],
+      source_locations: [{ path: "src/index.ts", line_start: 4, line_end: 8 }],
+      artifact_refs: ["artifact_1"],
+    })
+    store.createEdge({
+      edge_id: "edge_envelope",
+      from: { type: "tool_call", id: "call_1", label: "tool.call" },
+      to: { type: "node", id: "node_envelope", label: "decision" },
+      relation: "produced",
+      evidence_tier: "content_matched",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_test_fixture",
+      evidence_refs: ["evidence:fact_1"],
+      confidence: 0.9,
+      metadata: { retained: true },
+    })
+
+    const snapshot = store.snapshot()
+    expect(snapshot.nodes[0]).toMatchObject({
+      node_id: "node_envelope",
+      kind: "decision",
+      schema_version: "1.0",
+      origin: "observed",
+      order: {
+        sequence: 1,
+        timestamp: "2026-07-14T00:00:00.000Z",
+        time_ms: 1,
+      },
+      scope: {
+        run_id: "run_envelope",
+        case_id: "case_envelope",
+        span_id: "span_child",
+        parent_span_id: "span_parent",
+      },
+      payload: { chosen_action: "inspect" },
+      input_refs: [{ ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1" }],
+      output_refs: [{ ref_type: "node", ref_id: "result_1", legacy_ref: "tool_result:result_1" }],
+      source_refs: [{ ref_type: "node", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
+      source_locations: [{ path: "src/index.ts", line_start: 4, line_end: 8 }],
+      artifact_refs: ["artifact_1"],
+      aliases: expect.arrayContaining(["record:node_envelope", "node:node_envelope"]),
+      derivation: null,
+      integrity: {
+        payload_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        source_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    })
+    expect(snapshot.edges[0]).toEqual({
+      edge_id: "edge_envelope",
+      from: { ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1", label: "tool.call" },
+      to: { ref_type: "node", ref_id: "node_envelope", legacy_ref: "node:node_envelope", label: "decision" },
+      original_relation: "produced",
+      normalized_relation: "produced",
+      evidence_tier: "content_matched",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_test_fixture",
+      evidence_refs: [{ ref_type: "node", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
+      confidence: 0.9,
+      metadata: { retained: true },
+    })
+  })
+
+  test("poisons journal appends without advancing committed sequence or hashes", () => {
+    const persisted: CausalIRJournalEntry[] = []
+    let attempts = 0
+    const store = new CausalIRStore({
+      runID: "run_poison",
+      caseID: "case_poison",
+      append: (entry) => {
+        attempts += 1
+        if (attempts === 2) return false
+        persisted.push(structuredClone(entry))
+        return true
+      },
+    })
+    const first = node("node_first", { chosen_action: "first" })
+    const failed = node("node_failed", { chosen_action: "failed append" })
+    const afterFailure = node("node_after_failure", { chosen_action: "must not append" })
+
+    store.createNode(first)
+    store.createNode(failed)
+    store.createNode(afterFailure)
+
+    expect(persisted.map((entry) => entry.sequence)).toEqual([1])
+    expect(attempts).toBe(2)
+    expect(store.nodes).toEqual([first, failed, afterFailure])
+    expect((store as any).journalSummary()).toMatchObject({
+      entry_count: 1,
+      last_sequence: 1,
+      last_payload_hash: persisted[0]?.payload_hash,
+      poisoned: true,
+    })
+  })
+
+  test("inserts an edge without rescanning existing edges or diagnostics", () => {
+    const store = new CausalIRStore({ runID: "run_linear", caseID: "case_linear" })
+    for (let index = 0; index < 128; index++) store.createEdge(relationEdge(`edge_${index}`, "produced"))
+
+    let existingEdgeReads = 0
+    for (let index = 0; index < store.edges.length; index++) {
+      store.edges[index] = new Proxy(store.edges[index]!, {
+        get(target, property, receiver) {
+          if (property === "edge_id" || property === "relation" || property === "original_relation") {
+            existingEdgeReads += 1
+          }
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    }
+
+    store.createEdge(relationEdge("edge_new", "produced"))
+
+    expect(existingEdgeReads).toBeLessThan(8)
+  })
+
+  test("exports a full canonical trace replay API", () => {
+    expect(typeof (CausalIRModule as any).replayCausalIRTrace).toBe("function")
   })
 
   test("preserves an unknown original relation without making it attribution eligible", () => {

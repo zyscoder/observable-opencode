@@ -357,6 +357,34 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(graph.downstream_refs("record:dataflow_origin"), ["record:dataflow_target"])
         self.assertEqual(graph.downstream_refs("record:dataflow_target"), [])
 
+    def test_skips_explicitly_ineligible_edges_but_keeps_legacy_edges_without_a_flag(self):
+        trace = {
+            "records": [
+                {"record_id": "blocked", "event_type": "tool.result", "data": {"call_id": "blocked"}},
+                {"record_id": "legacy", "event_type": "tool.result", "data": {"call_id": "legacy"}},
+                {"record_id": "target", "event_type": "response.claim", "data": {"claim_id": "target"}},
+            ],
+            "dataflow_edges": [
+                {
+                    "edge_id": "explicit_false",
+                    "from": {"type": "tool_result", "id": "blocked"},
+                    "to": {"type": "response_claim", "id": "target"},
+                    "relation": "supports_claim",
+                    "metadata": {"eligible_for_attribution": False},
+                },
+                {
+                    "edge_id": "legacy_default_true",
+                    "from": {"type": "tool_result", "id": "legacy"},
+                    "to": {"type": "response_claim", "id": "target"},
+                    "relation": "supports_claim",
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.upstream_refs("record:target"), ["record:legacy"])
+
     def test_upstream_refs_preserve_explicit_source_ref_order(self):
         trace = {
             "case_id": "order-case",

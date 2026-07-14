@@ -1,103 +1,104 @@
-# Causal IR Subproject A Verification
+# Causal IR Unified Kernel Migration Verification
 
 ## Scope And Result
 
-This report covers only Subproject A's local compatibility and regression gate.
-The acceptance evidence is green: the Trace 6.0 Python characterization passed,
-the requested Bun suites passed, and TypeScript typecheck exited zero. No Python
-production code was changed.
+This report records the final unified fix for all nine findings in
+`.superpowers/sdd/final-review.md`: 4 Critical, 3 Important, and 2 Minor.
+The local acceptance gate is green. Canonical Trace 6.0 output now carries the
+formal Causal IR 1.0 envelope and full replay state while retaining the
+`records`/`dataflow_edges` compatibility projection.
+
+Production changes are limited to the owned TypeScript Causal IR/CaseTrace
+implementation and the Python compatibility graph loader. No viewer change was
+required because the viewer continues to consume the explicit compatibility
+projection rather than canonical-only fields.
 
 ## Commands And Counts
 
-All commands were run on 2026-07-14 from the indicated directory.
+All final commands were run on 2026-07-15 from the indicated directory.
 
 | Working directory | Command | Result |
 | --- | --- | --- |
-| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 84 passed, 0 failed, 0.128 s |
-| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 147 passed, 0 failed, 1,420 expectations, 23.14 s |
+| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 154 passed, 0 failed, 1,485 expectations, 21.06 s |
 | `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun typecheck` | exit 0 (`tsgo --noEmit`) |
+| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 85 passed, 0 failed, 0.133 s |
+| repository root | `git diff --check` | exit 0 |
 
-The Bun executable was the project-pinned `1.3.13` runtime. The three suites
-contain 36 Causal IR tests, 108 CaseTrace tests, and 3 semantic-observability
-tests. Python required `PYTHONPATH=tools/trace_attribution`; this is the
-existing repository convention for the attribution package when invoked from
-the repository root.
+The Bun executable reports version `1.3.13`. The Bun total comprises 40 Causal
+IR tests, 111 CaseTrace tests, and 3 semantic-observability tests. Python uses
+the repository-root `PYTHONPATH=tools/trace_attribution` convention.
 
-## Trace 6.0 Python Compatibility
+## Canonical Envelope And Replay
 
-`TraceGraphTest.test_loads_trace_6_causal_ir_with_legacy_attribution_projection`
-uses a minimal Trace 6.0 fixture with canonical `nodes`/`edges` plus the
-compatibility `records`/`dataflow_edges` projection. The canonical side has a
-canonical-only node and a reverse edge with a conflicting relation. The loader
-continues to expose only the four compatibility record refs, so either
-canonical-node ingestion or canonical-edge ingestion changes the asserted node
-set or upstream reachability.
+- `trace.json` contains top-level `trace_version: "6.0"`,
+  `causal_ir_version: "1.0"`, `manifest`, canonical `nodes` and `edges`,
+  `artifacts`, `journal`, `metrics`, `diagnostics`, and `compatibility`.
+- Every canonical node has `schema_version`, `origin`, `order`, `scope`,
+  `payload`, typed input/output/source refs, source locations, artifact refs,
+  aliases, derivation, and integrity hashes. Compatibility aliases remain a
+  superset and are not used as substitutes for the envelope.
+- Every canonical edge has typed endpoints, original and normalized relation,
+  evidence tier, eligibility, derivation method, typed evidence refs,
+  confidence/label when present, and metadata.
+- `replayCausalIRTrace(records)` reconstructs the complete persisted Trace 6.0
+  document. The bundle, normal-exit, signal, diagnostic, and partial-recovery
+  gates deep-compare replayed documents with their canonical trace or partial.
+- Lifecycle self-summary is intentionally non-recursive: a lifecycle entry's
+  embedded trace summarizes the journal prefix immediately before that entry.
+  Therefore final `trace.json.journal.last_sequence` is the finalization
+  entry's sequence minus one. The convention is deterministic and is asserted
+  together with the final payload hash.
 
-The compatibility `source_refs` path and `dataflow_edges` path use separate
-origin and target records. The test independently asserts each upstream and
-downstream relationship, so deleting either compatibility path fails its own
-assertion without being masked by the other. It directly checks the public
-`TraceNode.source_refs` representation and `TraceGraph.raw_trace` compatibility
-edge relation; `TraceGraph` exposes no separate parsed edge-relation collection.
-No `FakeJudge` judgment is used as relation evidence.
+## Attribution And Compatibility
 
-The new test passed immediately. This is a green characterization of the
-existing records/dataflow loader, not a reason to alter Python production code.
+- Explicit source refs remain attribution-bearing. Missing or `recent_*`
+  selectors produce only `temporal_advisory` edges with
+  `eligible_for_attribution: false` and `recent_source_fallback`; they do not
+  enter compatibility `source_refs`.
+- The rule covers response output/claims, tool-failure context, observations,
+  changes, exit gates, and aggregated compaction checks. Tool-failure handling
+  status remains observable without promoting recent failures to dependencies.
+- Python skips compatibility edges when either the top-level or metadata
+  eligibility flag is explicitly false. A legacy edge with no flag remains
+  eligible. The Trace 6.0 fixture also proves canonical-only nodes/edges are not
+  misread as compatibility graph input.
+- `provenance-trace.json` retains the historical `manifest`, `records`,
+  `dataflow_edges`, `artifacts`, and `metrics` contract. The static HTML viewer
+  continues to render that projection and artifact links.
 
-## Canonical And Compatibility Evidence
+## Redaction And Durability
 
-- Canonical `trace.json` uses `trace_version: "6.0"`,
-  `causal_ir_version: "1.0"`, `nodes`, `edges`, `artifacts`, `diagnostics`,
-  `compatibility`, `records`, and `dataflow_edges`.
-- The `provenance-trace.json` projection retains the legacy-facing
-  `manifest`, `records`, `dataflow_edges`, `artifacts`, `metrics`, and
-  `trace_version` fields only. The suite asserts it has no canonical
-  `causal_ir_version`, `nodes`, `edges`, `diagnostics`, or `compatibility`.
-- Bundle assertions verify canonical/projection graph collection equivalence:
-  canonical node IDs equal projected record IDs, and the corresponding
-  record/edge/artifact collections agree.
-- Focused Causal IR projector tests verify projected edge metadata preserves
-  the original relation, normalized relation, evidence tier, attribution
-  eligibility, and derivation method.
-- Journal replay equality is checked against canonical `trace.json` for graph
-  collections: node IDs, edge IDs, artifacts as `[artifact_id, hash]`, and
-  diagnostics. This report does not claim envelope-field equality.
-- The journal audit checks contiguous sequences, operation-to-`record_type`
-  contracts, payload hashes, and each entity/category
-  `previous_payload_hash` chain. Artifact tests additionally verify reuse and
-  a single SHA-256 artifact path for repeated payloads.
+- Persisted events, journal rows, canonical/legacy/provenance JSON, partials,
+  HTML, and artifact content redact plain token strings, non-numeric token
+  metric impostors, quoted JSON credentials, authorization/API-key headers,
+  shell assignments/options, URL userinfo/query credentials, and `Error`
+  messages/stacks. Numeric values survive only in explicit token-usage metric
+  fields. The seeded agent/model/tool objects are unchanged after tracing.
+- `records.jsonl` contains only canonical operations with sequence and payload
+  hashes. Duplicate-evidence and weak-observation suppression use stable
+  `diagnostic.created` entries.
+- Journal sequence and payload-hash state commit only after append succeeds.
+  The first failure poisons later journal writes without a sequence gap or
+  dangling previous hash and remains passive to the observed agent.
+- Artifacts are written to a same-directory temporary file and atomically
+  renamed before registration. Failure yields no artifact or HTML link and
+  records `artifact_write_failed` plus `artifact_status: "write_failed"`.
 
-## Lifecycle, Passive Collection, And Redaction
+## Performance, References, And Lifecycle
 
-The passing CaseTrace suite exercises generated child processes for these
-conditions:
+- Edge insertion uses edge-ID and diagnostic-ID indexes plus incremental
+  unknown-relation reconciliation. The regression probe inserts after 128
+  existing edges while observing fewer than eight existing-edge property reads.
+- `parent_span_id`, `input_refs`, and `output_refs` round-trip through canonical
+  typed refs and the legacy compatibility projection.
+- Normal exit, SIGINT, SIGTERM, post-finish SIGTERM, and preflushed SIGKILL
+  recovery remain green. Passive-sidecar metadata, redaction/hash-chain checks,
+  artifact de-duplication and HTML viewing, and historical compatibility tests
+  all run inside the 111-test CaseTrace suite.
 
-| Condition | Verified result |
-| --- | --- |
-| Normal exit | `trace.json`, `legacy-trace.json`, and `trace.html` are written; the legacy trace is successful. |
-| SIGINT | Manifest and provenance status are cancelled; final partial equals trace; journal replay and forced checkpoint match the trace. |
-| SIGTERM | Process exits 143; canonical trace, partial, and HTML are available with cancelled case/server state and replay equality. |
-| SIGKILL | It is intentionally unhandleable: a previously flushed partial snapshot and HTML remain readable, journal replay matches that partial, and no finalization is claimed. |
+## Remaining External Scope
 
-Passive behavior also passed: collection declares `passive_sidecar` and
-`behavior_impact: "none"`. In the forced trace-write failure test, the traced
-and untraced agent-visible stdout bytes and SHA-256 hash are identical, both
-processes exit zero, and fallback trace artifacts remain present. Redaction
-tests preserve original execution inputs while ensuring persisted trace,
-journal, artifacts, HTML, and projection files exclude the seeded credentials;
-journal hash-chain auditing remains valid after redaction.
-
-## Remaining Work Outside Subproject A
-
-- **Subproject B:** migrate typed producer families in bounded batches and
-  remove each parallel mutable store only after projection-equivalence tests.
-- **Subproject C:** migrate `trace.html`, Python loading, message-lineage
-  reconstruction, and attribution overlays to canonical IDs and Causal IR
-  edges while retaining compatibility regression coverage.
-- **Subproject D:** remove remaining duplicate state, replay historical traces,
-  rerun offline attribution, execute HTTP stress cases, recheck lifecycle and
-  passive behavior, and complete release validation.
-
-No HTTP stress cases and no DeepSeek attribution requests were executed for
-this Subproject A report. The evidence above is limited to the named Python and
-TypeScript local regression suites.
+No live DeepSeek request, external HTTP stress campaign, or historical corpus
+re-attribution run was executed. Those environment-dependent release gates are
+outside this local final-fix verification; there are no known remaining local
+code findings from `final-review.md`.

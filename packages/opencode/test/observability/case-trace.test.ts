@@ -4,6 +4,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import * as CausalIRModule from "@/observability/causal-ir"
 import { replayCausalIRJournal } from "@/observability/causal-ir"
 import { renderCaseTraceHtml } from "@/observability/case-trace-html"
 import { renderProvenanceTraceHtml } from "@/observability/causal-trace-viewer"
@@ -33,6 +34,7 @@ function assertFinalCancelledPartialMatchesTrace(partial: any, trace: any) {
     "dataflow_edges",
     "diagnostics",
     "edges",
+    "journal",
     "manifest",
     "metrics",
     "nodes",
@@ -227,6 +229,9 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
     edges: trace.edges,
     artifacts: trace.artifacts,
   })
+  const replayTrace = (CausalIRModule as any).replayCausalIRTrace
+  expect(typeof replayTrace).toBe("function")
+  if (typeof replayTrace === "function") expect(replayTrace(journal)).toEqual(trace)
 }
 
 function assertExactlyOneFinalizationAtEnd(journal: any[]) {
@@ -363,6 +368,18 @@ describe("case trace", () => {
     expect(manifest.files.viewer_alias).toBeUndefined()
     expect(trace.trace_version).toBe("6.0")
     expect(trace.causal_ir_version).toBe("1.0")
+    expect(trace.journal).toMatchObject({
+      path: "records.jsonl",
+      summary_scope: "entries_before_lifecycle_entry",
+      poisoned: false,
+    })
+    expect(typeof trace.journal.entry_count).toBe("number")
+    expect(typeof trace.journal.last_sequence).toBe("number")
+    expect(trace.journal.last_payload_hash).toMatch(/^[a-f0-9]{64}$/)
+    expect(trace.journal.entry_count).toBe(trace.journal.last_sequence)
+    expect(trace.journal.last_sequence).toBe(journal.at(-1).sequence - 1)
+    expect(trace.journal.last_payload_hash).toBe(journal.at(-2).payload_hash)
+    expect(journal.at(-1).data.trace).toEqual(trace)
     expect(trace.nodes.length).toBe(trace.metrics.records)
     expect(trace.edges.length).toBe(trace.metrics.dataflow_edges)
     expect(trace.artifacts.length).toBe(trace.metrics.artifacts)
@@ -446,6 +463,117 @@ describe("case trace", () => {
     expect(traceHtml).toContain("IO Inspector")
     expect(traceHtml).toContain("Context And Compaction")
     expect(traceHtml).not.toContain("Evidence Inspector")
+  })
+
+  test("round-trips node parent, input, and output refs through canonical and compatibility envelopes", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-causal-node-refs-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "node-refs.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "node_refs", kind: "decision", component: "task", span_id: "span_child", parent_span_id: "span_parent", input_refs: ["tool_call:call_1"], output_refs: ["tool_result:result_1"], data: { chosen_action: "inspect" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "node-refs-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "node-refs-case", "trace.json"), "utf8")) as any
+    const canonical = trace.nodes.find((item: any) => item.node_id === "node_refs")
+    const compatibility = trace.records.find((item: any) => item.record_id === "node_refs")
+    expect(canonical.scope.parent_span_id).toBe("span_parent")
+    expect(canonical.input_refs).toEqual([
+      { ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1" },
+    ])
+    expect(canonical.output_refs).toEqual([
+      { ref_type: "node", ref_id: "result_1", legacy_ref: "tool_result:result_1" },
+    ])
+    expect(compatibility).toMatchObject({
+      parent_span_id: "span_parent",
+      input_refs: ["tool_call:call_1"],
+      output_refs: ["tool_result:result_1"],
+    })
+  })
+
+  test("keeps recent fallback refs temporal advisory and outside attribution source refs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-temporal-advisory-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "temporal-advisory.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing owner is billing", data: { subject: "pricing", predicate: "owner", value: "billing" }, source_refs: [] })`,
+        `CaseTrace.responseOutput({ segment_id: "temporal_response", text: "Pricing owner is billing.", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.exitGate({ gate_id: "temporal_gate", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "response complete", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "temporal-advisory-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "temporal-advisory-case", "trace.json"), "utf8")) as any
+    const fact = trace.records.find((item: any) => item.event_type === "evidence.semantic_fact")
+    const response = trace.records.find(
+      (item: any) => item.event_type === "response.output" && item.data.segment_id === "temporal_response",
+    )
+    const exitGate = trace.records.find((item: any) => item.event_type === "exit.gate")
+    const advisory = trace.edges.find(
+      (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === response.record_id,
+    )
+    const compatibilityAdvisory = trace.dataflow_edges.find((item: any) => item.edge_id === advisory?.edge_id)
+    const exitAdvisory = trace.edges.find(
+      (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === exitGate.record_id,
+    )
+
+    expect(response.source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
+    expect(response.data.candidate_source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
+    expect(advisory).toMatchObject({
+      evidence_tier: "temporal_advisory",
+      eligible_for_attribution: false,
+      derivation_method: "recent_source_fallback",
+    })
+    expect(compatibilityAdvisory.metadata).toMatchObject({
+      evidence_tier: "temporal_advisory",
+      eligible_for_attribution: false,
+      derivation_method: "recent_source_fallback",
+    })
+    expect(exitGate.source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
+    expect(exitAdvisory).toMatchObject({
+      evidence_tier: "temporal_advisory",
+      eligible_for_attribution: false,
+      derivation_method: "recent_source_fallback",
+    })
   })
 
   test("links response generation provenance back to LLM, message transform, and context nodes", async () => {
@@ -1213,6 +1341,7 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "duplicate-fact-v59-case", "trace.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(path.join(dir, "duplicate-fact-v59-case"))
     const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
 
     expect(facts).toHaveLength(1)
@@ -1220,6 +1349,9 @@ describe("case trace", () => {
     expect(facts[0].source_refs).toContain("tool_result:read1")
     expect(facts[0].source_refs).toContain("tool_result:read2")
     expect(trace.metrics.trace_health.duplicate_semantic_facts).toBe(0)
+    expect(journal.every((entry: any) => typeof entry.operation === "string")).toBe(true)
+    expect(journal.map((entry: any) => entry.sequence)).toEqual(journal.map((_: any, index: number) => index + 1))
+    expect(journal.some((entry: any) => entry.data?.kind === "evidence_duplicate_suppressed")).toBe(true)
   })
 
   test("does not treat missing compaction after-token estimate as zero", async () => {
@@ -2349,11 +2481,15 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "weak-observation-case", "trace.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(path.join(dir, "weak-observation-case"))
     const observations = trace.records.filter((record: any) => record.event_type === "execution.observation")
 
     expect(observations).toHaveLength(1)
     expect(observations[0].title).toBe("file_read")
     expect(JSON.stringify(trace.records)).not.toContain("private/tmp/project/src/pricing.mjs")
+    expect(journal.every((entry: any) => typeof entry.operation === "string")).toBe(true)
+    expect(journal.map((entry: any) => entry.sequence)).toEqual(journal.map((_: any, index: number) => index + 1))
+    expect(journal.some((entry: any) => entry.data?.kind === "weak_observation_suppressed")).toBe(true)
   })
 
   test("converges tool span and lifecycle events into one canonical tool record", async () => {
@@ -3448,13 +3584,26 @@ describe("case trace", () => {
     expect(toolError.data.tool_name).toBe("read")
     expect(toolError.data.error_kind).toBe("file_not_found")
     expect(toolError.data.observed_by_model).toBe(true)
-    expect(response.source_refs).not.toContain("tool_error:call_missing")
-    expect(claim.data.support_level).toBe("direct")
-    expect(claim.data.direct_evidence_refs).toContain("tool_error:call_missing")
+    expect(response.source_refs ?? []).not.toContain("tool_error:call_missing")
+    expect(claim.data.support_level).toBe("unsupported")
+    expect(claim.data.direct_evidence_refs ?? []).not.toContain("tool_error:call_missing")
     expect(assessment).toBeTruthy()
     expect(assessment.data.claim_id).toBe(claim.data.claim_id)
-    expect(assessment.data.tool_failure_dependency_refs).toContain("tool_error:call_missing")
-    expect(assessment.data.support_level).toBe("direct")
+    expect(assessment.data.tool_failure_context_refs).toContain("tool_error:call_missing")
+    expect(assessment.data.tool_failure_dependency_refs ?? []).not.toContain("tool_error:call_missing")
+    expect(assessment.data.support_level).toBe("unsupported")
+    const advisoryEdges = trace.dataflow_edges.filter(
+      (edge: any) =>
+        edge.from?.id === "call_missing" && edge.metadata?.derivation_method === "recent_source_fallback",
+    )
+    expect(advisoryEdges.length).toBeGreaterThan(0)
+    expect(
+      advisoryEdges.every(
+        (edge: any) =>
+          edge.metadata?.evidence_tier === "temporal_advisory" &&
+          edge.metadata?.eligible_for_attribution === false,
+      ),
+    ).toBe(true)
   })
 
   test("records tool failure handling provenance when replacement evidence supports a claim", async () => {
@@ -3501,7 +3650,7 @@ describe("case trace", () => {
     expect(toolError.data.handled_status).toBe("recovered_with_replacement_evidence")
     expect(toolError.data.replacement_evidence_refs.length).toBeGreaterThan(0)
     expect(toolError.data.downstream_claim_refs.length).toBeGreaterThan(0)
-    expect(assessment.data.tool_failure_dependency_refs).toContain("tool_error:call_missing")
+    expect(assessment.data.tool_failure_dependency_refs ?? []).not.toContain("tool_error:call_missing")
     expect(assessment.data.tool_failure_handled_status).toBe("recovered_with_replacement_evidence")
     expect(assessment.data.tool_failure_context_refs).toContain("tool_error:call_missing")
     expect(assessment.data.replacement_evidence_refs.length).toBeGreaterThan(0)
@@ -3610,7 +3759,7 @@ describe("case trace", () => {
     const latestFact = factUpdates.at(-1)?.data
 
     expect(fact.data.occurrence_count).toBe(2)
-    expect(fact.source_refs).toEqual(
+    expect(fact.legacy_source_refs).toEqual(
       expect.arrayContaining([
         expect.stringMatching(/^span:/),
         "tool_result:call_owner",
@@ -3618,7 +3767,8 @@ describe("case trace", () => {
       ]),
     )
     expect(fact.data.tool_outcome_refs).toContain("tool_result:call_owner")
-    expect(latestFact.source_refs).toEqual(expect.arrayContaining(fact.source_refs))
+    expect(latestFact.source_refs).toEqual(fact.source_refs)
+    expect(latestFact.legacy_source_refs).toEqual(expect.arrayContaining(fact.legacy_source_refs))
     expect(latestFact.data.tool_outcome_refs).toContain("tool_result:call_owner")
     assertCausalIRJournalAudit(causalJournal)
     expect(replayCausalIRJournal(causalJournal).nodes).toEqual(trace.nodes)
@@ -4596,7 +4746,7 @@ describe("case trace", () => {
     expect(html).toContain("Context Ledger")
   })
 
-  test("preserves token metrics while redacting credentials", async () => {
+  test("preserves explicit token metrics while redacting ambiguous token fields and credentials", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-redaction-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "redaction-trace.ts")
@@ -4636,7 +4786,7 @@ describe("case trace", () => {
     expect(trace.token_usage.total).toBe(9)
     expect(trace.spans[0].token_usage?.total).toBe(9)
     expect(trace.context_snapshots?.[0]?.token_estimate).toBe(128)
-    expect(trace.context_snapshots?.[0]?.metadata?.tokens).toBe(128)
+    expect(trace.context_snapshots?.[0]?.metadata?.tokens).toBe("[REDACTED]")
     expect((trace.context_snapshots?.[0]?.metadata as any)?.token_usage).toEqual({ input: 3, output: 6 })
     expect(traceText).not.toContain("sk-test-secret-value")
     expect(traceText).not.toContain("sk-another-secret-value")
@@ -4862,7 +5012,7 @@ describe("case trace", () => {
 
     expect(change.source_refs).toContain("tool_call:call_edit")
     expect(change.source_refs).toContain(`span:${change.span_id}`)
-    expect(change.source_refs).toContain("verification:host_failure")
+    expect(change.source_refs).not.toContain("verification:host_failure")
     expect(change.data.source_ref_relations).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ source_ref: "tool_call:call_edit", relation: "materialized_by_action" }),
@@ -4878,7 +5028,12 @@ describe("case trace", () => {
       expect.arrayContaining([
         expect.objectContaining({
           relation: "motivated_by_evidence",
-          metadata: expect.objectContaining({ causal_semantics: "motivation_not_defect_propagation" }),
+          metadata: expect.objectContaining({
+            causal_semantics: "motivation_not_defect_propagation",
+            evidence_tier: "temporal_advisory",
+            eligible_for_attribution: false,
+            derivation_method: "recent_source_fallback",
+          }),
         }),
       ]),
     )
@@ -5090,6 +5245,16 @@ describe("case trace", () => {
       password: "sensitive-password-value",
       token: "sensitive-environment-token",
       accessToken: "sensitive-access-token",
+      plainToken: "plain-token-string-secret",
+      tokenUsageString: "token-usage-string-secret",
+      tokenEstimateString: "token-estimate-string-secret",
+      quotedJsonToken: "quoted-json-token-secret",
+      quotedJsonApiKey: "quoted-json-api-key-secret",
+      headerSecret: "header-credential-secret",
+      shellSecret: "shell-credential-secret",
+      stringUrlPassword: "string-url-password-secret",
+      stringUrlToken: "string-url-token-secret",
+      errorHeaderSecret: "error-header-secret",
       errorText: "sk-error-message-secret",
       urlPassword: "url-password-plain-secret",
       urlQuery: "url-query-plain-secret",
@@ -5102,8 +5267,9 @@ describe("case trace", () => {
         `const secrets = ${JSON.stringify(secrets)}`,
         `const error = new Error("request failed with " + secrets.errorText)`,
         `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
+        `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, shell: "TOKEN=" + secrets.shellSecret + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("X-API-Key: " + secrets.errorHeaderSecret) }`,
         `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
-        `const agentInput = { role: "build", error, endpoint }`,
+        `const agentInput = { role: "build", error, endpoint, textSecrets }`,
         `const modelInput = { messages: ["inspect"], error, endpoint }`,
         `const toolInput = { command: "inspect", environment, error, endpoint, token_usage: { input: 11, output: 7, total: 18 } }`,
         `const toolOutput = { result: "ok", environment, error, endpoint, tokens: 18 }`,
@@ -5116,7 +5282,7 @@ describe("case trace", () => {
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
         `CaseTrace.finish({ status: "success", result: { environment } })`,
-        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString() }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
+        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
       ].join("\n"),
     )
 
@@ -5147,7 +5313,21 @@ describe("case trace", () => {
       error: originalError,
       endpoint: originalEndpoint,
     })
-    expect(originals.agentInput).toEqual({ role: "build", error: originalError, endpoint: originalEndpoint })
+    expect(originals.agentInput).toEqual({
+      role: "build",
+      error: originalError,
+      endpoint: originalEndpoint,
+      textSecrets: {
+        token: secrets.plainToken,
+        token_usage: secrets.tokenUsageString,
+        token_estimate: secrets.tokenEstimateString,
+        quoted_json: `{"token":"${secrets.quotedJsonToken}","apiKey":"${secrets.quotedJsonApiKey}"}`,
+        header: `Authorization: Basic ${secrets.headerSecret}\nX-API-Key: ${secrets.headerSecret}`,
+        shell: `TOKEN=${secrets.shellSecret} --password ${secrets.shellSecret}`,
+        url: `https://reader:${secrets.stringUrlPassword}@example.com/audit?token=${secrets.stringUrlToken}`,
+        error: `X-API-Key: ${secrets.errorHeaderSecret}`,
+      },
+    })
     expect(originals.modelInput).toEqual({ messages: ["inspect"], error: originalError, endpoint: originalEndpoint })
     expect(originals.toolInput).toEqual({
       command: "inspect",
@@ -5200,9 +5380,8 @@ describe("case trace", () => {
     expect(replayed.edges).toEqual(trace.edges)
     expect(replayed.artifacts).toEqual(trace.artifacts)
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
-    for (const secret of Object.values(secrets)) {
-      expect(persistedText.every((text) => !text.includes(secret))).toBe(true)
-    }
+    const leakedSecrets = Object.values(secrets).filter((secret) => persistedText.some((text) => text.includes(secret)))
+    expect(leakedSecrets).toEqual([])
     expect(recordsText).toContain('"apiKey":"[REDACTED]"')
     expect(recordsText).toContain('"password":"[REDACTED]"')
     expect(recordsText).toContain('"token":"[REDACTED]"')
@@ -5306,6 +5485,56 @@ describe("case trace", () => {
     for (const secret of Object.values(secrets)) {
       expect(persistedText.every((text) => !text.includes(secret))).toBe(true)
     }
+  })
+
+  test("does not register or render an artifact until its atomic write succeeds", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-artifact-write-failure-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "artifact-write-failure.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import fs from "node:fs"`,
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const trace = CaseTrace.configure({ input: { task: "artifact failure remains passive" } })`,
+        `if (trace) fs.writeFileSync(trace.artifactDir, "artifact directory blocker")`,
+        `CaseTrace.observation({ source: "tool", category: "artifact_failure", summary: "large payload", data: { payload: "x".repeat(5000) }, source_refs: [] })`,
+        `CaseTrace.finish({ status: "success", result: { answer: "agent result preserved" } })`,
+        `process.stdout.write("agent result preserved")`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "artifact-write-failure-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await new Response(proc.stdout).text()).toBe("agent result preserved")
+
+    const caseDir = path.join(dir, "artifact-write-failure-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    const observation = trace.records.find((item: any) => item.title === "artifact_failure")
+    const payloadSummary = observation.data.data
+
+    expect(trace.artifacts).toEqual([])
+    expect(payloadSummary.artifact_id).toBeUndefined()
+    expect(payloadSummary.artifact_status).toBe("write_failed")
+    expect(trace.diagnostics).toContainEqual(
+      expect.objectContaining({ kind: "artifact_write_failed", status: "write_failed" }),
+    )
+    expect(html).not.toContain('href="artifacts/sha256/')
+    expect((await readCausalIRJournal(caseDir)).some((entry: any) => entry.operation === "artifact.created")).toBe(false)
   })
 
   test("updates and removes current formal diagnostics without duplicate journal facts", async () => {
@@ -5974,14 +6203,24 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "source-ref-case", "legacy-trace.json"), "utf8")) as any
-    const refs = trace.response_segments[0].source_refs
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(dir, "source-ref-case", "legacy-trace.json"), "utf8"),
+    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "source-ref-case", "trace.json"), "utf8")) as any
+    const refs = legacy.response_segments[0].source_refs ?? []
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    const advisoryEdges = trace.edges.filter(
+      (edge: any) =>
+        edge.to?.ref_id === response.record_id && edge.derivation_method === "recent_source_fallback",
+    )
+    const advisoryRefs = advisoryEdges.map((edge: any) => edge.from?.legacy_ref)
 
-    expect(refs).toContain(`context_snapshot:${trace.context_snapshots[0].snapshot_id}`)
-    expect(refs).toContain(`tool_span:${trace.spans[0].span_id}`)
-    expect(refs).toContain(`verification:${trace.verification_records[0].verification_id}`)
-    expect(refs).toContain(`change:${trace.change_records[0].change_id}`)
-    expect(refs.some((item: string) => item.startsWith("recent_"))).toBe(false)
+    expect(refs).toEqual([])
+    expect(advisoryRefs).toContain(`context_snapshot:${legacy.context_snapshots[0].snapshot_id}`)
+    expect(advisoryRefs).toContain(`tool_span:${legacy.spans[0].span_id}`)
+    expect(advisoryRefs).toContain(`verification:${legacy.verification_records[0].verification_id}`)
+    expect(advisoryRefs).toContain(`change:${legacy.change_records[0].change_id}`)
+    expect(advisoryEdges.every((edge: any) => edge.eligible_for_attribution === false)).toBe(true)
   })
 
   test("does not let trace-only controls alter compaction behavior", async () => {

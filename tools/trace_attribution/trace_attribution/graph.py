@@ -104,6 +104,9 @@ class TraceGraph:
         for edge in trace.get("dataflow_edges") or []:
             if not isinstance(edge, dict):
                 continue
+            metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+            if edge.get("eligible_for_attribution") is False or metadata.get("eligible_for_attribution") is False:
+                continue
             source = resolve_edge_endpoint(edge.get("from"), aliases)
             target = resolve_edge_endpoint(edge.get("to"), aliases)
             if source and target and source != target:
