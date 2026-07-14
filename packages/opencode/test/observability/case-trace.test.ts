@@ -176,6 +176,37 @@ async function readCausalIRJournal(caseDir: string) {
     .map((line) => JSON.parse(line))
 }
 
+function isCompleteCausalIRCheckpoint(entry: any) {
+  const snapshot = entry?.data?.snapshot
+  return (
+    entry?.operation === "case.checkpointed" &&
+    snapshot &&
+    typeof snapshot === "object" &&
+    Array.isArray(snapshot.nodes) &&
+    Array.isArray(snapshot.edges) &&
+    Array.isArray(snapshot.artifacts) &&
+    Array.isArray(snapshot.diagnostics)
+  )
+}
+
+async function waitForCompleteCausalIRCheckpoint(caseDir: string, timeoutMs = 3000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const journal = await readCausalIRJournal(caseDir)
+      if (journal.some(isCompleteCausalIRCheckpoint)) return journal
+    } catch {}
+    await Bun.sleep(50)
+  }
+
+  try {
+    const journal = await readCausalIRJournal(caseDir)
+    return journal.some(isCompleteCausalIRCheckpoint) ? journal : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
   const replayed = replayCausalIRJournal(journal)
   expect(replayed.nodes.map((node) => node.node_id)).toEqual(trace.nodes.map((node: any) => node.node_id))
@@ -194,6 +225,25 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
 function assertExactlyOneFinalizationAtEnd(journal: any[]) {
   expect(journal.filter((entry) => entry.operation === "case.finalized")).toHaveLength(1)
   expect(journal.at(-1)?.operation).toBe("case.finalized")
+}
+
+function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partial: any, trace: any) {
+  assertCausalIRJournalAudit(journal)
+  assertExactlyOneFinalizationAtEnd(journal)
+
+  const checkpoint = journal.at(-2)
+  const finalized = journal.at(-1)
+  expect(isCompleteCausalIRCheckpoint(checkpoint)).toBe(true)
+  expect(checkpoint?.payload_hash).toBe(causalIRPayloadHashForAudit(checkpoint?.data))
+  expect(finalized?.payload_hash).toBe(causalIRPayloadHashForAudit(finalized?.data))
+  expect(finalized?.previous_payload_hash).toBe(checkpoint?.payload_hash)
+  expect(checkpoint?.data?.data).toEqual(partial.manifest)
+
+  for (const field of ["nodes", "edges", "artifacts", "diagnostics"] as const) {
+    expect(checkpoint?.data?.snapshot?.[field]).toEqual(partial[field])
+    expect(checkpoint?.data?.snapshot?.[field]).toEqual(trace[field])
+    expect(finalized?.data?.snapshot?.[field]).toEqual(checkpoint?.data?.snapshot?.[field])
+  }
 }
 
 describe("case trace", () => {
@@ -256,6 +306,7 @@ describe("case trace", () => {
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
     const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const journal = await readCausalIRJournal(caseDir)
     const traceHtml = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const provenanceText = JSON.stringify(provenance)
     const canonicalEdge = trace.edges[0] as NonNullable<ProvenanceTraceSummary["edges"]>[number]
@@ -336,6 +387,8 @@ describe("case trace", () => {
     expect(partial.causal_ir_version).toBe("1.0")
     expect(partial.nodes).toEqual(trace.nodes)
     expect(partial.edges).toEqual(trace.edges)
+    assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
+    assertJournalReplaysCanonicalTrace(journal, trace)
     expect({ originalRelation, normalizedRelation, evidenceTier, eligibleForAttribution, derivationMethod }).toEqual({
       originalRelation: expect.any(String),
       normalizedRelation: expect.any(String),
@@ -2541,7 +2594,9 @@ describe("case trace", () => {
       stderr: "pipe",
     })
     const caseDir = path.join(dir, "causal-sigint-case")
-    expect(await waitForExists(path.join(caseDir, "events.jsonl"))).toBe(true)
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    expect(persistedJournal).toBeDefined()
+    assertCausalIRJournalAudit(persistedJournal!)
     proc.kill("SIGINT")
     await proc.exited
     const stderr = await new Response(proc.stderr).text()
@@ -2562,10 +2617,8 @@ describe("case trace", () => {
     expect(manifest.result.reason).toBe("SIGINT")
     expect(provenance.manifest.status).toBe("cancelled")
     assertFinalCancelledPartialMatchesTrace(partial, trace)
-    assertCausalIRJournalAudit(journal)
     assertJournalReplaysCanonicalTrace(journal, trace)
-    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
-    assertExactlyOneFinalizationAtEnd(journal)
+    assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
   })
 
   test("records observation and compaction facts for offline provenance analysis", async () => {
@@ -3210,7 +3263,9 @@ describe("case trace", () => {
       stderr: "pipe",
     })
     const caseDir = path.join(dir, "signal-flush-v58-case")
-    expect(await waitForExists(path.join(caseDir, "partial", "latest.json"), 3000)).toBe(true)
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    expect(persistedJournal).toBeDefined()
+    assertCausalIRJournalAudit(persistedJournal!)
 
     proc.kill("SIGTERM")
     const code = await proc.exited
@@ -3236,10 +3291,8 @@ describe("case trace", () => {
     expect(html).toContain("case cancelled")
     expect(html).toContain("observed pricing file before signal")
     assertFinalCancelledPartialMatchesTrace(partial, trace)
-    assertCausalIRJournalAudit(journal)
     assertJournalReplaysCanonicalTrace(journal, trace)
-    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
-    assertExactlyOneFinalizationAtEnd(journal)
+    assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
   })
 
   test("keeps SIGTERM journal finalization exactly once after the case already finished", async () => {
@@ -3981,16 +4034,20 @@ describe("case trace", () => {
       stderr: "pipe",
     })
 
-    expect(await waitForExists(path.join(dir, "sigkill-case", "partial", "latest.json"))).toBe(true)
-    expect(await waitForExists(path.join(dir, "sigkill-case", "trace.html"))).toBe(true)
+    const caseDir = path.join(dir, "sigkill-case")
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir)
+    expect(persistedJournal).toBeDefined()
+    assertCausalIRJournalAudit(persistedJournal!)
+    expect(await waitForExists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
+    expect(await waitForExists(path.join(caseDir, "trace.html"))).toBe(true)
     proc.kill("SIGKILL")
     await proc.exited.catch(() => undefined)
 
-    const html = await fs.readFile(path.join(dir, "sigkill-case", "trace.html"), "utf8")
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const partial = JSON.parse(
-      await fs.readFile(path.join(dir, "sigkill-case", "partial", "latest.json"), "utf8"),
+      await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8"),
     ) as any
-    const journal = await readCausalIRJournal(path.join(dir, "sigkill-case"))
+    const journal = await readCausalIRJournal(caseDir)
 
     expect(html).toContain("Trace v6.0")
     expect(partial.manifest.server_status).toBe("running")
@@ -6017,8 +6074,39 @@ describe("case trace", () => {
     expect(failedTrace.hash).toBe(baseline.hash)
     const caseDir = path.join(traceRoot, "passive-write-failure-case")
     expect((await fs.stat(path.join(caseDir, "trace.json"))).isDirectory()).toBe(true)
-    expect(await exists(path.join(caseDir, "manifest.json"))).toBe(true)
-    expect(await exists(path.join(caseDir, "records.jsonl"))).toBe(true)
+    for (const file of [
+      "manifest.json",
+      "legacy-trace.json",
+      "provenance-trace.json",
+      "records.jsonl",
+      "partial/latest.json",
+      "trace.html",
+    ]) {
+      expect(await exists(path.join(caseDir, file))).toBe(true)
+    }
+
+    const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
+    const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
+    const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(caseDir)
+
+    expect(partial.manifest).toEqual(manifest)
+    expect(provenance).toMatchObject({
+      trace_version: partial.trace_version,
+      manifest,
+      records: partial.records,
+      dataflow_edges: partial.dataflow_edges,
+      artifacts: partial.artifacts,
+    })
+    expect(legacy).toMatchObject({
+      case_id: manifest.case_id,
+      run_id: manifest.run_id,
+      status: manifest.status,
+      result: manifest.result,
+    })
+    assertJournalReplaysCanonicalTrace(journal, partial)
+    assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, partial)
   })
 
   test("persists and renders design records", async () => {
