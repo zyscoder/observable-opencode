@@ -8432,7 +8432,6 @@ class ActiveCaseTrace {
       if (input.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
         return this.summarizeText(input, this.causalArtifactLabel(label))
       }
-      if (isStructuredCausalContainer(label)) return input
       return input.length > maxFieldLength() ? this.summarizeText(input, this.causalArtifactLabel(label)) : input
     }
     if (typeof input === "number" || typeof input === "boolean") return input

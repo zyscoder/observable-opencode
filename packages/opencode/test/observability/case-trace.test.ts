@@ -5442,7 +5442,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.node({ node_id: "formal_suffixes", kind: "verification", component: "tool", title: "formal suffixes", data: { coverage_semantics: { source_refs: ["evidence:pricing"], quality_flags: ["coverage_complete"], nested_semantics: { changed_test_refs: ["change:test"], changed_production_refs: ["change:source"], verification_scope_risk_flags: ["tests_modified"] } }, source_refs: ["evidence:root"], quality_flags: ["reviewed"] } })`,
+        `CaseTrace.node({ node_id: "formal_suffixes", kind: "verification", component: "tool", title: "formal suffixes", data: { coverage_semantics: { source_refs: ["ev:price"], quality_flags: ["covered"], nested_semantics: { changed_test_refs: ["chg:test"], changed_production_refs: ["chg:src"], verification_scope_risk_flags: ["tested"] } }, source_refs: ["ev:root"], quality_flags: ["reviewed"] } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -5465,13 +5465,58 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(dir, "formal-suffixes-case", "trace.json"), "utf8")) as any
     const record = trace.records.find((item: any) => item.record_id === "formal_suffixes")
 
-    expect(record.data.coverage_semantics.source_refs).toEqual(["evidence:pricing"])
-    expect(record.data.coverage_semantics.quality_flags).toEqual(["coverage_complete"])
-    expect(record.data.coverage_semantics.nested_semantics.changed_test_refs).toEqual(["change:test"])
-    expect(record.data.coverage_semantics.nested_semantics.changed_production_refs).toEqual(["change:source"])
-    expect(record.data.coverage_semantics.nested_semantics.verification_scope_risk_flags).toEqual(["tests_modified"])
-    expect(record.data.source_refs).toEqual(["evidence:root"])
+    expect(record.data.coverage_semantics.source_refs).toEqual(["ev:price"])
+    expect(record.data.coverage_semantics.quality_flags).toEqual(["covered"])
+    expect(record.data.coverage_semantics.nested_semantics.changed_test_refs).toEqual(["chg:test"])
+    expect(record.data.coverage_semantics.nested_semantics.changed_production_refs).toEqual(["chg:src"])
+    expect(record.data.coverage_semantics.nested_semantics.verification_scope_risk_flags).toEqual(["tested"])
+    expect(record.data.source_refs).toEqual(["ev:root"])
     expect(record.data.quality_flags).toEqual(["reviewed"])
+  })
+
+  test("externalizes long string leaves inside structured semantic subtrees", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-semantic-string-leaves-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "semantic-string-leaves-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const longChangeSummary = "change-summary-" + "c".repeat(200)
+    const longClaimValue = "claim-value-" + "v".repeat(200)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Semantic summary boundary", diff: "- old\\n+ new", change_semantics: { changed_line_count: 2, added_line_count: 1, removed_line_count: 1, summary: ${JSON.stringify(longChangeSummary)} } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "repo_fact", summary: "long structured claim", data: { subject: "pricing", predicate: "owner", value: ${JSON.stringify(longClaimValue)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "semantic-string-leaves-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "semantic-string-leaves-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const change = trace.records.find((record: any) => record.event_type === "change")
+    const fact = trace.records.find((record: any) => record.event_type === "evidence.semantic_fact")
+
+    for (const summary of [change.data.change_semantics.summary, fact.data.structured_claim.value]) {
+      expect(summary.type).toBe("text")
+      expect(summary.artifact_id).toBeTruthy()
+      expect(summary.payload_ref).toBe(summary.artifact_id)
+    }
   })
 
   test("externalizes high-cardinality formal collections without truncating their contents", async () => {
@@ -5479,12 +5524,15 @@ describe("case trace", () => {
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "high-cardinality-trace.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const inputChecks = Array.from({ length: 65 }, (_, index) => `v${index}`)
+    const inputChecksByName = Object.fromEntries(inputChecks.map((value, index) => [`check_${index}`, value]))
+    const inlineChecks = Array.from({ length: 64 }, (_, index) => `i${index}`)
 
     await fs.writeFile(
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.node({ node_id: "high_cardinality", kind: "verification", component: "tool", title: "high cardinality", data: { final_test_result: { executed_checks: Array.from({ length: 65 }, (_, index) => "v" + index) } } })`,
+        `CaseTrace.node({ node_id: "high_cardinality", kind: "verification", component: "tool", title: "high cardinality", data: { final_test_result: { executed_checks: ${JSON.stringify(inputChecks)}, checks_by_name: ${JSON.stringify(inputChecksByName)}, inline_checks: ${JSON.stringify(inlineChecks)} } } })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -5508,13 +5556,25 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const record = trace.records.find((item: any) => item.record_id === "high_cardinality")
     const checks = record.data.final_test_result.executed_checks
-    const artifact = trace.artifacts.find((item: any) => item.artifact_id === checks.artifact_id)
+    const checksByName = record.data.final_test_result.checks_by_name
+    const arrayArtifact = trace.artifacts.find((item: any) => item.artifact_id === checks.artifact_id)
+    const objectArtifact = trace.artifacts.find((item: any) => item.artifact_id === checksByName.artifact_id)
 
     expect(checks.type).toBe("array")
     expect(checks.artifact_id).toBeTruthy()
     expect(checks.payload_ref).toBe(checks.artifact_id)
-    expect(artifact).toBeTruthy()
-    expect(await fs.readFile(path.join(caseDir, artifact.path), "utf8")).toContain("v64")
+    expect(JSON.parse(await fs.readFile(path.join(caseDir, arrayArtifact.path), "utf8"))).toEqual(
+      Array.from({ length: 65 }, (_, index) => `v${index}`),
+    )
+    expect(checksByName.type).toBe("object")
+    expect(checksByName.artifact_id).toBeTruthy()
+    expect(checksByName.payload_ref).toBe(checksByName.artifact_id)
+    expect(JSON.parse(await fs.readFile(path.join(caseDir, objectArtifact.path), "utf8"))).toEqual(
+      Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`check_${index}`, `v${index}`])),
+    )
+    expect(record.data.final_test_result.inline_checks).toEqual(
+      Array.from({ length: 64 }, (_, index) => `i${index}`),
+    )
   })
 
   test("keeps generated array summaries intact while rejecting summary-shaped business data", async () => {
