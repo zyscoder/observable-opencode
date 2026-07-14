@@ -117,6 +117,7 @@ export type ProvenanceCompatibilityRecord = ProvenanceRecord
 export type ProvenanceCompatibilityDataflowEdge = Omit<DataflowEdge, "metadata"> & {
   metadata: Record<string, unknown> & {
     original_relation: string
+    normalized_relation: FormalDataflowRelation
     evidence_tier: CausalEvidenceTier
     eligible_for_attribution: boolean
     derivation_method: string
@@ -194,6 +195,14 @@ function canonicalEdge(edge: CausalEdgeLike): CausalEdgeLike {
     ...edge,
     ...canonicalRelationAttributes(edge),
   }
+}
+
+function normalizeEdges(edges: CausalEdgeLike[]) {
+  const normalized: CausalEdgeLike[] = []
+  for (const edge of edges) {
+    replaceByID(normalized, "edge_id", canonicalEdge(edge))
+  }
+  return normalized
 }
 
 function unknownRelationDiagnostic(edge: CausalEdgeLike): CausalIRDiagnosticLike | undefined {
@@ -326,7 +335,7 @@ export class CausalIRStore {
   }
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
-    const canonical = canonicalEdge(edge)
+    const [canonical] = normalizeEdges([edge])
     replaceByID(this.edges, "edge_id", canonical)
     this.append("edge.created", "edge", canonical.edge_id, canonical)
     this.reconcileUnknownRelationDiagnostics()
@@ -334,7 +343,7 @@ export class CausalIRStore {
   }
 
   replaceEdges(edges: CausalEdgeLike[]): void {
-    const canonical = edges.map(canonicalEdge)
+    const canonical = normalizeEdges(edges)
     replaceAll(this.edges, canonical)
     this.rebuildPayloadHashes("edge", this.edges, "edge_id")
     this.reconcileUnknownRelationDiagnostics()
@@ -458,7 +467,8 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
     }
 
     if (entry.operation === "edge.created" && entry.data && typeof entry.data === "object") {
-      replaceByID(edges, "edge_id", canonicalEdge(entry.data as CausalEdgeLike))
+      const [canonical] = normalizeEdges([entry.data as CausalEdgeLike])
+      replaceByID(edges, "edge_id", canonical)
       continue
     }
 
@@ -477,7 +487,7 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
       if (typeof snapshot.runID === "string") runID = snapshot.runID
       if (typeof snapshot.caseID === "string") caseID = snapshot.caseID
       replaceAll(nodes, journalData(snapshot.nodes))
-      replaceAll(edges, journalData(snapshot.edges).map(canonicalEdge))
+      replaceAll(edges, normalizeEdges(journalData(snapshot.edges)))
       replaceAll(artifacts, journalData(snapshot.artifacts))
       replaceAll(diagnostics, journalData(snapshot.diagnostics))
     }
@@ -532,6 +542,24 @@ function provenanceLabel(label: string | undefined) {
   return label.replace(/final response evidence/gi, "response output").replace(/final claim/gi, "response output")
 }
 
+function projectedEdgeMetadata(edge: CausalEdgeLike, attributes: CanonicalRelationAttributes) {
+  const metadata = { ...edge.metadata }
+  delete metadata.original_relation
+  delete metadata.normalized_relation
+  delete metadata.evidence_tier
+  delete metadata.eligible_for_attribution
+  delete metadata.derivation_method
+
+  return {
+    ...metadata,
+    original_relation: attributes.original_relation,
+    normalized_relation: attributes.normalized_relation,
+    evidence_tier: attributes.evidence_tier,
+    eligible_for_attribution: attributes.eligible_for_attribution,
+    derivation_method: attributes.derivation_method,
+  }
+}
+
 export function projectProvenanceTrace(
   snapshot: CausalIRStoreSnapshot,
   input: ProvenanceProjectionInput,
@@ -570,13 +598,7 @@ export function projectProvenanceTrace(
       to: provenanceRef(edge.to),
       relation: attributes.normalized_relation,
       label: provenanceLabel(edge.label),
-      metadata: {
-        ...edge.metadata,
-        original_relation: attributes.original_relation,
-        evidence_tier: attributes.evidence_tier,
-        eligible_for_attribution: attributes.eligible_for_attribution,
-        derivation_method: attributes.derivation_method,
-      },
+      metadata: projectedEdgeMetadata(edge, attributes),
     } satisfies ProvenanceCompatibilityDataflowEdge
   })
   const spans = new Set(records.flatMap((record) => (record.span_id ? [record.span_id] : []))).size

@@ -295,6 +295,7 @@ describe("causal IR store", () => {
     expect(projection.dataflow_edges[0]?.metadata).toEqual({
       retained: true,
       original_relation: "source_to_observation",
+      normalized_relation: "derived_from",
       evidence_tier: "confirmed",
       eligible_for_attribution: true,
       derivation_method: "explicit_relation",
@@ -763,5 +764,104 @@ describe("causal IR store", () => {
         relation: "custom_lifecycle",
       }),
     ])
+  })
+
+  test("last write wins when replaceEdges receives duplicate edge IDs", () => {
+    const store = new CausalIRStore({ runID: "run_replace_duplicates", caseID: "case_replace_duplicates" })
+
+    store.replaceEdges([
+      relationEdge("edge_duplicate", "custom_first"),
+      relationEdge("edge_duplicate", "custom_last"),
+    ])
+
+    expect(store.edges).toEqual([
+      expect.objectContaining({
+        edge_id: "edge_duplicate",
+        original_relation: "custom_last",
+        normalized_relation: "derived_from",
+      }),
+    ])
+    expect(store.diagnostics).toEqual([
+      expect.objectContaining({
+        diagnostic_id: "unknown_relation:edge_duplicate",
+        relation: "custom_last",
+      }),
+    ])
+  })
+
+  test("last write wins for duplicate edge IDs in lifecycle snapshots", () => {
+    const replayed = replayCausalIRJournal([
+      {
+        sequence: 1,
+        time: "2026-07-14T08:00:00.000Z",
+        run_id: "run_lifecycle_duplicates",
+        case_id: "case_lifecycle_duplicates",
+        operation: "case.checkpointed",
+        record_type: "checkpoint",
+        entity_id: "case_lifecycle_duplicates",
+        data: {
+          snapshot: {
+            version: "1.0",
+            runID: "run_lifecycle_duplicates",
+            caseID: "case_lifecycle_duplicates",
+            nodes: [],
+            edges: [
+              relationEdge("edge_duplicate", "custom_first"),
+              relationEdge("edge_duplicate", "custom_last"),
+            ],
+            artifacts: [],
+            diagnostics: [],
+          },
+          data: { phase: "checkpoint" },
+        },
+      },
+    ])
+
+    expect(replayed.edges).toEqual([
+      expect.objectContaining({
+        edge_id: "edge_duplicate",
+        original_relation: "custom_last",
+        normalized_relation: "derived_from",
+      }),
+    ])
+    expect(replayed.diagnostics).toEqual([
+      expect.objectContaining({
+        diagnostic_id: "unknown_relation:edge_duplicate",
+        relation: "custom_last",
+      }),
+    ])
+  })
+
+  test("overwrites reserved projected relation metadata with canonical values", () => {
+    const store = new CausalIRStore({ runID: "run_projection_metadata", caseID: "case_projection_metadata" })
+    store.createEdge({
+      ...relationEdge("edge_projection_metadata", "custom_relation"),
+      metadata: {
+        retained: true,
+        normalized_relation: "produced",
+        original_relation: "forged_original",
+        evidence_tier: "content_matched",
+        eligible_for_attribution: true,
+        derivation_method: "forged_method",
+      },
+    })
+
+    const projection = projectProvenanceTrace(store.snapshot(), {
+      traceVersion: "5.6",
+      manifest: { case_id: "case_projection_metadata", run_id: "run_projection_metadata" },
+      metrics: { token_usage: {}, trace_health: { issues: [] } },
+    })
+
+    expect(projection.dataflow_edges[0]).toMatchObject({
+      relation: "derived_from",
+      metadata: {
+        retained: true,
+        original_relation: "custom_relation",
+        normalized_relation: "derived_from",
+        evidence_tier: "content_matched",
+        eligible_for_attribution: false,
+        derivation_method: "forged_method",
+      },
+    })
   })
 })
