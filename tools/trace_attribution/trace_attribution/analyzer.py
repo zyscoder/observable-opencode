@@ -195,6 +195,14 @@ class BackwardTaintAnalyzer:
                     judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
                     judgment = fallback_judgment_after_error(node=node, upstream_nodes=upstream_nodes, error=exc)
             judgments[ref] = judgment
+
+            episode_predecessors = semantic_episode_predecessors(graph, episode_index, ref)
+            if episode_predecessors:
+                if depth >= self.max_depth:
+                    depth_limit_hit = True
+                else:
+                    for predecessor_ref in episode_predecessors:
+                        queue.append((predecessor_ref, path + [predecessor_ref], depth + 1))
             if judgment.defect_status != "present":
                 continue
 
@@ -286,6 +294,110 @@ class BackwardTaintAnalyzer:
             root_causes[ref] = candidate
             root_paths[ref] = path
 
+        confirm_root = getattr(self.judge, "confirm_root", None)
+        if callable(confirm_root):
+            for ref in list(root_causes):
+                node = graph.hydrate_node(ref)
+                try:
+                    confirmed = confirm_root(
+                        node=node,
+                        judgment=judgments[ref],
+                        downstream_context=semantic_downstream_context(
+                            graph,
+                            root_paths.get(ref, [start_ref, ref]),
+                        ),
+                        objective=objective,
+                    )
+                except Exception as exc:
+                    judge_errors.append(
+                        {
+                            "node_ref": ref,
+                            "stage": "root_confirmation",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    confirmed = fallback_judgment_after_error(
+                        node=node,
+                        upstream_nodes=[],
+                        error=exc,
+                    )
+                judgments[ref] = confirmed
+                if not (
+                    confirmed.defect_status == "present"
+                    and confirmed.causal_role == "defect_introduction"
+                    and confirmed.is_root_cause
+                ):
+                    root_causes.pop(ref, None)
+                    root_paths.pop(ref, None)
+
+        for ref, judgment in list(judgments.items()):
+            if judgment.defect_status != "present" or judgment.causal_role != "defect_propagation":
+                continue
+            predecessor_refs = [
+                graph.resolve(item.upstream_ref) or item.upstream_ref
+                for item in judgment.influenced_by
+                if item.relation == "defect_propagated_from"
+            ]
+            if not predecessor_refs or any(item not in judgments for item in predecessor_refs):
+                continue
+            if any(judgments[item].defect_status != "absent" for item in predecessor_refs):
+                continue
+            retained_influences = [
+                item for item in judgment.influenced_by if item.relation != "defect_propagated_from"
+            ]
+            promoted = replace(
+                judgment,
+                causal_role="defect_introduction",
+                is_root_cause=True,
+                influenced_by=retained_influences,
+                model_notes=(
+                    (judgment.model_notes + "; ") if judgment.model_notes else ""
+                )
+                + "reclassified as introduction after every claimed defect predecessor was independently rejected",
+            )
+            judgments[ref] = promoted
+            node = graph.hydrate_node(ref)
+            candidate = RootCauseCandidate(
+                node_ref=ref,
+                component=node.component,
+                event_type=node.event_type,
+                defect_type=promoted.defect_type,
+                reason=promoted.defect_reason,
+                confidence=promoted.confidence,
+            )
+            root_causes[ref] = candidate
+            root_paths[ref] = visited_paths.get(ref, [start_ref, ref])
+            if not callable(confirm_root):
+                continue
+            try:
+                reconfirmed = confirm_root(
+                    node=node,
+                    judgment=promoted,
+                    downstream_context=semantic_downstream_context(graph, root_paths[ref]),
+                    objective=objective,
+                )
+            except Exception as exc:
+                judge_errors.append(
+                    {
+                        "node_ref": ref,
+                        "stage": "root_confirmation_after_boundary_reclassification",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                reconfirmed = fallback_judgment_after_error(
+                    node=node,
+                    upstream_nodes=[],
+                    error=exc,
+                )
+            judgments[ref] = reconfirmed
+            if not (
+                reconfirmed.defect_status == "present"
+                and reconfirmed.causal_role == "defect_introduction"
+                and reconfirmed.is_root_cause
+            ):
+                root_causes.pop(ref, None)
+                root_paths.pop(ref, None)
+
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
             "node_limit" if node_limit_hit else "depth_limit" if depth_limit_hit else "queue_exhausted"
@@ -350,6 +462,48 @@ class BackwardTaintAnalyzer:
         if judgment.is_root_cause:
             return []
         return []
+
+
+def semantic_episode_predecessors(
+    graph: TraceGraph,
+    episode_index: CausalEpisodeIndex,
+    current_ref: str,
+) -> List[str]:
+    current = graph.nodes.get(current_ref)
+    if not current or current.event_type not in {
+        "change",
+        "tool.call",
+        "tool.result",
+        "tool.error",
+        "execution.observation",
+        "verification",
+    }:
+        return []
+
+    current_position = graph.position(current_ref)
+    earlier_members = [
+        ref
+        for ref in episode_index.episode_for(current_ref).member_refs
+        if graph.position(ref) < current_position
+    ]
+    authored_action_refs = []
+    reasoning_refs = []
+    tool_call_refs = []
+    for ref in earlier_members:
+        node = graph.nodes.get(ref)
+        if not node:
+            continue
+        if node.event_type == "tool.call":
+            tool_call_refs.append(ref)
+            continue
+        if node.event_type != "decision":
+            continue
+        decision_type = str(node.data.get("decision_type") or "").strip().lower()
+        if decision_type == "reasoning_block":
+            reasoning_refs.append(ref)
+        elif decision_type in {"llm_tool_call", "agent_tool_call", "tool_call"}:
+            authored_action_refs.append(ref)
+    return dedupe(reasoning_refs + authored_action_refs + ([] if authored_action_refs else tool_call_refs[:1]))
 
 
 def collapse_episode_roots(

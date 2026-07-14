@@ -234,6 +234,13 @@ export type TraceChangeSemantics = {
   summary?: string
 }
 
+export type TraceSourceRefRelation = {
+  source_ref: string
+  relation: "materialized_by_action" | "executed_in_span" | "motivated_by_evidence" | "explicit_provenance" | string
+  inference: "runtime_identity" | "recent_failed_verification" | "explicit" | string
+  confidence: number
+}
+
 export type TraceChangeRecord = {
   change_id: string
   span_id?: string
@@ -249,6 +256,7 @@ export type TraceChangeRecord = {
   diff_semantics?: Record<string, unknown>
   quality_flags?: string[]
   source_refs?: string[]
+  source_ref_relations?: TraceSourceRefRelation[]
   verification_refs?: string[]
   metadata?: Record<string, unknown>
 }
@@ -673,6 +681,7 @@ export type DataflowEdge = {
     | "verified_by"
     | "modified_by"
     | "failed_before"
+    | "motivated_by_evidence"
     | "read_from"
     | "returned_by"
     | "submitted"
@@ -5310,10 +5319,42 @@ class ActiveCaseTrace {
   change(input: ChangeRecordInput) {
     const revisionBefore = this.repositoryRevision
     const revisionAfter = revisionBefore + 1
-    const sourceRefs =
-      input.source_refs ??
-      input.evidence_refs ??
-      (this.recentFailedVerificationID ? [`verification:${this.recentFailedVerificationID}`] : undefined)
+    const explicitSourceRefs = input.source_refs ?? input.evidence_refs ?? []
+    const actionSourceRefs = dedupeStrings([
+      ...(input.tool_call_id ? [`tool_call:${input.tool_call_id}`] : []),
+      ...(input.span_id ? [`span:${input.span_id}`] : []),
+    ])
+    const motivatingEvidenceRefs = this.recentFailedVerificationID
+      ? [`verification:${this.recentFailedVerificationID}`]
+      : []
+    const collectedSourceRefs = dedupeStrings([...actionSourceRefs, ...explicitSourceRefs, ...motivatingEvidenceRefs])
+    const sourceRefs = collectedSourceRefs.length ? collectedSourceRefs : undefined
+    const collectedSourceRefRelations = [
+      ...actionSourceRefs.map((sourceRef): TraceSourceRefRelation => ({
+        source_ref: sourceRef,
+        relation: sourceRef.startsWith("tool_call:") ? "materialized_by_action" : "executed_in_span",
+        inference: "runtime_identity",
+        confidence: 1,
+      })),
+      ...explicitSourceRefs.map((sourceRef): TraceSourceRefRelation => ({
+        source_ref: sourceRef,
+        relation: "explicit_provenance",
+        inference: "explicit",
+        confidence: 1,
+      })),
+      ...motivatingEvidenceRefs.map((sourceRef): TraceSourceRefRelation => ({
+        source_ref: sourceRef,
+        relation: "motivated_by_evidence",
+        inference: "recent_failed_verification",
+        confidence: 0.8,
+      })),
+    ].filter(
+      (item, index, items) =>
+        items.findIndex(
+          (candidate) => candidate.source_ref === item.source_ref && candidate.relation === item.relation,
+        ) === index,
+    )
+    const sourceRefRelations = collectedSourceRefRelations.length ? collectedSourceRefRelations : undefined
     const targetRole = input.change_target_role ?? changeTargetRole(input.files)
     const baseChangeSemantics = input.change_semantics ?? changeSemanticsFromDiff(input.diff)
     const changedTestOracle =
@@ -5346,6 +5387,7 @@ class ActiveCaseTrace {
       diff_semantics: diffSemantics,
       quality_flags: qualityFlags,
       source_refs: sourceRefs,
+      source_ref_relations: sourceRefRelations,
       verification_refs: input.verification_refs,
       metadata: input.metadata,
     }
@@ -5371,6 +5413,7 @@ class ActiveCaseTrace {
         diff_semantics: diffSemantics,
         quality_flags: qualityFlags,
         source_refs: sourceRefs,
+        source_ref_relations: sourceRefRelations,
         verification_refs: input.verification_refs,
         metadata: input.metadata,
       },
@@ -5388,8 +5431,13 @@ class ActiveCaseTrace {
       this.edge({
         from: { type: "verification", id: this.recentFailedVerificationID },
         to: { type: "change", id: change.change_id },
-        relation: "failure_to_change",
-        label: "Change followed a failed verification record",
+        relation: "motivated_by_evidence",
+        label: "Failed verification may have motivated the change; it does not carry the change defect",
+        metadata: {
+          causal_semantics: "motivation_not_defect_propagation",
+          inference: "recent_failed_verification",
+          confidence: 0.8,
+        },
       })
     }
     return change

@@ -7,6 +7,7 @@ from .models import AttributionReport, JsonDict, RootCauseCandidate, TraceNode
 
 def build_trace_improvement_report(graph: Any, report: AttributionReport) -> JsonDict:
     blocking_gaps: List[JsonDict] = []
+    advisory_gaps: List[JsonDict] = []
     recommendations: List[JsonDict] = []
 
     if not report.start_refs:
@@ -171,6 +172,12 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
             unblocks=["judge_error"],
         )
 
+    unknown_branch_outcomes: Dict[str, List[str]] = {}
+    for branch in report.defect_branches:
+        for ref, judgment in branch.node_judgments.items():
+            if judgment.defect_status == "unknown":
+                unknown_branch_outcomes.setdefault(ref, []).append(branch.analysis_outcome)
+
     for ref, judgment in report.node_judgments.items():
         if judgment.defect_status != "unknown":
             continue
@@ -187,23 +194,35 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
             else ["decisive_semantic_evidence"]
         )
         detail = judgment.model_notes or judgment.defect_reason or "The judge could not classify this node."
+        outcomes = unknown_branch_outcomes.get(ref) or []
+        gap_target = (
+            advisory_gaps
+            if outcomes and all(outcome == "root_found" for outcome in outcomes)
+            else blocking_gaps
+        )
         add_gap(
-            blocking_gaps,
+            gap_target,
             gap_type="unknown_node_judgment",
             node=node,
             why=(
                 "Backward analysis could not classify this node as defective or non-defective. "
-                f"Blocking detail: {detail}"
+                + (
+                    "The active defect branch still reached a confirmed root episode, so this is retained "
+                    "as an advisory completeness gap. "
+                    if gap_target is advisory_gaps
+                    else "This remains a blocking gap for at least one active defect branch. "
+                )
+                + f"Detail: {detail}"
             ),
             missing_semantic_fields=missing_fields,
             related_refs=[ref],
             confidence=1.0,
         )
-        blocking_gaps[-1]["component"] = gap_component
+        gap_target[-1]["component"] = gap_component
         add_recommendation(
             recommendations,
             component=gap_component or "trace",
-            priority="high",
+            priority="medium" if gap_target is advisory_gaps else "high",
             change=(
                 "Hydrate the cited trace artifact before judging this node."
                 if gap_component == "attribution_hydration"
@@ -318,14 +337,17 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
         )
 
     blocking_gaps = dedupe_gaps(blocking_gaps)
+    advisory_gaps = dedupe_gaps(advisory_gaps)
     recommendations = dedupe_recommendations(recommendations)
     return {
         "summary": {
             "blocking_gap_count": len(blocking_gaps),
+            "advisory_gap_count": len(advisory_gaps),
             "recommended_change_count": len(recommendations),
             "analysis_confidence": analysis_confidence(blocking_gaps, report),
         },
         "blocking_gaps": blocking_gaps,
+        "advisory_gaps": advisory_gaps,
         "recommended_trace_changes": recommendations,
     }
 
@@ -359,14 +381,19 @@ def has_meaningful_value(value: Any) -> bool:
 
 def defective_nodes_pointing_to_nondefective_upstream(report: AttributionReport) -> List[str]:
     refs = []
-    for ref, judgment in report.node_judgments.items():
-        if not judgment.has_defect:
-            continue
-        for influence in judgment.influenced_by:
-            upstream = report.node_judgments.get(influence.upstream_ref)
-            if upstream and not upstream.has_defect:
-                refs.append(f"{ref}->{influence.upstream_ref}")
-    return refs
+    branch_judgments = [branch.node_judgments for branch in report.defect_branches]
+    judgment_sets = branch_judgments or [report.node_judgments]
+    for judgments in judgment_sets:
+        for ref, judgment in judgments.items():
+            if judgment.defect_status != "present" or judgment.causal_role != "defect_propagation":
+                continue
+            for influence in judgment.influenced_by:
+                if influence.relation != "defect_propagated_from":
+                    continue
+                upstream = judgments.get(influence.upstream_ref)
+                if upstream and upstream.defect_status == "absent":
+                    refs.append(f"{ref}->{influence.upstream_ref}")
+    return dedupe(refs)
 
 
 def path_refs_containing(paths: Iterable[List[str]], ref: str) -> List[str]:

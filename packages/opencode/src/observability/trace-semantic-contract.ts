@@ -1,6 +1,6 @@
 import type { TraceComponent } from "./case-trace"
 
-export const TRACE_VERSION = "5.5" as const
+export const TRACE_VERSION = "5.6" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
@@ -55,6 +55,7 @@ export const FORMAL_DATAFLOW_RELATIONS = [
   "verified_by",
   "modified_by",
   "failed_before",
+  "motivated_by_evidence",
   "read_from",
   "returned_by",
   "submitted",
@@ -82,7 +83,7 @@ const FORMAL_RELATION_SET = new Set<string>(FORMAL_DATAFLOW_RELATIONS)
 const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
   tool_to_change: "modified_by",
   tool_to_observation: "produced",
-  failure_to_change: "failed_before",
+  failure_to_change: "motivated_by_evidence",
   change_to_verification: "verified_by",
   context_to_llm: "prompted",
   compaction_to_context: "compressed_to",

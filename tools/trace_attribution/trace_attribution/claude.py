@@ -7,7 +7,8 @@ import queue
 import re
 import signal
 import threading
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from dataclasses import replace
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 from .analyzer import JudgeClient
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
@@ -100,6 +101,7 @@ class ClaudeJudgeClient(JudgeClient):
         downstream_context: List[str],
         objective: str,
     ) -> NodeJudgment:
+        allowed_upstream_refs = {item.ref for item in upstream_nodes}
         prompt = build_judgment_prompt(
             node=node,
             upstream_nodes=upstream_nodes,
@@ -113,18 +115,160 @@ class ClaudeJudgeClient(JudgeClient):
         )
         try:
             payload = parse_json_object(text)
-            validate_judgment_payload(payload)
-        except (TypeError, ValueError):
+            validate_judgment_payload(
+                payload,
+                node=node,
+                allowed_upstream_refs=allowed_upstream_refs,
+            )
+        except (TypeError, ValueError) as validation_error:
             try:
-                payload = self._repair_json_response(text=text, node=node)
-            except ValueError as repair_error:
-                payload = self._retry_json_response(
-                    prompt=prompt,
+                payload = self._repair_json_response(
+                    text=text,
                     node=node,
-                    malformed_text=text,
-                    repair_error=repair_error,
+                    validation_error=validation_error,
+                    allowed_upstream_refs=allowed_upstream_refs,
                 )
+            except ValueError as repair_error:
+                try:
+                    payload = self._retry_json_response(
+                        prompt=prompt,
+                        node=node,
+                        malformed_text=text,
+                        repair_error=repair_error,
+                        allowed_upstream_refs=allowed_upstream_refs,
+                    )
+                except (TypeError, ValueError) as retry_error:
+                    return exhausted_schema_unknown_judgment(node=node, error=retry_error)
         return judgment_from_dict(payload, node)
+
+    def confirm_root(
+        self,
+        *,
+        node: TraceNode,
+        judgment: NodeJudgment,
+        downstream_context: List[str],
+        objective: str,
+    ) -> NodeJudgment:
+        prompt = build_root_confirmation_prompt(
+            node=node,
+            judgment=judgment,
+            downstream_context=downstream_context,
+            objective=objective,
+        )
+        text = self._create_message_text(
+            system=(
+                "You independently verify a proposed semantic-trace root cause. Try to falsify the proposal. "
+                "Use only the current node's own recorded semantics. Return one JSON object and no markdown."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=min(self.max_tokens, 2048),
+        )
+        try:
+            payload = parse_json_object(text)
+            validate_root_confirmation_payload(payload, node=node)
+        except (TypeError, ValueError) as validation_error:
+            repaired = self._create_message_text(
+                system=(
+                    "Repair an invalid root-confirmation JSON object. Correct the stated validation error "
+                    "using only the supplied current-node facts. Return one JSON object and no markdown."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": stable_json(
+                            {
+                                "malformed_output": text[:8000],
+                                "validation_error": f"{type(validation_error).__name__}: {validation_error}",
+                                "current_node": node.compact(max_chars=CURRENT_NODE_PROMPT_CHARS),
+                                "artifact_evidence": compact_artifact_evidence([node]),
+                                "required_node_ref": node.ref,
+                                "required_fields": {
+                                    "node_ref": node.ref,
+                                    "confirmation": "confirmed|rejected|unknown",
+                                    "exact_semantic_excerpt": "verbatim current-node excerpt",
+                                    "current_node_would_cause_defect_if_executed_exactly": False,
+                                    "reason": "node-local reason",
+                                    "confidence": 0.0,
+                                },
+                                "repair_rules": [
+                                    "confirmed requires current_node_would_cause_defect_if_executed_exactly=true",
+                                    "rejected requires current_node_would_cause_defect_if_executed_exactly=false",
+                                    "The exact excerpt must be copied from the current node or hydrated artifact.",
+                                ],
+                            }
+                        ),
+                    }
+                ],
+                max_tokens=min(self.repair_max_tokens, 1024),
+            )
+            try:
+                payload = parse_json_object(repaired)
+                validate_root_confirmation_payload(payload, node=node)
+            except (TypeError, ValueError) as repair_error:
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_status="unknown",
+                    defect_type="root_confirmation_error",
+                    defect_reason="The proposed root could not be independently confirmed.",
+                    causal_role="unknown",
+                    branch_relation="unknown",
+                    influenced_by=[],
+                    is_root_cause=False,
+                    severity="unknown",
+                    confidence=0.0,
+                    model_notes=(
+                        f"root confirmation invalid: {type(validation_error).__name__}: {validation_error}; "
+                        f"repair invalid: {type(repair_error).__name__}: {repair_error}"
+                    ),
+                )
+        confirmation = str(payload.get("confirmation") or "").strip().lower()
+        reason = str(payload.get("reason") or "").strip()
+        confidence = float(payload.get("confidence") or 0.0)
+        if confirmation == "confirmed":
+            notes = "root independently confirmed"
+            if judgment.model_notes:
+                notes = f"{judgment.model_notes}; {notes}"
+            return replace(
+                judgment,
+                confidence=min(judgment.confidence, confidence) if judgment.confidence else confidence,
+                model_notes=notes,
+            )
+        if confirmation == "rejected":
+            return NodeJudgment(
+                node_ref=node.ref,
+                component=node.component,
+                event_type=node.event_type,
+                has_defect=False,
+                defect_status="absent",
+                defect_type="",
+                defect_reason=reason,
+                causal_role="non_defective",
+                branch_relation="unrelated",
+                influenced_by=[],
+                is_root_cause=False,
+                severity="unknown",
+                confidence=confidence,
+                model_notes="proposed root rejected by independent node-local confirmation",
+            )
+        return NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=False,
+            defect_status="unknown",
+            defect_type="root_confirmation_unknown",
+            defect_reason=reason,
+            causal_role="unknown",
+            branch_relation="unknown",
+            influenced_by=[],
+            is_root_cause=False,
+            severity="unknown",
+            confidence=confidence,
+            model_notes="root confirmation lacked decisive node-local evidence",
+        )
 
     def _retry_json_response(
         self,
@@ -133,6 +277,7 @@ class ClaudeJudgeClient(JudgeClient):
         node: TraceNode,
         malformed_text: str,
         repair_error: Exception,
+        allowed_upstream_refs: Set[str],
     ) -> Dict[str, Any]:
         retried = self._create_message_text(
             system=(
@@ -155,10 +300,21 @@ class ClaudeJudgeClient(JudgeClient):
             max_tokens=self.max_tokens,
         )
         payload = parse_json_object(retried)
-        validate_judgment_payload(payload)
+        validate_judgment_payload(
+            payload,
+            node=node,
+            allowed_upstream_refs=allowed_upstream_refs,
+        )
         return payload
 
-    def _repair_json_response(self, *, text: str, node: TraceNode) -> Dict[str, Any]:
+    def _repair_json_response(
+        self,
+        *,
+        text: str,
+        node: TraceNode,
+        validation_error: Exception,
+        allowed_upstream_refs: Set[str],
+    ) -> Dict[str, Any]:
         repaired = self._create_message_text(
             system=(
                 "You repair malformed JSON emitted by an offline trace attribution reviewer. "
@@ -171,10 +327,13 @@ class ClaudeJudgeClient(JudgeClient):
                     "content": stable_json(
                         {
                             "malformed_output": text[:8000],
+                            "validation_error": f"{type(validation_error).__name__}: {validation_error}",
+                            "allowed_upstream_refs": sorted(allowed_upstream_refs),
                             "fallback_node": {
                                 "node_ref": node.ref,
                                 "component": node.component,
                                 "event_type": node.event_type,
+                                "semantic_role": semantic_role_for_node(node),
                             },
                             "required_fields": [
                                 "node_ref",
@@ -193,6 +352,7 @@ class ClaudeJudgeClient(JudgeClient):
                                 "model_notes",
                             ],
                             "repair_rules": [
+                                "Correct the specific validation_error before returning the repaired judgment.",
                                 "Preserve any clear judgment already present in malformed_output.",
                                 "defect_status must be present, absent, or unknown; use unknown when the evidence is insufficient.",
                                 "When defect_status is absent, defect_type must be an empty string and the reason must not describe the current node as defective.",
@@ -200,7 +360,10 @@ class ClaudeJudgeClient(JudgeClient):
                                 "causal_role must be defect_introduction, defect_propagation, defect_evidence, non_defective, or unknown.",
                                 "branch_relation must be same_defect, causal_precursor, outcome_evidence, unrelated, or unknown.",
                                 "Each influenced_by item must classify relation as defect_propagated_from, motivated_by_evidence, or derived_from.",
+                                "Every influenced_by.upstream_ref must be one of allowed_upstream_refs; never emit unknown, none, or a fabricated ref.",
+                                "A defect_propagated_from reason must state how the upstream already contains the same defect; mere motivation or evidence requires motivated_by_evidence.",
                                 "A faithful test or tool result that exposes a failure is defect_evidence, not defect_introduction.",
+                                "An authored_agent_action is never outcome evidence: a defective action is introduction or propagation, and a correct action is non-defective.",
                                 "A defect-introduction root may retain motivated_by_evidence or derived_from influences, but never defect_propagated_from.",
                                 "If another field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
                                 "Use fallback_node values for node_ref, component, and event_type when missing.",
@@ -213,11 +376,17 @@ class ClaudeJudgeClient(JudgeClient):
         )
         try:
             payload = parse_json_object(repaired)
-            validate_judgment_payload(payload)
+            validate_judgment_payload(
+                payload,
+                node=node,
+                allowed_upstream_refs=allowed_upstream_refs,
+            )
             return payload
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 "Claude response did not contain a complete judgment object after repair. "
+                f"Original validation: {type(validation_error).__name__}: {validation_error}. "
+                f"Repair validation: {type(exc).__name__}: {exc}. "
                 f"Original: {text[:200]} Repaired: {repaired[:200]}"
             ) from exc
 
@@ -288,6 +457,7 @@ def build_judgment_prompt(
     payload = {
         "objective": objective,
         "current_node": current_node,
+        "current_node_semantic_role": semantic_role_for_node(node),
         "upstream_nodes": compact_upstream_nodes,
         "artifact_evidence": artifact_evidence,
         "active_defect_branch": {
@@ -316,6 +486,9 @@ def build_judgment_prompt(
             "Classify branch_relation relative to active_defect_branch; unrelated defects must not become roots for this branch.",
             "A truthful environment or tool result may motivate a decision but does not propagate the decision's defect; label that edge motivated_by_evidence.",
             "Authored tool-call arguments or test scripts are action semantics; their execution results are outcome evidence unless the result itself corrupts data.",
+            "For an authored_agent_action, judge the executable arguments or script as the current node's semantics. A defective authored action is defect_introduction or defect_propagation, never defect_evidence.",
+            "A generic intent to run a test does not introduce a defect contained only in a later authored_agent_action.",
+            "A correct current plan is not defective merely because a later action in the same episode is defective; judge each node's own semantics before grouping the episode.",
             "Code size or complexity alone never proves defect introduction; require a concrete semantic mismatch visible in supplied trace facts.",
             "A defect_evidence or defect_propagation node must never be marked is_root_cause=true.",
             "Never set defect_status=absent while using a non-empty defect_type or while describing the current node as a semantic defect.",
@@ -332,6 +505,184 @@ def build_judgment_prompt(
         "required_json_schema": schema,
     }
     return stable_json(payload)
+
+
+def build_root_confirmation_prompt(
+    *,
+    node: TraceNode,
+    judgment: NodeJudgment,
+    downstream_context: List[str],
+    objective: str,
+) -> str:
+    return stable_json(
+        {
+            "objective": objective,
+            "active_defect_branch": downstream_context,
+            "proposed_root_judgment": {
+                "node_ref": judgment.node_ref,
+                "defect_type": judgment.defect_type,
+                "defect_reason": judgment.defect_reason,
+                "confidence": judgment.confidence,
+            },
+            "current_node": node.compact(max_chars=CURRENT_NODE_PROMPT_CHARS),
+            "current_node_semantic_role": semantic_role_for_node(node),
+            "artifact_evidence": compact_artifact_evidence([node]),
+            "rules": [
+                "Try to falsify the proposed root instead of repeating the first judgment.",
+                "Use only the current node's own semantics; a downstream defect or later action cannot make a correct current node defective.",
+                "A confirmed root requires an exact excerpt from the current node that contains the defective choice.",
+                "Apply the counterfactual: set current_node_would_cause_defect_if_executed_exactly=true only when executing this node exactly would itself cause the active defect.",
+                "Reject the root when the exact excerpt describes the opposite of the observed defect.",
+                "Return unknown when the visible node-local evidence is insufficient or truncated at the decisive point.",
+            ],
+            "required_json_schema": {
+                "node_ref": node.ref,
+                "confirmation": "confirmed|rejected|unknown",
+                "exact_semantic_excerpt": "verbatim excerpt from current node, empty only for unknown",
+                "current_node_would_cause_defect_if_executed_exactly": False,
+                "reason": "node-local confirmation or rejection reason",
+                "confidence": 0.0,
+            },
+        }
+    )
+
+
+def validate_root_confirmation_payload(value: Dict[str, Any], *, node: TraceNode) -> None:
+    if not isinstance(value, dict):
+        raise TypeError("root confirmation payload must be an object")
+    if str(value.get("node_ref") or "").strip() != node.ref:
+        raise ValueError("root confirmation node_ref does not match the current node")
+    confirmation = str(value.get("confirmation") or "").strip().lower()
+    if confirmation not in {"confirmed", "rejected", "unknown"}:
+        raise ValueError("root confirmation must be confirmed, rejected, or unknown")
+    reason = str(value.get("reason") or "").strip()
+    if not reason:
+        raise ValueError("root confirmation requires a reason")
+    causation_field = "current_node_would_cause_defect_if_executed_exactly"
+    if not isinstance(value.get(causation_field), bool):
+        raise ValueError("root confirmation requires a boolean counterfactual result")
+    if not isinstance(value.get("confidence"), (int, float)) or isinstance(value.get("confidence"), bool):
+        raise ValueError("root confirmation requires numeric confidence")
+    if confirmation == "rejected" and value[causation_field]:
+        raise ValueError("rejected root requires a false counterfactual causation result")
+    if confirmation != "confirmed":
+        return
+    if not value[causation_field]:
+        raise ValueError("confirmed root requires a true counterfactual defect result")
+    excerpt = str(value.get("exact_semantic_excerpt") or "").strip()
+    if not excerpt:
+        raise ValueError("confirmed root requires an exact semantic excerpt")
+    corpus = normalize_semantic_text(" ".join(semantic_text_fragments(node.data)))
+    if not semantic_excerpt_is_grounded(excerpt, corpus):
+        raise ValueError("exact semantic excerpt is not present in the current node")
+
+
+def normalize_semantic_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def semantic_excerpt_is_grounded(excerpt: str, normalized_corpus: str) -> bool:
+    normalized_excerpt = normalize_semantic_text(excerpt)
+    if normalized_excerpt in normalized_corpus:
+        return True
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?", excerpt)
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "the",
+        "this",
+        "to",
+        "uses",
+        "use",
+        "dispatches",
+        "calls",
+        "requires",
+        "require",
+    }
+    significant = [token for token in raw_tokens if token.lower() not in stop_words]
+    if len(significant) < 2:
+        return False
+    corpus_tokens = set(re.findall(r"[a-z_][a-z0-9_]*|\d+(?:\.\d+)?", normalized_corpus))
+    grounded = [token for token in significant if token.lower() in corpus_tokens]
+    code_grounded = [
+        token
+        for token in grounded
+        if "_" in token or any(character.isupper() for character in token[1:]) or any(character.isdigit() for character in token)
+    ]
+    return len(grounded) >= 2 and len(grounded) / len(significant) >= 0.6 and bool(code_grounded)
+
+
+def semantic_text_fragments(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        output: List[str] = []
+        for item in value.values():
+            output.extend(semantic_text_fragments(item))
+        return output
+    if isinstance(value, (list, tuple)):
+        output = []
+        for item in value:
+            output.extend(semantic_text_fragments(item))
+        return output
+    return []
+
+
+def semantic_role_for_node(node: TraceNode) -> str:
+    if is_authored_agent_action(node):
+        return "authored_agent_action"
+    if node.event_type == "decision" and str(node.data.get("decision_type") or "") == "reasoning_block":
+        return "agent_reasoning_or_plan"
+    if node.event_type in ("tool.result", "tool.error", "verification", "execution.observation"):
+        return "execution_outcome"
+    if node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic"):
+        return "offline_evaluation_assertion"
+    if node.event_type in ("evidence.fact", "evidence.semantic_fact"):
+        return "observed_semantic_fact"
+    return "trace_record"
+
+
+def exhausted_schema_unknown_judgment(*, node: TraceNode, error: Exception) -> NodeJudgment:
+    detail = f"{type(error).__name__}: {error}"
+    return NodeJudgment(
+        node_ref=node.ref,
+        component=node.component,
+        event_type=node.event_type,
+        has_defect=False,
+        defect_status="unknown",
+        defect_type="judge_schema_error",
+        defect_reason="The model judgment remained structurally invalid after repair and retry.",
+        causal_role="unknown",
+        branch_relation="unknown",
+        influenced_by=[],
+        is_root_cause=False,
+        severity="unknown",
+        confidence=0.0,
+        model_notes=f"schema repair exhausted: {detail}",
+    )
+
+
+def is_authored_agent_action(node: TraceNode) -> bool:
+    if node.event_type != "decision":
+        return False
+    decision_type = str(node.data.get("decision_type") or "").strip().lower()
+    if decision_type in {"llm_tool_call", "agent_tool_call", "tool_call"}:
+        return True
+    intent = str(node.data.get("intent") or "").strip().lower()
+    return intent == "model requested tool execution"
 
 
 def compact_artifact_evidence(nodes: List[TraceNode], max_chars: int = ARTIFACT_EVIDENCE_PROMPT_CHARS) -> List[Dict[str, Any]]:
@@ -386,7 +737,12 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     return json.loads(match.group(0))
 
 
-def validate_judgment_payload(value: Dict[str, Any]) -> None:
+def validate_judgment_payload(
+    value: Dict[str, Any],
+    *,
+    node: Optional[TraceNode] = None,
+    allowed_upstream_refs: Optional[Set[str]] = None,
+) -> None:
     if not isinstance(value, dict):
         raise TypeError("judgment payload must be an object")
     raw_status = value.get("defect_status")
@@ -416,11 +772,30 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
         raise ValueError("judgment requires a non-empty defect_reason")
     if not isinstance(value.get("influenced_by"), list):
         raise ValueError("judgment requires influenced_by as a list")
-    influence_relations = [
-        str(item.get("relation") or "defect_propagated_from").strip().lower()
-        for item in value.get("influenced_by") or []
-        if isinstance(item, dict)
-    ]
+    influences = value.get("influenced_by") or []
+    if any(not isinstance(item, dict) for item in influences):
+        raise ValueError("each influenced_by item must be an object")
+    influence_relations = []
+    for item in influences:
+        upstream_ref = str(item.get("upstream_ref") or "").strip()
+        if not upstream_ref or upstream_ref.lower() in {"unknown", "none", "null", "n/a"}:
+            raise ValueError("influenced_by requires a concrete upstream_ref")
+        if allowed_upstream_refs is not None and upstream_ref not in allowed_upstream_refs:
+            raise ValueError(
+                f"influenced_by upstream_ref {upstream_ref} is not in the supplied upstream node set"
+            )
+        influence_reason = str(item.get("reason") or "").strip()
+        if not influence_reason:
+            raise ValueError("influenced_by requires a non-empty reason")
+        relation = str(item.get("relation") or "").strip().lower()
+        influence_relations.append(relation)
+        if relation == "defect_propagated_from" and propagation_reason_only_describes_motivation(
+            influence_reason
+        ):
+            raise ValueError(
+                "defect_propagated_from reason describes motivation/evidence rather than an upstream copy "
+                "of the same defect; use motivated_by_evidence"
+            )
     if any(
         relation not in {"defect_propagated_from", "motivated_by_evidence", "derived_from"}
         for relation in influence_relations
@@ -432,6 +807,11 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
         "is_root_cause"
     ):
         raise ValueError(f"{causal_role} cannot be marked as a root cause")
+    if node and is_authored_agent_action(node) and status == "present" and causal_role == "defect_evidence":
+        raise ValueError(
+            "authored action semantics cannot be classified as defect_evidence; "
+            "use defect_introduction or defect_propagation"
+        )
     if causal_role == "defect_introduction":
         if (
             status != "present"
@@ -464,6 +844,22 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
 
 def speculative_root_reason(reason: str) -> bool:
     return bool(re.search(r"\b(could|may|might|possibly|potentially|perhaps)\b", reason, flags=re.IGNORECASE))
+
+
+def propagation_reason_only_describes_motivation(reason: str) -> bool:
+    normalized = reason.lower()
+    motivation_terms = ("motivat", "prompted", "triggered", "evidence", "exposed")
+    same_defect_terms = (
+        "same defect",
+        "already contains",
+        "already carried",
+        "pre-existing defect",
+        "propagates the defect",
+        "transmits the defect",
+    )
+    return any(term in normalized for term in motivation_terms) and not any(
+        term in normalized for term in same_defect_terms
+    )
 
 
 def call_with_wall_timeout(func: Callable[[], T], timeout_seconds: Optional[float]) -> T:

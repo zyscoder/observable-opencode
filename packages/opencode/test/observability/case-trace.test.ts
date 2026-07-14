@@ -29,7 +29,7 @@ function changeIdFromTrace(trace: any) {
 }
 
 describe("case trace", () => {
-  test("writes trace semantic contract v5.5 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes trace semantic contract v5.6 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -101,6 +101,7 @@ describe("case trace", () => {
       "verified_by",
       "modified_by",
       "failed_before",
+      "motivated_by_evidence",
       "read_from",
       "returned_by",
       "submitted",
@@ -120,13 +121,13 @@ describe("case trace", () => {
       "executed_for_claim",
     ])
 
-    expect(manifest.trace_version).toBe("5.5")
+    expect(manifest.trace_version).toBe("5.6")
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
     expect(manifest.files.trace_html).toBe("trace.html")
     expect(manifest.files.viewer_alias).toBeUndefined()
-    expect(provenance.trace_version).toBe("5.5")
+    expect(provenance.trace_version).toBe("5.6")
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -156,7 +157,7 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v5.5")
+    expect(traceHtml).toContain("Trace v5.6")
     expect(traceHtml).toContain('id="overview"')
     expect(traceHtml).toContain('id="trace-health"')
     expect(traceHtml).toContain('id="agent-flow"')
@@ -246,7 +247,7 @@ describe("case trace", () => {
     ).toBe(true)
   })
 
-  test("writes v5.5 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
+  test("writes v5.6 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-v45.ts")
@@ -287,7 +288,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(eventTypes).toContain("prompt.assembly")
     expect(eventTypes).toContain("context.transform")
     expect(eventTypes).toContain("decision")
@@ -397,7 +398,7 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.unexpected_missing_close_records).toBe(0)
   })
 
-  test("writes v5.5 lifecycle provenance records for LLM turns, exit gates, semantic evidence, and response claims", async () => {
+  test("writes v5.6 lifecycle provenance records for LLM turns, exit gates, semantic evidence, and response claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-lifecycle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "lifecycle-v45.ts")
@@ -445,7 +446,7 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(eventTypes).toContain("llm.turn")
     expect(eventTypes).toContain("agent.lifecycle")
     expect(eventTypes).toContain("exit.gate")
@@ -1622,7 +1623,7 @@ describe("case trace", () => {
     expect(claim.data.match_reasons).toContain("verification_result")
   })
 
-  test("writes v5.5 structurally safe trace JSON and classifies finalized lifecycle records", async () => {
+  test("writes v5.6 structurally safe trace JSON and classifies finalized lifecycle records", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-quality-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "quality-v45.ts")
@@ -1664,7 +1665,7 @@ describe("case trace", () => {
     const trace = JSON.parse(traceText) as any
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(traceText).not.toContain("[Circular]")
     expect(trace.records.filter((record: any) => record.status === "running")).toHaveLength(0)
     const openTurn = trace.records.find((record: any) => record.record_id === "llmturn_open_turn")
@@ -1730,7 +1731,7 @@ describe("case trace", () => {
     expect(provenance.metrics.trace_health.raw_stream_delta_events).toBe(1)
   })
 
-  test("adds v5.5 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
+  test("adds v5.6 semantic fields for source locations, compaction ledger, response visibility, and honest subagent trace refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v4-semantics-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "semantic-fields.ts")
@@ -2821,7 +2822,7 @@ describe("case trace", () => {
     )
     const finalizedLlmTurn = trace.records.find((record: any) => record.record_id === "llmturn_post_final_turn")
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(manifest.status).toBe("success")
     expect(manifest.server_status).toBe("cancelled")
     expect(manifest.process_status).toBe("cancelled")
@@ -3103,7 +3104,7 @@ describe("case trace", () => {
     const claim = trace.records.find((record: any) => record.event_type === "response.claim")
     const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(toolError).toBeTruthy()
     expect(toolError.status).toBe("error")
     expect(toolError.data.call_id).toBe("call_missing")
@@ -3215,7 +3216,7 @@ describe("case trace", () => {
     const claim = trace.records.find((record: any) => record.event_type === "response.claim")
     const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(toolResult).toBeTruthy()
     expect(observation.source_refs).toContain("tool_result:call_read")
     expect(evidence.source_refs).toContain("tool_result:call_read")
@@ -3270,7 +3271,7 @@ describe("case trace", () => {
     const claim = trace.records.find((record: any) => record.event_type === "response.claim")
     const assessment = trace.records.find((record: any) => record.event_type === "claim.support_assessment")
 
-    expect(trace.trace_version).toBe("5.5")
+    expect(trace.trace_version).toBe("5.6")
     expect(claim.data.candidate_tool_outcome_refs).toContain("tool_result:call_discount")
     expect(claim.data.candidate_tool_outcome_refs).toContain("tool_result:call_owner")
     expect(claim.data.dependency_tool_outcome_refs).toContain("tool_result:call_discount")
@@ -3654,7 +3655,7 @@ describe("case trace", () => {
       await fs.readFile(path.join(dir, "sigkill-case", "partial", "latest.json"), "utf8"),
     ) as ProvenanceTraceSummary
 
-    expect(html).toContain("Trace v5.5")
+    expect(html).toContain("Trace v5.6")
     expect(partial.manifest.server_status).toBe("running")
   })
 
@@ -3778,11 +3779,11 @@ describe("case trace", () => {
     expect(html).toContain('class="io-scroll"')
   })
 
-  test("renders v5.5 provenance report with flow-style sections and scrollable IO panes", () => {
+  test("renders v5.6 provenance report with flow-style sections and scrollable IO panes", () => {
     const trace: ProvenanceTraceSummary = {
-      trace_version: "5.5",
+      trace_version: "5.6",
       manifest: {
-        trace_version: "5.5",
+        trace_version: "5.6",
         case_id: "viewer-v46-case",
         run_id: "run_viewer_v46",
         started_at: "2026-06-30T00:00:00.000Z",
@@ -3986,7 +3987,7 @@ describe("case trace", () => {
     ]) {
       expect(html).toContain(`id="${id}"`)
     }
-    expect(html).toContain("Trace v5.5")
+    expect(html).toContain("Trace v5.6")
     expect(html).toContain("Trace Health")
     expect(html).toContain("Claim Evidence Matrix")
     expect(html).toContain("structured_claim")
@@ -4405,6 +4406,67 @@ describe("case trace", () => {
     expect(verifications[1].data.verification_phase).toBe("post_change")
     expect(verifications[1].data.effective_for_final_state).toBe(true)
     expect(verifications[1].data.supersedes_refs).toContain(`verification:${verifications[0].data.verification_id}`)
+  })
+
+  test("classifies direct action and motivating evidence refs on repository changes", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-change-provenance-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "change-provenance-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "edit" })`,
+        `CaseTrace.verification({ verification_id: "host_failure", command: "python -m pytest --version", exit_code: 1, status: "failed", stdout: "unsupported host python" })`,
+        `CaseTrace.change({ span_id: span?.id, tool_call_id: "call_edit", files: ["src/compat.py"], intent: "Patch host compatibility", diff: "- new_api()\\n+ old_api()" })`,
+        `span?.end({ output: { ok: true } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "change-provenance-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "change-provenance-case", "trace.json"), "utf8"),
+    ) as any
+    const change = trace.records.find((record: any) => record.event_type === "change")
+
+    expect(change.source_refs).toContain("tool_call:call_edit")
+    expect(change.source_refs).toContain(`span:${change.span_id}`)
+    expect(change.source_refs).toContain("verification:host_failure")
+    expect(change.data.source_ref_relations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source_ref: "tool_call:call_edit", relation: "materialized_by_action" }),
+        expect.objectContaining({ source_ref: `span:${change.span_id}`, relation: "executed_in_span" }),
+        expect.objectContaining({
+          source_ref: "verification:host_failure",
+          relation: "motivated_by_evidence",
+          inference: "recent_failed_verification",
+        }),
+      ]),
+    )
+    expect(trace.dataflow_edges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          relation: "motivated_by_evidence",
+          metadata: expect.objectContaining({ causal_semantics: "motivation_not_defect_propagation" }),
+        }),
+      ]),
+    )
   })
 
   test("links failed verification to the repository changes it observed", async () => {

@@ -1,0 +1,513 @@
+{
+  "case_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1",
+  "objective": "Baseline current attribution behavior before any changes. Identify why the Sphinx C-domain implementation achieved only 8/14 on the independently runnable hidden-test subset, why its self-verification missed the contract defects, and why unrelated host-compatibility edits were introduced. Treat SIGTERM as external run termination, not as an agent semantic defect.",
+  "start_refs": [
+    "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+    "record:observed_defect_verification_strategy_self_test_does_not_match_interface_contract",
+    "record:observed_defect_scope_management_host_compatibility_changes_outside_feature_scope"
+  ],
+  "root_causes": [
+    {
+      "node_ref": "record:decisionnode_dec_160_d3011460",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "reason": "The decision rationale explicitly plans to implement parse_declaration with a dispatch that requires struct/union/enum declarations to repeat their keyword in the input, even though objectType already supplies the directive type. This directly introduces the incorrect_declaration_parser_contract defect.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:decisionnode_dec_162_d4c07ef3",
+      "component": "processor",
+      "event_type": "decision",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "reason": "The edit in this node introduces the parse_declaration method that dispatches on objectType. For struct, union, and enum, it calls _parse_struct_keyword, _parse_union_keyword, and _parse_enum_keyword respectively, which require the keyword to appear in the input. This contradicts the contract that objectType already supplies the directive type, causing the incorrect_declaration_parser_contract defect. The node also introduces _parse_macro and _parse_macro_parameter_list, which may accept invalid macro declarations. No upstream node introduced this defect; the upstream node (dec_160) only planned the implementation.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:chgnode_chg_2_1ee08ab1",
+      "component": "tool",
+      "event_type": "change",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "reason": "The diff introduces new parse_declaration, _parse_struct_keyword, _parse_union_keyword, _parse_enum_keyword, _parse_macro, and _parse_macro_parameter_list methods. The parse_declaration method for 'struct', 'union', and 'enum' objectTypes calls the keyword-parsing helpers, which require the keyword to appear in the input string even though objectType already specifies the directive type. This redundant keyword requirement is a contract defect that causes test failures. Additionally, the macro parameter parsing logic accepts at least one invalid declaration, as noted in the downstream observed defect. These defects originate in this change; no upstream nodes are supplied.",
+      "confidence": 0.95,
+      "causal_role": "defect_introduction"
+    },
+    {
+      "node_ref": "record:chgnode_chg_5_75e72f77",
+      "component": "tool",
+      "event_type": "change",
+      "defect_type": "c_domain_symbol_resolution_defect",
+      "reason": "This change introduces new methods (_fill_empty, _symbol_lookup, _add_symbols, add_name, add_declaration) and modifies _make_cand_symbol in the C-domain symbol module. The diff shows substantial new logic for symbol lookup and declaration handling that directly affects the C-domain feature contract. The downstream taint path indicates this change is linked to the observed defect of achieving only 8/14 on hidden tests, and the new code contains complex branching logic (e.g., handling of with_decl, no_decl, dup_decl, ancestor_lookup_type) that could introduce semantic defects in symbol resolution.",
+      "confidence": 0.9,
+      "causal_role": "defect_introduction"
+    }
+  ],
+  "taint_paths": [
+    [
+      "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+      "record:decisionnode_dec_160_d3011460"
+    ],
+    [
+      "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+      "record:decisionnode_dec_162_d4c07ef3"
+    ],
+    [
+      "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+      "record:chgnode_chg_2_1ee08ab1"
+    ],
+    [
+      "record:observed_defect_scope_management_host_compatibility_changes_outside_feature_scope",
+      "record:chgnode_chg_8_8d17dba4",
+      "record:vernode_ver_1_ea7412b7",
+      "record:chgnode_chg_5_75e72f77"
+    ]
+  ],
+  "node_judgments": {
+    "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract": {
+      "node_ref": "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_160_d3011460",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:decisionnode_dec_162_d4c07ef3",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:chgnode_chg_2_1ee08ab1",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_verification_strategy_self_test_does_not_match_interface_contract": {
+      "node_ref": "record:observed_defect_verification_strategy_self_test_does_not_match_interface_contract",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "self_test_does_not_match_interface_contract",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_360_0d63baad",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:decisionnode_dec_362_abbf250d",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:toolresult_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:observed_defect_scope_management_host_compatibility_changes_outside_feature_scope": {
+      "node_ref": "record:observed_defect_scope_management_host_compatibility_changes_outside_feature_scope",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "host_compatibility_changes_outside_feature_scope",
+      "defect_reason": "This offline evaluation boundary declares an observed defect or quality gap. Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_346_dac72e2f",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:chgnode_chg_8_8d17dba4",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        },
+        {
+          "upstream_ref": "record:chgnode_chg_13_398dab5b",
+          "reason": "The offline evaluation cites this trace record as outcome evidence.",
+          "confidence": 1.0
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 1.0,
+      "model_notes": ""
+    },
+    "record:decisionnode_dec_160_d3011460": {
+      "node_ref": "record:decisionnode_dec_160_d3011460",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "defect_reason": "The decision rationale explicitly plans to implement parse_declaration with a dispatch that requires struct/union/enum declarations to repeat their keyword in the input, even though objectType already supplies the directive type. This directly introduces the incorrect_declaration_parser_contract defect.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The hydrated artifact is not truncated and contains the full rationale. The downstream observed_defect confirms the contract violation. No upstream nodes are supplied, so this node is the earliest visible introduction point."
+    },
+    "record:decisionnode_dec_162_d4c07ef3": {
+      "node_ref": "record:decisionnode_dec_162_d4c07ef3",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "defect_reason": "The edit in this node introduces the parse_declaration method that dispatches on objectType. For struct, union, and enum, it calls _parse_struct_keyword, _parse_union_keyword, and _parse_enum_keyword respectively, which require the keyword to appear in the input. This contradicts the contract that objectType already supplies the directive type, causing the incorrect_declaration_parser_contract defect. The node also introduces _parse_macro and _parse_macro_parameter_list, which may accept invalid macro declarations. No upstream node introduced this defect; the upstream node (dec_160) only planned the implementation.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "The upstream node dec_160 is a planning step that does not contain the defective code; the defect is first introduced in this edit. The hydrated artifact is not truncated and contains the full edit content."
+    },
+    "record:chgnode_chg_2_1ee08ab1": {
+      "node_ref": "record:chgnode_chg_2_1ee08ab1",
+      "component": "tool",
+      "event_type": "change",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "incorrect_declaration_parser_contract",
+      "defect_reason": "The diff introduces new parse_declaration, _parse_struct_keyword, _parse_union_keyword, _parse_enum_keyword, _parse_macro, and _parse_macro_parameter_list methods. The parse_declaration method for 'struct', 'union', and 'enum' objectTypes calls the keyword-parsing helpers, which require the keyword to appear in the input string even though objectType already specifies the directive type. This redundant keyword requirement is a contract defect that causes test failures. Additionally, the macro parameter parsing logic accepts at least one invalid declaration, as noted in the downstream observed defect. These defects originate in this change; no upstream nodes are supplied.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The diff is the only supplied node and contains the new parser logic that downstream evidence identifies as defective. No upstream nodes exist to attribute the defect to."
+    },
+    "record:decisionnode_dec_360_0d63baad": {
+      "node_ref": "record:decisionnode_dec_360_0d63baad",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": false,
+      "defect_status": "absent",
+      "defect_type": "",
+      "defect_reason": "This decision node captures the agent's intent to run a more comprehensive test after confirming imports work. The rationale 'Imports work. Now let me run a more comprehensive test to validate the implementations.' does not contain a semantic defect itself. It is a planning step that precedes the actual test execution and verification. The downstream taint path indicates that a later self-test was defective, but this node merely decides to proceed with testing, not how the test is designed or evaluated.",
+      "causal_role": "non_defective",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.95,
+      "model_notes": "No upstream nodes are supplied. The node itself shows no defective semantics. The downstream defect (self_test_does_not_match_interface_contract) occurs later in the trace, not at this decision point."
+    },
+    "record:decisionnode_dec_362_abbf250d": {
+      "node_ref": "record:decisionnode_dec_362_abbf250d",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "self_test_does_not_match_interface_contract",
+      "defect_reason": "The node executes a comprehensive smoke test that prints 'ALL TESTS PASSED' but the test inputs (e.g., 'struct MyStruct') do not match the official parser contract where parse_declaration('struct', ...) receives a body without the keyword. This test therefore fails to expose the hidden-test contract mismatch, providing false-positive evidence that the implementation is correct.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_360_0d63baad",
+          "reason": "The upstream reasoning block decided to run a comprehensive test but did not specify contract-aligned inputs, leading to a test that validates the wrong semantics.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The node is evidence of a defect (false-positive self-test) rather than the introduction of the underlying contract mismatch. The upstream reasoning node influenced the test design but did not itself contain the defect."
+    },
+    "record:toolresult_call_00_u9lT7eb9H0EFRCR1AKHb9088": {
+      "node_ref": "record:toolresult_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+      "component": "tool",
+      "event_type": "tool.result",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "self_test_does_not_match_interface_contract",
+      "defect_reason": "The tool result is the execution output of the agent's comprehensive smoke test. The test script itself contains inputs that do not match the official parser contract (e.g., 'struct MyStruct' instead of just 'MyStruct' for parse_declaration('struct', ...)), yet it prints 'ALL TESTS PASSED'. This output serves as evidence that the agent's self-verification was insufficient and missed the contract defects that later caused hidden-test failures.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:toolcall_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+          "reason": "The upstream tool.call node contains the test script that uses incorrect inputs (e.g., 'struct MyStruct') and asserts success. The defect in the test script's semantics directly causes this tool.result to report a misleading PASS, making it evidence of the upstream's defective self-test design.",
+          "confidence": 0.95
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.95,
+      "model_notes": "The tool.result is truncated, but the visible portion shows the test script and its 'ALL TESTS PASSED!' output, which is sufficient to classify it as defect_evidence. The root cause is the upstream tool.call that authored the flawed test script."
+    },
+    "record:decisionnode_dec_346_dac72e2f": {
+      "node_ref": "record:decisionnode_dec_346_dac72e2f",
+      "component": "processor",
+      "event_type": "decision",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "host_compatibility_changes_outside_feature_scope",
+      "defect_reason": "The node's rationale explicitly acknowledges the Python version incompatibility (3.9.6 vs 3.11+) and decides to 'fix these incompatibilities' by modifying the codebase, which directly aligns with the downstream observed defect of host_compatibility_changes_outside_feature_scope. The node does not introduce the defect; it propagates the agent's decision to address host environment issues instead of focusing on the C-domain feature contract.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.85,
+      "model_notes": "No upstream nodes are supplied, so the defect introduction point cannot be identified from this node alone. The node's semantics show it is acting on a pre-existing environmental mismatch, but the trace does not show where the agent first decided to deviate from the task scope."
+    },
+    "record:chgnode_chg_8_8d17dba4": {
+      "node_ref": "record:chgnode_chg_8_8d17dba4",
+      "component": "tool",
+      "event_type": "change",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "host_compatibility_changes_outside_feature_scope",
+      "defect_reason": "This change removes the generic type parameter from SphinxLoggerAdapter, which is a host-compatibility edit for Python 3.9. The diff shows a logging.py change unrelated to the C-domain feature scope. The upstream verification (ver_1_ea7412b7) already failed, indicating the environment was broken before this edit. This node propagates the existing host-compatibility defect rather than introducing it.",
+      "causal_role": "defect_propagation",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:vernode_ver_1_ea7412b7",
+          "reason": "The upstream verification failure (ver_1_ea7412b7) shows the environment was already incompatible, prompting this logging.py edit. The defect was introduced earlier; this change merely propagates the same host-compatibility issue.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The upstream verification node is truncated, but its status=failed and the context of host-compatibility edits are sufficient to conclude this node propagates an existing defect."
+    },
+    "record:chgnode_chg_13_398dab5b": {
+      "node_ref": "record:chgnode_chg_13_398dab5b",
+      "component": "tool",
+      "event_type": "change",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "host_compatibility_changes_outside_feature_scope",
+      "defect_reason": "This change node records a diff that introduces a try/except fallback for datetime.UTC to accommodate Python 3.9, which is a host-compatibility edit outside the C-domain feature scope. The downstream observed defect explicitly cites this change as evidence of host_compatibility_changes_outside_feature_scope.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "medium",
+      "confidence": 0.9,
+      "model_notes": "The change itself is evidence of the defect but does not introduce the defect; the defect (unrelated host-compatibility edits) was introduced by the agent's decision to apply this change. The upstream verification node (ver_1_ea7412b7) is a failed pytest --version check that may have prompted the compatibility edit, but the truncated verification data does not independently show the defect introduction."
+    },
+    "record:toolcall_call_00_u9lT7eb9H0EFRCR1AKHb9088": {
+      "node_ref": "record:toolcall_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+      "component": "tool",
+      "event_type": "tool.call",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "self_test_does_not_match_interface_contract",
+      "defect_reason": "The bash command executes a comprehensive smoke test that uses inputs like 'struct MyStruct' with parse_declaration('struct', 'struct'), which does not match the official parser contract where the declaration body is provided without the repeated directive keyword. The test prints 'ALL TESTS PASSED' and is later treated as sufficient verification, but it fails to exercise the hidden-test semantics that later produce six functional failures. This node exposes the defect by providing the misleading passing evidence.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:decisionnode_dec_362_abbf250d",
+          "reason": "The upstream decision node (record:decisionnode_dec_362_abbf250d) decided to run this comprehensive test and treated its passing result as sufficient verification, thereby propagating the defect of inadequate test coverage.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The hydrated artifact is not truncated, so the full command is visible. The defect is clearly present in the test inputs. The upstream decision node introduced the decision to rely on this test, making this node evidence of the defect rather than its introduction."
+    },
+    "record:vernode_ver_1_ea7412b7": {
+      "node_ref": "record:vernode_ver_1_ea7412b7",
+      "component": "tool",
+      "event_type": "verification",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "host_compatibility_changes_outside_feature_scope",
+      "defect_reason": "This verification node executed 'python3 -m pytest --version' and exited with code 1, which is a truthful observation that the test environment is broken. It does not introduce the host-compatibility defect but exposes the symptom that the agent's changes (including unrelated host-compatibility edits) left the environment in a non-functional state.",
+      "causal_role": "defect_evidence",
+      "influenced_by": [
+        {
+          "upstream_ref": "record:chgnode_chg_1_5fe46295",
+          "reason": "The verification failure (exit code 1) is a downstream consequence of the agent's code changes across multiple revisions. The host-compatibility edits (e.g., in cfamily.py) and the C-domain parser/symbol changes collectively broke the environment, and this verification node merely observes that breakage.",
+          "confidence": 0.9
+        },
+        {
+          "upstream_ref": "record:chgnode_chg_2_1ee08ab1",
+          "reason": "The parser changes introduced new parsing functions that may have introduced defects or incompatibilities, contributing to the broken state observed here.",
+          "confidence": 0.9
+        },
+        {
+          "upstream_ref": "record:chgnode_chg_5_75e72f77",
+          "reason": "The symbol table changes added complex lookup and declaration logic that could introduce defects, contributing to the verification failure.",
+          "confidence": 0.9
+        }
+      ],
+      "is_root_cause": false,
+      "severity": "high",
+      "confidence": 0.95,
+      "model_notes": "The verification command itself is a simple pytest version check; its failure indicates a broken Python environment, likely due to the agent's host-compatibility edits. The exact root cause among the upstream changes cannot be pinpointed from this node alone, but it clearly evidences the defect."
+    },
+    "record:chgnode_chg_1_5fe46295": {
+      "node_ref": "record:chgnode_chg_1_5fe46295",
+      "component": "tool",
+      "event_type": "change",
+      "has_defect": false,
+      "defect_status": "unknown",
+      "defect_type": "",
+      "defect_reason": "The diff shows a new method get_display_string added to a class in cfamily.py. The downstream taint path asserts host_compatibility_changes_outside_feature_scope, but this diff alone does not show any host-compatibility logic (e.g., version checks, platform-specific imports, or type annotations for older Python). The truncated flag on the current node means the full tool result may contain additional context that is not visible. Without the complete hydrated artifact, it is impossible to determine whether this change is a defect introduction, propagation, or evidence for the asserted defect.",
+      "causal_role": "unknown",
+      "influenced_by": [],
+      "is_root_cause": false,
+      "severity": "unknown",
+      "confidence": 0.0,
+      "model_notes": "The current node is marked truncated, and the visible diff only adds a get_display_string method. The downstream observed defect concerns host-compatibility changes outside feature scope, but the visible excerpt does not independently confirm or refute that. The missing portion of the hydrated artifact may contain the relevant host-compatibility edits. Per rules, when a hydrated artifact is truncated and the visible excerpt is not independently decisive, return unknown."
+    },
+    "record:chgnode_chg_5_75e72f77": {
+      "node_ref": "record:chgnode_chg_5_75e72f77",
+      "component": "tool",
+      "event_type": "change",
+      "has_defect": true,
+      "defect_status": "present",
+      "defect_type": "c_domain_symbol_resolution_defect",
+      "defect_reason": "This change introduces new methods (_fill_empty, _symbol_lookup, _add_symbols, add_name, add_declaration) and modifies _make_cand_symbol in the C-domain symbol module. The diff shows substantial new logic for symbol lookup and declaration handling that directly affects the C-domain feature contract. The downstream taint path indicates this change is linked to the observed defect of achieving only 8/14 on hidden tests, and the new code contains complex branching logic (e.g., handling of with_decl, no_decl, dup_decl, ancestor_lookup_type) that could introduce semantic defects in symbol resolution.",
+      "causal_role": "defect_introduction",
+      "influenced_by": [],
+      "is_root_cause": true,
+      "severity": "high",
+      "confidence": 0.9,
+      "model_notes": "This is the first node in the taint path with no upstream nodes supplied. The change introduces the core symbol resolution logic that the downstream defect evidence links to the C-domain test failures. However, without seeing the full file context or the specific test failures, the exact nature of the defect (e.g., incorrect ancestor lookup, mishandling of duplicate declarations) cannot be pinpointed with certainty."
+    }
+  },
+  "visited_order": [
+    "record:observed_defect_feature_implementation_incorrect_declaration_parser_contract",
+    "record:observed_defect_verification_strategy_self_test_does_not_match_interface_contract",
+    "record:observed_defect_scope_management_host_compatibility_changes_outside_feature_scope",
+    "record:decisionnode_dec_160_d3011460",
+    "record:decisionnode_dec_162_d4c07ef3",
+    "record:chgnode_chg_2_1ee08ab1",
+    "record:decisionnode_dec_360_0d63baad",
+    "record:decisionnode_dec_362_abbf250d",
+    "record:toolresult_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+    "record:decisionnode_dec_346_dac72e2f",
+    "record:chgnode_chg_8_8d17dba4",
+    "record:chgnode_chg_13_398dab5b",
+    "record:toolcall_call_00_u9lT7eb9H0EFRCR1AKHb9088",
+    "record:vernode_ver_1_ea7412b7",
+    "record:chgnode_chg_1_5fe46295",
+    "record:chgnode_chg_5_75e72f77"
+  ],
+  "unresolved_refs": [],
+  "trace_improvement_report": {
+    "summary": {
+      "blocking_gap_count": 2,
+      "recommended_change_count": 2,
+      "analysis_confidence": "limited"
+    },
+    "blocking_gaps": [
+      {
+        "gap_type": "unknown_node_judgment",
+        "node_ref": "record:chgnode_chg_1_5fe46295",
+        "component": "tool",
+        "event_type": "change",
+        "why_it_blocks_root_cause_analysis": "Backward analysis could not classify this node as defective or non-defective. Blocking detail: The current node is marked truncated, and the visible diff only adds a get_display_string method. The downstream observed defect concerns host-compatibility changes outside feature scope, but the visible excerpt does not independently confirm or refute that. The missing portion of the hydrated artifact may contain the relevant host-compatibility edits. Per rules, when a hydrated artifact is truncated and the visible excerpt is not independently decisive, return unknown.",
+        "missing_semantic_fields": [
+          "decisive_semantic_evidence"
+        ],
+        "related_refs": [
+          "record:chgnode_chg_1_5fe46295"
+        ],
+        "confidence": 1.0
+      },
+      {
+        "gap_type": "defective_node_points_to_nondefective_upstream",
+        "node_ref": "",
+        "component": "trace_provenance",
+        "event_type": "semantic_edge",
+        "why_it_blocks_root_cause_analysis": "A defective node claimed an upstream cause, but that upstream node was judged non-defective. This often indicates overly broad provenance edges, missing intermediate semantic nodes, or insufficient context for judging the upstream node.",
+        "missing_semantic_fields": [
+          "edge_reason",
+          "intermediate_semantic_node",
+          "upstream_usage_context"
+        ],
+        "related_refs": [
+          "record:observed_defect_verification_strategy_self_test_does_not_match_interface_contract->record:decisionnode_dec_360_0d63baad",
+          "record:decisionnode_dec_362_abbf250d->record:decisionnode_dec_360_0d63baad",
+          "record:vernode_ver_1_ea7412b7->record:chgnode_chg_1_5fe46295"
+        ],
+        "confidence": 0.8
+      }
+    ],
+    "recommended_trace_changes": [
+      {
+        "component": "tool",
+        "priority": "high",
+        "change": "Record or expose the decisive semantic evidence needed to classify this node.",
+        "unblocks": [
+          "unknown_node_judgment"
+        ]
+      },
+      {
+        "component": "trace_provenance",
+        "priority": "high",
+        "change": "For each source_ref/dataflow edge, record why the upstream fact was used, which downstream decision or claim consumed it, and whether the edge is direct evidence, contextual support, or legacy noise.",
+        "unblocks": [
+          "defective_node_points_to_nondefective_upstream"
+        ]
+      }
+    ]
+  },
+  "metadata": {
+    "analysis": "backward_semantic_taint",
+    "max_depth": 24,
+    "max_nodes": 128,
+    "judge_timeout_seconds": 3600.0,
+    "judge_thinking_mode": "auto",
+    "judge_thinking_config": {
+      "type": "disabled"
+    },
+    "judge_error_count": 0,
+    "judge_errors": [],
+    "analysis_outcome": "root_found",
+    "termination_reason": "queue_exhausted",
+    "artifact_hydration": {
+      "referenced": 1063,
+      "indexed": 1111,
+      "requested_nodes": 21,
+      "loaded": 7,
+      "missing": 0,
+      "truncated": 0,
+      "artifact_root": "/private/tmp/observable-opencode-featurebench-loop4-sphinx/traces/sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1"
+    },
+    "message_lineage": {
+      "version": "1.0",
+      "collection_mode": "offline_passive_reconstruction",
+      "behavior_impact": "none",
+      "stats": {
+        "turn_count": 70,
+        "snapshot_count": 550,
+        "edge_count": 1048,
+        "confirmed_edge_count": 136,
+        "content_matched_edge_count": 819,
+        "temporal_inferred_edge_count": 93,
+        "attribution_eligible_edge_count": 955,
+        "gap_count": 0
+      }
+    }
+  }
+}

@@ -13,10 +13,12 @@ from trace_attribution import claude as claude_module
 from trace_attribution.claude import (
     ClaudeJudgeClient,
     build_judgment_prompt,
+    build_root_confirmation_prompt,
     call_with_wall_timeout,
     resolve_thinking_config,
     run_worker_with_timeout,
     validate_judgment_payload,
+    validate_root_confirmation_payload,
 )
 from trace_attribution.cli import lineage_output_path, parse_args
 from trace_attribution.graph import TraceGraph
@@ -877,6 +879,304 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(report.root_causes[0].observed_defect_refs, ["record:observed"])
 
+    def test_expands_semantic_predecessors_from_an_observed_change_episode(self):
+        trace = {
+            "case_id": "change-episode-predecessor-case",
+            "records": [
+                {
+                    "record_id": "reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Modify unrelated compatibility code to make the host test run.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "span_id": "span_edit",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "edit",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_edit",
+                        },
+                    },
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"call_id": "call_edit", "tool_name": "edit"},
+                },
+                {
+                    "record_id": "change",
+                    "component": "tool",
+                    "event_type": "change",
+                    "span_id": "span_edit",
+                    "data": {
+                        "change_id": "chg_1",
+                        "files": ["src/compat.py"],
+                        "diff": "- use_new_api()\n+ use_old_api()",
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change"],
+                    "data": {"failure_type": "out_of_scope_host_compatibility"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:change": NodeJudgment(
+                    node_ref="record:change",
+                    component="tool",
+                    event_type="change",
+                    has_defect=False,
+                    defect_status="unknown",
+                    defect_type="judge_schema_error",
+                    defect_reason="The change judgment was structurally invalid after repair.",
+                    causal_role="unknown",
+                    branch_relation="unknown",
+                    is_root_cause=False,
+                ),
+                "record:reasoning": NodeJudgment(
+                    node_ref="record:reasoning",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="out_of_scope_host_compatibility",
+                    defect_reason="The reasoning first chooses to edit unrelated compatibility code.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                    confidence=0.95,
+                ),
+                "record:action": NodeJudgment(
+                    node_ref="record:action",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="out_of_scope_host_compatibility",
+                    defect_reason="The edit action materializes the out-of-scope decision.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                    confidence=0.9,
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls[0], "record:change")
+        self.assertIn("record:reasoning", judge.calls)
+        self.assertIn("record:action", judge.calls)
+        self.assertNotIn("record:tool_call", judge.calls)
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:reasoning"])
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        blocking_types = [item["gap_type"] for item in report.trace_improvement_report["blocking_gaps"]]
+        advisory_types = [item["gap_type"] for item in report.trace_improvement_report["advisory_gaps"]]
+        self.assertNotIn("unknown_node_judgment", blocking_types)
+        self.assertIn("unknown_node_judgment", advisory_types)
+
+    def test_root_confirmation_rejects_a_false_earlier_plan_before_episode_collapse(self):
+        trace = {
+            "case_id": "root-confirmation-case",
+            "records": [
+                {
+                    "record_id": "plan",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Parse the declaration body without repeating its directive keyword.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "edit",
+                        "rationale": "Require the struct keyword in the declaration body.",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_edit",
+                        },
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:plan", "record:action"],
+                    "data": {"failure_type": "repeated_directive_keyword"},
+                },
+            ],
+        }
+        roots = {
+            ref: NodeJudgment(
+                node_ref=ref,
+                component="processor",
+                event_type="decision",
+                has_defect=True,
+                defect_status="present",
+                defect_type="repeated_directive_keyword",
+                defect_reason="This node was initially classified as containing the parser defect.",
+                causal_role="defect_introduction",
+                branch_relation="same_defect",
+                is_root_cause=True,
+                confidence=0.9,
+            )
+            for ref in ("record:plan", "record:action")
+        }
+
+        class ConfirmingJudge(FakeJudge):
+            def __init__(self):
+                super().__init__(roots)
+                self.confirmed = []
+
+            def confirm_root(self, *, node, judgment, downstream_context, objective):
+                self.confirmed.append(node.ref)
+                if node.ref == "record:plan":
+                    return NodeJudgment(
+                        node_ref=node.ref,
+                        component=node.component,
+                        event_type=node.event_type,
+                        has_defect=False,
+                        defect_status="absent",
+                        defect_type="",
+                        defect_reason="The plan specifies the correct non-repeated-keyword contract.",
+                        causal_role="non_defective",
+                        branch_relation="unrelated",
+                        is_root_cause=False,
+                        confidence=0.95,
+                    )
+                return judgment
+
+        judge = ConfirmingJudge()
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(set(judge.confirmed), {"record:plan", "record:action"})
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
+        self.assertEqual(report.node_judgments["record:plan"].defect_status, "absent")
+
+    def test_reclassifies_propagation_when_confirmation_rejects_its_only_defect_predecessor(self):
+        trace = {
+            "case_id": "root-confirmation-boundary-case",
+            "records": [
+                {
+                    "record_id": "plan",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Parse the declaration body without repeating its directive keyword.",
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:plan"],
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "edit",
+                        "rationale": "Require the struct keyword in the declaration body.",
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:action"],
+                    "data": {"failure_type": "repeated_directive_keyword"},
+                },
+            ],
+        }
+        judgments = {
+            "record:action": NodeJudgment(
+                node_ref="record:action",
+                component="processor",
+                event_type="decision",
+                has_defect=True,
+                defect_status="present",
+                defect_type="repeated_directive_keyword",
+                defect_reason="The authored edit requires the keyword in the declaration body.",
+                causal_role="defect_propagation",
+                branch_relation="same_defect",
+                influenced_by=[
+                    TaintInfluence(
+                        upstream_ref="record:plan",
+                        reason="The initial judgment said the plan already contained this defect.",
+                        relation="defect_propagated_from",
+                    )
+                ],
+                is_root_cause=False,
+                confidence=0.9,
+            ),
+            "record:plan": NodeJudgment(
+                node_ref="record:plan",
+                component="processor",
+                event_type="decision",
+                has_defect=True,
+                defect_status="present",
+                defect_type="repeated_directive_keyword",
+                defect_reason="The initial judgment incorrectly treats the correct plan as defective.",
+                causal_role="defect_introduction",
+                branch_relation="same_defect",
+                is_root_cause=True,
+                confidence=0.8,
+            ),
+        }
+
+        class ConfirmingJudge(FakeJudge):
+            def __init__(self):
+                super().__init__(judgments)
+                self.confirmed = []
+
+            def confirm_root(self, *, node, judgment, downstream_context, objective):
+                self.confirmed.append(node.ref)
+                if node.ref == "record:plan":
+                    return NodeJudgment(
+                        node_ref=node.ref,
+                        component=node.component,
+                        event_type=node.event_type,
+                        has_defect=False,
+                        defect_status="absent",
+                        defect_type="",
+                        defect_reason="The plan specifies the correct contract.",
+                        causal_role="non_defective",
+                        branch_relation="unrelated",
+                        is_root_cause=False,
+                        confidence=0.95,
+                    )
+                return judgment
+
+        judge = ConfirmingJudge()
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.confirmed, ["record:plan", "record:action"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
+        action = report.node_judgments["record:action"]
+        self.assertEqual(action.causal_role, "defect_introduction")
+        self.assertTrue(action.is_root_cause)
+        self.assertFalse(any(item.relation == "defect_propagated_from" for item in action.influenced_by))
+
     def test_motivating_evidence_does_not_become_a_defect_predecessor(self):
         trace = {
             "case_id": "motivation-is-not-propagation-case",
@@ -1203,6 +1503,10 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual(judge.calls, ["record:claim", "record:failed_verification"])
         self.assertEqual(report.visited_order[0], "record:observed_defect")
         self.assertEqual([item.node_ref for item in report.root_causes], ["record:claim"])
+        self.assertNotIn(
+            "defective_node_points_to_nondefective_upstream",
+            [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]],
+        )
 
     def test_trace_without_analysis_start_is_inconclusive(self):
         report = BackwardTaintAnalyzer(judge=FakeJudge({}), max_depth=8).analyze(
@@ -1863,6 +2167,34 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                 }
             )
 
+    def test_rejects_defect_evidence_role_for_authored_action_decision(self):
+        node = TraceNode(
+            ref="record:test_action",
+            record_id="test_action",
+            component="processor",
+            event_type="decision",
+            data={"decision_type": "llm_tool_call"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "authored action"):
+            validate_judgment_payload(
+                {
+                    "node_ref": node.ref,
+                    "component": node.component,
+                    "event_type": node.event_type,
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "wrong_test_contract",
+                    "defect_reason": "The authored test script uses the wrong input contract.",
+                    "causal_role": "defect_evidence",
+                    "branch_relation": "outcome_evidence",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                },
+                node=node,
+            )
+
     def test_rejects_propagation_without_defective_upstream(self):
         with self.assertRaisesRegex(ValueError, "defect_propagated_from"):
             validate_judgment_payload(
@@ -1906,6 +2238,60 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                     "is_root_cause": False,
                     "confidence": 0.9,
                 }
+            )
+
+    def test_rejects_propagation_relation_whose_reason_only_describes_motivation(self):
+        with self.assertRaisesRegex(ValueError, "motivation/evidence"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:scope_change",
+                    "component": "tool",
+                    "event_type": "change",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "out_of_scope_change",
+                    "defect_reason": "The change edits compatibility code outside the task scope.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [
+                        {
+                            "upstream_ref": "record:environment_failure",
+                            "reason": "The failed verification exposed Python 3.9 and motivated this edit.",
+                            "relation": "defect_propagated_from",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                },
+                allowed_upstream_refs={"record:environment_failure"},
+            )
+
+    def test_rejects_influence_ref_outside_supplied_upstream_nodes(self):
+        with self.assertRaisesRegex(ValueError, "not in the supplied upstream node set"):
+            validate_judgment_payload(
+                {
+                    "node_ref": "record:scope_change",
+                    "component": "tool",
+                    "event_type": "change",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "out_of_scope_change",
+                    "defect_reason": "The change edits compatibility code outside the task scope.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [
+                        {
+                            "upstream_ref": "record:invented_decision",
+                            "reason": "An unspecified earlier decision introduced the defect.",
+                            "relation": "defect_propagated_from",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                },
+                allowed_upstream_refs={"record:environment_failure"},
             )
 
     def test_rejects_speculative_root_reason(self):
@@ -2131,6 +2517,210 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertIn("Authored tool-call arguments or test scripts are action semantics", rules)
         self.assertIn("Code size or complexity alone", rules)
 
+    def test_judgment_prompt_identifies_authored_action_semantics(self):
+        prompt = build_judgment_prompt(
+            node=TraceNode(
+                ref="record:self_test_action",
+                record_id="self_test_action",
+                component="processor",
+                event_type="decision",
+                data={
+                    "decision_type": "llm_tool_call",
+                    "chosen_action": "bash",
+                    "rationale": "python - <<'PY'\nassert parse_declaration('struct MyStruct')\nPY",
+                },
+            ),
+            upstream_nodes=[],
+            downstream_context=[
+                "record:observed event_type=case.observed_defect; failure_type=self_test_contract"
+            ],
+            objective="Find why the self-test missed the interface contract.",
+        )
+        payload = json.loads(prompt)
+
+        self.assertEqual(payload["current_node_semantic_role"], "authored_agent_action")
+        self.assertEqual(payload["current_node"]["data"]["decision_type"], "llm_tool_call")
+        rules = " ".join(payload["rules"])
+        self.assertIn("A generic intent to run a test", rules)
+        self.assertIn("A correct current plan is not defective merely because a later action", rules)
+
+    def test_root_confirmation_prompt_requires_node_local_evidence_and_counterfactual(self):
+        node = TraceNode(
+            ref="record:plan",
+            record_id="plan",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "reasoning_block",
+                "rationale": "Parse the declaration body without repeating its directive keyword.",
+            },
+        )
+        judgment = NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_status="present",
+            defect_type="repeated_directive_keyword",
+            defect_reason="The plan allegedly introduces the parser defect.",
+            causal_role="defect_introduction",
+            branch_relation="same_defect",
+            is_root_cause=True,
+        )
+
+        payload = json.loads(
+            build_root_confirmation_prompt(
+                node=node,
+                judgment=judgment,
+                downstream_context=["record:observed repeated_directive_keyword"],
+                objective="Locate the parser defect introduction.",
+            )
+        )
+
+        rules = " ".join(payload["rules"])
+        self.assertIn("exact excerpt", rules)
+        self.assertIn("counterfactual", rules)
+        with self.assertRaisesRegex(ValueError, "not present in the current node"):
+            validate_root_confirmation_payload(
+                {
+                    "node_ref": node.ref,
+                    "confirmation": "confirmed",
+                    "exact_semantic_excerpt": "Require the keyword again.",
+                    "current_node_would_cause_defect_if_executed_exactly": True,
+                    "reason": "The plan requires the keyword.",
+                    "confidence": 0.9,
+                },
+                node=node,
+            )
+        with self.assertRaisesRegex(ValueError, "counterfactual"):
+            validate_root_confirmation_payload(
+                {
+                    "node_ref": node.ref,
+                    "confirmation": "confirmed",
+                    "exact_semantic_excerpt": "without repeating its directive keyword",
+                    "current_node_would_cause_defect_if_executed_exactly": False,
+                    "reason": "The plan would not cause the defect if followed.",
+                    "confidence": 0.9,
+                },
+                node=node,
+            )
+
+    def test_root_confirmation_matches_excerpt_across_hydrated_artifact_whitespace(self):
+        node = TraceNode(
+            ref="record:action",
+            record_id="action",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "llm_tool_call",
+                "hydrated_artifacts": [
+                    {
+                        "label": "decision.rationale",
+                        "content": "if objectType == 'struct':\n    require_keyword()",
+                    }
+                ],
+            },
+        )
+
+        validate_root_confirmation_payload(
+            {
+                "node_ref": node.ref,
+                "confirmation": "confirmed",
+                "exact_semantic_excerpt": "if objectType == 'struct': require_keyword()",
+                "current_node_would_cause_defect_if_executed_exactly": True,
+                "reason": "The authored action requires the repeated keyword.",
+                "confidence": 0.95,
+            },
+            node=node,
+        )
+
+    def test_root_confirmation_accepts_a_grounded_paraphrase_with_exact_code_identifiers(self):
+        node = TraceNode(
+            ref="record:action",
+            record_id="action",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "llm_tool_call",
+                "rationale": "if objectType == 'struct':\n    declaration = self._parse_struct_keyword()",
+            },
+        )
+
+        validate_root_confirmation_payload(
+            {
+                "node_ref": node.ref,
+                "confirmation": "confirmed",
+                "exact_semantic_excerpt": "objectType struct dispatches to _parse_struct_keyword",
+                "current_node_would_cause_defect_if_executed_exactly": True,
+                "reason": "The authored action requires the struct keyword in the declaration body.",
+                "confidence": 0.95,
+            },
+            node=node,
+        )
+
+    def test_root_confirmation_repairs_an_inconsistent_causation_answer_once(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                payload = {
+                    "node_ref": "record:action",
+                    "confirmation": "confirmed",
+                    "exact_semantic_excerpt": "Require the struct keyword in the declaration body.",
+                    "current_node_would_cause_defect_if_executed_exactly": len(calls) > 1,
+                    "reason": "The authored action requires the repeated keyword.",
+                    "confidence": 0.95,
+                }
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text=json.dumps(payload))])
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
+
+        node = TraceNode(
+            ref="record:action",
+            record_id="action",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "llm_tool_call",
+                "rationale": "Require the struct keyword in the declaration body.",
+            },
+        )
+        judgment = NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_status="present",
+            defect_type="repeated_directive_keyword",
+            defect_reason="The action requires a repeated keyword.",
+            causal_role="defect_introduction",
+            branch_relation="same_defect",
+            is_root_cause=True,
+            confidence=0.9,
+        )
+
+        confirmed = client.confirm_root(
+            node=node,
+            judgment=judgment,
+            downstream_context=["record:observed repeated_directive_keyword"],
+            objective="Locate the parser defect introduction.",
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(confirmed.defect_status, "present")
+        self.assertTrue(confirmed.is_root_cause)
+        repair_payload = json.loads(calls[1]["messages"][0]["content"])
+        self.assertIn("requires a true", repair_payload["validation_error"])
+
     def test_judgment_prompt_keeps_semantics_under_budget(self):
         node = TraceNode(
             ref="record:observed_defect_tool_error",
@@ -2243,6 +2833,127 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(judgment.defect_status, "present")
         self.assertEqual(judgment.model_notes, "fresh retry succeeded")
+
+    def test_repair_receives_specific_judgment_validation_error(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    payload = {
+                        "node_ref": "record:plan",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "defect_status": "present",
+                        "has_defect": True,
+                        "defect_type": "wrong_test_contract",
+                        "defect_reason": "The plan carries the later self-test defect.",
+                        "causal_role": "defect_propagation",
+                        "branch_relation": "same_defect",
+                        "influenced_by": [],
+                        "is_root_cause": False,
+                        "confidence": 0.7,
+                    }
+                else:
+                    payload = {
+                        "node_ref": "record:plan",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "defect_status": "absent",
+                        "has_defect": False,
+                        "defect_type": "",
+                        "defect_reason": "The plan only states an intent to run a test.",
+                        "causal_role": "non_defective",
+                        "branch_relation": "unrelated",
+                        "influenced_by": [],
+                        "is_root_cause": False,
+                        "confidence": 0.9,
+                    }
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text=json.dumps(payload))])
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
+
+        judgment = client.judge_node(
+            node=TraceNode(
+                ref="record:plan",
+                record_id="plan",
+                component="processor",
+                event_type="decision",
+                data={
+                    "decision_type": "reasoning_block",
+                    "chosen_action": "continue_processing_stream",
+                    "rationale": "Run a comprehensive test.",
+                },
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:observed event_type=case.observed_defect"],
+            objective="Find why the self-test used the wrong contract.",
+        )
+
+        repair_payload = json.loads(calls[1]["messages"][0]["content"])
+        self.assertIn("defect_propagation requires a defect_propagated_from influence", repair_payload["validation_error"])
+        self.assertEqual(judgment.defect_status, "absent")
+        self.assertEqual(judgment.causal_role, "non_defective")
+
+    def test_exhausted_schema_repairs_return_auditable_unknown_judgment(self):
+        calls = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                payload = {
+                    "node_ref": "record:plan",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "wrong_test_contract",
+                    "defect_reason": "The plan carries the later self-test defect.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [],
+                    "is_root_cause": False,
+                    "confidence": 0.7,
+                }
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text=json.dumps(payload))])
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                self.messages = FakeMessages()
+
+        fake_module = types.SimpleNamespace(Anthropic=FakeAnthropic)
+        with mock.patch.dict(sys.modules, {"anthropic": fake_module}):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+                client = ClaudeJudgeClient(model="fake-model")
+                client.timeout_seconds = None
+
+        judgment = client.judge_node(
+            node=TraceNode(
+                ref="record:plan",
+                record_id="plan",
+                component="processor",
+                event_type="decision",
+                data={"decision_type": "reasoning_block", "rationale": "Run a comprehensive test."},
+            ),
+            upstream_nodes=[],
+            downstream_context=["record:observed event_type=case.observed_defect"],
+            objective="Find why the self-test used the wrong contract.",
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(judgment.defect_status, "unknown")
+        self.assertEqual(judgment.causal_role, "unknown")
+        self.assertFalse(judgment.is_root_cause)
+        self.assertIn("schema repair exhausted", judgment.model_notes)
 
     def test_repairs_malformed_json_judgment_once(self):
         calls = []

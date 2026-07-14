@@ -26,6 +26,13 @@ provenance never merge episodes. When multiple records in one episode are judged
 defect introduction, the earliest confirmed defective introduction is reported as the episode
 representative; `episode_member_refs` preserves the complete auditable group.
 
+Before episode collapse, every proposed introduction root receives an independent node-local
+confirmation. The confirmer must try to falsify the first judgment, ground its answer in text or
+code identifiers present in the current node, and apply a counterfactual: executing the node
+exactly must itself cause the active defect. If confirmation rejects an earlier alleged root, a
+downstream propagation whose only defect predecessor was that rejected node is reclassified and
+confirmed as the new introduction boundary.
+
 Each `influenced_by` edge has one of three relations:
 
 - `defect_propagated_from`: the upstream node already contains the active branch defect; only
@@ -39,12 +46,21 @@ Each `influenced_by` edge has one of three relations:
 precursor, is outcome evidence, is unrelated, or cannot be classified. Code complexity or a
 possible failure mechanism is not sufficient to establish a root.
 
+The judge prompt also labels the current node's semantic role. An Agent-authored tool command
+or self-test script is `authored_agent_action`: its arguments are action semantics, not outcome
+evidence. A defective action is introduction or propagation, while the subsequent `tool.result`
+remains truthful outcome evidence. A generic plan to run a test is judged separately and is not
+defective merely because the later executable test command is defective.
+
 The module is offline with respect to opencode execution. It never writes back to trace
 files and never feeds attribution results back into the agent.
 
 Each attribution JSON also includes `trace_improvement_report`. This report describes
 where backward taint analysis became weak or blocked, which trace facts were missing,
 and which component should emit richer semantics in the next trace iteration.
+Unknown judgments on unresolved branches remain in `blocking_gaps`. Unknown sibling records on a
+branch that already reached a confirmed root are retained in `advisory_gaps`, so completeness
+limitations stay auditable without incorrectly reporting that root attribution failed.
 
 The analyzer also reconstructs agent turns and message-context lineage from existing trace
 records and artifact payloads. Reconstruction is an offline passive sidecar: it does not
