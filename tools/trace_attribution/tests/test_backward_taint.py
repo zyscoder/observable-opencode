@@ -1927,6 +1927,31 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                 }
             )
 
+    def test_accepts_root_with_motivating_evidence_but_no_defect_predecessor(self):
+        validate_judgment_payload(
+            {
+                "node_ref": "record:scope_decision",
+                "component": "processor",
+                "event_type": "decision",
+                "defect_status": "present",
+                "has_defect": True,
+                "defect_type": "scope_coverage",
+                "defect_reason": "The decision itself incorrectly narrows the required scope.",
+                "causal_role": "defect_introduction",
+                "branch_relation": "same_defect",
+                "influenced_by": [
+                    {
+                        "upstream_ref": "record:environment_failure",
+                        "reason": "The environment failure motivated the scope decision.",
+                        "relation": "motivated_by_evidence",
+                        "confidence": 0.9,
+                    }
+                ],
+                "is_root_cause": True,
+                "confidence": 0.9,
+            }
+        )
+
     def test_rejects_absent_judgment_with_nonempty_defect_type(self):
         with self.assertRaises(ValueError):
             validate_judgment_payload(
@@ -2068,6 +2093,43 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertIn("evaluation assertion to validate", prompt)
         self.assertIn("may be rejected", prompt)
         self.assertNotIn("treat the quality gap as the defect to explain", prompt)
+
+    def test_judgment_prompt_defines_branch_and_influence_semantics(self):
+        prompt = build_judgment_prompt(
+            node=TraceNode(
+                ref="record:scope_decision",
+                record_id="scope_decision",
+                component="processor",
+                event_type="decision",
+            ),
+            upstream_nodes=[
+                TraceNode(
+                    ref="record:environment_failure",
+                    record_id="environment_failure",
+                    component="tool",
+                    event_type="tool.result",
+                )
+            ],
+            downstream_context=[
+                "record:observed_scope event_type=case.observed_defect; failure_type=scope_coverage"
+            ],
+            objective="Find the root cause of the scope coverage defect.",
+        )
+        payload = json.loads(prompt)
+
+        self.assertIn("active_defect_branch", payload)
+        self.assertEqual(
+            payload["required_json_schema"]["branch_relation"],
+            "same_defect|causal_precursor|outcome_evidence|unrelated|unknown",
+        )
+        self.assertEqual(
+            payload["required_json_schema"]["influenced_by"][0]["relation"],
+            "defect_propagated_from|motivated_by_evidence|derived_from",
+        )
+        rules = " ".join(payload["rules"])
+        self.assertIn("may motivate a decision but does not propagate", rules)
+        self.assertIn("Authored tool-call arguments or test scripts are action semantics", rules)
+        self.assertIn("Code size or complexity alone", rules)
 
     def test_judgment_prompt_keeps_semantics_under_budget(self):
         node = TraceNode(

@@ -13,8 +13,31 @@ to perform backward semantic taint analysis:
 
 Each node is classified as `present`, `absent`, or `unknown`. Judge failures, incomplete
 responses, unresolved refs, and traversal limits remain `unknown`/`inconclusive`; they are
-never promoted to root causes. Reports expose `analysis_outcome` as `root_found`,
-`no_defect`, or `inconclusive`, plus a separate `termination_reason`.
+never promoted to root causes. Every observed defect is traversed independently and emitted
+under `defect_branches`, with its own judgments, visited order, limits, paths, and roots.
+Reports expose `analysis_outcome` as `root_found`, `partial_root_found`, `no_defect`, or
+`inconclusive`, plus a separate `termination_reason`. `partial_root_found` means at least one
+observed defect reached a root while at least one other defect branch did not.
+
+Root candidates are grouped into confirmed causal episodes before reporting. An episode may
+contain same-message reasoning and action decisions, records sharing an explicit tool call ID,
+and tool/change records sharing an execution span. Temporal proximity and cumulative context
+provenance never merge episodes. When multiple records in one episode are judged as the same
+defect introduction, the earliest confirmed defective introduction is reported as the episode
+representative; `episode_member_refs` preserves the complete auditable group.
+
+Each `influenced_by` edge has one of three relations:
+
+- `defect_propagated_from`: the upstream node already contains the active branch defect; only
+  this relation continues backward defect traversal.
+- `motivated_by_evidence`: truthful evidence influenced a later decision but did not itself
+  contain or transmit that decision's defect.
+- `derived_from`: ordinary non-defect provenance, such as an evaluation assertion citing
+  outcome evidence.
+
+`branch_relation` states whether the current node has the same active defect, is a causal
+precursor, is outcome evidence, is unrelated, or cannot be classified. Code complexity or a
+possible failure mechanism is not sufficient to establish a root.
 
 The module is offline with respect to opencode execution. It never writes back to trace
 files and never feeds attribution results back into the agent.
@@ -74,6 +97,10 @@ Each judge or JSON-repair request waits up to 3600 seconds by default. Override 
 `--thinking-mode auto` disables thinking on DeepSeek's Anthropic-compatible endpoint so the output
 budget is spent on the structured judgment; use `enabled` explicitly when deeper online reasoning is
 worth the additional latency and token cost.
+
+`--max-depth` and `--max-nodes` apply independently to every defect branch. This prevents a
+large or difficult branch from consuming the search budget needed to analyze other observed
+defects.
 
 When `--lineage-out` is omitted, the CLI writes `<attribution-output-stem>.message-lineage.json`
 next to the attribution report. The lineage output contains normalized agent turns, prompt/context/
@@ -142,6 +169,8 @@ judgments. It does not make extra model calls. Typical entries include:
   incomplete judgment; the affected node remains `unknown` and the report is inconclusive.
 - `analysis_search_limit`: `max_depth` or `max_nodes` stopped traversal before all cited
   upstream nodes were evaluated.
+- `unresolved_defect_branch`: one observed defect did not reach a confirmed root episode,
+  even if other branches succeeded.
 
 Use this report as the feedback loop between the reasoning module and semantic tracing:
 when attribution can only say "the defect is somewhere around LLM generation", the report

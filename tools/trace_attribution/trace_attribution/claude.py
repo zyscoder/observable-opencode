@@ -185,6 +185,7 @@ class ClaudeJudgeClient(JudgeClient):
                                 "defect_type",
                                 "defect_reason",
                                 "causal_role",
+                                "branch_relation",
                                 "influenced_by",
                                 "is_root_cause",
                                 "severity",
@@ -197,7 +198,10 @@ class ClaudeJudgeClient(JudgeClient):
                                 "When defect_status is absent, defect_type must be an empty string and the reason must not describe the current node as defective.",
                                 "defect_reason must explain the judgment or the uncertainty and must not be empty.",
                                 "causal_role must be defect_introduction, defect_propagation, defect_evidence, non_defective, or unknown.",
+                                "branch_relation must be same_defect, causal_precursor, outcome_evidence, unrelated, or unknown.",
+                                "Each influenced_by item must classify relation as defect_propagated_from, motivated_by_evidence, or derived_from.",
                                 "A faithful test or tool result that exposes a failure is defect_evidence, not defect_introduction.",
+                                "A defect-introduction root may retain motivated_by_evidence or derived_from influences, but never defect_propagated_from.",
                                 "If another field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
                                 "Use fallback_node values for node_ref, component, and event_type when missing.",
                             ],
@@ -267,10 +271,12 @@ def build_judgment_prompt(
         "defect_type": "short_snake_case_or_empty",
         "defect_reason": "why this node is or is not defective",
         "causal_role": "defect_introduction|defect_propagation|defect_evidence|non_defective|unknown",
+        "branch_relation": "same_defect|causal_precursor|outcome_evidence|unrelated|unknown",
         "influenced_by": [
             {
                 "upstream_ref": "record:...",
-                "reason": "why this upstream node caused or propagated the defect",
+                "reason": "how this upstream node relates to the current semantics",
+                "relation": "defect_propagated_from|motivated_by_evidence|derived_from",
                 "confidence": 0.0,
             }
         ],
@@ -284,6 +290,10 @@ def build_judgment_prompt(
         "current_node": current_node,
         "upstream_nodes": compact_upstream_nodes,
         "artifact_evidence": artifact_evidence,
+        "active_defect_branch": {
+            "observed_defect": downstream_context[0] if downstream_context else "",
+            "path": downstream_context,
+        },
         "downstream_taint_path": downstream_context,
         "prompt_compaction": {
             "current_node_max_chars": CURRENT_NODE_PROMPT_CHARS,
@@ -303,6 +313,10 @@ def build_judgment_prompt(
             "Use defect_evidence for a truthful verification, tool result, benchmark result, or observation that exposes a defect without introducing it.",
             "Use defect_propagation when the node carries or acts on an already introduced defect.",
             "Use defect_introduction only when this node first introduces the defect and no earlier supplied causal node did so.",
+            "Classify branch_relation relative to active_defect_branch; unrelated defects must not become roots for this branch.",
+            "A truthful environment or tool result may motivate a decision but does not propagate the decision's defect; label that edge motivated_by_evidence.",
+            "Authored tool-call arguments or test scripts are action semantics; their execution results are outcome evidence unless the result itself corrupts data.",
+            "Code size or complexity alone never proves defect introduction; require a concrete semantic mismatch visible in supplied trace facts.",
             "A defect_evidence or defect_propagation node must never be marked is_root_cause=true.",
             "Never set defect_status=absent while using a non-empty defect_type or while describing the current node as a semantic defect.",
             "If the supplied facts are insufficient to decide, set defect_status=unknown, has_defect=false, is_root_cause=false, and explain what is missing.",
@@ -310,8 +324,9 @@ def build_judgment_prompt(
             "When a hydrated artifact is marked truncated, you must not infer a defect or root cause from the missing portion; return unknown if the visible excerpt is not independently decisive.",
             "Compare verification results only within the relevant repository_revision. A superseded or historical failure does not contradict an effective current-revision pass.",
             "For response.claim nodes, inspect direct_support_refs before candidate_context_refs and inspect superseded_evidence_refs last.",
-            "If the current node is defective because upstream semantics are already defective, list only those upstream refs.",
-            "If the current node first introduces the defect, set defect_status=present, has_defect=true, influenced_by=[], and is_root_cause=true.",
+            "If the current node is defective because upstream semantics are already defective, label those influences defect_propagated_from.",
+            "Use motivated_by_evidence or derived_from for non-defective provenance; these relations do not carry defect taint backward.",
+            "If the current node first introduces the defect, set defect_status=present, has_defect=true, is_root_cause=true, and include no defect_propagated_from influence.",
             "Prefer concrete trace refs from upstream_nodes. Do not cite refs that are absent from the supplied upstream list.",
         ],
         "required_json_schema": schema,
@@ -401,6 +416,16 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
         raise ValueError("judgment requires a non-empty defect_reason")
     if not isinstance(value.get("influenced_by"), list):
         raise ValueError("judgment requires influenced_by as a list")
+    influence_relations = [
+        str(item.get("relation") or "defect_propagated_from").strip().lower()
+        for item in value.get("influenced_by") or []
+        if isinstance(item, dict)
+    ]
+    if any(
+        relation not in {"defect_propagated_from", "motivated_by_evidence", "derived_from"}
+        for relation in influence_relations
+    ):
+        raise ValueError("invalid influence relation")
     if not isinstance(value.get("is_root_cause"), bool):
         raise ValueError("judgment requires is_root_cause as a boolean")
     if causal_role in {"defect_evidence", "defect_propagation", "non_defective", "unknown"} and value.get(
@@ -408,8 +433,12 @@ def validate_judgment_payload(value: Dict[str, Any]) -> None:
     ):
         raise ValueError(f"{causal_role} cannot be marked as a root cause")
     if causal_role == "defect_introduction":
-        if status != "present" or not value.get("is_root_cause") or value.get("influenced_by"):
-            raise ValueError("defect_introduction requires a present root with no upstream influence")
+        if (
+            status != "present"
+            or not value.get("is_root_cause")
+            or "defect_propagated_from" in influence_relations
+        ):
+            raise ValueError("defect_introduction requires a present root with no defect predecessor")
         branch_relation = str(value.get("branch_relation") or "same_defect").strip().lower()
         if branch_relation not in {"same_defect", "causal_precursor"}:
             raise ValueError("defect_introduction requires same_defect or causal_precursor branch_relation")
