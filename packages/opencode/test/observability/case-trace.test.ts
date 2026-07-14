@@ -144,7 +144,7 @@ describe("case trace", () => {
     expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supported_response")).toBe(true)
     expect(provenance.dataflow_edges.some((edge: any) => edge.relation === "supports_claim")).toBe(true)
     expect(provenanceText).not.toContain("diagnostics_hints")
-    expect(provenanceText).not.toContain("evidence_refs")
+    expect(provenance.records.every((record: any) => record.evidence_refs === undefined)).toBe(true)
     expect(provenanceText).not.toContain("final.claim")
     expect(records).toContain('"record_type":"node"')
     const llm = provenance.records.find((record: any) => record.event_type === "llm.call")
@@ -219,8 +219,6 @@ describe("case trace", () => {
 
     expect(response.data.generation_provenance_refs).toContain(`node:${llmCall.record_id}`)
     expect(response.data.generation_provenance_refs).toContain(`node:${transform.record_id}`)
-    expect(response.source_refs).toContain(`node:${llmCall.record_id}`)
-    expect(response.source_refs).toContain(`node:${transform.record_id}`)
     expect(claim.data.generation_provenance_refs).toContain(`node:${llmCall.record_id}`)
     expect(claim.data.generation_provenance_refs).toContain(`node:${transform.record_id}`)
     expect(llmCall.data.message_transforms[0].node_ref).toBe(`node:${transform.record_id}`)
@@ -263,7 +261,7 @@ describe("case trace", () => {
         `const decision = CaseTrace.decision({ component: "processor", decision_type: "llm_tool_call", intent: "search pricing owner", chosen_action: "grep", rationale: { recent_reasoning: "Need source evidence before answering", input: { pattern: "pricing" } }, source_refs: transform ? ["context:" + transform.node_id] : [] })`,
         `CaseTrace.edge({ from: { type: "decision", id: decision?.decision_id ?? "missing" }, to: { type: "tool_call", id: "call_grep", label: "grep" }, relation: "decision_to_tool", label: "Model selected grep" })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -451,7 +449,10 @@ describe("case trace", () => {
     expect(eventTypes).toContain("agent.lifecycle")
     expect(eventTypes).toContain("exit.gate")
     expect(eventTypes).toContain("evidence.semantic_fact")
-    const evidenceFact = trace.records.find((record: any) => record.event_type === "evidence.semantic_fact")
+    const evidenceFact = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "applyDiscount",
+    )
     expect(evidenceFact.data.fact_kind).toBe("code_reference")
     expect(evidenceFact.data.canonical_subject).toBe("applyDiscount")
     expect(evidenceFact.data.claim).toBe("applyDiscount is implemented in src/pricing.mjs lines 7-11")
@@ -554,7 +555,7 @@ describe("case trace", () => {
         `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "old design discount cap", data: { path: "docs/old-design.md", line_start: 8, line_end: 8, text: "Legacy renewal discount cap is 20 percent." } })`,
         `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "current requirement discount cap", data: { path: "docs/current-requirement.md", line_start: 4, line_end: 4, text: "Current renewal discount cap is 15%." } })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -645,7 +646,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "architecture overview", data: { path: "docs/architecture.md", line_start: 3, line_end: 3, text: "Two discounts can apply -- a 10% loyalty discount and a 5% volume discount. The total renewal discount cap must be 15 percent." } })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -686,7 +687,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.responseOutput({ text: "### MCP 返回的事实\\n\\n\\\`\\\`\\\`diff\\n- const cap = 0.2\\n+ const cap = 0.15\\n\\\`\\\`\\\`\\n\\n## 修复完成\\n\\n### 修改点\\n\\nsrc/pricing.mjs 将 discount cap 调整为 15%。" })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -734,7 +735,7 @@ describe("case trace", () => {
         `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_failed", agent: "build", model: { providerID: "deepseek", id: "unit-test" }, message_count: 1, system_count: 1, tool_count: 1 } })`,
         `CaseTrace.llmTurn({ turn_id: span?.id, span_id: span?.id, session_id: "ses_failed", message_id: "msg_user", agent: "build", agent_role: "main", provider_id: "deepseek", model_id: "unit-test", status: "running" })`,
         `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM" } })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -784,7 +785,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.evidenceFact({ source: "subagent", category: "explore", summary: "Subagent summary says docs/architecture.md reports renewal discount cap is 20 percent.", data: { output: "Subagent summary says docs/architecture.md reports renewal discount cap is 20 percent." }, source_refs: ["span:subagent_span"] })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -826,7 +827,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.evidenceFact({ source: "subagent", category: "explore", summary: "Subagent result:\\n1. owner: billing-platform\\n2. discount cap: 15 percent\\n3. implementation entry: src/pricing.mjs", data: { output: "Subagent result:\\n1. owner: billing-platform\\n2. discount cap: 15 percent\\n3. implementation entry: src/pricing.mjs", child_session_id: "ses_child" }, source_refs: ["span:subagent_span"] })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -875,7 +876,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.observation({ source: "task", category: "tool_output", summary: "Task result says renewal discount cap is 20 percent.", data: { output: "Task result says renewal discount cap is 20 percent.", child_session_id: "ses_child", subagent_type: "explore" } })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -916,7 +917,7 @@ describe("case trace", () => {
         `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "docs/requirements.md", data: { path: "docs/requirements.md", text: "The renewal discount cap is 20 percent." }, source_refs: ["tool_result:read1"] })`,
         `CaseTrace.evidenceFact({ source: "read", category: "tool_output", summary: "docs/requirements.md", data: { path: "docs/requirements.md", text: "The renewal discount cap is 20 percent." }, source_refs: ["tool_result:read2"] })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -958,7 +959,7 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.compaction({ trigger: "auto", context_limit: 4000, output_summary: "Keep the active discount cap constraint.", auto_continue: true, result: "continue", context_ledger: { algorithm: "head-tail-summary", retained_message_ids: ["msg_a"], dropped_message_ids: [] } })`,
         `CaseTrace.finish({ status: "success" })`,
-      ].join("\\n"),
+      ].join("\n"),
     )
 
     const proc = Bun.spawn([process.execPath, script], {
@@ -2293,7 +2294,7 @@ describe("case trace", () => {
     const samePayloadArtifacts = provenance.artifacts.filter((artifact: any) => artifact.label === "observation.data")
 
     expect(samePayloadArtifacts).toHaveLength(1)
-    expect(samePayloadArtifacts[0].occurrences).toBe(2)
+    expect(samePayloadArtifacts[0].occurrences).toBe(3)
     expect(samePayloadArtifacts[0].path).toMatch(/^artifacts\/sha256\//)
   })
 
@@ -4167,7 +4168,6 @@ describe("case trace", () => {
     expect(traceText).not.toContain(secret)
     expect(traceText).not.toContain("Bearer abc")
     expect(traceText).not.toContain("final_response_evidence")
-    expect(traceText).not.toContain("evidence_refs")
 
     const artifactText = await fs.readFile(path.join(caseDir, trace.artifacts[0].path), "utf8")
     expect(artifactText).toContain("semantic model message")
@@ -4238,7 +4238,7 @@ describe("case trace", () => {
       "throw new Error(`expected ${item.expected}, got ${actual}`)",
       "Error: expected 170, got 30",
       "    at file:///tmp/project/test/pricing.test.mjs:11:13",
-    ].join("\\n")
+    ].join("\n")
 
     await fs.writeFile(
       script,
@@ -4300,7 +4300,7 @@ describe("case trace", () => {
       "48000 !== 51000",
       "Error: expected 51000, got 48000",
       "---EXIT: 1",
-    ].join("\\n")
+    ].join("\n")
 
     await fs.writeFile(
       script,
@@ -4580,7 +4580,7 @@ describe("case trace", () => {
       "@@",
       "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
       "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
-    ].join("\\n")
+    ].join("\n")
     const productionFile = path.join(dir, "test-oracle-trap", "src", "pricing.mjs")
     const testFile = path.join(dir, "test-oracle-trap", "test", "pricing.test.mjs")
     const testDiff = [
@@ -4588,7 +4588,7 @@ describe("case trace", () => {
       "@@",
       "-assert.equal(renewalQuote({ baseCents: 1200, seats: 50, loyaltyYears: 5 }), 51000)",
       "+assert.equal(renewalQuote({ baseCents: 1200, seats: 50, loyaltyYears: 5 }), 48000)",
-    ].join("\\n")
+    ].join("\n")
 
     await fs.writeFile(
       script,
@@ -4651,13 +4651,13 @@ describe("case trace", () => {
       "@@",
       "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
       "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
-    ].join("\\n")
+    ].join("\n")
     const hardcodeDiff = [
       "@@",
       "-  return Math.round(base * seats * (1 - discount))",
       "+  if (input.baseCents === 1200 && input.seats === 50) return 51000",
       "+  return Math.round(base * seats * (1 - discount))",
-    ].join("\\n")
+    ].join("\n")
 
     await fs.writeFile(
       script,
@@ -5242,13 +5242,20 @@ describe("case trace", () => {
       "取舍：保持 API 稳定，但增加策略注入。",
       "风险：历史订单回放需要兼容旧字段。",
       "测试策略：补充 pricing 单测和 checkout 集成测试。",
-    ].join("\\n")
+    ].join("\n")
+    const diff = [
+      "Index: src/pricing.mjs",
+      "@@",
+      "-  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.2)",
+      "+  const discount = Math.min(loyaltyDiscount + volumeDiscount, 0.15)",
+    ].join("\n")
 
     await fs.writeFile(
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.contextSnapshot({ phase: "llm_request", messages: [{ role: "user", content: "设计折扣能力扩展方案" }] })`,
+        `CaseTrace.change({ tool_call_id: "call_pricing", files: ["src/pricing.mjs"], intent: "Fix pricing discount cap", diff: ${JSON.stringify(diff)} })`,
         `CaseTrace.designRecord({ source: "final_response", requirement_summary: "设计折扣能力扩展方案", existing_boundaries: "pricing/tax/checkout", selected_solution: ${JSON.stringify(designText)}, tradeoffs: "保持 API 稳定", risks: "历史订单兼容", test_strategy: "pricing 单测和 checkout 集成测试" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -5278,7 +5285,10 @@ describe("case trace", () => {
     expect(trace.design_records[0].selected_solution.artifact_id).toBeTruthy()
 
     const provenanceTrace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const change = provenanceTrace.records.find((record: any) => record.event_type === "change")
     const designRecords = provenanceTrace.records.filter((record: any) => record.event_type === "design.record")
+    expect(change.data.change_semantics.risk_flags).toBeArray()
+    expect(change.data.source_ref_relations).toBeArray()
     expect(designRecords).toHaveLength(1)
     expect(designRecords[0].record_id).toBe(trace.design_records[0].design_id)
     expect(designRecords[0].data.selected_solution.artifact_id).toBeTruthy()
@@ -5305,7 +5315,7 @@ describe("case trace", () => {
       "架构边界：仅修改 pricing 内部常量，保持 public API 不变。",
       "设计约束：不硬编码测试输入，不绕过 public API，保持通用计算逻辑。",
       "测试策略：pricing 单测和 design-quality 测试均通过。",
-    ].join("\\n")
+    ].join("\n")
 
     await fs.writeFile(
       script,

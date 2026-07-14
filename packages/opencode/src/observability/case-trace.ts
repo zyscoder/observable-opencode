@@ -39,6 +39,40 @@ export type TraceFieldSummary = {
   payload_dedupe_group_id?: string
 }
 
+function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false
+  const summary = input as Partial<TraceFieldSummary>
+  if (!new Set(["text", "array", "object", "null", "string", "number", "boolean", "undefined"]).has(summary.type ?? "")) {
+    return false
+  }
+  return (
+    "length" in summary ||
+    "hash" in summary ||
+    "preview" in summary ||
+    "value" in summary ||
+    "artifact_id" in summary ||
+    "payload_ref" in summary
+  )
+}
+
+function shouldExternalizeCausalContainer(label: string) {
+  const field = label.split(".").at(-1)
+  if (["input", "output", "messages", "tools", "diff", "stdout", "stderr"].includes(field ?? "")) return true
+  return /^context\.compaction\.(previous_summary|serialized_tail|output_summary)(?:\.|$)/.test(label)
+}
+
+function isStructuredCausalContainer(label: string) {
+  const field = label.split(".").at(-1) ?? ""
+  return (
+    field.endsWith("_refs") ||
+    field.endsWith("_flags") ||
+    field.endsWith("_semantics") ||
+    ["structured_claim", "context_ledger", "message_transforms", "source_ref_relations", "final_test_result"].includes(
+      field,
+    )
+  )
+}
+
 export type TraceArtifact = {
   artifact_id: string
   kind: "text" | "json"
@@ -1821,6 +1855,9 @@ function mcpSemanticExtras(data: unknown): {
       typedResources.push({
         index,
         type: "repo_fact",
+        subject: stringField(parsed, ["subject", "symbol", "name"]),
+        predicate: stringField(parsed, ["predicate", "relation", "property"]),
+        value: primitiveClaimValue(firstPresentField(parsed, ["value", "fact", "claim", "owner", "status"])),
         key: stringField(parsed, ["key"]),
         fact: stringField(parsed, ["fact", "summary", "text"]),
         source_location: sourceLocation ? { ...sourceLocation } : undefined,
@@ -2055,7 +2092,11 @@ function stripResponseClaimScaffolding(input: string) {
 function isNonFactualResponseClaim(input: string) {
   if (isMarkdownTableStructuralRow(input)) return true
   if (/__TRACE_PROTECTED_\d+__/.test(input)) return true
-  if (/^\s*[+-]\s+/.test(input) && /(?:\b(?:const|let|var|return|function|import|export)\b|[{};=]|=>)/.test(input))
+  if (
+    /^\s*[+-]\s+/.test(input) &&
+    (/(?:\b(?:const|let|var|return|import|export)\b|[{};=]|=>)/.test(input) ||
+      /^\s*[+-]\s*(?:async\s+)?function\s+\w+\s*\(/.test(input))
+  )
     return true
   const normalized = input
     .trim()
@@ -3652,15 +3693,19 @@ function explicitDiscountCapValueFromText(input: string) {
   const anchors = [
     ...input.matchAll(/math\.min|discount\s+cap|renewal\s+discount\s+cap|cap(?:ped)?|limit|maximum|max|上限|封顶/gi),
   ]
-    .map((match) => match.index)
-    .filter((index): index is number => index !== undefined)
+    .map((match) => (match.index === undefined ? undefined : { start: match.index, end: match.index + match[0].length }))
+    .filter((anchor): anchor is { start: number; end: number } => anchor !== undefined)
   if (!anchors.length) return candidates.sort((a, b) => a.index - b.index || a.priority - b.priority)[0]?.value
 
   return candidates
     .map((candidate) => ({
       ...candidate,
       distance: Math.min(
-        ...anchors.map((anchor) => Math.min(Math.abs(candidate.index - anchor), Math.abs(candidate.end - anchor))),
+        ...anchors.map((anchor) => {
+          if (candidate.end < anchor.start) return anchor.start - candidate.end
+          if (candidate.index > anchor.end) return candidate.index - anchor.end
+          return 0
+        }),
       ),
     }))
     .sort((a, b) => a.distance - b.distance || a.priority - b.priority || a.index - b.index)[0]?.value
@@ -3908,7 +3953,7 @@ function canonicalEvidence(input: EvidenceFactInput, sourceLocations: TraceSourc
   const summary = stringPreview(input.summary, 500)
   const structuredValue =
     structured.structured_claim.value === undefined ? undefined : String(structured.structured_claim.value)
-  const claim = factText ?? structuredValue ?? summary
+  const claim = factText ?? summary ?? structuredValue
   const factKind = (() => {
     if (source.includes("mcp")) return "mcp_fact"
     if (source.includes("skill")) return "skill_instruction"
@@ -4220,7 +4265,9 @@ function compactionSummarySemantics(input: unknown) {
   const summaryKeyFacts = dedupeStrings(
     lines.filter((line) => constraintPattern.test(line) || factPattern.test(line) || pathPattern.test(line)),
   ).slice(0, 20)
-  const summaryPreservedPaths = dedupeStrings([...text.matchAll(pathPattern)].map((match) => match[0])).slice(0, 20)
+  const summaryPreservedPaths = dedupeStrings(
+    [...text.matchAll(pathPattern)].map((match) => match[0].replace(/[.,，。；;:：)）\]]+$/, "")),
+  ).slice(0, 20)
   return {
     summary_key_facts: summaryKeyFacts,
     summary_constraint_facts: summaryConstraintFacts,
@@ -8298,18 +8345,29 @@ class ActiveCaseTrace {
   private summarizeCausalValue(input: unknown, label: string): unknown {
     if (input === undefined) return undefined
     if (input === null) return null
+    if (isTraceFieldSummary(input)) return input
     if (typeof input === "string") {
       return input.length > maxFieldLength() ? this.summarizeText(input, this.causalArtifactLabel(label)) : input
     }
     if (typeof input === "number" || typeof input === "boolean") return input
     if (Array.isArray(input)) {
       const serialized = json(input)
-      if (serialized.length > maxFieldLength()) return this.summarizeJson(input, this.causalArtifactLabel(label))
+      if (
+        serialized.length > maxFieldLength() &&
+        (shouldExternalizeCausalContainer(label) || !isStructuredCausalContainer(label))
+      ) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label))
+      }
       return input.map((item, index) => this.summarizeCausalValue(item, `${label}.${index}`))
     }
     if (typeof input === "object") {
       const serialized = json(input)
-      if (serialized.length > maxFieldLength()) return this.summarizeJson(input, this.causalArtifactLabel(label))
+      if (
+        serialized.length > maxFieldLength() &&
+        (shouldExternalizeCausalContainer(label) || !isStructuredCausalContainer(label))
+      ) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label))
+      }
       return this.summarizeCausalObject(input as Record<string, unknown>, label)
     }
     return String(input)
