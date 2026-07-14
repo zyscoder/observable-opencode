@@ -5431,4 +5431,129 @@ describe("case trace", () => {
     expect(designRecords.map((record: any) => record.record_id)).toEqual([keptDesignID])
     expect(designRecords[0].data.selected_solution.preview).toContain("最终采用")
   })
+
+  test("preserves formal semantic suffixes recursively below the collection boundary", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-formal-suffixes-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "formal-suffixes-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "formal_suffixes", kind: "verification", component: "tool", title: "formal suffixes", data: { coverage_semantics: { source_refs: ["evidence:pricing"], quality_flags: ["coverage_complete"], nested_semantics: { changed_test_refs: ["change:test"], changed_production_refs: ["change:source"], verification_scope_risk_flags: ["tests_modified"] } }, source_refs: ["evidence:root"], quality_flags: ["reviewed"] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "formal-suffixes-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "8",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "formal-suffixes-case", "trace.json"), "utf8")) as any
+    const record = trace.records.find((item: any) => item.record_id === "formal_suffixes")
+
+    expect(record.data.coverage_semantics.source_refs).toEqual(["evidence:pricing"])
+    expect(record.data.coverage_semantics.quality_flags).toEqual(["coverage_complete"])
+    expect(record.data.coverage_semantics.nested_semantics.changed_test_refs).toEqual(["change:test"])
+    expect(record.data.coverage_semantics.nested_semantics.changed_production_refs).toEqual(["change:source"])
+    expect(record.data.coverage_semantics.nested_semantics.verification_scope_risk_flags).toEqual(["tests_modified"])
+    expect(record.data.source_refs).toEqual(["evidence:root"])
+    expect(record.data.quality_flags).toEqual(["reviewed"])
+  })
+
+  test("externalizes high-cardinality formal collections without truncating their contents", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-high-cardinality-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "high-cardinality-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "high_cardinality", kind: "verification", component: "tool", title: "high cardinality", data: { final_test_result: { executed_checks: Array.from({ length: 65 }, (_, index) => "v" + index) } } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "high-cardinality-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "8",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "high-cardinality-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const record = trace.records.find((item: any) => item.record_id === "high_cardinality")
+    const checks = record.data.final_test_result.executed_checks
+    const artifact = trace.artifacts.find((item: any) => item.artifact_id === checks.artifact_id)
+
+    expect(checks.type).toBe("array")
+    expect(checks.artifact_id).toBeTruthy()
+    expect(checks.payload_ref).toBe(checks.artifact_id)
+    expect(artifact).toBeTruthy()
+    expect(await fs.readFile(path.join(caseDir, artifact.path), "utf8")).toContain("v64")
+  })
+
+  test("keeps generated array summaries intact while rejecting summary-shaped business data", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-summary-idempotence-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "summary-idempotence-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace, summarizeJson } from ${JSON.stringify(traceModule)}`,
+        `const generated = summarizeJson(["one", "two", "three"])`,
+        `CaseTrace.node({ node_id: "summary_idempotence", kind: "verification", component: "tool", title: "summary idempotence", data: { generated, business_payload: { type: "null", value: null, artifact_id: "not-a-summary" } } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "summary-idempotence-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "16",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "summary-idempotence-case", "trace.json"), "utf8")) as any
+    const record = trace.records.find((item: any) => item.record_id === "summary_idempotence")
+
+    expect(record.data.generated.type).toBe("array")
+    expect(record.data.generated.preview).toBe('["one","two","th')
+    expect(record.data.business_payload.type).toBe("object")
+    expect(record.data.business_payload.artifact_id).toBeTruthy()
+  })
 })

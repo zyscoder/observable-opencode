@@ -41,7 +41,7 @@ export type TraceFieldSummary = {
 
 function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
-  const summary = input as Partial<TraceFieldSummary>
+  const summary = input as Record<string, unknown>
   const keys = Object.keys(summary)
   const allowedKeys = new Set([
     "type",
@@ -55,10 +55,10 @@ function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
     "payload_dedupe_group_id",
   ])
   if (keys.some((key) => !allowedKeys.has(key))) return false
-  const hasArtifactFields = ["artifact_id", "payload_ref", "payload_dedupe_group_id"].every(
-    (key) => !(key in summary) || typeof summary[key as keyof TraceFieldSummary] === "string",
-  )
-  if (!hasArtifactFields) return false
+  const artifactKeys = ["artifact_id", "payload_ref", "payload_dedupe_group_id"]
+  const hasValidArtifactFields = artifactKeys.every((key) => !(key in summary) || typeof summary[key] === "string")
+  const hasNoArtifactFields = artifactKeys.every((key) => !(key in summary))
+  if (!hasValidArtifactFields) return false
   const isSizedSummary =
     typeof summary.length === "number" &&
     Number.isFinite(summary.length) &&
@@ -70,23 +70,58 @@ function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
     case "text":
       return isSizedSummary && !("keys" in summary) && !("value" in summary)
     case "array":
-      return isSizedSummary && !("keys" in summary) && !("value" in summary)
+      return (
+        isSizedSummary &&
+        !("value" in summary) &&
+        (!("keys" in summary) || summary.keys === undefined)
+      )
     case "object":
       return (
         isSizedSummary &&
         !("value" in summary) &&
-        (!("keys" in summary) || (Array.isArray(summary.keys) && summary.keys.every((key) => typeof key === "string")))
+        (!("keys" in summary) ||
+          summary.keys === undefined ||
+          (Array.isArray(summary.keys) && summary.keys.every((key) => typeof key === "string")))
       )
     case "null":
-      return summary.value === null && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+      return (
+        summary.value === null &&
+        hasNoArtifactFields &&
+        !("keys" in summary) &&
+        !("length" in summary) &&
+        !("hash" in summary) &&
+        !("preview" in summary)
+      )
     case "string":
-      return typeof summary.value === "string" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+      return (
+        typeof summary.value === "string" &&
+        hasNoArtifactFields &&
+        !("keys" in summary) &&
+        !("length" in summary) &&
+        !("hash" in summary) &&
+        !("preview" in summary)
+      )
     case "number":
-      return typeof summary.value === "number" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+      return (
+        typeof summary.value === "number" &&
+        Number.isFinite(summary.value) &&
+        hasNoArtifactFields &&
+        !("keys" in summary) &&
+        !("length" in summary) &&
+        !("hash" in summary) &&
+        !("preview" in summary)
+      )
     case "boolean":
-      return typeof summary.value === "boolean" && !("length" in summary) && !("hash" in summary) && !("preview" in summary)
+      return (
+        typeof summary.value === "boolean" &&
+        hasNoArtifactFields &&
+        !("keys" in summary) &&
+        !("length" in summary) &&
+        !("hash" in summary) &&
+        !("preview" in summary)
+      )
     case "undefined":
-      return !keys.some((key) => key !== "type")
+      return keys.length === 1
     default:
       return false
   }
@@ -109,7 +144,18 @@ function isStructuredCausalContainer(label: string) {
     "llm.call.data.message_transforms",
     "verification.data.final_test_result",
   ]
-  return schemaRoots.some((root) => label === root || label.startsWith(`${root}.`))
+  return (
+    schemaRoots.some((root) => label === root || label.startsWith(`${root}.`)) ||
+    label.split(".").some((segment) => /_(?:refs|flags|semantics)$/.test(segment))
+  )
+}
+
+const MAX_STRUCTURED_CAUSAL_COLLECTION_ITEMS = 64
+
+function exceedsStructuredCausalCollectionLimit(input: unknown) {
+  if (Array.isArray(input)) return input.length > MAX_STRUCTURED_CAUSAL_COLLECTION_ITEMS
+  if (input && typeof input === "object") return Object.keys(input).length > MAX_STRUCTURED_CAUSAL_COLLECTION_ITEMS
+  return false
 }
 
 export type TraceArtifact = {
@@ -1282,13 +1328,12 @@ export function summarizeText(input: unknown): TraceFieldSummary {
 export function summarizeJson(input: unknown): TraceFieldSummary {
   if (input === null || typeof input !== "object") return summarizeScalar(input)
   const serialized = json(input)
-  const keys = Array.isArray(input) ? undefined : Object.keys(input as Record<string, unknown>).slice(0, 50)
   return {
     type: Array.isArray(input) ? "array" : "object",
     length: serialized.length,
     hash: hash(serialized),
-    keys,
     preview: serialized.slice(0, maxFieldLength()),
+    ...(Array.isArray(input) ? {} : { keys: Object.keys(input as Record<string, unknown>).slice(0, 50) }),
   }
 }
 
@@ -8346,18 +8391,17 @@ class ActiveCaseTrace {
     }
   }
 
-  summarizeJson(input: unknown, label = "json"): TraceFieldSummary {
+  summarizeJson(input: unknown, label = "json", forceArtifact = false): TraceFieldSummary {
     if (input === null || typeof input !== "object") return summarizeScalar(input)
     const serialized = json(input)
-    const keys = Array.isArray(input) ? undefined : Object.keys(input as Record<string, unknown>).slice(0, 50)
     const summary: TraceFieldSummary = {
       type: Array.isArray(input) ? "array" : "object",
       length: serialized.length,
       hash: hash(serialized),
-      keys,
       preview: serialized.slice(0, maxFieldLength()),
+      ...(Array.isArray(input) ? {} : { keys: Object.keys(input as Record<string, unknown>).slice(0, 50) }),
     }
-    if (serialized.length <= maxFieldLength()) return summary
+    if (!forceArtifact && serialized.length <= maxFieldLength()) return summary
     const artifact = this.writeArtifact("json", label, prettyJsonString(serialized))
     return {
       ...summary,
@@ -8385,6 +8429,10 @@ class ActiveCaseTrace {
     if (input === undefined) return undefined
     if (input === null) return null
     if (typeof input === "string") {
+      if (input.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
+        return this.summarizeText(input, this.causalArtifactLabel(label))
+      }
+      if (isStructuredCausalContainer(label)) return input
       return input.length > maxFieldLength() ? this.summarizeText(input, this.causalArtifactLabel(label)) : input
     }
     if (typeof input === "number" || typeof input === "boolean") return input
@@ -8394,6 +8442,9 @@ class ActiveCaseTrace {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
       if (isTraceFieldSummary(input)) return input
+      if (isStructuredCausalContainer(label) && exceedsStructuredCausalCollectionLimit(input)) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label), true)
+      }
       if (serialized.length > maxFieldLength() && !isStructuredCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
@@ -8405,6 +8456,9 @@ class ActiveCaseTrace {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
       if (isTraceFieldSummary(input)) return input
+      if (isStructuredCausalContainer(label) && exceedsStructuredCausalCollectionLimit(input)) {
+        return this.summarizeJson(input, this.causalArtifactLabel(label), true)
+      }
       if (serialized.length > maxFieldLength() && !isStructuredCausalContainer(label)) {
         return this.summarizeJson(input, this.causalArtifactLabel(label))
       }
