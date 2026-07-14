@@ -673,6 +673,260 @@ class TraceGraphTest(unittest.TestCase):
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_judges_shared_node_independently_for_each_observed_defect(self):
+        class BranchJudge(FakeJudge):
+            def __init__(self):
+                super().__init__({})
+                self.contexts = []
+
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                self.contexts.append(list(downstream_context))
+                active_defect = "parser_contract" if "parser_contract" in downstream_context[0] else "scope_coverage"
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type=active_defect,
+                    defect_reason=f"The shared decision introduces {active_defect} on this branch.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                    confidence=0.9,
+                )
+
+        trace = {
+            "case_id": "branch-isolation-case",
+            "records": [
+                {
+                    "record_id": "shared_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"rationale": "Implement and verify the requested change."},
+                },
+                {
+                    "record_id": "parser_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:shared_decision"],
+                    "data": {"failure_type": "parser_contract"},
+                },
+                {
+                    "record_id": "scope_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:shared_decision"],
+                    "data": {"failure_type": "scope_coverage"},
+                },
+            ],
+        }
+        judge = BranchJudge()
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls, ["record:shared_decision", "record:shared_decision"])
+        self.assertEqual(len(report.defect_branches), 2)
+        branch_by_start = {branch.start_ref: branch for branch in report.defect_branches}
+        self.assertEqual(
+            branch_by_start["record:parser_defect"].node_judgments["record:shared_decision"].defect_type,
+            "parser_contract",
+        )
+        self.assertEqual(
+            branch_by_start["record:scope_defect"].node_judgments["record:shared_decision"].defect_type,
+            "scope_coverage",
+        )
+        self.assertEqual(
+            [branch.analysis_outcome for branch in report.defect_branches],
+            ["root_found", "root_found"],
+        )
+
+    def test_reports_partial_root_found_when_any_defect_branch_is_unresolved(self):
+        trace = {
+            "case_id": "partial-coverage-case",
+            "records": [
+                {"record_id": "root_a", "component": "processor", "event_type": "decision"},
+                {"record_id": "evidence_b", "component": "result", "event_type": "response.claim"},
+                {
+                    "record_id": "observed_a",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:root_a"],
+                    "data": {"failure_type": "defect_a"},
+                },
+                {
+                    "record_id": "observed_b",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:evidence_b"],
+                    "data": {"failure_type": "defect_b"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:root_a": NodeJudgment(
+                    node_ref="record:root_a",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="defect_a",
+                    defect_reason="This decision introduces defect A.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                ),
+                "record:evidence_b": NodeJudgment(
+                    node_ref="record:evidence_b",
+                    component="result",
+                    event_type="response.claim",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="defect_b",
+                    defect_reason="The defect is visible, but its source is absent from the trace.",
+                    causal_role="defect_propagation",
+                    branch_relation="same_defect",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:missing_source",
+                            reason="The missing source generated this claim.",
+                        )
+                    ],
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(report.metadata["analysis_outcome"], "partial_root_found")
+        self.assertEqual(
+            {branch.start_ref: branch.analysis_outcome for branch in report.defect_branches},
+            {"record:observed_a": "root_found", "record:observed_b": "inconclusive"},
+        )
+        self.assertIn(
+            "unresolved_defect_branch",
+            [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]],
+        )
+        self.assertEqual(report.trace_improvement_report["summary"]["analysis_confidence"], "partial")
+
+    def test_collapses_duplicate_roots_within_the_same_causal_episode(self):
+        trace = {
+            "case_id": "episode-root-case",
+            "records": [
+                {
+                    "record_id": "reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_1",
+                        },
+                    },
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"call_id": "call_1"},
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:reasoning", "record:action", "record:tool_call"],
+                    "data": {"failure_type": "wrong_parser_contract"},
+                },
+            ],
+        }
+        roots = {
+            ref: NodeJudgment(
+                node_ref=ref,
+                component="processor" if ref != "record:tool_call" else "tool",
+                event_type="decision" if ref != "record:tool_call" else "tool.call",
+                has_defect=True,
+                defect_status="present",
+                defect_type="wrong_parser_contract",
+                defect_reason="This member materializes the same defective action.",
+                causal_role="defect_introduction",
+                branch_relation="same_defect",
+                is_root_cause=True,
+            )
+            for ref in ("record:reasoning", "record:action", "record:tool_call")
+        }
+
+        report = BackwardTaintAnalyzer(judge=FakeJudge(roots)).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:reasoning"])
+        self.assertEqual(
+            set(report.root_causes[0].episode_member_refs),
+            {"record:reasoning", "record:action", "record:tool_call"},
+        )
+        self.assertEqual(report.root_causes[0].observed_defect_refs, ["record:observed"])
+
+    def test_motivating_evidence_does_not_become_a_defect_predecessor(self):
+        trace = {
+            "case_id": "motivation-is-not-propagation-case",
+            "records": [
+                {"record_id": "environment", "component": "tool", "event_type": "tool.result"},
+                {
+                    "record_id": "scope_decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:environment"],
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:scope_decision"],
+                    "data": {"failure_type": "scope_coverage"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:scope_decision": NodeJudgment(
+                    node_ref="record:scope_decision",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="scope_coverage",
+                    defect_reason="The decision incorrectly narrows the required scope.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:environment",
+                            reason="The environment result motivated the decision.",
+                            relation="motivated_by_evidence",
+                        )
+                    ],
+                    is_root_cause=True,
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.calls, ["record:scope_decision"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:scope_decision"])
+        self.assertNotIn("record:environment", report.visited_order)
+
     def test_defers_llm_surface_root_until_reconstructed_decisions_are_judged(self):
         trace = {
             "case_id": "deferred-surface-root-case",

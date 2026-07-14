@@ -4,8 +4,16 @@ from collections import deque
 from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .episodes import CausalEpisodeIndex
 from .graph import TraceGraph
-from .models import AttributionReport, NodeJudgment, RootCauseCandidate, TaintInfluence, TraceNode
+from .models import (
+    AttributionReport,
+    DefectBranchResult,
+    NodeJudgment,
+    RootCauseCandidate,
+    TaintInfluence,
+    TraceNode,
+)
 from .trace_improvement import build_trace_improvement_report
 
 
@@ -36,12 +44,85 @@ class BackwardTaintAnalyzer:
     ) -> AttributionReport:
         starts = [graph.resolve(ref) or ref for ref in (start_refs or graph.default_start_refs())]
         starts = [ref for ref in starts if ref in graph.nodes]
-        queue = deque((ref, [ref], 0) for ref in starts)
+        episode_index = CausalEpisodeIndex.from_graph(graph)
+        branches = [
+            self._analyze_branch(
+                graph,
+                start_ref=start_ref,
+                objective=objective,
+                episode_index=episode_index,
+            )
+            for start_ref in starts
+        ]
+
+        judgments: Dict[str, NodeJudgment] = {}
+        for branch in branches:
+            for ref, judgment in branch.node_judgments.items():
+                judgments.setdefault(ref, judgment)
+        root_causes = aggregate_root_causes(branches, graph)
+        taint_paths = dedupe_paths(path for branch in branches for path in branch.taint_paths)
+        visited_order = dedupe(ref for branch in branches for ref in branch.visited_order)
+        unresolved_refs = sorted({ref for branch in branches for ref in branch.unresolved_refs})
+        judge_errors = [
+            dict(error, branch_id=branch.branch_id)
+            for branch in branches
+            for error in branch.metadata.get("judge_errors") or []
+        ]
+        branch_outcomes = [branch.analysis_outcome for branch in branches]
+        analysis_outcome = aggregate_analysis_outcome(branch_outcomes)
+        termination_reason = aggregate_termination_reason(branches)
+
+        report = AttributionReport(
+            case_id=graph.case_id,
+            objective=objective,
+            start_refs=starts,
+            root_causes=root_causes,
+            taint_paths=taint_paths,
+            node_judgments=judgments,
+            visited_order=visited_order,
+            unresolved_refs=unresolved_refs,
+            defect_branches=branches,
+            metadata={
+                "analysis": "backward_semantic_taint",
+                "max_depth": self.max_depth,
+                "max_nodes": self.max_nodes,
+                "budget_scope": "per_defect_branch",
+                "judge_timeout_seconds": getattr(self.judge, "timeout_seconds", None),
+                "judge_thinking_mode": getattr(self.judge, "thinking_mode", None),
+                "judge_thinking_config": getattr(self.judge, "thinking_config", None),
+                "judge_error_count": len(judge_errors),
+                "judge_errors": judge_errors,
+                "analysis_outcome": analysis_outcome,
+                "termination_reason": termination_reason,
+                "defect_branch_count": len(branches),
+                "defect_branch_outcomes": {
+                    branch.branch_id: branch.analysis_outcome for branch in branches
+                },
+                "artifact_hydration": graph.artifact_hydration,
+                "message_lineage": {
+                    "version": graph.message_lineage.get("version"),
+                    "collection_mode": graph.message_lineage.get("collection_mode"),
+                    "behavior_impact": graph.message_lineage.get("behavior_impact"),
+                    "stats": graph.message_lineage.get("stats") or {},
+                },
+            },
+        )
+        return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))
+
+    def _analyze_branch(
+        self,
+        graph: TraceGraph,
+        *,
+        start_ref: str,
+        objective: str,
+        episode_index: CausalEpisodeIndex,
+    ) -> DefectBranchResult:
+        queue = deque([(start_ref, [start_ref], 0)])
         visited: Set[str] = set()
         visited_order: List[str] = []
         judgments: Dict[str, NodeJudgment] = {}
         root_causes: Dict[str, RootCauseCandidate] = {}
-        taint_paths: List[List[str]] = []
+        root_paths: Dict[str, List[str]] = {}
         unresolved_refs: List[str] = []
         visited_paths: Dict[str, List[str]] = {}
         provisional_surface_roots: Dict[str, Tuple[RootCauseCandidate, List[str], List[str]]] = {}
@@ -94,6 +175,7 @@ class BackwardTaintAnalyzer:
                             upstream_ref=item,
                             reason="The offline evaluation cites this trace record as outcome evidence.",
                             confidence=1.0,
+                            relation="derived_from",
                         )
                         for item in evaluation_refs
                     ],
@@ -144,7 +226,7 @@ class BackwardTaintAnalyzer:
                         queue.append((decision_ref, path + [decision_ref], depth + 1))
                     continue
                 root_causes[ref] = candidate
-                taint_paths.append(path)
+                root_paths[ref] = path
                 continue
 
             for next_ref in next_refs:
@@ -188,7 +270,7 @@ class BackwardTaintAnalyzer:
                 ).strip(),
                 confidence=judgment.confidence,
             )
-            taint_paths.append(visited_paths.get(ref, [ref]))
+            root_paths[ref] = visited_paths.get(ref, [ref])
 
         for ref, (candidate, path, decision_refs) in provisional_surface_roots.items():
             decision_judgments = [judgments.get(item) for item in decision_refs]
@@ -202,7 +284,7 @@ class BackwardTaintAnalyzer:
             if not decision_judgments or any(item is None or item.defect_status == "unknown" for item in decision_judgments):
                 continue
             root_causes[ref] = candidate
-            taint_paths.append(path)
+            root_paths[ref] = path
 
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
@@ -211,8 +293,7 @@ class BackwardTaintAnalyzer:
         if root_causes:
             analysis_outcome = "root_found"
         elif (
-            not starts
-            or node_limit_hit
+            node_limit_hit
             or depth_limit_hit
             or unresolved_refs
             or judge_errors
@@ -222,40 +303,45 @@ class BackwardTaintAnalyzer:
         else:
             analysis_outcome = "no_defect"
 
-        report = AttributionReport(
-            case_id=graph.case_id,
-            objective=objective,
-            start_refs=starts,
-            root_causes=list(root_causes.values()),
-            taint_paths=dedupe_paths(taint_paths),
+        collapsed_roots, collapsed_paths = collapse_episode_roots(
+            graph=graph,
+            episode_index=episode_index,
+            roots=root_causes,
+            root_paths=root_paths,
+            judgments=judgments,
+            observed_defect_ref=start_ref,
+        )
+        if root_causes and not collapsed_roots:
+            analysis_outcome = "inconclusive"
+
+        branch_id = f"defect_branch:{start_ref}"
+        return DefectBranchResult(
+            branch_id=branch_id,
+            start_ref=start_ref,
+            defect_type=start_defect_type(graph, start_ref),
+            analysis_outcome=analysis_outcome,
+            root_causes=collapsed_roots,
+            taint_paths=collapsed_paths,
             node_judgments=judgments,
             visited_order=visited_order,
             unresolved_refs=sorted(set(unresolved_refs)),
             metadata={
-                "analysis": "backward_semantic_taint",
-                "max_depth": self.max_depth,
-                "max_nodes": self.max_nodes,
-                "judge_timeout_seconds": getattr(self.judge, "timeout_seconds", None),
-                "judge_thinking_mode": getattr(self.judge, "thinking_mode", None),
-                "judge_thinking_config": getattr(self.judge, "thinking_config", None),
                 "judge_error_count": len(judge_errors),
                 "judge_errors": judge_errors,
-                "analysis_outcome": analysis_outcome,
                 "termination_reason": termination_reason,
-                "artifact_hydration": graph.artifact_hydration,
-                "message_lineage": {
-                    "version": graph.message_lineage.get("version"),
-                    "collection_mode": graph.message_lineage.get("collection_mode"),
-                    "behavior_impact": graph.message_lineage.get("behavior_impact"),
-                    "stats": graph.message_lineage.get("stats") or {},
-                },
+                "node_limit_hit": node_limit_hit,
+                "depth_limit_hit": depth_limit_hit,
             },
         )
-        return replace(report, trace_improvement_report=build_trace_improvement_report(graph, report))
 
     def _resolve_influences(self, graph: TraceGraph, judgment: NodeJudgment, current_ref: str) -> List[str]:
+        current = graph.nodes.get(current_ref)
+        if current and is_evaluation_assertion(current):
+            return dedupe(graph.upstream_refs(current_ref))
         explicit = []
         for influence in judgment.influenced_by:
+            if influence.relation != "defect_propagated_from":
+                continue
             resolved = graph.resolve(influence.upstream_ref) or influence.upstream_ref
             if resolved != current_ref:
                 explicit.append(resolved)
@@ -264,6 +350,94 @@ class BackwardTaintAnalyzer:
         if judgment.is_root_cause:
             return []
         return []
+
+
+def collapse_episode_roots(
+    *,
+    graph: TraceGraph,
+    episode_index: CausalEpisodeIndex,
+    roots: Dict[str, RootCauseCandidate],
+    root_paths: Dict[str, List[str]],
+    judgments: Dict[str, NodeJudgment],
+    observed_defect_ref: str,
+) -> Tuple[List[RootCauseCandidate], List[List[str]]]:
+    refs_by_episode: Dict[str, List[str]] = {}
+    for ref in roots:
+        episode = episode_index.episode_for(ref)
+        refs_by_episode.setdefault(episode.episode_id, []).append(ref)
+
+    candidates: List[RootCauseCandidate] = []
+    paths: List[List[str]] = []
+    for episode_id, candidate_refs in refs_by_episode.items():
+        representative = episode_index.representative(candidate_refs, judgments)
+        if not representative:
+            continue
+        episode = episode_index.episode_for(representative)
+        candidates.append(
+            replace(
+                roots[representative],
+                episode_id=episode_id,
+                episode_member_refs=episode.member_refs,
+                observed_defect_refs=[observed_defect_ref],
+            )
+        )
+        paths.append(root_paths.get(representative, [observed_defect_ref, representative]))
+
+    candidates.sort(key=lambda item: graph.position(item.node_ref))
+    path_by_root = {path[-1]: path for path in paths if path}
+    ordered_paths = [path_by_root[item.node_ref] for item in candidates if item.node_ref in path_by_root]
+    return candidates, dedupe_paths(ordered_paths)
+
+
+def aggregate_root_causes(branches: List[DefectBranchResult], graph: TraceGraph) -> List[RootCauseCandidate]:
+    aggregated: Dict[Tuple[str, str], RootCauseCandidate] = {}
+    for branch in branches:
+        for candidate in branch.root_causes:
+            key = (candidate.node_ref, candidate.defect_type)
+            existing = aggregated.get(key)
+            if not existing:
+                aggregated[key] = candidate
+                continue
+            aggregated[key] = replace(
+                existing,
+                observed_defect_refs=dedupe(
+                    existing.observed_defect_refs + candidate.observed_defect_refs
+                ),
+                confidence=max(existing.confidence, candidate.confidence),
+            )
+    return sorted(aggregated.values(), key=lambda item: graph.position(item.node_ref))
+
+
+def aggregate_analysis_outcome(branch_outcomes: List[str]) -> str:
+    if not branch_outcomes:
+        return "inconclusive"
+    if all(outcome == "root_found" for outcome in branch_outcomes):
+        return "root_found"
+    if any(outcome == "root_found" for outcome in branch_outcomes):
+        return "partial_root_found"
+    if all(outcome == "no_defect" for outcome in branch_outcomes):
+        return "no_defect"
+    return "inconclusive"
+
+
+def aggregate_termination_reason(branches: List[DefectBranchResult]) -> str:
+    reasons = {str(branch.metadata.get("termination_reason") or "") for branch in branches}
+    if "node_limit" in reasons:
+        return "node_limit"
+    if "depth_limit" in reasons:
+        return "depth_limit"
+    return "queue_exhausted"
+
+
+def start_defect_type(graph: TraceGraph, start_ref: str) -> str:
+    node = graph.nodes.get(start_ref)
+    if not node:
+        return "analysis_start"
+    for key in ("failure_type", "gap_kind", "dimension", "issue_kind"):
+        value = node.data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "analysis_start"
 
 
 def dedupe(items: Iterable[str]) -> List[str]:

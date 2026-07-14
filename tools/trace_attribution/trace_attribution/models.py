@@ -268,6 +268,23 @@ class RootCauseCandidate:
     reason: str
     confidence: float
     causal_role: str = "defect_introduction"
+    episode_id: str = ""
+    episode_member_refs: List[str] = field(default_factory=list)
+    observed_defect_refs: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DefectBranchResult:
+    branch_id: str
+    start_ref: str
+    defect_type: str
+    analysis_outcome: str
+    root_causes: List[RootCauseCandidate]
+    taint_paths: List[List[str]]
+    node_judgments: Dict[str, NodeJudgment]
+    visited_order: List[str]
+    unresolved_refs: List[str]
+    metadata: JsonDict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -280,6 +297,7 @@ class AttributionReport:
     node_judgments: Dict[str, NodeJudgment]
     visited_order: List[str]
     unresolved_refs: List[str]
+    defect_branches: List[DefectBranchResult] = field(default_factory=list)
     trace_improvement_report: JsonDict = field(default_factory=dict)
     metadata: JsonDict = field(default_factory=dict)
 

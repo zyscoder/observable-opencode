@@ -33,6 +33,39 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
             unblocks=["no_analysis_start"],
         )
 
+    incomplete_branches = [
+        branch
+        for branch in report.defect_branches
+        if branch.analysis_outcome not in ("root_found", "no_defect")
+    ]
+    for branch in incomplete_branches:
+        blocking_gaps.append(
+            {
+                "gap_type": "unresolved_defect_branch",
+                "node_ref": branch.start_ref,
+                "component": "attribution",
+                "event_type": "defect_branch",
+                "why_it_blocks_root_cause_analysis": (
+                    f"The observed defect branch {branch.defect_type} did not reach a confirmed "
+                    "defect-introduction episode. Other successful branches do not cover this defect."
+                ),
+                "missing_semantic_fields": ["branch_root_cause_episode"],
+                "related_refs": dedupe(branch.visited_order + branch.unresolved_refs),
+                "confidence": 1.0,
+            }
+        )
+    if incomplete_branches:
+        add_recommendation(
+            recommendations,
+            component="attribution",
+            priority="high",
+            change=(
+                "Review each unresolved defect branch independently and add the missing causal identity, "
+                "semantic predecessor, or judge evidence needed to reach its introduction episode."
+            ),
+            unblocks=["unresolved_defect_branch"],
+        )
+
     for root in report.root_causes:
         node = graph.nodes.get(root.node_ref)
         if not node:
@@ -390,6 +423,8 @@ def analysis_confidence(blocking_gaps: List[JsonDict], report: AttributionReport
     outcome = report.metadata.get("analysis_outcome")
     if outcome == "no_defect":
         return "no_defect"
+    if outcome == "partial_root_found":
+        return "partial"
     if outcome == "inconclusive":
         return "blocked"
     if not report.root_causes:
