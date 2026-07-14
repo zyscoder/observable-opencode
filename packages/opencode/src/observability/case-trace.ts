@@ -724,6 +724,11 @@ export type CausalEdge = {
   from: TraceRef
   to: TraceRef
   relation: string
+  original_relation: string
+  normalized_relation: DataflowEdge["relation"]
+  evidence_tier: "confirmed" | "content_matched" | "temporal_advisory"
+  eligible_for_attribution: boolean
+  derivation_method: string
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -1084,8 +1089,21 @@ type CausalNodeInput = Omit<
   evidence_refs?: string[]
 }
 
-type CausalEdgeInput = Omit<CausalEdge, "edge_id"> & {
+type CausalEdgeInput = Omit<
+  CausalEdge,
+  | "edge_id"
+  | "original_relation"
+  | "normalized_relation"
+  | "evidence_tier"
+  | "eligible_for_attribution"
+  | "derivation_method"
+> & {
   edge_id?: string
+  original_relation?: string
+  normalized_relation?: DataflowEdge["relation"]
+  evidence_tier?: CausalEdge["evidence_tier"]
+  eligible_for_attribution?: boolean
+  derivation_method?: string
 }
 
 type ObservationInput = {
@@ -6791,11 +6809,16 @@ class ActiveCaseTrace {
   }
 
   causalEdge(input: CausalEdgeInput) {
-    const edge: CausalEdge = {
+    const edge: CausalEdgeInput & { edge_id: string } = {
       edge_id: input.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
       from: input.from,
       to: input.to,
       relation: input.relation,
+      original_relation: input.original_relation,
+      normalized_relation: input.normalized_relation,
+      evidence_tier: input.evidence_tier,
+      eligible_for_attribution: input.eligible_for_attribution,
+      derivation_method: input.derivation_method,
       label: input.label,
       metadata: input.metadata,
     }
@@ -7285,12 +7308,12 @@ class ActiveCaseTrace {
 
   private provenanceSummary(status: TraceStatus, caseStatus?: TraceStatus): ProvenanceTraceSummary {
     const manifest = this.manifest(status, caseStatus)
-    const causalIR = this.causalIR.snapshot()
-    const records = this.provenanceRecords()
+    const records = this.provenanceRecords().filter((record) => !this.isCaseDiagnosticKind(record.event_type))
     const dataflowEdges = this.provenanceDataflowEdges()
     const traceHealth = this.traceHealth(records)
-    const diagnosticRecords = this.caseDiagnosticRecords(traceHealth)
-    const allRecords = [...records, ...diagnosticRecords]
+    this.syncCaseDiagnosticNodes(traceHealth)
+    const causalIR = this.causalIR.snapshot()
+    const allRecords = this.provenanceRecords()
     const streamSummary = this.streamSummary()
     return {
       trace_version: TRACE_VERSION,
@@ -7318,18 +7341,51 @@ class ActiveCaseTrace {
     }
   }
 
-  private caseDiagnosticRecords(traceHealth: TraceHealthMetrics): ProvenanceRecord[] {
-    const records: ProvenanceRecord[] = []
+  private syncCaseDiagnosticNodes(traceHealth: TraceHealthMetrics) {
+    const current = this.causalNodes.filter((node) => this.isCaseDiagnosticKind(node.kind))
+    const currentByID = new Map(current.map((node) => [node.node_id, node]))
+    const desired = this.caseDiagnosticNodes(traceHealth, currentByID)
+    const desiredIDs = new Set(desired.map((node) => node.node_id))
+
+    for (const node of desired) {
+      const existing = currentByID.get(node.node_id)
+      if (!existing) {
+        this.causalIR.createNode(node)
+        continue
+      }
+      if (JSON.stringify(existing) !== JSON.stringify(node)) this.causalIR.updateNode(node)
+    }
+
+    if (current.some((node) => !desiredIDs.has(node.node_id))) {
+      this.causalIR.replaceNodes(
+        this.causalNodes.filter((node) => !this.isCaseDiagnosticKind(node.kind) || desiredIDs.has(node.node_id)),
+      )
+    }
+  }
+
+  private caseDiagnosticNodes(
+    traceHealth: TraceHealthMetrics,
+    currentByID: Map<string, CausalNode>,
+  ): CausalNode[] {
+    const nodes: CausalNode[] = []
     const timestamp = nowIso()
     const timeMs = Date.now() - this.startedAt
+    const diagnosticNode = (node: CausalNode) => {
+      const current = currentByID.get(node.node_id)
+      nodes.push({
+        ...node,
+        timestamp: current?.timestamp ?? node.timestamp,
+        time_ms: current?.time_ms ?? node.time_ms,
+      })
+    }
     const missingVerification = traceHealth.issues.find((issue) => issue.kind === "missing_verification_after_change")
     if (missingVerification) {
       const missingID = "missing_semantic_final_test_result"
       const sourceRefs = dedupeStrings(missingVerification.refs ?? [])
-      records.push({
-        record_id: missingID,
+      diagnosticNode({
+        node_id: missingID,
+        kind: "case.missing_semantic",
         component: "trace",
-        event_type: "case.missing_semantic",
         timestamp,
         time_ms: timeMs,
         title: "Missing final test result",
@@ -7343,10 +7399,10 @@ class ActiveCaseTrace {
           issue_refs: sourceRefs,
         },
       })
-      records.push({
-        record_id: "observed_defect_missing_verification_after_change",
+      diagnosticNode({
+        node_id: "observed_defect_missing_verification_after_change",
+        kind: "case.observed_defect",
         component: "trace",
-        event_type: "case.observed_defect",
         timestamp,
         time_ms: timeMs,
         title: "Observed defect: missing verification after change",
@@ -7363,11 +7419,11 @@ class ActiveCaseTrace {
       })
     }
     for (const issue of traceHealth.issues.filter((item) => item.kind === "verification_after_test_change")) {
-      const id = `observed_defect_${safeNodeIDPart(`${issue.kind}_${issue.record_id ?? records.length}`)}`
-      records.push({
-        record_id: id,
+      const id = `observed_defect_${safeNodeIDPart(`${issue.kind}_${issue.record_id ?? nodes.length}`)}`
+      diagnosticNode({
+        node_id: id,
+        kind: "case.observed_defect",
         component: "trace",
-        event_type: "case.observed_defect",
         timestamp,
         time_ms: timeMs,
         title: "Observed defect: verification after test change",
@@ -7383,7 +7439,11 @@ class ActiveCaseTrace {
         },
       })
     }
-    return records
+    return nodes
+  }
+
+  private isCaseDiagnosticKind(kind: string) {
+    return kind === "case.missing_semantic" || kind === "case.observed_defect"
   }
 
   private serverShutdownReason() {

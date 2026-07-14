@@ -3,6 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { replayCausalIRJournal } from "@/observability/causal-ir"
 import { renderCaseTraceHtml } from "@/observability/case-trace-html"
 import { renderProvenanceTraceHtml } from "@/observability/causal-trace-viewer"
 import type { ProvenanceTraceSummary, TraceSummary } from "@/observability/case-trace"
@@ -89,6 +90,12 @@ describe("case trace", () => {
     const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
     const traceHtml = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const provenanceText = JSON.stringify(provenance)
+    const canonicalEdge = trace.edges[0] as NonNullable<ProvenanceTraceSummary["edges"]>[number]
+    const originalRelation: string = canonicalEdge.original_relation
+    const normalizedRelation: string = canonicalEdge.normalized_relation
+    const evidenceTier: "confirmed" | "content_matched" | "temporal_advisory" = canonicalEdge.evidence_tier
+    const eligibleForAttribution: boolean = canonicalEdge.eligible_for_attribution
+    const derivationMethod: string = canonicalEdge.derivation_method
     const allowedRelations = new Set([
       "selected_into_context",
       "prompted",
@@ -135,6 +142,13 @@ describe("case trace", () => {
     )
     expect(trace.artifacts).toEqual(provenance.artifacts)
     expect(trace.compatibility.provenance_projection).toBe("provenance-trace.json")
+    expect({ originalRelation, normalizedRelation, evidenceTier, eligibleForAttribution, derivationMethod }).toEqual({
+      originalRelation: expect.any(String),
+      normalizedRelation: expect.any(String),
+      evidenceTier: expect.any(String),
+      eligibleForAttribution: expect.any(Boolean),
+      derivationMethod: expect.any(String),
+    })
     expect(legacy.trace_version).toBe("1.3")
     expect(provenance.metrics.token_usage.total).toBe(15)
     expect(provenanceText).not.toContain("[Circular]")
@@ -4524,17 +4538,22 @@ describe("case trace", () => {
     ).toBe(true)
   })
 
-  test("reports missing verification after repository changes", async () => {
+  test("audits replayable diagnostics after repository changes without verification", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-missing-verification-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "missing-verification-trace.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const repeated = `shared diagnostic payload:${"x".repeat(6000)}`
 
     await fs.writeFile(
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `await Bun.sleep(5)`,
         `CaseTrace.change({ files: ["src/pricing.mjs"], intent: "Fix discount cap", diff: "- 0.2\\n+ 0.15" })`,
+        `await Bun.sleep(5)`,
+        `CaseTrace.observation({ source: "tool", category: "audit", summary: "first audit observation", data: { payload: ${JSON.stringify(repeated)} } })`,
+        `CaseTrace.observation({ source: "tool", category: "audit", summary: "second audit observation", data: { payload: ${JSON.stringify(repeated)} } })`,
         `CaseTrace.responseOutput({ text: "Changed src/pricing.mjs but did not run tests." })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
@@ -4547,6 +4566,8 @@ describe("case trace", () => {
         OPENCODE_CASE_TRACE: "1",
         OPENCODE_CASE_ID: "missing-verification-case",
         OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "1",
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -4560,6 +4581,11 @@ describe("case trace", () => {
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "missing-verification-case", "trace.json"), "utf8"),
     ) as any
+    const journal = (await fs.readFile(path.join(dir, "missing-verification-case", "records.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const replayed = replayCausalIRJournal(journal)
     const issues = trace.metrics.trace_health.issues.map((issue: any) => issue.kind)
     const missingSemantic = trace.records.find(
       (record: any) =>
@@ -4575,6 +4601,110 @@ describe("case trace", () => {
     expect(missingSemantic.data.reason).toContain("No test-like verification command")
     expect(missingSemantic.source_refs).toEqual(expect.arrayContaining([expect.stringMatching(/^change:chg_1_/)]))
     expect(observedDefect.source_refs).toContain(`record:${missingSemantic.record_id}`)
+    expect(trace.nodes.map((node: any) => node.node_id)).toEqual(
+      expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]),
+    )
+    expect(
+      journal
+        .filter((entry: any) => entry.operation === "node.created")
+        .map((entry: any) => entry.entity_id),
+    ).toEqual(expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]))
+    expect(replayed.nodes.map((node: any) => node.node_id)).toEqual(
+      expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]),
+    )
+    const journalOperations = journal.map((entry: any) => entry.operation)
+    expect(journalOperations).toContain("artifact.reused")
+    const diagnosticJournal = journal.filter((entry: any) =>
+      [missingSemantic.record_id, observedDefect.record_id].includes(entry.entity_id),
+    )
+    expect(diagnosticJournal.map((entry: any) => entry.operation)).toEqual(["node.created", "node.created"])
+    for (const [index, entry] of journal.entries()) {
+      expect(entry).toMatchObject({
+        sequence: index + 1,
+        operation: expect.any(String),
+        record_type: expect.any(String),
+        entity_id: expect.any(String),
+        payload_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      })
+    }
+    const graphOperations = new Set([
+      "node.created",
+      "node.updated",
+      "edge.created",
+      "artifact.created",
+      "artifact.reused",
+    ])
+    const graphFactKeys = journal
+      .filter((entry: any) => graphOperations.has(entry.operation))
+      .map((entry: any) => `${entry.operation}:${entry.entity_id}:${entry.payload_hash}`)
+    expect(new Set(graphFactKeys).size).toBe(graphFactKeys.length)
+    expect(replayed.nodes).toEqual(trace.nodes)
+    expect(replayed.edges).toEqual(trace.edges)
+    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expect(replayed.diagnostics).toEqual(trace.diagnostics)
+  })
+
+  test("updates and removes current formal diagnostics without duplicate journal facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-diagnostic-reconcile-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "diagnostic-reconcile-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `await Bun.sleep(5)`,
+        `CaseTrace.change({ files: ["src/first.mjs"], intent: "first change", diff: "- 1\\n+ 2" })`,
+        `await Bun.sleep(5)`,
+        `CaseTrace.change({ files: ["src/second.mjs"], intent: "second change", diff: "- 3\\n+ 4" })`,
+        `await Bun.sleep(5)`,
+        `CaseTrace.responseOutput({ text: "Changes are pending verification." })`,
+        `await Bun.sleep(5)`,
+        `CaseTrace.verification({ command: "bun test", exit_code: 0, status: "passed", stdout: "tests passed" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "diagnostic-reconcile-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "diagnostic-reconcile-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const journal = (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const replayed = replayCausalIRJournal(journal)
+    const diagnosticIDs = [
+      "missing_semantic_final_test_result",
+      "observed_defect_missing_verification_after_change",
+    ]
+
+    for (const diagnosticID of diagnosticIDs) {
+      const entries = journal.filter((entry: any) => entry.entity_id === diagnosticID)
+      expect(entries.map((entry: any) => entry.operation)).toEqual(["node.created", "node.updated"])
+      expect(new Set(entries.map((entry: any) => entry.payload_hash)).size).toBe(entries.length)
+    }
+    expect(journal.some((entry: any) => entry.operation === "case.checkpointed")).toBe(true)
+    expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
+    expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
+    expect(replayed.nodes).toEqual(trace.nodes)
+    expect(replayed.edges).toEqual(trace.edges)
+    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expect(replayed.diagnostics).toEqual(trace.diagnostics)
   })
 
   test("marks verification risk when test oracles were changed before tests passed", async () => {
