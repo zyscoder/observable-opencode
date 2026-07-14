@@ -179,6 +179,53 @@ describe("causal IR store", () => {
     expect(journal[0]?.payload_hash).toBe(expectedHash)
   })
 
+  test("hashes sparse array slots as JSON null values", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_sparse", caseID: "case_sparse", append: (entry) => journal.push(entry) })
+    store.createNode(node("empty", { values: [] }))
+    store.createNode(node("hole", { values: new Array(1) }))
+    store.createNode(node("mixed", { values: [1, , 2] }))
+
+    const expectedHoleHash = createHash("sha256")
+      .update('{"component":"task","data":{"values":[null]},"kind":"decision","node_id":"hole","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
+      .digest("hex")
+    const expectedMixedHash = createHash("sha256")
+      .update('{"component":"task","data":{"values":[1,null,2]},"kind":"decision","node_id":"mixed","time_ms":1,"timestamp":"2026-07-14T00:00:00.000Z"}')
+      .digest("hex")
+
+    expect(journal[0]?.payload_hash).not.toBe(journal[1]?.payload_hash)
+    expect(journal[1]?.payload_hash).toBe(expectedHoleHash)
+    expect(journal[2]?.payload_hash).toBe(expectedMixedHash)
+  })
+
+  test("replays diagnostic creation into the snapshot", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_diagnostic",
+      caseID: "case_diagnostic",
+      append: (entry) => journal.push(entry),
+    })
+    const diagnostic = store.createDiagnostic({
+      diagnostic_id: "diagnostic_1",
+      level: "warning",
+      message: "missing source reference",
+    })
+
+    expect(journal.map((entry) => entry.operation)).toEqual(["diagnostic.created"])
+    expect(replayCausalIRJournal(journal).diagnostics).toEqual([diagnostic])
+  })
+
+  test("assigns contiguous journal sequence values", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({ runID: "run_sequence", caseID: "case_sequence", append: (entry) => journal.push(entry) })
+    store.createNode(node("node_1"))
+    store.createDiagnostic({ diagnostic_id: "diagnostic_1", message: "warning" })
+    store.checkpoint({ phase: "partial" })
+    store.finalize({ status: "success" })
+
+    expect(journal.map((entry) => entry.sequence)).toEqual([1, 2, 3, 4])
+  })
+
   test("preserves caller references while isolating emitted journal payloads", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({ runID: "run_refs", caseID: "case_refs", append: (entry) => journal.push(entry) })

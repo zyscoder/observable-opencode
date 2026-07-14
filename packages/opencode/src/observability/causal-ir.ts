@@ -101,7 +101,13 @@ function canonicalJSON(input: unknown, arrayValue = false): string | undefined {
       throw new TypeError("Do not know how to serialize a BigInt")
   }
 
-  if (Array.isArray(input)) return `[${input.map((item) => canonicalJSON(item, true) ?? "null").join(",")}]`
+  if (Array.isArray(input)) {
+    const values: string[] = []
+    for (let index = 0; index < input.length; index++) {
+      values.push(canonicalJSON(input[index], true) ?? "null")
+    }
+    return `[${values.join(",")}]`
+  }
 
   const value = input as Record<string, unknown>
   if (typeof value.toJSON === "function") return canonicalJSON(value.toJSON(), arrayValue)
