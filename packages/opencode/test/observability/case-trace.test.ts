@@ -4965,6 +4965,105 @@ describe("case trace", () => {
     expect(recordsText).toContain('"accessToken":"[REDACTED]"')
   })
 
+  test("redacts direct summarizeText special objects across persisted trace outputs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-summarize-special-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "summarize-special-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const secrets = {
+      urlPassword: "summarize-url-password-secret",
+      apiKey: "summarize-api-key-secret",
+      password: "summarize-error-password-secret",
+    }
+    const ordinaryText = "ordinary summary text ".repeat(5)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace, summarizeText } from ${JSON.stringify(traceModule)}`,
+        `const secrets = ${JSON.stringify(secrets)}`,
+        `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.apiKey + "&visible=ok")`,
+        `const error = new Error("request failed: password=" + secrets.password + " " + "x".repeat(96))`,
+        `const ordinaryText = ${JSON.stringify(ordinaryText)}`,
+        `CaseTrace.configure({ input: { task: "summarize special objects" } })`,
+        `const urlSummary = CaseTrace.summarizeText(endpoint)`,
+        `const moduleErrorSummary = summarizeText(error)`,
+        `const traceErrorSummary = CaseTrace.summarizeText(error)`,
+        `const ordinarySummary = CaseTrace.summarizeText(ordinaryText)`,
+        `CaseTrace.node({ node_id: "direct_summaries", kind: "verification", component: "tool", title: "direct summaries", data: { urlSummary, moduleErrorSummary, traceErrorSummary, ordinarySummary } })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `process.stdout.write(JSON.stringify({ endpoint: endpoint.toString(), error: error.message }))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "summarize-special-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "64",
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({
+      endpoint: `https://reader:${secrets.urlPassword}@example.com/audit?api_key=${secrets.apiKey}&visible=ok`,
+      error: `request failed: password=${secrets.password} ${"x".repeat(96)}`,
+    })
+
+    const caseDir = path.join(dir, "summarize-special-case")
+    const recordsText = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const journal = recordsText
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const summaries = trace.nodes.find((node: any) => node.node_id === "direct_summaries").data
+    const artifactDir = path.join(caseDir, "artifacts", "sha256")
+    const artifactFiles = await fs.readdir(artifactDir)
+    const persistedText = await Promise.all(
+      [
+        "events.jsonl",
+        "raw-events.jsonl",
+        "records.jsonl",
+        "trace.json",
+        "legacy-trace.json",
+        "provenance-trace.json",
+        "partial/latest.json",
+        "manifest.json",
+        "trace.html",
+      ]
+        .map((file) => path.join(caseDir, file))
+        .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
+        .map((file) => fs.readFile(file, "utf8")),
+    )
+
+    expect(summaries.urlSummary.artifact_id).toBeTruthy()
+    expect(summaries.traceErrorSummary.artifact_id).toBeTruthy()
+    expect(summaries.ordinarySummary).toMatchObject({
+      length: ordinaryText.length,
+      preview: ordinaryText.slice(0, 64),
+    })
+    expect(summaries.ordinarySummary.artifact_id).toBeTruthy()
+    const ordinaryArtifact = trace.artifacts.find((artifact: any) => artifact.artifact_id === summaries.ordinarySummary.artifact_id)
+    expect(await fs.readFile(path.join(caseDir, ordinaryArtifact.path), "utf8")).toBe(ordinaryText)
+    assertCausalIRJournalAudit(journal)
+    const replayed = replayCausalIRJournal(journal)
+    expect(replayed.nodes).toEqual(trace.nodes)
+    expect(replayed.edges).toEqual(trace.edges)
+    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expect(replayed.diagnostics).toEqual(trace.diagnostics)
+    for (const secret of Object.values(secrets)) {
+      expect(persistedText.every((text) => !text.includes(secret))).toBe(true)
+    }
+  })
+
   test("updates and removes current formal diagnostics without duplicate journal facts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-diagnostic-reconcile-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

@@ -1222,7 +1222,11 @@ export type ActiveSpan = {
 }
 
 const truthy = new Set(["1", "true", "yes", "on"])
-const secretTextPatterns = [/\bsk-[a-zA-Z0-9_-]{8,}\b/g, /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi]
+const secretTextPatterns = [
+  /\bsk-[a-zA-Z0-9_-]{8,}\b/g,
+  /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi,
+  /\b(?:api[_-]?key|password|passwd|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*(?:=|:)\s*[^\s,;]+/gi,
+]
 let active: ActiveCaseTrace | false | undefined
 let processFinalizerInstalled = false
 
@@ -1426,6 +1430,15 @@ function redactUrlText(input: URL) {
   return redactText(output.toString())
 }
 
+function textForSummary(input: unknown) {
+  const sanitized = input instanceof Error || input instanceof URL ? sanitizeForJson(input) : input
+  if (input instanceof Error && sanitized && typeof sanitized === "object") {
+    const error = sanitized as TraceError
+    return redactText(`${error.name ?? "Error"}: ${error.message ?? error.name ?? "Error"}`)
+  }
+  return redactText(String(sanitized ?? ""))
+}
+
 function maxFieldLength() {
   return safeNumber(process.env.OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH || 2048) || 2048
 }
@@ -1439,7 +1452,7 @@ function summarizeScalar(input: unknown): TraceFieldSummary {
 }
 
 export function summarizeText(input: unknown): TraceFieldSummary {
-  const text = redactText(String(input ?? ""))
+  const text = textForSummary(input)
   const limit = maxFieldLength()
   return {
     type: "text",
@@ -8561,7 +8574,7 @@ class ActiveCaseTrace {
   }
 
   summarizeText(input: unknown, label = "text"): TraceFieldSummary {
-    const text = redactText(String(input ?? ""))
+    const text = textForSummary(input)
     const summary: TraceFieldSummary = {
       type: "text",
       length: text.length,
