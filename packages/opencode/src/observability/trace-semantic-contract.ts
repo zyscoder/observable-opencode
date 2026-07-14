@@ -80,7 +80,7 @@ export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]
 const FORMAL_RECORD_TYPE_SET = new Set<string>(FORMAL_RECORD_TYPES)
 const FORMAL_RELATION_SET = new Set<string>(FORMAL_DATAFLOW_RELATIONS)
 
-export const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
+export const RELATION_MIGRATIONS: Readonly<Record<string, FormalDataflowRelation>> = Object.freeze({
   tool_to_change: "modified_by",
   tool_to_observation: "produced",
   failure_to_change: "motivated_by_evidence",
@@ -113,7 +113,7 @@ export const RELATION_MIGRATIONS: Record<string, FormalDataflowRelation> = {
   processor_to_final_response: "produced",
   final_response_to_design_record: "produced",
   evidence_to_observation: "derived_from",
-}
+})
 
 const ACTION_AFFECTING_RUNTIME_EVENTS = new Set([
   "permission.request",

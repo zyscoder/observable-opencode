@@ -4,34 +4,40 @@ import {
   normalizeRelationDetails,
   type FormalDataflowRelation,
 } from "./trace-semantic-contract"
+import type { DataflowEdge, ProvenanceRecord } from "./case-trace"
 
 export const CAUSAL_IR_VERSION = "1.0" as const
 
 export type CausalNodeLike = {
   node_id: string
   kind: string
-  component?: string
+  component?: ProvenanceRecord["component"]
   span_id?: string
+  parent_span_id?: string
   timestamp: string
   time_ms: number
   title?: string
-  status?: string
+  status?: ProvenanceRecord["status"]
+  input_refs?: string[]
+  output_refs?: string[]
   data?: Record<string, unknown>
   source_refs?: string[]
-  source_locations?: Record<string, unknown>[]
-  typed_resources?: Record<string, unknown>[]
+  source_locations?: ProvenanceRecord["source_locations"]
+  typed_resources?: ProvenanceRecord["typed_resources"]
   artifact_refs?: string[]
   metadata?: Record<string, unknown>
 }
 
+export type CausalEvidenceTier = "confirmed" | "content_matched" | "temporal_advisory"
+
 export type CausalEdgeLike = {
   edge_id: string
-  from: { type: string; id: string; label?: string }
-  to: { type: string; id: string; label?: string }
+  from: DataflowEdge["from"]
+  to: DataflowEdge["to"]
   relation: string
   original_relation?: string
   normalized_relation?: FormalDataflowRelation
-  evidence_tier?: string
+  evidence_tier?: CausalEvidenceTier
   eligible_for_attribution?: boolean
   derivation_method?: string
   label?: string
@@ -92,6 +98,11 @@ export type ProvenanceProjectionInput = {
     [key: string]: unknown
   }
   metrics: {
+    spans?: number
+    events?: number
+    records?: number
+    dataflow_edges?: number
+    artifacts?: number
     token_usage: Record<string, unknown>
     trace_health: {
       issues: unknown[]
@@ -101,33 +112,22 @@ export type ProvenanceProjectionInput = {
   }
 }
 
+export type ProvenanceCompatibilityRecord = ProvenanceRecord
+
+export type ProvenanceCompatibilityDataflowEdge = Omit<DataflowEdge, "metadata"> & {
+  metadata: Record<string, unknown> & {
+    original_relation: string
+    evidence_tier: CausalEvidenceTier
+    eligible_for_attribution: boolean
+    derivation_method: string
+  }
+}
+
 export type ProvenanceTraceProjection = {
   trace_version: string
   manifest: ProvenanceProjectionInput["manifest"]
-  records: Array<{
-    record_id: string
-    component?: string
-    event_type: string
-    span_id?: string
-    timestamp: string
-    time_ms: number
-    title?: string
-    status?: string
-    source_refs?: string[]
-    source_locations?: Record<string, unknown>[]
-    typed_resources?: Record<string, unknown>[]
-    artifact_refs?: string[]
-    data?: Record<string, unknown>
-    metadata?: Record<string, unknown>
-  }>
-  dataflow_edges: Array<{
-    edge_id: string
-    from: CausalEdgeLike["from"]
-    to: CausalEdgeLike["to"]
-    relation: FormalDataflowRelation
-    label?: string
-    metadata: Record<string, unknown>
-  }>
+  records: ProvenanceCompatibilityRecord[]
+  dataflow_edges: ProvenanceCompatibilityDataflowEdge[]
   artifacts: ArtifactLike[]
   metrics: ProvenanceProjectionInput["metrics"] & {
     spans: number
@@ -152,28 +152,79 @@ type CausalIRStoreInput = {
 type CanonicalRelationAttributes = {
   original_relation: string
   normalized_relation: FormalDataflowRelation
-  evidence_tier: string
+  evidence_tier: CausalEvidenceTier
   eligible_for_attribution: boolean
   derivation_method: string
 }
 
+const EVIDENCE_TIERS = new Set<CausalEvidenceTier>(["confirmed", "content_matched", "temporal_advisory"])
+
+function evidenceTier(input: unknown): CausalEvidenceTier | undefined {
+  return typeof input === "string" && EVIDENCE_TIERS.has(input as CausalEvidenceTier)
+    ? (input as CausalEvidenceTier)
+    : undefined
+}
+
+function originalRelation(edge: CausalEdgeLike) {
+  return edge.original_relation ?? edge.relation
+}
+
 function canonicalRelationAttributes(edge: CausalEdgeLike): CanonicalRelationAttributes {
-  const details = normalizeRelationDetails(edge.original_relation ?? edge.relation)
+  const details = normalizeRelationDetails(originalRelation(edge))
   const metadataEligible = edge.metadata?.eligible_for_attribution
   const declaredEligible = edge.eligible_for_attribution ?? (typeof metadataEligible === "boolean" ? metadataEligible : undefined)
   const metadataEvidenceTier = edge.metadata?.evidence_tier
   const metadataDerivationMethod = edge.metadata?.derivation_method
+  const tier = evidenceTier(edge.evidence_tier) ?? evidenceTier(metadataEvidenceTier) ?? "confirmed"
 
   return {
     original_relation: details.original,
     normalized_relation: details.normalized,
-    evidence_tier: edge.evidence_tier ?? (typeof metadataEvidenceTier === "string" ? metadataEvidenceTier : "unspecified"),
-    eligible_for_attribution: details.known && declaredEligible !== false,
+    evidence_tier: tier,
+    eligible_for_attribution: details.known && tier !== "temporal_advisory" && declaredEligible !== false,
     derivation_method:
       edge.derivation_method ??
       (typeof metadataDerivationMethod === "string" ? metadataDerivationMethod : undefined) ??
       (details.known ? "explicit_relation" : "unknown_relation_fallback"),
   }
+}
+
+function canonicalEdge(edge: CausalEdgeLike): CausalEdgeLike {
+  return {
+    ...edge,
+    ...canonicalRelationAttributes(edge),
+  }
+}
+
+function unknownRelationDiagnostic(edge: CausalEdgeLike): CausalIRDiagnosticLike | undefined {
+  const details = normalizeRelationDetails(originalRelation(edge))
+  if (details.known) return undefined
+  return {
+    diagnostic_id: `unknown_relation:${edge.edge_id}`,
+    kind: "unknown_relation",
+    level: "warning",
+    message: `Unknown causal relation: ${details.original}`,
+    edge_id: edge.edge_id,
+    relation: details.original,
+  }
+}
+
+function isUnknownRelationDiagnostic(diagnostic: CausalIRDiagnosticLike) {
+  return diagnostic.kind === "unknown_relation" && typeof diagnostic.edge_id === "string"
+}
+
+function currentUnknownRelationDiagnostics(edges: CausalEdgeLike[]) {
+  return edges.flatMap((edge) => {
+    const diagnostic = unknownRelationDiagnostic(edge)
+    return diagnostic ? [diagnostic] : []
+  })
+}
+
+function reconciledDiagnostics(edges: CausalEdgeLike[], diagnostics: CausalIRDiagnosticLike[]) {
+  return [
+    ...diagnostics.filter((diagnostic) => !isUnknownRelationDiagnostic(diagnostic)),
+    ...currentUnknownRelationDiagnostics(edges),
+  ]
 }
 
 function canonicalJSON(input: unknown, arrayValue = false): string | undefined {
@@ -275,18 +326,18 @@ export class CausalIRStore {
   }
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
-    const canonical = this.canonicalEdge(edge)
-    this.edges.push(canonical)
+    const canonical = canonicalEdge(edge)
+    replaceByID(this.edges, "edge_id", canonical)
     this.append("edge.created", "edge", canonical.edge_id, canonical)
-    this.recordUnknownRelationDiagnostic(canonical)
+    this.reconcileUnknownRelationDiagnostics()
     return canonical as T
   }
 
   replaceEdges(edges: CausalEdgeLike[]): void {
-    const canonical = edges.map((edge) => this.canonicalEdge(edge))
+    const canonical = edges.map(canonicalEdge)
     replaceAll(this.edges, canonical)
     this.rebuildPayloadHashes("edge", this.edges, "edge_id")
-    canonical.forEach((edge) => this.recordUnknownRelationDiagnostic(edge))
+    this.reconcileUnknownRelationDiagnostics()
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
@@ -332,25 +383,20 @@ export class CausalIRStore {
     this.append(operation, recordType, this.input.caseID, { snapshot: this.snapshot(), data }, "case")
   }
 
-  private canonicalEdge(edge: CausalEdgeLike): CausalEdgeLike {
-    return {
-      ...edge,
-      ...canonicalRelationAttributes(edge),
-    }
-  }
+  private reconcileUnknownRelationDiagnostics() {
+    const existing = new Map(
+      this.diagnostics
+        .filter(isUnknownRelationDiagnostic)
+        .map((diagnostic) => [diagnostic.diagnostic_id, diagnostic]),
+    )
+    const next = reconciledDiagnostics(this.edges, this.diagnostics)
+    replaceAll(this.diagnostics, next)
 
-  private recordUnknownRelationDiagnostic(edge: CausalEdgeLike) {
-    if (edge.eligible_for_attribution) return
-    const diagnosticID = `unknown_relation:${edge.edge_id}`
-    if (this.diagnostics.some((diagnostic) => diagnostic.diagnostic_id === diagnosticID)) return
-    this.createDiagnostic({
-      diagnostic_id: diagnosticID,
-      kind: "unknown_relation",
-      level: "warning",
-      message: `Unknown causal relation: ${edge.original_relation ?? edge.relation}`,
-      edge_id: edge.edge_id,
-      relation: edge.original_relation ?? edge.relation,
-    })
+    for (const diagnostic of next.filter(isUnknownRelationDiagnostic)) {
+      const previous = existing.get(diagnostic.diagnostic_id)
+      if (previous?.relation === diagnostic.relation) continue
+      this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
+    }
   }
 
   private rebuildPayloadHashes<T extends Record<string, unknown>>(hashType: string, items: T[], idKey: keyof T) {
@@ -412,7 +458,7 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
     }
 
     if (entry.operation === "edge.created" && entry.data && typeof entry.data === "object") {
-      replaceByID(edges, "edge_id", entry.data as CausalEdgeLike)
+      replaceByID(edges, "edge_id", canonicalEdge(entry.data as CausalEdgeLike))
       continue
     }
 
@@ -431,7 +477,7 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
       if (typeof snapshot.runID === "string") runID = snapshot.runID
       if (typeof snapshot.caseID === "string") caseID = snapshot.caseID
       replaceAll(nodes, journalData(snapshot.nodes))
-      replaceAll(edges, journalData(snapshot.edges))
+      replaceAll(edges, journalData(snapshot.edges).map(canonicalEdge))
       replaceAll(artifacts, journalData(snapshot.artifacts))
       replaceAll(diagnostics, journalData(snapshot.diagnostics))
     }
@@ -444,8 +490,46 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
     nodes,
     edges,
     artifacts,
-    diagnostics,
+    diagnostics: reconciledDiagnostics(edges, diagnostics),
   }
+}
+
+function optionalNumber(input: unknown) {
+  if (input === undefined || input === null) return undefined
+  const value = Number(input)
+  return Number.isFinite(value) ? value : undefined
+}
+
+function safeNumber(input: unknown) {
+  const value = Number(input ?? 0)
+  return Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+function compatibilityTokenUsage(input: unknown): ProvenanceRecord["token_usage"] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+  const usage = input as Record<string, unknown>
+  return {
+    input: safeNumber(usage.input),
+    output: safeNumber(usage.output),
+    reasoning: safeNumber(usage.reasoning),
+    cached_input: safeNumber(usage.cached_input),
+    cache_write: safeNumber(usage.cache_write),
+    total: safeNumber(usage.total),
+    cost: safeNumber(usage.cost),
+  }
+}
+
+function provenanceRef(ref: DataflowEdge["from"]): DataflowEdge["from"] {
+  return {
+    ...ref,
+    type: ref.type === "final_response_evidence" ? "response_segment" : ref.type,
+    label: ref.label === "final.claim" ? "response.output" : ref.label,
+  }
+}
+
+function provenanceLabel(label: string | undefined) {
+  if (!label) return undefined
+  return label.replace(/final response evidence/gi, "response output").replace(/final claim/gi, "response output")
 }
 
 export function projectProvenanceTrace(
@@ -453,16 +537,23 @@ export function projectProvenanceTrace(
   input: ProvenanceProjectionInput,
 ): ProvenanceTraceProjection {
   const records = snapshot.nodes
-    .filter((node) => isFormalRecordType(node.kind))
-    .map((node) => ({
+    .map((node) => ({ node, eventType: node.kind === "final.claim" ? "response.output" : node.kind }))
+    .filter((item) => isFormalRecordType(item.eventType))
+    .map(({ node, eventType }): ProvenanceCompatibilityRecord => ({
       record_id: node.node_id,
       component: node.component,
-      event_type: node.kind,
+      event_type: eventType,
       span_id: node.span_id,
+      parent_span_id: node.parent_span_id,
       timestamp: node.timestamp,
       time_ms: node.time_ms,
       title: node.title,
       status: node.status,
+      duration_ms: optionalNumber(node.data?.duration_ms),
+      token_usage: compatibilityTokenUsage(node.data?.token_usage),
+      error: node.data?.error,
+      input_refs: node.input_refs,
+      output_refs: node.output_refs,
       source_refs: node.source_refs,
       source_locations: node.source_locations,
       typed_resources: node.typed_resources,
@@ -475,10 +566,10 @@ export function projectProvenanceTrace(
 
     return {
       edge_id: edge.edge_id,
-      from: edge.from,
-      to: edge.to,
+      from: provenanceRef(edge.from),
+      to: provenanceRef(edge.to),
       relation: attributes.normalized_relation,
-      label: edge.label,
+      label: provenanceLabel(edge.label),
       metadata: {
         ...edge.metadata,
         original_relation: attributes.original_relation,
@@ -486,7 +577,7 @@ export function projectProvenanceTrace(
         eligible_for_attribution: attributes.eligible_for_attribution,
         derivation_method: attributes.derivation_method,
       },
-    }
+    } satisfies ProvenanceCompatibilityDataflowEdge
   })
   const spans = new Set(records.flatMap((record) => (record.span_id ? [record.span_id] : []))).size
 
@@ -498,8 +589,8 @@ export function projectProvenanceTrace(
     artifacts: snapshot.artifacts,
     metrics: {
       ...input.metrics,
-      spans,
-      events: records.length,
+      spans: input.metrics.spans ?? spans,
+      events: input.metrics.events ?? records.length,
       records: records.length,
       dataflow_edges: dataflowEdges.length,
       artifacts: snapshot.artifacts.length,
