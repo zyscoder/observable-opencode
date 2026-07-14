@@ -247,6 +247,106 @@ class TraceGraphTest(unittest.TestCase):
         self.assertIn("record:change_bad", upstream)
         self.assertIn("record:evidence_old", upstream)
 
+    def test_loads_trace_6_causal_ir_with_legacy_attribution_projection(self):
+        trace = {
+            "trace_version": "6.0",
+            "causal_ir_version": "1.0",
+            "manifest": {"case_id": "causal-ir-compatibility-case"},
+            "nodes": [
+                {
+                    "node_id": "decision_1",
+                    "kind": "decision",
+                    "component": "processor",
+                    "timestamp": "2026-07-14T00:00:00.000Z",
+                    "time_ms": 1,
+                    "data": {"chosen_action": "apply the compatibility projection"},
+                },
+                {
+                    "node_id": "claim_1",
+                    "kind": "response.claim",
+                    "component": "result",
+                    "timestamp": "2026-07-14T00:00:01.000Z",
+                    "time_ms": 2,
+                    "data": {"text": "The projection preserves attribution."},
+                },
+            ],
+            "edges": [
+                {
+                    "edge_id": "causal_edge_1",
+                    "from": {"type": "node", "id": "decision_1"},
+                    "to": {"type": "node", "id": "claim_1"},
+                    "relation": "derived_from",
+                }
+            ],
+            "records": [
+                {
+                    "record_id": "decision_1",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"decision_id": "decision_1", "chosen_action": "apply the compatibility projection"},
+                },
+                {
+                    "record_id": "claim_1",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "source_refs": ["decision:decision_1"],
+                    "data": {"claim_id": "claim_1", "text": "The projection preserves attribution."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "edge_id": "projection_edge_1",
+                    "from": {"type": "decision", "id": "decision_1"},
+                    "to": {"type": "response_claim", "id": "claim_1"},
+                    "relation": "derived_from",
+                }
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        report = BackwardTaintAnalyzer(
+            judge=FakeJudge(
+                {
+                    "record:claim_1": NodeJudgment(
+                        node_ref="record:claim_1",
+                        component="result",
+                        event_type="response.claim",
+                        has_defect=True,
+                        defect_status="present",
+                        defect_type="projection_regression",
+                        defect_reason="The final claim reflects the upstream decision.",
+                        causal_role="defect_propagation",
+                        branch_relation="same_defect",
+                        influenced_by=[
+                            TaintInfluence(
+                                upstream_ref="record:decision_1",
+                                reason="The claim propagates the decision.",
+                                relation="defect_propagated_from",
+                            )
+                        ],
+                    ),
+                    "record:decision_1": NodeJudgment(
+                        node_ref="record:decision_1",
+                        component="processor",
+                        event_type="decision",
+                        has_defect=True,
+                        defect_status="present",
+                        defect_type="projection_regression",
+                        defect_reason="The decision introduces the projection regression.",
+                        causal_role="defect_introduction",
+                        branch_relation="same_defect",
+                        is_root_cause=True,
+                    ),
+                }
+            )
+        ).analyze(graph, start_refs=["record:claim_1"])
+
+        self.assertEqual(set(graph.nodes), {"record:decision_1", "record:claim_1"})
+        self.assertEqual(graph.upstream_refs("record:claim_1"), ["record:decision_1"])
+        self.assertEqual(report.visited_order, ["record:claim_1", "record:decision_1"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:decision_1"])
+        self.assertEqual(report.taint_paths, [["record:claim_1", "record:decision_1"]])
+
     def test_upstream_refs_preserve_explicit_source_ref_order(self):
         trace = {
             "case_id": "order-case",
