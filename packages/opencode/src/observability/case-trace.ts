@@ -1274,6 +1274,18 @@ const secretTextPatterns = [
   /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi,
   /\b(?:api[_-]?key|password|passwd|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*(?:=|:)\s*[^\s,;]+/gi,
 ]
+const legacySemanticEdgeProjectionKey = "__case_trace_legacy_semantic_edge_projection"
+const legacySemanticEdgeOptionalFields = [
+  "evidence_tier",
+  "eligible_for_attribution",
+  "derivation_method",
+  "evidence_refs",
+  "confidence",
+  "label",
+  "metadata",
+] as const
+type LegacySemanticEdgeOptionalField = (typeof legacySemanticEdgeOptionalFields)[number]
+const legacySemanticEdgeOptionalFieldSet = new Set<string>(legacySemanticEdgeOptionalFields)
 let active: ActiveCaseTrace | false | undefined
 let processFinalizerInstalled = false
 
@@ -1532,7 +1544,7 @@ function redactText(input: string) {
     (_match, quote: string, header: string) => `${quote}${header}[REDACTED]${quote}`,
   )
   output = output.replace(
-    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])([^\r\n"']*?)(?=["']|\s+--?[a-z][a-z0-9_-]*(?:[=\s]|$)|$)/gi,
+    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])([^\r\n]*?)(?=\s+--?[a-z][a-z0-9_-]*(?:[=\s]|$)|$)/gi,
     "$1[REDACTED]",
   )
   output = output.replace(
@@ -4687,7 +4699,7 @@ class ActiveCaseTrace {
   private errors: TraceError[] = []
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
-  private semanticEdges: TraceSemanticEdge[] = []
+  private semanticEdgeSequence = 0
   private verificationRecords: TraceVerificationRecord[] = []
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
@@ -5532,8 +5544,9 @@ class ActiveCaseTrace {
 
   edge(input: SemanticEdgeInput) {
     const normalized = normalizeTemporalReferences(input).value
+    const sequence = ++this.semanticEdgeSequence
     const edge: TraceSemanticEdge = {
-      edge_id: normalized.edge_id ?? semanticID("edge", this.semanticEdges.length + 1),
+      edge_id: normalized.edge_id ?? semanticID("edge", sequence),
       from: normalized.from,
       to: normalized.to,
       relation: normalized.relation,
@@ -5545,8 +5558,9 @@ class ActiveCaseTrace {
       label: normalized.label,
       metadata: normalized.metadata,
     }
-    this.semanticEdges.push(edge)
-    this.write("semantic.edge", edge)
+    const projectionFields = legacySemanticEdgeOptionalFields.filter(
+      (field) => normalized[field] !== undefined,
+    )
     this.causalEdge({
       edge_id: edge.edge_id,
       from: input.from,
@@ -5558,8 +5572,12 @@ class ActiveCaseTrace {
       evidence_refs: input.evidence_refs,
       confidence: input.confidence,
       label: input.label,
-      metadata: input.metadata,
+      metadata: {
+        ...(input.metadata ?? {}),
+        [legacySemanticEdgeProjectionKey]: { fields: projectionFields },
+      },
     })
+    this.write("semantic.edge", edge)
     return edge
   }
 
@@ -6702,7 +6720,6 @@ class ActiveCaseTrace {
     const referencesStaleDesign = (edge: { from: TraceRef; to: TraceRef }) =>
       (edge.from.type === "design_record" && staleDesignIDs.has(edge.from.id)) ||
       (edge.to.type === "design_record" && staleDesignIDs.has(edge.to.id))
-    this.semanticEdges = this.semanticEdges.filter((edge) => !referencesStaleDesign(edge))
     this.causalIR.replaceEdges(this.causalEdges.filter((edge) => !referencesStaleDesign(edge)))
     this.write("semantic.design_record.pruned", {
       design_ids: [...staleDesignIDs],
@@ -7592,9 +7609,9 @@ class ActiveCaseTrace {
     this.enrichMcpConsumptionRefs()
     this.emitCaseLifecycleRecord(status, caseStatus)
     this.finished = true
-    const summary = this.summary(status)
+    const checkpointSummary = this.causalIRSummary(status, caseStatus)
+    const summary = this.summary(status, checkpointSummary)
     this.write("trace.finish", summary)
-    const checkpointSummary = this.causalIRSummary(summary.status, caseStatus)
     this.writePartial(true, checkpointSummary)
     const causalIR: CausalIRTraceSummary = {
       ...checkpointSummary,
@@ -7628,8 +7645,8 @@ class ActiveCaseTrace {
     }
     this.result = result
     const caseStatus = this.observedCaseStatus() ?? this.inferCaseStatus("cancelled", undefined)
-    const summary = this.summary("cancelled")
     const causalIR = this.causalIRSummary("cancelled", caseStatus)
+    const summary = this.summary("cancelled", causalIR)
     const provenance = this.projectProvenanceSummary(causalIR)
     this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
@@ -7639,7 +7656,10 @@ class ActiveCaseTrace {
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
 
-  private summary(status: TraceStatus): TraceSummary {
+  private summary(
+    status: TraceStatus,
+    canonical: Pick<CausalIRTraceSummary, "edges" | "dataflow_edges">,
+  ): TraceSummary {
     const ended = Date.now()
     return {
       trace_version: "1.3",
@@ -7660,7 +7680,7 @@ class ActiveCaseTrace {
       result: this.result,
       context_snapshots: this.contextSnapshots,
       semantic_decisions: this.semanticDecisions,
-      dataflow_edges: this.semanticEdges,
+      dataflow_edges: this.projectLegacySemanticEdges(canonical.edges, canonical.dataflow_edges),
       verification_records: this.verificationRecords,
       change_records: this.changeRecords,
       constraint_records: this.constraintRecords,
@@ -7765,6 +7785,51 @@ class ActiveCaseTrace {
     )
   }
 
+  private projectLegacySemanticEdges(
+    canonicalEdges: CausalIREdge[],
+    compatibilityEdges: DataflowEdge[],
+  ): TraceSemanticEdge[] {
+    const compatibilityByID = new Map(compatibilityEdges.map((edge) => [edge.edge_id, edge]))
+    const output: TraceSemanticEdge[] = []
+    for (const edge of canonicalEdges) {
+      const marker = edge.metadata?.[legacySemanticEdgeProjectionKey]
+      if (!marker || typeof marker !== "object" || Array.isArray(marker)) continue
+      const rawFields = (marker as Record<string, unknown>).fields
+      if (!Array.isArray(rawFields)) continue
+      const fields = new Set<LegacySemanticEdgeOptionalField>(
+        rawFields.filter(
+          (field): field is LegacySemanticEdgeOptionalField =>
+            typeof field === "string" && legacySemanticEdgeOptionalFieldSet.has(field),
+        ),
+      )
+      const compatibility = compatibilityByID.get(edge.edge_id)
+      if (!compatibility) continue
+      const projected: TraceSemanticEdge = {
+        edge_id: edge.edge_id,
+        from: compatibility.from,
+        to: compatibility.to,
+        relation: edge.original_relation,
+      }
+      if (fields.has("evidence_tier")) projected.evidence_tier = edge.evidence_tier
+      if (fields.has("eligible_for_attribution"))
+        projected.eligible_for_attribution = edge.eligible_for_attribution
+      if (fields.has("derivation_method")) projected.derivation_method = edge.derivation_method
+      if (fields.has("evidence_refs"))
+        projected.evidence_refs = edge.evidence_refs.map(
+          (ref) => ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`,
+        )
+      if (fields.has("confidence")) projected.confidence = edge.confidence
+      if (fields.has("label")) projected.label = edge.label
+      if (fields.has("metadata")) {
+        const metadata = { ...(edge.metadata ?? {}) }
+        delete metadata[legacySemanticEdgeProjectionKey]
+        projected.metadata = metadata
+      }
+      output.push(projected)
+    }
+    return output
+  }
+
   private projectCausalIRSnapshot(
     snapshot: CausalIRStoreSnapshot,
     manifest: TraceManifest,
@@ -7775,17 +7840,22 @@ class ActiveCaseTrace {
       manifest,
       metrics,
     })
+    const dataflowEdges = projection.dataflow_edges.map((edge) => {
+      const metadata = { ...edge.metadata }
+      delete metadata[legacySemanticEdgeProjectionKey]
+      return { ...edge, metadata }
+    })
     return {
       trace_version: TRACE_VERSION,
       manifest,
       records: projection.records,
-      dataflow_edges: projection.dataflow_edges,
+      dataflow_edges: dataflowEdges,
       artifacts: projection.artifacts as TraceArtifact[],
       metrics: {
         spans: projection.metrics.spans,
         events: projection.metrics.events,
         records: projection.metrics.records,
-        dataflow_edges: projection.metrics.dataflow_edges,
+        dataflow_edges: dataflowEdges.length,
         artifacts: projection.metrics.artifacts,
         token_usage: metrics.token_usage,
         stream_summary: metrics.stream_summary,

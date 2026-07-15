@@ -565,6 +565,125 @@ describe("case trace", () => {
     })
   })
 
+  test("projects legacy semantic edges from canonical late-alias state without a second mutable graph", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-canonical-legacy-edges-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "canonical-legacy-edges.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const edge = { edge_id: "late_alias_edge", from: { type: "verification", id: "late_verification" }, to: { type: "external", id: "final_result" }, relation: "failure_to_change", evidence_tier: "content_matched", eligible_for_attribution: true, derivation_method: "explicit_test_fixture", evidence_refs: ["verification:late_verification"], confidence: 0.75 } as const`,
+        `CaseTrace.edge({ ...edge, label: "stale edge before alias resolution", metadata: { revision: 1 } })`,
+        `CaseTrace.node({ node_id: "late_verification_node", kind: "verification", component: "tool", data: { verification_id: "late_verification" } })`,
+        `CaseTrace.edge({ ...edge, label: "resolved edge after alias resolution", metadata: { revision: 2, nested: { preserved: true } } })`,
+        `CaseTrace.edge({ edge_id: "legacy_edge_after", from: { type: "external", id: "next_source" }, to: { type: "external", id: "next_target" }, relation: "derived_from" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "canonical-legacy-edges-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "canonical-legacy-edges-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
+    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+    const canonicalEdge = trace.edges.find((item: any) => item.edge_id === "late_alias_edge")
+    const compatibilityEdge = trace.dataflow_edges.find((item: any) => item.edge_id === "late_alias_edge")
+    const legacyEdges = legacy.dataflow_edges.filter((item: any) => item.edge_id === "late_alias_edge")
+
+    expect(canonicalEdge).toMatchObject({
+      from: {
+        ref_type: "node",
+        ref_id: "late_verification_node",
+        legacy_ref: "verification:late_verification",
+      },
+      to: { ref_type: "external", ref_id: "final_result", legacy_ref: "external:final_result" },
+      original_relation: "failure_to_change",
+      normalized_relation: "motivated_by_evidence",
+      evidence_tier: "content_matched",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_test_fixture",
+      evidence_refs: [
+        {
+          ref_type: "node",
+          ref_id: "late_verification_node",
+          legacy_ref: "verification:late_verification",
+        },
+      ],
+      confidence: 0.75,
+      label: "resolved edge after alias resolution",
+      metadata: { revision: 2, nested: { preserved: true } },
+    })
+    expect(compatibilityEdge).toMatchObject({
+      from: { type: "verification", id: "late_verification" },
+      to: { type: "external", id: "final_result" },
+      relation: "motivated_by_evidence",
+      label: "resolved edge after alias resolution",
+      metadata: {
+        original_relation: "failure_to_change",
+        normalized_relation: "motivated_by_evidence",
+        evidence_tier: "content_matched",
+        eligible_for_attribution: true,
+        derivation_method: "explicit_test_fixture",
+        revision: 2,
+        nested: { preserved: true },
+      },
+    })
+    expect(legacyEdges).toHaveLength(1)
+    expect(legacyEdges[0]).toEqual({
+      edge_id: "late_alias_edge",
+      from: compatibilityEdge.from,
+      to: compatibilityEdge.to,
+      relation: "failure_to_change",
+      evidence_tier: "content_matched",
+      eligible_for_attribution: true,
+      derivation_method: "explicit_test_fixture",
+      evidence_refs: ["verification:late_verification"],
+      confidence: 0.75,
+      label: "resolved edge after alias resolution",
+      metadata: { revision: 2, nested: { preserved: true } },
+    })
+    expect(legacy.dataflow_edges.map((item: any) => item.edge_id)).toEqual([
+      "late_alias_edge",
+      "legacy_edge_after",
+    ])
+    expect(Object.keys(legacy.dataflow_edges[0])).toEqual([
+      "edge_id",
+      "from",
+      "to",
+      "relation",
+      "evidence_tier",
+      "eligible_for_attribution",
+      "derivation_method",
+      "evidence_refs",
+      "confidence",
+      "label",
+      "metadata",
+    ])
+    expect(Object.keys(legacy.dataflow_edges[1])).toEqual(["edge_id", "from", "to", "relation"])
+    expect(partial.edges).toEqual(trace.edges)
+    expect(partial.dataflow_edges).toEqual(trace.dataflow_edges)
+    expect(JSON.stringify(trace.dataflow_edges)).not.toContain("__case_trace_legacy_semantic_edge_projection")
+    expect(html).toContain("resolved edge after alias resolution")
+    expect(html).not.toContain("__case_trace_legacy_semantic_edge_projection")
+  })
+
   test("keeps recent fallback refs temporal advisory and outside attribution source refs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-temporal-advisory-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -5459,6 +5578,10 @@ describe("case trace", () => {
       cookieCurlRefresh: "cookie-curl-refresh-secret",
       cookieCurlSingle: "cookie-curl-single-secret",
       cookieCurlUnquoted: "cookie-curl-unquoted-secret",
+      cookieCurlEmbeddedDouble: "cookie-curl-embedded-double-secret",
+      cookieCurlEmbeddedSingle: "cookie-curl-embedded-single-secret",
+      setCookieCurlEmbeddedDouble: "set-cookie-curl-embedded-double-secret",
+      setCookieCurlEmbeddedSingle: "set-cookie-curl-embedded-single-secret",
       stringUrlPassword: "string-url-password-secret",
       stringUrlToken: "string-url-token-secret",
       errorHeaderSecret: "error-header-secret",
@@ -5476,6 +5599,10 @@ describe("case trace", () => {
         `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
         `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, cookie_header: "Cookie: session=" + secrets.cookieSession + "; refresh=" + secrets.cookieRefresh + "; Path=/", curl_header_command: "curl -sS https://example.com/audit -H \\\"Cookie: session=" + secrets.cookieCurlSession + "; refresh=" + secrets.cookieCurlRefresh + "; Path=/\\\" --compressed", quoted_header_command: "env MODE=audit curl --header='Cookie: auth=" + secrets.cookieCurlSingle + "; Path=/' https://example.com", shell: "TOKEN=" + secrets.shellSecret + " AUTHORIZATION=" + secrets.authorizationAssignment + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("Cookie: session=" + secrets.cookieError + "; Path=/audit") }`,
         `textSecrets.unquoted_header_command = "env MODE=audit curl -H Cookie:auth=" + secrets.cookieCurlUnquoted + ";Path=/ --compressed https://example.com"`,
+        `textSecrets.shell_fragment_double_a = 'curl -H Cookie:session="' + secrets.cookieCurlEmbeddedDouble + '" --compressed'`,
+        `textSecrets.shell_fragment_single_a = "curl -H Cookie:session='" + secrets.cookieCurlEmbeddedSingle + "' --compressed"`,
+        `textSecrets.shell_fragment_double_b = 'curl -H Set-Cookie:session="' + secrets.setCookieCurlEmbeddedDouble + '" --compressed'`,
+        `textSecrets.shell_fragment_single_b = "curl -H Set-Cookie:session='" + secrets.setCookieCurlEmbeddedSingle + "' --compressed"`,
         `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
         `const agentInput = { role: "build", error, endpoint, textSecrets }`,
         `const modelInput = { messages: ["inspect"], error, endpoint }`,
@@ -5493,7 +5620,7 @@ describe("case trace", () => {
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
         `CaseTrace.finish({ status: "success", result: { environment } })`,
-        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, cookie_header: textSecrets.cookie_header, curl_header_command: textSecrets.curl_header_command, quoted_header_command: textSecrets.quoted_header_command, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
+        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, cookie_header: textSecrets.cookie_header, curl_header_command: textSecrets.curl_header_command, quoted_header_command: textSecrets.quoted_header_command, unquoted_header_command: textSecrets.unquoted_header_command, shell_fragment_double_a: textSecrets.shell_fragment_double_a, shell_fragment_single_a: textSecrets.shell_fragment_single_a, shell_fragment_double_b: textSecrets.shell_fragment_double_b, shell_fragment_single_b: textSecrets.shell_fragment_single_b, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
       ].join("\n"),
     )
 
@@ -5537,6 +5664,11 @@ describe("case trace", () => {
         cookie_header: `Cookie: session=${secrets.cookieSession}; refresh=${secrets.cookieRefresh}; Path=/`,
         curl_header_command: `curl -sS https://example.com/audit -H "Cookie: session=${secrets.cookieCurlSession}; refresh=${secrets.cookieCurlRefresh}; Path=/" --compressed`,
         quoted_header_command: `env MODE=audit curl --header='Cookie: auth=${secrets.cookieCurlSingle}; Path=/' https://example.com`,
+        unquoted_header_command: `env MODE=audit curl -H Cookie:auth=${secrets.cookieCurlUnquoted};Path=/ --compressed https://example.com`,
+        shell_fragment_double_a: `curl -H Cookie:session="${secrets.cookieCurlEmbeddedDouble}" --compressed`,
+        shell_fragment_single_a: `curl -H Cookie:session='${secrets.cookieCurlEmbeddedSingle}' --compressed`,
+        shell_fragment_double_b: `curl -H Set-Cookie:session="${secrets.setCookieCurlEmbeddedDouble}" --compressed`,
+        shell_fragment_single_b: `curl -H Set-Cookie:session='${secrets.setCookieCurlEmbeddedSingle}' --compressed`,
         shell: `TOKEN=${secrets.shellSecret} AUTHORIZATION=${secrets.authorizationAssignment} --password ${secrets.shellSecret}`,
         url: `https://reader:${secrets.stringUrlPassword}@example.com/audit?token=${secrets.stringUrlToken}`,
         error: `Cookie: session=${secrets.cookieError}; Path=/audit`,

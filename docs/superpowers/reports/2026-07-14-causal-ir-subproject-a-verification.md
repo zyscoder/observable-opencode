@@ -2,16 +2,16 @@
 
 ## Scope And Result
 
-Round 3 closes all seven findings in
-`.superpowers/sdd/final-review-round3.md`: 1 Critical, 5 Important, and 1
-Minor. Together with the first two unified-fix rounds, the local Causal IR
-migration acceptance gate is green.
+Round 4 closes both findings in
+`.superpowers/sdd/final-review-round4.md`: 1 Critical and 1 Important. Together
+with the first three unified-fix rounds, the local Causal IR migration
+acceptance gate is green.
 
-This round changes only the owned TypeScript Causal IR/CaseTrace
-implementation, their focused tests, and this report. The viewer, semantic
-observability implementation, and Python attribution implementation did not
-need changes. They continue to consume the compatibility projection and remain
-covered by final verification.
+This round changes only the owned CaseTrace implementation, its focused tests,
+and the two requested reports. `causal-ir.ts`, the viewers, semantic
+observability, and Python attribution did not need changes. Partial, final,
+signal recovery, viewer, and attribution consumers continue to receive edges
+through canonical compatibility projections.
 
 ## Commands And Counts
 
@@ -20,45 +20,35 @@ All final commands were run on 2026-07-15. The Bun executable reports version
 
 | Working directory | Command | Result |
 | --- | --- | --- |
-| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 168 passed, 0 failed, 1,724 expectations, 25.63 s |
+| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 169 passed, 0 failed, 1,738 expectations, 26.80 s |
 | `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun run typecheck` | exit 0 (`tsgo --noEmit`) |
-| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 85 passed, 0 failed, 0.132 s |
-| `packages/opencode` | signal filter: `-t "(SIGINT\|SIGTERM\|SIGKILL\|process exits)"` | 6 passed, 0 failed, 158 expectations, 1.92 s |
-| `packages/opencode` | viewer filter: `-t "(trace.html\|renders component\|renders all agent\|renders v6.0 provenance\|renders artifact-backed)"` | 8 passed, 0 failed, 184 expectations, 1.50 s |
-| `packages/opencode` | redaction filter: `-t "(redact\|token metrics)"` | 4 passed, 0 failed, 69 expectations, 1.79 s |
-| `packages/opencode` | replay filter over Causal IR and CaseTrace: `-t "(replay\|canonical partial\|poisoned journal semantics)"` | 17 passed, 0 failed, 238 expectations, 1.79 s |
-| `packages/opencode` | standalone Causal IR suite | 50 passed, 0 failed, 170 expectations, 0.579 s |
-| `packages/opencode` | standalone semantic-observability suite | 3 passed, 0 failed, 15 expectations, 0.728 s |
+| repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 85 passed, 0 failed, 0.129 s |
 | repository root | `git diff --check` | exit 0 |
 
-The full Bun total comprises 50 Causal IR tests, 115 CaseTrace tests, and 3
-semantic-observability tests. Focused filters overlap that full total and are
-listed as targeted acceptance evidence, not additional tests.
+The full Bun total comprises 50 Causal IR tests, 116 CaseTrace tests, and 3
+semantic-observability tests.
 
-## TDD Evidence
+## Round 4 TDD Evidence
 
-The unchanged Round 2 baseline was 160 passed, 0 failed, and 1,598
-expectations. Round 3 tests first reproduced all seven findings:
-
-- quoted and unquoted neutral-shell Cookie values survived output scans;
-- selectors remained in nested, typed, compatibility, payload, producer
-  update, and legacy-edge refs;
-- malformed derived nodes were accepted;
-- late alias resolution was absent from the durable journal;
-- alias collisions resolved first-wins;
-- the node update scaling fixture observed 832 unrelated property reads; and
-- root string `token_usage` serialized as `[REDACTED]`.
-
-Additional RED hardening caught replacement-graph derivation validation,
-replacement checkpoint edge hash chaining, named compatibility-ref maps, and
-typed endpoint selector rejection. The final implementation turns all of
-these fixtures green.
+- The redaction regression first used neutral property names so key-based
+  sanitation could not mask the text bug. It failed with all four seeded
+  Cookie/Set-Cookie secrets present: embedded single-quoted and double-quoted
+  values in otherwise unquoted shell headers.
+- The canonical ownership regression wrote the same `edge_id` before and
+  after late alias resolution. RED observed two legacy edges while the
+  canonical store correctly held one last-write-wins edge.
+- GREEN replaces the complete header value, keeps agent inputs byte-for-byte
+  unchanged, and projects one legacy edge from the canonical late-alias state.
+- The regression also checks legacy field order, optional-field omission,
+  original relation names, partial/final parity, compatibility endpoints, and
+  viewer marker isolation.
 
 ## Redaction And Token Usage
 
 - Neutral shell text recognizes Cookie and Set-Cookie headers at any command
   position, including single-quoted and double-quoted `curl -H` arguments and
-  unquoted header forms. The complete header value is replaced.
+  unquoted header forms whose values contain embedded single or double quotes.
+  The complete header value is replaced.
 - The regression fixture scans events, raw events, canonical journal, final
   and legacy JSON, provenance projection, partial snapshot, manifest, HTML,
   and every artifact. None contains seeded plaintext secrets.
@@ -126,7 +116,19 @@ these fixtures green.
 
 - `records` and `dataflow_edges` remain projections of canonical
   nodes/edges. The static viewer and Python loader continue to use that
-  surface; no second mutable graph was introduced.
+  surface.
+- The independent mutable `semanticEdges` array is removed. `edge()` writes
+  only the canonical store and uses a short-lived normalized value for its
+  return/event compatibility contract.
+- Canonical projection metadata identifies legacy semantic edges and records
+  which optional legacy fields were present. The legacy projector joins those
+  canonical edges to the existing compatibility endpoint projection, restores
+  original relation names and field order, and removes the internal marker
+  from compatibility JSON and HTML.
+- Same-ID edge updates and late alias reconciliation therefore have one owner:
+  `legacy-trace.json`, canonical `trace.json`, `trace.json.dataflow_edges`,
+  `partial/latest.json`, and `trace.html` all reflect the same canonical edge
+  order and endpoints.
 - Normal exit, SIGINT, SIGTERM, post-finish SIGTERM, and preflushed SIGKILL
   recovery remain green. Redaction, artifact rendering, journal poisoning,
   hash chains, replay, and Python backward attribution are covered by the full
@@ -137,4 +139,4 @@ these fixtures green.
 No live DeepSeek request, external HTTP stress campaign, or historical corpus
 re-attribution run was executed. Those environment-dependent release gates
 remain outside local acceptance. There are no known remaining local findings
-from the three unified migration review rounds.
+from the four unified migration review rounds.
