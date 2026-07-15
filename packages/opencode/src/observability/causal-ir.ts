@@ -180,6 +180,14 @@ export type CausalIRJournalSummary = {
   poisoned: boolean
 }
 
+export type CausalIRCommitResult = {
+  committed: boolean
+  operation: CausalIRJournalEntry["operation"]
+  sequence: number
+  payload_hash: string | undefined
+  poisoned: boolean
+}
+
 export type CausalIRStoreSnapshot = {
   version: typeof CAUSAL_IR_VERSION
   runID: string
@@ -445,6 +453,9 @@ function legacyRef(ref: CausalIRRef) {
   return ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`
 }
 
+type CausalIRRefInput = string | CausalIRRef | DataflowEdge["from"]
+type CausalIRRefResolver = (input: CausalIRRefInput) => CausalIRRef
+
 function textField(input: Record<string, unknown> | undefined, keys: string[]) {
   if (!input) return undefined
   for (const key of keys) {
@@ -452,6 +463,129 @@ function textField(input: Record<string, unknown> | undefined, keys: string[]) {
     if (typeof value === "string" && value) return value
   }
   return undefined
+}
+
+function nodeAliases(node: CausalNodeLike, payload: Record<string, unknown>) {
+  const aliases = new Set([...(node.aliases ?? []), `record:${node.node_id}`, `node:${node.node_id}`])
+  const add = (type: string, id: unknown) => {
+    if (typeof id === "string" && id) aliases.add(`${type}:${id}`)
+  }
+  const addTypes = (types: string[], keys: string[] = []) => {
+    for (const type of types) {
+      add(type, node.node_id)
+      for (const key of keys) add(type, payload[key])
+    }
+  }
+
+  switch (node.kind) {
+    case "prompt.assembly":
+      addTypes(["prompt"])
+      break
+    case "context.transform":
+    case "context.pack":
+      addTypes(["context"])
+      break
+    case "context.compaction_check":
+      addTypes(["compaction_check"], ["check_id"])
+      break
+    case "context.compaction":
+      addTypes(["compaction"], ["compaction_id"])
+      break
+    case "llm.call":
+      addTypes(["llm_request"])
+      add("span", node.span_id)
+      break
+    case "llm.turn":
+      addTypes(["llm_turn", "llm"], ["turn_id"])
+      break
+    case "exit.gate":
+      addTypes(["exit_gate"], ["gate_id"])
+      break
+    case "decision":
+      addTypes(["decision"], ["decision_id"])
+      break
+    case "tool.call":
+      addTypes(["tool_call"], ["call_id", "callID", "tool_call_id"])
+      break
+    case "tool.result":
+      addTypes(["tool_result"], ["call_id", "callID", "tool_call_id"])
+      break
+    case "tool.error":
+      addTypes(["tool_error"], ["call_id", "callID", "tool_call_id"])
+      break
+    case "mcp.call":
+      addTypes(["mcp_call"], ["call_id", "callID"])
+      break
+    case "skill.load":
+      addTypes(["skill"], ["skill_id"])
+      break
+    case "subagent.call":
+      addTypes(["subagent_task"], ["task_id", "taskID"])
+      break
+    case "observation":
+    case "execution.observation":
+      addTypes(["observation"], ["observation_id"])
+      break
+    case "evidence.fact":
+    case "evidence.semantic_fact":
+      addTypes(["evidence", "repo_fact"], ["fact_id"])
+      break
+    case "change":
+      addTypes(["change"], ["change_id"])
+      break
+    case "verification":
+      addTypes(["verification"], ["verification_id"])
+      break
+    case "response.output":
+    case "final.claim":
+      addTypes(["response_segment", "final_response_evidence"], ["segment_id"])
+      break
+    case "response.claim":
+      addTypes(["response_claim"], ["claim_id"])
+      break
+    case "claim.support_assessment":
+      addTypes(["claim_support"], ["assessment_id"])
+      break
+    case "task.obligation": {
+      const obligationType = payload.obligation_type
+      if (typeof obligationType === "string") addTypes([obligationType])
+      break
+    }
+  }
+
+  return [...aliases]
+}
+
+function isValidTypedRef(input: unknown): input is CausalIRRef {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false
+  const ref = input as Partial<CausalIRRef>
+  return (
+    (ref.ref_type === "node" ||
+      ref.ref_type === "artifact" ||
+      ref.ref_type === "raw_event" ||
+      ref.ref_type === "external") &&
+    typeof ref.ref_id === "string" &&
+    ref.ref_id.length > 0
+  )
+}
+
+function validateNodeProvenance(node: CausalNodeLike) {
+  const origin = node.origin ?? "observed"
+  const derivation = node.derivation
+  if (origin === "observed") {
+    if (derivation !== undefined) throw new TypeError("observed node cannot declare derivation provenance")
+    return
+  }
+  if (!derivation) throw new TypeError("derived node requires derivation provenance")
+  if (!(node.input_refs?.length)) throw new TypeError("derived node requires non-empty input refs")
+  if (!derivation.input_refs.length || !derivation.input_refs.every(isValidTypedRef))
+    throw new TypeError("derived node requires non-empty typed derivation input refs")
+  if (!derivation.algorithm || !derivation.algorithm_version || !derivation.derived_at)
+    throw new TypeError("derived node requires algorithm, version, and derived_at provenance")
+  if (typeof derivation.reproducible !== "boolean")
+    throw new TypeError("derived node requires an explicit reproducible flag")
+  if (origin === "deterministic_derived" && derivation.reproducible !== true)
+    throw new TypeError("deterministic derived node must be reproducible")
 }
 
 function isCanonicalNode(input: unknown): input is CausalIRNode {
@@ -475,18 +609,25 @@ function isCanonicalNode(input: unknown): input is CausalIRNode {
 function canonicalNodeEnvelope(
   node: CausalNodeLike,
   input: { runID: string; caseID: string; sequence: number },
+  resolveRef: CausalIRRefResolver = typedRef,
 ): CausalIRNode {
   const payload = journalData(node.data ?? {})
-  const inputRefs = (node.input_refs ?? []).map(typedRef)
-  const outputRefs = (node.output_refs ?? []).map(typedRef)
-  const sourceRefs = (node.source_refs ?? []).map(typedRef)
+  const inputRefs = (node.input_refs ?? []).map(resolveRef)
+  const outputRefs = (node.output_refs ?? []).map(resolveRef)
+  const sourceRefs = (node.source_refs ?? []).map(resolveRef)
   const sourceLocations = journalData(node.source_locations ?? [])
   const artifactRefs = [...(node.artifact_refs ?? [])]
   const metadata = node.metadata ? journalData(node.metadata) : undefined
   const scopeSources = [payload, metadata]
   const scoped = (keys: string[]) => scopeSources.map((item) => textField(item, keys)).find(Boolean)
-  const aliases = [...new Set([...(node.aliases ?? []), `record:${node.node_id}`, `node:${node.node_id}`])]
+  const aliases = nodeAliases(node, payload)
   const sourceHash = payloadHash({ inputRefs, outputRefs, sourceRefs, sourceLocations, artifactRefs })
+  const derivation = node.derivation
+    ? {
+        ...journalData(node.derivation),
+        input_refs: node.derivation.input_refs.map(resolveRef),
+      }
+    : null
 
   return {
     node_id: node.node_id,
@@ -520,7 +661,7 @@ function canonicalNodeEnvelope(
     source_locations: sourceLocations,
     artifact_refs: artifactRefs,
     aliases,
-    derivation: node.derivation ? journalData(node.derivation) : null,
+    derivation,
     integrity: {
       payload_hash: payloadHash(payload),
       source_hash: sourceHash,
@@ -561,34 +702,37 @@ function isCanonicalEdge(input: unknown): input is CausalIREdge {
   )
 }
 
-function canonicalEdgeEnvelope(input: CausalEdgeLike | CausalIREdge): CausalIREdge {
+function canonicalEdgeEnvelope(
+  input: CausalEdgeLike | CausalIREdge,
+  resolveRef: CausalIRRefResolver = typedRef,
+): CausalIREdge {
   if (isCanonicalEdge(input)) {
     const details = normalizeRelationDetails(input.original_relation)
     const tier = evidenceTier(input.evidence_tier) ?? "confirmed"
     return {
       ...journalData(input),
-      from: typedRef(input.from),
-      to: typedRef(input.to),
+      from: resolveRef(input.from),
+      to: resolveRef(input.to),
       original_relation: details.original,
       normalized_relation: details.normalized,
       evidence_tier: tier,
       eligible_for_attribution: details.known && tier !== "temporal_advisory" && input.eligible_for_attribution !== false,
       derivation_method: input.derivation_method ?? (details.known ? "explicit_relation" : "unknown_relation_fallback"),
-      evidence_refs: (input.evidence_refs ?? []).map(typedRef),
+      evidence_refs: (input.evidence_refs ?? []).map(resolveRef),
     }
   }
 
   const attributes = canonicalRelationAttributes(input)
   return {
     edge_id: input.edge_id,
-    from: typedRef(input.from),
-    to: typedRef(input.to),
+    from: resolveRef(input.from),
+    to: resolveRef(input.to),
     original_relation: attributes.original_relation,
     normalized_relation: attributes.normalized_relation,
     evidence_tier: attributes.evidence_tier,
     eligible_for_attribution: attributes.eligible_for_attribution,
     derivation_method: attributes.derivation_method,
-    evidence_refs: (input.evidence_refs ?? []).map(typedRef),
+    evidence_refs: (input.evidence_refs ?? []).map(resolveRef),
     confidence: input.confidence,
     label: input.label,
     metadata: input.metadata ? journalData(input.metadata) : undefined,
@@ -656,29 +800,38 @@ export class CausalIRStore {
   private lastJournalPayloadHash: string | undefined
   private readonly payloadHashes = new Map<string, string>()
   private readonly nodeOrders = new Map<string, number>()
+  private readonly nodeAliasIndex = new Map<string, string>()
   private readonly edgeIndexes = new Map<string, number>()
   private readonly diagnosticIndexes = new Map<string, number>()
 
   constructor(private readonly input: CausalIRStoreInput) {}
 
   createNode<T extends CausalNodeLike>(node: T): T {
+    validateNodeProvenance(node)
     this.nodes.push(node)
+    this.rebuildNodeAliasIndex()
     const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
     this.nodeOrders.set(node.node_id, sequence)
     this.append("node.created", "node", node.node_id, this.canonicalNode(node, sequence))
+    this.reconcileReferenceDiagnostics()
     return node
   }
 
   updateNode<T extends CausalNodeLike>(node: T): T {
+    validateNodeProvenance(node)
     replaceByID(this.nodes, "node_id", node)
+    this.rebuildNodeAliasIndex()
     const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
     this.nodeOrders.set(node.node_id, sequence)
     this.append("node.updated", "node.update", node.node_id, this.canonicalNode(node, sequence), "node")
+    this.reconcileReferenceDiagnostics()
     return node
   }
 
   replaceNodes(nodes: CausalNodeLike[]): void {
+    for (const node of nodes) validateNodeProvenance(node)
     replaceAll(this.nodes, nodes)
+    this.rebuildNodeAliasIndex()
     const nextOrders = new Map<string, number>()
     for (const node of nodes) {
       const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
@@ -687,6 +840,7 @@ export class CausalIRStore {
     this.nodeOrders.clear()
     for (const [nodeID, sequence] of nextOrders) this.nodeOrders.set(nodeID, sequence)
     this.rebuildPayloadHashes("node", this.canonicalNodes(), "node_id")
+    this.reconcileReferenceDiagnostics()
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "nodes.replaced" })
   }
 
@@ -699,8 +853,9 @@ export class CausalIRStore {
     } else {
       this.edges[index] = canonical
     }
-    this.append("edge.created", "edge", canonical.edge_id, canonicalEdgeEnvelope(canonical))
+    this.append("edge.created", "edge", canonical.edge_id, canonicalEdgeEnvelope(canonical, this.resolveRef))
     this.reconcileUnknownRelationDiagnostic(canonical)
+    this.reconcileReferenceDiagnostics(canonical.edge_id)
     return canonical as T
   }
 
@@ -710,6 +865,7 @@ export class CausalIRStore {
     this.rebuildEdgeIndexes()
     this.rebuildPayloadHashes("edge", this.canonicalEdges(), "edge_id")
     this.reconcileAllUnknownRelationDiagnostics()
+    this.reconcileReferenceDiagnostics()
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
@@ -735,8 +891,8 @@ export class CausalIRStore {
     this.appendSnapshot("case.checkpointed", "checkpoint", data)
   }
 
-  finalize(data: unknown): void {
-    this.appendSnapshot("case.finalized", "finish", data)
+  finalize(data: unknown): CausalIRCommitResult {
+    return this.appendSnapshot("case.finalized", "finish", data)
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -766,7 +922,7 @@ export class CausalIRStore {
 
   private appendSnapshot(operation: "case.checkpointed" | "case.finalized", recordType: string, data: unknown) {
     const trace = isCausalIRTraceDocument(data) ? journalData(data) : undefined
-    this.append(
+    return this.append(
       operation,
       recordType,
       this.input.caseID,
@@ -779,8 +935,110 @@ export class CausalIRStore {
     )
   }
 
+  private readonly resolveRef: CausalIRRefResolver = (input) => {
+    const ref = typedRef(input)
+    if (ref.ref_type !== "node") return ref
+    const legacy = legacyRef(ref)
+    const nodeID =
+      this.nodeAliasIndex.get(legacy) ??
+      this.nodeAliasIndex.get(`node:${ref.ref_id}`) ??
+      this.nodeAliasIndex.get(`record:${ref.ref_id}`)
+    if (!nodeID) {
+      return {
+        ...ref,
+        ref_type: "external",
+        legacy_ref: legacy,
+      }
+    }
+    return {
+      ...ref,
+      ref_type: "node",
+      ref_id: nodeID,
+      legacy_ref: ref.legacy_ref ?? legacy,
+    }
+  }
+
+  private rebuildNodeAliasIndex() {
+    this.nodeAliasIndex.clear()
+    for (const node of this.nodes) {
+      for (const alias of nodeAliases(node, node.data ?? {})) {
+        if (!this.nodeAliasIndex.has(alias)) this.nodeAliasIndex.set(alias, node.node_id)
+      }
+    }
+  }
+
+  private referenceDiagnostics(edgeID?: string) {
+    const diagnostics = new Map<string, CausalIRDiagnosticLike>()
+    const inspect = (
+      owner: { type: "node" | "edge"; id: string },
+      field: string,
+      input: CausalIRRefInput,
+    ) => {
+      const legacy = typedRef(input)
+      if (legacy.ref_type !== "node" || this.resolveRef(input).ref_type !== "external") return
+      const legacyValue = legacyRef(legacy)
+      const diagnostic: CausalIRDiagnosticLike = {
+        diagnostic_id: `unresolved_ref:${owner.id}:${field}:${payloadHash(legacyValue).slice(0, 16)}`,
+        kind: "unresolved_ref",
+        level: "warning",
+        message: `Unresolved causal reference: ${legacyValue}`,
+        owner_type: owner.type,
+        field,
+        legacy_ref: legacyValue,
+        ...(owner.type === "node" ? { node_id: owner.id } : { edge_id: owner.id }),
+      }
+      diagnostics.set(diagnostic.diagnostic_id, diagnostic)
+    }
+
+    if (edgeID === undefined) {
+      for (const node of this.nodes) {
+        for (const [index, ref] of (node.input_refs ?? []).entries())
+          inspect({ type: "node", id: node.node_id }, `input_refs[${index}]`, ref)
+        for (const [index, ref] of (node.output_refs ?? []).entries())
+          inspect({ type: "node", id: node.node_id }, `output_refs[${index}]`, ref)
+        for (const [index, ref] of (node.source_refs ?? []).entries())
+          inspect({ type: "node", id: node.node_id }, `source_refs[${index}]`, ref)
+        for (const [index, ref] of (node.derivation?.input_refs ?? []).entries())
+          inspect({ type: "node", id: node.node_id }, `derivation.input_refs[${index}]`, ref)
+      }
+    }
+    const indexedEdge = edgeID === undefined ? undefined : this.edges[this.edgeIndexes.get(edgeID) ?? -1]
+    const edges = edgeID === undefined ? this.edges : indexedEdge ? [indexedEdge] : []
+    for (const edge of edges) {
+      inspect({ type: "edge", id: edge.edge_id }, "from", edge.from)
+      inspect({ type: "edge", id: edge.edge_id }, "to", edge.to)
+      for (const [index, ref] of (edge.evidence_refs ?? []).entries())
+        inspect({ type: "edge", id: edge.edge_id }, `evidence_refs[${index}]`, ref)
+    }
+    return [...diagnostics.values()]
+  }
+
+  private reconcileReferenceDiagnostics(edgeID?: string) {
+    const inScope = (diagnostic: CausalIRDiagnosticLike) =>
+      diagnostic.kind === "unresolved_ref" && (edgeID === undefined || diagnostic.edge_id === edgeID)
+    const current = new Map(
+      this.diagnostics
+        .filter(inScope)
+        .map((diagnostic) => [diagnostic.diagnostic_id, diagnostic]),
+    )
+    const next = this.referenceDiagnostics(edgeID)
+    replaceAll(
+      this.diagnostics,
+      [...this.diagnostics.filter((diagnostic) => !inScope(diagnostic)), ...next],
+    )
+    this.rebuildDiagnosticIndexes()
+    for (const diagnostic of next) {
+      if (current.has(diagnostic.diagnostic_id)) continue
+      this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
+    }
+  }
+
   private canonicalNode(node: CausalNodeLike, sequence: number) {
-    return canonicalNodeEnvelope(node, { runID: this.input.runID, caseID: this.input.caseID, sequence })
+    return canonicalNodeEnvelope(
+      node,
+      { runID: this.input.runID, caseID: this.input.caseID, sequence },
+      this.resolveRef,
+    )
   }
 
   private canonicalNodes() {
@@ -790,7 +1048,7 @@ export class CausalIRStore {
   }
 
   private canonicalEdges() {
-    return this.edges.map(canonicalEdgeEnvelope)
+    return this.edges.map((edge) => canonicalEdgeEnvelope(edge, this.resolveRef))
   }
 
   private rebuildEdgeIndexes() {
@@ -870,7 +1128,15 @@ export class CausalIRStore {
     data: unknown,
     hashType = recordType,
   ) {
-    if (this.poisoned) return false
+    if (this.poisoned) {
+      return {
+        committed: false,
+        operation,
+        sequence: this.sequence,
+        payload_hash: undefined,
+        poisoned: true,
+      } satisfies CausalIRCommitResult
+    }
     const payloadHashValue = payloadHash(data)
     const hashKey = entityID ? `${hashType}:${entityID}` : undefined
     const entry: CausalIRJournalEntry = {
@@ -889,17 +1155,35 @@ export class CausalIRStore {
     try {
       if (this.input.append?.(entry) === false) {
         this.poisoned = true
-        return false
+        return {
+          committed: false,
+          operation,
+          sequence: this.sequence,
+          payload_hash: undefined,
+          poisoned: true,
+        } satisfies CausalIRCommitResult
       }
     } catch {
       this.poisoned = true
-      return false
+      return {
+        committed: false,
+        operation,
+        sequence: this.sequence,
+        payload_hash: undefined,
+        poisoned: true,
+      } satisfies CausalIRCommitResult
     }
 
     this.sequence = entry.sequence
     if (hashKey) this.payloadHashes.set(hashKey, payloadHashValue)
     this.lastJournalPayloadHash = payloadHashValue
-    return true
+    return {
+      committed: true,
+      operation,
+      sequence: entry.sequence,
+      payload_hash: payloadHashValue,
+      poisoned: false,
+    } satisfies CausalIRCommitResult
   }
 }
 
@@ -1006,23 +1290,15 @@ function optionalNumber(input: unknown) {
   return Number.isFinite(value) ? value : undefined
 }
 
-function safeNumber(input: unknown) {
-  const value = Number(input ?? 0)
-  return Number.isFinite(value) ? Math.max(0, value) : 0
-}
-
 function compatibilityTokenUsage(input: unknown): ProvenanceRecord["token_usage"] {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
   const usage = input as Record<string, unknown>
-  return {
-    input: safeNumber(usage.input),
-    output: safeNumber(usage.output),
-    reasoning: safeNumber(usage.reasoning),
-    cached_input: safeNumber(usage.cached_input),
-    cache_write: safeNumber(usage.cache_write),
-    total: safeNumber(usage.total),
-    cost: safeNumber(usage.cost),
+  const output: NonNullable<ProvenanceRecord["token_usage"]> = {}
+  for (const key of ["input", "output", "reasoning", "cached_input", "cache_write", "total", "cost"] as const) {
+    const value = usage[key]
+    if (typeof value === "number" && Number.isFinite(value)) output[key] = Math.max(0, value)
   }
+  return Object.keys(output).length ? output : undefined
 }
 
 function provenanceRef(ref: DataflowEdge["from"]): DataflowEdge["from"] {
@@ -1038,7 +1314,7 @@ function compatibilityRef(ref: CausalIRRef): DataflowEdge["from"] {
   const separator = value.indexOf(":")
   return {
     type: separator === -1 ? ref.ref_type : value.slice(0, separator),
-    id: ref.ref_id,
+    id: separator === -1 ? ref.ref_id : value.slice(separator + 1),
     label: ref.label,
   }
 }

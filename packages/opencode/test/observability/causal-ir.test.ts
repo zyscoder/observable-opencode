@@ -25,8 +25,8 @@ function node(nodeID: string, data: Record<string, unknown> = {}): CausalIRNodeI
 function edge(edgeID: string) {
   return {
     edge_id: edgeID,
-    from: { type: "node", id: "node_1" },
-    to: { type: "node", id: "node_2" },
+    from: { type: "external", id: "source_1" },
+    to: { type: "external", id: "target_1" },
     relation: "produced",
   }
 }
@@ -34,8 +34,8 @@ function edge(edgeID: string) {
 function relationEdge(edgeID: string, relation: string) {
   return {
     edge_id: edgeID,
-    from: { type: "node", id: `${edgeID}_from` },
-    to: { type: "node", id: `${edgeID}_to` },
+    from: { type: "external", id: `${edgeID}_from` },
+    to: { type: "external", id: `${edgeID}_to` },
     relation,
   }
 }
@@ -359,9 +359,9 @@ describe("causal IR store", () => {
         parent_span_id: "span_parent",
       },
       payload: { chosen_action: "inspect" },
-      input_refs: [{ ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1" }],
-      output_refs: [{ ref_type: "node", ref_id: "result_1", legacy_ref: "tool_result:result_1" }],
-      source_refs: [{ ref_type: "node", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
+      input_refs: [{ ref_type: "external", ref_id: "call_1", legacy_ref: "tool_call:call_1" }],
+      output_refs: [{ ref_type: "external", ref_id: "result_1", legacy_ref: "tool_result:result_1" }],
+      source_refs: [{ ref_type: "external", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
       source_locations: [{ path: "src/index.ts", line_start: 4, line_end: 8 }],
       artifact_refs: ["artifact_1"],
       aliases: expect.arrayContaining(["record:node_envelope", "node:node_envelope"]),
@@ -373,16 +373,154 @@ describe("causal IR store", () => {
     })
     expect(snapshot.edges[0]).toEqual({
       edge_id: "edge_envelope",
-      from: { ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1", label: "tool.call" },
+      from: { ref_type: "external", ref_id: "call_1", legacy_ref: "tool_call:call_1", label: "tool.call" },
       to: { ref_type: "node", ref_id: "node_envelope", legacy_ref: "node:node_envelope", label: "decision" },
       original_relation: "produced",
       normalized_relation: "produced",
       evidence_tier: "content_matched",
       eligible_for_attribution: true,
       derivation_method: "explicit_test_fixture",
-      evidence_refs: [{ ref_type: "node", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
+      evidence_refs: [{ ref_type: "external", ref_id: "fact_1", legacy_ref: "evidence:fact_1" }],
       confidence: 0.9,
       metadata: { retained: true },
+    })
+  })
+
+  test("resolves legacy endpoint aliases to distinct canonical node identities", () => {
+    const store = new CausalIRStore({ runID: "run_alias", caseID: "case_alias" })
+    store.createNode({
+      ...node("toolcall_shared"),
+      kind: "tool.call",
+      component: "tool",
+      data: { call_id: "shared_call" },
+    })
+    store.createNode({
+      ...node("toolresult_shared"),
+      kind: "tool.result",
+      component: "tool",
+      data: { call_id: "shared_call" },
+    })
+    store.createEdge({
+      edge_id: "edge_shared_call",
+      from: { type: "tool_call", id: "shared_call" },
+      to: { type: "tool_result", id: "shared_call" },
+      relation: "produced",
+    })
+    store.createEdge({
+      edge_id: "edge_unresolved",
+      from: { type: "verification", id: "missing_verification" },
+      to: { type: "tool_result", id: "shared_call" },
+      relation: "derived_from",
+    })
+    store.createEdge({
+      edge_id: "edge_explicit_node_unresolved",
+      from: { type: "node", id: "missing_node" },
+      to: { type: "tool_result", id: "shared_call" },
+      relation: "derived_from",
+    })
+
+    const snapshot = store.snapshot()
+    const call = snapshot.nodes.find((item) => item.node_id === "toolcall_shared")
+    const result = snapshot.nodes.find((item) => item.node_id === "toolresult_shared")
+    const resolved = snapshot.edges.find((item) => item.edge_id === "edge_shared_call")
+    const unresolved = snapshot.edges.find((item) => item.edge_id === "edge_unresolved")
+    const explicitNodeUnresolved = snapshot.edges.find(
+      (item) => item.edge_id === "edge_explicit_node_unresolved",
+    )
+
+    expect(call?.aliases).toContain("tool_call:shared_call")
+    expect(result?.aliases).toContain("tool_result:shared_call")
+    expect(resolved).toMatchObject({
+      from: { ref_type: "node", ref_id: "toolcall_shared", legacy_ref: "tool_call:shared_call" },
+      to: { ref_type: "node", ref_id: "toolresult_shared", legacy_ref: "tool_result:shared_call" },
+    })
+    expect(resolved?.from.ref_id).not.toBe(resolved?.to.ref_id)
+    expect(unresolved?.from).toEqual({
+      ref_type: "external",
+      ref_id: "missing_verification",
+      legacy_ref: "verification:missing_verification",
+    })
+    expect(explicitNodeUnresolved?.from).toEqual({
+      ref_type: "external",
+      ref_id: "missing_node",
+      legacy_ref: "node:missing_node",
+    })
+    expect(snapshot.diagnostics).toContainEqual(
+      expect.objectContaining({
+        diagnostic_id: expect.stringContaining("unresolved_ref:edge_unresolved:from:"),
+        kind: "unresolved_ref",
+        edge_id: "edge_unresolved",
+        field: "from",
+        legacy_ref: "verification:missing_verification",
+      }),
+    )
+    expect(store.snapshot().diagnostics).toEqual(snapshot.diagnostics)
+
+    const projection = projectProvenanceTrace(snapshot, {
+      traceVersion: "6.0",
+      manifest: { case_id: "case_alias", run_id: "run_alias" },
+      metrics: { token_usage: {}, trace_health: { issues: [] } },
+    })
+    expect(projection.dataflow_edges.find((item) => item.edge_id === "edge_shared_call")).toMatchObject({
+      from: { type: "tool_call", id: "shared_call" },
+      to: { type: "tool_result", id: "shared_call" },
+    })
+  })
+
+  test("rejects invalid derived provenance and accepts typed reproducible inputs", () => {
+    const store = new CausalIRStore({ runID: "run_derivation", caseID: "case_derivation" })
+    store.createNode(node("observed_input"))
+    const derivedBase = {
+      ...node("derived_output"),
+      origin: "deterministic_derived" as const,
+      input_refs: ["node:observed_input"],
+    }
+
+    expect(() => store.createNode(derivedBase)).toThrow("derived node requires derivation provenance")
+    expect(() =>
+      store.createNode({
+        ...derivedBase,
+        derivation: {
+          algorithm: "fixture_derivation",
+          algorithm_version: "1.0.0",
+          derived_at: "2026-07-15T00:00:00.000Z",
+          input_refs: [],
+          reproducible: true,
+        },
+      }),
+    ).toThrow("derived node requires non-empty typed derivation input refs")
+    expect(() =>
+      store.createNode({
+        ...node("observed_with_derivation"),
+        derivation: {
+          algorithm: "invalid_observed_derivation",
+          algorithm_version: "1.0.0",
+          derived_at: "2026-07-15T00:00:00.000Z",
+          input_refs: [{ ref_type: "node", ref_id: "observed_input" }],
+          reproducible: true,
+        },
+      }),
+    ).toThrow("observed node cannot declare derivation provenance")
+
+    store.createNode({
+      ...derivedBase,
+      derivation: {
+        algorithm: "fixture_derivation",
+        algorithm_version: "1.0.0",
+        derived_at: "2026-07-15T00:00:00.000Z",
+        input_refs: [{ ref_type: "node", ref_id: "observed_input", legacy_ref: "node:observed_input" }],
+        reproducible: true,
+      },
+    })
+    expect(store.snapshot().nodes.find((item) => item.node_id === "derived_output")).toMatchObject({
+      origin: "deterministic_derived",
+      input_refs: [{ ref_type: "node", ref_id: "observed_input", legacy_ref: "node:observed_input" }],
+      derivation: {
+        algorithm: "fixture_derivation",
+        algorithm_version: "1.0.0",
+        input_refs: [{ ref_type: "node", ref_id: "observed_input", legacy_ref: "node:observed_input" }],
+        reproducible: true,
+      },
     })
   })
 
@@ -416,6 +554,38 @@ describe("causal IR store", () => {
       last_payload_hash: persisted[0]?.payload_hash,
       poisoned: true,
     })
+  })
+
+  test("returns the durable commit result when finalization append fails", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_finalize_failure",
+      caseID: "case_finalize_failure",
+      append: (entry) => {
+        if (entry.operation === "case.finalized") return false
+        journal.push(entry)
+        return true
+      },
+    })
+    store.createNode(node("node_before_finalize_failure"))
+    const before = store.journalSummary()
+
+    const result = store.finalize({ status: "success" }) as any
+
+    expect(result).toEqual({
+      committed: false,
+      operation: "case.finalized",
+      sequence: before.last_sequence,
+      payload_hash: undefined,
+      poisoned: true,
+    })
+    expect(store.journalSummary()).toMatchObject({
+      entry_count: before.entry_count,
+      last_sequence: before.last_sequence,
+      last_payload_hash: before.last_payload_hash,
+      poisoned: true,
+    })
+    expect(journal.some((entry) => entry.operation === "case.finalized")).toBe(false)
   })
 
   test("inserts an edge without rescanning existing edges or diagnostics", () => {
@@ -569,11 +739,7 @@ describe("causal IR store", () => {
       token_usage: {
         input: 3,
         output: 5,
-        reasoning: 0,
-        cached_input: 0,
-        cache_write: 0,
         total: 8,
-        cost: 0,
       },
       error: { message: "retained diagnostic" },
       input_refs: ["tool_call:call_1"],
@@ -672,8 +838,8 @@ describe("causal IR store", () => {
     const store = new CausalIRStore({ runID: "run_metadata", caseID: "case_metadata" })
     store.createEdge({
       edge_id: "edge_metadata",
-      from: { type: "node", id: "node_1" },
-      to: { type: "node", id: "node_2" },
+      from: { type: "external", id: "source_1" },
+      to: { type: "external", id: "target_1" },
       relation: "custom_metadata_relation",
       metadata: {
         normalized_relation: "produced",
@@ -697,8 +863,8 @@ describe("causal IR store", () => {
     const store = new CausalIRStore({ runID: "run_known", caseID: "case_known" })
     store.createEdge({
       edge_id: "edge_known",
-      from: { type: "node", id: "node_1" },
-      to: { type: "node", id: "node_2" },
+      from: { type: "external", id: "source_1" },
+      to: { type: "external", id: "target_1" },
       relation: "produced",
       eligible_for_attribution: false,
     })
@@ -711,8 +877,8 @@ describe("causal IR store", () => {
     const store = new CausalIRStore({ runID: "run_temporal", caseID: "case_temporal" })
     store.createEdge({
       edge_id: "edge_temporal",
-      from: { type: "node", id: "node_1" },
-      to: { type: "node", id: "node_2" },
+      from: { type: "external", id: "source_1" },
+      to: { type: "external", id: "target_1" },
       relation: "produced",
       evidence_tier: "temporal_advisory",
       eligible_for_attribution: true,

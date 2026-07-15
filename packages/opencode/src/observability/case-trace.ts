@@ -8,10 +8,14 @@ import {
   type ArtifactLike,
   type CausalEdgeLike,
   type CausalIREdge,
+  type CausalIRDerivation,
+  type CausalIRCommitResult,
   type CausalIRDiagnosticLike,
   type CausalIRJournalEntry,
   type CausalIRJournalSummary,
   type CausalIRNode,
+  type CausalIROrigin,
+  type CausalIRRef,
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
@@ -731,6 +735,7 @@ export type CausalNode = {
   time_ms: number
   title?: string
   status?: TraceStatus | TraceVerificationRecord["status"]
+  origin?: CausalIROrigin
   data?: Record<string, unknown>
   input_refs?: string[]
   output_refs?: string[]
@@ -738,6 +743,8 @@ export type CausalNode = {
   source_locations?: TraceSourceLocation[]
   typed_resources?: Record<string, unknown>[]
   artifact_refs?: string[]
+  aliases?: string[]
+  derivation?: CausalIRDerivation
   metadata?: Record<string, unknown>
 }
 
@@ -1260,6 +1267,7 @@ export type ActiveSpan = {
 }
 
 const truthy = new Set(["1", "true", "yes", "on"])
+const tokenUsageFields = ["input", "output", "reasoning", "cached_input", "cache_write", "total", "cost"] as const
 const secretTextPatterns = [
   /\bsk-[a-zA-Z0-9_-]{8,}\b/g,
   /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi,
@@ -1306,12 +1314,33 @@ function defaultTraceDir() {
   return process.env.OPENCODE_CASE_TRACE_DIR || path.join(Global.Path.data, "case-traces")
 }
 
+function isTokenUsageContainer(input: string) {
+  return normalizeKey(input) === "token_usage"
+}
+
+function finiteTokenMetric(input: unknown) {
+  return typeof input === "number" && Number.isFinite(input) ? Math.max(0, input) : undefined
+}
+
+function sanitizeTokenUsage(input: unknown): TraceTokenUsage | "[REDACTED]" {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return "[REDACTED]"
+  const value = input as Record<string, unknown>
+  const output: TraceTokenUsage = {}
+  for (const key of tokenUsageFields) {
+    const metric = finiteTokenMetric(value[key])
+    if (metric !== undefined) output[key] = metric
+  }
+  return output
+}
+
 function sanitizeForJson(
   input: unknown,
   key = "",
   stack = new WeakSet<object>(),
   path: readonly string[] = [],
 ): unknown {
+  if (input === undefined) return undefined
+  if (isTokenUsageContainer(key)) return sanitizeTokenUsage(input)
   if (isSensitiveKey(key, path, input)) return "[REDACTED]"
   if (typeof input === "bigint") return String(input)
   if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
@@ -1326,7 +1355,8 @@ function sanitizeForJson(
       return input.map((item, index) => sanitizeForJson(item, String(index), stack, [...path, String(index)]))
     const output: Record<string, unknown> = {}
     for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) {
-      output[childKey] = sanitizeForJson(value, childKey, stack, [...path, childKey])
+      const sanitized = sanitizeForJson(value, childKey, stack, [...path, childKey])
+      if (sanitized !== undefined) output[childKey] = sanitized
     }
     return output
   } finally {
@@ -1393,7 +1423,7 @@ function isSensitiveKey(input: string, path: readonly string[] = [], value?: unk
 class TraceOwnedCausalIRStore {
   private readonly store: CausalIRStore
 
-  constructor(input: { runID: string; caseID: string; append?: (entry: CausalIRJournalEntry) => void }) {
+  constructor(input: { runID: string; caseID: string; append?: (entry: CausalIRJournalEntry) => unknown }) {
     this.store = new CausalIRStore(input)
   }
 
@@ -1449,8 +1479,8 @@ class TraceOwnedCausalIRStore {
     this.store.checkpoint(this.copy(data))
   }
 
-  finalize(data: unknown): void {
-    this.store.finalize(this.copy(data))
+  finalize(data: unknown): CausalIRCommitResult {
+    return this.store.finalize(this.copy(data))
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -1489,15 +1519,15 @@ function redactText(input: string) {
       `${quote}${key}${quote}${separator}${valueQuote}[REDACTED]${valueQuote}`,
   )
   output = output.replace(
-    /\b((?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)(?:(?:Basic|Bearer)\s+)?[^\s,;]+/gi,
-    "$1[REDACTED]",
+    /(^|[\r\n]|(?:[a-z]*Error:\s+))(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)[^\r\n]*/gi,
+    "$1$2[REDACTED]",
   )
   output = output.replace(
     /(\-\-(?:api[-_]?key|password|passwd|credential|secret|token|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token)(?:=|\s+))(?:(?:"[^"]*")|(?:'[^']*')|[^\s,;]+)/gi,
     "$1[REDACTED]",
   )
   output = output.replace(
-    /\b((?:api[_-]?key|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*=\s*)(?:(?:"[^"]*")|(?:'[^']*')|[^\s,;]+)/gi,
+    /\b((?:api[_-]?key|authorization|proxy[_-]?authorization|cookie|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*=\s*)(?:(?:"[^"]*")|(?:'[^']*')|(?:(?:Basic|Bearer)\s+)?[^\s,]+)/gi,
     "$1[REDACTED]",
   )
   for (const pattern of secretTextPatterns) output = output.replace(pattern, "[REDACTED]")
@@ -1734,40 +1764,29 @@ export function normalizeTokenUsage(input: unknown): TraceTokenUsage {
   if (!input || typeof input !== "object") return {}
   const value = input as Record<string, any>
   const cache = value.cache && typeof value.cache === "object" ? value.cache : {}
-  return {
-    input: safeNumber(value.input ?? value.inputTokens),
-    output: safeNumber(value.output ?? value.outputTokens),
-    reasoning: safeNumber(value.reasoning ?? value.reasoningTokens ?? value.outputTokenDetails?.reasoningTokens),
-    cached_input: safeNumber(
+  return omitUndefined({
+    input: finiteTokenMetric(value.input ?? value.inputTokens),
+    output: finiteTokenMetric(value.output ?? value.outputTokens),
+    reasoning: finiteTokenMetric(value.reasoning ?? value.reasoningTokens ?? value.outputTokenDetails?.reasoningTokens),
+    cached_input: finiteTokenMetric(
       value.cached_input ?? value.cachedInputTokens ?? value.inputTokenDetails?.cacheReadTokens ?? cache.read,
     ),
-    cache_write: safeNumber(value.cache_write ?? value.inputTokenDetails?.cacheWriteTokens ?? cache.write),
-    total: safeNumber(value.total ?? value.totalTokens),
-    cost: safeNumber(value.cost),
-  }
+    cache_write: finiteTokenMetric(value.cache_write ?? value.inputTokenDetails?.cacheWriteTokens ?? cache.write),
+    total: finiteTokenMetric(value.total ?? value.totalTokens),
+    cost: finiteTokenMetric(value.cost),
+  }) as TraceTokenUsage
 }
 
 function mergeUsage(target: TraceTokenUsage, next: TraceTokenUsage) {
-  target.input = safeNumber(target.input) + safeNumber(next.input)
-  target.output = safeNumber(target.output) + safeNumber(next.output)
-  target.reasoning = safeNumber(target.reasoning) + safeNumber(next.reasoning)
-  target.cached_input = safeNumber(target.cached_input) + safeNumber(next.cached_input)
-  target.cache_write = safeNumber(target.cache_write) + safeNumber(next.cache_write)
-  target.total = safeNumber(target.total) + safeNumber(next.total)
-  target.cost = safeNumber(target.cost) + safeNumber(next.cost)
+  for (const key of tokenUsageFields) {
+    const value = finiteTokenMetric(next[key])
+    if (value !== undefined) target[key] = (finiteTokenMetric(target[key]) ?? 0) + value
+  }
 }
 
 function cloneTokenUsage(input: TraceTokenUsage | undefined): TraceTokenUsage | undefined {
   if (!input) return undefined
-  return {
-    input: safeNumber(input.input),
-    output: safeNumber(input.output),
-    reasoning: safeNumber(input.reasoning),
-    cached_input: safeNumber(input.cached_input),
-    cache_write: safeNumber(input.cache_write),
-    total: safeNumber(input.total),
-    cost: safeNumber(input.cost),
-  }
+  return sanitizeTokenUsage(input) as TraceTokenUsage
 }
 
 function stringField(input: Record<string, unknown>, keys: string[]) {
@@ -2943,6 +2962,32 @@ function toolOutcomeMatchAnalysis(
 
 function dedupeStrings(input: string[]) {
   return input.filter((item, index, array) => array.indexOf(item) === index)
+}
+
+function typedCausalRef(input: string): CausalIRRef {
+  const separator = input.indexOf(":")
+  const type = separator === -1 ? "external" : input.slice(0, separator)
+  const id = separator === -1 ? input : input.slice(separator + 1)
+  const refType: CausalIRRef["ref_type"] =
+    type === "artifact"
+      ? "artifact"
+      : type === "raw_event" || type === "event"
+        ? "raw_event"
+        : ["external", "file", "path", "uri", "url"].includes(type)
+          ? "external"
+          : "node"
+  return { ref_type: refType, ref_id: id, legacy_ref: input }
+}
+
+function deterministicDerivation(algorithm: string, inputRefs: string[], derivedAt: string): CausalIRDerivation {
+  return {
+    algorithm,
+    algorithm_version: "1.0.0",
+    derived_at: derivedAt,
+    input_refs: inputRefs.map(typedCausalRef),
+    rule_id: `${algorithm}:1.0.0`,
+    reproducible: true,
+  }
 }
 
 function stringPreview(input: unknown, limit = 400) {
@@ -5342,7 +5387,7 @@ class ActiveCaseTrace {
   }
 
   decision(input: SemanticDecisionInput) {
-    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const decision: TraceSemanticDecision = {
       decision_id: input.decision_id ?? semanticID("dec", this.semanticDecisions.length + 1),
       span_id: input.span_id,
@@ -6276,12 +6321,26 @@ class ActiveCaseTrace {
         generation_provenance_refs: generationProvenanceRefs,
       }),
     }
+    const responseNodeID =
+      input.metadata && typeof input.metadata.response_node_id === "string"
+        ? input.metadata.response_node_id
+        : undefined
+    const derivationInputRefs = dedupeStrings([
+      ...(responseNodeID ? [`node:${responseNodeID}`] : []),
+      ...(claim.response_segment_id ? [`response_segment:${claim.response_segment_id}`] : []),
+      ...attributionSourceRefs,
+    ])
+    if (!derivationInputRefs.length) derivationInputRefs.push(`external:response_claim_input:${claim.claim_id}`)
+    const derivedAt = nowIso()
     const node = this.node({
       node_id: `responseclaim_${claim.claim_id}`,
       kind: "response.claim",
       component: "result",
       title: `Response claim ${claim.claim_index}`,
       status: "success",
+      origin: "deterministic_derived",
+      input_refs: derivationInputRefs,
+      derivation: deterministicDerivation("response_claim_extraction", derivationInputRefs, derivedAt),
       data: {
         claim_id: claim.claim_id,
         response_segment_id: claim.response_segment_id,
@@ -6330,10 +6389,6 @@ class ActiveCaseTrace {
         ...recentToolFailureRefs,
       ]),
     })
-    const responseNodeID =
-      input.metadata && typeof input.metadata.response_node_id === "string"
-        ? input.metadata.response_node_id
-        : undefined
     if (responseNodeID) {
       this.causalEdge({
         from: { type: "node", id: responseNodeID, label: "response.output" },
@@ -6383,12 +6438,25 @@ class ActiveCaseTrace {
         : []),
     ])
     const assessmentID = `claimsupport_${safeNodeIDPart(claim.claim_id)}`
+    const derivationInputRefs = dedupeStrings([
+      `response_claim:${claimNodeID}`,
+      ...claim.direct_evidence_refs,
+      ...(claim.conflicting_evidence_refs ?? []),
+      ...(claim.verification_after_test_change_refs ?? []),
+      ...allToolOutcomeRefs,
+      ...claim.context_refs,
+      ...claim.execution_refs,
+    ])
+    const derivedAt = nowIso()
     const node = this.node({
       node_id: assessmentID,
       kind: "claim.support_assessment",
       component: "result",
       title: `Claim support assessment ${claim.claim_index}`,
       status: "success",
+      origin: "deterministic_derived",
+      input_refs: derivationInputRefs,
+      derivation: deterministicDerivation("claim_support_assessment", derivationInputRefs, derivedAt),
       data: {
         assessment_id: assessmentID,
         claim_id: claim.claim_id,
@@ -6419,15 +6487,7 @@ class ActiveCaseTrace {
         match_reasons: claim.match_reasons,
         attribution_summary: claim.attribution_summary,
       },
-      source_refs: dedupeStrings([
-        `response_claim:${claimNodeID}`,
-        ...claim.direct_evidence_refs,
-        ...(claim.conflicting_evidence_refs ?? []),
-        ...(claim.verification_after_test_change_refs ?? []),
-        ...allToolOutcomeRefs,
-        ...claim.context_refs,
-        ...claim.execution_refs,
-      ]),
+      source_refs: derivationInputRefs,
       source_locations: claim.source_locations,
       temporal_advisory_refs: toolFailureContextRefs,
     })
@@ -7014,23 +7074,32 @@ class ActiveCaseTrace {
   }
 
   node(input: CausalNodeInput) {
+    const requestedSourceRefs = input.source_refs ?? input.evidence_refs
+    const sourceRefs =
+      requestedSourceRefs?.some((ref) => ref.startsWith("recent_")) || this.temporalSourceRefs(requestedSourceRefs).length
+        ? this.normalizeSourceRefs(requestedSourceRefs)
+        : requestedSourceRefs
+    const timestamp = nowIso()
     const node: CausalNode = {
       node_id: input.node_id ?? semanticID("node", this.causalNodes.length + 1),
       kind: input.kind,
       component: input.component,
       span_id: input.span_id,
       parent_span_id: input.parent_span_id,
-      timestamp: nowIso(),
+      timestamp,
       time_ms: Math.max(0, Date.now() - this.startedAt),
       title: input.title,
       status: input.status,
+      origin: input.origin,
       input_refs: input.input_refs,
       output_refs: input.output_refs,
       data: input.data === undefined ? undefined : this.summarizeCausalObject(input.data, `${input.kind}.data`),
-      source_refs: input.source_refs ?? input.evidence_refs,
+      source_refs: sourceRefs,
       source_locations: input.source_locations,
       typed_resources: input.typed_resources,
       artifact_refs: [],
+      aliases: input.aliases,
+      derivation: input.derivation,
       metadata: input.metadata,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
@@ -7039,10 +7108,9 @@ class ActiveCaseTrace {
     if (stored.kind === "context.pack" || stored.kind === "context.transform")
       this.remember(this.recentContextNodeIDs, stored.node_id)
     if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
-    const requestedSourceRefs = input.source_refs ?? input.evidence_refs
     this.createTemporalAdvisoryEdges(stored, [
       ...(input.temporal_advisory_refs ?? []),
-      ...this.temporalSourceRefs(requestedSourceRefs),
+      ...this.temporalSourceRefs(sourceRefs),
     ])
     this.writePartial()
     return stored
@@ -7075,6 +7143,7 @@ class ActiveCaseTrace {
   }
 
   causalEdge(input: CausalEdgeInput) {
+    if (input.from.type.startsWith("recent_") || input.to.type.startsWith("recent_")) return undefined
     const edge: CausalEdgeInput & { edge_id: string } = {
       edge_id: input.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
       from: input.from,
@@ -7085,7 +7154,7 @@ class ActiveCaseTrace {
       evidence_tier: input.evidence_tier,
       eligible_for_attribution: input.eligible_for_attribution,
       derivation_method: input.derivation_method,
-      evidence_refs: input.evidence_refs,
+      evidence_refs: input.evidence_refs?.filter((ref) => !ref.startsWith("recent_")),
       confidence: input.confidence,
       label: input.label,
       metadata: input.metadata,
@@ -7178,7 +7247,7 @@ class ActiveCaseTrace {
   }
 
   compaction(input: CompactionRecordInput) {
-    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const contextLedger = traceContextLedger(input)
     const previousSummary =
       input.previous_summary === undefined
@@ -7490,13 +7559,19 @@ class ActiveCaseTrace {
       ...checkpointSummary,
       journal: this.causalIR.journalSummary(),
     }
-    const provenance = this.projectProvenanceSummary(causalIR)
-    this.causalIR.finalize(causalIR)
-    this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
+    const finalization = this.causalIR.finalize(causalIR)
+    const emittedCausalIR: CausalIRTraceSummary = finalization.committed
+      ? causalIR
+      : {
+          ...causalIR,
+          journal: this.causalIR.journalSummary(),
+        }
+    const provenance = this.projectProvenanceSummary(emittedCausalIR)
+    this.safeWrite(this.manifestFile, jsonPretty(emittedCausalIR.manifest))
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.safeWrite(this.traceFile, jsonPretty(causalIR))
+    this.safeWrite(this.traceFile, jsonPretty(emittedCausalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
-    this.writePartial(true, causalIR, false)
+    this.writePartial(true, emittedCausalIR, false)
   }
 
   flushForSignal(signal: NodeJS.Signals) {
@@ -8844,6 +8919,7 @@ class ActiveCaseTrace {
 
   private summarizeCausalValue(input: unknown, label: string): unknown {
     if (input === undefined) return undefined
+    if (isTokenUsageContainer(label.split(".").at(-1) ?? "")) return sanitizeTokenUsage(input)
     if (input === null) return null
     if (typeof input === "string") {
       if (input.length > maxFieldLength() && shouldExternalizeCausalContainer(label)) {
@@ -8912,11 +8988,16 @@ class ActiveCaseTrace {
 
   private normalizeSourceRefs(input: string[] | undefined) {
     const provided = input ?? []
+    const carriedTemporalRefs = this.temporalSourceRefs(input)
     const concreteProvided = dedupeStrings(provided.filter((item) => !item.startsWith("recent_")))
+    let temporalRefs = carriedTemporalRefs
     if (!provided.length || provided.some((item) => item.startsWith("recent_"))) {
-      const temporalRefs = this.currentSourceRefs().filter((ref) => !concreteProvided.includes(ref))
-      this.setTemporalSourceRefs(concreteProvided, temporalRefs)
+      temporalRefs = dedupeStrings([
+        ...carriedTemporalRefs,
+        ...this.currentSourceRefs().filter((ref) => !concreteProvided.includes(ref)),
+      ])
     }
+    if (temporalRefs.length) this.setTemporalSourceRefs(concreteProvided, temporalRefs)
     return concreteProvided
   }
 

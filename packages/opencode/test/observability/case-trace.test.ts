@@ -499,15 +499,69 @@ describe("case trace", () => {
     const compatibility = trace.records.find((item: any) => item.record_id === "node_refs")
     expect(canonical.scope.parent_span_id).toBe("span_parent")
     expect(canonical.input_refs).toEqual([
-      { ref_type: "node", ref_id: "call_1", legacy_ref: "tool_call:call_1" },
+      { ref_type: "external", ref_id: "call_1", legacy_ref: "tool_call:call_1" },
     ])
     expect(canonical.output_refs).toEqual([
-      { ref_type: "node", ref_id: "result_1", legacy_ref: "tool_result:result_1" },
+      { ref_type: "external", ref_id: "result_1", legacy_ref: "tool_result:result_1" },
     ])
     expect(compatibility).toMatchObject({
       parent_span_id: "span_parent",
       input_refs: ["tool_call:call_1"],
       output_refs: ["tool_result:result_1"],
+    })
+  })
+
+  test("resolves real tool call and result endpoints without a canonical self-loop", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-canonical-tool-identities-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "canonical-tool-identities.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { callID: "shared_call", tool: "read", input: { path: "src/pricing.ts" } } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { callID: "shared_call", tool: "read", output: { content: "pricing owner is billing" } } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "canonical-tool-identities-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "canonical-tool-identities-case", "trace.json"), "utf8"),
+    ) as any
+    const call = trace.nodes.find((item: any) => item.kind === "tool.call" && item.scope.call_id === "shared_call")
+    const result = trace.nodes.find((item: any) => item.kind === "tool.result" && item.scope.call_id === "shared_call")
+    const canonicalEdge = trace.edges.find(
+      (item: any) =>
+        item.from?.legacy_ref === "tool_call:shared_call" && item.to?.legacy_ref === "tool_result:shared_call",
+    )
+    const compatibilityEdge = trace.dataflow_edges.find((item: any) => item.edge_id === canonicalEdge?.edge_id)
+
+    expect(call.aliases).toContain("tool_call:shared_call")
+    expect(result.aliases).toContain("tool_result:shared_call")
+    expect(canonicalEdge).toMatchObject({
+      from: { ref_type: "node", ref_id: call.node_id, legacy_ref: "tool_call:shared_call" },
+      to: { ref_type: "node", ref_id: result.node_id, legacy_ref: "tool_result:shared_call" },
+    })
+    expect(canonicalEdge.from.ref_id).not.toBe(canonicalEdge.to.ref_id)
+    expect(compatibilityEdge).toMatchObject({
+      from: { type: "tool_call", id: "shared_call" },
+      to: { type: "tool_result", id: "shared_call" },
     })
   })
 
@@ -522,6 +576,11 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing owner is billing", data: { subject: "pricing", predicate: "owner", value: "billing" }, source_refs: [] })`,
+        `CaseTrace.decision({ decision_id: "temporal_decision", component: "processor", decision_type: "tool_selection", intent: "inspect pricing owner", chosen_action: "read", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.promptAssembly({ stage: "temporal_prompt", session_id: "ses_temporal", input: { text: "inspect pricing owner" }, source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.contextTransform({ stage: "temporal_transform", session_id: "ses_temporal", message_id: "msg_temporal", step: 1, input: { text: "inspect pricing owner" }, output: { text: "inspect pricing owner" }, source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.compactionCheck({ check_id: "temporal_compaction", session_id: "ses_temporal", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.compaction({ trigger: "auto", session_id: "ses_temporal", output_summary: "pricing owner remains billing", result: "success", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.responseOutput({ segment_id: "temporal_response", text: "Pricing owner is billing.", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.exitGate({ gate_id: "temporal_gate", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "response complete", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.finish({ status: "success" })`,
@@ -548,6 +607,19 @@ describe("case trace", () => {
       (item: any) => item.event_type === "response.output" && item.data.segment_id === "temporal_response",
     )
     const exitGate = trace.records.find((item: any) => item.event_type === "exit.gate")
+    const policyTargets = [
+      trace.records.find((item: any) => item.event_type === "decision" && item.data.decision_id === "temporal_decision"),
+      trace.records.find((item: any) => item.event_type === "prompt.assembly" && item.data.stage === "temporal_prompt"),
+      trace.records.find((item: any) => item.event_type === "context.transform" && item.data.stage === "temporal_transform"),
+      trace.records.find(
+        (item: any) => item.event_type === "context.compaction_check" && item.data.check_id === "temporal_compaction",
+      ),
+      trace.records.find(
+        (item: any) => item.event_type === "context.compaction" && item.data.trigger === "auto",
+      ),
+      response,
+      exitGate,
+    ]
     const advisory = trace.edges.find(
       (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === response.record_id,
     )
@@ -574,6 +646,85 @@ describe("case trace", () => {
       eligible_for_attribution: false,
       derivation_method: "recent_source_fallback",
     })
+    expect(policyTargets.every(Boolean)).toBe(true)
+    for (const target of policyTargets) {
+      expect(target.source_refs ?? []).not.toContain("recent_evidence_records")
+      expect(target.source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
+      const fallbackEdges = trace.edges.filter(
+        (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === target.record_id,
+      )
+      expect(fallbackEdges).not.toHaveLength(0)
+      expect(
+        fallbackEdges.every(
+          (item: any) =>
+            item.evidence_tier === "temporal_advisory" &&
+            item.eligible_for_attribution === false &&
+            item.derivation_method === "recent_source_fallback",
+        ),
+      ).toBe(true)
+    }
+    const compaction = policyTargets.find((item: any) => item.event_type === "context.compaction")
+    expect(JSON.stringify(compaction.data.before_context_refs)).not.toContain("recent_")
+    for (const node of trace.nodes) {
+      for (const field of ["input_refs", "output_refs", "source_refs"])
+        expect((node[field] ?? []).some((ref: any) => ref.legacy_ref?.startsWith("recent_"))).toBe(false)
+    }
+  })
+
+  test("marks response claims and support assessments as reproducible deterministic derivations", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-derived-response-facts-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "derived-response-facts.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing owner is billing", data: { subject: "pricing", predicate: "owner", value: "billing" }, source_refs: [] })`,
+        `CaseTrace.responseOutput({ segment_id: "derived_response", text: "Pricing owner is billing.", source_refs: fact ? ["evidence:" + fact.node_id] : [] })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "derived-response-facts-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "derived-response-facts-case", "trace.json"), "utf8"),
+    ) as any
+    const derived = trace.nodes.filter(
+      (item: any) => item.kind === "response.claim" || item.kind === "claim.support_assessment",
+    )
+
+    expect(derived.map((item: any) => item.kind)).toEqual(
+      expect.arrayContaining(["response.claim", "claim.support_assessment"]),
+    )
+    for (const node of derived) {
+      expect(node.origin).toBe("deterministic_derived")
+      expect(node.input_refs.length).toBeGreaterThan(0)
+      expect(node.input_refs.every((ref: any) => typeof ref.ref_type === "string" && typeof ref.ref_id === "string")).toBe(
+        true,
+      )
+      expect(node.derivation).toMatchObject({
+        algorithm: expect.any(String),
+        algorithm_version: expect.any(String),
+        derived_at: expect.any(String),
+        reproducible: true,
+      })
+      expect(node.derivation.input_refs).toEqual(node.input_refs)
+    }
   })
 
   test("links response generation provenance back to LLM, message transform, and context nodes", async () => {
@@ -5247,11 +5398,17 @@ describe("case trace", () => {
       accessToken: "sensitive-access-token",
       plainToken: "plain-token-string-secret",
       tokenUsageString: "token-usage-string-secret",
+      tokenUsageOutput: "token-usage-output-secret",
+      tokenUsageExtra: "token-usage-extra-secret",
       tokenEstimateString: "token-estimate-string-secret",
       quotedJsonToken: "quoted-json-token-secret",
       quotedJsonApiKey: "quoted-json-api-key-secret",
       headerSecret: "header-credential-secret",
       shellSecret: "shell-credential-secret",
+      authorizationAssignment: "authorization-assignment-secret",
+      cookieSession: "cookie-session-secret",
+      cookieRefresh: "cookie-refresh-secret",
+      cookieError: "cookie-error-secret",
       stringUrlPassword: "string-url-password-secret",
       stringUrlToken: "string-url-token-secret",
       errorHeaderSecret: "error-header-secret",
@@ -5267,13 +5424,16 @@ describe("case trace", () => {
         `const secrets = ${JSON.stringify(secrets)}`,
         `const error = new Error("request failed with " + secrets.errorText)`,
         `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
-        `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, shell: "TOKEN=" + secrets.shellSecret + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("X-API-Key: " + secrets.errorHeaderSecret) }`,
+        `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, cookie_header: "Cookie: session=" + secrets.cookieSession + "; refresh=" + secrets.cookieRefresh + "; Path=/", shell: "TOKEN=" + secrets.shellSecret + " AUTHORIZATION=" + secrets.authorizationAssignment + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("Cookie: session=" + secrets.cookieError + "; Path=/audit") }`,
         `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
         `const agentInput = { role: "build", error, endpoint, textSecrets }`,
         `const modelInput = { messages: ["inspect"], error, endpoint }`,
-        `const toolInput = { command: "inspect", environment, error, endpoint, token_usage: { input: 11, output: 7, total: 18 } }`,
+        `const unsafeTokenUsage = { input: 11, output: secrets.tokenUsageOutput, total: 18, provider_note: secrets.tokenUsageExtra, arbitrary_numeric: 42 }`,
+        `const toolInput = { command: "inspect", environment, error, endpoint, token_usage: unsafeTokenUsage }`,
         `const toolOutput = { result: "ok", environment, error, endpoint, tokens: 18 }`,
         `CaseTrace.configure({ input: { task: "audit sensitive journal", agentInput, modelInput }, environment })`,
+        `CaseTrace.node({ node_id: "token_usage_policy", kind: "execution.observation", component: "runtime", data: { marker: "token_usage_policy", token_usage: unsafeTokenUsage } })`,
+        `CaseTrace.node({ node_id: "undefined_token_usage_policy", kind: "execution.observation", component: "runtime", data: { marker: "undefined_token_usage_policy", token_usage: undefined } })`,
         `const modelSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "generate", name: "audit-model", input: modelInput })`,
         `modelSpan?.end({ output: modelInput })`,
         `const span = CaseTrace.get()?.startSpan({ component: "tool", operation: "execute", name: "inspect", input: toolInput, metadata: { environment } })`,
@@ -5282,7 +5442,7 @@ describe("case trace", () => {
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
         `CaseTrace.finish({ status: "success", result: { environment } })`,
-        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
+        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, cookie_header: textSecrets.cookie_header, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
       ].join("\n"),
     )
 
@@ -5323,9 +5483,10 @@ describe("case trace", () => {
         token_estimate: secrets.tokenEstimateString,
         quoted_json: `{"token":"${secrets.quotedJsonToken}","apiKey":"${secrets.quotedJsonApiKey}"}`,
         header: `Authorization: Basic ${secrets.headerSecret}\nX-API-Key: ${secrets.headerSecret}`,
-        shell: `TOKEN=${secrets.shellSecret} --password ${secrets.shellSecret}`,
+        cookie_header: `Cookie: session=${secrets.cookieSession}; refresh=${secrets.cookieRefresh}; Path=/`,
+        shell: `TOKEN=${secrets.shellSecret} AUTHORIZATION=${secrets.authorizationAssignment} --password ${secrets.shellSecret}`,
         url: `https://reader:${secrets.stringUrlPassword}@example.com/audit?token=${secrets.stringUrlToken}`,
-        error: `X-API-Key: ${secrets.errorHeaderSecret}`,
+        error: `Cookie: session=${secrets.cookieError}; Path=/audit`,
       },
     })
     expect(originals.modelInput).toEqual({ messages: ["inspect"], error: originalError, endpoint: originalEndpoint })
@@ -5333,10 +5494,22 @@ describe("case trace", () => {
       command: "inspect",
       error: originalError,
       endpoint: originalEndpoint,
-      token_usage: { input: 11, output: 7, total: 18 },
+      token_usage: {
+        input: 11,
+        output: secrets.tokenUsageOutput,
+        total: 18,
+        provider_note: secrets.tokenUsageExtra,
+        arbitrary_numeric: 42,
+      },
     })
     expect(originals.toolOutput).toEqual({ result: "ok", error: originalError, endpoint: originalEndpoint, tokens: 18 })
-    expect(originals.toolInput.token_usage).toEqual({ input: 11, output: 7, total: 18 })
+    expect(originals.toolInput.token_usage).toEqual({
+      input: 11,
+      output: secrets.tokenUsageOutput,
+      total: 18,
+      provider_note: secrets.tokenUsageExtra,
+      arbitrary_numeric: 42,
+    })
     expect(originals.toolOutput.tokens).toBe(18)
 
     const caseDir = path.join(dir, "sensitive-journal-case")
@@ -5346,6 +5519,8 @@ describe("case trace", () => {
       .split("\n")
       .map((line) => JSON.parse(line))
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const tokenUsagePolicy = trace.nodes.find((item: any) => item.node_id === "token_usage_policy")
+    const undefinedTokenUsagePolicy = trace.nodes.find((item: any) => item.node_id === "undefined_token_usage_policy")
     const artifactDir = path.join(caseDir, "artifacts", "sha256")
     const artifactFiles = await fs.readdir(artifactDir)
     const persistedText = await Promise.all(
@@ -5380,6 +5555,8 @@ describe("case trace", () => {
     expect(replayed.edges).toEqual(trace.edges)
     expect(replayed.artifacts).toEqual(trace.artifacts)
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
+    expect(tokenUsagePolicy.payload.token_usage).toEqual({ input: 11, total: 18 })
+    expect(undefinedTokenUsagePolicy.payload).not.toHaveProperty("token_usage")
     const leakedSecrets = Object.values(secrets).filter((secret) => persistedText.some((text) => text.includes(secret)))
     expect(leakedSecrets).toEqual([])
     expect(recordsText).toContain('"apiKey":"[REDACTED]"')
@@ -6364,6 +6541,70 @@ describe("case trace", () => {
     })
     assertJournalReplaysCanonicalTrace(journal, partial)
     assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, partial)
+  })
+
+  test("persists poisoned journal semantics when only the finalization append fails", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-finalization-append-failure-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "finalization-append-failure.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const result = { answer: "agent result survives finalization append failure", exit_code: 0 }`,
+        `CaseTrace.node({ node_id: "before_finalization_failure", kind: "execution.observation", component: "runtime", data: { status: "ready" } })`,
+        `const trace = CaseTrace.get() as any`,
+        `const durableAppend = trace.writeCausalIRRecord.bind(trace)`,
+        `trace.writeCausalIRRecord = (entry: any) => entry.operation === "case.finalized" ? false : durableAppend(entry)`,
+        `CaseTrace.finish({ status: "success", result })`,
+        `process.stdout.write(JSON.stringify(result))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "finalization-append-failure-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({
+      answer: "agent result survives finalization append failure",
+      exit_code: 0,
+    })
+
+    const caseDir = path.join(dir, "finalization-append-failure-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(caseDir)
+    const replayTrace = (CausalIRModule as any).replayCausalIRTrace(journal)
+
+    assertCausalIRJournalAudit(journal)
+    expect(journal.some((entry: any) => entry.operation === "case.finalized")).toBe(false)
+    expect(trace.journal).toMatchObject({
+      entry_count: journal.length,
+      last_sequence: journal.at(-1)?.sequence,
+      last_payload_hash: journal.at(-1)?.payload_hash,
+      poisoned: true,
+    })
+    expect(partial.journal).toEqual(trace.journal)
+    expect(replayTrace).toBeDefined()
+    expect(replayTrace).not.toEqual(trace)
+    expect(replayTrace.journal.poisoned).toBe(false)
+    expect(replayCausalIRJournal(journal)).toMatchObject({
+      nodes: trace.nodes,
+      edges: trace.edges,
+      artifacts: trace.artifacts,
+      diagnostics: trace.diagnostics,
+    })
   })
 
   test("persists and renders design records", async () => {
