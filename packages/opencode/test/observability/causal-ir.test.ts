@@ -386,6 +386,96 @@ describe("causal IR store", () => {
     })
   })
 
+  test("strips temporal selectors recursively from canonical and compatibility ref fields", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_temporal_boundary",
+      caseID: "case_temporal_boundary",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("source_node"))
+    store.createNode({
+      ...node("generic_temporal", {
+        nested: {
+          input_refs: ["recent_evidence_records", "node:source_node"],
+          evidence_refs: ["recent_verification_records", "node:source_node"],
+          payload_refs: ["recent_tool_results", "artifact:artifact_1"],
+          compatibility_refs: {
+            primary: "recent_evidence_records",
+            concrete: "node:source_node",
+          },
+          typed_refs: [
+            {
+              ref_type: "external",
+              ref_id: "recent_change_records",
+              legacy_ref: "recent_change_records",
+            },
+            { ref_type: "node", ref_id: "source_node", legacy_ref: "node:source_node" },
+          ],
+        },
+      }),
+      input_refs: ["recent_evidence_records", "node:source_node"],
+      output_refs: ["recent_change_records", "external:result"],
+      source_refs: ["recent_tool_results"],
+      metadata: {
+        nested: {
+          source_refs: ["recent_evidence_records", "node:source_node"],
+        },
+      },
+    })
+    store.createEdge({
+      edge_id: "edge_temporal_boundary",
+      from: { type: "node", id: "source_node" },
+      to: { type: "node", id: "generic_temporal" },
+      relation: "derived_from",
+      evidence_refs: ["recent_evidence_records", "node:source_node"],
+    })
+
+    const snapshot = store.snapshot()
+    const generic = snapshot.nodes.find((item) => item.node_id === "generic_temporal")!
+    const canonicalEdge = snapshot.edges.find((item) => item.edge_id === "edge_temporal_boundary")!
+    const projection = projectProvenanceTrace(snapshot, {
+      traceVersion: "6.0",
+      manifest: { case_id: "case_temporal_boundary", run_id: "run_temporal_boundary" },
+      metrics: { token_usage: {}, trace_health: { issues: [] } },
+    })
+    const selectors = [
+      "recent_evidence_records",
+      "recent_verification_records",
+      "recent_tool_results",
+      "recent_change_records",
+    ]
+
+    for (const selector of selectors) {
+      expect(JSON.stringify(snapshot)).not.toContain(selector)
+      expect(JSON.stringify(journal)).not.toContain(selector)
+      expect(JSON.stringify(projection)).not.toContain(selector)
+    }
+    expect(generic.input_refs).toEqual([{ ref_type: "node", ref_id: "source_node", legacy_ref: "node:source_node" }])
+    expect(generic.output_refs).toEqual([{ ref_type: "external", ref_id: "result", legacy_ref: "external:result" }])
+    expect(generic.source_refs).toEqual([])
+    expect(generic.legacy_input_refs).toEqual(["node:source_node"])
+    expect((generic.payload.nested as any).input_refs).toEqual(["node:source_node"])
+    expect((generic.payload.nested as any).typed_refs).toEqual([
+      { ref_type: "node", ref_id: "source_node", legacy_ref: "node:source_node" },
+    ])
+    expect((generic.payload.nested as any).compatibility_refs).toEqual({ concrete: "node:source_node" })
+    expect(canonicalEdge.evidence_refs).toEqual([
+      { ref_type: "node", ref_id: "source_node", legacy_ref: "node:source_node" },
+    ])
+
+    const rejected = new CausalIRStore({ runID: "run_temporal_endpoint", caseID: "case_temporal_endpoint" })
+    expect(() =>
+      rejected.createEdge({
+        edge_id: "edge_temporal_endpoint",
+        from: { type: "node", id: "recent_evidence_records" },
+        to: { type: "external", id: "result" },
+        relation: "derived_from",
+      }),
+    ).toThrow(/temporal selector/)
+    expect(rejected.edges).toEqual([])
+  })
+
   test("resolves legacy endpoint aliases to distinct canonical node identities", () => {
     const store = new CausalIRStore({ runID: "run_alias", caseID: "case_alias" })
     store.createNode({
@@ -467,6 +557,169 @@ describe("causal IR store", () => {
     })
   })
 
+  test("journals late alias reconciliation so every durable prefix replays the live snapshot", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_late_alias",
+      caseID: "case_late_alias",
+      append: (entry) => journal.push(entry),
+    })
+    store.createEdge({
+      edge_id: "edge_late_alias",
+      from: { type: "verification", id: "late_verification" },
+      to: { type: "external", id: "result" },
+      relation: "derived_from",
+    })
+    const originalEdgeEntry = journal.find((entry) => entry.operation === "edge.created")!
+    const beforeResolution = journal.length
+
+    store.createNode({
+      ...node("verification_node"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "late_verification" },
+    })
+
+    const snapshot = store.snapshot()
+    const reconciliation = journal.slice(beforeResolution)
+    const reconciledEdgeEntry = reconciliation.find(
+      (entry) => entry.operation === "edge.created" && entry.entity_id === "edge_late_alias",
+    )
+    expect(snapshot.edges[0]?.from).toEqual({
+      ref_type: "node",
+      ref_id: "verification_node",
+      legacy_ref: "verification:late_verification",
+    })
+    expect(snapshot.diagnostics.some((item) => item.kind === "unresolved_ref")).toBe(false)
+    expect(reconciledEdgeEntry).toMatchObject({
+      operation: "edge.created",
+      record_type: "edge",
+      previous_payload_hash: originalEdgeEntry.payload_hash,
+    })
+    expect(reconciledEdgeEntry?.payload_hash).toMatch(/^[a-f0-9]{64}$/)
+    expect(replayCausalIRJournal(journal)).toEqual(snapshot)
+
+    const recordTypes: Record<CausalIRJournalEntry["operation"], string> = {
+      "node.created": "node",
+      "node.updated": "node.update",
+      "edge.created": "edge",
+      "artifact.created": "artifact",
+      "artifact.reused": "artifact.reuse",
+      "diagnostic.created": "diagnostic",
+      "case.checkpointed": "checkpoint",
+      "case.finalized": "finish",
+    }
+    for (const [index, entry] of journal.entries()) {
+      expect(entry.sequence).toBe(index + 1)
+      expect(entry.record_type).toBe(recordTypes[entry.operation])
+      expect(entry.payload_hash).toBe(payloadHashForAudit(entry.data))
+    }
+  })
+
+  test("chains alias-reconciled edge hashes through node replacement checkpoints", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_alias_checkpoint_hash",
+      caseID: "case_alias_checkpoint_hash",
+      append: (entry) => journal.push(entry),
+    })
+    store.createEdge({
+      edge_id: "edge_alias_checkpoint_hash",
+      from: { type: "verification", id: "checkpoint_verification" },
+      to: { type: "external", id: "result" },
+      relation: "derived_from",
+    })
+    store.replaceNodes([
+      {
+        ...node("checkpoint_owner"),
+        kind: "verification",
+        component: "tool",
+        data: { verification_id: "checkpoint_verification" },
+      },
+    ])
+    const checkpoint = journal.find((entry) => entry.operation === "case.checkpointed")!
+    const checkpointEdge = (checkpoint.data as any).snapshot.edges[0]
+
+    store.updateNode({
+      ...node("checkpoint_owner"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "replacement_verification" },
+    })
+
+    const reconciledEdge = journal
+      .filter((entry) => entry.operation === "edge.created" && entry.entity_id === "edge_alias_checkpoint_hash")
+      .at(-1)!
+    expect(reconciledEdge.previous_payload_hash).toBe(payloadHashForAudit(checkpointEdge))
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+  })
+
+  test("keeps collided aliases external until one durable owner remains", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_alias_collision",
+      caseID: "case_alias_collision",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode({
+      ...node("verification_owner_a"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "shared_verification" },
+    })
+    store.createNode({
+      ...node("verification_owner_b"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "shared_verification" },
+    })
+    store.createEdge({
+      edge_id: "edge_ambiguous_alias",
+      from: { type: "verification", id: "shared_verification" },
+      to: { type: "external", id: "result" },
+      relation: "derived_from",
+    })
+
+    const ambiguous = store.snapshot()
+    const collision = ambiguous.diagnostics.filter((item) => item.kind === "alias_collision")
+    expect(ambiguous.edges[0]?.from).toEqual({
+      ref_type: "external",
+      ref_id: "shared_verification",
+      legacy_ref: "verification:shared_verification",
+    })
+    expect(collision).toEqual([
+      expect.objectContaining({
+        diagnostic_id: expect.stringMatching(/^alias_collision:/),
+        alias: "verification:shared_verification",
+        owner_ids: ["verification_owner_a", "verification_owner_b"],
+      }),
+    ])
+    expect(ambiguous.diagnostics).toContainEqual(
+      expect.objectContaining({ kind: "unresolved_ref", edge_id: "edge_ambiguous_alias" }),
+    )
+    expect(store.snapshot().diagnostics.filter((item) => item.kind === "alias_collision")).toEqual(collision)
+
+    store.updateNode({
+      ...node("verification_owner_b"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "unique_verification" },
+    })
+
+    const resolved = store.snapshot()
+    expect(resolved.edges[0]?.from).toEqual({
+      ref_type: "node",
+      ref_id: "verification_owner_a",
+      legacy_ref: "verification:shared_verification",
+    })
+    expect(resolved.diagnostics.some((item) => item.kind === "alias_collision")).toBe(false)
+    expect(resolved.diagnostics.some((item) => item.kind === "unresolved_ref")).toBe(false)
+    expect(
+      journal.some((entry) => entry.operation === "edge.created" && entry.entity_id === "edge_ambiguous_alias"),
+    ).toBe(true)
+    expect(replayCausalIRJournal(journal)).toEqual(resolved)
+  })
+
   test("rejects invalid derived provenance and accepts typed reproducible inputs", () => {
     const store = new CausalIRStore({ runID: "run_derivation", caseID: "case_derivation" })
     store.createNode(node("observed_input"))
@@ -522,6 +775,102 @@ describe("causal IR store", () => {
         reproducible: true,
       },
     })
+  })
+
+  test("requires canonically equal non-empty and valid derived input ref sets", () => {
+    const makeStore = () => {
+      const store = new CausalIRStore({ runID: "run_strict_derivation", caseID: "case_strict_derivation" })
+      store.createNode(node("observed_input"))
+      return store
+    }
+    const derived = (
+      nodeID: string,
+      inputRefs: string[],
+      derivationRefs: Array<{
+        ref_type: "node" | "artifact" | "external"
+        ref_id: string
+        legacy_ref?: string
+      }>,
+    ) => ({
+      ...node(nodeID),
+      origin: "deterministic_derived" as const,
+      input_refs: inputRefs,
+      derivation: {
+        algorithm: "strict_fixture",
+        algorithm_version: "1.0.0",
+        derived_at: "2026-07-15T00:00:00.000Z",
+        input_refs: derivationRefs,
+        reproducible: true,
+      },
+    })
+
+    expect(() =>
+      makeStore().createNode(derived("derived_empty_input", [""], [{ ref_type: "external", ref_id: "contract" }])),
+    ).toThrow(/valid non-empty input refs/)
+    expect(() =>
+      makeStore().createNode(
+        derived("derived_mismatch", ["node:observed_input"], [{ ref_type: "external", ref_id: "different_input" }]),
+      ),
+    ).toThrow(/canonically match/)
+    expect(() =>
+      makeStore().createNode(
+        derived(
+          "derived_missing_node",
+          ["node:missing_input"],
+          [{ ref_type: "node", ref_id: "missing_input", legacy_ref: "node:missing_input" }],
+        ),
+      ),
+    ).toThrow(/existing node/)
+    expect(() =>
+      makeStore().createNode(
+        derived(
+          "derived_missing_artifact",
+          ["artifact:missing_artifact"],
+          [{ ref_type: "artifact", ref_id: "missing_artifact", legacy_ref: "artifact:missing_artifact" }],
+        ),
+      ),
+    ).toThrow(/existing artifact/)
+
+    const store = makeStore()
+    store.createArtifact({ artifact_id: "artifact_derived", hash: "hash_derived", path: "artifact.json" })
+    store.createNode(
+      derived(
+        "derived_valid",
+        ["decision:observed_input", "decision:observed_input", "artifact:artifact_derived", "external:contract"],
+        [
+          { ref_type: "node", ref_id: "observed_input", legacy_ref: "node:observed_input" },
+          { ref_type: "artifact", ref_id: "artifact_derived", legacy_ref: "artifact:artifact_derived" },
+          { ref_type: "external", ref_id: "contract", legacy_ref: "external:contract" },
+        ],
+      ),
+    )
+    const valid = store.snapshot().nodes.find((item) => item.node_id === "derived_valid")!
+    expect(valid.input_refs).toEqual(valid.derivation!.input_refs)
+    expect(valid.input_refs).toHaveLength(3)
+  })
+
+  test("validates replacement-derived refs against the replacement graph", () => {
+    const derived = (nodeID: string, inputID: string) => ({
+      ...node(nodeID),
+      origin: "deterministic_derived" as const,
+      input_refs: [`node:${inputID}`],
+      derivation: {
+        algorithm: "replacement_fixture",
+        algorithm_version: "1.0.0",
+        derived_at: "2026-07-15T00:00:00.000Z",
+        input_refs: [{ ref_type: "node" as const, ref_id: inputID, legacy_ref: `node:${inputID}` }],
+        reproducible: true,
+      },
+    })
+    const store = new CausalIRStore({ runID: "run_replace_validation", caseID: "case_replace_validation" })
+    store.createNode(node("old_input"))
+
+    expect(() => store.replaceNodes([node("replacement_input"), derived("replacement_output", "replacement_input")])).not.toThrow()
+    expect(store.snapshot().nodes.map((item) => item.node_id)).toEqual(["replacement_input", "replacement_output"])
+
+    const staleStore = new CausalIRStore({ runID: "run_replace_stale", caseID: "case_replace_stale" })
+    staleStore.createNode(node("old_input"))
+    expect(() => staleStore.replaceNodes([derived("stale_output", "old_input")])).toThrow(/existing node/)
   })
 
   test("poisons journal appends without advancing committed sequence or hashes", () => {
@@ -607,6 +956,72 @@ describe("causal IR store", () => {
     store.createEdge(relationEdge("edge_new", "produced"))
 
     expect(existingEdgeReads).toBeLessThan(8)
+  })
+
+  test("creates and updates nodes without scanning unrelated nodes edges or diagnostics", () => {
+    const store = new CausalIRStore({ runID: "run_incremental_alias", caseID: "case_incremental_alias" })
+    for (let index = 0; index < 64; index++) store.createNode(node(`existing_node_${index}`))
+    for (let index = 0; index < 64; index++) {
+      store.createEdge({
+        edge_id: `unresolved_edge_${index}`,
+        from: { type: "verification", id: `late_alias_${index}` },
+        to: { type: "external", id: `target_${index}` },
+        relation: "derived_from",
+      })
+    }
+
+    let nodeReads = 0
+    let edgeReads = 0
+    let diagnosticReads = 0
+    for (let index = 0; index < store.nodes.length; index++) {
+      store.nodes[index] = new Proxy(store.nodes[index]!, {
+        get(target, property, receiver) {
+          nodeReads += 1
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    }
+    for (let index = 0; index < store.edges.length; index++) {
+      store.edges[index] = new Proxy(store.edges[index]!, {
+        get(target, property, receiver) {
+          edgeReads += 1
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    }
+    for (let index = 0; index < store.diagnostics.length; index++) {
+      store.diagnostics[index] = new Proxy(store.diagnostics[index]!, {
+        get(target, property, receiver) {
+          diagnosticReads += 1
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    }
+
+    store.createNode({
+      ...node("late_owner"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "late_alias_31" },
+    })
+
+    expect(nodeReads).toBeLessThan(20)
+    expect(edgeReads).toBeLessThan(48)
+    expect(diagnosticReads).toBeLessThan(48)
+
+    nodeReads = 0
+    edgeReads = 0
+    diagnosticReads = 0
+    store.updateNode({
+      ...node("late_owner"),
+      kind: "verification",
+      component: "tool",
+      data: { verification_id: "late_alias_unique" },
+    })
+
+    expect(nodeReads).toBeLessThan(20)
+    expect(edgeReads).toBeLessThan(48)
+    expect(diagnosticReads).toBeLessThan(48)
   })
 
   test("exports a full canonical trace replay API", () => {

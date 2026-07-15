@@ -576,11 +576,18 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing owner is billing", data: { subject: "pricing", predicate: "owner", value: "billing" }, source_refs: [] })`,
-        `CaseTrace.decision({ decision_id: "temporal_decision", component: "processor", decision_type: "tool_selection", intent: "inspect pricing owner", chosen_action: "read", source_refs: ["recent_evidence_records"] })`,
-        `CaseTrace.promptAssembly({ stage: "temporal_prompt", session_id: "ses_temporal", input: { text: "inspect pricing owner" }, source_refs: ["recent_evidence_records"] })`,
-        `CaseTrace.contextTransform({ stage: "temporal_transform", session_id: "ses_temporal", message_id: "msg_temporal", step: 1, input: { text: "inspect pricing owner" }, output: { text: "inspect pricing owner" }, source_refs: ["recent_evidence_records"] })`,
+        `const generic = CaseTrace.node({ node_id: "temporal_generic", kind: "execution.observation", component: "runtime", input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], output_refs: ["recent_change_records"], source_refs: ["recent_evidence_records"], data: { nested: { input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], evidence_refs: ["recent_verification_records"], payload_refs: ["recent_tool_results"], typed_refs: [{ ref_type: "external", ref_id: "recent_change_records", legacy_ref: "recent_change_records" }] } } })`,
+        `const edgeTarget = CaseTrace.node({ node_id: "temporal_edge_target", kind: "execution.observation", component: "runtime", data: { marker: "edge_target" } })`,
+        `CaseTrace.edge({ edge_id: "temporal_legacy_edge", from: { type: "external", id: "explicit_source" }, to: { type: "node", id: edgeTarget.node_id }, relation: "derived_from", evidence_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.decision({ decision_id: "temporal_decision", component: "processor", decision_type: "tool_selection", intent: "inspect pricing owner", chosen_action: "read", source_refs: ["recent_evidence_records"], metadata: { payload_refs: ["recent_change_records"] } })`,
+        `CaseTrace.promptAssembly({ stage: "temporal_prompt", session_id: "ses_temporal", input: { text: "inspect pricing owner", evidence_refs: ["recent_evidence_records"] }, source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.contextTransform({ stage: "temporal_transform", session_id: "ses_temporal", message_id: "msg_temporal", step: 1, input: { text: "inspect pricing owner", source_refs: ["recent_evidence_records"] }, output: { text: "inspect pricing owner", payload_refs: ["recent_tool_results"] }, source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.compactionCheck({ check_id: "temporal_compaction", session_id: "ses_temporal", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
-        `CaseTrace.compaction({ trigger: "auto", session_id: "ses_temporal", output_summary: "pricing owner remains billing", result: "success", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.compaction({ trigger: "auto", session_id: "ses_temporal", output_summary: "pricing owner remains billing", result: "success", source_refs: ["recent_evidence_records"], after_context_refs: ["recent_change_records"], context_ledger: { retained_fact_refs: ["recent_evidence_records"], dropped_fact_refs: ["recent_verification_records"] }, metadata: { payload_refs: ["recent_tool_results"] } })`,
+        `CaseTrace.change({ change_id: "temporal_change", files: ["src/pricing.ts"], intent: "record temporal policy", source_refs: ["recent_evidence_records"], verification_refs: ["recent_verification_records"], metadata: { evidence_refs: ["recent_evidence_records"] } })`,
+        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_1", session_id: "ses_repeat", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
+        `const secondFact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "shipping owner is logistics", data: { subject: "shipping", predicate: "owner", value: "logistics" }, source_refs: [] })`,
+        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_2", session_id: "ses_repeat", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.responseOutput({ segment_id: "temporal_response", text: "Pricing owner is billing.", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.exitGate({ gate_id: "temporal_gate", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "response complete", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.finish({ status: "success" })`,
@@ -602,13 +609,26 @@ describe("case trace", () => {
     expect(await new Response(proc.stderr).text()).toBe("")
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "temporal-advisory-case", "trace.json"), "utf8")) as any
+    const legacyText = await fs.readFile(path.join(dir, "temporal-advisory-case", "legacy-trace.json"), "utf8")
     const fact = trace.records.find((item: any) => item.event_type === "evidence.semantic_fact")
+    const secondFact = trace.records.find(
+      (item: any) => item.event_type === "evidence.semantic_fact" && item.data.canonical_subject === "shipping",
+    )
     const response = trace.records.find(
       (item: any) => item.event_type === "response.output" && item.data.segment_id === "temporal_response",
     )
     const exitGate = trace.records.find((item: any) => item.event_type === "exit.gate")
+    const generic = trace.records.find((item: any) => item.record_id === "temporal_generic")
+    const edgeTarget = trace.records.find((item: any) => item.record_id === "temporal_edge_target")
+    const repeatedCheck = trace.records.find(
+      (item: any) => item.event_type === "context.compaction_check" && item.data.check_count === 2,
+    )
     const policyTargets = [
-      trace.records.find((item: any) => item.event_type === "decision" && item.data.decision_id === "temporal_decision"),
+      generic,
+      edgeTarget,
+      trace.records.find(
+        (item: any) => item.event_type === "decision" && item.data.decision_id === "temporal_decision",
+      ),
       trace.records.find((item: any) => item.event_type === "prompt.assembly" && item.data.stage === "temporal_prompt"),
       trace.records.find((item: any) => item.event_type === "context.transform" && item.data.stage === "temporal_transform"),
       trace.records.find(
@@ -617,6 +637,8 @@ describe("case trace", () => {
       trace.records.find(
         (item: any) => item.event_type === "context.compaction" && item.data.trigger === "auto",
       ),
+      trace.records.find((item: any) => item.event_type === "change" && item.data.change_id === "temporal_change"),
+      repeatedCheck,
       response,
       exitGate,
     ]
@@ -646,6 +668,7 @@ describe("case trace", () => {
       eligible_for_attribution: false,
       derivation_method: "recent_source_fallback",
     })
+    expect(secondFact).toBeTruthy()
     expect(policyTargets.every(Boolean)).toBe(true)
     for (const target of policyTargets) {
       expect(target.source_refs ?? []).not.toContain("recent_evidence_records")
@@ -663,11 +686,34 @@ describe("case trace", () => {
         ),
       ).toBe(true)
     }
+    expect(
+      trace.edges.some(
+        (item: any) =>
+          item.from?.legacy_ref === `evidence:${secondFact.record_id}` &&
+          item.to?.ref_id === repeatedCheck.record_id &&
+          item.evidence_tier === "temporal_advisory" &&
+          item.eligible_for_attribution === false &&
+          item.derivation_method === "recent_source_fallback",
+      ),
+    ).toBe(true)
+    const legacySelectorEdge = trace.edges.find((item: any) => item.edge_id === "temporal_legacy_edge")
+    expect(legacySelectorEdge.evidence_refs).toEqual([])
     const compaction = policyTargets.find((item: any) => item.event_type === "context.compaction")
     expect(JSON.stringify(compaction.data.before_context_refs)).not.toContain("recent_")
     for (const node of trace.nodes) {
       for (const field of ["input_refs", "output_refs", "source_refs"])
         expect((node[field] ?? []).some((ref: any) => ref.legacy_ref?.startsWith("recent_"))).toBe(false)
+    }
+    for (const selector of [
+      "recent_evidence_records",
+      "recent_verification_records",
+      "recent_change_records",
+      "recent_tool_results",
+    ]) {
+      expect(JSON.stringify(trace.nodes)).not.toContain(selector)
+      expect(JSON.stringify(trace.records)).not.toContain(selector)
+      expect(JSON.stringify(trace.dataflow_edges)).not.toContain(selector)
+      expect(legacyText).not.toContain(selector)
     }
   })
 
@@ -5409,6 +5455,10 @@ describe("case trace", () => {
       cookieSession: "cookie-session-secret",
       cookieRefresh: "cookie-refresh-secret",
       cookieError: "cookie-error-secret",
+      cookieCurlSession: "cookie-curl-session-secret",
+      cookieCurlRefresh: "cookie-curl-refresh-secret",
+      cookieCurlSingle: "cookie-curl-single-secret",
+      cookieCurlUnquoted: "cookie-curl-unquoted-secret",
       stringUrlPassword: "string-url-password-secret",
       stringUrlToken: "string-url-token-secret",
       errorHeaderSecret: "error-header-secret",
@@ -5424,7 +5474,8 @@ describe("case trace", () => {
         `const secrets = ${JSON.stringify(secrets)}`,
         `const error = new Error("request failed with " + secrets.errorText)`,
         `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
-        `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, cookie_header: "Cookie: session=" + secrets.cookieSession + "; refresh=" + secrets.cookieRefresh + "; Path=/", shell: "TOKEN=" + secrets.shellSecret + " AUTHORIZATION=" + secrets.authorizationAssignment + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("Cookie: session=" + secrets.cookieError + "; Path=/audit") }`,
+        `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, cookie_header: "Cookie: session=" + secrets.cookieSession + "; refresh=" + secrets.cookieRefresh + "; Path=/", curl_header_command: "curl -sS https://example.com/audit -H \\\"Cookie: session=" + secrets.cookieCurlSession + "; refresh=" + secrets.cookieCurlRefresh + "; Path=/\\\" --compressed", quoted_header_command: "env MODE=audit curl --header='Cookie: auth=" + secrets.cookieCurlSingle + "; Path=/' https://example.com", shell: "TOKEN=" + secrets.shellSecret + " AUTHORIZATION=" + secrets.authorizationAssignment + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("Cookie: session=" + secrets.cookieError + "; Path=/audit") }`,
+        `textSecrets.unquoted_header_command = "env MODE=audit curl -H Cookie:auth=" + secrets.cookieCurlUnquoted + ";Path=/ --compressed https://example.com"`,
         `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
         `const agentInput = { role: "build", error, endpoint, textSecrets }`,
         `const modelInput = { messages: ["inspect"], error, endpoint }`,
@@ -5442,7 +5493,7 @@ describe("case trace", () => {
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "first", data: { payload: repeated } })`,
         `CaseTrace.observation({ source: "tool", category: "audit", summary: "second", data: { payload: repeated } })`,
         `CaseTrace.finish({ status: "success", result: { environment } })`,
-        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, cookie_header: textSecrets.cookie_header, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
+        `process.stdout.write(JSON.stringify({ agentInput: { role: agentInput.role, error: agentInput.error.message, endpoint: agentInput.endpoint.toString(), textSecrets: { token: textSecrets.token, token_usage: textSecrets.token_usage, token_estimate: textSecrets.token_estimate, quoted_json: textSecrets.quoted_json, header: textSecrets.header, cookie_header: textSecrets.cookie_header, curl_header_command: textSecrets.curl_header_command, quoted_header_command: textSecrets.quoted_header_command, shell: textSecrets.shell, url: textSecrets.url, error: textSecrets.error.message } }, modelInput: { messages: modelInput.messages, error: modelInput.error.message, endpoint: modelInput.endpoint.toString() }, toolInput: { command: toolInput.command, error: toolInput.error.message, endpoint: toolInput.endpoint.toString(), token_usage: toolInput.token_usage }, toolOutput: { result: toolOutput.result, error: toolOutput.error.message, endpoint: toolOutput.endpoint.toString(), tokens: toolOutput.tokens }, environment: { apiKey: environment.apiKey, password: environment.password, token: environment.token, accessToken: environment.accessToken, error: environment.error.message, endpoint: environment.endpoint.toString() } }))`,
       ].join("\n"),
     )
 
@@ -5484,6 +5535,8 @@ describe("case trace", () => {
         quoted_json: `{"token":"${secrets.quotedJsonToken}","apiKey":"${secrets.quotedJsonApiKey}"}`,
         header: `Authorization: Basic ${secrets.headerSecret}\nX-API-Key: ${secrets.headerSecret}`,
         cookie_header: `Cookie: session=${secrets.cookieSession}; refresh=${secrets.cookieRefresh}; Path=/`,
+        curl_header_command: `curl -sS https://example.com/audit -H "Cookie: session=${secrets.cookieCurlSession}; refresh=${secrets.cookieCurlRefresh}; Path=/" --compressed`,
+        quoted_header_command: `env MODE=audit curl --header='Cookie: auth=${secrets.cookieCurlSingle}; Path=/' https://example.com`,
         shell: `TOKEN=${secrets.shellSecret} AUTHORIZATION=${secrets.authorizationAssignment} --password ${secrets.shellSecret}`,
         url: `https://reader:${secrets.stringUrlPassword}@example.com/audit?token=${secrets.stringUrlToken}`,
         error: `Cookie: session=${secrets.cookieError}; Path=/audit`,
@@ -5563,6 +5616,44 @@ describe("case trace", () => {
     expect(recordsText).toContain('"password":"[REDACTED]"')
     expect(recordsText).toContain('"token":"[REDACTED]"')
     expect(recordsText).toContain('"accessToken":"[REDACTED]"')
+  })
+
+  test("omits root non-object token_usage while preserving the closed numeric schema", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-root-token-usage-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "root-token-usage.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "string_usage", kind: "execution.observation", component: "runtime", data: { marker: "string_usage", token_usage: "not-a-token-usage-object" } })`,
+        `CaseTrace.node({ node_id: "undefined_usage", kind: "execution.observation", component: "runtime", data: { marker: "undefined_usage", token_usage: undefined } })`,
+        `CaseTrace.node({ node_id: "numeric_usage", kind: "execution.observation", component: "runtime", data: { marker: "numeric_usage", token_usage: { input: 4, output: 5, total: 9, provider_note: "omit-me", arbitrary_numeric: 42 } } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "root-token-usage-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "root-token-usage-case", "trace.json"), "utf8")) as any
+    const payload = (nodeID: string) => trace.nodes.find((item: any) => item.node_id === nodeID).payload
+    expect(payload("string_usage")).not.toHaveProperty("token_usage")
+    expect(payload("undefined_usage")).not.toHaveProperty("token_usage")
+    expect(payload("numeric_usage").token_usage).toEqual({ input: 4, output: 5, total: 9 })
   })
 
   test("redacts direct summarizeText special objects across persisted trace outputs", async () => {

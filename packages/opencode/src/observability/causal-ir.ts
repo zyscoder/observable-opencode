@@ -372,6 +372,95 @@ function reconciledDiagnostics(
   ]
 }
 
+function aliasCollisionDiagnostic(alias: string, owners: Iterable<string>): CausalIRDiagnosticLike | undefined {
+  const ownerIDs = [...owners].sort((left, right) => (left === right ? 0 : left < right ? -1 : 1))
+  if (ownerIDs.length < 2) return undefined
+  return {
+    diagnostic_id: `alias_collision:${payloadHash(alias).slice(0, 16)}`,
+    kind: "alias_collision",
+    level: "warning",
+    message: `Ambiguous causal alias: ${alias}`,
+    alias,
+    owner_ids: ownerIDs,
+  }
+}
+
+function unresolvedReferenceDiagnostic(
+  owner: { type: "node" | "edge"; id: string },
+  field: string,
+  legacyValue: string,
+): CausalIRDiagnosticLike {
+  return {
+    diagnostic_id: `unresolved_ref:${owner.id}:${field}:${payloadHash(legacyValue).slice(0, 16)}`,
+    kind: "unresolved_ref",
+    level: "warning",
+    message: `Unresolved causal reference: ${legacyValue}`,
+    owner_type: owner.type,
+    field,
+    legacy_ref: legacyValue,
+    ...(owner.type === "node" ? { node_id: owner.id } : { edge_id: owner.id }),
+  }
+}
+
+function currentAliasCollisionDiagnostics(nodes: CausalIRNode[]) {
+  const owners = new Map<string, Set<string>>()
+  for (const node of nodes) {
+    for (const alias of node.aliases) {
+      const current = owners.get(alias) ?? new Set<string>()
+      current.add(node.node_id)
+      owners.set(alias, current)
+    }
+  }
+  return [...owners.entries()].flatMap(([alias, nodeIDs]) => {
+    const diagnostic = aliasCollisionDiagnostic(alias, nodeIDs)
+    return diagnostic ? [diagnostic] : []
+  })
+}
+
+function currentCanonicalReferenceDiagnostics(nodes: CausalIRNode[], edges: CausalIREdge[]) {
+  const diagnostics = new Map<string, CausalIRDiagnosticLike>()
+  const inspect = (owner: { type: "node" | "edge"; id: string }, field: string, ref: CausalIRRef) => {
+    if (ref.ref_type !== "external" || !ref.legacy_ref) return
+    const legacy = typedRef(ref.legacy_ref)
+    if (legacy.ref_type !== "node") return
+    const diagnostic = unresolvedReferenceDiagnostic(owner, field, legacyRef(legacy))
+    diagnostics.set(diagnostic.diagnostic_id, diagnostic)
+  }
+  for (const node of nodes) {
+    for (const [index, ref] of node.input_refs.entries())
+      inspect({ type: "node", id: node.node_id }, `input_refs[${index}]`, ref)
+    for (const [index, ref] of node.output_refs.entries())
+      inspect({ type: "node", id: node.node_id }, `output_refs[${index}]`, ref)
+    for (const [index, ref] of node.source_refs.entries())
+      inspect({ type: "node", id: node.node_id }, `source_refs[${index}]`, ref)
+    for (const [index, ref] of (node.derivation?.input_refs ?? []).entries())
+      inspect({ type: "node", id: node.node_id }, `derivation.input_refs[${index}]`, ref)
+  }
+  for (const edge of edges) {
+    inspect({ type: "edge", id: edge.edge_id }, "from", edge.from)
+    inspect({ type: "edge", id: edge.edge_id }, "to", edge.to)
+    for (const [index, ref] of edge.evidence_refs.entries())
+      inspect({ type: "edge", id: edge.edge_id }, `evidence_refs[${index}]`, ref)
+  }
+  return [...diagnostics.values()]
+}
+
+function reconciledGraphDiagnostics(
+  nodes: CausalIRNode[],
+  edges: CausalIREdge[],
+  diagnostics: CausalIRDiagnosticLike[],
+) {
+  const generatedKinds = new Set(["unknown_relation", "alias_collision", "unresolved_ref"])
+  const generated = [
+    ...currentUnknownRelationDiagnostics(edges),
+    ...currentAliasCollisionDiagnostics(nodes),
+    ...currentCanonicalReferenceDiagnostics(nodes, edges),
+  ].sort((left, right) =>
+    left.diagnostic_id === right.diagnostic_id ? 0 : left.diagnostic_id < right.diagnostic_id ? -1 : 1,
+  )
+  return [...diagnostics.filter((diagnostic) => !generatedKinds.has(String(diagnostic.kind))), ...generated]
+}
+
 function canonicalJSON(input: unknown, arrayValue = false): string | undefined {
   if (input === null) return "null"
 
@@ -455,6 +544,140 @@ function legacyRef(ref: CausalIRRef) {
 
 type CausalIRRefInput = string | CausalIRRef | DataflowEdge["from"]
 type CausalIRRefResolver = (input: CausalIRRefInput) => CausalIRRef
+
+function referenceAliasCandidates(input: CausalIRRefInput) {
+  const ref = typedRef(input)
+  if (ref.ref_type !== "node") return []
+  return [...new Set([legacyRef(ref), `node:${ref.ref_id}`, `record:${ref.ref_id}`])]
+}
+
+function resolveReferenceWithOwners(input: CausalIRRefInput, aliasOwners: Map<string, Set<string>>): CausalIRRef {
+  const ref = typedRef(input)
+  if (ref.ref_type !== "node") return ref
+  const legacy = legacyRef(ref)
+  let nodeID: string | undefined
+  for (const alias of referenceAliasCandidates(input)) {
+    const owners = aliasOwners.get(alias)
+    if (!owners?.size) continue
+    if (owners.size > 1) {
+      nodeID = undefined
+      break
+    }
+    nodeID = owners.values().next().value
+    break
+  }
+  if (!nodeID) {
+    return {
+      ...ref,
+      ref_type: "external",
+      legacy_ref: legacy,
+    }
+  }
+  return {
+    ...ref,
+    ref_type: "node",
+    ref_id: nodeID,
+    legacy_ref: ref.legacy_ref ?? legacy,
+  }
+}
+
+const OMIT_TEMPORAL_REFERENCE = Symbol("omit-temporal-reference")
+
+function temporalSelector(input: unknown) {
+  return typeof input === "string" && input.startsWith("recent_") ? input : undefined
+}
+
+function temporalSelectorFromRef(input: unknown) {
+  const direct = temporalSelector(input)
+  if (direct) return direct
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
+  const ref = input as Record<string, unknown>
+  return (
+    temporalSelector(ref.legacy_ref) ??
+    temporalSelector(ref.ref_id) ??
+    temporalSelector(ref.id) ??
+    temporalSelector(ref.type) ??
+    temporalSelector(ref.source_ref)
+  )
+}
+
+function semanticRefField(input: string) {
+  const normalized = input
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+  return /(^|_)(?:ref|refs)(?:_|$)/.test(normalized)
+}
+
+function structuredReferenceObject(input: Record<string, unknown>) {
+  return [
+    "ref_type",
+    "ref_id",
+    "legacy_ref",
+    "type",
+    "id",
+    "source_ref",
+    "target_ref",
+    "relation",
+    "inference",
+    "confidence",
+    "label",
+  ].some((key) => key in input)
+}
+
+export function normalizeTemporalReferences<T>(input: T): { value: T; selectors: string[] } {
+  const selectors = new Set<string>()
+  const omit = (selector: string) => {
+    selectors.add(selector)
+    return OMIT_TEMPORAL_REFERENCE
+  }
+  const visit = (value: unknown, inRefField: boolean): unknown | typeof OMIT_TEMPORAL_REFERENCE => {
+    if (typeof value === "string") {
+      const selector = inRefField ? temporalSelector(value) : undefined
+      return selector ? omit(selector) : value
+    }
+    if (!value || typeof value !== "object") return value
+    if (inRefField) {
+      const selector = temporalSelectorFromRef(value)
+      if (selector) return omit(selector)
+    }
+    if (Array.isArray(value)) {
+      if (inRefField) {
+        return value.flatMap((item) => {
+          const normalized = visit(item, true)
+          return normalized === OMIT_TEMPORAL_REFERENCE ? [] : [normalized]
+        })
+      }
+      const output = new Array(value.length)
+      for (let index = 0; index < value.length; index++) {
+        if (!(index in value)) continue
+        const normalized = visit(value[index], false)
+        if (normalized !== OMIT_TEMPORAL_REFERENCE) output[index] = normalized
+      }
+      return output
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return value
+
+    const record = value as Record<string, unknown>
+    const inheritRefField = inRefField && !structuredReferenceObject(record)
+    const output: Record<string, unknown> = {}
+    for (const [key, child] of Object.entries(record)) {
+      const childIsRef = semanticRefField(key)
+      const normalized = visit(child, inheritRefField || childIsRef)
+      if (normalized === OMIT_TEMPORAL_REFERENCE) continue
+      output[key] = normalized
+    }
+    return output
+  }
+
+  const value = visit(input, false)
+  return {
+    value: (value === OMIT_TEMPORAL_REFERENCE ? undefined : value) as T,
+    selectors: [...selectors],
+  }
+}
 
 function textField(input: Record<string, unknown> | undefined, keys: string[]) {
   if (!input) return undefined
@@ -569,15 +792,57 @@ function isValidTypedRef(input: unknown): input is CausalIRRef {
   )
 }
 
-function validateNodeProvenance(node: CausalNodeLike) {
-  const origin = node.origin ?? "observed"
-  const derivation = node.derivation
+function canonicalRefKey(ref: CausalIRRef) {
+  return `${ref.ref_type}:${ref.ref_id}`
+}
+
+function dedupeCanonicalRefs(refs: CausalIRRef[]) {
+  const output = new Map<string, CausalIRRef>()
+  for (const ref of refs) {
+    const key = canonicalRefKey(ref)
+    if (!output.has(key)) output.set(key, ref)
+  }
+  return [...output.values()]
+}
+
+function sameCanonicalRefSet(left: CausalIRRef[], right: CausalIRRef[]) {
+  if (left.length !== right.length) return false
+  const rightKeys = new Set(right.map(canonicalRefKey))
+  return left.every((ref) => rightKeys.has(canonicalRefKey(ref)))
+}
+
+type NodeProvenanceValidationContext = {
+  resolveRef: CausalIRRefResolver
+  hasNode: (nodeID: string) => boolean
+  hasArtifact: (artifactID: string) => boolean
+}
+
+function validateDerivedInputRef(input: CausalIRRefInput, context: NodeProvenanceValidationContext): CausalIRRef {
+  const declared = typedRef(input)
+  if (!declared.ref_id) throw new TypeError("derived node requires valid non-empty input refs")
+  if (declared.ref_type === "node") {
+    const resolved = context.resolveRef(input)
+    if (resolved.ref_type !== "node" || !context.hasNode(resolved.ref_id)) {
+      throw new TypeError("derived node input ref must resolve to an existing node")
+    }
+    return resolved
+  }
+  if (declared.ref_type === "artifact" && !context.hasArtifact(declared.ref_id)) {
+    throw new TypeError("derived node input ref must resolve to an existing artifact")
+  }
+  return declared
+}
+
+function validateNodeProvenance(node: CausalNodeLike, context: NodeProvenanceValidationContext) {
+  const normalized = normalizeTemporalReferences(node).value
+  const origin = normalized.origin ?? "observed"
+  const derivation = normalized.derivation
   if (origin === "observed") {
     if (derivation !== undefined) throw new TypeError("observed node cannot declare derivation provenance")
     return
   }
   if (!derivation) throw new TypeError("derived node requires derivation provenance")
-  if (!(node.input_refs?.length)) throw new TypeError("derived node requires non-empty input refs")
+  if (!normalized.input_refs?.length) throw new TypeError("derived node requires non-empty input refs")
   if (!derivation.input_refs.length || !derivation.input_refs.every(isValidTypedRef))
     throw new TypeError("derived node requires non-empty typed derivation input refs")
   if (!derivation.algorithm || !derivation.algorithm_version || !derivation.derived_at)
@@ -586,6 +851,12 @@ function validateNodeProvenance(node: CausalNodeLike) {
     throw new TypeError("derived node requires an explicit reproducible flag")
   if (origin === "deterministic_derived" && derivation.reproducible !== true)
     throw new TypeError("deterministic derived node must be reproducible")
+  const inputRefs = dedupeCanonicalRefs(normalized.input_refs.map((ref) => validateDerivedInputRef(ref, context)))
+  const derivationRefs = dedupeCanonicalRefs(derivation.input_refs.map((ref) => validateDerivedInputRef(ref, context)))
+  if (!inputRefs.length || !derivationRefs.length)
+    throw new TypeError("derived node requires valid non-empty input refs")
+  if (!sameCanonicalRefSet(inputRefs, derivationRefs))
+    throw new TypeError("derived node input refs must canonically match derivation input refs")
 }
 
 function isCanonicalNode(input: unknown): input is CausalIRNode {
@@ -611,36 +882,42 @@ function canonicalNodeEnvelope(
   input: { runID: string; caseID: string; sequence: number },
   resolveRef: CausalIRRefResolver = typedRef,
 ): CausalIRNode {
-  const payload = journalData(node.data ?? {})
-  const inputRefs = (node.input_refs ?? []).map(resolveRef)
-  const outputRefs = (node.output_refs ?? []).map(resolveRef)
-  const sourceRefs = (node.source_refs ?? []).map(resolveRef)
-  const sourceLocations = journalData(node.source_locations ?? [])
-  const artifactRefs = [...(node.artifact_refs ?? [])]
-  const metadata = node.metadata ? journalData(node.metadata) : undefined
+  const normalized = normalizeTemporalReferences(node).value
+  const payload = journalData(normalized.data ?? {})
+  const inputRefs = dedupeCanonicalRefs((normalized.input_refs ?? []).map(resolveRef))
+  const outputRefs = (normalized.output_refs ?? []).map(resolveRef)
+  const sourceRefs = (normalized.source_refs ?? []).map(resolveRef)
+  const sourceLocations = journalData(normalized.source_locations ?? [])
+  const artifactRefs = [...(normalized.artifact_refs ?? [])]
+  const metadata = normalized.metadata ? journalData(normalized.metadata) : undefined
   const scopeSources = [payload, metadata]
   const scoped = (keys: string[]) => scopeSources.map((item) => textField(item, keys)).find(Boolean)
-  const aliases = nodeAliases(node, payload)
+  const aliases = nodeAliases(normalized, payload)
   const sourceHash = payloadHash({ inputRefs, outputRefs, sourceRefs, sourceLocations, artifactRefs })
-  const derivation = node.derivation
+  const resolvedDerivationRefs = normalized.derivation
+    ? dedupeCanonicalRefs(normalized.derivation.input_refs.map(resolveRef))
+    : []
+  const derivation = normalized.derivation
     ? {
-        ...journalData(node.derivation),
-        input_refs: node.derivation.input_refs.map(resolveRef),
+        ...journalData(normalized.derivation),
+        input_refs: sameCanonicalRefSet(inputRefs, resolvedDerivationRefs)
+          ? inputRefs.map((ref) => ({ ...ref }))
+          : resolvedDerivationRefs,
       }
     : null
 
   return {
-    node_id: node.node_id,
-    kind: node.kind,
-    schema_version: node.schema_version ?? CAUSAL_IR_VERSION,
-    origin: node.origin ?? "observed",
-    component: node.component ?? "trace",
-    status: node.status,
-    title: node.title,
+    node_id: normalized.node_id,
+    kind: normalized.kind,
+    schema_version: normalized.schema_version ?? CAUSAL_IR_VERSION,
+    origin: normalized.origin ?? "observed",
+    component: normalized.component ?? "trace",
+    status: normalized.status,
+    title: normalized.title,
     order: {
       sequence: input.sequence,
-      timestamp: node.timestamp,
-      time_ms: node.time_ms,
+      timestamp: normalized.timestamp,
+      time_ms: normalized.time_ms,
     },
     scope: {
       run_id: input.runID,
@@ -649,8 +926,8 @@ function canonicalNodeEnvelope(
       message_id: scoped(["message_id", "messageID"]),
       part_id: scoped(["part_id", "partID"]),
       call_id: scoped(["call_id", "callID", "tool_call_id"]),
-      span_id: node.span_id,
-      parent_span_id: node.parent_span_id,
+      span_id: normalized.span_id,
+      parent_span_id: normalized.parent_span_id,
       agent_id: scoped(["agent_id", "agentID", "agent"]),
       parent_agent_id: scoped(["parent_agent_id", "parentAgentID"]),
     },
@@ -667,15 +944,15 @@ function canonicalNodeEnvelope(
       source_hash: sourceHash,
     },
     metadata,
-    timestamp: node.timestamp,
-    time_ms: node.time_ms,
-    span_id: node.span_id,
-    parent_span_id: node.parent_span_id,
+    timestamp: normalized.timestamp,
+    time_ms: normalized.time_ms,
+    span_id: normalized.span_id,
+    parent_span_id: normalized.parent_span_id,
     data: journalData(payload),
-    typed_resources: node.typed_resources ? journalData(node.typed_resources) : undefined,
-    legacy_input_refs: node.input_refs ? [...node.input_refs] : undefined,
-    legacy_output_refs: node.output_refs ? [...node.output_refs] : undefined,
-    legacy_source_refs: node.source_refs ? [...node.source_refs] : undefined,
+    typed_resources: normalized.typed_resources ? journalData(normalized.typed_resources) : undefined,
+    legacy_input_refs: normalized.input_refs ? [...normalized.input_refs] : undefined,
+    legacy_output_refs: normalized.output_refs ? [...normalized.output_refs] : undefined,
+    legacy_source_refs: normalized.source_refs ? [...normalized.source_refs] : undefined,
   }
 }
 
@@ -706,36 +983,42 @@ function canonicalEdgeEnvelope(
   input: CausalEdgeLike | CausalIREdge,
   resolveRef: CausalIRRefResolver = typedRef,
 ): CausalIREdge {
-  if (isCanonicalEdge(input)) {
-    const details = normalizeRelationDetails(input.original_relation)
-    const tier = evidenceTier(input.evidence_tier) ?? "confirmed"
+  if (temporalSelectorFromRef(input.from) || temporalSelectorFromRef(input.to)) {
+    throw new TypeError("temporal selector cannot be a canonical edge endpoint")
+  }
+  const normalized = normalizeTemporalReferences(input).value
+  if (isCanonicalEdge(normalized)) {
+    const details = normalizeRelationDetails(normalized.original_relation)
+    const tier = evidenceTier(normalized.evidence_tier) ?? "confirmed"
     return {
-      ...journalData(input),
-      from: resolveRef(input.from),
-      to: resolveRef(input.to),
+      ...journalData(normalized),
+      from: resolveRef(normalized.from),
+      to: resolveRef(normalized.to),
       original_relation: details.original,
       normalized_relation: details.normalized,
       evidence_tier: tier,
-      eligible_for_attribution: details.known && tier !== "temporal_advisory" && input.eligible_for_attribution !== false,
-      derivation_method: input.derivation_method ?? (details.known ? "explicit_relation" : "unknown_relation_fallback"),
-      evidence_refs: (input.evidence_refs ?? []).map(resolveRef),
+      eligible_for_attribution:
+        details.known && tier !== "temporal_advisory" && normalized.eligible_for_attribution !== false,
+      derivation_method:
+        normalized.derivation_method ?? (details.known ? "explicit_relation" : "unknown_relation_fallback"),
+      evidence_refs: (normalized.evidence_refs ?? []).map(resolveRef),
     }
   }
 
-  const attributes = canonicalRelationAttributes(input)
+  const attributes = canonicalRelationAttributes(normalized)
   return {
-    edge_id: input.edge_id,
-    from: resolveRef(input.from),
-    to: resolveRef(input.to),
+    edge_id: normalized.edge_id,
+    from: resolveRef(normalized.from),
+    to: resolveRef(normalized.to),
     original_relation: attributes.original_relation,
     normalized_relation: attributes.normalized_relation,
     evidence_tier: attributes.evidence_tier,
     eligible_for_attribution: attributes.eligible_for_attribution,
     derivation_method: attributes.derivation_method,
-    evidence_refs: (input.evidence_refs ?? []).map(resolveRef),
-    confidence: input.confidence,
-    label: input.label,
-    metadata: input.metadata ? journalData(input.metadata) : undefined,
+    evidence_refs: (normalized.evidence_refs ?? []).map(resolveRef),
+    confidence: normalized.confidence,
+    label: normalized.label,
+    metadata: normalized.metadata ? journalData(normalized.metadata) : undefined,
   }
 }
 
@@ -800,38 +1083,53 @@ export class CausalIRStore {
   private lastJournalPayloadHash: string | undefined
   private readonly payloadHashes = new Map<string, string>()
   private readonly nodeOrders = new Map<string, number>()
-  private readonly nodeAliasIndex = new Map<string, string>()
+  private readonly nodeById = new Map<string, CausalNodeLike>()
+  private readonly nodeIndexes = new Map<string, number>()
+  private readonly aliasesByNodeID = new Map<string, Set<string>>()
+  private readonly aliasOwners = new Map<string, Set<string>>()
+  private readonly referencedAliasesByNodeID = new Map<string, Set<string>>()
+  private readonly referencedAliasesByEdgeID = new Map<string, Set<string>>()
+  private readonly aliasAffectedNodeIDs = new Map<string, Set<string>>()
+  private readonly aliasAffectedEdgeIDs = new Map<string, Set<string>>()
+  private readonly referenceDiagnosticIDsByOwner = new Map<string, Set<string>>()
   private readonly edgeIndexes = new Map<string, number>()
+  private readonly artifactIndexes = new Map<string, number>()
+  private readonly artifactById = new Map<string, ArtifactLike>()
   private readonly diagnosticIndexes = new Map<string, number>()
 
   constructor(private readonly input: CausalIRStoreInput) {}
 
+  resolveReference(input: string | CausalIRRef | DataflowEdge["from"]): CausalIRRef {
+    return this.resolveRef(input)
+  }
+
   createNode<T extends CausalNodeLike>(node: T): T {
-    validateNodeProvenance(node)
-    this.nodes.push(node)
-    this.rebuildNodeAliasIndex()
-    const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
-    this.nodeOrders.set(node.node_id, sequence)
-    this.append("node.created", "node", node.node_id, this.canonicalNode(node, sequence))
-    this.reconcileReferenceDiagnostics()
-    return node
+    return this.upsertNode(node, "node.created", "node")
   }
 
   updateNode<T extends CausalNodeLike>(node: T): T {
-    validateNodeProvenance(node)
-    replaceByID(this.nodes, "node_id", node)
-    this.rebuildNodeAliasIndex()
-    const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
-    this.nodeOrders.set(node.node_id, sequence)
-    this.append("node.updated", "node.update", node.node_id, this.canonicalNode(node, sequence), "node")
-    this.reconcileReferenceDiagnostics()
-    return node
+    return this.upsertNode(node, "node.updated", "node.update")
   }
 
   replaceNodes(nodes: CausalNodeLike[]): void {
-    for (const node of nodes) validateNodeProvenance(node)
+    const nodeIDs = new Set(nodes.map((node) => node.node_id))
+    const aliasOwners = new Map<string, Set<string>>()
+    for (const node of nodes) {
+      for (const alias of this.aliasesForNode(node)) {
+        const owners = aliasOwners.get(alias) ?? new Set<string>()
+        owners.add(node.node_id)
+        aliasOwners.set(alias, owners)
+      }
+    }
+    const validationContext: NodeProvenanceValidationContext = {
+      resolveRef: (input) => resolveReferenceWithOwners(input, aliasOwners),
+      hasNode: (nodeID) => nodeIDs.has(nodeID),
+      hasArtifact: (artifactID) => this.artifactById.has(artifactID),
+    }
+    for (const node of nodes) this.validateNodeProvenance(node, validationContext)
     replaceAll(this.nodes, nodes)
-    this.rebuildNodeAliasIndex()
+    this.rebuildNodeIndexesAndAliases()
+    this.rebuildNodeReferenceIndexes()
     const nextOrders = new Map<string, number>()
     for (const node of nodes) {
       const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
@@ -840,12 +1138,15 @@ export class CausalIRStore {
     this.nodeOrders.clear()
     for (const [nodeID, sequence] of nextOrders) this.nodeOrders.set(nodeID, sequence)
     this.rebuildPayloadHashes("node", this.canonicalNodes(), "node_id")
-    this.reconcileReferenceDiagnostics()
+    this.rebuildPayloadHashes("edge", this.canonicalEdges(), "edge_id")
+    this.reconcileAllAliasCollisionDiagnostics()
+    this.reconcileAllReferenceDiagnostics()
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "nodes.replaced" })
   }
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
     const canonical = canonicalEdge(edge)
+    const envelope = canonicalEdgeEnvelope(canonical, this.resolveRef)
     const index = this.edgeIndexes.get(canonical.edge_id)
     if (index === undefined) {
       this.edgeIndexes.set(canonical.edge_id, this.edges.length)
@@ -853,30 +1154,41 @@ export class CausalIRStore {
     } else {
       this.edges[index] = canonical
     }
-    this.append("edge.created", "edge", canonical.edge_id, canonicalEdgeEnvelope(canonical, this.resolveRef))
+    this.updateEdgeReferenceIndexes(canonical)
+    this.append("edge.created", "edge", canonical.edge_id, envelope)
     this.reconcileUnknownRelationDiagnostic(canonical)
-    this.reconcileReferenceDiagnostics(canonical.edge_id)
+    this.reconcileReferenceDiagnosticsForOwner("edge", canonical.edge_id)
     return canonical as T
   }
 
   replaceEdges(edges: CausalEdgeLike[]): void {
     const canonical = normalizeEdges(edges)
+    const envelopes = canonical.map((edge) => canonicalEdgeEnvelope(edge, this.resolveRef))
     replaceAll(this.edges, canonical)
     this.rebuildEdgeIndexes()
-    this.rebuildPayloadHashes("edge", this.canonicalEdges(), "edge_id")
+    this.rebuildPayloadHashes("edge", envelopes, "edge_id")
     this.reconcileAllUnknownRelationDiagnostics()
-    this.reconcileReferenceDiagnostics()
+    this.reconcileAllReferenceDiagnostics()
     this.appendSnapshot("case.checkpointed", "checkpoint", { reason: "edges.replaced" })
   }
 
   createArtifact<T extends ArtifactLike>(artifact: T): T {
+    this.artifactIndexes.set(artifact.artifact_id, this.artifacts.length)
+    this.artifactById.set(artifact.artifact_id, artifact)
     this.artifacts.push(artifact)
     this.append("artifact.created", "artifact", artifact.artifact_id, artifact)
     return artifact
   }
 
   reuseArtifact<T extends ArtifactLike>(artifact: T): T {
-    replaceByID(this.artifacts, "artifact_id", artifact)
+    const index = this.artifactIndexes.get(artifact.artifact_id)
+    if (index === undefined) {
+      this.artifactIndexes.set(artifact.artifact_id, this.artifacts.length)
+      this.artifacts.push(artifact)
+    } else {
+      this.artifacts[index] = artifact
+    }
+    this.artifactById.set(artifact.artifact_id, artifact)
     this.append("artifact.reused", "artifact.reuse", artifact.artifact_id, artifact, "artifact")
     return artifact
   }
@@ -896,14 +1208,16 @@ export class CausalIRStore {
   }
 
   snapshot(): CausalIRStoreSnapshot {
+    const nodes = this.canonicalNodes()
+    const edges = this.canonicalEdges()
     return {
       version: CAUSAL_IR_VERSION,
       runID: this.input.runID,
       caseID: this.input.caseID,
-      nodes: this.canonicalNodes(),
-      edges: this.canonicalEdges(),
+      nodes,
+      edges,
       artifacts: this.artifacts,
-      diagnostics: this.diagnostics,
+      diagnostics: reconciledGraphDiagnostics(nodes, edges, this.diagnostics),
     }
   }
 
@@ -935,102 +1249,295 @@ export class CausalIRStore {
     )
   }
 
-  private readonly resolveRef: CausalIRRefResolver = (input) => {
-    const ref = typedRef(input)
-    if (ref.ref_type !== "node") return ref
-    const legacy = legacyRef(ref)
-    const nodeID =
-      this.nodeAliasIndex.get(legacy) ??
-      this.nodeAliasIndex.get(`node:${ref.ref_id}`) ??
-      this.nodeAliasIndex.get(`record:${ref.ref_id}`)
-    if (!nodeID) {
-      return {
-        ...ref,
-        ref_type: "external",
-        legacy_ref: legacy,
+  private readonly resolveRef: CausalIRRefResolver = (input) => resolveReferenceWithOwners(input, this.aliasOwners)
+
+  private validateNodeProvenance(node: CausalNodeLike, context?: NodeProvenanceValidationContext) {
+    validateNodeProvenance(
+      node,
+      context ?? {
+        resolveRef: this.resolveRef,
+        hasNode: (nodeID) => this.nodeById.has(nodeID),
+        hasArtifact: (artifactID) => this.artifactById.has(artifactID),
+      },
+    )
+  }
+
+  private upsertNode<T extends CausalNodeLike>(
+    node: T,
+    operation: "node.created" | "node.updated",
+    recordType: "node" | "node.update",
+  ): T {
+    this.validateNodeProvenance(node)
+    const nextAliases = this.aliasesForNode(node)
+    const previousAliases = this.aliasesByNodeID.get(node.node_id) ?? new Set<string>()
+    const changedAliases = new Set<string>()
+    for (const alias of previousAliases) if (!nextAliases.has(alias)) changedAliases.add(alias)
+    for (const alias of nextAliases) if (!previousAliases.has(alias)) changedAliases.add(alias)
+    const affected = this.captureAliasAffectedEntities(changedAliases, node.node_id)
+
+    const index = this.nodeIndexes.get(node.node_id)
+    if (index === undefined) {
+      this.nodeIndexes.set(node.node_id, this.nodes.length)
+      this.nodes.push(node)
+    } else {
+      this.nodes[index] = node
+    }
+    this.nodeById.set(node.node_id, node)
+    this.applyNodeAliases(node.node_id, previousAliases, nextAliases)
+    this.updateNodeReferenceIndexes(node)
+
+    const sequence = this.nodeOrders.get(node.node_id) ?? ++this.nodeSequence
+    this.nodeOrders.set(node.node_id, sequence)
+    this.append(operation, recordType, node.node_id, this.canonicalNode(node, sequence), "node")
+    for (const alias of changedAliases) this.reconcileAliasCollisionDiagnostic(alias)
+    this.reconcileReferenceDiagnosticsForOwner("node", node.node_id)
+    this.reconcileAliasAffectedEntities(affected)
+    return node
+  }
+
+  private aliasesForNode(node: CausalNodeLike) {
+    const normalized = normalizeTemporalReferences(node).value
+    return new Set(nodeAliases(normalized, normalized.data ?? {}))
+  }
+
+  private applyNodeAliases(nodeID: string, previous: Set<string>, next: Set<string>) {
+    for (const alias of previous) {
+      if (next.has(alias)) continue
+      const owners = this.aliasOwners.get(alias)
+      owners?.delete(nodeID)
+      if (!owners?.size) this.aliasOwners.delete(alias)
+    }
+    for (const alias of next) {
+      if (previous.has(alias)) continue
+      const owners = this.aliasOwners.get(alias) ?? new Set<string>()
+      owners.add(nodeID)
+      this.aliasOwners.set(alias, owners)
+    }
+    this.aliasesByNodeID.set(nodeID, next)
+  }
+
+  private captureAliasAffectedEntities(aliases: Iterable<string>, excludedNodeID: string) {
+    const nodes = new Map<string, CausalIRNode>()
+    const edges = new Map<string, CausalIREdge>()
+    for (const alias of aliases) {
+      for (const nodeID of this.aliasAffectedNodeIDs.get(alias) ?? []) {
+        if (nodeID === excludedNodeID || nodes.has(nodeID)) continue
+        const node = this.nodeById.get(nodeID)
+        if (!node) continue
+        nodes.set(nodeID, this.canonicalNode(node, this.nodeOrders.get(nodeID) ?? 1))
+      }
+      for (const edgeID of this.aliasAffectedEdgeIDs.get(alias) ?? []) {
+        if (edges.has(edgeID)) continue
+        const index = this.edgeIndexes.get(edgeID)
+        const edge = index === undefined ? undefined : this.edges[index]
+        if (edge) edges.set(edgeID, canonicalEdgeEnvelope(edge, this.resolveRef))
       }
     }
-    return {
-      ...ref,
-      ref_type: "node",
-      ref_id: nodeID,
-      legacy_ref: ref.legacy_ref ?? legacy,
+    return { nodes, edges }
+  }
+
+  private reconcileAliasAffectedEntities(affected: {
+    nodes: Map<string, CausalIRNode>
+    edges: Map<string, CausalIREdge>
+  }) {
+    for (const [nodeID, before] of [...affected.nodes.entries()].sort(([left], [right]) =>
+      left === right ? 0 : left < right ? -1 : 1,
+    )) {
+      const node = this.nodeById.get(nodeID)
+      if (!node) continue
+      const after = this.canonicalNode(node, this.nodeOrders.get(nodeID) ?? 1)
+      if (payloadHash(before) !== payloadHash(after)) {
+        this.append("node.updated", "node.update", nodeID, after, "node")
+      }
+      this.reconcileReferenceDiagnosticsForOwner("node", nodeID)
+    }
+    for (const [edgeID, before] of [...affected.edges.entries()].sort(([left], [right]) =>
+      left === right ? 0 : left < right ? -1 : 1,
+    )) {
+      const index = this.edgeIndexes.get(edgeID)
+      const edge = index === undefined ? undefined : this.edges[index]
+      if (!edge) continue
+      const after = canonicalEdgeEnvelope(edge, this.resolveRef)
+      if (payloadHash(before) !== payloadHash(after)) {
+        this.append("edge.created", "edge", edgeID, after)
+      }
+      this.reconcileReferenceDiagnosticsForOwner("edge", edgeID)
     }
   }
 
-  private rebuildNodeAliasIndex() {
-    this.nodeAliasIndex.clear()
-    for (const node of this.nodes) {
-      for (const alias of nodeAliases(node, node.data ?? {})) {
-        if (!this.nodeAliasIndex.has(alias)) this.nodeAliasIndex.set(alias, node.node_id)
+  private rebuildNodeIndexesAndAliases() {
+    this.nodeById.clear()
+    this.nodeIndexes.clear()
+    this.aliasesByNodeID.clear()
+    this.aliasOwners.clear()
+    for (let index = 0; index < this.nodes.length; index++) {
+      const node = this.nodes[index]!
+      this.nodeById.set(node.node_id, node)
+      this.nodeIndexes.set(node.node_id, index)
+      const aliases = this.aliasesForNode(node)
+      this.aliasesByNodeID.set(node.node_id, aliases)
+      for (const alias of aliases) {
+        const owners = this.aliasOwners.get(alias) ?? new Set<string>()
+        owners.add(node.node_id)
+        this.aliasOwners.set(alias, owners)
       }
     }
   }
 
-  private referenceDiagnostics(edgeID?: string) {
-    const diagnostics = new Map<string, CausalIRDiagnosticLike>()
-    const inspect = (
-      owner: { type: "node" | "edge"; id: string },
-      field: string,
-      input: CausalIRRefInput,
-    ) => {
-      const legacy = typedRef(input)
-      if (legacy.ref_type !== "node" || this.resolveRef(input).ref_type !== "external") return
-      const legacyValue = legacyRef(legacy)
-      const diagnostic: CausalIRDiagnosticLike = {
-        diagnostic_id: `unresolved_ref:${owner.id}:${field}:${payloadHash(legacyValue).slice(0, 16)}`,
-        kind: "unresolved_ref",
-        level: "warning",
-        message: `Unresolved causal reference: ${legacyValue}`,
-        owner_type: owner.type,
-        field,
-        legacy_ref: legacyValue,
-        ...(owner.type === "node" ? { node_id: owner.id } : { edge_id: owner.id }),
-      }
-      diagnostics.set(diagnostic.diagnostic_id, diagnostic)
-    }
-
-    if (edgeID === undefined) {
-      for (const node of this.nodes) {
-        for (const [index, ref] of (node.input_refs ?? []).entries())
-          inspect({ type: "node", id: node.node_id }, `input_refs[${index}]`, ref)
-        for (const [index, ref] of (node.output_refs ?? []).entries())
-          inspect({ type: "node", id: node.node_id }, `output_refs[${index}]`, ref)
-        for (const [index, ref] of (node.source_refs ?? []).entries())
-          inspect({ type: "node", id: node.node_id }, `source_refs[${index}]`, ref)
-        for (const [index, ref] of (node.derivation?.input_refs ?? []).entries())
-          inspect({ type: "node", id: node.node_id }, `derivation.input_refs[${index}]`, ref)
-      }
-    }
-    const indexedEdge = edgeID === undefined ? undefined : this.edges[this.edgeIndexes.get(edgeID) ?? -1]
-    const edges = edgeID === undefined ? this.edges : indexedEdge ? [indexedEdge] : []
-    for (const edge of edges) {
-      inspect({ type: "edge", id: edge.edge_id }, "from", edge.from)
-      inspect({ type: "edge", id: edge.edge_id }, "to", edge.to)
-      for (const [index, ref] of (edge.evidence_refs ?? []).entries())
-        inspect({ type: "edge", id: edge.edge_id }, `evidence_refs[${index}]`, ref)
-    }
-    return [...diagnostics.values()]
+  private forEachNodeReference(node: CausalNodeLike, visit: (field: string, ref: CausalIRRefInput) => void) {
+    for (const [index, ref] of (node.input_refs ?? []).entries()) visit(`input_refs[${index}]`, ref)
+    for (const [index, ref] of (node.output_refs ?? []).entries()) visit(`output_refs[${index}]`, ref)
+    for (const [index, ref] of (node.source_refs ?? []).entries()) visit(`source_refs[${index}]`, ref)
+    for (const [index, ref] of (node.derivation?.input_refs ?? []).entries())
+      visit(`derivation.input_refs[${index}]`, ref)
   }
 
-  private reconcileReferenceDiagnostics(edgeID?: string) {
-    const inScope = (diagnostic: CausalIRDiagnosticLike) =>
-      diagnostic.kind === "unresolved_ref" && (edgeID === undefined || diagnostic.edge_id === edgeID)
-    const current = new Map(
+  private forEachEdgeReference(edge: CausalEdgeLike, visit: (field: string, ref: CausalIRRefInput) => void) {
+    visit("from", edge.from)
+    visit("to", edge.to)
+    for (const [index, ref] of (edge.evidence_refs ?? []).entries()) visit(`evidence_refs[${index}]`, ref)
+  }
+
+  private updateReferenceIndexes(
+    ownerID: string,
+    referencedByOwner: Map<string, Set<string>>,
+    affectedByAlias: Map<string, Set<string>>,
+    next: Set<string>,
+  ) {
+    const previous = referencedByOwner.get(ownerID) ?? new Set<string>()
+    for (const alias of previous) {
+      if (next.has(alias)) continue
+      const owners = affectedByAlias.get(alias)
+      owners?.delete(ownerID)
+      if (!owners?.size) affectedByAlias.delete(alias)
+    }
+    for (const alias of next) {
+      if (previous.has(alias)) continue
+      const owners = affectedByAlias.get(alias) ?? new Set<string>()
+      owners.add(ownerID)
+      affectedByAlias.set(alias, owners)
+    }
+    if (next.size) referencedByOwner.set(ownerID, next)
+    else referencedByOwner.delete(ownerID)
+  }
+
+  private updateNodeReferenceIndexes(node: CausalNodeLike) {
+    const aliases = new Set<string>()
+    this.forEachNodeReference(node, (_field, ref) => {
+      for (const alias of referenceAliasCandidates(ref)) aliases.add(alias)
+    })
+    this.updateReferenceIndexes(node.node_id, this.referencedAliasesByNodeID, this.aliasAffectedNodeIDs, aliases)
+  }
+
+  private updateEdgeReferenceIndexes(edge: CausalEdgeLike) {
+    const aliases = new Set<string>()
+    this.forEachEdgeReference(edge, (_field, ref) => {
+      for (const alias of referenceAliasCandidates(ref)) aliases.add(alias)
+    })
+    this.updateReferenceIndexes(edge.edge_id, this.referencedAliasesByEdgeID, this.aliasAffectedEdgeIDs, aliases)
+  }
+
+  private rebuildNodeReferenceIndexes() {
+    this.referencedAliasesByNodeID.clear()
+    this.aliasAffectedNodeIDs.clear()
+    for (const node of this.nodes) this.updateNodeReferenceIndexes(node)
+  }
+
+  private reconcileAliasCollisionDiagnostic(alias: string) {
+    const next = aliasCollisionDiagnostic(alias, this.aliasOwners.get(alias) ?? [])
+    const diagnosticID = `alias_collision:${payloadHash(alias).slice(0, 16)}`
+    const existingIndex = this.diagnosticIndexes.get(diagnosticID)
+    const existing = existingIndex === undefined ? undefined : this.diagnostics[existingIndex]
+    if (!next) {
+      this.removeDiagnostic(diagnosticID)
+      return
+    }
+    if (existing && payloadHash(existing) === payloadHash(next)) return
+    this.upsertDiagnostic(next)
+    this.append("diagnostic.created", "diagnostic", next.diagnostic_id, next)
+  }
+
+  private reconcileAllAliasCollisionDiagnostics() {
+    const existing = new Map(
       this.diagnostics
-        .filter(inScope)
+        .filter((diagnostic) => diagnostic.kind === "alias_collision")
         .map((diagnostic) => [diagnostic.diagnostic_id, diagnostic]),
     )
-    const next = this.referenceDiagnostics(edgeID)
     replaceAll(
       this.diagnostics,
-      [...this.diagnostics.filter((diagnostic) => !inScope(diagnostic)), ...next],
+      this.diagnostics.filter((diagnostic) => diagnostic.kind !== "alias_collision"),
     )
     this.rebuildDiagnosticIndexes()
-    for (const diagnostic of next) {
-      if (current.has(diagnostic.diagnostic_id)) continue
+    for (const alias of [...this.aliasOwners.keys()].sort()) {
+      const diagnostic = aliasCollisionDiagnostic(alias, this.aliasOwners.get(alias) ?? [])
+      if (!diagnostic) continue
+      this.upsertDiagnostic(diagnostic)
+      if (payloadHash(existing.get(diagnostic.diagnostic_id)) === payloadHash(diagnostic)) continue
       this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
     }
+  }
+
+  private referenceDiagnosticsForOwner(type: "node" | "edge", id: string) {
+    const diagnostics = new Map<string, CausalIRDiagnosticLike>()
+    const inspect = (field: string, input: CausalIRRefInput) => {
+      const declared = typedRef(input)
+      if (declared.ref_type !== "node" || this.resolveRef(input).ref_type !== "external") return
+      const diagnostic = unresolvedReferenceDiagnostic({ type, id }, field, legacyRef(declared))
+      diagnostics.set(diagnostic.diagnostic_id, diagnostic)
+    }
+    if (type === "node") {
+      const node = this.nodeById.get(id)
+      if (node) this.forEachNodeReference(node, inspect)
+    } else {
+      const index = this.edgeIndexes.get(id)
+      const edge = index === undefined ? undefined : this.edges[index]
+      if (edge) this.forEachEdgeReference(edge, inspect)
+    }
+    return diagnostics
+  }
+
+  private reconcileReferenceDiagnosticsForOwner(type: "node" | "edge", id: string) {
+    const ownerKey = `${type}:${id}`
+    const previous = this.referenceDiagnosticIDsByOwner.get(ownerKey) ?? new Set<string>()
+    const next = this.referenceDiagnosticsForOwner(type, id)
+    for (const diagnosticID of previous) {
+      if (!next.has(diagnosticID)) this.removeDiagnostic(diagnosticID)
+    }
+    for (const diagnostic of next.values()) {
+      const index = this.diagnosticIndexes.get(diagnostic.diagnostic_id)
+      const existing = index === undefined ? undefined : this.diagnostics[index]
+      if (existing && payloadHash(existing) === payloadHash(diagnostic)) continue
+      this.upsertDiagnostic(diagnostic)
+      this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
+    }
+    if (next.size) this.referenceDiagnosticIDsByOwner.set(ownerKey, new Set(next.keys()))
+    else this.referenceDiagnosticIDsByOwner.delete(ownerKey)
+  }
+
+  private reconcileAllReferenceDiagnostics() {
+    const existing = new Map(
+      this.diagnostics
+        .filter((diagnostic) => diagnostic.kind === "unresolved_ref")
+        .map((diagnostic) => [diagnostic.diagnostic_id, diagnostic]),
+    )
+    replaceAll(
+      this.diagnostics,
+      this.diagnostics.filter((diagnostic) => diagnostic.kind !== "unresolved_ref"),
+    )
+    this.rebuildDiagnosticIndexes()
+    this.referenceDiagnosticIDsByOwner.clear()
+    const reconcile = (type: "node" | "edge", id: string) => {
+      const ownerKey = `${type}:${id}`
+      const next = this.referenceDiagnosticsForOwner(type, id)
+      if (next.size) this.referenceDiagnosticIDsByOwner.set(ownerKey, new Set(next.keys()))
+      for (const diagnostic of next.values()) {
+        this.upsertDiagnostic(diagnostic)
+        if (payloadHash(existing.get(diagnostic.diagnostic_id)) === payloadHash(diagnostic)) continue
+        this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic)
+      }
+    }
+    for (const node of this.nodes) reconcile("node", node.node_id)
+    for (const edge of this.edges) reconcile("edge", edge.edge_id)
   }
 
   private canonicalNode(node: CausalNodeLike, sequence: number) {
@@ -1053,7 +1560,13 @@ export class CausalIRStore {
 
   private rebuildEdgeIndexes() {
     this.edgeIndexes.clear()
-    for (let index = 0; index < this.edges.length; index++) this.edgeIndexes.set(this.edges[index]!.edge_id, index)
+    this.referencedAliasesByEdgeID.clear()
+    this.aliasAffectedEdgeIDs.clear()
+    for (let index = 0; index < this.edges.length; index++) {
+      const edge = this.edges[index]!
+      this.edgeIndexes.set(edge.edge_id, index)
+      this.updateEdgeReferenceIndexes(edge)
+    }
   }
 
   private rebuildDiagnosticIndexes() {
@@ -1076,8 +1589,14 @@ export class CausalIRStore {
   private removeDiagnostic(diagnosticID: string) {
     const index = this.diagnosticIndexes.get(diagnosticID)
     if (index === undefined) return
-    this.diagnostics.splice(index, 1)
-    this.rebuildDiagnosticIndexes()
+    const lastIndex = this.diagnostics.length - 1
+    const last = this.diagnostics[lastIndex]
+    if (index !== lastIndex && last) {
+      this.diagnostics[index] = last
+      this.diagnosticIndexes.set(last.diagnostic_id, index)
+    }
+    this.diagnostics.pop()
+    this.diagnosticIndexes.delete(diagnosticID)
   }
 
   private reconcileUnknownRelationDiagnostic(edge: CausalEdgeLike) {
@@ -1268,7 +1787,7 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
     nodes,
     edges,
     artifacts,
-    diagnostics: reconciledDiagnostics(edges, diagnostics),
+    diagnostics: reconciledGraphDiagnostics(nodes, edges, diagnostics),
   }
 }
 

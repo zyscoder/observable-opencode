@@ -4,6 +4,7 @@ import path from "path"
 import { Global } from "@opencode-ai/core/global"
 import {
   CausalIRStore,
+  normalizeTemporalReferences,
   projectProvenanceTrace,
   type ArtifactLike,
   type CausalEdgeLike,
@@ -1322,8 +1323,8 @@ function finiteTokenMetric(input: unknown) {
   return typeof input === "number" && Number.isFinite(input) ? Math.max(0, input) : undefined
 }
 
-function sanitizeTokenUsage(input: unknown): TraceTokenUsage | "[REDACTED]" {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return "[REDACTED]"
+function sanitizeTokenUsage(input: unknown): TraceTokenUsage | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined
   const value = input as Record<string, unknown>
   const output: TraceTokenUsage = {}
   for (const key of tokenUsageFields) {
@@ -1366,7 +1367,11 @@ function sanitizeForJson(
 
 function json(input: unknown, label?: string) {
   const path = label?.split(".").filter(Boolean) ?? []
-  return JSON.stringify(sanitizeForJson(input, path.at(-1) ?? "", new WeakSet<object>(), path), undefined, 0)
+  return JSON.stringify(
+    sanitizeForJson(normalizeTemporalReferences(input).value, path.at(-1) ?? "", new WeakSet<object>(), path),
+    undefined,
+    0,
+  )
 }
 
 function normalizeKey(input: string) {
@@ -1475,6 +1480,10 @@ class TraceOwnedCausalIRStore {
     return this.store.createDiagnostic(this.copy(diagnostic))
   }
 
+  resolveReference(input: string): CausalIRRef {
+    return this.store.resolveReference(input)
+  }
+
   checkpoint(data: unknown): void {
     this.store.checkpoint(this.copy(data))
   }
@@ -1517,6 +1526,14 @@ function redactText(input: string) {
     /(["'])(api[_-]?key|authorization|cookie|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\1(\s*:\s*)(["'])(?:\\.|(?!\4)[\s\S])*?\4/gi,
     (_match, quote: string, key: string, separator: string, valueQuote: string) =>
       `${quote}${key}${quote}${separator}${valueQuote}[REDACTED]${valueQuote}`,
+  )
+  output = output.replace(
+    /(["'])(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)(?:\\.|(?!\1)[\s\S])*?\1/gi,
+    (_match, quote: string, header: string) => `${quote}${header}[REDACTED]${quote}`,
+  )
+  output = output.replace(
+    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])([^\r\n"']*?)(?=["']|\s+--?[a-z][a-z0-9_-]*(?:[=\s]|$)|$)/gi,
+    "$1[REDACTED]",
   )
   output = output.replace(
     /(^|[\r\n]|(?:[a-z]*Error:\s+))(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)[^\r\n]*/gi,
@@ -5514,22 +5531,24 @@ class ActiveCaseTrace {
   }
 
   edge(input: SemanticEdgeInput) {
+    const normalized = normalizeTemporalReferences(input).value
     const edge: TraceSemanticEdge = {
-      edge_id: input.edge_id ?? semanticID("edge", this.semanticEdges.length + 1),
-      from: input.from,
-      to: input.to,
-      relation: input.relation,
-      evidence_tier: input.evidence_tier,
-      eligible_for_attribution: input.eligible_for_attribution,
-      derivation_method: input.derivation_method,
-      evidence_refs: input.evidence_refs,
-      confidence: input.confidence,
-      label: input.label,
-      metadata: input.metadata,
+      edge_id: normalized.edge_id ?? semanticID("edge", this.semanticEdges.length + 1),
+      from: normalized.from,
+      to: normalized.to,
+      relation: normalized.relation,
+      evidence_tier: normalized.evidence_tier,
+      eligible_for_attribution: normalized.eligible_for_attribution,
+      derivation_method: normalized.derivation_method,
+      evidence_refs: normalized.evidence_refs,
+      confidence: normalized.confidence,
+      label: normalized.label,
+      metadata: normalized.metadata,
     }
     this.semanticEdges.push(edge)
     this.write("semantic.edge", edge)
     this.causalEdge({
+      edge_id: edge.edge_id,
       from: input.from,
       to: input.to,
       relation: input.relation,
@@ -6325,7 +6344,7 @@ class ActiveCaseTrace {
       input.metadata && typeof input.metadata.response_node_id === "string"
         ? input.metadata.response_node_id
         : undefined
-    const derivationInputRefs = dedupeStrings([
+    const derivationInputRefs = this.canonicalDerivationInputRefs([
       ...(responseNodeID ? [`node:${responseNodeID}`] : []),
       ...(claim.response_segment_id ? [`response_segment:${claim.response_segment_id}`] : []),
       ...attributionSourceRefs,
@@ -6438,7 +6457,7 @@ class ActiveCaseTrace {
         : []),
     ])
     const assessmentID = `claimsupport_${safeNodeIDPart(claim.claim_id)}`
-    const derivationInputRefs = dedupeStrings([
+    const derivationInputRefs = this.canonicalDerivationInputRefs([
       `response_claim:${claimNodeID}`,
       ...claim.direct_evidence_refs,
       ...(claim.conflicting_evidence_refs ?? []),
@@ -6504,6 +6523,18 @@ class ActiveCaseTrace {
       label: "Claim support assessment derived from response claim attribution",
     })
     return node
+  }
+
+  private canonicalDerivationInputRefs(input: string[]) {
+    return dedupeStrings(
+      input.flatMap((ref) => {
+        const declared = typedCausalRef(ref)
+        if (!declared.ref_id) return []
+        const resolved = this.causalIR.resolveReference(ref)
+        if (declared.ref_type === "node" && resolved.ref_type === "external") return [`external:${ref}`]
+        return [ref]
+      }),
+    )
   }
 
   private toolFailureContextRefsForClaim(claim: TraceResponseClaimRecord, attributionRefs: string[]) {
@@ -7074,33 +7105,40 @@ class ActiveCaseTrace {
   }
 
   node(input: CausalNodeInput) {
+    const temporal = normalizeTemporalReferences(input)
+    const normalized = temporal.value
     const requestedSourceRefs = input.source_refs ?? input.evidence_refs
-    const sourceRefs =
-      requestedSourceRefs?.some((ref) => ref.startsWith("recent_")) || this.temporalSourceRefs(requestedSourceRefs).length
-        ? this.normalizeSourceRefs(requestedSourceRefs)
-        : requestedSourceRefs
+    const sourceRefs = normalized.source_refs ?? normalized.evidence_refs
+    const temporalAdvisoryRefs = dedupeStrings([
+      ...(normalized.temporal_advisory_refs ?? []),
+      ...this.temporalSourceRefs(requestedSourceRefs),
+      ...(temporal.selectors.length ? this.currentSourceRefs() : []),
+    ])
     const timestamp = nowIso()
     const node: CausalNode = {
-      node_id: input.node_id ?? semanticID("node", this.causalNodes.length + 1),
-      kind: input.kind,
-      component: input.component,
-      span_id: input.span_id,
-      parent_span_id: input.parent_span_id,
+      node_id: normalized.node_id ?? semanticID("node", this.causalNodes.length + 1),
+      kind: normalized.kind,
+      component: normalized.component,
+      span_id: normalized.span_id,
+      parent_span_id: normalized.parent_span_id,
       timestamp,
       time_ms: Math.max(0, Date.now() - this.startedAt),
-      title: input.title,
-      status: input.status,
-      origin: input.origin,
-      input_refs: input.input_refs,
-      output_refs: input.output_refs,
-      data: input.data === undefined ? undefined : this.summarizeCausalObject(input.data, `${input.kind}.data`),
+      title: normalized.title,
+      status: normalized.status,
+      origin: normalized.origin,
+      input_refs: normalized.input_refs,
+      output_refs: normalized.output_refs,
+      data:
+        normalized.data === undefined
+          ? undefined
+          : this.summarizeCausalObject(normalized.data, `${normalized.kind}.data`),
       source_refs: sourceRefs,
-      source_locations: input.source_locations,
-      typed_resources: input.typed_resources,
+      source_locations: normalized.source_locations,
+      typed_resources: normalized.typed_resources,
       artifact_refs: [],
-      aliases: input.aliases,
-      derivation: input.derivation,
-      metadata: input.metadata,
+      aliases: normalized.aliases,
+      derivation: normalized.derivation,
+      metadata: normalized.metadata,
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     const stored = this.causalIR.createNode(node) as CausalNode
@@ -7108,10 +7146,7 @@ class ActiveCaseTrace {
     if (stored.kind === "context.pack" || stored.kind === "context.transform")
       this.remember(this.recentContextNodeIDs, stored.node_id)
     if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
-    this.createTemporalAdvisoryEdges(stored, [
-      ...(input.temporal_advisory_refs ?? []),
-      ...this.temporalSourceRefs(sourceRefs),
-    ])
+    this.createTemporalAdvisoryEdges(stored, temporalAdvisoryRefs)
     this.writePartial()
     return stored
   }
@@ -7144,22 +7179,28 @@ class ActiveCaseTrace {
 
   causalEdge(input: CausalEdgeInput) {
     if (input.from.type.startsWith("recent_") || input.to.type.startsWith("recent_")) return undefined
+    const temporal = normalizeTemporalReferences(input)
+    const normalized = temporal.value
     const edge: CausalEdgeInput & { edge_id: string } = {
-      edge_id: input.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
-      from: input.from,
-      to: input.to,
-      relation: input.relation,
-      original_relation: input.original_relation,
-      normalized_relation: input.normalized_relation,
-      evidence_tier: input.evidence_tier,
-      eligible_for_attribution: input.eligible_for_attribution,
-      derivation_method: input.derivation_method,
-      evidence_refs: input.evidence_refs?.filter((ref) => !ref.startsWith("recent_")),
-      confidence: input.confidence,
-      label: input.label,
-      metadata: input.metadata,
+      edge_id: normalized.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
+      from: normalized.from,
+      to: normalized.to,
+      relation: normalized.relation,
+      original_relation: normalized.original_relation,
+      normalized_relation: normalized.normalized_relation,
+      evidence_tier: normalized.evidence_tier,
+      eligible_for_attribution: normalized.eligible_for_attribution,
+      derivation_method: normalized.derivation_method,
+      evidence_refs: normalized.evidence_refs,
+      confidence: normalized.confidence,
+      label: normalized.label,
+      metadata: normalized.metadata,
     }
     const stored = this.causalIR.createEdge(edge) as CausalEdge
+    if (temporal.selectors.length) {
+      const target = this.causalNodes.find((node) => node.node_id === normalized.to.id)
+      if (target) this.createTemporalAdvisoryEdges(target, this.currentSourceRefs())
+    }
     this.writePartial()
     return stored
   }
@@ -9463,7 +9504,7 @@ class ActiveCaseTrace {
 }
 
 function jsonPretty(input: unknown) {
-  return JSON.stringify(sanitizeForJson(input), undefined, 2)
+  return JSON.stringify(sanitizeForJson(normalizeTemporalReferences(input).value), undefined, 2)
 }
 
 function prettyJsonString(input: string) {
