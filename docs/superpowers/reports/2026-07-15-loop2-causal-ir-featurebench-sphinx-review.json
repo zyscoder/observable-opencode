@@ -1,0 +1,156 @@
+{
+  "case_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1",
+  "benchmark": {
+    "name": "FeatureBench Lite",
+    "dataset": "LiberCoders/FeatureBench",
+    "instance_id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1"
+  },
+  "trace_sufficiency": "sufficient_for_primary_parser_decision_attribution_with_identity_and_external_termination_gaps",
+  "case_effectiveness": "effective_real_partial_implementation_and_interrupted_lifecycle_case",
+  "can_offline_module_identify_root_cause": "partially_yes_with_one_exact_root_one_late_boundary_and_one_correctly_inconclusive_external_branch",
+  "observed_defects": [
+    {
+      "component": "parser_contract_recovery",
+      "failure_type": "missing_parse_namespace_object_contract",
+      "description": "The restored official FeatureBench test file reports six integration failures because DefinitionParser.parse_namespace_object is absent. The benchmark prompt does not list this method in the interface descriptions even though the masked source block removed it and unchanged C-domain consumers still call it. The agent searched for the explicitly named helper parsers and hidden C tests, then decided to proceed from the interface descriptions without searching repository call sites for other DefinitionParser methods. The resulting parser edit restored the named interfaces but not this required compatibility method.",
+      "record_refs": [
+        "record:node_3_53808635",
+        "record:decisionnode_dec_90_19b79db7",
+        "record:decisionnode_dec_107_6ff6b852",
+        "record:chgnode_chg_3_c1d1ecbb",
+        "record:toolresult_call_00_6iyfkB71kVtAuNLyIoyC1563"
+      ]
+    },
+    {
+      "component": "parser_implementation",
+      "failure_type": "invalid_named_variadic_macro_is_accepted",
+      "description": "The official test test_domain_c_ast_macro_definitions fails because the new _parse_macro accepts M(arg1, arg2..., arg3). A named variadic parameter must terminate the macro parameter list, but the implementation appends the variadic argument and then accepts a following comma. This defect is introduced directly by the parser edit selected in decision dec_107.",
+      "record_refs": [
+        "record:decisionnode_dec_107_6ff6b852",
+        "record:toolcall_call_00_spdOb6yfljS5HAXWaX8b4850",
+        "record:toolresult_call_00_spdOb6yfljS5HAXWaX8b4850",
+        "record:chgnode_chg_3_c1d1ecbb"
+      ]
+    },
+    {
+      "component": "benchmark_request_lifecycle",
+      "failure_type": "http_client_headers_timeout_interrupts_case_before_verification",
+      "description": "The HTTP session/message request exceeded the Node client header timeout after about 300 seconds. The runner then sent SIGINT while the agent was still editing production code. The trace correctly records interrupted_before_case_completion and eight unverified changes, but it only observes SIGINT and does not preserve the upstream UND_ERR_HEADERS_TIMEOUT cause. This is a harness lifecycle defect and a contributor to the incomplete result, not evidence that the agent declared completion.",
+      "record_refs": [
+        "record:case_failed_ea9779c1",
+        "record:decisionnode_dec_92_db3c1229",
+        "record:chgnode_chg_8_9cee1b43"
+      ]
+    }
+  ],
+  "missing_semantics": [
+    "call-id identity bridge from semantic tool.call/tool.result nodes to span-level tool.call nodes that own repository change edges",
+    "external HTTP client timeout cause and request lifecycle event preceding SIGINT",
+    "compact context-membership representation that avoids repeating every historical tool-result edge at every message transform"
+  ],
+  "host_evaluation": {
+    "status": "unofficial_but_complete_for_declared_featurebench_test_lists",
+    "python": "3.12.13",
+    "fail_to_pass": {
+      "test_file": "tests/test_domains/test_domain_c.py",
+      "passed": 28,
+      "failed": 7,
+      "total": 35,
+      "pass_rate": 0.8,
+      "failure_groups": {
+        "missing_parse_namespace_object": 6,
+        "invalid_named_variadic_macro_accepted": 1
+      }
+    },
+    "pass_to_pass": {
+      "test_files": [
+        "tests/test_ext_napoleon/test_ext_napoleon_docstring.py",
+        "tests/test_util/test_util_inventory.py",
+        "tests/test_util/test_util_logging.py",
+        "tests/test_util/test_util_docstrings.py",
+        "tests/test_intl/test_catalogs.py"
+      ],
+      "passed": 81,
+      "failed": 0
+    },
+    "official_harness": {
+      "status": "not_run",
+      "reason": "docker_unavailable_on_host"
+    }
+  },
+  "manual_backward_taint": {
+    "primary_chains": [
+      [
+        "Six official integration tests fail with missing DefinitionParser.parse_namespace_object",
+        "The parser change restores only the methods named by the interface descriptions",
+        "The model explicitly decides to proceed from interface descriptions after hidden C tests are not found",
+        "Repository consumers of parse_namespace_object are not searched",
+        "The benchmark prompt omits a compatibility method removed from the masked source block"
+      ],
+      [
+        "The official macro test accepts an invalid parameter following a named variadic parameter",
+        "The new _parse_macro implementation continues after consuming identifier plus ellipsis",
+        "Decision dec_107 directly materializes this parser algorithm"
+      ],
+      [
+        "The case ends with eight unverified production changes",
+        "The agent plan still contains a pending pytest step",
+        "The HTTP client times out before response headers and the runner sends SIGINT",
+        "The process signal finalizer preserves the partial trace but cannot observe the external timeout reason"
+      ]
+    ],
+    "expected_primary_root_refs": [
+      "record:decisionnode_dec_107_6ff6b852",
+      "record:decisionnode_dec_90_19b79db7",
+      "record:case_failed_ea9779c1"
+    ],
+    "contributing_external_root_refs": ["record:node_3_53808635"]
+  },
+  "trace_fact_layer_findings": [
+    {
+      "kind": "causal_ir_reference_integrity_converged",
+      "description": "The trace has zero unresolved_ref diagnostics. Context snapshot, session, message, processor_text, tool span, and tool call aliases no longer create unresolved-reference amplification. The only diagnostic is a deliberate duplicate-evidence suppression record."
+    },
+    {
+      "kind": "decision_generation_provenance_is_available",
+      "description": "144 of 174 decision nodes include generation provenance and source refs. Decision dec_107 links to the prompt, four message/context transformation stages, and the two LLM lifecycle nodes that produced the edit action."
+    },
+    {
+      "kind": "decision_to_change_identity_gap",
+      "description": "Decision dec_107 links to semantic toolcall_call_00_spd..., which links to semantic toolresult_call_00_spd.... The repository change chg_3 is instead linked from span-level node_467_c9fc6be0. Both represent the same call ID, but no confirmed identity edge unifies them, so the attribution path from decision to changed code is interrupted."
+    },
+    {
+      "kind": "context_edge_and_temporal_advisory_expansion",
+      "description": "The graph contains 3,920 confirmed tool_call_identity_in_message edges and 2,927 temporal-advisory recent_source_fallback edges. Historical tool results are repeatedly connected to every later context transform. These facts are individually defensible but too dense for efficient offline traversal and account for most of the 8,888 edges."
+    },
+    {
+      "kind": "artifact_and_projection_amplification",
+      "description": "The case directory occupies 323,208 KiB for 804 semantic nodes. Artifacts store about 112.7 MB after JSON minification, records.jsonl is 88.6 MB, and trace/legacy/provenance/HTML projections duplicate another large fraction. Lossless JSON minification preserved inspectability but did not materially control repeated full-context snapshots."
+    },
+    {
+      "kind": "signal_finalization_preserves_partial_evidence",
+      "description": "SIGINT finalization generated trace.json, trace.html, manifest.json, compatibility projections, records, and artifacts. The case is correctly marked cancelled and interrupted_before_case_completion, while all eight changes and the pending verification plan remain inspectable."
+    }
+  ],
+  "trace_metrics": {
+    "trace_version": "6.0",
+    "causal_ir_version": "1.0",
+    "duration_ms": 300734,
+    "status": "cancelled",
+    "node_count": 804,
+    "edge_count": 8888,
+    "artifact_count": 516,
+    "diagnostic_count": 1,
+    "unresolved_reference_count": 0,
+    "raw_stream_delta_event_count": 18704,
+    "semantic_decision_count": 174,
+    "decisions_with_generation_provenance": 144,
+    "change_count": 8,
+    "verification_attempt_count": 0,
+    "confirmed_tool_context_edge_count": 3920,
+    "temporal_advisory_edge_count": 2927,
+    "trace_directory_size_kib": 323208,
+    "artifact_stored_bytes": 112715768,
+    "records_jsonl_bytes": 88589338
+  }
+}

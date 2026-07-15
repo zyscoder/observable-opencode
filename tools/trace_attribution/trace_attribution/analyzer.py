@@ -59,18 +59,44 @@ class BackwardTaintAnalyzer:
         for branch in branches:
             for ref, judgment in branch.node_judgments.items():
                 judgments.setdefault(ref, judgment)
-        root_causes = aggregate_root_causes(branches, graph)
-        taint_paths = dedupe_paths(path for branch in branches for path in branch.taint_paths)
+        branches_by_domain: Dict[str, List[DefectBranchResult]] = {}
+        for branch in branches:
+            domain = str(branch.metadata.get("attribution_domain") or "task_quality")
+            branches_by_domain.setdefault(domain, []).append(branch)
+        domain_outcomes = {
+            domain: aggregate_analysis_outcome([branch.analysis_outcome for branch in domain_branches])
+            for domain, domain_branches in branches_by_domain.items()
+        }
+        primary_domain = "task_quality" if branches_by_domain.get("task_quality") else "all"
+        primary_branches = branches_by_domain.get("task_quality") or branches
+        root_causes = aggregate_root_causes(primary_branches, graph)
+        taint_paths = dedupe_paths(path for branch in primary_branches for path in branch.taint_paths)
         visited_order = dedupe(ref for branch in branches for ref in branch.visited_order)
-        unresolved_refs = sorted({ref for branch in branches for ref in branch.unresolved_refs})
+        unresolved_refs_by_domain = {
+            domain: sorted({ref for branch in domain_branches for ref in branch.unresolved_refs})
+            for domain, domain_branches in branches_by_domain.items()
+        }
+        unresolved_refs = sorted({ref for branch in primary_branches for ref in branch.unresolved_refs})
+        judge_errors_by_domain = {
+            domain: [
+                dict(error, branch_id=branch.branch_id)
+                for branch in domain_branches
+                for error in branch.metadata.get("judge_errors") or []
+            ]
+            for domain, domain_branches in branches_by_domain.items()
+        }
         judge_errors = [
             dict(error, branch_id=branch.branch_id)
-            for branch in branches
+            for branch in primary_branches
             for error in branch.metadata.get("judge_errors") or []
         ]
-        branch_outcomes = [branch.analysis_outcome for branch in branches]
+        branch_outcomes = [branch.analysis_outcome for branch in primary_branches]
         analysis_outcome = aggregate_analysis_outcome(branch_outcomes)
-        termination_reason = aggregate_termination_reason(branches)
+        termination_reasons_by_domain = {
+            domain: aggregate_termination_reason(domain_branches)
+            for domain, domain_branches in branches_by_domain.items()
+        }
+        termination_reason = aggregate_termination_reason(primary_branches)
 
         report = AttributionReport(
             case_id=graph.case_id,
@@ -92,8 +118,16 @@ class BackwardTaintAnalyzer:
                 "judge_thinking_config": getattr(self.judge, "thinking_config", None),
                 "judge_error_count": len(judge_errors),
                 "judge_errors": judge_errors,
+                "judge_error_counts_by_domain": {
+                    domain: len(errors) for domain, errors in judge_errors_by_domain.items()
+                },
+                "judge_errors_by_domain": judge_errors_by_domain,
                 "analysis_outcome": analysis_outcome,
+                "analysis_outcomes_by_domain": domain_outcomes,
+                "primary_attribution_domain": primary_domain,
                 "termination_reason": termination_reason,
+                "termination_reasons_by_domain": termination_reasons_by_domain,
+                "unresolved_refs_by_domain": unresolved_refs_by_domain,
                 "defect_branch_count": len(branches),
                 "defect_branch_outcomes": {
                     branch.branch_id: branch.analysis_outcome for branch in branches
@@ -330,7 +364,8 @@ class BackwardTaintAnalyzer:
                     root_causes.pop(ref, None)
                     root_paths.pop(ref, None)
 
-        for ref, judgment in list(judgments.items()):
+        first_observed_propagation_refs = []
+        for ref, judgment in judgments.items():
             if judgment.defect_status != "present" or judgment.causal_role != "defect_propagation":
                 continue
             predecessor_refs = [
@@ -338,65 +373,10 @@ class BackwardTaintAnalyzer:
                 for item in judgment.influenced_by
                 if item.relation == "defect_propagated_from"
             ]
-            if not predecessor_refs or any(item not in judgments for item in predecessor_refs):
-                continue
-            if any(judgments[item].defect_status != "absent" for item in predecessor_refs):
-                continue
-            retained_influences = [
-                item for item in judgment.influenced_by if item.relation != "defect_propagated_from"
-            ]
-            promoted = replace(
-                judgment,
-                causal_role="defect_introduction",
-                is_root_cause=True,
-                influenced_by=retained_influences,
-                model_notes=(
-                    (judgment.model_notes + "; ") if judgment.model_notes else ""
-                )
-                + "reclassified as introduction after every claimed defect predecessor was independently rejected",
-            )
-            judgments[ref] = promoted
-            node = graph.hydrate_node(ref)
-            candidate = RootCauseCandidate(
-                node_ref=ref,
-                component=node.component,
-                event_type=node.event_type,
-                defect_type=promoted.defect_type,
-                reason=promoted.defect_reason,
-                confidence=promoted.confidence,
-            )
-            root_causes[ref] = candidate
-            root_paths[ref] = visited_paths.get(ref, [start_ref, ref])
-            if not callable(confirm_root):
-                continue
-            try:
-                reconfirmed = confirm_root(
-                    node=node,
-                    judgment=promoted,
-                    downstream_context=semantic_downstream_context(graph, root_paths[ref]),
-                    objective=objective,
-                )
-            except Exception as exc:
-                judge_errors.append(
-                    {
-                        "node_ref": ref,
-                        "stage": "root_confirmation_after_boundary_reclassification",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                reconfirmed = fallback_judgment_after_error(
-                    node=node,
-                    upstream_nodes=[],
-                    error=exc,
-                )
-            judgments[ref] = reconfirmed
-            if not (
-                reconfirmed.defect_status == "present"
-                and reconfirmed.causal_role == "defect_introduction"
-                and reconfirmed.is_root_cause
+            if predecessor_refs and all(
+                item in judgments and judgments[item].defect_status == "absent" for item in predecessor_refs
             ):
-                root_causes.pop(ref, None)
-                root_paths.pop(ref, None)
+                first_observed_propagation_refs.append(ref)
 
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
@@ -443,6 +423,8 @@ class BackwardTaintAnalyzer:
                 "termination_reason": termination_reason,
                 "node_limit_hit": node_limit_hit,
                 "depth_limit_hit": depth_limit_hit,
+                "attribution_domain": attribution_domain(graph, start_ref),
+                "first_observed_propagation_refs": sorted(first_observed_propagation_refs),
             },
         )
 
@@ -592,6 +574,18 @@ def start_defect_type(graph: TraceGraph, start_ref: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return "analysis_start"
+
+
+def attribution_domain(graph: TraceGraph, start_ref: str) -> str:
+    node = graph.nodes.get(start_ref)
+    if not node:
+        return "task_quality"
+    declared = str(node.data.get("attribution_domain") or "").strip()
+    if declared in {"task_quality", "trace_health"}:
+        return declared
+    if is_observability_gap(node):
+        return "trace_health"
+    return "task_quality"
 
 
 def dedupe(items: Iterable[str]) -> List[str]:

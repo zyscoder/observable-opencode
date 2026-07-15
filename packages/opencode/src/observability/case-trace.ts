@@ -21,11 +21,7 @@ import {
   type CausalNodeLike,
 } from "./causal-ir"
 import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
-import {
-  TRACE_VERSION,
-  isFormalRecordType,
-  shouldPromoteRuntimeEvent,
-} from "./trace-semantic-contract"
+import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
 
@@ -90,11 +86,7 @@ function isTraceFieldSummary(input: unknown): input is TraceFieldSummary {
     case "text":
       return isSizedSummary && !("keys" in summary) && !("value" in summary)
     case "array":
-      return (
-        isSizedSummary &&
-        !("value" in summary) &&
-        (!("keys" in summary) || summary.keys === undefined)
-      )
+      return isSizedSummary && !("value" in summary) && (!("keys" in summary) || summary.keys === undefined)
     case "object":
       return (
         isSizedSummary &&
@@ -189,6 +181,9 @@ export type TraceArtifact = {
   created_at: string
   dedupe_key?: string
   occurrences?: number
+  storage_encoding?: "identity" | "json_minified"
+  original_length?: number
+  stored_length?: number
 }
 
 export type TraceTokenUsage = {
@@ -356,6 +351,7 @@ export type TraceVerificationRecord = {
   verification_scope_risk_flags?: string[]
   final_test_result?: Record<string, unknown>
   coverage_semantics?: Record<string, unknown>
+  verification_attempt?: Record<string, unknown>
   metadata?: Record<string, unknown>
 }
 
@@ -1408,11 +1404,7 @@ function isSensitiveKey(input: string, path: readonly string[] = [], value?: unk
     "cache_read_tokens",
     "cache_write_tokens",
   ])
-  const metricContainerKeys = new Set([
-    "token_usage",
-    "input_token_details",
-    "output_token_details",
-  ])
+  const metricContainerKeys = new Set(["token_usage", "input_token_details", "output_token_details"])
   if (key === "token" || key === "tokens") {
     const explicitUsagePath = path.slice(0, -1).some((segment) => {
       const normalized = normalizeKey(segment)
@@ -1703,6 +1695,7 @@ function parsedCommandOutcomes(stdout: unknown, stderr: unknown) {
 
 function finalTestResultSemantics(input: {
   command?: string
+  purpose?: string
   exitCode?: number
   status: TraceVerificationRecord["status"]
   parsedFailures: TraceParsedFailure[]
@@ -1713,7 +1706,7 @@ function finalTestResultSemantics(input: {
     exit_code: input.exitCode,
     parsed_failure_count: input.parsedFailures.length,
     first_failure: input.parsedFailures[0],
-    result_kind: isTestLikeCommand(input.command) ? "test_result" : "command_result",
+    result_kind: isTestLikeCommand(input.command, input.purpose) ? "test_result" : "command_result",
   })
 }
 
@@ -1725,12 +1718,14 @@ function verificationCoverageSemantics(input: {
   riskFlags: string[]
 }) {
   const command = input.command ?? ""
-  const executedScripts = dedupeStrings([
-    ...[...command.matchAll(/(?:node|bun)\s+([^\s;&|]+test[^\s;&|]*)/gi)].map((match) => match[1] ?? ""),
-    ...[...command.matchAll(/\bnpm\s+run\s+([A-Za-z0-9:_-]+)/g)].map((match) => `npm:${match[1]}`),
-    ...(command.includes("npm test") ? ["npm:test"] : []),
-    ...(command.includes("test:full") ? ["npm:test:full"] : []),
-  ].filter(Boolean))
+  const executedScripts = dedupeStrings(
+    [
+      ...[...command.matchAll(/(?:node|bun)\s+([^\s;&|]+test[^\s;&|]*)/gi)].map((match) => match[1] ?? ""),
+      ...[...command.matchAll(/\bnpm\s+run\s+([A-Za-z0-9:_-]+)/g)].map((match) => `npm:${match[1]}`),
+      ...(command.includes("npm test") ? ["npm:test"] : []),
+      ...(command.includes("test:full") ? ["npm:test:full"] : []),
+    ].filter(Boolean),
+  )
   const coveredRisks = new Set<string>()
   if (/pricing|renewal|discount|quote/i.test(command)) coveredRisks.add("pricing_behavior")
   if (/owner|ownership/i.test(command)) coveredRisks.add("ownership_metadata")
@@ -1755,12 +1750,34 @@ function verificationCoverageSemantics(input: {
   })
 }
 
-function isTestLikeCommand(command: string | undefined) {
+function verificationAttemptSemantics(command: string | undefined, purpose: string | undefined) {
+  const commandText = command ?? ""
+  const assertionCount = [...commandText.matchAll(/\bassert\b/g)].length
+  const isInlineScript = /\bpython(?:3(?:\.\d+)?)?\s+(?:-[^\s]+\s+)*-[cC]\b/.test(commandText)
+  if (!isInlineScript || assertionCount === 0) return undefined
+  const scopeText = `${purpose ?? ""} ${commandText}`
+  const declaredScope = /\bfull\b.*\bintegration\b|\bintegration\b.*\bfull\b/i.test(scopeText)
+    ? "full_integration"
+    : /\bintegration\b/i.test(scopeText)
+      ? "integration"
+      : "handwritten_self_test"
+  return {
+    attempt_kind: "handwritten_assertion_script",
+    detection_method: "passive_command_analysis",
+    assertion_count: assertionCount,
+    declared_scope: declaredScope,
+    oracle_source: "inline_assertions",
+    behavior_impact: "none",
+  }
+}
+
+function isTestLikeCommand(command: string | undefined, purpose?: string) {
   return Boolean(
-    command &&
+    (command &&
       /\b(test|pytest|jest|vitest|mocha)\b|bun test|npm test|pnpm test|yarn test|go test|cargo test|node .*test|xcodebuild/i.test(
         command,
-      ),
+      )) ||
+      verificationAttemptSemantics(command, purpose),
   )
 }
 
@@ -2015,6 +2032,24 @@ function toolCallIDFromPayload(payload: unknown, fallback?: string) {
     firstStringField(objectField(payload, "metadata"), ["callID", "call_id", "toolCallID", "tool_call_id"]) ??
     fallback
   )
+}
+
+function structuredToolCallIDs(input: unknown, output = new Set<string>(), seen = new WeakSet<object>(), depth = 0) {
+  if (input === undefined || input === null || depth > 12) return output
+  if (Array.isArray(input)) {
+    for (const item of input) structuredToolCallIDs(item, output, seen, depth + 1)
+    return output
+  }
+  if (typeof input !== "object") return output
+  if (seen.has(input)) return output
+  seen.add(input)
+  const record = input as Record<string, unknown>
+  for (const key of ["callID", "call_id", "toolCallID", "tool_call_id", "toolCallId"]) {
+    const value = record[key]
+    if (typeof value === "string" && value.trim()) output.add(value)
+  }
+  for (const value of Object.values(record)) structuredToolCallIDs(value, output, seen, depth + 1)
+  return output
 }
 
 function toolNameFromPayload(payload: unknown) {
@@ -2411,9 +2446,8 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
       if (isBrokenClaimFragment(claim)) return []
       const textLength = claim.replace(/\s/g, "").length
       const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(claim)
-      const hasAtomicVerdict = /^(?:全部|所有)?(?:测试|检查|验证|用例)?(?:均|都|已)?(?:通过|失败|成功|完成)[。.!?]?$/.test(
-        claim,
-      )
+      const hasAtomicVerdict =
+        /^(?:全部|所有)?(?:测试|检查|验证|用例)?(?:均|都|已)?(?:通过|失败|成功|完成)[。.!?]?$/.test(claim)
       if (textLength < 6 && !hasFactSignal && !hasAtomicVerdict) return []
       if (isNonFactualResponseClaim(claim)) return []
       const candidate = markdownTableFactClaim(claim) ?? {
@@ -2492,7 +2526,11 @@ function isNonFactualResponseClaim(input: string) {
   if (/^计算推导(?:\s*[（(].*[）)])?$/.test(normalized)) return true
   if (/^(?:(?:mcp\s*)?返回的事实|mcp facts?|facts?|修改点|改动点|变更点|changes?|changed files?)$/i.test(normalized))
     return true
-  if (/^(design constraints?|design constraints honored|verification results?|implementation summary|change summary)$/.test(normalized))
+  if (
+    /^(design constraints?|design constraints honored|verification results?|implementation summary|change summary)$/.test(
+      normalized,
+    )
+  )
     return true
   if (/^[\w\s-]+存在不一致$/.test(normalized)) return true
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
@@ -2623,7 +2661,11 @@ function responseClaimQualityFlags(classifiedRefs: ReturnType<typeof classifySou
 
 function responseClaimKind(input: unknown): TraceResponseClaimRecord["claim_kind"] {
   const text = fieldSummaryText(input).toLowerCase()
-  if (/(?:测试|验证|检查|用例|test|verify|verification|lint|build|构建).*(?:通过|失败|成功|passed|failed)|^(?:全部|所有).*(?:通过|失败)/i.test(text))
+  if (
+    /(?:测试|验证|检查|用例|test|verify|verification|lint|build|构建).*(?:通过|失败|成功|passed|failed)|^(?:全部|所有).*(?:通过|失败)/i.test(
+      text,
+    )
+  )
     return "verification"
   if (/(?:修改|变更|修复|实现|changed?|modified|fixed|implemented)/i.test(text)) return "change"
   if (/(?:需求|requirement|acceptance criteria)/i.test(text)) return "requirement"
@@ -2681,7 +2723,9 @@ function taskObligationsFromInput(input: unknown, sourceRefs: string[] = []) {
   const text = fieldSummaryText(input)
   const obligations: TaskObligationDraft[] = []
   const source_refs = dedupeStrings(sourceRefs)
-  if (/npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|运行[^。.\n]*测试|执行[^。.\n]*测试|run[^.\n]*tests?/i.test(text)) {
+  if (
+    /npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|运行[^。.\n]*测试|执行[^。.\n]*测试|run[^.\n]*tests?/i.test(text)
+  ) {
     obligations.push({
       obligation_type: "verification_required",
       requirement_text: "Run the requested verification tests.",
@@ -2699,7 +2743,11 @@ function taskObligationsFromInput(input: unknown, sourceRefs: string[] = []) {
       source_refs,
     })
   }
-  if (/(?:委派|调用|使用|spawn|delegate).*?(?:subagent|子\s*agent)|(?:subagent|子\s*agent).*?(?:总结|复核|调用|委派|delegate)/i.test(text)) {
+  if (
+    /(?:委派|调用|使用|spawn|delegate).*?(?:subagent|子\s*agent)|(?:subagent|子\s*agent).*?(?:总结|复核|调用|委派|delegate)/i.test(
+      text,
+    )
+  ) {
     obligations.push({
       obligation_type: "subagent_required",
       requirement_text: "Use the requested subagent workflow.",
@@ -3604,10 +3652,18 @@ function nearestCompactionCheck(compaction: CausalNode, checks: CausalNode[]) {
   return (matches.length ? matches : before).at(-1)
 }
 
-function causalNodeReferencesSession(node: CausalNode, sessionID: string) {
-  const directSession =
+function causalNodeSessionID(node: CausalNode) {
+  return (
     recordStringField(node.data, ["session_id", "sessionID"]) ??
-    recordStringField(objectField(node.data, "metadata"), ["session_id", "sessionID"])
+    recordStringField(objectField(node.data, "input"), ["session_id", "sessionID", "parent_session_id"]) ??
+    recordStringField(objectField(node.data, "data"), ["session_id", "sessionID", "parent_session_id"]) ??
+    recordStringField(objectField(node.data, "metadata"), ["session_id", "sessionID"]) ??
+    recordStringField(node.metadata, ["session_id", "sessionID"])
+  )
+}
+
+function causalNodeReferencesSession(node: CausalNode, sessionID: string) {
+  const directSession = causalNodeSessionID(node)
   if (directSession === sessionID) return true
   return stringPreview(node.data, 20000).includes(sessionID)
 }
@@ -3637,6 +3693,13 @@ function childMetricSummary(records: CausalNode[]) {
     ).length,
     response_output_count: records.filter((record) => record.kind === "response.output").length,
   }
+}
+
+type SubagentConsumptionEvidence = {
+  node: CausalNode
+  evidence_tier: "confirmed" | "content_matched"
+  derivation_method: string
+  matched_text_hash?: string
 }
 
 function applySubagentInlineFields(data: Record<string, unknown>, fields: Record<string, unknown>) {
@@ -4073,7 +4136,9 @@ function explicitDiscountCapValueFromText(input: string) {
   const anchors = [
     ...input.matchAll(/math\.min|discount\s+cap|renewal\s+discount\s+cap|cap(?:ped)?|limit|maximum|max|上限|封顶/gi),
   ]
-    .map((match) => (match.index === undefined ? undefined : { start: match.index, end: match.index + match[0].length }))
+    .map((match) =>
+      match.index === undefined ? undefined : { start: match.index, end: match.index + match[0].length },
+    )
     .filter((anchor): anchor is { start: number; end: number } => anchor !== undefined)
   if (!anchors.length) return candidates.sort((a, b) => a.index - b.index || a.priority - b.priority)[0]?.value
 
@@ -4721,7 +4786,10 @@ class ActiveCaseTrace {
   private recentToolFailureRefs: string[] = []
   private temporalSourceRefsBySelection = new WeakMap<string[], string[]>()
   private temporalAdvisoryEdgeKeys = new Set<string>()
-  private toolOutcomeRefsByCallID = new Map<string, string>()
+  private toolOutcomeRefsByCallID = new Map<
+    string,
+    Array<{ sourceRef: string; sessionID?: string; messageID?: string }>
+  >()
   private requestedSkillNames = new Set<string>()
   private recordedSkillRequestNames = new Set<string>()
   private tokenUsage: TraceTokenUsage = {}
@@ -4924,6 +4992,8 @@ class ActiveCaseTrace {
     return {
       ...base,
       request_id: stringField(record, ["request_id", "response_id", "id"]),
+      session_id: stringField(record, ["sessionID", "session_id"]),
+      message_id: stringField(record, ["messageID", "message_id"]),
       agent: stringField(record, ["agent"]),
       provider_id:
         stringField(model, ["providerID", "provider_id"]) ??
@@ -5092,13 +5162,18 @@ class ActiveCaseTrace {
     const callID = toolCallIDFromPayload(payload, input.span_id)
     const toolName = toolNameFromPayload(payload)
     const args = toolArgsFromPayload(payload)
+    const sessionID = firstStringField(payload, ["sessionID", "session_id"])
+    const messageID = firstStringField(payload, ["messageID", "message_id"])
+    const scopedCallID = callID
+      ? [sessionID ? safeNodeIDPart(sessionID) : undefined, safeNodeIDPart(callID)].filter(Boolean).join("_")
+      : undefined
     const sourceRef =
       eventType === "tool.error" || eventType === "tool.result" ? toolSourceRef(eventType, callID) : undefined
     const common = {
       call_id: callID,
       tool_name: toolName,
-      session_id: firstStringField(payload, ["sessionID", "session_id"]),
-      message_id: firstStringField(payload, ["messageID", "message_id"]),
+      session_id: sessionID,
+      message_id: messageID,
       part_id: firstStringField(payload, ["partID", "part_id"]),
       args,
       provider_executed: payload.providerExecuted,
@@ -5106,12 +5181,16 @@ class ActiveCaseTrace {
     }
 
     if (eventType === "tool.call") {
-      const nodeID = callID ? `toolcall_${safeNodeIDPart(callID)}` : undefined
+      const nodeID = scopedCallID ? `toolcall_${scopedCallID}` : undefined
       const existing = this.causalNodes.find((node) => {
         if (node.kind !== "tool.call") return false
         if (nodeID && node.node_id === nodeID) return true
         if (input.span_id && node.span_id === input.span_id) return true
         const nodeInput = recordFromUnknown(node.data?.input)
+        const nodeSessionID =
+          firstStringField(node.data, ["session_id", "sessionID"]) ??
+          firstStringField(nodeInput, ["session_id", "sessionID"])
+        if (sessionID && nodeSessionID && nodeSessionID !== sessionID) return false
         return Boolean(
           callID &&
             (firstStringField(node.data, ["call_id", "callID"]) === callID ||
@@ -5177,7 +5256,7 @@ class ActiveCaseTrace {
 
     const isError = eventType === "tool.error"
     const error = isError ? errorInfo(payload.error ?? input.data) : undefined
-    const nodeID = callID ? `${isError ? "toolerror" : "toolresult"}_${safeNodeIDPart(callID)}` : undefined
+    const nodeID = scopedCallID ? `${isError ? "toolerror" : "toolresult"}_${scopedCallID}` : undefined
     const existing = nodeID ? this.causalNodes.find((node) => node.node_id === nodeID) : undefined
     if (existing) return existing
     const node = this.node({
@@ -5213,19 +5292,42 @@ class ActiveCaseTrace {
         },
       ],
     })
-    this.closeMatchingToolCall(callID, node, isError ? "error" : "success", payload.error ?? payload.output)
+    const callNode = this.closeMatchingToolCall(
+      callID,
+      node,
+      isError ? "error" : "success",
+      payload.error ?? payload.output,
+      sessionID,
+    )
     if (sourceRef) {
       this.remember(this.recentToolOutcomeRefs, sourceRef)
       if (isError) this.remember(this.recentToolFailureRefs, sourceRef, 24)
-      if (callID) this.toolOutcomeRefsByCallID.set(callID, sourceRef)
-      this.backfillToolOutcomeRef({ callID, sourceRef, spanID: input.span_id, outcomeKind: eventType })
+      if (callID) {
+        const entries = this.toolOutcomeRefsByCallID.get(callID) ?? []
+        entries.push({ sourceRef: `node:${node.node_id}`, sessionID, messageID })
+        this.toolOutcomeRefsByCallID.set(callID, entries.slice(-8))
+      }
+      this.backfillToolOutcomeRef({
+        callID,
+        sourceRef,
+        canonicalOutcomeRef: `node:${node.node_id}`,
+        sessionID,
+        spanID: input.span_id,
+        outcomeKind: eventType,
+      })
     }
     if (callID) {
       this.causalEdge({
-        from: { type: "tool_call", id: callID, label: toolName ?? "tool.call" },
-        to: { type: isError ? "tool_error" : "tool_result", id: callID, label: eventType },
+        from: callNode
+          ? { type: "node", id: callNode.node_id, label: toolName ?? "tool.call" }
+          : { type: "tool_call", id: callID, label: toolName ?? "tool.call" },
+        to: { type: "node", id: node.node_id, label: eventType },
         relation: isError ? "failed_before" : "produced",
         label: isError ? "Tool call failed with an observed error" : "Tool call produced an observed result",
+        metadata: {
+          compatibility_from_ref: `tool_call:${callID}`,
+          compatibility_to_ref: `${isError ? "tool_error" : "tool_result"}:${callID}`,
+        },
       })
     }
     return node
@@ -5236,12 +5338,16 @@ class ActiveCaseTrace {
     outcomeNode: CausalNode,
     status: Exclude<TraceStatus, "running">,
     outcome: unknown,
+    sessionID?: string,
   ) {
     if (!callID) return
     const node = this.causalNodes.find((item) => {
       if (item.kind !== "tool.call") return false
-      if (item.status !== "running") return false
+      if (item.status !== "running" && item.data?.outcome_record_id) return false
       const input = objectField(item.data, "input")
+      const nodeSessionID =
+        firstStringField(item.data, ["session_id", "sessionID"]) ?? firstStringField(input, ["session_id", "sessionID"])
+      if (sessionID && nodeSessionID && nodeSessionID !== sessionID) return false
       return (
         firstStringField(item.data, ["call_id", "callID"]) === callID ||
         firstStringField(input, ["callID", "call_id", "toolCallID", "tool_call_id"]) === callID
@@ -5259,11 +5365,14 @@ class ActiveCaseTrace {
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     this.causalIR.updateNode(node)
+    return node
   }
 
   private backfillToolOutcomeRef(input: {
     callID: string | undefined
     sourceRef: string
+    canonicalOutcomeRef: string
+    sessionID?: string
     spanID?: string
     outcomeKind: "tool.result" | "tool.error"
   }) {
@@ -5271,29 +5380,38 @@ class ActiveCaseTrace {
     if (input.callID) targetRefs.add(`tool_call:${input.callID}`)
     if (input.spanID) targetRefs.add(`span:${input.spanID}`)
 
-    for (const node of this.causalNodes) {
-      if (node.kind !== "tool.call") continue
+    const matchingCallNodes = this.causalNodes.filter((node) => {
+      if (node.kind !== "tool.call" || !input.callID) return false
       const nodeInput = recordFromUnknown(node.data?.input)
       const matchesCall =
-        input.callID !== undefined &&
-        (firstStringField(node.data, ["call_id", "callID"]) === input.callID ||
-          firstStringField(nodeInput, ["callID", "call_id", "toolCallID", "tool_call_id"]) === input.callID)
-      if (matchesCall && node.span_id) targetRefs.add(`span:${node.span_id}`)
-      if (matchesCall) targetRefs.add(`tool_call:${input.callID}`)
+        firstStringField(node.data, ["call_id", "callID"]) === input.callID ||
+        firstStringField(nodeInput, ["callID", "call_id", "toolCallID", "tool_call_id"]) === input.callID
+      if (!matchesCall) return false
+      const nodeSessionID = causalNodeSessionID(node)
+      return !input.sessionID || !nodeSessionID || nodeSessionID === input.sessionID
+    })
+    for (const node of matchingCallNodes) {
+      targetRefs.add(`node:${node.node_id}`)
+      if (node.span_id) targetRefs.add(`span:${node.span_id}`)
     }
 
     if (!targetRefs.size) return
-    const parsedOutcome = this.parseSourceRef(input.sourceRef)
+    const parsedOutcome = this.parseSourceRef(input.canonicalOutcomeRef)
     let changed = true
     while (changed) {
       changed = false
       for (const node of this.causalNodes) {
         if (!this.canBackfillToolOutcome(node)) continue
         const sourceRefs = node.source_refs ?? []
-        if (sourceRefs.includes(input.sourceRef)) continue
-        if (!sourceRefs.some((ref) => targetRefs.has(ref))) continue
+        if (sourceRefs.includes(input.canonicalOutcomeRef)) continue
+        const matchingRefs = sourceRefs.filter((ref) => targetRefs.has(ref))
+        if (!matchingRefs.length) continue
+        const nodeSessionID = causalNodeSessionID(node)
+        if (input.sessionID && nodeSessionID && nodeSessionID !== input.sessionID) continue
+        if (input.sessionID && !nodeSessionID && matchingRefs.every((ref) => ref === `tool_call:${input.callID}`))
+          continue
 
-        node.source_refs = dedupeStrings([...sourceRefs, input.sourceRef])
+        node.source_refs = dedupeStrings([...sourceRefs, input.sourceRef, input.canonicalOutcomeRef])
         if (node.data && typeof node.data === "object") {
           const existing =
             Array.isArray(node.data.tool_outcome_refs) &&
@@ -5302,7 +5420,7 @@ class ActiveCaseTrace {
               : []
           node.data = {
             ...node.data,
-            tool_outcome_refs: dedupeStrings([...existing, input.sourceRef]),
+            tool_outcome_refs: dedupeStrings([...existing, input.sourceRef, input.canonicalOutcomeRef]),
           }
         }
         node.artifact_refs = this.collectArtifactRefs(node.data)
@@ -5416,7 +5534,13 @@ class ActiveCaseTrace {
   }
 
   decision(input: SemanticDecisionInput) {
-    const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const explicitSourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const generationProvenance = this.currentGenerationProvenance(input.metadata)
+    const generationRefs =
+      input.component === "processor" || /reasoning|llm|tool/i.test(input.decision_type)
+        ? generationProvenance.refs
+        : []
+    const sourceRefs = dedupeStrings([...explicitSourceRefs, ...generationRefs])
     const decision: TraceSemanticDecision = {
       decision_id: input.decision_id ?? semanticID("dec", this.semanticDecisions.length + 1),
       span_id: input.span_id,
@@ -5431,7 +5555,7 @@ class ActiveCaseTrace {
     }
     this.semanticDecisions.push(decision)
     this.write("semantic.decision", decision)
-    this.node({
+    const node = this.node({
       node_id: `decisionnode_${decision.decision_id}`,
       kind: "decision",
       component: input.component,
@@ -5444,6 +5568,9 @@ class ActiveCaseTrace {
         intent: input.intent,
         chosen_action: input.chosen_action,
         rationale: input.rationale,
+        generation_provenance_refs: generationRefs,
+        message_transforms: generationProvenance.messageTransforms,
+        selected_context_refs: generationProvenance.selectedContextRefs,
         metadata: input.metadata,
       },
       source_refs: sourceRefs,
@@ -5453,6 +5580,7 @@ class ActiveCaseTrace {
       ]),
       metadata: input.metadata,
     })
+    this.linkGenerationProvenanceToDecision(node, generationProvenance)
     return decision
   }
 
@@ -5498,7 +5626,9 @@ class ActiveCaseTrace {
   }
 
   contextTransform(input: ContextTransformInput) {
-    const sourceRefs = input.source_refs ?? input.evidence_refs
+    const explicitSourceRefs = input.source_refs ?? input.evidence_refs ?? []
+    const inferredToolOutcomeRefs = this.toolOutcomeRefsSelectedIntoContext(input)
+    const sourceRefs = dedupeStrings([...explicitSourceRefs, ...inferredToolOutcomeRefs])
     const node = this.node({
       kind: "context.transform",
       component: "context",
@@ -5515,6 +5645,11 @@ class ActiveCaseTrace {
         input: input.input,
         output: input.output,
         transforms: input.transforms,
+        inferred_tool_context_refs: inferredToolOutcomeRefs,
+        provenance_inference:
+          inferredToolOutcomeRefs.length > 0
+            ? { method: "tool_call_identity_in_message", evidence_tier: "confirmed", behavior_impact: "none" }
+            : undefined,
         metadata: input.metadata,
       },
       source_refs: sourceRefs,
@@ -5526,20 +5661,39 @@ class ActiveCaseTrace {
       ]),
       metadata: input.metadata,
     })
-    for (const ref of sourceRefs ?? []) {
+    for (const ref of sourceRefs) {
       const parsed = this.parseSourceRef(ref)
       if (!parsed) continue
+      const inferredToolOutcome = inferredToolOutcomeRefs.includes(ref)
       this.causalEdge({
         from: parsed,
         to: { type: "node", id: node.node_id, label: "context.transform" },
-        relation: "context_transform",
-        label: "Context transform consumed source record",
+        relation: inferredToolOutcome ? "used_as_context" : "context_transform",
+        evidence_tier: inferredToolOutcome ? "confirmed" : undefined,
+        derivation_method: inferredToolOutcome ? "tool_call_identity_in_message" : undefined,
+        evidence_refs: inferredToolOutcome ? [ref] : undefined,
+        label: inferredToolOutcome
+          ? "Tool result was selected into the model request by exact call identity"
+          : "Context transform consumed source record",
       })
     }
     if (input.stage === "model_messages_built" || input.stage === "llm_request_ready") {
       this.recordRequestedSkillAvailability(input.output, node.node_id)
     }
     return node
+  }
+
+  private toolOutcomeRefsSelectedIntoContext(input: ContextTransformInput) {
+    const refs: string[] = []
+    const callIDs = structuredToolCallIDs([input.input, input.output, input.transforms])
+    for (const callID of callIDs) {
+      const entries = this.toolOutcomeRefsByCallID.get(callID) ?? []
+      for (const entry of entries) {
+        if (input.session_id && entry.sessionID !== input.session_id) continue
+        refs.push(entry.sourceRef)
+      }
+    }
+    return dedupeStrings(refs)
   }
 
   edge(input: SemanticEdgeInput) {
@@ -5558,9 +5712,7 @@ class ActiveCaseTrace {
       label: normalized.label,
       metadata: normalized.metadata,
     }
-    const projectionFields = legacySemanticEdgeOptionalFields.filter(
-      (field) => normalized[field] !== undefined,
-    )
+    const projectionFields = legacySemanticEdgeOptionalFields.filter((field) => normalized[field] !== undefined)
     this.causalEdge({
       edge_id: edge.edge_id,
       from: input.from,
@@ -5642,15 +5794,15 @@ class ActiveCaseTrace {
         : verificationScope.changedTestRefs.length
           ? "post_test_change"
           : "post_change"
-    const superseded = this.verificationRecords.filter(
-      (item) => item.command?.trim() === input.command?.trim(),
-    )
+    const superseded = this.verificationRecords.filter((item) => item.command?.trim() === input.command?.trim())
     const finalTestResult = finalTestResultSemantics({
       command: input.command,
+      purpose: input.purpose,
       exitCode,
       status: statusInference.status,
       parsedFailures: parsed,
     })
+    const verificationAttempt = verificationAttemptSemantics(input.command, input.purpose)
     const coverageSemantics = verificationCoverageSemantics({
       command: input.command,
       changedTestRefs: verificationScope.changedTestRefs,
@@ -5684,8 +5836,7 @@ class ActiveCaseTrace {
       process_exit_code: exitCode,
       parsed_command_outcomes: commandOutcomes,
       exit_masked_by_shell:
-        exitCode === 0 &&
-        (commandOutcomes.some((outcome) => outcome.status === "failed") || Boolean(parsed.length)),
+        exitCode === 0 && (commandOutcomes.some((outcome) => outcome.status === "failed") || Boolean(parsed.length)),
       status: statusInference.status,
       parsed_failures: parsed,
       stdout: input.stdout === undefined ? undefined : this.summarizeText(input.stdout, "verification.stdout"),
@@ -5694,6 +5845,7 @@ class ActiveCaseTrace {
         ...(input.quality_flags ?? []),
         ...statusInference.quality_flags,
         ...verificationScope.riskFlags,
+        ...(verificationAttempt ? ["handwritten_self_test"] : []),
       ]),
       changed_test_refs: verificationScope.changedTestRefs,
       changed_production_refs: verificationScope.changedProductionRefs,
@@ -5701,6 +5853,7 @@ class ActiveCaseTrace {
       verification_scope_risk_flags: verificationScope.riskFlags,
       final_test_result: finalTestResult,
       coverage_semantics: coverageSemantics,
+      verification_attempt: verificationAttempt,
       metadata: input.metadata,
     }
     this.verificationRecords.push(verification)
@@ -5749,6 +5902,7 @@ class ActiveCaseTrace {
         verification_scope_risk_flags: verification.verification_scope_risk_flags,
         final_test_result: verification.final_test_result,
         coverage_semantics: verification.coverage_semantics,
+        verification_attempt: verification.verification_attempt,
         parsed_failures: verification.parsed_failures,
         stdout: input.stdout,
         stderr: input.stderr,
@@ -5790,24 +5944,30 @@ class ActiveCaseTrace {
     const collectedSourceRefs = dedupeStrings([...actionSourceRefs, ...explicitSourceRefs])
     const sourceRefs = collectedSourceRefs.length ? collectedSourceRefs : undefined
     const collectedSourceRefRelations = [
-      ...actionSourceRefs.map((sourceRef): TraceSourceRefRelation => ({
-        source_ref: sourceRef,
-        relation: sourceRef.startsWith("tool_call:") ? "materialized_by_action" : "executed_in_span",
-        inference: "runtime_identity",
-        confidence: 1,
-      })),
-      ...explicitSourceRefs.map((sourceRef): TraceSourceRefRelation => ({
-        source_ref: sourceRef,
-        relation: "explicit_provenance",
-        inference: "explicit",
-        confidence: 1,
-      })),
-      ...motivatingEvidenceRefs.map((sourceRef): TraceSourceRefRelation => ({
-        source_ref: sourceRef,
-        relation: "motivated_by_evidence",
-        inference: "recent_failed_verification",
-        confidence: 0.8,
-      })),
+      ...actionSourceRefs.map(
+        (sourceRef): TraceSourceRefRelation => ({
+          source_ref: sourceRef,
+          relation: sourceRef.startsWith("tool_call:") ? "materialized_by_action" : "executed_in_span",
+          inference: "runtime_identity",
+          confidence: 1,
+        }),
+      ),
+      ...explicitSourceRefs.map(
+        (sourceRef): TraceSourceRefRelation => ({
+          source_ref: sourceRef,
+          relation: "explicit_provenance",
+          inference: "explicit",
+          confidence: 1,
+        }),
+      ),
+      ...motivatingEvidenceRefs.map(
+        (sourceRef): TraceSourceRefRelation => ({
+          source_ref: sourceRef,
+          relation: "motivated_by_evidence",
+          inference: "recent_failed_verification",
+          confidence: 0.8,
+        }),
+      ),
     ].filter(
       (item, index, items) =>
         items.findIndex(
@@ -5936,35 +6096,81 @@ class ActiveCaseTrace {
     return narrowed.length ? narrowed.slice(0, 8) : sourceRefs.slice(-8)
   }
 
-  private currentGenerationProvenance(): GenerationProvenance {
-    const promptNodeIDs = this.recentPromptNodeIDs.slice(-2)
-    const contextNodeIDs = this.recentContextNodeIDs.slice(-4)
-    const llmNodeIDs = this.recentLLMNodeIDs.slice(-2)
+  private currentGenerationProvenance(scope?: Record<string, unknown>): GenerationProvenance {
+    const sessionID = firstStringField(scope ?? {}, ["session_id", "sessionID"])
+    const messageID = firstStringField(scope ?? {}, ["message_id", "messageID"])
+    const nodeScopeValue = (node: CausalNode, fields: string[]) =>
+      firstStringField(node.data ?? {}, fields) ??
+      firstStringField(recordFromUnknown(node.data?.input) ?? {}, fields) ??
+      firstStringField(node.metadata ?? {}, fields)
+    const nodePosition = (node: CausalNode) =>
+      this.causalNodes.findIndex((candidate) => candidate.node_id === node.node_id)
+    const exactContextAnchor = [...this.recentContextNodeIDs]
+      .reverse()
+      .map((id) => this.causalNodes.find((candidate) => candidate.node_id === id))
+      .find((node) => {
+        if (!node || !messageID) return false
+        if (sessionID && nodeScopeValue(node, ["session_id", "sessionID"]) !== sessionID) return false
+        return nodeScopeValue(node, ["message_id", "messageID"]) === messageID
+      })
+    const anchorPosition = exactContextAnchor ? nodePosition(exactContextAnchor) : undefined
+    const scopedNodeIDs = (nodeIDs: string[], limit: number, matchMessage: boolean) =>
+      nodeIDs
+        .filter((id) => {
+          const node = this.causalNodes.find((candidate) => candidate.node_id === id)
+          if (!node) return false
+          if (sessionID && nodeScopeValue(node, ["session_id", "sessionID"]) !== sessionID) return false
+          if (matchMessage && messageID) {
+            const nodeMessageID = nodeScopeValue(node, ["message_id", "messageID"])
+            if (nodeMessageID) return nodeMessageID === messageID
+            return anchorPosition !== undefined && nodePosition(node) >= anchorPosition
+          }
+          return true
+        })
+        .slice(-limit)
+    const promptNodeIDs = scopedNodeIDs(this.recentPromptNodeIDs, 2, false)
+    const contextNodeIDs = scopedNodeIDs(this.recentContextNodeIDs, 4, true)
+    const llmNodeIDs = scopedNodeIDs(this.recentLLMNodeIDs, 2, true)
     const nodeIDs = dedupeStrings([...promptNodeIDs, ...contextNodeIDs, ...llmNodeIDs])
     const refs = nodeIDs.map((id) => `node:${id}`)
     const promptRefs = promptNodeIDs.map((id) => `node:${id}`)
     const contextRefs = contextNodeIDs.map((id) => `node:${id}`)
     const llmRefs = llmNodeIDs.map((id) => `node:${id}`)
+    const selectedLLMSpanIDs = new Set(
+      llmNodeIDs
+        .map((id) => this.causalNodes.find((node) => node.node_id === id)?.span_id)
+        .filter((id): id is string => Boolean(id)),
+    )
+    const contextSnapshotRefs = this.recentContextSnapshotIDs
+      .map((snapshotID) => ({
+        snapshotID,
+        node: this.causalNodes.find((node) => node.node_id === `ctxnode_${snapshotID}`),
+      }))
+      .filter(({ node }) => {
+        if (!node) return false
+        if (node.span_id && selectedLLMSpanIDs.has(node.span_id)) return true
+        if (sessionID && nodeScopeValue(node, ["session_id", "sessionID"]) !== sessionID) return false
+        if (messageID && nodeScopeValue(node, ["message_id", "messageID"]) !== messageID) return false
+        return Boolean(sessionID || messageID)
+      })
+      .slice(-2)
+      .map(({ snapshotID }) => `context_snapshot:${snapshotID}`)
     const contextNodes = contextNodeIDs
       .map((id) => this.causalNodes.find((node) => node.node_id === id))
       .filter((node): node is CausalNode => Boolean(node))
-    const messageTransforms = contextNodes
-      .map((node) => ({
-        node_ref: `node:${node.node_id}`,
-        event_type: node.kind,
-        stage: stringField(node.data ?? {}, ["stage"]) ?? node.title,
-        transforms: node.data?.transforms,
-      }))
+    const messageTransforms = contextNodes.map((node) => ({
+      node_ref: `node:${node.node_id}`,
+      event_type: node.kind,
+      stage: stringField(node.data ?? {}, ["stage"]) ?? node.title,
+      transforms: node.data?.transforms,
+    }))
     const inputMessages = contextNodes
       .map((node) => {
         const output = recordFromUnknown(node.data?.output)
         return output?.model_messages ?? output?.messages ?? node.data?.messages
       })
       .find((value) => value !== undefined)
-    const selectedContextRefs = dedupeStrings([
-      ...contextRefs,
-      ...this.recentContextSnapshotIDs.slice(-2).map((id) => `context_snapshot:${id}`),
-    ])
+    const selectedContextRefs = dedupeStrings([...contextRefs, ...contextSnapshotRefs])
     return {
       refs,
       promptRefs,
@@ -5974,6 +6180,29 @@ class ActiveCaseTrace {
       inputMessages,
       selectedContextRefs,
     }
+  }
+
+  private linkGenerationProvenanceToDecision(decisionNode: CausalNode, provenance: GenerationProvenance) {
+    if (!provenance.refs.length) return
+    const target = { type: "node", id: decisionNode.node_id, label: "decision" }
+    const link = (ref: string, relation: string, label: string) => {
+      const parsed = this.parseSourceRef(ref)
+      if (!parsed || this.hasCausalEdge(parsed, decisionNode.node_id, relation)) return
+      this.causalEdge({
+        from: parsed,
+        to: target,
+        relation,
+        evidence_tier: "confirmed",
+        eligible_for_attribution: true,
+        derivation_method: "same_generation_lifecycle",
+        evidence_refs: [ref],
+        label,
+      })
+    }
+    for (const ref of provenance.promptRefs) link(ref, "prompted", "Prompt assembly contributed to model decision")
+    for (const ref of provenance.contextRefs)
+      link(ref, "used_as_context", "Context/message transform contributed to model decision")
+    for (const ref of provenance.llmRefs) link(ref, "produced", "LLM generation produced semantic decision")
   }
 
   private linkGenerationProvenanceToResponse(input: {
@@ -6046,7 +6275,7 @@ class ActiveCaseTrace {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
     const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
-    const generationProvenance = this.currentGenerationProvenance()
+    const generationProvenance = this.currentGenerationProvenance(input.metadata)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
     const metadataResponseRole = input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined
@@ -6245,8 +6474,7 @@ class ActiveCaseTrace {
       const verificationID = ref.slice("verification:".length)
       const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
       return (
-        verification?.effective_for_final_state === true &&
-        verification.repository_revision === this.repositoryRevision
+        verification?.effective_for_final_state === true && verification.repository_revision === this.repositoryRevision
       )
     })
     const supersededEvidenceRefs = verificationSourceRefs.filter((ref) => !effectiveVerificationRefs.includes(ref))
@@ -6421,10 +6649,7 @@ class ActiveCaseTrace {
       source_refs: attributionSourceRefs,
       source_locations: sourceLocations,
       metadata: claim.metadata,
-      temporal_advisory_refs: dedupeStrings([
-        ...this.temporalSourceRefs(sourceRefs),
-        ...recentToolFailureRefs,
-      ]),
+      temporal_advisory_refs: dedupeStrings([...this.temporalSourceRefs(sourceRefs), ...recentToolFailureRefs]),
     })
     if (responseNodeID) {
       this.causalEdge({
@@ -7430,10 +7655,7 @@ class ActiveCaseTrace {
     const refs = provided ? this.normalizeSourceRefs(provided) : []
     if (!this.isToolOutcomeObservation(input)) return refs
     if (refs.some(isToolOutcomeRef)) return refs
-    this.setTemporalSourceRefs(refs, [
-      ...this.temporalSourceRefs(refs),
-      ...this.recentToolOutcomeRefs.slice(-2),
-    ])
+    this.setTemporalSourceRefs(refs, [...this.temporalSourceRefs(refs), ...this.recentToolOutcomeRefs.slice(-2)])
     return refs
   }
 
@@ -7811,13 +8033,10 @@ class ActiveCaseTrace {
         relation: edge.original_relation,
       }
       if (fields.has("evidence_tier")) projected.evidence_tier = edge.evidence_tier
-      if (fields.has("eligible_for_attribution"))
-        projected.eligible_for_attribution = edge.eligible_for_attribution
+      if (fields.has("eligible_for_attribution")) projected.eligible_for_attribution = edge.eligible_for_attribution
       if (fields.has("derivation_method")) projected.derivation_method = edge.derivation_method
       if (fields.has("evidence_refs"))
-        projected.evidence_refs = edge.evidence_refs.map(
-          (ref) => ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`,
-        )
+        projected.evidence_refs = edge.evidence_refs.map((ref) => ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`)
       if (fields.has("confidence")) projected.confidence = edge.confidence
       if (fields.has("label")) projected.label = edge.label
       if (fields.has("metadata")) {
@@ -7833,7 +8052,10 @@ class ActiveCaseTrace {
   private projectCausalIRSnapshot(
     snapshot: CausalIRStoreSnapshot,
     manifest: TraceManifest,
-    metrics: Pick<ProvenanceTraceSummary["metrics"], "spans" | "events" | "token_usage" | "stream_summary" | "trace_health">,
+    metrics: Pick<
+      ProvenanceTraceSummary["metrics"],
+      "spans" | "events" | "token_usage" | "stream_summary" | "trace_health"
+    >,
   ): ProvenanceTraceView {
     const projection = projectProvenanceTrace(snapshot, {
       traceVersion: TRACE_VERSION,
@@ -7886,10 +8108,7 @@ class ActiveCaseTrace {
     }
   }
 
-  private caseDiagnosticNodes(
-    traceHealth: TraceHealthMetrics,
-    currentByID: Map<string, CausalNode>,
-  ): CausalNode[] {
+  private caseDiagnosticNodes(traceHealth: TraceHealthMetrics, currentByID: Map<string, CausalNode>): CausalNode[] {
     const nodes: CausalNode[] = []
     const timestamp = nowIso()
     const timeMs = Date.now() - this.startedAt
@@ -8301,10 +8520,11 @@ class ActiveCaseTrace {
         .filter((record) => record.kind === "evidence.semantic_fact" || record.kind === "evidence.fact")
         .map((record) => `evidence:${record.node_id}`)
         .slice(0, 20)
-      const parentConsumers = this.parentConsumersForSubagent(
+      const parentConsumptionEvidence = this.parentConsumptionEvidenceForSubagent(
         subagent,
         dedupeStrings([...childRecordRefs, ...childPromptRefs, ...childResultRefs, ...childKeyEvidenceRefs]),
       )
+      const parentConsumers = parentConsumptionEvidence.map((item) => item.node)
       const parentConsumptionRefs = parentConsumers.map((record) => this.recordRefForNode(record))
       const fullTraceRefArtifact = this.writeArtifact(
         "json",
@@ -8331,6 +8551,13 @@ class ActiveCaseTrace {
         child_key_fact_refs: childKeyEvidenceRefs,
         child_output_preview: fieldSummaryText(subagent.data.output).slice(0, 2000),
         parent_consumption_refs: parentConsumptionRefs,
+        parent_consumption_evidence: parentConsumptionEvidence.map((item) => ({
+          consumer_ref: this.recordRefForNode(item.node),
+          evidence_tier: item.evidence_tier,
+          derivation_method: item.derivation_method,
+          matched_text_hash: item.matched_text_hash,
+          behavior_impact: "none",
+        })),
         child_timeline_summary: childTimelineSummary(childRecords),
         child_metric_summary: childMetricSummary(childRecords),
         child_trace_artifact_ref: fullTraceRefArtifact?.artifact_id,
@@ -8339,7 +8566,8 @@ class ActiveCaseTrace {
       applySubagentInlineFields(subagent.data, inlineFields)
       subagent.artifact_refs = this.collectArtifactRefs(subagent.data)
       this.causalIR.updateNode(subagent)
-      for (const consumer of parentConsumers) {
+      for (const evidence of parentConsumptionEvidence) {
+        const consumer = evidence.node
         if (
           this.hasCausalEdge(
             { type: "node", id: subagent.node_id, label: "subagent.call" },
@@ -8359,13 +8587,23 @@ class ActiveCaseTrace {
             label: consumer.kind,
           },
           relation: "reported_to",
+          evidence_tier: evidence.evidence_tier,
+          derivation_method: evidence.derivation_method,
+          confidence: evidence.evidence_tier === "confirmed" ? 1 : 0.9,
+          metadata: {
+            behavior_impact: "none",
+            matched_text_hash: evidence.matched_text_hash,
+          },
           label: "Subagent result was consumed by the parent agent record",
         })
       }
     }
   }
 
-  private parentConsumersForSubagent(subagent: CausalNode, childRefs: string[] = []) {
+  private parentConsumptionEvidenceForSubagent(
+    subagent: CausalNode,
+    childRefs: string[] = [],
+  ): SubagentConsumptionEvidence[] {
     const refs = dedupeStrings([
       `node:${subagent.node_id}`,
       ...(subagent.span_id ? [`span:${subagent.span_id}`, `tool_span:${subagent.span_id}`] : []),
@@ -8373,10 +8611,72 @@ class ActiveCaseTrace {
       ...childRefs,
     ])
     const childSessionID = firstStringField(subagent.data, ["child_session_id", "childSessionID"])
-    return this.causalNodes.filter((node) => {
-      if (node.node_id === subagent.node_id) return false
-      if (childSessionID && causalNodeReferencesSession(node, childSessionID)) return false
-      return (node.source_refs ?? []).some((ref) => refs.includes(ref))
+    const subagentInput = recordFromUnknown(subagent.data?.input)
+    const parentSessionID =
+      firstStringField(subagent.data, ["parent_session_id", "parentSessionID"]) ??
+      firstStringField(subagentInput, ["parent_session_id", "parentSessionID", "session_id", "sessionID"])
+    const subagentPosition = this.causalNodes.findIndex((node) => node.node_id === subagent.node_id)
+    const childCompletionPositions = this.causalNodes.flatMap((node, index) => {
+      if (!childSessionID || !causalNodeReferencesSession(node, childSessionID)) return []
+      if (node.kind === "response.output") return [index]
+      if (
+        node.kind === "agent.lifecycle" &&
+        /response\.completed|turn\.completed|completed/.test(firstStringField(node.data, ["phase"]) ?? "")
+      )
+        return [index]
+      return []
+    })
+    const completionPosition = Math.max(subagentPosition, ...childCompletionPositions)
+    const contentConsumerKinds = new Set([
+      "context.transform",
+      "context.pack",
+      "decision",
+      "response.output",
+      "response.claim",
+      "agent.lifecycle",
+    ])
+    const childPhrases = dedupeStrings(
+      [
+        ...collectTextCandidates(subagent.data?.output),
+        ...this.causalNodes
+          .filter(
+            (node) =>
+              childSessionID && node.kind === "response.output" && causalNodeReferencesSession(node, childSessionID),
+          )
+          .flatMap((node) => collectTextCandidates(node.data)),
+      ]
+        .map((item) => normalizeMatchText(item))
+        .filter((item) => item.length >= 16 && item.length <= 2000),
+    )
+    return this.causalNodes.flatMap<SubagentConsumptionEvidence>((node, position) => {
+      if (node.node_id === subagent.node_id) return []
+      if (position <= completionPosition) return []
+      if (childSessionID && causalNodeReferencesSession(node, childSessionID)) return []
+      const nodeSessionID = causalNodeSessionID(node)
+      if (parentSessionID && nodeSessionID && nodeSessionID !== parentSessionID) return []
+      if ((node.source_refs ?? []).some((ref) => refs.includes(ref))) {
+        return [
+          {
+            node,
+            evidence_tier: "confirmed",
+            derivation_method: "explicit_source_ref",
+            matched_text_hash: undefined,
+          },
+        ]
+      }
+      if (!contentConsumerKinds.has(node.kind)) return []
+      if (parentSessionID && nodeSessionID !== parentSessionID) return []
+      const consumerText = normalizeMatchText(collectTextCandidates(node.data).join("\n"))
+      const matched = childPhrases.find((phrase) => consumerText.includes(phrase))
+      if (!matched) return []
+      return [
+        {
+          node,
+          evidence_tier: "content_matched",
+          derivation_method: "exact_normalized_child_output_match",
+          matched_text_hash: hash(matched),
+        },
+      ]
     })
   }
 
@@ -8432,6 +8732,7 @@ class ActiveCaseTrace {
     if (node.kind === "response.output" && typeof node.data?.segment_id === "string")
       return `response_segment:${node.data.segment_id}`
     if (node.kind === "prompt.assembly") return `prompt:${node.node_id}`
+    if (node.kind === "context.transform" || node.kind === "context.pack") return `context:${node.node_id}`
     if (node.kind === "response.claim") return `response_claim:${node.node_id}`
     if (node.kind === "evidence.semantic_fact" || node.kind === "evidence.fact") return `evidence:${node.node_id}`
     if (node.kind === "execution.observation" || node.kind === "observation") return `observation:${node.node_id}`
@@ -9342,7 +9643,9 @@ class ActiveCaseTrace {
       for (const sourceRef of dataRefs) visit(sourceRef, depth + 1)
       const callID = firstStringField(node.data, ["call_id", "callID"])
       if (callID) {
-        const outcomeRef = this.toolOutcomeRefsByCallID.get(callID)
+        const sessionID = firstStringField(node.data, ["session_id", "sessionID"])
+        const outcomes = this.toolOutcomeRefsByCallID.get(callID) ?? []
+        const outcomeRef = outcomes.findLast((item) => !sessionID || item.sessionID === sessionID)?.sourceRef
         if (outcomeRef) output.add(outcomeRef)
       }
     }
@@ -9432,7 +9735,15 @@ class ActiveCaseTrace {
 
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact | undefined {
     const redacted = redactText(content)
-    const contentHash = hash(redacted)
+    let storedContent = redacted
+    let storageEncoding: TraceArtifact["storage_encoding"] = "identity"
+    if (kind === "json") {
+      try {
+        storedContent = JSON.stringify(JSON.parse(redacted))
+        storageEncoding = "json_minified"
+      } catch {}
+    }
+    const contentHash = hash(storedContent)
     const dedupeKey = `${kind}:${contentHash}`
     const existing = this.artifactByDedupeKey.get(dedupeKey)
     if (existing) {
@@ -9450,18 +9761,21 @@ class ActiveCaseTrace {
       kind,
       label,
       path: relativePath,
-      length: redacted.length,
+      length: storedContent.length,
       hash: contentHash,
-      preview: redacted.slice(0, maxFieldLength()),
+      preview: storedContent.slice(0, maxFieldLength()),
       created_at: nowIso(),
       dedupe_key: dedupeKey,
       occurrences: 1,
+      storage_encoding: storageEncoding,
+      original_length: Buffer.byteLength(redacted),
+      stored_length: Buffer.byteLength(storedContent),
     }
     const target = path.join(this.caseDir, relativePath)
     const temp = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(temp, redacted)
+      fs.writeFileSync(temp, storedContent)
       fs.renameSync(temp, target)
       this.causalIR.createArtifact(artifact)
       this.artifactByDedupeKey.set(dedupeKey, artifact)

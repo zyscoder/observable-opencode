@@ -95,7 +95,23 @@ class CausalEpisodeIndex:
                 eligible.append(resolved)
         if not eligible:
             return None
-        return min(eligible, key=self.graph.position)
+        return min(eligible, key=lambda ref: (representative_priority(self.graph.hydrate_node(ref)), self.graph.position(ref)))
+
+
+def representative_priority(node: TraceNode) -> int:
+    data = node.data if isinstance(node.data, dict) else {}
+    decision_type = str(data.get("decision_type") or "").strip().lower()
+    if node.event_type == "decision" and decision_type in {"llm_tool_call", "tool_execute", "action_generation"}:
+        return 0
+    if node.event_type == "tool.call":
+        return 1
+    if node.event_type == "change":
+        return 2
+    if node.event_type == "decision" and (data.get("chosen_action") or data.get("tool_name")):
+        return 3
+    if node.event_type == "decision":
+        return 4
+    return 5
 
 
 def confirmed_episode_pairs(graph: TraceGraph) -> List[Tuple[str, str]]:

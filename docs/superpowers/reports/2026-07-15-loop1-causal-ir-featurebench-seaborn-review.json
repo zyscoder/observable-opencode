@@ -1,0 +1,122 @@
+{
+  "case_id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1",
+  "benchmark": {
+    "name": "FeatureBench Lite",
+    "dataset": "LiberCoders/FeatureBench",
+    "instance_id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1"
+  },
+  "trace_sufficiency": "partially_sufficient_with_reference_and_evidence_gaps",
+  "case_effectiveness": "effective_real_partial_correctness_case",
+  "can_offline_module_identify_root_cause": "to_be_measured",
+  "observed_defects": [
+    {
+      "component": "feature_implementation",
+      "failure_type": "incomplete_regression_contract_implementation",
+      "description": "After restoring the official hidden FeatureBench test, 37 tests passed, 19 failed, and 5 were skipped. Failures cover DataFrame and Series preservation, data ownership, singleton behavior, x_ci semantics, ci=None handling, scatter color propagation, binned error bars, facet limits, warning compatibility, and shared x-limit behavior. The broad implementation edits materialized simplified behavior that does not satisfy these observable contracts.",
+      "record_refs": [
+        "record:decisionnode_dec_145_266de773",
+        "record:decisionnode_dec_147_daaf5288",
+        "record:decisionnode_dec_157_4fa83c71",
+        "record:toolcall_call_00_CsUApgaEZw1P4ZYmKhez7445",
+        "record:toolcall_call_00_wax8saiXPrSSuZAhBriA0001"
+      ]
+    },
+    {
+      "component": "verification_and_completion",
+      "failure_type": "narrow_self_tests_support_false_completion_claim",
+      "description": "The agent used handwritten smoke scripts that validated selected happy paths and its own simplified assumptions instead of the available contract surface. The final integration script exited successfully but emitted repeated divide-by-zero, overflow, and invalid-value warnings. The agent classified these as normal and concluded that all implementation was complete, while the restored official hidden test later exposed 19 failures.",
+      "record_refs": [
+        "record:toolresult_call_00_AbtCdQgQZJ1lRARy5fSH2872",
+        "record:decisionnode_dec_523_b477b0ab",
+        "record:decisionnode_dec_528_25f64f0d",
+        "record:decisionnode_dec_558_26185496",
+        "record:responseclaim_claim_2592_1f6e6aae"
+      ]
+    },
+    {
+      "component": "test_strategy",
+      "failure_type": "interface_presence_substituted_for_behavioral_contract_validation",
+      "description": "Late verification checked that named methods and properties existed, then treated structural presence as completion evidence. This did not test data-type preservation, edge-case semantics, plotting artist counts, limits, warnings, or compatibility behavior that determine benchmark correctness.",
+      "record_refs": [
+        "record:decisionnode_dec_533_0db92968",
+        "record:decisionnode_dec_543_70a21fa2",
+        "record:decisionnode_dec_548_eaeb6b81",
+        "record:decisionnode_dec_553_9ac132b5"
+      ]
+    }
+  ],
+  "host_evaluation": {
+    "status": "unofficial",
+    "fail_to_pass": {
+      "test_file": "tests/test_regression.py",
+      "passed": 37,
+      "failed": 19,
+      "skipped": 5,
+      "executed_non_skipped": 56,
+      "pass_rate_excluding_skipped": 0.6607142857
+    },
+    "pass_to_pass": {
+      "test_files": [
+        "tests/_marks/test_bar.py",
+        "tests/test_algorithms.py",
+        "tests/test_objects.py",
+        "tests/test_base.py",
+        "tests/_stats/test_density.py"
+      ],
+      "passed": 220,
+      "failed": 0
+    },
+    "official_harness": {
+      "status": "not_run",
+      "reason": "docker_unavailable_on_host"
+    }
+  },
+  "manual_backward_taint": {
+    "primary_chain": [
+      "Official hidden regression assertions fail across 19 behavioral contracts",
+      "Final response claims all implementation is complete",
+      "Completion decision relies on narrow handwritten smoke scripts and method-presence checks",
+      "Runtime warnings are explicitly classified as normal without contract-level validation",
+      "Broad implementation decisions materialize simplified behavior in regression.py and axisgrid.py"
+    ],
+    "expected_root_refs": [
+      "record:decisionnode_dec_147_daaf5288",
+      "record:decisionnode_dec_157_4fa83c71",
+      "record:decisionnode_dec_528_25f64f0d"
+    ],
+    "contributing_root_refs": ["record:decisionnode_dec_523_b477b0ab", "record:decisionnode_dec_553_9ac132b5"]
+  },
+  "trace_fact_layer_findings": [
+    {
+      "kind": "unresolved_reference_amplification",
+      "description": "The final Causal IR contains 10,247 unresolved_ref diagnostics for only 405 unique legacy references. Tool-span references account for 5,748 occurrences and context snapshots for 4,074. The same unresolved reference is repeated up to 90 times, inflating a 2,622-node trace directory to 1.1 GB."
+    },
+    {
+      "kind": "missing_subagent_consumption_link",
+      "description": "The explore subagent records its prompt, output, child timeline, and 269 child records, but parent_consumption_refs is empty. The trace therefore shows that the subagent ran but does not explicitly identify which parent decision consumed which subagent findings."
+    },
+    {
+      "kind": "verification_semantics_not_promoted",
+      "description": "The final handwritten integration script is preserved as a tool result, including runtime warnings, but no dedicated verification node summarizes its scope, assertions, warnings, and limitations. The final completion claim has support_level=unsupported and no evidence refs instead of being linked to the narrow smoke result with an explicit scope mismatch."
+    },
+    {
+      "kind": "completion_claim_conflict_underrepresented",
+      "description": "The claim 'All implementation is complete' is correctly marked unsupported, but support_conflict_status remains unconflicted and candidate evidence contains unrelated tool errors rather than the immediately preceding self-test and warning evidence."
+    },
+    {
+      "kind": "passive_behavior_preserved",
+      "description": "The manifest records collection_mode=passive_sidecar and behavior_impact=none. The benchmark used the required HTTP session flow, and the SIGINT shutdown occurred only after case completion."
+    }
+  ],
+  "trace_metrics": {
+    "trace_version": "6.0",
+    "causal_ir_version": "1.0",
+    "duration_ms": 1153846,
+    "node_count": 2622,
+    "edge_count": 26654,
+    "artifact_count": 1677,
+    "diagnostic_count": 10247,
+    "unique_unresolved_reference_count": 405,
+    "trace_directory_size_bytes_approx": 1181116006
+  }
+}

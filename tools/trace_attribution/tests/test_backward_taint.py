@@ -1010,7 +1010,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
 
         report = BackwardTaintAnalyzer(judge=FakeJudge(roots)).analyze(TraceGraph.from_trace(trace))
 
-        self.assertEqual([root.node_ref for root in report.root_causes], ["record:reasoning"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
         self.assertEqual(
             set(report.root_causes[0].episode_member_refs),
             {"record:reasoning", "record:action", "record:tool_call"},
@@ -1121,7 +1121,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("record:reasoning", judge.calls)
         self.assertIn("record:action", judge.calls)
         self.assertNotIn("record:tool_call", judge.calls)
-        self.assertEqual([root.node_ref for root in report.root_causes], ["record:reasoning"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
         self.assertEqual(report.metadata["analysis_outcome"], "root_found")
         blocking_types = [item["gap_type"] for item in report.trace_improvement_report["blocking_gaps"]]
         advisory_types = [item["gap_type"] for item in report.trace_improvement_report["advisory_gaps"]]
@@ -1213,7 +1213,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
         self.assertEqual(report.node_judgments["record:plan"].defect_status, "absent")
 
-    def test_reclassifies_propagation_when_confirmation_rejects_its_only_defect_predecessor(self):
+    def test_does_not_reclassify_propagation_without_counterfactual_evidence(self):
         trace = {
             "case_id": "root-confirmation-boundary-case",
             "records": [
@@ -1308,12 +1308,234 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         judge = ConfirmingJudge()
         report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
 
-        self.assertEqual(judge.confirmed, ["record:plan", "record:action"])
-        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
+        self.assertEqual(judge.confirmed, ["record:plan"])
+        self.assertEqual(report.root_causes, [])
         action = report.node_judgments["record:action"]
-        self.assertEqual(action.causal_role, "defect_introduction")
-        self.assertTrue(action.is_root_cause)
-        self.assertFalse(any(item.relation == "defect_propagated_from" for item in action.influenced_by))
+        self.assertEqual(action.causal_role, "defect_propagation")
+        self.assertFalse(action.is_root_cause)
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertIn("record:action", report.defect_branches[0].metadata["first_observed_propagation_refs"])
+
+    def test_reports_task_quality_outcome_independently_from_trace_health(self):
+        trace = {
+            "case_id": "attribution-domain-case",
+            "records": [
+                {"record_id": "task_root", "component": "processor", "event_type": "decision"},
+                {"record_id": "trace_evidence", "component": "trace", "event_type": "observation"},
+                {
+                    "record_id": "observed_task_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:task_root"],
+                    "data": {"failure_type": "wrong_implementation", "attribution_domain": "task_quality"},
+                },
+                {
+                    "record_id": "missing_final_test",
+                    "component": "evaluation",
+                    "event_type": "case.missing_semantic",
+                    "source_refs": ["record:trace_evidence"],
+                    "data": {"gap_kind": "final_test_result_missing", "attribution_domain": "trace_health"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:task_root": NodeJudgment(
+                    node_ref="record:task_root",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="wrong_implementation",
+                    defect_reason="The implementation decision introduced the task defect.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                ),
+                "record:trace_evidence": NodeJudgment(
+                    node_ref="record:trace_evidence",
+                    component="trace",
+                    event_type="observation",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="final_test_result_missing",
+                    defect_reason="The trace does not expose the required verification result.",
+                    causal_role="defect_propagation",
+                    branch_relation="same_defect",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:missing_trace_source",
+                            reason="The missing trace source is not available.",
+                        )
+                    ],
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        self.assertEqual(
+            report.metadata["analysis_outcomes_by_domain"],
+            {"task_quality": "root_found", "trace_health": "inconclusive"},
+        )
+        branches = {branch.start_ref: branch for branch in report.defect_branches}
+        self.assertEqual(branches["record:observed_task_defect"].metadata["attribution_domain"], "task_quality")
+        self.assertEqual(branches["record:missing_final_test"].metadata["attribution_domain"], "trace_health")
+        self.assertNotIn(
+            "record:missing_final_test",
+            [gap["node_ref"] for gap in report.trace_improvement_report["blocking_gaps"]],
+        )
+        self.assertIn(
+            "record:missing_final_test",
+            [gap["node_ref"] for gap in report.trace_improvement_report["advisory_gaps"]],
+        )
+
+    def test_trace_health_judge_errors_and_unresolved_refs_remain_advisory(self):
+        trace = {
+            "case_id": "attribution-secondary-errors-case",
+            "records": [
+                {"record_id": "task_root", "component": "processor", "event_type": "decision"},
+                {"record_id": "trace_error", "component": "trace", "event_type": "observation"},
+                {"record_id": "trace_unresolved", "component": "trace", "event_type": "observation"},
+                {
+                    "record_id": "observed_task_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:task_root"],
+                    "data": {"failure_type": "wrong_implementation", "attribution_domain": "task_quality"},
+                },
+                {
+                    "record_id": "missing_error_semantic",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:trace_error"],
+                    "data": {"gap_kind": "judge_timeout", "attribution_domain": "trace_health"},
+                },
+                {
+                    "record_id": "missing_ref_semantic",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:trace_unresolved"],
+                    "data": {"gap_kind": "unresolved_provenance", "attribution_domain": "trace_health"},
+                },
+            ],
+        }
+
+        class SecondaryFailureJudge(FakeJudge):
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                if node.ref == "record:trace_error":
+                    raise TimeoutError("secondary trace-health judge timed out")
+                if node.ref == "record:trace_unresolved":
+                    return NodeJudgment(
+                        node_ref=node.ref,
+                        component=node.component,
+                        event_type=node.event_type,
+                        has_defect=True,
+                        defect_status="present",
+                        defect_type="unresolved_provenance",
+                        defect_reason="The trace-health branch cites an unavailable provenance node.",
+                        causal_role="defect_propagation",
+                        influenced_by=[TaintInfluence(upstream_ref="record:missing_trace_source", reason="missing")],
+                    )
+                return super().judge_node(
+                    node=node,
+                    upstream_nodes=upstream_nodes,
+                    downstream_context=downstream_context,
+                    objective=objective,
+                )
+
+        judge = SecondaryFailureJudge(
+            {
+                "record:task_root": NodeJudgment(
+                    node_ref="record:task_root",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="wrong_implementation",
+                    defect_reason="The implementation decision introduced the task defect.",
+                    causal_role="defect_introduction",
+                    is_root_cause=True,
+                    confidence=0.95,
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+        blocking_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
+        advisory_types = [gap["gap_type"] for gap in report.trace_improvement_report["advisory_gaps"]]
+
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        self.assertEqual(report.metadata["judge_error_count"], 0)
+        self.assertEqual(report.unresolved_refs, [])
+        self.assertEqual(report.metadata["judge_error_counts_by_domain"]["trace_health"], 1)
+        self.assertEqual(report.metadata["unresolved_refs_by_domain"]["trace_health"], ["record:missing_trace_source"])
+        self.assertNotIn("judge_error", blocking_types)
+        self.assertNotIn("unresolved_trace_refs", blocking_types)
+        self.assertIn("judge_error", advisory_types)
+        self.assertIn("unresolved_trace_refs", advisory_types)
+
+    def test_trace_health_search_limit_does_not_limit_a_found_task_root(self):
+        trace = {
+            "case_id": "attribution-secondary-limit-case",
+            "records": [
+                {"record_id": "task_root", "component": "processor", "event_type": "decision"},
+                {"record_id": "trace_seed", "component": "trace", "event_type": "observation"},
+                {"record_id": "trace_upstream", "component": "trace", "event_type": "observation"},
+                {
+                    "record_id": "observed_task_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:task_root"],
+                    "data": {"failure_type": "wrong_implementation", "attribution_domain": "task_quality"},
+                },
+                {
+                    "record_id": "missing_trace_semantic",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:trace_seed"],
+                    "data": {"gap_kind": "deep_trace_gap", "attribution_domain": "trace_health"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:task_root": NodeJudgment(
+                    node_ref="record:task_root",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="wrong_implementation",
+                    defect_reason="The implementation decision introduced the task defect.",
+                    causal_role="defect_introduction",
+                    is_root_cause=True,
+                    confidence=0.95,
+                ),
+                "record:trace_seed": NodeJudgment(
+                    node_ref="record:trace_seed",
+                    component="trace",
+                    event_type="observation",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="deep_trace_gap",
+                    defect_reason="The trace-health branch requires a deeper predecessor.",
+                    causal_role="defect_propagation",
+                    influenced_by=[TaintInfluence(upstream_ref="record:trace_upstream", reason="continue")],
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge, max_nodes=2).analyze(TraceGraph.from_trace(trace))
+        blocking_types = [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]]
+        advisory_types = [gap["gap_type"] for gap in report.trace_improvement_report["advisory_gaps"]]
+
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        self.assertEqual(report.metadata["termination_reason"], "queue_exhausted")
+        self.assertEqual(report.metadata["termination_reasons_by_domain"]["trace_health"], "node_limit")
+        self.assertNotIn("analysis_search_limit", blocking_types)
+        self.assertIn("analysis_search_limit", advisory_types)
 
     def test_motivating_evidence_does_not_become_a_defect_predecessor(self):
         trace = {

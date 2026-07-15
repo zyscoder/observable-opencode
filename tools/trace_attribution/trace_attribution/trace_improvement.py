@@ -40,7 +40,13 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
         if branch.analysis_outcome not in ("root_found", "no_defect")
     ]
     for branch in incomplete_branches:
-        blocking_gaps.append(
+        gap_target = (
+            advisory_gaps
+            if branch.metadata.get("attribution_domain") == "trace_health"
+            and report.metadata.get("primary_attribution_domain") == "task_quality"
+            else blocking_gaps
+        )
+        gap_target.append(
             {
                 "gap_type": "unresolved_defect_branch",
                 "node_ref": branch.start_ref,
@@ -53,9 +59,14 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
                 "missing_semantic_fields": ["branch_root_cause_episode"],
                 "related_refs": dedupe(branch.visited_order + branch.unresolved_refs),
                 "confidence": 1.0,
+                "attribution_domain": branch.metadata.get("attribution_domain", "task_quality"),
             }
         )
-    if incomplete_branches:
+    if any(
+        branch.metadata.get("attribution_domain") != "trace_health"
+        or report.metadata.get("primary_attribution_domain") != "task_quality"
+        for branch in incomplete_branches
+    ):
         add_recommendation(
             recommendations,
             component="attribution",
@@ -66,6 +77,68 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
             ),
             unblocks=["unresolved_defect_branch"],
         )
+
+    if report.metadata.get("primary_attribution_domain") == "task_quality":
+        for branch in report.defect_branches:
+            if branch.metadata.get("attribution_domain") != "trace_health":
+                continue
+            judge_errors = branch.metadata.get("judge_errors") or []
+            if judge_errors:
+                advisory_gaps.append(
+                    {
+                        "gap_type": "judge_error",
+                        "node_ref": branch.start_ref,
+                        "component": "attribution",
+                        "event_type": "node_judgment",
+                        "why_it_blocks_root_cause_analysis": (
+                            "A trace-health node could not be classified by the offline judge. "
+                            "The task-quality root remains valid, but observability diagnostics are incomplete."
+                        ),
+                        "missing_semantic_fields": ["completed_node_judgment"],
+                        "related_refs": [
+                            str(item.get("node_ref") or "")
+                            for item in judge_errors
+                            if isinstance(item, dict) and item.get("node_ref")
+                        ],
+                        "confidence": 1.0,
+                        "attribution_domain": "trace_health",
+                    }
+                )
+            termination_reason = branch.metadata.get("termination_reason")
+            if termination_reason in ("depth_limit", "node_limit"):
+                advisory_gaps.append(
+                    {
+                        "gap_type": "analysis_search_limit",
+                        "node_ref": branch.start_ref,
+                        "component": "attribution",
+                        "event_type": "analysis_boundary",
+                        "why_it_blocks_root_cause_analysis": (
+                            f"The trace-health branch stopped at the configured {termination_reason}. "
+                            "This does not invalidate the independently found task-quality root."
+                        ),
+                        "missing_semantic_fields": [],
+                        "related_refs": branch.visited_order,
+                        "confidence": 1.0,
+                        "attribution_domain": "trace_health",
+                    }
+                )
+            if branch.unresolved_refs:
+                advisory_gaps.append(
+                    {
+                        "gap_type": "unresolved_trace_refs",
+                        "node_ref": branch.start_ref,
+                        "component": "trace_graph",
+                        "event_type": "reference_resolution",
+                        "why_it_blocks_root_cause_analysis": (
+                            "The trace-health branch cites refs that do not resolve. "
+                            "They limit observability review but do not replace the task-quality outcome."
+                        ),
+                        "missing_semantic_fields": [],
+                        "related_refs": sorted(set(branch.unresolved_refs)),
+                        "confidence": 1.0,
+                        "attribution_domain": "trace_health",
+                    }
+                )
 
     for root in report.root_causes:
         node = graph.nodes.get(root.node_ref)
@@ -172,11 +245,16 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
             unblocks=["judge_error"],
         )
 
-    unknown_branch_outcomes: Dict[str, List[str]] = {}
+    unknown_branch_outcomes: Dict[str, List[tuple[str, str]]] = {}
     for branch in report.defect_branches:
         for ref, judgment in branch.node_judgments.items():
             if judgment.defect_status == "unknown":
-                unknown_branch_outcomes.setdefault(ref, []).append(branch.analysis_outcome)
+                unknown_branch_outcomes.setdefault(ref, []).append(
+                    (
+                        branch.analysis_outcome,
+                        str(branch.metadata.get("attribution_domain") or "task_quality"),
+                    )
+                )
 
     for ref, judgment in report.node_judgments.items():
         if judgment.defect_status != "unknown":
@@ -195,9 +273,17 @@ def build_trace_improvement_report(graph: Any, report: AttributionReport) -> Jso
         )
         detail = judgment.model_notes or judgment.defect_reason or "The judge could not classify this node."
         outcomes = unknown_branch_outcomes.get(ref) or []
+        all_non_blocking = bool(outcomes) and all(
+            outcome == "root_found"
+            or (
+                domain == "trace_health"
+                and report.metadata.get("primary_attribution_domain") == "task_quality"
+            )
+            for outcome, domain in outcomes
+        )
         gap_target = (
             advisory_gaps
-            if outcomes and all(outcome == "root_found" for outcome in outcomes)
+            if all_non_blocking
             else blocking_gaps
         )
         add_gap(

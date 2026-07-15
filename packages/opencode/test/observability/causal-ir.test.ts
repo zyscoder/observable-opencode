@@ -91,7 +91,11 @@ describe("causal IR store", () => {
 
   test("replays a node replacement journal prefix without a later lifecycle snapshot", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_nodes", caseID: "case_nodes", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_nodes",
+      caseID: "case_nodes",
+      append: (entry) => journal.push(entry),
+    })
     store.createNode(node("node_removed"))
     store.createNode(node("node_retained", { chosen_action: "keep" }))
     store.replaceNodes([node("node_replacement", { chosen_action: "replace" })])
@@ -103,7 +107,11 @@ describe("causal IR store", () => {
 
   test("replays an edge replacement journal prefix without a later lifecycle snapshot", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_edges", caseID: "case_edges", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_edges",
+      caseID: "case_edges",
+      append: (entry) => journal.push(entry),
+    })
     store.createEdge(edge("edge_removed"))
     store.createEdge(edge("edge_retained"))
     store.replaceEdges([edge("edge_replacement")])
@@ -155,7 +163,11 @@ describe("causal IR store", () => {
 
   test("replays a finalization prefix with the snapshot current at finalization", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_final", caseID: "case_final", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_final",
+      caseID: "case_final",
+      append: (entry) => journal.push(entry),
+    })
     const created = store.createNode(node("node_1", { chosen_action: "read" }))
     created.data = { chosen_action: "finalized" }
     store.finalize({ status: "success" })
@@ -193,7 +205,11 @@ describe("causal IR store", () => {
 
   test("rebuilds node payload hashes from a replacement snapshot and clears removed node hashes", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_node_hash", caseID: "case_node_hash", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_node_hash",
+      caseID: "case_node_hash",
+      append: (entry) => journal.push(entry),
+    })
     store.createNode(node("node_1", { chosen_action: "original" }))
     const replacement = node("node_1", { chosen_action: "replacement" })
     store.replaceNodes([replacement])
@@ -218,7 +234,11 @@ describe("causal IR store", () => {
 
   test("clears removed edge payload hashes after replacement", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_edge_hash", caseID: "case_edge_hash", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_edge_hash",
+      caseID: "case_edge_hash",
+      append: (entry) => journal.push(entry),
+    })
     store.createEdge(edge("edge_deleted"))
     store.replaceEdges([])
     store.createEdge(edge("edge_deleted"))
@@ -229,8 +249,8 @@ describe("causal IR store", () => {
   test("chains canonical payload hashes using locale-independent lexical key ordering", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({ runID: "run_hash", caseID: "case_hash", append: (entry) => journal.push(entry) })
-    const created = store.createNode(node("node_1", { z: 0, "ä": 2, a: 1 }))
-    created.data = { "ä": 2, a: 1, z: 3 }
+    const created = store.createNode(node("node_1", { z: 0, ä: 2, a: 1 }))
+    created.data = { ä: 2, a: 1, z: 3 }
     store.updateNode(created)
 
     const canonicalCreated = canonicalJSONForAudit(journal[0]?.data)
@@ -257,7 +277,11 @@ describe("causal IR store", () => {
 
   test("hashes sparse array slots as JSON null values", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_sparse", caseID: "case_sparse", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_sparse",
+      caseID: "case_sparse",
+      append: (entry) => journal.push(entry),
+    })
     store.createNode(node("empty", { values: [] }))
     store.createNode(node("hole", { values: new Array(1) }))
     store.createNode(node("mixed", { values: [1, , 2] }))
@@ -291,7 +315,11 @@ describe("causal IR store", () => {
 
   test("assigns contiguous journal sequence values", () => {
     const journal: CausalIRJournalEntry[] = []
-    const store = new CausalIRStore({ runID: "run_sequence", caseID: "case_sequence", append: (entry) => journal.push(entry) })
+    const store = new CausalIRStore({
+      runID: "run_sequence",
+      caseID: "case_sequence",
+      append: (entry) => journal.push(entry),
+    })
     store.createNode(node("node_1"))
     store.createDiagnostic({ diagnostic_id: "diagnostic_1", message: "warning" })
     store.checkpoint({ phase: "partial" })
@@ -514,9 +542,7 @@ describe("causal IR store", () => {
     const result = snapshot.nodes.find((item) => item.node_id === "toolresult_shared")
     const resolved = snapshot.edges.find((item) => item.edge_id === "edge_shared_call")
     const unresolved = snapshot.edges.find((item) => item.edge_id === "edge_unresolved")
-    const explicitNodeUnresolved = snapshot.edges.find(
-      (item) => item.edge_id === "edge_explicit_node_unresolved",
-    )
+    const explicitNodeUnresolved = snapshot.edges.find((item) => item.edge_id === "edge_explicit_node_unresolved")
 
     expect(call?.aliases).toContain("tool_call:shared_call")
     expect(result?.aliases).toContain("tool_result:shared_call")
@@ -537,11 +563,12 @@ describe("causal IR store", () => {
     })
     expect(snapshot.diagnostics).toContainEqual(
       expect.objectContaining({
-        diagnostic_id: expect.stringContaining("unresolved_ref:edge_unresolved:from:"),
+        diagnostic_id: expect.stringMatching(/^unresolved_ref:[a-f0-9]{16}$/),
         kind: "unresolved_ref",
         edge_id: "edge_unresolved",
         field: "from",
         legacy_ref: "verification:missing_verification",
+        occurrence_count: 1,
       }),
     )
     expect(store.snapshot().diagnostics).toEqual(snapshot.diagnostics)
@@ -554,6 +581,91 @@ describe("causal IR store", () => {
     expect(projection.dataflow_edges.find((item) => item.edge_id === "edge_shared_call")).toMatchObject({
       from: { type: "tool_call", id: "shared_call" },
       to: { type: "tool_result", id: "shared_call" },
+    })
+  })
+
+  test("resolves context snapshots and tool spans while preserving declared external identities", () => {
+    const store = new CausalIRStore({ runID: "run_runtime_aliases", caseID: "case_runtime_aliases" })
+    store.createNode({
+      ...node("context_pack_1"),
+      kind: "context.pack",
+      component: "context",
+      data: { snapshot_id: "ctx_1" },
+    })
+    store.createNode({
+      ...node("tool_call_1"),
+      kind: "tool.call",
+      component: "tool",
+      span_id: "span_1",
+      data: { call_id: "call_1" },
+    })
+    store.createEdge({
+      edge_id: "edge_context_snapshot",
+      from: { type: "context_snapshot", id: "ctx_1" },
+      to: { type: "tool_span", id: "span_1" },
+      relation: "used_as_context",
+    })
+    store.createEdge({
+      edge_id: "edge_span_alias",
+      from: { type: "span", id: "span_1" },
+      to: { type: "external", id: "result" },
+      relation: "produced",
+    })
+    store.createEdge({
+      edge_id: "edge_declared_external",
+      from: { type: "session", id: "ses_1" },
+      to: { type: "message", id: "msg_1" },
+      relation: "continued_from",
+      evidence_refs: ["processor_text:txt_1"],
+    })
+
+    const snapshot = store.snapshot()
+    expect(snapshot.nodes.find((item) => item.node_id === "context_pack_1")?.aliases).toContain(
+      "context_snapshot:ctx_1",
+    )
+    expect(snapshot.nodes.find((item) => item.node_id === "tool_call_1")?.aliases).toEqual(
+      expect.arrayContaining(["tool_span:span_1", "span:span_1"]),
+    )
+    expect(snapshot.edges.find((item) => item.edge_id === "edge_context_snapshot")).toMatchObject({
+      from: { ref_type: "node", ref_id: "context_pack_1" },
+      to: { ref_type: "node", ref_id: "tool_call_1" },
+    })
+    expect(snapshot.edges.find((item) => item.edge_id === "edge_span_alias")?.from).toMatchObject({
+      ref_type: "node",
+      ref_id: "tool_call_1",
+    })
+    expect(snapshot.edges.find((item) => item.edge_id === "edge_declared_external")).toMatchObject({
+      from: { ref_type: "external", ref_id: "ses_1" },
+      to: { ref_type: "external", ref_id: "msg_1" },
+      evidence_refs: [{ ref_type: "external", ref_id: "txt_1" }],
+    })
+    expect(snapshot.diagnostics.filter((item) => item.kind === "unresolved_ref")).toEqual([])
+  })
+
+  test("aggregates repeated unresolved references by legacy identity", () => {
+    const store = new CausalIRStore({ runID: "run_unresolved_aggregate", caseID: "case_unresolved_aggregate" })
+    store.createEdge({
+      edge_id: "edge_missing_1",
+      from: { type: "verification", id: "missing_verification" },
+      to: { type: "external", id: "result_1" },
+      relation: "derived_from",
+    })
+    store.createEdge({
+      edge_id: "edge_missing_2",
+      from: { type: "verification", id: "missing_verification" },
+      to: { type: "external", id: "result_2" },
+      relation: "derived_from",
+    })
+
+    const unresolved = store.snapshot().diagnostics.filter((item) => item.kind === "unresolved_ref")
+    expect(unresolved).toHaveLength(1)
+    expect(unresolved[0]).toMatchObject({
+      legacy_ref: "verification:missing_verification",
+      occurrence_count: 2,
+      affected_owners: [
+        { owner_type: "edge", owner_id: "edge_missing_1", field: "from" },
+        { owner_type: "edge", owner_id: "edge_missing_2", field: "from" },
+      ],
     })
   })
 
@@ -865,7 +977,9 @@ describe("causal IR store", () => {
     const store = new CausalIRStore({ runID: "run_replace_validation", caseID: "case_replace_validation" })
     store.createNode(node("old_input"))
 
-    expect(() => store.replaceNodes([node("replacement_input"), derived("replacement_output", "replacement_input")])).not.toThrow()
+    expect(() =>
+      store.replaceNodes([node("replacement_input"), derived("replacement_output", "replacement_input")]),
+    ).not.toThrow()
     expect(store.snapshot().nodes.map((item) => item.node_id)).toEqual(["replacement_input", "replacement_output"])
 
     const staleStore = new CausalIRStore({ runID: "run_replace_stale", caseID: "case_replace_stale" })
@@ -1209,7 +1323,7 @@ describe("causal IR store", () => {
       path: "artifacts/envelope.json",
       length: 42,
       hash: "hash_envelope",
-      preview: "{\"ok\":true}",
+      preview: '{"ok":true}',
       created_at: "2026-07-14T03:00:00.000Z",
       dedupe_key: "json:hash_envelope",
       occurrences: 2,
@@ -1539,10 +1653,7 @@ describe("causal IR store", () => {
   test("last write wins when replaceEdges receives duplicate edge IDs", () => {
     const store = new CausalIRStore({ runID: "run_replace_duplicates", caseID: "case_replace_duplicates" })
 
-    store.replaceEdges([
-      relationEdge("edge_duplicate", "custom_first"),
-      relationEdge("edge_duplicate", "custom_last"),
-    ])
+    store.replaceEdges([relationEdge("edge_duplicate", "custom_first"), relationEdge("edge_duplicate", "custom_last")])
 
     expect(store.edges).toEqual([
       expect.objectContaining({
@@ -1575,10 +1686,7 @@ describe("causal IR store", () => {
             runID: "run_lifecycle_duplicates",
             caseID: "case_lifecycle_duplicates",
             nodes: [],
-            edges: [
-              relationEdge("edge_duplicate", "custom_first"),
-              relationEdge("edge_duplicate", "custom_last"),
-            ],
+            edges: [relationEdge("edge_duplicate", "custom_first"), relationEdge("edge_duplicate", "custom_last")],
             artifacts: [],
             diagnostics: [],
           },

@@ -134,7 +134,7 @@ class CausalEpisodeIndexTest(unittest.TestCase):
             episodes.episode_for("record:temporal_neighbor").episode_id,
         )
 
-    def test_selects_earliest_defective_introduction_member(self):
+    def test_prefers_concrete_authored_action_over_generic_reasoning(self):
         graph = TraceGraph.from_trace(episode_trace())
         episodes = CausalEpisodeIndex.from_graph(graph)
         judgments = {
@@ -181,7 +181,7 @@ class CausalEpisodeIndexTest(unittest.TestCase):
             judgments,
         )
 
-        self.assertEqual(representative, "record:reasoning")
+        self.assertEqual(representative, "record:llm_tool_call")
 
     def test_aggregated_observation_provenance_does_not_bridge_tool_episodes(self):
         graph = TraceGraph.from_trace(trace_with_aggregated_observation_sources())

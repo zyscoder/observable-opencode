@@ -193,8 +193,7 @@ function isCompleteCausalIRCheckpoint(entry: any) {
 
 function checkpointIncludesNode(entry: any, markerNodeID: string) {
   return (
-    isCompleteCausalIRCheckpoint(entry) &&
-    entry.data.snapshot.nodes.some((node: any) => node?.node_id === markerNodeID)
+    isCompleteCausalIRCheckpoint(entry) && entry.data.snapshot.nodes.some((node: any) => node?.node_id === markerNodeID)
   )
 }
 
@@ -383,9 +382,7 @@ describe("case trace", () => {
     expect(trace.nodes.length).toBe(trace.metrics.records)
     expect(trace.edges.length).toBe(trace.metrics.dataflow_edges)
     expect(trace.artifacts.length).toBe(trace.metrics.artifacts)
-    expect(trace.nodes.map((node: any) => node.node_id)).toEqual(
-      trace.records.map((record: any) => record.record_id),
-    )
+    expect(trace.nodes.map((node: any) => node.node_id)).toEqual(trace.records.map((record: any) => record.record_id))
     expect(trace.records).toEqual(provenance.records)
     expect(trace.dataflow_edges).toEqual(provenance.dataflow_edges)
     expect(trace.artifacts).toEqual(provenance.artifacts)
@@ -498,9 +495,7 @@ describe("case trace", () => {
     const canonical = trace.nodes.find((item: any) => item.node_id === "node_refs")
     const compatibility = trace.records.find((item: any) => item.record_id === "node_refs")
     expect(canonical.scope.parent_span_id).toBe("span_parent")
-    expect(canonical.input_refs).toEqual([
-      { ref_type: "external", ref_id: "call_1", legacy_ref: "tool_call:call_1" },
-    ])
+    expect(canonical.input_refs).toEqual([{ ref_type: "external", ref_id: "call_1", legacy_ref: "tool_call:call_1" }])
     expect(canonical.output_refs).toEqual([
       { ref_type: "external", ref_id: "result_1", legacy_ref: "tool_result:result_1" },
     ])
@@ -659,10 +654,7 @@ describe("case trace", () => {
       label: "resolved edge after alias resolution",
       metadata: { revision: 2, nested: { preserved: true } },
     })
-    expect(legacy.dataflow_edges.map((item: any) => item.edge_id)).toEqual([
-      "late_alias_edge",
-      "legacy_edge_after",
-    ])
+    expect(legacy.dataflow_edges.map((item: any) => item.edge_id)).toEqual(["late_alias_edge", "legacy_edge_after"])
     expect(Object.keys(legacy.dataflow_edges[0])).toEqual([
       "edge_id",
       "from",
@@ -749,13 +741,13 @@ describe("case trace", () => {
         (item: any) => item.event_type === "decision" && item.data.decision_id === "temporal_decision",
       ),
       trace.records.find((item: any) => item.event_type === "prompt.assembly" && item.data.stage === "temporal_prompt"),
-      trace.records.find((item: any) => item.event_type === "context.transform" && item.data.stage === "temporal_transform"),
+      trace.records.find(
+        (item: any) => item.event_type === "context.transform" && item.data.stage === "temporal_transform",
+      ),
       trace.records.find(
         (item: any) => item.event_type === "context.compaction_check" && item.data.check_id === "temporal_compaction",
       ),
-      trace.records.find(
-        (item: any) => item.event_type === "context.compaction" && item.data.trigger === "auto",
-      ),
+      trace.records.find((item: any) => item.event_type === "context.compaction" && item.data.trigger === "auto"),
       trace.records.find((item: any) => item.event_type === "change" && item.data.change_id === "temporal_change"),
       repeatedCheck,
       response,
@@ -879,9 +871,9 @@ describe("case trace", () => {
     for (const node of derived) {
       expect(node.origin).toBe("deterministic_derived")
       expect(node.input_refs.length).toBeGreaterThan(0)
-      expect(node.input_refs.every((ref: any) => typeof ref.ref_type === "string" && typeof ref.ref_id === "string")).toBe(
-        true,
-      )
+      expect(
+        node.input_refs.every((ref: any) => typeof ref.ref_type === "string" && typeof ref.ref_id === "string"),
+      ).toBe(true)
       expect(node.derivation).toMatchObject({
         algorithm: expect.any(String),
         algorithm_version: expect.any(String),
@@ -960,6 +952,273 @@ describe("case trace", () => {
           edge.from.id === transform.record_id &&
           edge.to.id === response.record_id &&
           edge.relation === "used_as_context",
+      ),
+    ).toBe(true)
+  })
+
+  test("links tool result through request context and LLM generation to a reasoning decision", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-decision-generation-chain-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "decision-generation-chain.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "inspect then decide" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "bash", callID: "call_tests", sessionID: "ses_decision", messageID: "msg_tool", output: "18 assertions passed" } })`,
+        `const transform = CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_decision", message_id: "msg_assistant", step: 2, agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { session_messages: [{ role: "tool", toolCallId: "call_tests", content: "18 assertions passed" }] }, output: { model_messages: [{ role: "tool", toolCallId: "call_tests", content: "18 assertions passed" }] }, transforms: [{ name: "MessageV2.toModelMessagesEffect" }] })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_decision", messageID: "msg_assistant", agent: "build", model: { providerID: "deepseek", id: "unit-test" } } })`,
+        `CaseTrace.llmTurn({ span_id: span?.id, session_id: "ses_decision", message_id: "msg_assistant", agent: "build", provider_id: "deepseek", model_id: "unit-test", input_context_refs: transform ? ["node:" + transform.node_id] : [], source_refs: transform ? ["node:" + transform.node_id] : [], status: "success", finish_reason: "tool-calls" })`,
+        `CaseTrace.decision({ component: "processor", decision_type: "reasoning_block", intent: "interpret verification", chosen_action: "report success", rationale: "The observed assertions passed.", metadata: { sessionID: "ses_decision", messageID: "msg_assistant" } })`,
+        `span?.end({ output: { completed: true, finish_reason: "tool-calls" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "decision-generation-chain-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "decision-generation-chain-case", "trace.json"), "utf8"),
+    ) as any
+    const toolResult = trace.records.find((record: any) => record.event_type === "tool.result")
+    const transform = trace.records.find((record: any) => record.event_type === "context.transform")
+    const llm = trace.records.find((record: any) => record.event_type === "llm.call")
+    const decision = trace.records.find(
+      (record: any) => record.event_type === "decision" && record.data.decision_type === "reasoning_block",
+    )
+
+    expect(transform.source_refs).toContain(`node:${toolResult.record_id}`)
+    expect(decision.source_refs).toEqual(
+      expect.arrayContaining([`node:${transform.record_id}`, `node:${llm.record_id}`]),
+    )
+    expect(
+      trace.edges.some(
+        (edge: any) =>
+          edge.from.ref_id === toolResult.record_id &&
+          edge.to.ref_id === transform.record_id &&
+          edge.normalized_relation === "used_as_context",
+      ),
+    ).toBe(true)
+    expect(
+      trace.dataflow_edges.some(
+        (edge: any) =>
+          edge.from.id === llm.record_id && edge.to.id === decision.record_id && edge.relation === "produced",
+      ),
+    ).toBe(true)
+  })
+
+  test("keeps decision generation provenance within the decision session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-decision-session-scope-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "decision-session-scope.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "parent request" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", message_id: "msg_parent", input: { messages: ["parent"] }, output: { model_messages: ["parent"] } })`,
+        `CaseTrace.llmTurn({ session_id: "ses_parent", message_id: "msg_parent", agent: "build", provider_id: "deepseek", model_id: "unit-test", status: "success", finish_reason: "tool-calls" })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_child", message_id: "msg_child", input: { messages: ["child"] }, output: { model_messages: ["child"] } })`,
+        `CaseTrace.llmTurn({ session_id: "ses_child", message_id: "msg_child", agent: "general", provider_id: "deepseek", model_id: "unit-test", status: "success", finish_reason: "tool-calls" })`,
+        `CaseTrace.decision({ component: "processor", decision_type: "reasoning_block", chosen_action: "edit parent", rationale: "parent reasoning", metadata: { sessionID: "ses_parent", messageID: "msg_parent" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "decision-session-scope-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "decision-session-scope-case", "trace.json"), "utf8"),
+    ) as any
+    const decision = trace.records.find(
+      (record: any) => record.event_type === "decision" && record.data.chosen_action === "edit parent",
+    )
+    const referenced = decision.source_refs.map((ref: string) => ref.replace(/^node:/, ""))
+    const referencedNodes = trace.records.filter((record: any) => referenced.includes(record.record_id))
+
+    expect(referencedNodes.some((record: any) => record.data.session_id === "ses_parent")).toBe(true)
+    expect(referencedNodes.some((record: any) => record.data.session_id === "ses_child")).toBe(false)
+  })
+
+  test("scopes production-shaped generation nodes and context snapshots to one assistant turn", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-production-generation-scope-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "production-generation-scope.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "parent request" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_parent", message_id: "msg_parent_assistant", input: { messages: ["parent"] }, output: { model_messages: ["parent"] } })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", input: { messages: ["parent-ready"] }, output: { model_messages: ["parent-ready"] } })`,
+        `const parentSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_parent", agent: "build", model: { providerID: "deepseek", id: "unit-test" } } })`,
+        `const parentSnapshot = CaseTrace.contextSnapshot({ span_id: parentSpan?.id, phase: "llm_request", agent: "build", messages: ["parent"], metadata: { session_id: "ses_parent", message_id: "msg_parent_assistant" } })`,
+        `CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_child", message_id: "msg_child_assistant", input: { messages: ["child"] }, output: { model_messages: ["child"] } })`,
+        `const childSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_child", agent: "general", model: { providerID: "deepseek", id: "unit-test" } } })`,
+        `const childSnapshot = CaseTrace.contextSnapshot({ span_id: childSpan?.id, phase: "llm_request", agent: "general", messages: ["child"], metadata: { session_id: "ses_child", message_id: "msg_child_assistant" } })`,
+        `CaseTrace.decision({ component: "processor", decision_type: "reasoning_block", chosen_action: "edit parent", rationale: "parent reasoning", metadata: { sessionID: "ses_parent", messageID: "msg_parent_assistant" } })`,
+        `parentSpan?.end({ output: { completed: true } })`,
+        `childSpan?.end({ output: { completed: true } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "production-generation-scope-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "production-generation-scope-case", "trace.json"), "utf8"),
+    ) as any
+    const decision = trace.records.find(
+      (record: any) => record.event_type === "decision" && record.data.chosen_action === "edit parent",
+    )
+    const selected = decision.data.selected_context_refs as string[]
+    const generatedBy = decision.source_refs
+      .map((ref: string) => ref.replace(/^node:/, ""))
+      .map((id: string) => trace.records.find((record: any) => record.record_id === id))
+      .filter(Boolean)
+    const parentSnapshot = trace.records.find(
+      (record: any) => record.event_type === "context.pack" && record.data.metadata?.session_id === "ses_parent",
+    )
+    const childSnapshot = trace.records.find(
+      (record: any) => record.event_type === "context.pack" && record.data.metadata?.session_id === "ses_child",
+    )
+
+    expect(
+      generatedBy.some((record: any) => record.event_type === "llm.call" && record.data.session_id === "ses_parent"),
+    ).toBe(true)
+    expect(generatedBy.some((record: any) => record.data.session_id === "ses_child")).toBe(false)
+    expect(selected).toContain(`context_snapshot:${parentSnapshot.data.snapshot_id}`)
+    expect(selected).not.toContain(`context_snapshot:${childSnapshot.data.snapshot_id}`)
+  })
+
+  test("selects tool outcomes only by structured call identity in the same session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-exact-tool-context-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "exact-tool-context.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "inspect" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { sessionID: "ses_owner", messageID: "msg_tool", callID: "call_1", tool: "read", input: { path: "owner.txt" } } })`,
+        `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "owner observation", data: { session_id: "ses_owner", call_id: "call_1", output: "owner pending" }, source_refs: ["tool_call:call_1"] })`,
+        `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "unscoped legacy observation", data: { call_id: "call_1", output: "ambiguous pending" }, source_refs: ["tool_call:call_1"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { sessionID: "ses_owner", messageID: "msg_tool", callID: "call_1", tool: "read", output: "owner result" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { sessionID: "ses_other", messageID: "msg_other_tool", callID: "call_1", tool: "read", input: { path: "other.txt" } } })`,
+        `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "other observation", data: { session_id: "ses_other", call_id: "call_1", output: "other pending" }, source_refs: ["tool_call:call_1"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { sessionID: "ses_other", messageID: "msg_other_tool", callID: "call_1", tool: "read", output: "other result" } })`,
+        `CaseTrace.contextTransform({ stage: "ordinary_text", session_id: "ses_owner", message_id: "msg_owner", input: { text: "Do not confuse call_10 with another identifier." }, output: { messages: [{ role: "user", content: "call_10" }] } })`,
+        `CaseTrace.contextTransform({ stage: "other_session", session_id: "ses_other", message_id: "msg_other", input: { messages: [{ role: "tool", toolCallId: "call_1", content: "foreign" }] }, output: { model_messages: [{ role: "tool", toolCallId: "call_1", content: "foreign" }] } })`,
+        `CaseTrace.contextTransform({ stage: "owner_session", session_id: "ses_owner", message_id: "msg_owner", input: { messages: [{ role: "tool", toolCallId: "call_1", content: "owner result" }] }, output: { model_messages: [{ role: "tool", toolCallId: "call_1", content: "owner result" }] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "exact-tool-context-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "exact-tool-context-case", "trace.json"), "utf8")) as any
+    const transforms = Object.fromEntries(
+      trace.records
+        .filter((record: any) => record.event_type === "context.transform")
+        .map((record: any) => [record.data.stage, record]),
+    )
+    const ownerResult = trace.records.find(
+      (record: any) => record.event_type === "tool.result" && record.data.session_id === "ses_owner",
+    )
+    const otherResult = trace.records.find(
+      (record: any) => record.event_type === "tool.result" && record.data.session_id === "ses_other",
+    )
+    const ownerCall = trace.records.find(
+      (record: any) => record.event_type === "tool.call" && record.data.session_id === "ses_owner",
+    )
+    const otherCall = trace.records.find(
+      (record: any) => record.event_type === "tool.call" && record.data.session_id === "ses_other",
+    )
+    const ownerObservation = trace.records.find(
+      (record: any) => record.event_type === "execution.observation" && record.data.data?.session_id === "ses_owner",
+    )
+    const otherObservation = trace.records.find(
+      (record: any) => record.event_type === "execution.observation" && record.data.data?.session_id === "ses_other",
+    )
+    const unscopedObservation = trace.records.find(
+      (record: any) =>
+        record.event_type === "execution.observation" && record.data.summary === "unscoped legacy observation",
+    )
+
+    expect(transforms.ordinary_text.data.inferred_tool_context_refs).toEqual([])
+    expect(ownerResult.record_id).not.toBe(otherResult.record_id)
+    expect(transforms.other_session.data.inferred_tool_context_refs).toEqual([`node:${otherResult.record_id}`])
+    expect(transforms.owner_session.data.inferred_tool_context_refs).toEqual([`node:${ownerResult.record_id}`])
+    expect(ownerObservation.source_refs).toContain(`node:${ownerResult.record_id}`)
+    expect(ownerObservation.source_refs).not.toContain(`node:${otherResult.record_id}`)
+    expect(otherObservation.source_refs).toContain(`node:${otherResult.record_id}`)
+    expect(otherObservation.source_refs).not.toContain(`node:${ownerResult.record_id}`)
+    expect(unscopedObservation.source_refs).not.toContain(`node:${ownerResult.record_id}`)
+    expect(unscopedObservation.source_refs).not.toContain(`node:${otherResult.record_id}`)
+    expect(
+      trace.edges.some(
+        (edge: any) => edge.from.ref_id === ownerCall.record_id && edge.to.ref_id === ownerResult.record_id,
+      ),
+    ).toBe(true)
+    expect(
+      trace.edges.some(
+        (edge: any) => edge.from.ref_id === otherCall.record_id && edge.to.ref_id === otherResult.record_id,
       ),
     ).toBe(true)
   })
@@ -3023,6 +3282,12 @@ describe("case trace", () => {
     expect(samePayloadArtifacts).toHaveLength(1)
     expect(samePayloadArtifacts[0].occurrences).toBe(3)
     expect(samePayloadArtifacts[0].path).toMatch(/^artifacts\/sha256\//)
+    expect(samePayloadArtifacts[0].storage_encoding).toBe("json_minified")
+    const stored = await fs.readFile(path.join(dir, "causal-dedupe-case", samePayloadArtifacts[0].path), "utf8")
+    expect(() => JSON.parse(stored)).not.toThrow()
+    expect(stored).not.toContain("\n  ")
+    expect(samePayloadArtifacts[0].stored_length).toBe(Buffer.byteLength(stored))
+    expect(samePayloadArtifacts[0].original_length).toBeGreaterThanOrEqual(samePayloadArtifacts[0].stored_length)
   })
 
   test("finalizes canonical partial and trace when a traced process receives SIGINT", async () => {
@@ -3472,6 +3737,147 @@ describe("case trace", () => {
     ).toBe(true)
   })
 
+  test("links parent consumption by exact child-result content without altering agent input", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v63-subagent-content-consumed-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subagent-content-consumed-v63.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner" } })`,
+        `span?.end({ output: { child_session_id: "ses_child_content", child_status: "success", output: "renewalQuote owner is billing-platform" } })`,
+        `CaseTrace.responseOutput({ response_role: "subagent_result", text: "renewalQuote owner is billing-platform", metadata: { session_id: "ses_child_content" } })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", message_id: "msg_parent", input: { messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] } })`,
+        `CaseTrace.responseOutput({ text: "The renewalQuote owner is billing-platform." })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subagent-content-consumed-v63-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-content-consumed-v63-case", "trace.json"), "utf8"),
+    ) as any
+    const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
+    const parentContext = trace.records.find(
+      (record: any) => record.event_type === "context.transform" && record.data.session_id === "ses_parent",
+    )
+
+    expect(subagent.data.parent_consumption_refs).toContain(`context:${parentContext.record_id}`)
+    expect(subagent.data.parent_consumption_evidence).toContainEqual(
+      expect.objectContaining({
+        consumer_ref: `context:${parentContext.record_id}`,
+        evidence_tier: "content_matched",
+        behavior_impact: "none",
+      }),
+    )
+  })
+
+  test("does not infer parent consumption from an internal child tool result", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-subagent-internal-result-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subagent-internal-result.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { sessionID: "ses_child_internal", callID: "call_child_read", tool: "read", output: "shared internal code fragment" } })`,
+        `span?.end({ output: { child_session_id: "ses_child_internal", child_status: "success", output: "final owner is billing-platform" } })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", message_id: "msg_parent", input: { messages: [{ role: "user", content: "shared internal code fragment" }] }, output: { model_messages: [{ role: "user", content: "shared internal code fragment" }] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subagent-internal-result-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-internal-result-case", "trace.json"), "utf8"),
+    ) as any
+    const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
+
+    expect(subagent.data.parent_consumption_refs).toEqual([])
+    expect(subagent.data.parent_consumption_evidence).toEqual([])
+  })
+
+  test("matches subagent consumption only after child completion and inside the parent session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-subagent-parent-boundary-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subagent-parent-boundary.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.contextTransform({ stage: "before_child", session_id: "ses_parent", message_id: "msg_before", input: { messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] } })`,
+        `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner", parent_session_id: "ses_parent", message_id: "msg_parent" } })`,
+        `span?.end({ output: { child_session_id: "ses_child_boundary", child_status: "success", output: "renewalQuote owner is billing-platform" } })`,
+        `CaseTrace.responseOutput({ response_role: "subagent_result", text: "renewalQuote owner is billing-platform", metadata: { session_id: "ses_child_boundary", message_id: "msg_child" } })`,
+        `CaseTrace.contextTransform({ stage: "other_parent", session_id: "ses_other", message_id: "msg_other", input: { messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] } })`,
+        `CaseTrace.contextTransform({ stage: "after_child", session_id: "ses_parent", message_id: "msg_after", input: { messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subagent-parent-boundary-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-parent-boundary-case", "trace.json"), "utf8"),
+    ) as any
+    const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
+    const consumerStages = subagent.data.parent_consumption_refs
+      .map((ref: string) => ref.replace(/^context:/, ""))
+      .map((id: string) => trace.records.find((record: any) => record.record_id === id)?.data?.stage)
+      .filter(Boolean)
+
+    expect(consumerStages).toEqual(["after_child"])
+  })
+
   test("treats run and lifecycle records cancelled at trace finish as expected finalization", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v51-lifecycle-cancelled-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -3909,15 +4315,13 @@ describe("case trace", () => {
     expect(assessment.data.tool_failure_dependency_refs ?? []).not.toContain("tool_error:call_missing")
     expect(assessment.data.support_level).toBe("unsupported")
     const advisoryEdges = trace.dataflow_edges.filter(
-      (edge: any) =>
-        edge.from?.id === "call_missing" && edge.metadata?.derivation_method === "recent_source_fallback",
+      (edge: any) => edge.from?.id === "call_missing" && edge.metadata?.derivation_method === "recent_source_fallback",
     )
     expect(advisoryEdges.length).toBeGreaterThan(0)
     expect(
       advisoryEdges.every(
         (edge: any) =>
-          edge.metadata?.evidence_tier === "temporal_advisory" &&
-          edge.metadata?.eligible_for_attribution === false,
+          edge.metadata?.evidence_tier === "temporal_advisory" && edge.metadata?.eligible_for_attribution === false,
       ),
     ).toBe(true)
   })
@@ -4528,9 +4932,7 @@ describe("case trace", () => {
     await proc.exited.catch(() => undefined)
 
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
-    const partial = JSON.parse(
-      await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8"),
-    ) as any
+    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const journal = await readCausalIRJournal(caseDir)
 
     expect(html).toContain("Trace v6.0")
@@ -5321,9 +5723,7 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(
-      await fs.readFile(path.join(dir, "change-provenance-case", "trace.json"), "utf8"),
-    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "change-provenance-case", "trace.json"), "utf8")) as any
     const change = trace.records.find((record: any) => record.event_type === "change")
 
     expect(change.source_refs).toContain("tool_call:call_edit")
@@ -5496,9 +5896,7 @@ describe("case trace", () => {
       expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]),
     )
     expect(
-      journal
-        .filter((entry: any) => entry.operation === "node.created")
-        .map((entry: any) => entry.entity_id),
+      journal.filter((entry: any) => entry.operation === "node.created").map((entry: any) => entry.entity_id),
     ).toEqual(expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]))
     expect(replayed.nodes.map((node: any) => node.node_id)).toEqual(
       expect.arrayContaining([missingSemantic.record_id, observedDefect.record_id]),
@@ -5726,13 +6124,7 @@ describe("case trace", () => {
     )
 
     expect(journal.map((entry: any) => entry.operation)).toEqual(
-      expect.arrayContaining([
-        "node.created",
-        "node.updated",
-        "artifact.created",
-        "artifact.reused",
-        "case.finalized",
-      ]),
+      expect.arrayContaining(["node.created", "node.updated", "artifact.created", "artifact.reused", "case.finalized"]),
     )
     assertCausalIRJournalAudit(journal)
     const replayed = replayCausalIRJournal(journal)
@@ -5745,9 +6137,7 @@ describe("case trace", () => {
     const leakedSecrets = Object.values(secrets).filter((secret) => persistedText.some((text) => text.includes(secret)))
     expect(leakedSecrets).toEqual([])
     expect(persistedText.some((text) => text.includes("https://cookie-provenance.example/api"))).toBe(true)
-    expect(
-      persistedText.some((text) => text.includes("-X POST https://cookie-provenance.example/post")),
-    ).toBe(true)
+    expect(persistedText.some((text) => text.includes("-X POST https://cookie-provenance.example/post"))).toBe(true)
     expect(recordsText).toContain('"apiKey":"[REDACTED]"')
     expect(recordsText).toContain('"password":"[REDACTED]"')
     expect(recordsText).toContain('"token":"[REDACTED]"')
@@ -5878,7 +6268,9 @@ describe("case trace", () => {
       preview: ordinaryText.slice(0, 64),
     })
     expect(summaries.ordinarySummary.artifact_id).toBeTruthy()
-    const ordinaryArtifact = trace.artifacts.find((artifact: any) => artifact.artifact_id === summaries.ordinarySummary.artifact_id)
+    const ordinaryArtifact = trace.artifacts.find(
+      (artifact: any) => artifact.artifact_id === summaries.ordinarySummary.artifact_id,
+    )
     expect(await fs.readFile(path.join(caseDir, ordinaryArtifact.path), "utf8")).toBe(ordinaryText)
     assertCausalIRJournalAudit(journal)
     const replayed = replayCausalIRJournal(journal)
@@ -5938,7 +6330,9 @@ describe("case trace", () => {
       expect.objectContaining({ kind: "artifact_write_failed", status: "write_failed" }),
     )
     expect(html).not.toContain('href="artifacts/sha256/')
-    expect((await readCausalIRJournal(caseDir)).some((entry: any) => entry.operation === "artifact.created")).toBe(false)
+    expect((await readCausalIRJournal(caseDir)).some((entry: any) => entry.operation === "artifact.created")).toBe(
+      false,
+    )
   })
 
   test("updates and removes current formal diagnostics without duplicate journal facts", async () => {
@@ -5981,10 +6375,7 @@ describe("case trace", () => {
     const caseDir = path.join(dir, "diagnostic-reconcile-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const journal = await readCausalIRJournal(caseDir)
-    const diagnosticIDs = [
-      "missing_semantic_final_test_result",
-      "observed_defect_missing_verification_after_change",
-    ]
+    const diagnosticIDs = ["missing_semantic_final_test_result", "observed_defect_missing_verification_after_change"]
 
     assertCausalIRJournalAudit(journal)
     const checkpoints = journal.filter((entry: any) => entry.operation === "case.checkpointed")
@@ -6011,6 +6402,53 @@ describe("case trace", () => {
     expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
     expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
     assertJournalReplaysCanonicalTrace(journal, trace)
+  })
+
+  test("records passive verification-attempt semantics for handwritten assertion scripts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-handwritten-verification-attempt-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "handwritten-verification-attempt.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const command = `python3 -c "assert 2 + 2 == 4; assert 'owner'.upper() == 'OWNER'; print('ALL TESTS PASSED')"`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ command: ${JSON.stringify(command)}, purpose: "Run handwritten full integration test", exit_code: 0, status: "passed", stdout: "ALL TESTS PASSED\\n2 assertions" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "handwritten-verification-attempt-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "handwritten-verification-attempt-case", "trace.json"), "utf8"),
+    ) as any
+    const verification = trace.records.find((record: any) => record.event_type === "verification")
+
+    expect(verification.data.final_test_result.result_kind).toBe("test_result")
+    expect(verification.data.verification_attempt).toMatchObject({
+      attempt_kind: "handwritten_assertion_script",
+      detection_method: "passive_command_analysis",
+      assertion_count: 2,
+      declared_scope: "full_integration",
+      oracle_source: "inline_assertions",
+      behavior_impact: "none",
+    })
+    expect(verification.data.quality_flags).toContain("handwritten_self_test")
   })
 
   test("marks verification risk when test oracles were changed before tests passed", async () => {
@@ -6607,15 +7045,12 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(code).toBe(0)
 
-    const legacy = JSON.parse(
-      await fs.readFile(path.join(dir, "source-ref-case", "legacy-trace.json"), "utf8"),
-    ) as any
+    const legacy = JSON.parse(await fs.readFile(path.join(dir, "source-ref-case", "legacy-trace.json"), "utf8")) as any
     const trace = JSON.parse(await fs.readFile(path.join(dir, "source-ref-case", "trace.json"), "utf8")) as any
     const refs = legacy.response_segments[0].source_refs ?? []
     const response = trace.records.find((record: any) => record.event_type === "response.output")
     const advisoryEdges = trace.edges.filter(
-      (edge: any) =>
-        edge.to?.ref_id === response.record_id && edge.derivation_method === "recent_source_fallback",
+      (edge: any) => edge.to?.ref_id === response.record_id && edge.derivation_method === "recent_source_fallback",
     )
     const advisoryRefs = advisoryEdges.map((edge: any) => edge.from?.legacy_ref)
 
@@ -7175,9 +7610,7 @@ describe("case trace", () => {
     expect(JSON.parse(await fs.readFile(path.join(caseDir, objectArtifact.path), "utf8"))).toEqual(
       Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`check_${index}`, `v${index}`])),
     )
-    expect(record.data.final_test_result.inline_checks).toEqual(
-      Array.from({ length: 64 }, (_, index) => `i${index}`),
-    )
+    expect(record.data.final_test_result.inline_checks).toEqual(Array.from({ length: 64 }, (_, index) => `i${index}`))
   })
 
   test("keeps generated array summaries intact while rejecting summary-shaped business data", async () => {

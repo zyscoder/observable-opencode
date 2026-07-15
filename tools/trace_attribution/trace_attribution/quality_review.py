@@ -43,6 +43,7 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
                     "minimum_acceptable_score": quality.get("minimum_acceptable_score"),
                     "quality_status": quality.get("status"),
                     "attribution_objective": quality.get("attribution_objective"),
+                    "attribution_domain": "task_quality",
                 },
             }
         )
@@ -67,6 +68,7 @@ def inject_quality_gap_records(trace: JsonDict, review: JsonDict) -> JsonDict:
                     "semantic_name": semantic_name,
                     "gap_kind": "required_trace_semantic_missing",
                     "reason": f"Stress review did not find required trace semantic: {semantic_name}.",
+                    "attribution_domain": "trace_health",
                 },
             }
         )
@@ -113,6 +115,7 @@ def inject_observed_defect_record(
                 "source_ref_count_included": len(included_refs),
                 "source_refs_truncated": len(included_refs) < len(all_refs),
                 "offline_only": True,
+                "attribution_domain": "task_quality",
                 "reason": "Stress review explicitly declares an observed execution defect with evidence refs.",
             },
         }
