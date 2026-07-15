@@ -1544,7 +1544,7 @@ function redactText(input: string) {
     (_match, quote: string, header: string) => `${quote}${header}[REDACTED]${quote}`,
   )
   output = output.replace(
-    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])([^\r\n]*?)(?=\s+--?[a-z][a-z0-9_-]*(?:[=\s]|$)|$)/gi,
+    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])(?:(?:"(?:\\.|[^"\\])*")|(?:'(?:\\.|[^'\\])*')|[^\s\r\n"'])+/gi,
     "$1[REDACTED]",
   )
   output = output.replace(

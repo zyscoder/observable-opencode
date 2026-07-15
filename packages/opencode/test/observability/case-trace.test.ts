@@ -5599,8 +5599,8 @@ describe("case trace", () => {
         `const endpoint = new URL("https://reader:" + secrets.urlPassword + "@example.com/audit?api_key=" + secrets.urlQuery + "&visible=ok")`,
         `const textSecrets = { token: secrets.plainToken, token_usage: secrets.tokenUsageString, token_estimate: secrets.tokenEstimateString, quoted_json: "{\\\"token\\\":\\\"" + secrets.quotedJsonToken + "\\\",\\\"apiKey\\\":\\\"" + secrets.quotedJsonApiKey + "\\\"}", header: "Authorization: Basic " + secrets.headerSecret + "\\nX-API-Key: " + secrets.headerSecret, cookie_header: "Cookie: session=" + secrets.cookieSession + "; refresh=" + secrets.cookieRefresh + "; Path=/", curl_header_command: "curl -sS https://example.com/audit -H \\\"Cookie: session=" + secrets.cookieCurlSession + "; refresh=" + secrets.cookieCurlRefresh + "; Path=/\\\" --compressed", quoted_header_command: "env MODE=audit curl --header='Cookie: auth=" + secrets.cookieCurlSingle + "; Path=/' https://example.com", shell: "TOKEN=" + secrets.shellSecret + " AUTHORIZATION=" + secrets.authorizationAssignment + " --password " + secrets.shellSecret, url: "https://reader:" + secrets.stringUrlPassword + "@example.com/audit?token=" + secrets.stringUrlToken, error: new Error("Cookie: session=" + secrets.cookieError + "; Path=/audit") }`,
         `textSecrets.unquoted_header_command = "env MODE=audit curl -H Cookie:auth=" + secrets.cookieCurlUnquoted + ";Path=/ --compressed https://example.com"`,
-        `textSecrets.shell_fragment_double_a = 'curl -H Cookie:session="' + secrets.cookieCurlEmbeddedDouble + '" --compressed'`,
-        `textSecrets.shell_fragment_single_a = "curl -H Cookie:session='" + secrets.cookieCurlEmbeddedSingle + "' --compressed"`,
+        `textSecrets.shell_fragment_double_a = 'curl -H Cookie:session="' + secrets.cookieCurlEmbeddedDouble + '" https://cookie-provenance.example/api'`,
+        `textSecrets.shell_fragment_single_a = "curl -H Cookie:session='" + secrets.cookieCurlEmbeddedSingle + "' -X POST https://cookie-provenance.example/post"`,
         `textSecrets.shell_fragment_double_b = 'curl -H Set-Cookie:session="' + secrets.setCookieCurlEmbeddedDouble + '" --compressed'`,
         `textSecrets.shell_fragment_single_b = "curl -H Set-Cookie:session='" + secrets.setCookieCurlEmbeddedSingle + "' --compressed"`,
         `const environment = { apiKey: secrets.apiKey, password: secrets.password, token: secrets.token, accessToken: secrets.accessToken, error, endpoint }`,
@@ -5665,8 +5665,8 @@ describe("case trace", () => {
         curl_header_command: `curl -sS https://example.com/audit -H "Cookie: session=${secrets.cookieCurlSession}; refresh=${secrets.cookieCurlRefresh}; Path=/" --compressed`,
         quoted_header_command: `env MODE=audit curl --header='Cookie: auth=${secrets.cookieCurlSingle}; Path=/' https://example.com`,
         unquoted_header_command: `env MODE=audit curl -H Cookie:auth=${secrets.cookieCurlUnquoted};Path=/ --compressed https://example.com`,
-        shell_fragment_double_a: `curl -H Cookie:session="${secrets.cookieCurlEmbeddedDouble}" --compressed`,
-        shell_fragment_single_a: `curl -H Cookie:session='${secrets.cookieCurlEmbeddedSingle}' --compressed`,
+        shell_fragment_double_a: `curl -H Cookie:session="${secrets.cookieCurlEmbeddedDouble}" https://cookie-provenance.example/api`,
+        shell_fragment_single_a: `curl -H Cookie:session='${secrets.cookieCurlEmbeddedSingle}' -X POST https://cookie-provenance.example/post`,
         shell_fragment_double_b: `curl -H Set-Cookie:session="${secrets.setCookieCurlEmbeddedDouble}" --compressed`,
         shell_fragment_single_b: `curl -H Set-Cookie:session='${secrets.setCookieCurlEmbeddedSingle}' --compressed`,
         shell: `TOKEN=${secrets.shellSecret} AUTHORIZATION=${secrets.authorizationAssignment} --password ${secrets.shellSecret}`,
@@ -5744,6 +5744,10 @@ describe("case trace", () => {
     expect(undefinedTokenUsagePolicy.payload).not.toHaveProperty("token_usage")
     const leakedSecrets = Object.values(secrets).filter((secret) => persistedText.some((text) => text.includes(secret)))
     expect(leakedSecrets).toEqual([])
+    expect(persistedText.some((text) => text.includes("https://cookie-provenance.example/api"))).toBe(true)
+    expect(
+      persistedText.some((text) => text.includes("-X POST https://cookie-provenance.example/post")),
+    ).toBe(true)
     expect(recordsText).toContain('"apiKey":"[REDACTED]"')
     expect(recordsText).toContain('"password":"[REDACTED]"')
     expect(recordsText).toContain('"token":"[REDACTED]"')

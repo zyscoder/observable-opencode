@@ -3,9 +3,11 @@
 ## Scope And Result
 
 Round 4 closes both findings in
-`.superpowers/sdd/final-review-round4.md`: 1 Critical and 1 Important. Together
-with the first three unified-fix rounds, the local Causal IR migration
-acceptance gate is green.
+`.superpowers/sdd/final-review-round4.md`: 1 Critical and 1 Important. Round 5
+then closes the follow-up over-redaction finding in
+`.superpowers/sdd/final-review-round5.md`: 1 Important. Together with the
+first three unified-fix rounds, the local Causal IR migration acceptance gate
+is green.
 
 This round changes only the owned CaseTrace implementation, its focused tests,
 and the two requested reports. `causal-ir.ts`, the viewers, semantic
@@ -20,7 +22,7 @@ All final commands were run on 2026-07-15. The Bun executable reports version
 
 | Working directory | Command | Result |
 | --- | --- | --- |
-| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 169 passed, 0 failed, 1,738 expectations, 26.80 s |
+| `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun test test/observability/causal-ir.test.ts test/observability/case-trace.test.ts test/tool/semantic-observability.test.ts --timeout 30000` | 169 passed, 0 failed, 1,740 expectations, 28.28 s |
 | `packages/opencode` | `/private/tmp/bun-1.3.13/bin/bun run typecheck` | exit 0 (`tsgo --noEmit`) |
 | repository root | `PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_backward_taint -v` | 85 passed, 0 failed, 0.129 s |
 | repository root | `git diff --check` | exit 0 |
@@ -37,8 +39,9 @@ semantic-observability tests.
 - The canonical ownership regression wrote the same `edge_id` before and
   after late alias resolution. RED observed two legacy edges while the
   canonical store correctly held one last-write-wins edge.
-- GREEN replaces the complete header value, keeps agent inputs byte-for-byte
-  unchanged, and projects one legacy edge from the canonical late-alias state.
+- GREEN replaces the complete shell header token, preserves following URL and
+  option arguments, keeps agent inputs byte-for-byte unchanged, and projects
+  one legacy edge from the canonical late-alias state.
 - The regression also checks legacy field order, optional-field omission,
   original relation names, partial/final parity, compatibility endpoints, and
   viewer marker isolation.
@@ -48,7 +51,8 @@ semantic-observability tests.
 - Neutral shell text recognizes Cookie and Set-Cookie headers at any command
   position, including single-quoted and double-quoted `curl -H` arguments and
   unquoted header forms whose values contain embedded single or double quotes.
-  The complete header value is replaced.
+  The complete header value is replaced without consuming following URL or
+  option arguments.
 - The regression fixture scans events, raw events, canonical journal, final
   and legacy JSON, provenance projection, partial snapshot, manifest, HTML,
   and every artifact. None contains seeded plaintext secrets.
@@ -139,4 +143,4 @@ semantic-observability tests.
 No live DeepSeek request, external HTTP stress campaign, or historical corpus
 re-attribution run was executed. Those environment-dependent release gates
 remain outside local acceptance. There are no known remaining local findings
-from the four unified migration review rounds.
+from the five unified migration review rounds.
