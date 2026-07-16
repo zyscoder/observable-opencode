@@ -779,6 +779,45 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(compact["data"]["text"], "I did not guess the missing requirement value.")
         self.assertEqual(compact["data"]["attribution_summary"]["support_level"], "contextual")
 
+    def test_trace_node_compact_preserves_claim_grounding_decisions(self):
+        node = TraceNode(
+            ref="record:claim",
+            record_id="claim",
+            component="result",
+            event_type="response.claim",
+            data={
+                "text": "The active discount cap is 15 percent.",
+                "grounding_candidate_refs": ["evidence:current", "evidence:unrelated"],
+                "grounding_method": "confirmed_context_semantic_match_v1",
+                "grounding_behavior_impact": "none",
+                "grounding_decisions": [
+                    {
+                        "candidate_ref": "evidence:current",
+                        "decision": "selected_direct_support",
+                        "agent_attention_observed": False,
+                        "behavior_impact": "none",
+                    },
+                    {
+                        "candidate_ref": "evidence:unrelated",
+                        "decision": "rejected_no_match",
+                        "agent_attention_observed": False,
+                        "behavior_impact": "none",
+                    },
+                ],
+                "unrelated_payload": "x" * 5000,
+            },
+        )
+
+        compact = node.compact(max_chars=1200)
+
+        self.assertLessEqual(len(stable_json(compact)), 1200)
+        self.assertEqual(compact["data"]["grounding_method"], "confirmed_context_semantic_match_v1")
+        self.assertEqual(compact["data"]["grounding_behavior_impact"], "none")
+        self.assertEqual(
+            compact["data"]["grounding_decisions"][0]["decision"],
+            "selected_direct_support",
+        )
+
     def test_completed_trace_prefers_flagged_atomic_claim_over_final_response_output(self):
         trace = sample_trace()
         trace["records"].extend(
@@ -1213,7 +1252,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
         self.assertEqual(report.node_judgments["record:plan"].defect_status, "absent")
 
-    def test_does_not_reclassify_propagation_without_counterfactual_evidence(self):
+    def test_promotes_first_observed_propagation_after_predecessor_is_disproved(self):
         trace = {
             "case_id": "root-confirmation-boundary-case",
             "records": [
@@ -1286,9 +1325,11 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
             def __init__(self):
                 super().__init__(judgments)
                 self.confirmed = []
+                self.confirmation_contexts = {}
 
             def confirm_root(self, *, node, judgment, downstream_context, objective):
                 self.confirmed.append(node.ref)
+                self.confirmation_contexts[node.ref] = downstream_context
                 if node.ref == "record:plan":
                     return NodeJudgment(
                         node_ref=node.ref,
@@ -1308,13 +1349,215 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         judge = ConfirmingJudge()
         report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
 
-        self.assertEqual(judge.confirmed, ["record:plan"])
-        self.assertEqual(report.root_causes, [])
+        self.assertEqual(judge.confirmed, ["record:plan", "record:action"])
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:action"])
         action = report.node_judgments["record:action"]
-        self.assertEqual(action.causal_role, "defect_propagation")
-        self.assertFalse(action.is_root_cause)
-        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertEqual(action.causal_role, "defect_introduction")
+        self.assertTrue(action.is_root_cause)
+        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
         self.assertIn("record:action", report.defect_branches[0].metadata["first_observed_propagation_refs"])
+        self.assertTrue(
+            any(
+                "disproved_defect_predecessor" in item and "record:plan" in item
+                for item in judge.confirmation_contexts["record:action"]
+            )
+        )
+
+    def test_does_not_promote_propagation_when_a_predecessor_is_unknown(self):
+        trace = {
+            "case_id": "unknown-boundary-case",
+            "records": [
+                {"record_id": "plan", "component": "processor", "event_type": "decision"},
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:plan"],
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:action"],
+                    "data": {"failure_type": "wrong_action"},
+                },
+            ],
+        }
+        judge = FakeJudge(
+            {
+                "record:action": NodeJudgment(
+                    node_ref="record:action",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="wrong_action",
+                    defect_reason="The action contains the observed defect.",
+                    causal_role="defect_propagation",
+                    branch_relation="same_defect",
+                    influenced_by=[
+                        TaintInfluence(
+                            upstream_ref="record:plan",
+                            reason="The plan may contain the same defect.",
+                            relation="defect_propagated_from",
+                        )
+                    ],
+                ),
+                "record:plan": NodeJudgment(
+                    node_ref="record:plan",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=False,
+                    defect_status="unknown",
+                    defect_type="wrong_action",
+                    defect_reason="The plan semantics are incomplete.",
+                    causal_role="unknown",
+                    branch_relation="unknown",
+                    is_root_cause=False,
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:action"].causal_role, "defect_propagation")
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+
+    def test_does_not_promote_a_derived_response_claim_boundary(self):
+        trace = {
+            "case_id": "derived-claim-boundary-case",
+            "records": [
+                {"record_id": "output", "component": "result", "event_type": "response.output"},
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "source_refs": ["record:output"],
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:claim"],
+                    "data": {"failure_type": "incorrect_claim"},
+                },
+            ],
+        }
+        judgments = {
+            "record:claim": NodeJudgment(
+                node_ref="record:claim",
+                component="result",
+                event_type="response.claim",
+                has_defect=True,
+                defect_status="present",
+                defect_type="incorrect_claim",
+                defect_reason="The claim was initially judged to repeat the output defect.",
+                causal_role="defect_propagation",
+                branch_relation="same_defect",
+                influenced_by=[
+                    TaintInfluence(
+                        upstream_ref="record:output",
+                        reason="The output was initially suspected to contain the same claim defect.",
+                        relation="defect_propagated_from",
+                    )
+                ],
+            ),
+            "record:output": NodeJudgment(
+                node_ref="record:output",
+                component="result",
+                event_type="response.output",
+                has_defect=False,
+                defect_status="absent",
+                defect_reason="The response output is correct.",
+                causal_role="non_defective",
+                branch_relation="unrelated",
+            ),
+        }
+
+        class AcceptingJudge(FakeJudge):
+            def confirm_root(self, *, node, judgment, downstream_context, objective):
+                return judgment
+
+        report = BackwardTaintAnalyzer(judge=AcceptingJudge(judgments)).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:claim"].causal_role, "defect_propagation")
+        branch = report.defect_branches[0]
+        self.assertIn("record:claim", branch.metadata["first_observed_propagation_refs"])
+        self.assertIn("record:claim", branch.metadata["non_promotable_first_observed_refs"])
+
+    def test_removes_promoted_boundary_when_root_confirmation_rejects_it(self):
+        trace = {
+            "case_id": "rejected-boundary-case",
+            "records": [
+                {"record_id": "plan", "component": "processor", "event_type": "decision"},
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:plan"],
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:action"],
+                    "data": {"failure_type": "wrong_action"},
+                },
+            ],
+        }
+        judgments = {
+            "record:action": NodeJudgment(
+                node_ref="record:action",
+                component="processor",
+                event_type="decision",
+                has_defect=True,
+                defect_status="present",
+                defect_type="wrong_action",
+                defect_reason="The action contains the observed defect.",
+                causal_role="defect_propagation",
+                branch_relation="same_defect",
+                influenced_by=[
+                    TaintInfluence(
+                        upstream_ref="record:plan",
+                        reason="The plan was initially suspected.",
+                        relation="defect_propagated_from",
+                    )
+                ],
+            ),
+            "record:plan": NodeJudgment(
+                node_ref="record:plan",
+                component="processor",
+                event_type="decision",
+                has_defect=False,
+                defect_status="absent",
+                defect_reason="The plan is correct.",
+                causal_role="non_defective",
+                branch_relation="unrelated",
+            ),
+        }
+
+        class RejectingJudge(FakeJudge):
+            def confirm_root(self, *, node, judgment, downstream_context, objective):
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_status="absent",
+                    defect_reason="Counterfactual review rejects this node as the introduction.",
+                    causal_role="non_defective",
+                    branch_relation="unrelated",
+                    is_root_cause=False,
+                    confidence=0.9,
+                )
+
+        report = BackwardTaintAnalyzer(judge=RejectingJudge(judgments)).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.node_judgments["record:action"].defect_status, "absent")
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
 
     def test_reports_task_quality_outcome_independently_from_trace_health(self):
         trace = {
@@ -2876,6 +3119,9 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertIn("may motivate a decision but does not propagate", rules)
         self.assertIn("Authored tool-call arguments or test scripts are action semantics", rules)
         self.assertIn("Code size or complexity alone", rules)
+        self.assertIn("evaluate answer quality only", rules)
+        self.assertIn("pre-existing requirement/code conflict", rules)
+        self.assertIn("does not make the response node defective", rules)
 
     def test_judgment_prompt_identifies_authored_action_semantics(self):
         prompt = build_judgment_prompt(
@@ -2940,6 +3186,7 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         rules = " ".join(payload["rules"])
         self.assertIn("exact excerpt", rules)
         self.assertIn("counterfactual", rules)
+        self.assertIn("pre-existing repository defect", rules)
         with self.assertRaisesRegex(ValueError, "not present in the current node"):
             validate_root_confirmation_payload(
                 {

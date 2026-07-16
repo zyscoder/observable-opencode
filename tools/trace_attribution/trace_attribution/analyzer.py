@@ -364,8 +364,11 @@ class BackwardTaintAnalyzer:
                     root_causes.pop(ref, None)
                     root_paths.pop(ref, None)
 
-        first_observed_propagation_refs = []
-        for ref, judgment in judgments.items():
+        first_observed_propagation_refs: List[str] = []
+        promoted_boundary_refs: List[str] = []
+        non_promotable_first_observed_refs: List[str] = []
+        disproved_predecessors_by_ref: Dict[str, List[str]] = {}
+        for ref, judgment in list(judgments.items()):
             if judgment.defect_status != "present" or judgment.causal_role != "defect_propagation":
                 continue
             predecessor_refs = [
@@ -377,6 +380,84 @@ class BackwardTaintAnalyzer:
                 item in judgments and judgments[item].defect_status == "absent" for item in predecessor_refs
             ):
                 first_observed_propagation_refs.append(ref)
+                node = graph.nodes.get(ref)
+                if not node or is_evaluation_assertion(node):
+                    continue
+                if not is_promotable_first_observed_boundary(node):
+                    non_promotable_first_observed_refs.append(ref)
+                    continue
+                retained_influences = [
+                    item for item in judgment.influenced_by if item.relation != "defect_propagated_from"
+                ]
+                promoted = replace(
+                    judgment,
+                    defect_reason=(
+                        judgment.defect_reason
+                        + " All declared defect predecessors were independently judged absent; this node is "
+                        "therefore the first observed defect boundary and requires root confirmation."
+                    ).strip(),
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    influenced_by=retained_influences,
+                    is_root_cause=True,
+                )
+                judgments[ref] = promoted
+                root_causes[ref] = RootCauseCandidate(
+                    node_ref=ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    defect_type=promoted.defect_type or "defect_boundary",
+                    reason=promoted.defect_reason,
+                    confidence=promoted.confidence,
+                )
+                root_paths[ref] = visited_paths.get(ref, [start_ref, ref])
+                promoted_boundary_refs.append(ref)
+                disproved_predecessors_by_ref[ref] = predecessor_refs
+
+        if callable(confirm_root):
+            for ref in promoted_boundary_refs:
+                node = graph.hydrate_node(ref)
+                try:
+                    confirmed = confirm_root(
+                        node=node,
+                        judgment=judgments[ref],
+                        downstream_context=[
+                            *semantic_downstream_context(
+                                graph,
+                                root_paths.get(ref, [start_ref, ref]),
+                            ),
+                            *[
+                                (
+                                    f"disproved_defect_predecessor ref={predecessor_ref}; "
+                                    f"status={judgments[predecessor_ref].defect_status}; "
+                                    f"reason={judgments[predecessor_ref].defect_reason}"
+                                )
+                                for predecessor_ref in disproved_predecessors_by_ref.get(ref, [])
+                            ],
+                        ],
+                        objective=objective,
+                    )
+                except Exception as exc:
+                    judge_errors.append(
+                        {
+                            "node_ref": ref,
+                            "stage": "promoted_boundary_confirmation",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    confirmed = fallback_judgment_after_error(
+                        node=node,
+                        upstream_nodes=[],
+                        error=exc,
+                    )
+                judgments[ref] = confirmed
+                if not (
+                    confirmed.defect_status == "present"
+                    and confirmed.causal_role == "defect_introduction"
+                    and confirmed.is_root_cause
+                ):
+                    root_causes.pop(ref, None)
+                    root_paths.pop(ref, None)
 
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
@@ -425,6 +506,8 @@ class BackwardTaintAnalyzer:
                 "depth_limit_hit": depth_limit_hit,
                 "attribution_domain": attribution_domain(graph, start_ref),
                 "first_observed_propagation_refs": sorted(first_observed_propagation_refs),
+                "promoted_boundary_refs": sorted(promoted_boundary_refs),
+                "non_promotable_first_observed_refs": sorted(non_promotable_first_observed_refs),
             },
         )
 
@@ -613,6 +696,23 @@ def dedupe_paths(paths: Iterable[List[str]]) -> List[List[str]]:
 
 def is_evaluation_assertion(node: TraceNode) -> bool:
     return node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic")
+
+
+def is_promotable_first_observed_boundary(node: TraceNode) -> bool:
+    return node.event_type not in {
+        "response.claim",
+        "claim.support_assessment",
+        "evidence.semantic_fact",
+        "evidence.fact",
+        "execution.observation",
+        "verification",
+        "tool.result",
+        "tool.error",
+        "task.obligation",
+        "design.record",
+        "case.completed",
+        "case.failed",
+    }
 
 
 def is_observability_gap(node: TraceNode) -> bool:

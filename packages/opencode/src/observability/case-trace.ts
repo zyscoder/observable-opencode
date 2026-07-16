@@ -410,6 +410,17 @@ export type TraceConstraintRecord = {
   metadata?: Record<string, unknown>
 }
 
+type ClaimGroundingDecision = {
+  candidate_ref: string
+  candidate_origin: "confirmed_generation_context" | "explicit_response_source"
+  decision: "selected_direct_support" | "rejected_no_match" | "rejected_lower_ranked_match"
+  score: number
+  reasons: string[]
+  rejection_reason?: "semantic_match_below_threshold" | "lower_ranked_match"
+  agent_attention_observed: false
+  behavior_impact: "none"
+}
+
 export type TraceResponseSegment = {
   segment_id: string
   response_artifact?: string
@@ -423,6 +434,8 @@ export type TraceResponseSegment = {
   context_refs?: string[]
   execution_refs?: string[]
   generation_provenance_refs?: string[]
+  generation_grounding_candidate_refs?: string[]
+  generation_tool_outcome_refs?: string[]
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   metadata?: Record<string, unknown>
@@ -593,6 +606,10 @@ export type TraceResponseClaimRecord = {
   legacy_context_refs?: string[]
   matched_evidence_refs?: string[]
   candidate_evidence_refs?: string[]
+  grounding_candidate_refs?: string[]
+  grounding_decisions?: ClaimGroundingDecision[]
+  grounding_method?: "confirmed_context_semantic_match_v1" | string
+  grounding_behavior_impact?: "none" | string
   match_strategy?: string
   match_score?: number
   match_reasons?: string[]
@@ -941,6 +958,11 @@ type GenerationProvenance = {
   selectedContextRefs: string[]
 }
 
+type GenerationGroundingCandidates = {
+  candidateRefs: string[]
+  toolOutcomeRefs: string[]
+}
+
 type StartSpanInput = {
   component: TraceComponent
   operation: string
@@ -1045,6 +1067,10 @@ type ResponseClaimInput = Omit<
   | "context_refs"
   | "execution_refs"
   | "generation_provenance_refs"
+  | "grounding_candidate_refs"
+  | "grounding_decisions"
+  | "grounding_method"
+  | "grounding_behavior_impact"
   | "source_refs"
   | "source_locations"
   | "support_level"
@@ -1062,6 +1088,7 @@ type ResponseClaimInput = Omit<
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
   generation_provenance_refs?: string[]
+  generation_grounding_candidate_refs?: string[]
   support_level?: TraceResponseClaimRecord["support_level"]
   quality_flags?: string[]
 }
@@ -2504,7 +2531,7 @@ function isNonFactualResponseClaim(input: string) {
   if (/^(好的|可以|下面|因此|总结|结论)$/.test(normalized)) return true
   if (/^(summary|here'?s the summary|final summary|result summary)$/.test(normalized)) return true
   if (
-    /^(冲突总结|修复完成|完成|最终答案|最终结果|根因分析|问题定位|验证结果|npm test 结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查|额外通用性检查结果)$/.test(
+    /^(冲突点|冲突总结|修复完成|完成|最终答案|最终结果|根因分析|问题定位|验证结果|npm test 结果|改动说明|变更摘要|执行结果|实现结果|设计约束|修改文件|额外通用性检查|额外通用性检查结果)$/.test(
       normalized,
     )
   )
@@ -2796,7 +2823,9 @@ function dedupeTaskObligations(input: TaskObligationDraft[]) {
 function normalizeMatchText(input: unknown) {
   return stringPreview(input, 6000)
     .toLowerCase()
-    .replace(/15\s*%|15\s+percent/g, "0.15")
+    .replace(/(\d+(?:\.\d+)?)\s*(?:%|percent\b)/g, (_match, value: string) =>
+      String(Number(value) / 100),
+    )
     .replace(/_/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -2840,7 +2869,19 @@ function evidenceMatchStrings(data: Record<string, unknown> | undefined) {
   if (!data) return []
   const output: string[] = []
   const structured = recordFromUnknown(data.structured_claim)
-  for (const key of ["canonical_subject", "claim", "fact_kind", "category", "source"]) {
+  for (const key of [
+    "canonical_subject",
+    "claim",
+    "fact_kind",
+    "category",
+    "source",
+    "summary",
+    "intent",
+    "diff",
+    "files",
+    "change_semantics",
+    "diff_semantics",
+  ]) {
     const value = data[key]
     if (value !== undefined) output.push(stringPreview(value, 1000))
   }
@@ -2862,10 +2903,26 @@ function evidenceMatchStrings(data: Record<string, unknown> | undefined) {
   return dedupeStrings(output.filter(Boolean))
 }
 
+function sharedCodeIdentifiers(left: string, right: string) {
+  const extensions = new Set(["js", "jsx", "ts", "tsx", "mjs", "cjs", "json", "md", "py", "go", "rs", "java"])
+  const collect = (value: string) =>
+    new Set(
+      (value.match(/[a-z_$][\w$]*(?:\.[a-z_$][\w$]*)+/gi) ?? [])
+        .map((item) => item.toLowerCase())
+        .filter((item) => !extensions.has(item.split(".").at(-1) ?? "")),
+    )
+  const rightIDs = collect(right)
+  return [...collect(left)].filter((item) => rightIDs.has(item))
+}
+
 function isVerificationClaimText(input: string) {
   return /test|测试|passed|failed|pass|fail|assert|断言|exit|退出码|验证|genericity|extra check|通用性检查|pricing tests|expected|actual|通过|失败|\b48000\b|\b51000\b|\b850000\b/i.test(
     input,
   )
+}
+
+function isChangeClaimText(input: string) {
+  return /修改|变更|修复|实现|改为|调整|更新|changed?|modified|fixed|implemented|updated|adjusted/i.test(input)
 }
 
 function isToolFailureClaimText(input: string) {
@@ -2928,6 +2985,10 @@ function evidenceMatchAnalysis(claimText: unknown, evidenceData: Record<string, 
   if (shared.length) {
     score += Math.min(0.36, shared.length * 0.09)
     reasons.push("shared_terms")
+  }
+  if (sharedCodeIdentifiers(claim, haystack).length) {
+    score += 0.4
+    reasons.push("exact_code_identifier")
   }
   if (/0\.15/.test(claim) && /0\.15/.test(haystack)) {
     score += 0.45
@@ -3024,6 +3085,10 @@ function toolOutcomeMatchAnalysis(
   if (shared.length) {
     score += Math.min(0.4, shared.length * (kind === "tool_error" ? 0.08 : 0.1))
     reasons.push("shared_tool_outcome_terms")
+  }
+  if (sharedCodeIdentifiers(claim, haystack).length) {
+    score += 0.4
+    reasons.push("exact_code_identifier")
   }
   if (/0\.15/.test(claim) && /0\.15/.test(haystack)) {
     score += 0.45
@@ -6271,6 +6336,76 @@ class ActiveCaseTrace {
     }
   }
 
+  private generationGroundingCandidates(
+    provenance: GenerationProvenance,
+  ): GenerationGroundingCandidates {
+    const contextNodes = provenance.contextRefs
+      .map((ref) => this.sourceNodeForRef(ref))
+      .filter((node): node is CausalNode => Boolean(node))
+    const selectedToolNodeRefs = dedupeStrings(
+      contextNodes.flatMap((node) => {
+        const inferredRefs = stringArrayField(node.data ?? {}, [
+          "inferred_tool_context_refs",
+          "inferredToolContextRefs",
+        ])
+        const contextSetRef = firstStringField(node.data ?? {}, [
+          "inferred_tool_context_set_ref",
+          "inferredToolContextSetRef",
+        ])
+        const contextSet = contextSetRef ? this.sourceNodeForRef(contextSetRef) : undefined
+        const memberRefs = stringArrayField(contextSet?.data ?? {}, ["member_refs", "memberRefs"])
+        return [...(inferredRefs ?? []), ...(memberRefs ?? [])]
+      }),
+    )
+    const canonicalToolOutcomeRef = (ref: string) => {
+      const node = this.sourceNodeForRef(ref)
+      const callID = firstStringField(node?.data ?? {}, ["call_id", "callID"])
+      if (!node || !callID) return undefined
+      if (node.kind === "tool.error") return `tool_error:${callID}`
+      if (node.kind === "tool.result") return `tool_result:${callID}`
+      return undefined
+    }
+    const toolOutcomeRefs = dedupeStrings([
+      ...selectedToolNodeRefs
+        .flatMap((ref) => this.toolOutcomeRefsFromSourceRefs([ref]))
+        .flatMap((ref) => {
+          if (isToolOutcomeRef(ref)) return [ref]
+          const canonical = canonicalToolOutcomeRef(ref)
+          return canonical ? [canonical] : []
+        }),
+      ...selectedToolNodeRefs.flatMap((ref) => {
+        const canonical = canonicalToolOutcomeRef(ref)
+        return canonical ? [canonical] : []
+      }),
+    ])
+    const selectedIdentities = new Set([...selectedToolNodeRefs, ...toolOutcomeRefs])
+    const isSelectedGenerationEvidence = (node: CausalNode) => {
+      const nodeRef = `node:${node.node_id}`
+      const outcomeRefs = dedupeStrings([
+        ...(node.source_refs ?? []).filter(isToolOutcomeRef),
+        ...this.toolOutcomeRefsFromSourceRefs([nodeRef]),
+      ])
+      return outcomeRefs.some((ref) => selectedIdentities.has(ref))
+    }
+    const candidateRefs = this.causalNodes.flatMap((node) => {
+      if (!isSelectedGenerationEvidence(node)) return []
+      if (node.kind === "evidence.semantic_fact") return [`evidence:${node.node_id}`]
+      if (node.kind === "verification") {
+        const verificationID = firstStringField(node.data ?? {}, ["verification_id", "verificationID"])
+        return verificationID ? [`verification:${verificationID}`] : []
+      }
+      if (node.kind === "change") {
+        const changeID = firstStringField(node.data ?? {}, ["change_id", "changeID"])
+        return changeID ? [`change:${changeID}`] : []
+      }
+      return []
+    })
+    return {
+      candidateRefs: dedupeStrings([...candidateRefs, ...toolOutcomeRefs]),
+      toolOutcomeRefs,
+    }
+  }
+
   private linkGenerationProvenanceToDecision(decisionNode: CausalNode, provenance: GenerationProvenance) {
     if (!provenance.refs.length) return
     const target = { type: "node", id: decisionNode.node_id, label: "decision" }
@@ -6365,6 +6500,7 @@ class ActiveCaseTrace {
     const classifiedRefs = classifySourceRefs(sourceRefs)
     const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
     const generationProvenance = this.currentGenerationProvenance(input.metadata)
+    const generationGrounding = this.generationGroundingCandidates(generationProvenance)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
     const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
     const metadataResponseRole = input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined
@@ -6390,6 +6526,8 @@ class ActiveCaseTrace {
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
       generation_provenance_refs: generationProvenance.refs,
+      generation_grounding_candidate_refs: generationGrounding.candidateRefs,
+      generation_tool_outcome_refs: generationGrounding.toolOutcomeRefs,
       generation_context_refs: generationProvenance.contextRefs,
       generation_llm_refs: generationProvenance.llmRefs,
       message_transform_refs: generationProvenance.contextRefs,
@@ -6408,6 +6546,8 @@ class ActiveCaseTrace {
       context_refs: classifiedRefs.context_refs,
       execution_refs: classifiedRefs.execution_refs,
       generation_provenance_refs: generationProvenance.refs,
+      generation_grounding_candidate_refs: generationGrounding.candidateRefs,
+      generation_tool_outcome_refs: generationGrounding.toolOutcomeRefs,
       source_refs: sourceRefs,
       source_locations: sourceLocations,
       metadata,
@@ -6432,6 +6572,8 @@ class ActiveCaseTrace {
         context_refs: classifiedRefs.context_refs,
         execution_refs: classifiedRefs.execution_refs,
         generation_provenance_refs: generationProvenance.refs,
+        generation_grounding_candidate_refs: generationGrounding.candidateRefs,
+        generation_tool_outcome_refs: generationGrounding.toolOutcomeRefs,
         generation_context_refs: generationProvenance.contextRefs,
         generation_llm_refs: generationProvenance.llmRefs,
         message_transform_refs: generationProvenance.contextRefs,
@@ -6548,17 +6690,34 @@ class ActiveCaseTrace {
         ...classifiedRefs.direct_evidence_refs,
         ...this.toolOutcomeRefsFromSourceRefs(sourceRefs),
         ...changeScopeExclusionRefs,
+        ...classifySourceRefs(input.generation_grounding_candidate_refs).direct_evidence_refs,
       ]),
     }
-    const evidenceMatch = this.matchEvidenceForClaim(claimText, candidateClassifiedRefs.direct_evidence_refs)
-    const effectiveDirectEvidenceRefs = evidenceMatch.refs.length
-      ? evidenceMatch.refs
-      : candidateClassifiedRefs.direct_evidence_refs.length <= 1
+    const generationGroundingCandidateRefs = dedupeStrings(input.generation_grounding_candidate_refs ?? [])
+    const groundingCandidateRefs = dedupeStrings([
+      ...candidateClassifiedRefs.direct_evidence_refs,
+      ...classifiedRefs.execution_refs.filter(
+        (ref) => ref.startsWith("change:") || ref.startsWith("verification:"),
+      ),
+      ...generationGroundingCandidateRefs,
+    ])
+    const evidenceMatch = this.matchEvidenceForClaim(
+      claimText,
+      groundingCandidateRefs,
+      generationGroundingCandidateRefs,
+    )
+    const matchedClassifiedRefs = classifySourceRefs(evidenceMatch.refs)
+    const effectiveDirectEvidenceRefs = matchedClassifiedRefs.direct_evidence_refs.length
+      ? matchedClassifiedRefs.direct_evidence_refs
+      : generationGroundingCandidateRefs.length === 0 && candidateClassifiedRefs.direct_evidence_refs.length <= 1
         ? candidateClassifiedRefs.direct_evidence_refs
         : []
     const claimKind = responseClaimKind(claimText)
     const temporalScope = responseClaimTemporalScope(claimText, this.repositoryRevision)
-    const verificationSourceRefs = classifiedRefs.execution_refs.filter((ref) => ref.startsWith("verification:"))
+    const verificationSourceRefs = dedupeStrings([
+      ...classifiedRefs.execution_refs,
+      ...generationGroundingCandidateRefs,
+    ]).filter((ref) => ref.startsWith("verification:"))
     const effectiveVerificationRefs = verificationSourceRefs.filter((ref) => {
       const verificationID = ref.slice("verification:".length)
       const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
@@ -6567,10 +6726,29 @@ class ActiveCaseTrace {
       )
     })
     const supersededEvidenceRefs = verificationSourceRefs.filter((ref) => !effectiveVerificationRefs.includes(ref))
+    const matchedExecutionSupportRefs = evidenceMatch.refs.filter((ref) => {
+      if (ref.startsWith("verification:")) return effectiveVerificationRefs.includes(ref)
+      if (!ref.startsWith("change:")) return false
+      const changeID = ref.slice("change:".length)
+      const change = this.changeRecords.find((item) => item.change_id === changeID)
+      return change?.revision_after === this.repositoryRevision
+    })
     const directSupportRefs = dedupeStrings([
       ...effectiveDirectEvidenceRefs,
+      ...matchedExecutionSupportRefs,
       ...(claimKind === "verification" ? effectiveVerificationRefs : []),
     ])
+    const weakEvidenceMatch =
+      evidenceMatch.weak && !(claimKind === "verification" && effectiveVerificationRefs.length > 0)
+    const groundingDecisions: ClaimGroundingDecision[] = evidenceMatch.decisions.map((item) =>
+      directSupportRefs.includes(item.candidate_ref)
+        ? {
+            ...item,
+            decision: "selected_direct_support",
+            rejection_reason: undefined,
+          }
+        : item,
+    )
     const legacyContextRefs = sourceRefs.filter((ref) => !effectiveDirectEvidenceRefs.includes(ref))
     const effectiveClassifiedRefs = {
       ...candidateClassifiedRefs,
@@ -6599,6 +6777,10 @@ class ActiveCaseTrace {
       direct_evidence_count: effectiveDirectEvidenceRefs.length,
       matched_evidence_count: evidenceMatch.refs.length,
       candidate_evidence_count: evidenceMatch.candidateRefs.length,
+      grounding_candidate_count: groundingCandidateRefs.length,
+      grounding_selected_count: directSupportRefs.length,
+      grounding_rejected_count: groundingDecisions.filter((item) => item.decision !== "selected_direct_support")
+        .length,
       context_ref_count: classifiedRefs.context_refs.length,
       execution_ref_count: classifiedRefs.execution_refs.length,
       legacy_context_count: legacyContextRefs.length,
@@ -6615,8 +6797,8 @@ class ActiveCaseTrace {
       ...(input.quality_flags ?? []),
       ...(directSupportRefs.length ? [] : responseClaimQualityFlags(effectiveClassifiedRefs)),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
-      ...(evidenceMatch.weak ? ["weak_evidence_match"] : []),
-      ...(candidateClassifiedRefs.direct_evidence_refs.length && !evidenceMatch.refs.length
+      ...(weakEvidenceMatch ? ["weak_evidence_match"] : []),
+      ...(groundingCandidateRefs.length && !evidenceMatch.refs.length
         ? ["unmatched_direct_evidence_refs"]
         : []),
       ...(conflictInfo.conflictingEvidenceRefs.length ? ["conflicting_evidence"] : []),
@@ -6651,6 +6833,10 @@ class ActiveCaseTrace {
       legacy_context_refs: legacyContextRefs,
       matched_evidence_refs: evidenceMatch.refs,
       candidate_evidence_refs: evidenceMatch.candidateRefs,
+      grounding_candidate_refs: groundingCandidateRefs,
+      grounding_decisions: groundingDecisions,
+      grounding_method: "confirmed_context_semantic_match_v1",
+      grounding_behavior_impact: "none",
       match_strategy: evidenceMatch.strategy,
       match_score: evidenceMatch.score,
       match_reasons: evidenceMatch.reasons,
@@ -6719,6 +6905,10 @@ class ActiveCaseTrace {
         legacy_context_refs: claim.legacy_context_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
+        grounding_candidate_refs: claim.grounding_candidate_refs,
+        grounding_decisions: claim.grounding_decisions,
+        grounding_method: claim.grounding_method,
+        grounding_behavior_impact: claim.grounding_behavior_impact,
         match_strategy: claim.match_strategy,
         match_score: claim.match_score,
         match_reasons: claim.match_reasons,
@@ -6749,6 +6939,10 @@ class ActiveCaseTrace {
       })
     }
     for (const ref of claim.direct_evidence_refs) this.linkSourceToClaim(ref, node.node_id, "evidence_to_claim")
+    for (const ref of claim.direct_support_refs ?? []) {
+      if (claim.direct_evidence_refs.includes(ref) || claim.execution_refs.includes(ref)) continue
+      this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
+    }
     for (const ref of claim.context_refs) this.linkSourceToClaim(ref, node.node_id, "context_to_claim")
     for (const ref of claim.execution_refs) this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
     this.claimSupportAssessment(claim, node.node_id)
@@ -6822,6 +7016,10 @@ class ActiveCaseTrace {
         dependency_tool_outcome_refs: claim.dependency_tool_outcome_refs,
         matched_evidence_refs: claim.matched_evidence_refs,
         candidate_evidence_refs: claim.candidate_evidence_refs,
+        grounding_candidate_refs: claim.grounding_candidate_refs,
+        grounding_decisions: claim.grounding_decisions,
+        grounding_method: claim.grounding_method,
+        grounding_behavior_impact: claim.grounding_behavior_impact,
         context_refs: claim.context_refs,
         execution_refs: claim.execution_refs,
         tool_failure_context_refs: toolFailureContextRefs,
@@ -7111,6 +7309,7 @@ class ActiveCaseTrace {
           source_refs: segment.source_refs,
           source_locations: segment.source_locations,
           generation_provenance_refs: segment.generation_provenance_refs,
+          generation_grounding_candidate_refs: segment.generation_grounding_candidate_refs,
           metadata: {
             response_node_id: responseNodeID,
             response_role: segment.response_role,
@@ -9723,6 +9922,15 @@ class ActiveCaseTrace {
             node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`)),
       )
     }
+    if (parsed.type === "change" || parsed.type === "verification") {
+      const expectedKind = parsed.type
+      const identityKeys = parsed.type === "change" ? ["change_id", "changeID"] : ["verification_id", "verificationID"]
+      return this.causalNodes.find(
+        (node) =>
+          node.kind === expectedKind &&
+          (node.node_id === parsed.id || firstStringField(node.data, identityKeys) === parsed.id),
+      )
+    }
     return this.causalNodes.find((node) => node.source_refs?.includes(ref) || node.node_id === parsed.id)
   }
 
@@ -9757,8 +9965,14 @@ class ActiveCaseTrace {
     return [...output]
   }
 
-  private matchEvidenceForClaim(claimText: unknown, evidenceRefs: string[]) {
-    const scored = evidenceRefs
+  private matchEvidenceForClaim(
+    claimText: unknown,
+    evidenceRefs: string[],
+    generationGroundingCandidateRefs: string[] = [],
+  ) {
+    const candidateRefs = dedupeStrings(evidenceRefs)
+    const generationCandidateSet = new Set(generationGroundingCandidateRefs)
+    const analyzed = candidateRefs
       .map((ref) => {
         const node = this.sourceNodeForRef(ref)
         const analysis = this.sourceRefMatchAnalysis(ref, claimText, node)
@@ -9770,26 +9984,87 @@ class ActiveCaseTrace {
           factKind: typeof node?.data?.fact_kind === "string" ? node.data.fact_kind : undefined,
         }
       })
+    const scored = analyzed
       .filter((item) => item.score >= 0.35)
       .sort((a, b) => b.score - a.score)
     const claimPreview = stringPreview(claimText, 2000)
     const isVerificationClaim = isVerificationClaimText(claimPreview)
+    const isChangeClaim = isChangeClaimText(claimPreview)
     const mentionsToolFailure = isToolFailureClaimText(claimPreview)
-    const preferred =
+    let preferred =
       isVerificationClaim && !mentionsToolFailure && scored.some((item) => item.factKind === "verification_output")
         ? scored.filter((item) => item.factKind === "verification_output")
         : scored
-    const refs = preferred.slice(0, 3).map((item) => item.ref)
+    let selectionLimit = 3
+    if (isChangeClaim && scored.some((item) => item.ref.startsWith("change:"))) {
+      const changeCandidates = scored.filter((item) => item.ref.startsWith("change:"))
+      if (isVerificationClaim) {
+        const verificationCandidates = scored.filter(
+          (item) => item.factKind === "verification_output" || item.ref.startsWith("verification:"),
+        )
+        const remainingCandidates = scored.filter(
+          (item) =>
+            !item.ref.startsWith("change:") &&
+            item.factKind !== "verification_output" &&
+            !item.ref.startsWith("verification:"),
+        )
+        const seen = new Set<string>()
+        preferred = [
+          ...changeCandidates.slice(0, 1),
+          ...verificationCandidates.slice(0, 1),
+          ...remainingCandidates,
+          ...changeCandidates.slice(1),
+          ...verificationCandidates.slice(1),
+        ].filter((item) => {
+          if (seen.has(item.ref)) return false
+          seen.add(item.ref)
+          return true
+        })
+        selectionLimit = 4
+      } else {
+        preferred = [
+          ...changeCandidates,
+          ...scored.filter((item) => !item.ref.startsWith("change:")),
+        ]
+      }
+    }
+    const refs = preferred.slice(0, selectionLimit).map((item) => item.ref)
     const score = preferred[0]?.score ?? 0
     const reasons = dedupeStrings(preferred.flatMap((item) => item.reasons))
-    const weak = preferred.some((item) => item.weak)
+    const weak = preferred.slice(0, selectionLimit).some((item) => item.weak)
+    const selectedRefSet = new Set(refs)
+    const decisions: ClaimGroundingDecision[] = analyzed.map((item) => {
+      const selected = selectedRefSet.has(item.ref)
+      const aboveThreshold = item.score >= 0.35
+      return {
+        candidate_ref: item.ref,
+        candidate_origin: generationCandidateSet.has(item.ref)
+          ? "confirmed_generation_context"
+          : "explicit_response_source",
+        decision: selected
+          ? "selected_direct_support"
+          : aboveThreshold
+            ? "rejected_lower_ranked_match"
+            : "rejected_no_match",
+        score: item.score,
+        reasons: item.reasons,
+        rejection_reason: selected
+          ? undefined
+          : aboveThreshold
+            ? "lower_ranked_match"
+            : "semantic_match_below_threshold",
+        agent_attention_observed: false,
+        behavior_impact: "none",
+      }
+    })
     return {
       refs,
       score,
       reasons,
       weak,
-      candidateRefs: evidenceRefs,
-      strategy: refs.length ? "structured_text_overlap" : evidenceRefs.length ? "no_direct_match" : "no_evidence_refs",
+      decisions,
+      candidateRefs,
+      strategy: refs.length ? "structured_text_overlap" : candidateRefs.length ? "no_direct_match" : "no_evidence_refs",
     }
   }
 

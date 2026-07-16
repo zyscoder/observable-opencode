@@ -480,6 +480,9 @@ def build_judgment_prompt(
             "For an evaluation assertion, use its dimensions and upstream_nodes to determine whether the asserted defect is present, absent, or unknown.",
             "If the current node has no relevant semantic defect, set defect_status=absent, has_defect=false, and influenced_by=[].",
             "defect_status classifies the current node's semantics, not whether it is the code-level root. A false or unsupported response claim is present even when an earlier code change caused the underlying failure.",
+            "When the active branch starts at a response.claim or response.output instead of an evaluation assertion, evaluate answer quality only; do not treat the repository problem described by the answer as an observed Agent defect.",
+            "A truthful response claim that identifies a pre-existing requirement/code conflict, selects the current requirement over a superseded document, reports its repair, or reports a confirmed verification is non_defective rather than defect_evidence.",
+            "Mentioning, analyzing, or fixing a repository defect does not make the response node defective. Mark a supported response claim present only when its own conclusion contradicts, misuses, or overstates the supplied evidence.",
             "Use defect_evidence for a truthful verification, tool result, benchmark result, or observation that exposes a defect without introducing it.",
             "Use defect_propagation when the node carries or acts on an already introduced defect.",
             "Use defect_introduction only when this node first introduces the defect and no earlier supplied causal node did so.",
@@ -533,6 +536,7 @@ def build_root_confirmation_prompt(
                 "A confirmed root requires an exact excerpt from the current node that contains the defective choice.",
                 "Apply the counterfactual: set current_node_would_cause_defect_if_executed_exactly=true only when executing this node exactly would itself cause the active defect.",
                 "Reject the root when the exact excerpt describes the opposite of the observed defect.",
+                "Reject the root when the excerpt truthfully describes a pre-existing repository defect or its correct resolution rather than introducing an Agent behavior defect.",
                 "Return unknown when the visible node-local evidence is insufficient or truncated at the decisive point.",
             ],
             "required_json_schema": {

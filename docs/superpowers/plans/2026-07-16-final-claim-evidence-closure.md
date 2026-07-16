@@ -36,11 +36,11 @@
 - Produces: `generationEvidenceCandidates(provenance)` with confirmed tool, evidence, verification, and change refs.
 - Consumes: final response generation provenance and confirmed context-set membership.
 
-- [ ] Add a failing HTTP-shaped trace fixture whose final response has no explicit source refs.
-- [ ] Assert evidence derived from selected tool results appears as generation grounding candidates.
-- [ ] Assert evidence outside the selected generation context is excluded.
-- [ ] Implement candidate reconstruction without writing to Agent-visible state.
-- [ ] Run the focused test and confirm it passes.
+- [x] Add a failing HTTP-shaped trace fixture whose final response has no explicit source refs.
+- [x] Assert evidence derived from selected tool results appears as generation grounding candidates.
+- [x] Assert evidence outside the selected generation context is excluded.
+- [x] Implement candidate reconstruction without writing to Agent-visible state.
+- [x] Run the focused test and confirm it passes.
 
 ### Task 3: Per-Claim Grounding Decisions
 
@@ -52,12 +52,12 @@
 - Produces: `grounding_candidate_refs`, `grounding_decisions`, `grounding_method`, and `grounding_behavior_impact`.
 - Produces: attribution edges only for selected direct support refs.
 
-- [ ] Extend the failing fixture with one matching and one unrelated candidate.
-- [ ] Assert the matching candidate is selected and linked to the Claim.
-- [ ] Assert the unrelated candidate records `rejected_no_match` and has no Claim edge.
-- [ ] Implement deterministic decision records using existing match scores and reasons.
-- [ ] Add grounding decisions to `claim.support_assessment`.
-- [ ] Run focused Claim tests and confirm they pass.
+- [x] Extend the failing fixture with one matching and one unrelated candidate.
+- [x] Assert the matching candidate is selected and linked to the Claim.
+- [x] Assert the unrelated candidate records `rejected_no_match` and has no Claim edge.
+- [x] Implement deterministic decision records using existing match scores and reasons.
+- [x] Add grounding decisions to `claim.support_assessment`.
+- [x] Run focused Claim tests and confirm they pass.
 
 ### Task 4: First-Observed Defect Boundary
 
@@ -69,12 +69,12 @@
 - Consumes: a present `defect_propagation` judgment and all declared defect predecessors.
 - Produces: a provisional `defect_introduction` candidate only when every predecessor is absent.
 
-- [ ] Add a failing test where a propagation node points only to absent defect predecessors.
-- [ ] Assert it becomes a root candidate and is listed as a first-observed boundary.
-- [ ] Add tests proving unknown/unvisited predecessors prevent promotion.
-- [ ] Add a confirmer-rejection test proving the candidate is removed.
-- [ ] Implement the minimal deterministic boundary promotion.
-- [ ] Run the full attribution suite.
+- [x] Add a failing test where a propagation node points only to absent defect predecessors.
+- [x] Assert it becomes a root candidate and is listed as a first-observed boundary.
+- [x] Add tests proving unknown/unvisited predecessors prevent promotion.
+- [x] Add a confirmer-rejection test proving the candidate is removed.
+- [x] Implement the minimal deterministic boundary promotion.
+- [x] Run the full attribution suite.
 
 ### Task 5: Full Regression and Real Semantic Cases
 
@@ -86,8 +86,8 @@
 - Produces: coverage, reachability, attribution, size, and edge metrics.
 
 - [ ] Run Causal IR, CaseTrace, FeatureBench runner, stress, attribution, and typecheck suites.
-- [ ] Build a native macOS binary from the current source.
+- [x] Build a native macOS binary from the current source.
 - [ ] Run `semantic-requirement-priority`, `semantic-architecture-boundary`, and `semantic-verification-depth` through HTTP.
 - [ ] Compare Claim evidence coverage, quality score, unresolved refs, temporal eligibility, edges, and bytes.
-- [ ] Run the offline attribution module on at least one quality-gap trace.
-- [ ] Write the report and reject the iteration if passive behavior or causal reachability regresses.
+- [x] Run the offline attribution module on at least one quality-gap trace.
+- [x] Write the report and reject the iteration if passive behavior or causal reachability regresses.

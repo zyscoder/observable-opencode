@@ -1407,6 +1407,131 @@ describe("case trace", () => {
     ).toBe(false)
   })
 
+  test("grounds final claims from confirmed generation context without attributing rejected candidates", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-final-claim-grounding-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "final-claim-grounding.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "report the active discount cap" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_current", sessionID: "ses_grounding", messageID: "msg_tool_current", output: "renewalQuote has an active 15 percent total discount cap" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "current discount requirement", data: { subject: "renewalQuote", predicate: "discount_cap", value: "15 percent" }, source_refs: ["tool_result:call_current"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_old", sessionID: "ses_grounding", messageID: "msg_tool_old", output: "the stale design allowed a 20 percent discount cap" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "old discount design", data: { subject: "discount", predicate: "discount_cap", value: "20 percent" }, source_refs: ["tool_result:call_old"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_code", sessionID: "ses_grounding", messageID: "msg_tool_code", output: "const discount = Math.min(total, 0.15); return Math.round(base * (1 - discount))" } })`,
+        `CaseTrace.change({ change_id: "discount_fix", files: ["src/pricing.mjs"], diff: "- Math.min(total, 0.2)\\n+ Math.min(total, 0.15)", source_refs: ["tool_result:call_code"] })`,
+        `CaseTrace.verification({ verification_id: "post_change", command: "npm test", exit_code: 0, status: "passed", stdout: "all tests passed", source_refs: ["change:discount_fix"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_unrelated", sessionID: "ses_grounding", messageID: "msg_tool_unrelated", output: "shipping owner is logistics" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "shipping owner", data: { subject: "shipping", predicate: "owner", value: "logistics" }, source_refs: ["tool_result:call_unrelated"] })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { tool: "read", callID: "call_outside", sessionID: "ses_grounding", messageID: "msg_tool_outside", output: "tax owner is finance" } })`,
+        `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "tax owner", data: { subject: "tax", predicate: "owner", value: "finance" }, source_refs: ["tool_result:call_outside"] })`,
+        `const transform = CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_grounding", message_id: "msg_grounding", agent: "build", provider_id: "deepseek", model_id: "unit-test", input: { messages: [{ role: "tool", toolCallId: "call_current", content: "15 percent" }, { role: "tool", toolCallId: "call_old", content: "20 percent" }, { role: "tool", toolCallId: "call_code", content: "Math.round" }, { role: "tool", toolCallId: "call_unrelated", content: "shipping owner" }] }, output: { model_messages: [{ role: "tool", toolCallId: "call_current", content: "15 percent" }, { role: "tool", toolCallId: "call_old", content: "20 percent" }, { role: "tool", toolCallId: "call_code", content: "Math.round" }, { role: "tool", toolCallId: "call_unrelated", content: "shipping owner" }] } })`,
+        `CaseTrace.llmTurn({ session_id: "ses_grounding", message_id: "msg_grounding", agent: "build", provider_id: "deepseek", model_id: "unit-test", input_context_refs: transform ? ["node:" + transform.node_id] : [], source_refs: transform ? ["node:" + transform.node_id] : [], status: "success", finish_reason: "stop" })`,
+        `CaseTrace.responseOutput({ text: "The old discount cap was changed from 20% to the active renewalQuote cap of 15%, and npm test passed. Math.round handles the final rounding.", metadata: { sessionID: "ses_grounding", messageID: "msg_grounding", response_role: "final_answer", visibility: "user_visible", is_final_for_case: true } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "final-claim-grounding-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "12000",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "final-claim-grounding-case", "trace.json"), "utf8"),
+    ) as any
+    const current = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "renewalQuote",
+    )
+    const unrelated = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "shipping",
+    )
+    const old = trace.records.find(
+      (record: any) =>
+        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "discount",
+    )
+    const outside = trace.records.find(
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "tax",
+    )
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    const claim = trace.records.find(
+      (record: any) => record.event_type === "response.claim" && String(record.data.text).includes("discount cap"),
+    )
+    const codeClaim = trace.records.find(
+      (record: any) => record.event_type === "response.claim" && String(record.data.text).includes("Math.round"),
+    )
+    const assessment = trace.records.find(
+      (record: any) =>
+        record.event_type === "claim.support_assessment" && record.data.claim_id === claim.data.claim_id,
+    )
+    const currentRef = `evidence:${current.record_id}`
+    const oldRef = `evidence:${old.record_id}`
+    const unrelatedRef = `evidence:${unrelated.record_id}`
+    const outsideRef = `evidence:${outside.record_id}`
+
+    expect(response.data.generation_grounding_candidate_refs).toEqual(
+      expect.arrayContaining([currentRef, oldRef, unrelatedRef]),
+    )
+    expect(response.data.generation_grounding_candidate_refs).not.toContain(outsideRef)
+    expect(response.data.generation_grounding_candidate_refs.some((ref: string) => ref.startsWith("node:toolresult"))).toBe(false)
+    expect(claim.data.direct_evidence_refs).toContain(currentRef)
+    expect(claim.data.direct_evidence_refs).toContain(oldRef)
+    expect(claim.data.direct_evidence_refs).not.toContain(unrelatedRef)
+    expect(claim.data.direct_support_refs).toContain("change:discount_fix")
+    expect(claim.data.direct_support_refs).toContain("verification:post_change")
+    expect(claim.data.grounding_candidate_refs).toEqual(expect.arrayContaining([currentRef, oldRef, unrelatedRef]))
+    expect(claim.data.grounding_method).toBe("confirmed_context_semantic_match_v1")
+    expect(claim.data.grounding_behavior_impact).toBe("none")
+    expect(claim.data.quality_flags).not.toContain("weak_evidence_match")
+    expect(claim.data.grounding_decisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          candidate_ref: currentRef,
+          decision: "selected_direct_support",
+          candidate_origin: "confirmed_generation_context",
+          agent_attention_observed: false,
+          behavior_impact: "none",
+        }),
+        expect.objectContaining({
+          candidate_ref: unrelatedRef,
+          decision: "rejected_no_match",
+          rejection_reason: "semantic_match_below_threshold",
+          agent_attention_observed: false,
+          behavior_impact: "none",
+        }),
+      ]),
+    )
+    expect(assessment.data.grounding_decisions).toEqual(claim.data.grounding_decisions)
+    expect(codeClaim.data.direct_evidence_refs).toContain("tool_result:call_code")
+    expect(codeClaim.data.quality_flags).not.toContain("unsupported_response_claim")
+    expect(
+      trace.edges.some(
+        (edge: any) => edge.from.ref_id === current.record_id && edge.to.ref_id === claim.record_id,
+      ),
+    ).toBe(true)
+    expect(
+      trace.edges.some(
+        (edge: any) => edge.from.ref_id === unrelated.record_id && edge.to.ref_id === claim.record_id,
+      ),
+    ).toBe(false)
+  })
+
   test("writes v6.0 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v45-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -2366,6 +2491,47 @@ describe("case trace", () => {
     expect(claimText).toContain("pricing tests passed")
   })
 
+  test("drops emphasized conflict headings from final response claims", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-conflict-heading-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "conflict-heading.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: "**冲突点**\\n\\nThe active discount cap is 15%." })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "conflict-heading-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "conflict-heading-case", "trace.json"), "utf8"),
+    ) as any
+    const claimText = trace.records
+      .filter((record: any) => record.event_type === "response.claim")
+      .map((record: any) => record.data.text)
+      .join("\n")
+
+    expect(claimText).not.toContain("冲突点")
+    expect(claimText).toContain("active discount cap")
+  })
+
   test("keeps short verification conclusions as atomic response claims", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-short-verification-claim-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -2453,6 +2619,7 @@ describe("case trace", () => {
     expect(claim.data.direct_support_refs).toContain("verification:post_change")
     expect(claim.data.direct_support_refs).not.toContain("verification:baseline")
     expect(claim.data.superseded_evidence_refs).toContain("verification:baseline")
+    expect(claim.data.quality_flags).not.toContain("weak_evidence_match")
   })
 
   test("drops localized key-value table headers from response claims", async () => {
