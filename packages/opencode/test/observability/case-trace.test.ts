@@ -85,6 +85,41 @@ function changeIdFromTrace(trace: any) {
   return record?.data?.change_id ?? record?.record_id
 }
 
+function temporalAdvisoryEdgesTo(trace: any, targetID: string) {
+  return trace.edges.filter(
+    (edge: any) => edge.to?.ref_id === targetID && edge.derivation_method === "recent_source_fallback",
+  )
+}
+
+function contextSetMemberRefs(trace: any, edge: any) {
+  const contextSet = trace.records.find((record: any) => record.record_id === edge.from?.ref_id)
+  return contextSet?.data?.member_refs ?? []
+}
+
+function temporalAdvisoryMemberRefs(trace: any, targetID: string) {
+  return [
+    ...new Set(
+      temporalAdvisoryEdgesTo(trace, targetID).flatMap((edge: any) => contextSetMemberRefs(trace, edge)),
+    ),
+  ]
+}
+
+function temporalAdvisoryEdgesForMember(trace: any, memberRef: string) {
+  const contextSetIDs = new Set(
+    trace.records
+      .filter(
+        (record: any) =>
+          record.event_type === "context.pack" &&
+          record.data?.context_set_kind === "temporal_advisory" &&
+          record.data?.member_refs?.includes(memberRef),
+      )
+      .map((record: any) => record.record_id),
+  )
+  return trace.edges.filter(
+    (edge: any) => contextSetIDs.has(edge.from?.ref_id) && edge.derivation_method === "recent_source_fallback",
+  )
+}
+
 const causalIRJournalContract = {
   "node.created": { recordType: "node", category: "node", startsChain: true },
   "node.updated": { recordType: "node.update", category: "node", requiresPrevious: true },
@@ -242,19 +277,19 @@ function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partia
   assertCausalIRJournalAudit(journal)
   assertExactlyOneFinalizationAtEnd(journal)
 
-  const checkpoint = journal.at(-2)
   const finalized = journal.at(-1)
-  expect(isCompleteCausalIRCheckpoint(checkpoint)).toBe(true)
-  expect(checkpoint?.payload_hash).toBe(causalIRPayloadHashForAudit(checkpoint?.data))
   expect(finalized?.payload_hash).toBe(causalIRPayloadHashForAudit(finalized?.data))
-  expect(finalized?.previous_payload_hash).toBe(checkpoint?.payload_hash)
-  expect(checkpoint?.data?.data).toEqual(partial.manifest)
-
-  for (const field of ["nodes", "edges", "artifacts", "diagnostics"] as const) {
-    expect(checkpoint?.data?.snapshot?.[field]).toEqual(partial[field])
-    expect(checkpoint?.data?.snapshot?.[field]).toEqual(trace[field])
-    expect(finalized?.data?.snapshot?.[field]).toEqual(checkpoint?.data?.snapshot?.[field])
-  }
+  expect(finalized?.data?.format).toBe("compact_causal_ir_finalization")
+  expect(finalized?.data?.snapshot).toBeUndefined()
+  expect(finalized?.data?.trace).toBeUndefined()
+  expect(finalized?.data?.data).toEqual(partial.manifest)
+  expect(finalized?.data?.graph).toMatchObject({
+    nodes: trace.nodes.length,
+    edges: trace.edges.length,
+    artifacts: trace.artifacts.length,
+    diagnostics: trace.diagnostics.length,
+  })
+  expect(partial).toEqual(trace)
 }
 
 describe("case trace", () => {
@@ -378,7 +413,14 @@ describe("case trace", () => {
     expect(trace.journal.entry_count).toBe(trace.journal.last_sequence)
     expect(trace.journal.last_sequence).toBe(journal.at(-1).sequence - 1)
     expect(trace.journal.last_payload_hash).toBe(journal.at(-2).payload_hash)
-    expect(journal.at(-1).data.trace).toEqual(trace)
+    expect(journal.at(-1).data.snapshot).toBeUndefined()
+    expect(journal.at(-1).data.trace).toBeUndefined()
+    expect(journal.at(-1).data.canonical).toMatchObject({
+      trace_version: trace.trace_version,
+      causal_ir_version: trace.causal_ir_version,
+      manifest: trace.manifest,
+    })
+    expect((CausalIRModule as any).replayCausalIRTrace(journal)).toEqual(trace)
     expect(trace.nodes.length).toBe(trace.metrics.records)
     expect(trace.edges.length).toBe(trace.metrics.dataflow_edges)
     expect(trace.artifacts.length).toBe(trace.metrics.artifacts)
@@ -753,12 +795,12 @@ describe("case trace", () => {
       response,
       exitGate,
     ]
-    const advisory = trace.edges.find(
-      (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === response.record_id,
+    const advisory = temporalAdvisoryEdgesTo(trace, response.record_id).find((item: any) =>
+      contextSetMemberRefs(trace, item).includes(`evidence:${fact.record_id}`),
     )
     const compatibilityAdvisory = trace.dataflow_edges.find((item: any) => item.edge_id === advisory?.edge_id)
-    const exitAdvisory = trace.edges.find(
-      (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === exitGate.record_id,
+    const exitAdvisory = temporalAdvisoryEdgesTo(trace, exitGate.record_id).find((item: any) =>
+      contextSetMemberRefs(trace, item).includes(`evidence:${fact.record_id}`),
     )
 
     expect(response.source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
@@ -784,8 +826,8 @@ describe("case trace", () => {
     for (const target of policyTargets) {
       expect(target.source_refs ?? []).not.toContain("recent_evidence_records")
       expect(target.source_refs ?? []).not.toContain(`evidence:${fact.record_id}`)
-      const fallbackEdges = trace.edges.filter(
-        (item: any) => item.from?.legacy_ref === `evidence:${fact.record_id}` && item.to?.ref_id === target.record_id,
+      const fallbackEdges = temporalAdvisoryEdgesTo(trace, target.record_id).filter((item: any) =>
+        contextSetMemberRefs(trace, item).includes(`evidence:${fact.record_id}`),
       )
       expect(fallbackEdges).not.toHaveLength(0)
       expect(
@@ -798,13 +840,11 @@ describe("case trace", () => {
       ).toBe(true)
     }
     expect(
-      trace.edges.some(
+      temporalAdvisoryEdgesTo(trace, repeatedCheck.record_id).some(
         (item: any) =>
-          item.from?.legacy_ref === `evidence:${secondFact.record_id}` &&
-          item.to?.ref_id === repeatedCheck.record_id &&
+          contextSetMemberRefs(trace, item).includes(`evidence:${secondFact.record_id}`) &&
           item.evidence_tier === "temporal_advisory" &&
-          item.eligible_for_attribution === false &&
-          item.derivation_method === "recent_source_fallback",
+          item.eligible_for_attribution === false,
       ),
     ).toBe(true)
     const legacySelectorEdge = trace.edges.find((item: any) => item.edge_id === "temporal_legacy_edge")
@@ -1000,8 +1040,12 @@ describe("case trace", () => {
     const decision = trace.records.find(
       (record: any) => record.event_type === "decision" && record.data.decision_type === "reasoning_block",
     )
+    const contextSetRef = transform.data.inferred_tool_context_set_ref
+    const contextSet = trace.records.find((record: any) => `node:${record.record_id}` === contextSetRef)
 
-    expect(transform.source_refs).toContain(`node:${toolResult.record_id}`)
+    expect(transform.source_refs).toContain(contextSetRef)
+    expect(transform.source_refs).not.toContain(`node:${toolResult.record_id}`)
+    expect(contextSet.data.member_refs).toContain(`node:${toolResult.record_id}`)
     expect(decision.source_refs).toEqual(
       expect.arrayContaining([`node:${transform.record_id}`, `node:${llm.record_id}`]),
     )
@@ -1009,6 +1053,14 @@ describe("case trace", () => {
       trace.edges.some(
         (edge: any) =>
           edge.from.ref_id === toolResult.record_id &&
+          edge.to.ref_id === contextSet.record_id &&
+          edge.normalized_relation === "selected_into_context",
+      ),
+    ).toBe(true)
+    expect(
+      trace.edges.some(
+        (edge: any) =>
+          edge.from.ref_id === contextSet.record_id &&
           edge.to.ref_id === transform.record_id &&
           edge.normalized_relation === "used_as_context",
       ),
@@ -1221,6 +1273,138 @@ describe("case trace", () => {
         (edge: any) => edge.from.ref_id === otherCall.record_id && edge.to.ref_id === otherResult.record_id,
       ),
     ).toBe(true)
+  })
+
+  test("reuses one confirmed context set across transforms of the same model request", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-confirmed-context-set-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "confirmed-context-set.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { sessionID: "ses_set", messageID: "msg_tool", callID: "call_set", tool: "read", input: { path: "owner.txt" } } })`,
+        `CaseTrace.event({ component: "tool", event_type: "tool.result", data: { sessionID: "ses_set", messageID: "msg_tool", callID: "call_set", tool: "read", output: "owner is billing" } })`,
+        `const modelMessages = [{ role: "tool", toolCallId: "call_set", content: "owner is billing" }]`,
+        `CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_set", message_id: "msg_request", input: { messages: modelMessages }, output: { model_messages: modelMessages } })`,
+        `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_set", message_id: "msg_request", input: { model_messages: modelMessages }, output: { model_messages: modelMessages } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "confirmed-context-set-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "confirmed-context-set-case", "trace.json"), "utf8")) as any
+    const toolResult = trace.records.find((record: any) => record.event_type === "tool.result")
+    const transforms = trace.records.filter((record: any) => record.event_type === "context.transform")
+    const sets = trace.records.filter(
+      (record: any) => record.event_type === "context.pack" && record.data.context_set_kind === "confirmed_tool_selection",
+    )
+    expect(sets).toHaveLength(1)
+    expect(sets[0].data.member_refs).toEqual([`node:${toolResult.record_id}`])
+    expect(transforms).toHaveLength(2)
+    expect(transforms.every((record: any) => record.source_refs?.includes(`node:${sets[0].record_id}`))).toBe(true)
+    expect(transforms.every((record: any) => !record.source_refs?.includes(`node:${toolResult.record_id}`))).toBe(true)
+    expect(
+      trace.edges.filter(
+        (edge: any) =>
+          edge.from.ref_id === toolResult.record_id &&
+          edge.to.ref_id === sets[0].record_id &&
+          edge.normalized_relation === "selected_into_context",
+      ),
+    ).toHaveLength(1)
+    expect(
+      trace.edges.filter(
+        (edge: any) =>
+          edge.from.ref_id === sets[0].record_id &&
+          transforms.some((record: any) => record.record_id === edge.to.ref_id) &&
+          edge.normalized_relation === "used_as_context",
+      ),
+    ).toHaveLength(2)
+    expect(
+      trace.edges.some(
+        (edge: any) =>
+          edge.from.ref_id === toolResult.record_id && transforms.some((record: any) => record.record_id === edge.to.ref_id),
+      ),
+    ).toBe(false)
+  })
+
+  test("reuses payload-only temporal advisory sets without member-to-target edges", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-temporal-context-set-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "temporal-context-set.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const first = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "owner is billing", data: { subject: "owner", value: "billing" }, source_refs: [] })`,
+        `const second = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "cap is 15 percent", data: { subject: "cap", value: "15%" }, source_refs: [] })`,
+        `CaseTrace.node({ node_id: "temporal_set_target_1", kind: "execution.observation", component: "runtime", source_refs: ["recent_evidence_records"], data: { target: 1 } })`,
+        `CaseTrace.node({ node_id: "temporal_set_target_2", kind: "execution.observation", component: "runtime", source_refs: ["recent_evidence_records"], data: { target: 2 } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "temporal-context-set-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "temporal-context-set-case", "trace.json"), "utf8")) as any
+    const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
+    const targets = trace.records.filter((record: any) => record.record_id.startsWith("temporal_set_target_"))
+    const allSets = trace.records.filter(
+      (record: any) => record.event_type === "context.pack" && record.data.context_set_kind === "temporal_advisory",
+    )
+    const targetIDs = new Set(targets.map((record: any) => record.record_id))
+    const sets = allSets.filter((record: any) =>
+      trace.edges.some(
+        (edge: any) => edge.from.ref_id === record.record_id && targetIDs.has(edge.to.ref_id),
+      ),
+    )
+    expect(sets).toHaveLength(1)
+    expect(sets[0].data.member_refs.sort()).toEqual(facts.map((record: any) => `evidence:${record.record_id}`).sort())
+    expect(sets[0].source_refs ?? []).toEqual([])
+    expect(
+      trace.edges.filter(
+        (edge: any) =>
+          edge.from.ref_id === sets[0].record_id &&
+          targets.some((record: any) => record.record_id === edge.to.ref_id) &&
+          edge.derivation_method === "recent_source_fallback",
+      ),
+    ).toHaveLength(2)
+    expect(
+      trace.edges.some(
+        (edge: any) =>
+          facts.some((record: any) => record.record_id === edge.from.ref_id) &&
+          targets.some((record: any) => record.record_id === edge.to.ref_id),
+      ),
+    ).toBe(false)
   })
 
   test("writes v6.0 semantic pipeline records for prompt assembly, context transforms, and decisions", async () => {
@@ -4164,6 +4348,49 @@ describe("case trace", () => {
     assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
   })
 
+  test("flushes before an earlier server signal listener exits the process", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-signal-listener-order-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "signal-listener-order.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `process.once("SIGTERM", () => process.exit(143))`,
+        `CaseTrace.configure({ input: { prompt: "server listener was registered first" } })`,
+        `CaseTrace.node({ node_id: "signal_listener_order_ready", kind: "verification", component: "runtime", title: "ready" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "signal-listener-order-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const caseDir = path.join(dir, "signal-listener-order-case")
+    expect(await waitForCompleteCausalIRCheckpoint(caseDir, "signal_listener_order_ready")).toBeDefined()
+
+    proc.kill("SIGTERM")
+    expect(await proc.exited).toBe(143)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
+
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    expect(trace.manifest.status).toBe("cancelled")
+    expect(trace.manifest.shutdown_signal).toBe("SIGTERM")
+    expect(trace.nodes.some((node: any) => node.node_id === "signal_listener_order_ready")).toBe(true)
+  })
+
   test("keeps SIGTERM journal finalization exactly once after the case already finished", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigterm-after-finish-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -4203,6 +4430,75 @@ describe("case trace", () => {
     assertCausalIRJournalAudit(journal)
     assertJournalReplaysCanonicalTrace(journal, trace)
     assertExactlyOneFinalizationAtEnd(journal)
+  })
+
+  test("publishes canonical terminal files before compatibility projections", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-canonical-first-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "canonical-first.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import fs from "node:fs"`,
+        `import path from "node:path"`,
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const trace = CaseTrace.configure({ input: { prompt: "canonical first" } }) as any`,
+        `CaseTrace.node({ node_id: "canonical_first_ready", kind: "verification", component: "runtime", title: "ready" })`,
+        `const writes: string[] = []`,
+        `const durableWrite = trace.safeWrite.bind(trace)`,
+        `trace.safeWrite = (target: string, content: string) => { writes.push(path.relative(trace.caseDir, target)); return durableWrite(target, content) }`,
+        `const durableLinkOrWrite = trace.safeLinkOrWrite.bind(trace)`,
+        `trace.safeLinkOrWrite = (source: string, target: string, content: string) => { writes.push(path.relative(trace.caseDir, target)); return durableLinkOrWrite(source, target, content) }`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM" } })`,
+        `fs.writeFileSync(path.join(trace.caseDir, "write-order.json"), JSON.stringify(writes))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "canonical-first-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "canonical-first-case")
+    const writes = JSON.parse(await fs.readFile(path.join(caseDir, "write-order.json"), "utf8")) as string[]
+    const traceIndex = writes.indexOf("trace.json")
+    const manifestIndex = writes.indexOf("manifest.json")
+    const partialIndex = writes.indexOf(path.join("partial", "latest.json"))
+    const provenanceIndex = writes.indexOf("provenance-trace.json")
+    const legacyIndex = writes.indexOf("legacy-trace.json")
+    const htmlIndex = writes.indexOf("trace.html")
+
+    expect(traceIndex).toBeGreaterThanOrEqual(0)
+    expect(manifestIndex).toBeGreaterThan(traceIndex)
+    expect(partialIndex).toBeGreaterThan(manifestIndex)
+    expect(provenanceIndex).toBeGreaterThan(partialIndex)
+    expect(legacyIndex).toBeGreaterThan(partialIndex)
+    expect(htmlIndex).toBeGreaterThan(partialIndex)
+
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const finalization = (await readCausalIRJournal(caseDir)).at(-1) as any
+    expect(trace.manifest.status).toBe("cancelled")
+    expect(finalization.operation).toBe("case.finalized")
+    expect(finalization.data.snapshot).toBeUndefined()
+    expect(finalization.data.trace).toBeUndefined()
+    expect(Buffer.byteLength(JSON.stringify(finalization))).toBeLessThan(16 * 1024)
+    if (process.platform !== "win32") {
+      const canonicalStat = await fs.stat(path.join(caseDir, "trace.json"))
+      const partialStat = await fs.stat(path.join(caseDir, "partial", "latest.json"))
+      expect(partialStat.dev).toBe(canonicalStat.dev)
+      expect(partialStat.ino).toBe(canonicalStat.ino)
+    }
   })
 
   test("promotes an inferred final response when the exit gate confirms completion before shutdown", async () => {
@@ -4314,14 +4610,12 @@ describe("case trace", () => {
     expect(assessment.data.tool_failure_context_refs).toContain("tool_error:call_missing")
     expect(assessment.data.tool_failure_dependency_refs ?? []).not.toContain("tool_error:call_missing")
     expect(assessment.data.support_level).toBe("unsupported")
-    const advisoryEdges = trace.dataflow_edges.filter(
-      (edge: any) => edge.from?.id === "call_missing" && edge.metadata?.derivation_method === "recent_source_fallback",
-    )
+    const advisoryEdges = temporalAdvisoryEdgesForMember(trace, "tool_error:call_missing")
     expect(advisoryEdges.length).toBeGreaterThan(0)
     expect(
       advisoryEdges.every(
         (edge: any) =>
-          edge.metadata?.evidence_tier === "temporal_advisory" && edge.metadata?.eligible_for_attribution === false,
+          edge.evidence_tier === "temporal_advisory" && edge.eligible_for_attribution === false,
       ),
     ).toBe(true)
   })
@@ -7049,10 +7343,8 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(dir, "source-ref-case", "trace.json"), "utf8")) as any
     const refs = legacy.response_segments[0].source_refs ?? []
     const response = trace.records.find((record: any) => record.event_type === "response.output")
-    const advisoryEdges = trace.edges.filter(
-      (edge: any) => edge.to?.ref_id === response.record_id && edge.derivation_method === "recent_source_fallback",
-    )
-    const advisoryRefs = advisoryEdges.map((edge: any) => edge.from?.legacy_ref)
+    const advisoryEdges = temporalAdvisoryEdgesTo(trace, response.record_id)
+    const advisoryRefs = temporalAdvisoryMemberRefs(trace, response.record_id)
 
     expect(refs).toEqual([])
     expect(advisoryRefs).toContain(`context_snapshot:${legacy.context_snapshots[0].snapshot_id}`)

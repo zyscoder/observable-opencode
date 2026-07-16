@@ -124,6 +124,77 @@ test("runner waits for trace finalization after the server process exits", async
   assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).status, "success")
 })
 
+test("runner forwards a parent signal once and waits for child trace publication", async () => {
+  assert.equal(typeof featureBenchRunner.createRunnerSignalLifecycle, "function")
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-signal-forward-"))
+  const traceFile = path.join(directory, "trace.json")
+  const forwarded = []
+  const listeners = new Map()
+  const child = {
+    exitCode: null,
+    kill(signal) {
+      forwarded.push(signal)
+      setTimeout(() => {
+        fs.writeFileSync(traceFile, JSON.stringify({ manifest: { status: "cancelled", shutdown_signal: signal } }))
+        child.exitCode = signal === "SIGTERM" ? 143 : 130
+        listeners.get("exit")?.(child.exitCode)
+      }, 30)
+      return true
+    },
+    once(event, listener) {
+      listeners.set(event, listener)
+      return child
+    },
+    off(event, listener) {
+      if (listeners.get(event) === listener) listeners.delete(event)
+      return child
+    },
+  }
+
+  const lifecycle = featureBenchRunner.createRunnerSignalLifecycle({
+    child,
+    traceFile,
+    traceTimeoutMs: 1000,
+    installProcessHandlers: false,
+  })
+  const first = lifecycle.forward("SIGTERM")
+  const second = lifecycle.forward("SIGTERM")
+  const result = await first
+
+  assert.strictEqual(first, second)
+  assert.deepEqual(forwarded, ["SIGTERM"])
+  assert.equal(result.signal, "SIGTERM")
+  assert.equal(result.traceFile, traceFile)
+  assert.equal(result.exitCode, 143)
+  assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).manifest.status, "cancelled")
+  lifecycle.dispose()
+})
+
+test("runner targets the detached child process group on posix", () => {
+  assert.equal(typeof featureBenchRunner.signalRunnerChild, "function")
+  const groupSignals = []
+  const directSignals = []
+  const child = {
+    pid: 4242,
+    exitCode: null,
+    kill(signal) {
+      directSignals.push(signal)
+      return true
+    },
+  }
+
+  const target = featureBenchRunner.signalRunnerChild(child, "SIGTERM", {
+    platform: "darwin",
+    killProcessGroup(pid, signal) {
+      groupSignals.push([pid, signal])
+    },
+  })
+
+  assert.equal(target, "process_group")
+  assert.deepEqual(groupSignals, [[-4242, "SIGTERM"]])
+  assert.deepEqual(directSignals, [])
+})
+
 test("masked repositories expose no parent commit or unreachable original implementation", () => {
   assert.equal(typeof featureBenchRunner.sealMaskedRepositoryHistory, "function")
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-sealed-history-"))

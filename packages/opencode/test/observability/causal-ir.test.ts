@@ -203,6 +203,27 @@ describe("causal IR store", () => {
     expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
   })
 
+  test("keeps finalization compact regardless of graph payload size", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_compact_final",
+      caseID: "case_compact_final",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("large_node", { payload: "x".repeat(256 * 1024) }))
+    store.checkpoint({ phase: "recoverable" })
+
+    store.finalize({ status: "success", canonical_trace_path: "trace.json" })
+
+    const finalization = journal.at(-1) as any
+    expect(finalization.operation).toBe("case.finalized")
+    expect(finalization.data.snapshot).toBeUndefined()
+    expect(finalization.data.trace).toBeUndefined()
+    expect(finalization.data.graph).toMatchObject({ nodes: 1, edges: 0, artifacts: 0, diagnostics: 0 })
+    expect(Buffer.byteLength(JSON.stringify(finalization))).toBeLessThan(4096)
+    expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
+  })
+
   test("rebuilds node payload hashes from a replacement snapshot and clears removed node hashes", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({

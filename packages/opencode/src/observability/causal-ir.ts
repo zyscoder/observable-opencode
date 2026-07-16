@@ -264,6 +264,26 @@ type CausalIRLifecycleJournalData = {
   trace?: CausalIRTraceDocument
 }
 
+type CausalIRTraceEnvelope = Pick<
+  CausalIRTraceDocument,
+  "trace_version" | "causal_ir_version" | "manifest" | "journal" | "metrics" | "compatibility"
+>
+
+type CausalIRFinalizationJournalData = {
+  format: "compact_causal_ir_finalization"
+  data: unknown
+  graph: {
+    version: typeof CAUSAL_IR_VERSION
+    nodes: number
+    edges: number
+    artifacts: number
+    diagnostics: number
+    integrity_hash: string
+  }
+  canonical_trace_path: "trace.json"
+  canonical?: CausalIRTraceEnvelope
+}
+
 type CausalIRStoreInput = {
   runID: string
   caseID: string
@@ -1079,6 +1099,17 @@ function isLifecycleJournalData(input: unknown): input is CausalIRLifecycleJourn
   )
 }
 
+function isCompactFinalizationJournalData(input: unknown): input is CausalIRFinalizationJournalData {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false
+  const value = input as Partial<CausalIRFinalizationJournalData>
+  return (
+    value.format === "compact_causal_ir_finalization" &&
+    !!value.graph &&
+    typeof value.graph === "object" &&
+    value.canonical_trace_path === "trace.json"
+  )
+}
+
 function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
   const value = input as Partial<CausalIRTraceDocument>
@@ -1233,7 +1264,65 @@ export class CausalIRStore {
   }
 
   finalize(data: unknown): CausalIRCommitResult {
-    return this.appendSnapshot("case.finalized", "finish", data)
+    const snapshot = this.synchronize()
+    const trace = isCausalIRTraceDocument(data) ? data : undefined
+    const integrityHash = payloadHash({
+      nodes: snapshot.nodes.map((node) => [node.node_id, node.integrity.payload_hash]),
+      edges: snapshot.edges.map((edge) => [edge.edge_id, payloadHash(edge)]),
+      artifacts: snapshot.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash]),
+      diagnostics: snapshot.diagnostics.map((diagnostic) => [diagnostic.diagnostic_id, payloadHash(diagnostic)]),
+    })
+    const compact: CausalIRFinalizationJournalData = {
+      format: "compact_causal_ir_finalization",
+      data: trace?.manifest ?? data,
+      graph: {
+        version: CAUSAL_IR_VERSION,
+        nodes: snapshot.nodes.length,
+        edges: snapshot.edges.length,
+        artifacts: snapshot.artifacts.length,
+        diagnostics: snapshot.diagnostics.length,
+        integrity_hash: integrityHash,
+      },
+      canonical_trace_path: "trace.json",
+      ...(trace
+        ? {
+            canonical: {
+              trace_version: trace.trace_version,
+              causal_ir_version: trace.causal_ir_version,
+              manifest: trace.manifest,
+              journal: trace.journal,
+              metrics: trace.metrics,
+              compatibility: trace.compatibility,
+            },
+          }
+        : {}),
+    }
+    return this.append("case.finalized", "finish", this.input.caseID, compact, "case")
+  }
+
+  synchronize(): CausalIRStoreSnapshot {
+    const snapshot = this.snapshot()
+    this.synchronizeDirtySnapshot(snapshot)
+    return snapshot
+  }
+
+  private synchronizeDirtySnapshot(snapshot: CausalIRStoreSnapshot) {
+    for (const node of snapshot.nodes) {
+      if (this.payloadHashes.get(`node:${node.node_id}`) === payloadHash(node)) continue
+      this.append("node.updated", "node.update", node.node_id, node, "node")
+    }
+    for (const edge of snapshot.edges) {
+      if (this.payloadHashes.get(`edge:${edge.edge_id}`) === payloadHash(edge)) continue
+      this.append("edge.created", "edge", edge.edge_id, edge, "edge")
+    }
+    for (const artifact of snapshot.artifacts) {
+      if (this.payloadHashes.get(`artifact:${artifact.artifact_id}`) === payloadHash(artifact)) continue
+      this.append("artifact.reused", "artifact.reuse", artifact.artifact_id, artifact, "artifact")
+    }
+    for (const diagnostic of snapshot.diagnostics) {
+      if (this.payloadHashes.get(`diagnostic:${diagnostic.diagnostic_id}`) === payloadHash(diagnostic)) continue
+      this.append("diagnostic.created", "diagnostic", diagnostic.diagnostic_id, diagnostic, "diagnostic")
+    }
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -1263,7 +1352,7 @@ export class CausalIRStore {
     }
   }
 
-  private appendSnapshot(operation: "case.checkpointed" | "case.finalized", recordType: string, data: unknown) {
+  private appendSnapshot(operation: "case.checkpointed", recordType: string, data: unknown) {
     const trace = isCausalIRTraceDocument(data) ? journalData(data) : undefined
     return this.append(
       operation,
@@ -1829,14 +1918,37 @@ export function replayCausalIRJournal(journal: unknown[]): CausalIRStoreSnapshot
 
 export function replayCausalIRTrace(journal: unknown[]): CausalIRTraceDocument | undefined {
   let trace: CausalIRTraceDocument | undefined
+  let compact: CausalIRTraceEnvelope | undefined
   for (const item of journal) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue
     const entry = item as Partial<CausalIRJournalEntry>
     if (entry.operation !== "case.checkpointed" && entry.operation !== "case.finalized") continue
-    if (!isLifecycleJournalData(entry.data) || !isCausalIRTraceDocument(entry.data.trace)) continue
-    trace = journalData(entry.data.trace)
+    if (isLifecycleJournalData(entry.data) && isCausalIRTraceDocument(entry.data.trace)) {
+      trace = journalData(entry.data.trace)
+      continue
+    }
+    if (entry.operation === "case.finalized" && isCompactFinalizationJournalData(entry.data) && entry.data.canonical) {
+      compact = journalData(entry.data.canonical)
+    }
   }
-  return trace
+  if (!compact) return trace
+
+  const snapshot = replayCausalIRJournal(journal)
+  const projection = projectProvenanceTrace(snapshot, {
+    traceVersion: compact.trace_version,
+    manifest: compact.manifest as ProvenanceProjectionInput["manifest"],
+    metrics: compact.metrics as ProvenanceProjectionInput["metrics"],
+  })
+  const document: CausalIRTraceDocument = {
+    ...compact,
+    nodes: snapshot.nodes,
+    edges: snapshot.edges,
+    artifacts: snapshot.artifacts,
+    diagnostics: snapshot.diagnostics,
+    records: projection.records,
+    dataflow_edges: projection.dataflow_edges,
+  }
+  return JSON.parse(JSON.stringify(document)) as CausalIRTraceDocument
 }
 
 function optionalNumber(input: unknown) {
@@ -1885,6 +1997,7 @@ function provenanceLabel(label: string | undefined) {
 
 function projectedEdgeMetadata(edge: CausalIREdge, attributes: CanonicalRelationAttributes) {
   const metadata = { ...edge.metadata }
+  delete metadata.__case_trace_legacy_semantic_edge_projection
   delete metadata.original_relation
   delete metadata.normalized_relation
   delete metadata.evidence_tier

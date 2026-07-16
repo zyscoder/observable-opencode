@@ -1504,6 +1504,10 @@ class TraceOwnedCausalIRStore {
     return this.store.journalSummary()
   }
 
+  synchronize(): CausalIRStoreSnapshot {
+    return this.store.synchronize()
+  }
+
   private copy<T>(input: T): T {
     return sanitizeForJson(input) as T
   }
@@ -4786,6 +4790,7 @@ class ActiveCaseTrace {
   private recentToolFailureRefs: string[] = []
   private temporalSourceRefsBySelection = new WeakMap<string[], string[]>()
   private temporalAdvisoryEdgeKeys = new Set<string>()
+  private contextSetNodeIDsByKey = new Map<string, string>()
   private toolOutcomeRefsByCallID = new Map<
     string,
     Array<{ sourceRef: string; sessionID?: string; messageID?: string }>
@@ -5628,7 +5633,22 @@ class ActiveCaseTrace {
   contextTransform(input: ContextTransformInput) {
     const explicitSourceRefs = input.source_refs ?? input.evidence_refs ?? []
     const inferredToolOutcomeRefs = this.toolOutcomeRefsSelectedIntoContext(input)
-    const sourceRefs = dedupeStrings([...explicitSourceRefs, ...inferredToolOutcomeRefs])
+    const inferredToolContextSet = inferredToolOutcomeRefs.length
+      ? this.contextSet({
+          kind: "confirmed_tool_selection",
+          memberRefs: inferredToolOutcomeRefs,
+          sessionID: input.session_id,
+          messageID: input.message_id,
+          selectionMethod: "tool_call_identity_in_message",
+        })
+      : undefined
+    const inferredToolContextSetRef = inferredToolContextSet
+      ? `node:${inferredToolContextSet.node_id}`
+      : undefined
+    const sourceRefs = dedupeStrings([
+      ...explicitSourceRefs,
+      ...(inferredToolContextSetRef ? [inferredToolContextSetRef] : []),
+    ])
     const node = this.node({
       kind: "context.transform",
       component: "context",
@@ -5646,6 +5666,7 @@ class ActiveCaseTrace {
         output: input.output,
         transforms: input.transforms,
         inferred_tool_context_refs: inferredToolOutcomeRefs,
+        inferred_tool_context_set_ref: inferredToolContextSetRef,
         provenance_inference:
           inferredToolOutcomeRefs.length > 0
             ? { method: "tool_call_identity_in_message", evidence_tier: "confirmed", behavior_impact: "none" }
@@ -5661,20 +5682,30 @@ class ActiveCaseTrace {
       ]),
       metadata: input.metadata,
     })
-    for (const ref of sourceRefs) {
+    for (const ref of explicitSourceRefs) {
       const parsed = this.parseSourceRef(ref)
       if (!parsed) continue
-      const inferredToolOutcome = inferredToolOutcomeRefs.includes(ref)
       this.causalEdge({
         from: parsed,
         to: { type: "node", id: node.node_id, label: "context.transform" },
-        relation: inferredToolOutcome ? "used_as_context" : "context_transform",
-        evidence_tier: inferredToolOutcome ? "confirmed" : undefined,
-        derivation_method: inferredToolOutcome ? "tool_call_identity_in_message" : undefined,
-        evidence_refs: inferredToolOutcome ? [ref] : undefined,
-        label: inferredToolOutcome
-          ? "Tool result was selected into the model request by exact call identity"
-          : "Context transform consumed source record",
+        relation: "context_transform",
+        label: "Context transform consumed source record",
+      })
+    }
+    if (inferredToolContextSet && inferredToolContextSetRef) {
+      this.causalEdge({
+        from: {
+          type: "node",
+          id: inferredToolContextSet.node_id,
+          label: inferredToolContextSet.kind,
+        },
+        to: { type: "node", id: node.node_id, label: "context.transform" },
+        relation: "used_as_context",
+        evidence_tier: "confirmed",
+        eligible_for_attribution: true,
+        derivation_method: "tool_call_identity_in_message",
+        evidence_refs: [inferredToolContextSetRef],
+        label: "Confirmed tool-result context set was selected into the model request",
       })
     }
     if (input.stage === "model_messages_built" || input.stage === "llm_request_ready") {
@@ -5694,6 +5725,64 @@ class ActiveCaseTrace {
       }
     }
     return dedupeStrings(refs)
+  }
+
+  private contextSet(input: {
+    kind: "confirmed_tool_selection" | "temporal_advisory"
+    memberRefs: string[]
+    sessionID?: string
+    messageID?: string
+    selectionMethod: string
+  }) {
+    const memberRefs = dedupeStrings(input.memberRefs).sort()
+    const key = [input.kind, input.sessionID ?? "", input.messageID ?? "", ...memberRefs].join("|")
+    const existingID = this.contextSetNodeIDsByKey.get(key)
+    if (existingID) {
+      const existing = this.causalNodes.find((node) => node.node_id === existingID)
+      if (existing) return existing
+    }
+    const node = this.node(
+      {
+        node_id: `contextset_${hash(key)}`,
+        kind: "context.pack",
+        component: "context",
+        title:
+          input.kind === "confirmed_tool_selection"
+            ? "Confirmed tool-result context set"
+            : "Temporal advisory context set",
+        status: "success",
+        data: {
+          context_set_kind: input.kind,
+          member_refs: memberRefs,
+          member_count: memberRefs.length,
+          session_id: input.sessionID,
+          message_id: input.messageID,
+          selection_method: input.selectionMethod,
+          membership_storage: "payload_only",
+          attribution_eligible: input.kind === "confirmed_tool_selection",
+          behavior_impact: "none",
+        },
+      },
+      { trackGeneration: false, writePartial: false },
+    )
+    this.contextSetNodeIDsByKey.set(key, node.node_id)
+    if (input.kind === "confirmed_tool_selection") {
+      for (const ref of memberRefs) {
+        const parsed = this.parseSourceRef(ref)
+        if (!parsed || parsed.id === node.node_id) continue
+        this.causalEdge({
+          from: parsed,
+          to: { type: "node", id: node.node_id, label: node.kind },
+          relation: "selected_into_context",
+          evidence_tier: "confirmed",
+          eligible_for_attribution: true,
+          derivation_method: input.selectionMethod,
+          evidence_refs: [ref],
+          label: "Tool result is a member of the confirmed model-request context set",
+        })
+      }
+    }
+    return node
   }
 
   edge(input: SemanticEdgeInput) {
@@ -7346,7 +7435,10 @@ class ActiveCaseTrace {
     return node
   }
 
-  node(input: CausalNodeInput) {
+  node(
+    input: CausalNodeInput,
+    options: { trackGeneration?: boolean; writePartial?: boolean } = {},
+  ) {
     const temporal = normalizeTemporalReferences(input)
     const normalized = temporal.value
     const requestedSourceRefs = input.source_refs ?? input.evidence_refs
@@ -7384,39 +7476,45 @@ class ActiveCaseTrace {
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     const stored = this.causalIR.createNode(node) as CausalNode
-    if (stored.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, stored.node_id)
-    if (stored.kind === "context.pack" || stored.kind === "context.transform")
-      this.remember(this.recentContextNodeIDs, stored.node_id)
-    if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
+    if (options.trackGeneration !== false) {
+      if (stored.kind === "prompt.assembly") this.remember(this.recentPromptNodeIDs, stored.node_id)
+      if (stored.kind === "context.pack" || stored.kind === "context.transform")
+        this.remember(this.recentContextNodeIDs, stored.node_id)
+      if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
+    }
     this.createTemporalAdvisoryEdges(stored, temporalAdvisoryRefs)
-    this.writePartial()
+    if (options.writePartial !== false) this.writePartial()
     return stored
   }
 
   private createTemporalAdvisoryEdges(node: Pick<CausalNode, "node_id" | "kind">, refs: string[]) {
     const temporalRefs = dedupeStrings(refs)
-    for (const ref of temporalRefs) {
-      const parsed = this.parseSourceRef(ref)
-      if (!parsed || parsed.id === node.node_id) continue
-      const key = `${parsed.type}:${parsed.id}->${node.node_id}`
-      if (this.temporalAdvisoryEdgeKeys.has(key)) continue
-      this.temporalAdvisoryEdgeKeys.add(key)
-      this.causalIR.createEdge({
-        edge_id: semanticID("cedge", this.causalEdges.length + 1),
-        from: parsed,
-        to: { type: "node", id: node.node_id, label: node.kind },
-        relation: "derived_from",
-        label: "Temporal proximity advisory; not attribution-bearing",
-        evidence_tier: "temporal_advisory",
+    if (!temporalRefs.length) return
+    const contextSet = this.contextSet({
+      kind: "temporal_advisory",
+      memberRefs: temporalRefs,
+      selectionMethod: "recent_source_fallback",
+    })
+    if (contextSet.node_id === node.node_id) return
+    const key = `${contextSet.node_id}->${node.node_id}`
+    if (this.temporalAdvisoryEdgeKeys.has(key)) return
+    this.temporalAdvisoryEdgeKeys.add(key)
+    this.causalIR.createEdge({
+      edge_id: semanticID("cedge", this.causalEdges.length + 1),
+      from: { type: "node", id: contextSet.node_id, label: contextSet.kind },
+      to: { type: "node", id: node.node_id, label: node.kind },
+      relation: "derived_from",
+      label: "Temporal proximity advisory context set; not attribution-bearing",
+      evidence_tier: "temporal_advisory",
+      eligible_for_attribution: false,
+      derivation_method: "recent_source_fallback",
+      evidence_refs: [`node:${contextSet.node_id}`],
+      metadata: {
+        temporal_advisory: true,
         eligible_for_attribution: false,
-        derivation_method: "recent_source_fallback",
-        evidence_refs: [ref],
-        metadata: {
-          temporal_advisory: true,
-          eligible_for_attribution: false,
-        },
-      })
-    }
+        membership_expansion: "context_set_payload",
+      },
+    })
   }
 
   causalEdge(input: CausalEdgeInput) {
@@ -7831,10 +7929,9 @@ class ActiveCaseTrace {
     this.enrichMcpConsumptionRefs()
     this.emitCaseLifecycleRecord(status, caseStatus)
     this.finished = true
-    const checkpointSummary = this.causalIRSummary(status, caseStatus)
+    const checkpointSummary = this.causalIRSummary(status, caseStatus, true)
     const summary = this.summary(status, checkpointSummary)
     this.write("trace.finish", summary)
-    this.writePartial(true, checkpointSummary)
     const causalIR: CausalIRTraceSummary = {
       ...checkpointSummary,
       journal: this.causalIR.journalSummary(),
@@ -7847,11 +7944,13 @@ class ActiveCaseTrace {
           journal: this.causalIR.journalSummary(),
         }
     const provenance = this.projectProvenanceSummary(emittedCausalIR)
+    const canonical = jsonPretty(emittedCausalIR)
+    this.safeWrite(this.traceFile, canonical)
     this.safeWrite(this.manifestFile, jsonPretty(emittedCausalIR.manifest))
+    this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.safeWrite(this.traceFile, jsonPretty(emittedCausalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
-    this.writePartial(true, emittedCausalIR, false)
+    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
 
   flushForSignal(signal: NodeJS.Signals) {
@@ -7870,10 +7969,11 @@ class ActiveCaseTrace {
     const causalIR = this.causalIRSummary("cancelled", caseStatus)
     const summary = this.summary("cancelled", causalIR)
     const provenance = this.projectProvenanceSummary(causalIR)
+    const canonical = jsonPretty(causalIR)
+    this.safeWrite(this.traceFile, canonical)
     this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
+    this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
     this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.writePartial(true, causalIR, false)
-    this.safeWrite(this.traceFile, jsonPretty(causalIR))
     this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
     this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
@@ -7950,12 +8050,16 @@ class ActiveCaseTrace {
     }
   }
 
-  private causalIRSummary(status: TraceStatus, caseStatus?: TraceStatus): CausalIRTraceSummary {
+  private causalIRSummary(
+    status: TraceStatus,
+    caseStatus?: TraceStatus,
+    synchronize = false,
+  ): CausalIRTraceSummary {
     const manifest = this.manifest(status, caseStatus)
     const records = this.provenanceRecords().filter((record) => !this.isCaseDiagnosticKind(record.event_type))
     const traceHealth = this.traceHealth(records)
     this.syncCaseDiagnosticNodes(traceHealth)
-    const causalIR = this.causalIR.snapshot()
+    const causalIR = synchronize ? this.causalIR.synchronize() : this.causalIR.snapshot()
     const streamSummary = this.streamSummary()
     const provenance = this.projectCausalIRSnapshot(causalIR, manifest, {
       spans: this.spans.size,
@@ -9880,10 +9984,37 @@ class ActiveCaseTrace {
   }
 
   private safeWrite(target: string, content: string) {
+    const temporary = path.join(
+      path.dirname(target),
+      `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    )
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, content)
-    } catch {}
+      fs.writeFileSync(temporary, content)
+      fs.renameSync(temporary, target)
+    } catch {
+      try {
+        fs.unlinkSync(temporary)
+      } catch {}
+    }
+  }
+
+  private safeLinkOrWrite(source: string, target: string, fallbackContent: string) {
+    const temporary = path.join(
+      path.dirname(target),
+      `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.link`,
+    )
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.linkSync(source, temporary)
+      fs.renameSync(temporary, target)
+      return
+    } catch {
+      try {
+        fs.unlinkSync(temporary)
+      } catch {}
+    }
+    this.safeWrite(target, fallbackContent)
   }
 }
 
@@ -9941,7 +10072,7 @@ function installProcessFinalizer() {
   process.once("beforeExit", (code) => finishActiveFromProcessExit(code))
   process.once("exit", (code) => finishActiveFromProcessExit(code))
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
-    process.once(signal, () => {
+    process.prependOnceListener(signal, () => {
       finishActiveFromSignal(signal)
       const code = signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129
       process.exit(code)

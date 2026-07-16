@@ -154,6 +154,93 @@ export async function waitForGeneratedFile(file, options = {}) {
   throw new Error(`timed out after ${timeoutMs} ms waiting for generated file: ${file}`)
 }
 
+function signalExitCode(signal) {
+  return signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null) return Promise.resolve(child.exitCode)
+  return new Promise((resolve, reject) => {
+    const onExit = (code) => {
+      clearTimeout(timer)
+      resolve(code ?? child.exitCode ?? 0)
+    }
+    const timer = setTimeout(() => {
+      child.off?.("exit", onExit)
+      reject(new Error(`timed out after ${timeoutMs} ms waiting for observable-opencode child exit`))
+    }, timeoutMs)
+    child.once("exit", onExit)
+  })
+}
+
+export function createRunnerSignalLifecycle(options) {
+  const child = options.child
+  const traceFile = options.traceFile
+  const traceTimeoutMs = options.traceTimeoutMs ?? 60_000
+  const childExitTimeoutMs = options.childExitTimeoutMs ?? 30_000
+  const handlers = new Map()
+  let forwardedSignal
+  let forwarding
+
+  const forward = (signal) => {
+    if (forwarding) return forwarding
+    forwardedSignal = signal
+    forwarding = (async () => {
+      if (child.exitCode === null) signalRunnerChild(child, signal)
+      const exitCode = await waitForChildExit(child, childExitTimeoutMs)
+      await waitForGeneratedFile(traceFile, { timeoutMs: traceTimeoutMs })
+      return { signal, exitCode, traceFile }
+    })()
+    return forwarding
+  }
+
+  const dispose = () => {
+    for (const [signal, handler] of handlers) process.off(signal, handler)
+    handlers.clear()
+  }
+
+  if (options.installProcessHandlers !== false) {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      const handler = () => void forward(signal)
+      handlers.set(signal, handler)
+      process.once(signal, handler)
+    }
+  }
+
+  return {
+    forward,
+    dispose,
+    get signal() {
+      return forwardedSignal
+    },
+    get pending() {
+      return forwarding
+    },
+  }
+}
+
+export function signalRunnerChild(child, signal, options = {}) {
+  const platform = options.platform ?? process.platform
+  const killProcessGroup = options.killProcessGroup ?? process.kill.bind(process)
+  if (platform !== "win32" && Number.isInteger(child.pid) && child.pid > 0) {
+    try {
+      killProcessGroup(-child.pid, signal)
+      return "process_group"
+    } catch {}
+  }
+  child.kill(signal)
+  return "child"
+}
+
+class RunnerSignalError extends Error {
+  constructor(signal) {
+    super(`benchmark runner interrupted by ${signal}`)
+    this.name = "RunnerSignalError"
+    this.signal = signal
+    this.exitCode = signalExitCode(signal)
+  }
+}
+
 function attachProcessLogs(child, resultDir) {
   const stdout = fs.createWriteStream(path.join(resultDir, "server.stdout.log"))
   const stderr = fs.createWriteStream(path.join(resultDir, "server.stderr.log"))
@@ -189,12 +276,12 @@ async function waitForServer(child) {
 
 async function stopServer(child) {
   if (child.exitCode !== null) return
-  child.kill("SIGINT")
+  signalRunnerChild(child, "SIGINT")
   for (let attempt = 0; attempt < 80; attempt++) {
     if (child.exitCode !== null) return
     await wait(250)
   }
-  child.kill("SIGTERM")
+  signalRunnerChild(child, "SIGTERM")
   for (let attempt = 0; attempt < 40; attempt++) {
     if (child.exitCode !== null) return
     await wait(250)
@@ -260,6 +347,7 @@ async function runOneCase(row, args, sourceManifest) {
     fs.mkdirSync(directory, { recursive: true })
   }
   const prompt = buildAgentPrompt(row, repoDir)
+  const traceFile = path.join(tracesDir, row.instance_id, "trace.json")
   const child = spawn(path.resolve(args.binary), ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
     cwd: repoDir,
     env: {
@@ -276,7 +364,9 @@ async function runOneCase(row, args, sourceManifest) {
       OPENCODE_BENCHMARK_INSTANCE_ID: row.instance_id,
     },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   })
+  const signalLifecycle = createRunnerSignalLifecycle({ child, traceFile })
   const closeProcessLogs = attachProcessLogs(child, resultDir)
 
   let requestError
@@ -303,11 +393,13 @@ async function runOneCase(row, args, sourceManifest) {
   } catch (error) {
     requestError = error
   } finally {
-    await stopServer(child)
+    if (signalLifecycle.pending) await signalLifecycle.pending
+    else await stopServer(child)
+    signalLifecycle.dispose()
     await closeProcessLogs()
   }
 
-  const traceFile = path.join(tracesDir, row.instance_id, "trace.json")
+  if (signalLifecycle.signal) throw new RunnerSignalError(signalLifecycle.signal)
   try {
     await waitForGeneratedFile(traceFile)
   } catch (error) {
@@ -366,6 +458,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
   runFeatureBenchCases(args).catch((error) => {
     console.error(error?.stack ?? String(error))
-    process.exit(1)
+    process.exit(error instanceof RunnerSignalError ? error.exitCode : 1)
   })
 }
