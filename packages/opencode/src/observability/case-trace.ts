@@ -413,12 +413,41 @@ export type TraceConstraintRecord = {
 type ClaimGroundingDecision = {
   candidate_ref: string
   candidate_origin: "confirmed_generation_context" | "explicit_response_source"
-  decision: "selected_direct_support" | "rejected_no_match" | "rejected_lower_ranked_match"
+  decision:
+    | "selected_direct_support"
+    | "rejected_no_match"
+    | "rejected_lower_ranked_match"
+    | "rejected_inapplicable"
   score: number
   reasons: string[]
-  rejection_reason?: "semantic_match_below_threshold" | "lower_ranked_match"
+  rejection_reason?:
+    | "semantic_match_below_threshold"
+    | "lower_ranked_match"
+    | "superseded_verification"
+    | "verification_revision_mismatch"
+    | "verification_status_mismatch"
+    | "unscoped_verification_candidate"
+  candidate_verification_refs?: string[]
+  candidate_repository_revision?: number
+  candidate_verification_phase?: TraceVerificationRecord["verification_phase"]
+  candidate_verification_status?: TraceVerificationRecord["status"]
+  candidate_effective_for_final_state?: boolean
+  candidate_temporal_role?: "current_effective" | "superseded" | "unknown"
+  candidate_temporally_eligible?: boolean
+  attribution_eligible: boolean
   agent_attention_observed: false
   behavior_impact: "none"
+}
+
+type VerificationFactProvenance = {
+  verification_refs: string[]
+  verification_repository_revision?: number
+  verification_phase?: TraceVerificationRecord["verification_phase"]
+  verification_status?: TraceVerificationRecord["status"]
+  verification_effective_for_final_state?: boolean
+  verification_temporal_role: "current_effective" | "superseded" | "unknown"
+  verification_supersedes_refs?: string[]
+  verification_superseded_by_refs?: string[]
 }
 
 export type TraceResponseSegment = {
@@ -2643,6 +2672,9 @@ function protectClaimSegments(input: string) {
     })
   }
   protect(/`[^`\n]+`/g)
+  protect(
+    /(?:\b\d+(?:\.\d+)?|\b[A-Za-z_$][\w$]*)\s*(?:!==|===|!=|==|<=|>=|<|>)\s*(?:\d+(?:\.\d+)?\b|[A-Za-z_$][\w$]*\b)/g,
+  )
   protect(/\b\d+\.\d+%?/g)
   protect(/\b\d+\s*percent\b/gi)
   protect(/\b[\w@+.-]+\.(?:mjs|js|ts|tsx|jsx|json|md|txt|py|go|rs|java|c|cc|cpp|h|hpp|swift|kt|sh|yaml|yml)\b/gi)
@@ -2919,6 +2951,13 @@ function isVerificationClaimText(input: string) {
   return /test|测试|passed|failed|pass|fail|assert|断言|exit|退出码|验证|genericity|extra check|通用性检查|pricing tests|expected|actual|通过|失败|\b48000\b|\b51000\b|\b850000\b/i.test(
     input,
   )
+}
+
+function verificationClaimExpectedStatus(input: string): TraceVerificationRecord["status"] | undefined {
+  const passed = /\bpass(?:ed)?\b|全部通过|测试通过|验证通过|成功|exit(?:[_ -]?code)?\s*[:=]?\s*0|退出码\s*[:=]?\s*0/i.test(input)
+  const failed = /\bfail(?:ed|ure)?\b|测试失败|验证失败|失败|断言|assert(?:ion)?|error/i.test(input)
+  if (passed === failed) return undefined
+  return passed ? "passed" : "failed"
 }
 
 function isChangeClaimText(input: string) {
@@ -5916,6 +5955,56 @@ class ActiveCaseTrace {
     }
   }
 
+  private verificationRecordsForRefs(refs: string[], spanID?: string) {
+    const found = new Map<string, TraceVerificationRecord>()
+    const seen = new Set<string>()
+    const visit = (ref: string, depth: number) => {
+      if (!ref || depth > 4 || seen.has(ref)) return
+      seen.add(ref)
+      if (ref.startsWith("verification:")) {
+        const verificationID = ref.slice("verification:".length)
+        const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
+        if (verification) found.set(verification.verification_id, verification)
+        return
+      }
+      const node = this.sourceNodeForRef(ref)
+      if (!node) return
+      for (const verificationRef of stringArrayField(node.data ?? {}, ["verification_refs", "verificationRefs"]) ?? []) {
+        visit(verificationRef, depth + 1)
+      }
+      for (const sourceRef of node.source_refs ?? []) visit(sourceRef, depth + 1)
+    }
+    for (const ref of refs) visit(ref, 0)
+    if (!found.size && spanID) {
+      for (const verification of this.verificationRecords) {
+        if (verification.span_id === spanID) found.set(verification.verification_id, verification)
+      }
+    }
+    return [...found.values()]
+  }
+
+  private verificationFactProvenance(refs: string[], spanID?: string): VerificationFactProvenance | undefined {
+    const records = this.verificationRecordsForRefs(refs, spanID)
+    if (!records.length) return undefined
+    const primary = records.findLast((item) => item.span_id && item.span_id === spanID) ?? records.at(-1)!
+    const temporalRole =
+      primary.effective_for_final_state === true && primary.repository_revision === this.repositoryRevision
+        ? "current_effective"
+        : primary.effective_for_final_state === false || Boolean(primary.superseded_by_refs?.length)
+          ? "superseded"
+          : "unknown"
+    return {
+      verification_refs: records.map((item) => `verification:${item.verification_id}`),
+      verification_repository_revision: primary.repository_revision,
+      verification_phase: primary.verification_phase,
+      verification_status: primary.status,
+      verification_effective_for_final_state: primary.effective_for_final_state,
+      verification_temporal_role: temporalRole,
+      verification_supersedes_refs: primary.supersedes_refs,
+      verification_superseded_by_refs: primary.superseded_by_refs,
+    }
+  }
+
   private syncVerificationNode(verification: TraceVerificationRecord) {
     const node = this.causalNodes.find((item) => item.node_id === `vernode_${verification.verification_id}`)
     if (!node) return
@@ -5929,6 +6018,18 @@ class ActiveCaseTrace {
     }
     node.artifact_refs = this.collectArtifactRefs(node.data)
     this.causalIR.updateNode(node)
+    const verificationRef = `verification:${verification.verification_id}`
+    for (const derived of this.causalNodes) {
+      if (derived.node_id === node.node_id) continue
+      const provenance = this.verificationFactProvenance(derived.source_refs ?? [], derived.span_id)
+      if (!provenance?.verification_refs.includes(verificationRef)) continue
+      derived.data = {
+        ...(derived.data ?? {}),
+        ...provenance,
+      }
+      derived.artifact_refs = this.collectArtifactRefs(derived.data)
+      this.causalIR.updateNode(derived)
+    }
   }
 
   verification(input: VerificationRecordInput) {
@@ -6725,7 +6826,17 @@ class ActiveCaseTrace {
         verification?.effective_for_final_state === true && verification.repository_revision === this.repositoryRevision
       )
     })
-    const supersededEvidenceRefs = verificationSourceRefs.filter((ref) => !effectiveVerificationRefs.includes(ref))
+    const temporallyInapplicableEvidenceRefs = evidenceMatch.decisions
+      .filter(
+        (item) =>
+          item.rejection_reason === "superseded_verification" ||
+          item.rejection_reason === "verification_revision_mismatch",
+      )
+      .map((item) => item.candidate_ref)
+    const supersededEvidenceRefs = dedupeStrings([
+      ...verificationSourceRefs.filter((ref) => !effectiveVerificationRefs.includes(ref)),
+      ...temporallyInapplicableEvidenceRefs,
+    ])
     const matchedExecutionSupportRefs = evidenceMatch.refs.filter((ref) => {
       if (ref.startsWith("verification:")) return effectiveVerificationRefs.includes(ref)
       if (!ref.startsWith("change:")) return false
@@ -6736,18 +6847,24 @@ class ActiveCaseTrace {
     const directSupportRefs = dedupeStrings([
       ...effectiveDirectEvidenceRefs,
       ...matchedExecutionSupportRefs,
-      ...(claimKind === "verification" ? effectiveVerificationRefs : []),
+      ...(claimKind === "verification" && temporalScope !== "historical" && temporalScope !== "future"
+        ? effectiveVerificationRefs
+        : []),
     ])
     const weakEvidenceMatch =
       evidenceMatch.weak && !(claimKind === "verification" && effectiveVerificationRefs.length > 0)
     const groundingDecisions: ClaimGroundingDecision[] = evidenceMatch.decisions.map((item) =>
       directSupportRefs.includes(item.candidate_ref)
-        ? {
+          ? {
             ...item,
             decision: "selected_direct_support",
             rejection_reason: undefined,
+            attribution_eligible: true,
           }
-        : item,
+        : {
+            ...item,
+            attribution_eligible: false,
+          },
     )
     const legacyContextRefs = sourceRefs.filter((ref) => !effectiveDirectEvidenceRefs.includes(ref))
     const effectiveClassifiedRefs = {
@@ -6942,6 +7059,10 @@ class ActiveCaseTrace {
     for (const ref of claim.direct_support_refs ?? []) {
       if (claim.direct_evidence_refs.includes(ref) || claim.execution_refs.includes(ref)) continue
       this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
+    }
+    for (const ref of claim.superseded_evidence_refs ?? []) {
+      if (claim.direct_support_refs?.includes(ref)) continue
+      this.linkSupersededSourceToClaim(ref, node.node_id)
     }
     for (const ref of claim.context_refs) this.linkSourceToClaim(ref, node.node_id, "context_to_claim")
     for (const ref of claim.execution_refs) this.linkSourceToClaim(ref, node.node_id, "execution_to_claim")
@@ -7501,6 +7622,7 @@ class ActiveCaseTrace {
   evidenceFact(input: EvidenceFactInput) {
     const factID = input.fact_id ?? semanticID("fact", this.causalNodes.length + 1)
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
+    const verificationProvenance = this.verificationFactProvenance(sourceRefs, input.span_id)
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
       ...collectSourceLocations(input.data),
@@ -7519,6 +7641,7 @@ class ActiveCaseTrace {
       existing.source_refs = mergeRefs(existing.source_refs, sourceRefs)
       existing.data = {
         ...existingData,
+        ...verificationProvenance,
         occurrence_count: occurrenceCount + 1,
         duplicate_source_refs: dedupeStrings([
           ...(stringArrayField(existingData, ["duplicate_source_refs", "duplicateSourceRefs"]) ?? []),
@@ -7574,6 +7697,7 @@ class ActiveCaseTrace {
         quality_flags: canonical.quality_flags,
         confidence: input.confidence ?? "observed",
         evidence_origin: canonical.evidence_origin,
+        ...verificationProvenance,
         source_locations: sourceLocations,
         evidence_class:
           recordKind === "evidence.semantic_fact"
@@ -7762,6 +7886,7 @@ class ActiveCaseTrace {
       return undefined
     }
     const sourceRefs = this.observationSourceRefs(input)
+    const verificationProvenance = this.verificationFactProvenance(sourceRefs, input.span_id)
     const semanticExtras = observationSemanticExtras(input.source, input.data)
     const sourceLocations = dedupeSourceLocations([
       ...(input.source_locations ?? []),
@@ -7785,6 +7910,7 @@ class ActiveCaseTrace {
         data: input.data,
         evidence_class: observationKind === "task.plan_state" ? "plan_state" : "execution_observation",
         plan_items: observationKind === "task.plan_state" ? planStateSummary(input.data ?? input.summary) : undefined,
+        ...verificationProvenance,
         source_locations: sourceLocations,
         typed_resources: semanticExtras.typed_resources,
         metadata: input.metadata,
@@ -9965,6 +10091,84 @@ class ActiveCaseTrace {
     return [...output]
   }
 
+  private verificationCandidateSemantics(
+    ref: string,
+    node: CausalNode | undefined,
+    claimText: string,
+  ): {
+    verificationRefs?: string[]
+    repositoryRevision?: number
+    verificationPhase?: TraceVerificationRecord["verification_phase"]
+    verificationStatus?: TraceVerificationRecord["status"]
+    effectiveForFinalState?: boolean
+    temporalRole?: VerificationFactProvenance["verification_temporal_role"]
+    temporallyEligible: boolean
+    rejectionReason?: ClaimGroundingDecision["rejection_reason"]
+  } {
+    const data = node?.data ?? {}
+    const factKind = typeof data.fact_kind === "string" ? data.fact_kind : undefined
+    const embeddedRefs = stringArrayField(data, ["verification_refs", "verificationRefs"]) ?? []
+    const isVerificationCandidate =
+      factKind === "verification_output" || ref.startsWith("verification:") || embeddedRefs.length > 0
+    if (!isVerificationCandidate) return { temporallyEligible: true }
+
+    const verificationRefs = dedupeStrings([
+      ...(ref.startsWith("verification:") ? [ref] : []),
+      ...embeddedRefs,
+    ])
+    const repositoryRevision = optionalNumber(
+      data.verification_repository_revision ?? data.repository_revision,
+    )
+    const phaseValue = firstStringField(data, ["verification_phase", "verificationPhase"])
+    const verificationPhase = ["baseline", "post_change", "post_test_change", "unknown"].includes(
+      phaseValue ?? "",
+    )
+      ? (phaseValue as TraceVerificationRecord["verification_phase"])
+      : undefined
+    const statusValue =
+      firstStringField(data, ["verification_status", "verificationStatus", "status"]) ?? node?.status
+    const verificationStatus = ["passed", "failed", "unknown"].includes(statusValue ?? "")
+      ? (statusValue as TraceVerificationRecord["status"])
+      : undefined
+    const effectiveValue = data.verification_effective_for_final_state ?? data.effective_for_final_state
+    const effectiveForFinalState =
+      typeof effectiveValue === "boolean" ? effectiveValue : undefined
+    const roleValue = firstStringField(data, ["verification_temporal_role", "verificationTemporalRole"])
+    const temporalRole = ["current_effective", "superseded", "unknown"].includes(roleValue ?? "")
+      ? (roleValue as VerificationFactProvenance["verification_temporal_role"])
+      : effectiveForFinalState === false
+        ? "superseded"
+        : effectiveForFinalState === true && repositoryRevision === this.repositoryRevision
+          ? "current_effective"
+          : undefined
+    const expectedStatus = verificationClaimExpectedStatus(claimText)
+    const temporalScope = responseClaimTemporalScope(claimText, this.repositoryRevision)
+    let rejectionReason: ClaimGroundingDecision["rejection_reason"]
+    if (temporalScope === "historical") {
+      if (effectiveForFinalState === true && repositoryRevision === this.repositoryRevision) {
+        rejectionReason = "verification_revision_mismatch"
+      } else if (expectedStatus && verificationStatus && verificationStatus !== expectedStatus) {
+        rejectionReason = "verification_status_mismatch"
+      }
+    } else if (effectiveForFinalState === false || temporalRole === "superseded") {
+      rejectionReason = "superseded_verification"
+    } else if (repositoryRevision !== undefined && repositoryRevision !== this.repositoryRevision) {
+      rejectionReason = "verification_revision_mismatch"
+    } else if (expectedStatus && verificationStatus && verificationStatus !== expectedStatus) {
+      rejectionReason = "verification_status_mismatch"
+    }
+    return {
+      verificationRefs: verificationRefs.length ? verificationRefs : undefined,
+      repositoryRevision,
+      verificationPhase,
+      verificationStatus,
+      effectiveForFinalState,
+      temporalRole,
+      temporallyEligible: rejectionReason === undefined,
+      rejectionReason,
+    }
+  }
+
   private matchEvidenceForClaim(
     claimText: unknown,
     evidenceRefs: string[],
@@ -9972,25 +10176,42 @@ class ActiveCaseTrace {
   ) {
     const candidateRefs = dedupeStrings(evidenceRefs)
     const generationCandidateSet = new Set(generationGroundingCandidateRefs)
+    const claimPreview = stringPreview(claimText, 2000)
+    const isVerificationClaim = isVerificationClaimText(claimPreview)
+    const isChangeClaim = isChangeClaimText(claimPreview)
+    const mentionsToolFailure = isToolFailureClaimText(claimPreview)
     const analyzed = candidateRefs
       .map((ref) => {
         const node = this.sourceNodeForRef(ref)
         const analysis = this.sourceRefMatchAnalysis(ref, claimText, node)
+        const verification = this.verificationCandidateSemantics(ref, node, stringPreview(claimText, 2000))
         return {
           ref,
           score: analysis.score,
           reasons: analysis.reasons,
           weak: analysis.weak,
           factKind: typeof node?.data?.fact_kind === "string" ? node.data.fact_kind : undefined,
+          verification,
         }
       })
+    const hasScopedVerificationCandidate = analyzed.some(
+      (item) =>
+        item.verification.temporallyEligible &&
+        Boolean(item.verification.verificationRefs?.length) &&
+        (item.verification.repositoryRevision !== undefined ||
+          item.verification.effectiveForFinalState !== undefined ||
+          item.verification.verificationStatus !== undefined),
+    )
+    if (isVerificationClaim && hasScopedVerificationCandidate) {
+      for (const item of analyzed) {
+        if (item.factKind !== "verification_output" || item.verification.verificationRefs?.length) continue
+        item.verification.temporallyEligible = false
+        item.verification.rejectionReason = "unscoped_verification_candidate"
+      }
+    }
     const scored = analyzed
-      .filter((item) => item.score >= 0.35)
+      .filter((item) => item.verification.temporallyEligible && item.score >= 0.35)
       .sort((a, b) => b.score - a.score)
-    const claimPreview = stringPreview(claimText, 2000)
-    const isVerificationClaim = isVerificationClaimText(claimPreview)
-    const isChangeClaim = isChangeClaimText(claimPreview)
-    const mentionsToolFailure = isToolFailureClaimText(claimPreview)
     let preferred =
       isVerificationClaim && !mentionsToolFailure && scored.some((item) => item.factKind === "verification_output")
         ? scored.filter((item) => item.factKind === "verification_output")
@@ -10043,16 +10264,28 @@ class ActiveCaseTrace {
           : "explicit_response_source",
         decision: selected
           ? "selected_direct_support"
-          : aboveThreshold
-            ? "rejected_lower_ranked_match"
-            : "rejected_no_match",
+          : item.verification.rejectionReason
+            ? "rejected_inapplicable"
+            : aboveThreshold
+              ? "rejected_lower_ranked_match"
+              : "rejected_no_match",
         score: item.score,
         reasons: item.reasons,
         rejection_reason: selected
           ? undefined
-          : aboveThreshold
-            ? "lower_ranked_match"
-            : "semantic_match_below_threshold",
+          : item.verification.rejectionReason
+            ? item.verification.rejectionReason
+            : aboveThreshold
+              ? "lower_ranked_match"
+              : "semantic_match_below_threshold",
+        candidate_verification_refs: item.verification.verificationRefs,
+        candidate_repository_revision: item.verification.repositoryRevision,
+        candidate_verification_phase: item.verification.verificationPhase,
+        candidate_verification_status: item.verification.verificationStatus,
+        candidate_effective_for_final_state: item.verification.effectiveForFinalState,
+        candidate_temporal_role: item.verification.temporalRole,
+        candidate_temporally_eligible: item.verification.temporallyEligible,
+        attribution_eligible: selected,
         agent_attention_observed: false,
         behavior_impact: "none",
       }
@@ -10109,6 +10342,24 @@ class ActiveCaseTrace {
           : relation === "context_to_claim"
             ? "Context record contextualizes response claim"
             : "Execution record was used for response claim",
+    })
+  }
+
+  private linkSupersededSourceToClaim(ref: string, claimNodeID: string) {
+    const parsed = this.parseSourceRef(ref)
+    if (!parsed) return
+    this.causalEdge({
+      from: parsed,
+      to: { type: "response_claim", id: claimNodeID, label: "response.claim" },
+      relation: "context_to_claim",
+      evidence_tier: "temporal_advisory",
+      eligible_for_attribution: false,
+      derivation_method: "verification_temporal_applicability_v1",
+      label: "Superseded verification evidence contextualizes but does not support the current claim",
+      metadata: {
+        causal_semantics: "superseded_verification_context",
+        behavior_impact: "none",
+      },
     })
   }
 

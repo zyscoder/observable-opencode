@@ -1794,7 +1794,7 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.responseOutput({ text: "修复点在 src/pricing.mjs：renewalQuote 使用 Math.min(input.discountPercent, 0.15) 将折扣上限限制为 15%。" })`,
+        `CaseTrace.responseOutput({ text: "修复点在 src/pricing.mjs：renewalQuote 使用 Math.min(input.discountPercent, 0.15) 将折扣上限限制为 15%。基线断言显示 48000 !== 51000。" })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -1820,10 +1820,12 @@ describe("case trace", () => {
     const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
     const claimText = claims.map((record: any) => record.data.text).join("\n")
 
-    expect(claims).toHaveLength(1)
+    expect(claims).toHaveLength(2)
     expect(claimText).toContain("src/pricing.mjs")
     expect(claimText).toContain("Math.min(input.discountPercent, 0.15)")
     expect(claimText).toContain("15%")
+    expect(claimText).toContain("48000 !== 51000")
+    expect(claims.filter((record: any) => String(record.data.text).includes("48000 !== 51000"))).toHaveLength(1)
     expect(claimText).not.toMatch(/(^|\n)(0\.|15\)|mjs)[。.!?；;]?($|\n)/)
     expect(trace.metrics.trace_health.broken_claim_fragments).toBe(0)
   })
@@ -2586,9 +2588,12 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.verification({ verification_id: "baseline", command: "npm test", exit_code: 1, status: "failed", stderr: "1 test failed" })`,
+        `const baselineFact = CaseTrace.evidenceFact({ fact_id: "baseline_result", source: "bash", category: "verification_output", summary: "baseline npm test failed", data: { command: "npm test", status: "failed", exit_code: 1 }, source_refs: ["verification:baseline"] })`,
         `CaseTrace.change({ change_id: "implementation", files: ["src/owner.mjs"], diff: "-return 'legacy'\\n+return 'billing-platform'" })`,
         `CaseTrace.verification({ verification_id: "post_change", command: "npm test", exit_code: 0, status: "passed", stdout: "all tests passed" })`,
-        `CaseTrace.responseOutput({ text: "全部通过。", source_refs: ["verification:baseline", "change:implementation", "verification:post_change"] })`,
+        `const postChangeFact = CaseTrace.evidenceFact({ fact_id: "post_change_result", source: "bash", category: "verification_output", summary: "post-change npm test passed", data: { command: "npm test", status: "passed", exit_code: 0 }, source_refs: ["verification:post_change"] })`,
+        `const setupFact = CaseTrace.evidenceFact({ fact_id: "setup_command", source: "bash", category: "verification_output", summary: "list repository files", data: { command: "ls -R", status: "passed", exit_code: 0 } })`,
+        `CaseTrace.responseOutput({ text: "Before the change, the baseline npm test failed. All tests passed after the change.", source_refs: [baselineFact ? "evidence:" + baselineFact.node_id : "", postChangeFact ? "evidence:" + postChangeFact.node_id : "", setupFact ? "evidence:" + setupFact.node_id : "", "verification:baseline", "change:implementation", "verification:post_change"] })`,
         `CaseTrace.finish({ status: "success" })`,
       ].join("\n"),
     )
@@ -2600,6 +2605,7 @@ describe("case trace", () => {
         OPENCODE_CASE_TRACE: "1",
         OPENCODE_CASE_ID: "revision-claim-case",
         OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "12000",
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -2611,15 +2617,88 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "revision-claim-case", "trace.json"), "utf8")) as any
-    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+    const baselineFact = trace.records.find(
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.fact_id === "baseline_result",
+    )
+    const postChangeFact = trace.records.find(
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.fact_id === "post_change_result",
+    )
+    const setupFact = trace.records.find(
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.fact_id === "setup_command",
+    )
+    const currentClaim = trace.records.find(
+      (record: any) => record.event_type === "response.claim" && String(record.data.text).includes("All tests passed"),
+    )
+    const historicalClaim = trace.records.find(
+      (record: any) =>
+        record.event_type === "response.claim" && String(record.data.text).includes("baseline npm test failed"),
+    )
+    const baselineRef = `evidence:${baselineFact.record_id}`
+    const postChangeRef = `evidence:${postChangeFact.record_id}`
+    const setupRef = `evidence:${setupFact.record_id}`
 
-    expect(claim.data.claim_kind).toBe("verification")
-    expect(claim.data.temporal_scope).toBe("current_revision")
-    expect(claim.data.repository_revision).toBe(1)
-    expect(claim.data.direct_support_refs).toContain("verification:post_change")
-    expect(claim.data.direct_support_refs).not.toContain("verification:baseline")
-    expect(claim.data.superseded_evidence_refs).toContain("verification:baseline")
-    expect(claim.data.quality_flags).not.toContain("weak_evidence_match")
+    expect(baselineFact.data.verification_refs).toEqual(["verification:baseline"])
+    expect(baselineFact.data.verification_repository_revision).toBe(0)
+    expect(baselineFact.data.verification_phase).toBe("baseline")
+    expect(baselineFact.data.verification_status).toBe("failed")
+    expect(baselineFact.data.verification_effective_for_final_state).toBe(false)
+    expect(baselineFact.data.verification_temporal_role).toBe("superseded")
+    expect(postChangeFact.data.verification_refs).toEqual(["verification:post_change"])
+    expect(postChangeFact.data.verification_repository_revision).toBe(1)
+    expect(postChangeFact.data.verification_phase).toBe("post_change")
+    expect(postChangeFact.data.verification_status).toBe("passed")
+    expect(postChangeFact.data.verification_effective_for_final_state).toBe(true)
+    expect(postChangeFact.data.verification_temporal_role).toBe("current_effective")
+
+    expect(currentClaim.data.claim_kind).toBe("verification")
+    expect(currentClaim.data.temporal_scope).toBe("current_revision")
+    expect(currentClaim.data.repository_revision).toBe(1)
+    expect(currentClaim.data.direct_evidence_refs).toContain(postChangeRef)
+    expect(currentClaim.data.direct_evidence_refs).not.toContain(baselineRef)
+    expect(currentClaim.data.direct_evidence_refs).not.toContain(setupRef)
+    expect(currentClaim.data.direct_support_refs).toContain("verification:post_change")
+    expect(currentClaim.data.direct_support_refs).not.toContain("verification:baseline")
+    expect(currentClaim.data.superseded_evidence_refs).toEqual(
+      expect.arrayContaining(["verification:baseline", baselineRef]),
+    )
+    expect(currentClaim.data.grounding_decisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          candidate_ref: baselineRef,
+          decision: "rejected_inapplicable",
+          rejection_reason: "superseded_verification",
+          candidate_effective_for_final_state: false,
+          candidate_repository_revision: 0,
+          candidate_verification_status: "failed",
+          attribution_eligible: false,
+        }),
+        expect.objectContaining({
+          candidate_ref: setupRef,
+          decision: "rejected_inapplicable",
+          rejection_reason: "unscoped_verification_candidate",
+          attribution_eligible: false,
+        }),
+      ]),
+    )
+    expect(currentClaim.data.quality_flags).not.toContain("weak_evidence_match")
+
+    expect(historicalClaim.data.temporal_scope).toBe("historical")
+    expect(historicalClaim.data.direct_evidence_refs).toContain(baselineRef)
+    expect(historicalClaim.data.direct_evidence_refs).not.toContain(postChangeRef)
+    expect(historicalClaim.data.direct_support_refs).not.toContain("verification:post_change")
+
+    const baselineToCurrentEdges = trace.edges.filter(
+      (edge: any) => edge.from.ref_id === baselineFact.record_id && edge.to.ref_id === currentClaim.record_id,
+    )
+    expect(baselineToCurrentEdges).toEqual([
+      expect.objectContaining({
+        original_relation: "context_to_claim",
+        normalized_relation: "contextualizes_claim",
+        evidence_tier: "temporal_advisory",
+        eligible_for_attribution: false,
+        metadata: expect.objectContaining({ causal_semantics: "superseded_verification_context" }),
+      }),
+    ])
   })
 
   test("drops localized key-value table headers from response claims", async () => {

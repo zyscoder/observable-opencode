@@ -787,6 +787,12 @@ class TraceGraphTest(unittest.TestCase):
             event_type="response.claim",
             data={
                 "text": "The active discount cap is 15 percent.",
+                "verification_refs": ["verification:post_change"],
+                "verification_repository_revision": 1,
+                "verification_phase": "post_change",
+                "verification_status": "passed",
+                "verification_effective_for_final_state": True,
+                "verification_temporal_role": "current_effective",
                 "grounding_candidate_refs": ["evidence:current", "evidence:unrelated"],
                 "grounding_method": "confirmed_context_semantic_match_v1",
                 "grounding_behavior_impact": "none",
@@ -799,7 +805,13 @@ class TraceGraphTest(unittest.TestCase):
                     },
                     {
                         "candidate_ref": "evidence:unrelated",
-                        "decision": "rejected_no_match",
+                        "decision": "rejected_inapplicable",
+                        "rejection_reason": "superseded_verification",
+                        "candidate_repository_revision": 0,
+                        "candidate_effective_for_final_state": False,
+                        "candidate_verification_status": "failed",
+                        "candidate_temporal_role": "superseded",
+                        "attribution_eligible": False,
                         "agent_attention_observed": False,
                         "behavior_impact": "none",
                     },
@@ -813,10 +825,51 @@ class TraceGraphTest(unittest.TestCase):
         self.assertLessEqual(len(stable_json(compact)), 1200)
         self.assertEqual(compact["data"]["grounding_method"], "confirmed_context_semantic_match_v1")
         self.assertEqual(compact["data"]["grounding_behavior_impact"], "none")
+        self.assertEqual(compact["data"]["verification_refs"], ["verification:post_change"])
+        self.assertEqual(compact["data"]["verification_repository_revision"], 1)
+        self.assertTrue(compact["data"]["verification_effective_for_final_state"])
+        self.assertEqual(compact["data"]["verification_temporal_role"], "current_effective")
         self.assertEqual(
             compact["data"]["grounding_decisions"][0]["decision"],
             "selected_direct_support",
         )
+        self.assertEqual(
+            compact["data"]["grounding_decisions"][1]["rejection_reason"],
+            "superseded_verification",
+        )
+
+    def test_superseded_verification_advisory_edge_is_not_a_backward_predecessor(self):
+        trace = {
+            "records": [
+                {
+                    "record_id": "baseline_fact",
+                    "component": "tool",
+                    "event_type": "evidence.semantic_fact",
+                    "data": {"verification_temporal_role": "superseded"},
+                },
+                {
+                    "record_id": "current_claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "All tests passed."},
+                },
+            ],
+            "edges": [
+                {
+                    "edge_id": "superseded_context",
+                    "from": {"ref_type": "node", "ref_id": "baseline_fact"},
+                    "to": {"ref_type": "node", "ref_id": "current_claim"},
+                    "relation": "context_to_claim",
+                    "evidence_tier": "temporal_advisory",
+                    "eligible_for_attribution": False,
+                    "metadata": {"causal_semantics": "superseded_verification_context"},
+                }
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.upstream_refs("record:current_claim"), [])
 
     def test_completed_trace_prefers_flagged_atomic_claim_over_final_response_output(self):
         trace = sample_trace()

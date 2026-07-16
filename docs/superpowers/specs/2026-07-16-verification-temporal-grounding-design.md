@@ -84,7 +84,10 @@ For a current verification Claim:
 3. Exclude superseded, wrong-revision, and status-incompatible candidates before
    semantic ranking.
 4. Preserve candidates without observable verification provenance as unknown;
-   do not invent lifecycle metadata.
+   do not invent lifecycle metadata. When at least one canonical verification
+   candidate exists, reject unscoped shell facts as
+   `unscoped_verification_candidate` instead of using a successful setup command
+   to prove a test-result Claim.
 
 For an explicitly historical Claim such as "the baseline test failed",
 superseded facts remain eligible when their status matches the Claim.

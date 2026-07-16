@@ -41,12 +41,12 @@ type VerificationFactProvenance = {
 }
 ```
 
-- [ ] Add a fixture containing a baseline failure, repository change, and post-change success for the same command.
-- [ ] Assert the baseline and post-change evidence facts expose their verification refs, revision, phase, status, and effective state.
-- [ ] Run the focused test and confirm it fails because derived facts currently omit lifecycle fields.
-- [ ] Implement transitive verification-ref resolution with a bounded source-ref walk and exact span fallback.
-- [ ] Synchronize matching observation and evidence nodes whenever `syncVerificationNode()` changes canonical lifecycle state.
-- [ ] Run the focused test and confirm it passes.
+- [x] Add a fixture containing a baseline failure, repository change, and post-change success for the same command.
+- [x] Assert the baseline and post-change evidence facts expose their verification refs, revision, phase, status, and effective state.
+- [x] Run the focused test and confirm it fails because derived facts currently omit lifecycle fields.
+- [x] Implement transitive verification-ref resolution with a bounded source-ref walk and exact span fallback.
+- [x] Synchronize matching observation and evidence nodes whenever `syncVerificationNode()` changes canonical lifecycle state.
+- [x] Run the focused test and confirm it passes.
 
 ### Task 2: Temporally Eligible Claim Grounding
 
@@ -65,14 +65,14 @@ type VerificationCandidateRejection =
   | "verification_status_mismatch"
 ```
 
-- [ ] Assert a current passed Claim selects only the post-change fact and effective verification record.
-- [ ] Assert the baseline fact has rejection reason `superseded_verification` and appears in `superseded_evidence_refs`.
-- [ ] Assert the baseline fact has no attribution-eligible `evidence_to_claim` edge.
-- [ ] Add a historical baseline-failure Claim assertion that retains the old failure as direct support.
-- [ ] Run the focused test and confirm the current Claim assertions fail before implementation.
-- [ ] Filter current verification candidates by effective state, repository revision, and explicit status compatibility before ranking.
-- [ ] Add candidate lifecycle fields and `attribution_eligible` to grounding decisions.
-- [ ] Run focused tests and confirm both current and historical Claim behavior passes.
+- [x] Assert a current passed Claim selects only the post-change fact and effective verification record.
+- [x] Assert the baseline fact has rejection reason `superseded_verification` and appears in `superseded_evidence_refs`.
+- [x] Assert the baseline fact has no attribution-eligible `evidence_to_claim` edge.
+- [x] Add a historical baseline-failure Claim assertion that retains the old failure as direct support.
+- [x] Run the focused test and confirm the current Claim assertions fail before implementation.
+- [x] Filter current verification candidates by effective state, repository revision, and explicit status compatibility before ranking.
+- [x] Add candidate lifecycle fields and `attribution_eligible` to grounding decisions.
+- [x] Run focused tests and confirm both current and historical Claim behavior passes.
 
 ### Task 3: Historical Advisory Edge
 
@@ -95,10 +95,10 @@ this.causalEdge({
 })
 ```
 
-- [ ] Assert the old fact retains an edge to the current Claim for HTML inspection.
-- [ ] Assert `evidence_tier=temporal_advisory` and `eligible_for_attribution=false`.
-- [ ] Implement a dedicated superseded-context edge helper without reusing direct support linking.
-- [ ] Run the focused test and verify the direct and advisory paths are distinct.
+- [x] Assert the old fact retains an edge to the current Claim for HTML inspection.
+- [x] Assert `evidence_tier=temporal_advisory` and `eligible_for_attribution=false`.
+- [x] Implement a dedicated superseded-context edge helper without reusing direct support linking.
+- [x] Run the focused test and verify the direct and advisory paths are distinct.
 
 ### Task 4: Offline Attribution Compatibility
 
@@ -120,10 +120,10 @@ for key in (
     assert key in compact["data"]
 ```
 
-- [ ] Add a compact trace fixture containing one selected current fact and one rejected superseded fact.
-- [ ] Assert graph construction preserves candidate temporal fields.
-- [ ] Assert backward predecessors exclude the advisory superseded edge.
-- [ ] Run the full attribution suite.
+- [x] Add a compact trace fixture containing one selected current fact and one rejected superseded fact.
+- [x] Assert graph construction preserves candidate temporal fields.
+- [x] Assert backward predecessors exclude the advisory superseded edge.
+- [x] Run the full attribution suite.
 
 ### Task 5: Regression and Stress Validation
 
@@ -134,12 +134,12 @@ for key in (
 - Consumes: current native binary and HTTP session API.
 - Produces: manual-versus-offline attribution comparison for successful and failing cases.
 
-- [ ] Run the complete CaseTrace and Causal IR suites.
-- [ ] Run the complete offline attribution suite and TypeScript typecheck.
-- [ ] Build the native macOS binary.
-- [ ] Run a successful requirement-conflict repair through `serve -> session -> message`.
-- [ ] Run an intentionally failing verification case through the same path.
-- [ ] Confirm the successful pass Claim excludes baseline failure direct support.
-- [ ] Compare manual and offline attribution for both cases.
-- [ ] Write the iteration report with remaining semantic gaps and storage observations.
-- [ ] Stage and commit only files belonging to this iteration.
+- [x] Run the complete CaseTrace and Causal IR suites.
+- [x] Run the complete offline attribution suite and TypeScript typecheck.
+- [x] Build the native macOS binary.
+- [x] Run a successful requirement-conflict repair through `serve -> session -> message`.
+- [x] Run an intentionally failing verification case through the same path.
+- [x] Confirm the successful pass Claim excludes baseline failure direct support.
+- [x] Compare manual and offline attribution for both cases.
+- [x] Write the iteration report with remaining semantic gaps and storage observations.
+- [x] Stage and commit only files belonging to this iteration.
