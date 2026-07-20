@@ -831,22 +831,75 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
                 )
 
-    def test_ordinary_grounded_tool_failure_remains_eligible(self):
-        candidate_fact = {
-            **reference_envelope("record:decision"),
-            "content": "Implement only the explicitly listed methods.",
-            "tool_execution": {
-                "status": "failed",
-                "reason": "The tool returned invalid output.",
-            },
-        }
-
-        result = validate_recursive_confirmation(
-            {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]},
-            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+    def test_blocking_aliases_are_normalized_by_semantic_family(self):
+        blocking_aliases = (
+            {"evidence_status": {"availability": False}},
+            {"reference_status": {"resolution": False}},
+            {"artifact_state": {"hydration": False}},
+            {"provider_result": "failed"},
+            {"provider_status": "failure"},
+            {"circuit_breaker": {"state": "tripped"}},
+            {"provider_tool_request": {"status": "failed"}},
         )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for blocking in blocking_aliases:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                "nested_analysis": blocking,
+            }
+            with self.subTest(blocking=blocking), self.assertRaisesRegex(
+                ValueError, "blocking"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
 
-        self.assertEqual(result.status, "confirmed")
+    def test_positive_status_aliases_and_grounded_tool_failures_remain_eligible(self):
+        eligible_states = (
+            {"evidence_status": {"availability": True}},
+            {"reference_status": {"resolution": True}},
+            {"artifact_state": {"hydration": True}},
+            {"provider_result": "succeeded"},
+            {"provider_status": "available"},
+            {"circuit_breaker": {"state": "closed"}},
+            {
+                "tool_execution": {
+                    "status": "failed",
+                    "reason": "The tool returned invalid output.",
+                }
+            },
+            {
+                "tool_result": {
+                    "status": "failed",
+                    "reason": "The domain tool reported a causal failure.",
+                }
+            },
+            {
+                "tool_request": {
+                    "status": "failed",
+                    "reason": "The domain tool request itself failed.",
+                }
+            },
+        )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for eligible in eligible_states:
+            with self.subTest(eligible=eligible):
+                candidate_fact = {
+                    **reference_envelope("record:decision"),
+                    "content": "Implement only the explicitly listed methods.",
+                    "nested_analysis": eligible,
+                }
+
+                result = validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(
+                        supporting_evidence=(candidate_fact,)
+                    ),
+                )
+
+                self.assertEqual(result.status, "confirmed")
 
     def test_structured_provenance_context_preserves_temporal_exclusion(self):
         temporal_containers = (
@@ -865,6 +918,8 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 }
             },
             {"inference": {"type": "temporal_order"}},
+            {"origin": {"type": "temporal_order"}},
+            {"method": {"kind": "temporal_order"}},
         )
         payload = valid_confirmation_payload()
         payload["evidence_refs"] = ["record:decision"]
@@ -881,6 +936,21 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     payload,
                     request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
                 )
+
+    def test_nested_non_temporal_origin_and_method_remain_eligible(self):
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "origin": {"type": "recorded_edge"},
+            "method": {"kind": "semantic_analysis"},
+        }
+
+        result = validate_recursive_confirmation(
+            {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]},
+            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+        )
+
+        self.assertEqual(result.status, "confirmed")
 
     def test_excerpt_cannot_be_synthesized_across_candidate_fact_fragments(self):
         payload = valid_confirmation_payload()
@@ -1477,11 +1547,17 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             "text": "Preserve the parser contract.",
             "nested_analysis": {"provider_error": "obligation provider failed"},
         }
+        aliased_blocker = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "nested_analysis": {"evidence_status": {"availability": False}},
+        }
         for request in (
             sample_confirmation_request(opposing_evidence=(unresolved_opposition,)),
             sample_confirmation_request(supporting_evidence=(missing_artifact,)),
             sample_confirmation_request(supporting_evidence=(nested_provider_error,)),
             sample_confirmation_request(task_obligations=(provider_error_obligation,)),
+            sample_confirmation_request(supporting_evidence=(aliased_blocker,)),
         ):
             with self.subTest(request=request.to_dict()):
                 transport = ScriptedTransport(
@@ -1495,8 +1571,15 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
 
                     self.assertEqual(result.status, "unknown")
                     self.assertEqual(result.counterfactual_status, "unknown")
-                    self.assertEqual(transport.request_count, 2)
-                    self.assertEqual(cache.stats()["writes"], 0)
+                    self.assertEqual(transport.request_count, 0)
+                    self.assertEqual(transport.calls, [])
+                    self.assertEqual(
+                        {
+                            key: cache.stats()[key]
+                            for key in ("hits", "misses", "writes", "invalid_entries")
+                        },
+                        {"hits": 0, "misses": 0, "writes": 0, "invalid_entries": 0},
+                    )
 
     def test_provider_and_validation_failures_never_confirm_roots(self):
         for response in (

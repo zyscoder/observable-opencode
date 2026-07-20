@@ -541,6 +541,31 @@ _PROVENANCE_CONTEXT_FIELDS = {
     "relation",
     "type",
 }
+_SEMANTIC_TOKEN_ALIASES = {
+    "availability": "available",
+    "completeness": "complete",
+    "failure": "failed",
+    "grounding": "grounded",
+    "hydration": "hydrated",
+    "resolution": "resolved",
+    "tripped": "open",
+}
+_STATUS_KEY_TOKENS = {
+    "availability",
+    "hydration",
+    "outcome",
+    "resolution",
+    "result",
+    "state",
+    "status",
+}
+_CONTEXTUAL_FAILURE_STATES = {
+    "error",
+    "failed",
+    "open",
+    "timeout",
+    "unavailable",
+}
 _SEMANTIC_TEXT_FIELDS = {
     "actual",
     "body",
@@ -586,6 +611,7 @@ def _is_provenance_field(key: str) -> bool:
 def _is_provenance_container_key(key: str) -> bool:
     return (
         key in _PROVENANCE_CONTAINER_KEYS
+        or key in {"method", "origin"}
         or "provenance" in key
         or "inference" in key
         or "lineage" in key
@@ -598,12 +624,27 @@ def _key_tokens(key: str) -> Set[str]:
     return {token for token in re.split(r"[^a-z0-9]+", key.lower()) if token}
 
 
+def _semantic_tokens(key: str) -> Set[str]:
+    tokens = _key_tokens(key)
+    return tokens | {
+        _SEMANTIC_TOKEN_ALIASES[token]
+        for token in tokens
+        if token in _SEMANTIC_TOKEN_ALIASES
+    }
+
+
+def _semantic_state(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    return _SEMANTIC_TOKEN_ALIASES.get(normalized, normalized)
+
+
 def _is_provider_context_key(key: str) -> bool:
-    return bool(
-        _key_tokens(key).intersection(
-            {"circuit", "provider", "request", "transport"}
-        )
-    )
+    tokens = _semantic_tokens(key)
+    if tokens.intersection({"circuit", "judge", "provider", "transport"}):
+        return True
+    if {"request", "tool"}.issubset(tokens):
+        return False
+    return "request" in tokens
 
 
 def _is_grounding_status_context_key(key: str) -> bool:
@@ -1154,7 +1195,7 @@ class _ConfirmationFactTreeValidator:
         errors: List[str] = []
         for raw_key, child in value.items():
             key = str(raw_key).strip().lower()
-            key_tokens = _key_tokens(key)
+            key_tokens = _semantic_tokens(key)
             provider_context = (
                 context.in_provider_context or _is_provider_context_key(key)
             )
@@ -1166,31 +1207,18 @@ class _ConfirmationFactTreeValidator:
                 context.in_missing_evidence_context
                 or _is_missing_evidence_context_key(key)
             )
-            status_like = (
-                key == "status"
-                or key.endswith("_status")
-                or key.endswith("_state")
-                or key.endswith("_outcome")
-                or key.endswith("_resolution")
-                or key in {
-                    "availability",
-                    "outcome",
-                    "resolution",
-                    "result",
-                    "state",
-                }
-            )
+            status_like = bool(key_tokens.intersection(_STATUS_KEY_TOKENS))
             if status_like and isinstance(child, str):
                 status = child.strip().lower()
-                if status in _BLOCKING_STATUS_VALUES:
+                semantic_status = _semantic_state(child)
+                if (
+                    status in _BLOCKING_STATUS_VALUES
+                    or semantic_status in _BLOCKING_STATUS_VALUES
+                ):
                     errors.append("blocking {0}={1}".format(key, status))
-                if (provider_context or missing_evidence_context) and status in {
-                    "error",
-                    "failed",
-                    "open",
-                    "timeout",
-                    "unavailable",
-                }:
+                if (
+                    provider_context or missing_evidence_context
+                ) and semantic_status in _CONTEXTUAL_FAILURE_STATES:
                     errors.append("blocking contextual {0}={1}".format(key, status))
             if (
                 provider_context
@@ -1594,6 +1622,13 @@ class ClaudeCausalJudge:
         )
 
     def confirm_candidate(self, request: RootConfirmationRequest) -> RootConfirmation:
+        try:
+            _ConfirmationFactTreeValidator(request).validate()
+        except (TypeError, ValueError) as exc:
+            return RootConfirmation.unknown(
+                request.candidate_ref,
+                "Judge request_ineligible: {0}: {1}".format(type(exc).__name__, exc),
+            )
         prompt = build_recursive_confirmation_prompt(request)
         outcome = self._request_validated(
             stage="recursive_root_confirmation",
