@@ -246,6 +246,38 @@ class CausalStateTest(unittest.TestCase):
             self.assertEqual(report.confirmed_roots, ())
             self.assertEqual(report.co_roots, ())
 
+    def test_report_outcome_downgrades_root_labels_without_confirmed_roots(self):
+        root_found = RecursiveAttributionReport(
+            case_id="no-root",
+            objective="Find the root.",
+            analysis_outcome="root_found",
+        )
+        self.assertEqual(root_found.analysis_outcome, "no_defect")
+
+        partial = RecursiveAttributionReport(
+            case_id="no-partial-root",
+            objective="Find the root.",
+            analysis_outcome="partial_root_found",
+            unresolved_refs=["record:change"],
+        )
+        self.assertEqual(partial.analysis_outcome, "inconclusive")
+
+    def test_report_rejects_confirmed_root_and_unresolved_ref_overlap(self):
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            reason="The decision stopped discovery.",
+            counterfactual="Searching call sites would reveal the contract.",
+            confidence=0.9,
+        )
+        with self.assertRaisesRegex(ValueError, "both confirmed and unresolved"):
+            RecursiveAttributionReport(
+                case_id="contradictory",
+                objective="Find the root.",
+                confirmed_roots=[root],
+                unresolved_refs=[root.node_ref],
+            )
+
     def test_recursive_state_collections_are_deeply_immutable(self):
         defect_state = sample_defect_state()
         node = TraceNode(
@@ -299,10 +331,17 @@ class CausalStateTest(unittest.TestCase):
         item = sample_frontier_item()
         before = (candidate.to_dict(), hypothesis.semantic_hash, item.visit_key, report.to_dict())
 
+        self.assertNotIsInstance(candidate.edge, dict)
+        self.assertEqual(candidate.edge, {"context": {"confidence": 1.0}})
+        self.assertEqual(list(candidate.edge), ["context"])
+        self.assertEqual(candidate.edge["context"]["confidence"], 1.0)
+
         for callback in (
             lambda: candidate.evidence_refs.append("record:forged"),
             lambda: candidate.edge.__setitem__("forged", True),
+            lambda: dict.__setitem__(candidate.edge, "forged", True),
             lambda: candidate.node.data["nested"].__setitem__("forged", True),
+            lambda: dict.__setitem__(candidate.node.data["nested"], "forged", True),
             lambda: item.downstream_path.append("record:forged"),
             lambda: judgment.predecessors.append(assessment),
             lambda: judgment.suggested_investigation.__setitem__("forged", True),
@@ -313,6 +352,7 @@ class CausalStateTest(unittest.TestCase):
             lambda: report.causal_candidates.append(candidate),
             lambda: report.taint_paths[0].append("record:forged"),
             lambda: report.metadata["nested"].__setitem__("forged", True),
+            lambda: dict.__setitem__(report.metadata, "forged", True),
         ):
             with self.assertRaises((AttributeError, TypeError)):
                 callback()

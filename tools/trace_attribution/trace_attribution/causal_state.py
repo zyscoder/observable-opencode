@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from .models import JsonDict, TraceNode, stable_json
 
@@ -24,37 +25,43 @@ HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded"
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
 
 
-class FrozenDict(dict):
-    """JSON-compatible mapping that rejects ordinary in-place mutation."""
+class FrozenMapping(Mapping[str, Any]):
+    """Immutable JSON mapping backed by recursively frozen key/value entries."""
 
-    def __init__(self, value: Optional[Dict[str, Any]] = None) -> None:
-        dict.__init__(self)
-        for key, item in (value or {}).items():
-            dict.__setitem__(self, key, _freeze(item))
+    __slots__ = ("_entries",)
 
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("recursive causal state mappings are immutable")
+    def __init__(self, value: Optional[Mapping[str, Any]] = None) -> None:
+        self._entries = tuple((str(key), _freeze(item)) for key, item in (value or {}).items())
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __getitem__(self, key: str) -> Any:
+        for candidate, value in self._entries:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, Mapping) and dict(self.items()) == dict(other.items())
+
+    def __repr__(self) -> str:
+        return repr(dict(self.items()))
 
 
 def _freeze(value: Any) -> Any:
-    if isinstance(value, dict):
-        return FrozenDict(value)
+    if isinstance(value, Mapping):
+        return FrozenMapping(value)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     return value
 
 
 def _thaw(value: Any) -> Any:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
@@ -78,7 +85,7 @@ def _string_list(value: Any) -> List[str]:
 
 
 def _json_dict(value: Any) -> JsonDict:
-    return dict(value) if isinstance(value, dict) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _float(value: Any) -> float:
@@ -125,7 +132,7 @@ def _freeze_trace_node(node: TraceNode) -> TraceNode:
         title=node.title,
         status=node.status,
         timestamp=node.timestamp,
-        data=FrozenDict(_thaw(node.data)),
+        data=FrozenMapping(_thaw(node.data)),
         source_refs=_frozen_strings(node.source_refs),
     )
 
@@ -234,13 +241,13 @@ class CausalCandidate:
     ref: str
     node: TraceNode
     source: str
-    edge: JsonDict = field(default_factory=FrozenDict)
+    edge: JsonDict = field(default_factory=FrozenMapping)
     score: float = 0.0
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "node", _freeze_trace_node(self.node))
-        object.__setattr__(self, "edge", FrozenDict(_thaw(self.edge)))
+        object.__setattr__(self, "edge", FrozenMapping(_thaw(self.edge)))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     def to_dict(self) -> JsonDict:
@@ -325,7 +332,7 @@ class CausalStepJudgment:
         object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
         if self.suggested_investigation is not None:
             object.__setattr__(
-                self, "suggested_investigation", FrozenDict(_thaw(self.suggested_investigation))
+                self, "suggested_investigation", FrozenMapping(_thaw(self.suggested_investigation))
             )
 
     def to_dict(self) -> JsonDict:
@@ -502,7 +509,7 @@ class AttributionHypothesis:
     opposing_evidence: Tuple[HypothesisEvidence, ...] = field(default_factory=tuple)
     unresolved_questions: Tuple[str, ...] = field(default_factory=tuple)
     alternative_hypothesis_ids: Tuple[str, ...] = field(default_factory=tuple)
-    counterfactual: JsonDict = field(default_factory=FrozenDict)
+    counterfactual: JsonDict = field(default_factory=FrozenMapping)
     status: str = "active"
     confidence: float = 0.0
     resolution_reason: str = ""
@@ -515,7 +522,7 @@ class AttributionHypothesis:
         object.__setattr__(self, "opposing_evidence", tuple(self.opposing_evidence))
         object.__setattr__(self, "unresolved_questions", _frozen_strings(self.unresolved_questions))
         object.__setattr__(self, "alternative_hypothesis_ids", _frozen_strings(self.alternative_hypothesis_ids))
-        object.__setattr__(self, "counterfactual", FrozenDict(_thaw(self.counterfactual)))
+        object.__setattr__(self, "counterfactual", FrozenMapping(_thaw(self.counterfactual)))
 
     @classmethod
     def create(
@@ -828,7 +835,7 @@ class RecursiveAttributionReport:
     taint_paths: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
     visited_order: Tuple[str, ...] = field(default_factory=tuple)
     unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
-    metadata: JsonDict = field(default_factory=FrozenDict)
+    metadata: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         for name in (
@@ -851,13 +858,23 @@ class RecursiveAttributionReport:
         object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
         object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
         object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
-        object.__setattr__(self, "metadata", FrozenDict(_thaw(self.metadata)))
-        if self.confirmed_roots or self.co_roots:
+        object.__setattr__(self, "metadata", FrozenMapping(_thaw(self.metadata)))
+        confirmed_root_refs = {item.node_ref for item in (*self.confirmed_roots, *self.co_roots)}
+        overlapping_refs = confirmed_root_refs.intersection(self.unresolved_refs)
+        if overlapping_refs:
+            raise ValueError("a node cannot be both confirmed and unresolved")
+        if confirmed_root_refs:
             has_unresolved_branches = bool(self.unresolved_refs or self.unresolved_hypotheses)
             if has_unresolved_branches:
                 object.__setattr__(self, "analysis_outcome", "partial_root_found")
             elif self.analysis_outcome == "inconclusive":
                 object.__setattr__(self, "analysis_outcome", "root_found")
+        elif self.analysis_outcome in {"root_found", "partial_root_found"}:
+            object.__setattr__(
+                self,
+                "analysis_outcome",
+                "inconclusive" if (self.unresolved_refs or self.unresolved_hypotheses) else "no_defect",
+            )
 
     def to_dict(self) -> JsonDict:
         return {
