@@ -1036,7 +1036,7 @@ class CausalInvestigationTools:
         inspected_count = upstream_scan.inspected_count
         scan_truncated = upstream_scan.scan_truncated
         truncated = upstream_scan.truncated
-        if not truncated:
+        if not upstream_scan.scan_truncated:
             remaining = MAX_EPISODE_REFS - len(episode_refs)
             downstream_scan = self.graph.bounded_downstream_refs(
                 resolved,

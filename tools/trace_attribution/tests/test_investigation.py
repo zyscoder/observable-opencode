@@ -87,6 +87,66 @@ class CountingAdjacency(dict):
             yield ref
 
 
+def episode_adjacency_graph(upstream_count: int, downstream_count: int):
+    upstream_ids = ["up_{0:03d}".format(index) for index in range(upstream_count)]
+    downstream_ids = ["down_{0:03d}".format(index) for index in range(downstream_count)]
+    records = [
+        {
+            "record_id": record_id,
+            "component": "progress",
+            "event_type": "progress.episode",
+            "data": {"summary": record_id},
+        }
+        for record_id in upstream_ids
+    ] + [
+        {
+            "record_id": "anchor",
+            "component": "progress",
+            "event_type": "progress.episode",
+            "data": {"summary": "anchor"},
+        }
+    ] + [
+        {
+            "record_id": record_id,
+            "component": "progress",
+            "event_type": "progress.episode",
+            "data": {"summary": record_id},
+        }
+        for record_id in downstream_ids
+    ]
+    edges = [
+        {
+            "from": {"type": "record", "id": record_id},
+            "to": {"type": "record", "id": "anchor"},
+            "relation": "progress_episode_member",
+            "evidence_type": "recorded_dataflow",
+            "eligible_for_attribution": True,
+        }
+        for record_id in upstream_ids
+    ] + [
+        {
+            "from": {"type": "record", "id": "anchor"},
+            "to": {"type": "record", "id": record_id},
+            "relation": "progress_episode_member",
+            "evidence_type": "recorded_dataflow",
+            "eligible_for_attribution": True,
+        }
+        for record_id in downstream_ids
+    ]
+    graph = TraceGraph.from_trace(
+        {"case_id": "episode-boundary", "records": records, "dataflow_edges": edges}
+    )
+    upstream = CountingAdjacency(
+        (ref, None) for ref in graph._upstream["record:anchor"]
+    )
+    downstream = CountingAdjacency(
+        (ref, None) for ref in graph._downstream["record:anchor"]
+    )
+    graph._upstream["record:anchor"] = upstream
+    graph._downstream["record:anchor"] = downstream
+    return graph, upstream, downstream
+
+
 def trace_with_artifact() -> dict:
     return {
         "case_id": "investigation-case",
@@ -730,6 +790,68 @@ class InvestigationToolTest(unittest.TestCase):
         self.assertEqual(adjacency.visits, 65)
         self.assertEqual(result.payload["episodes"], ())
         self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 65)
+        self.assertTrue(result.payload["adjacency_scan"]["scan_truncated"])
+        self.assertTrue(result.truncated)
+
+    def test_episode_full_output_uses_last_physical_slot_to_probe_downstream(self):
+        graph, upstream, downstream = episode_adjacency_graph(64, 1)
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_episode",
+                {"ref": "record:anchor"},
+                requested_by_ref="record:anchor",
+                reason="Use the final physical slot even though output is full.",
+            )
+        )
+        self.assertEqual((upstream.visits, downstream.visits), (64, 1))
+        self.assertEqual(len(result.payload["episodes"]), 64)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 65)
+        self.assertFalse(result.payload["adjacency_scan"]["scan_truncated"])
+
+    def test_episode_full_output_without_downstream_is_scan_complete(self):
+        graph, upstream, downstream = episode_adjacency_graph(64, 0)
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_episode",
+                {"ref": "record:anchor"},
+                requested_by_ref="record:anchor",
+                reason="Distinguish output truncation from complete adjacency scanning.",
+            )
+        )
+        self.assertEqual((upstream.visits, downstream.visits), (64, 0))
+        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 64)
+        self.assertFalse(result.payload["adjacency_scan"]["scan_truncated"])
+        self.assertTrue(result.truncated)
+
+    def test_episode_one_remaining_output_slot_includes_downstream(self):
+        graph, upstream, downstream = episode_adjacency_graph(62, 1)
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_episode",
+                {"ref": "record:anchor"},
+                requested_by_ref="record:anchor",
+                reason="Fill the final output slot from downstream adjacency.",
+            )
+        )
+        self.assertEqual((upstream.visits, downstream.visits), (62, 1))
+        self.assertEqual(len(result.payload["episodes"]), 64)
+        self.assertIn("record:down_000", result.resolved_refs)
+        self.assertFalse(result.truncated)
+        self.assertFalse(result.payload["adjacency_scan"]["scan_truncated"])
+
+    def test_episode_upstream_scan_truncation_blocks_downstream_truthfully(self):
+        graph, upstream, downstream = episode_adjacency_graph(65, 1)
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_episode",
+                {"ref": "record:anchor"},
+                requested_by_ref="record:anchor",
+                reason="Stop after upstream physical scan exhaustion.",
+            )
+        )
+        self.assertEqual((upstream.visits, downstream.visits), (64, 0))
+        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 64)
         self.assertTrue(result.payload["adjacency_scan"]["scan_truncated"])
         self.assertTrue(result.truncated)
 
