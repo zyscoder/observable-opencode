@@ -526,7 +526,9 @@ _PROVENANCE_FIELDS = {
 }
 _PROVENANCE_CONTAINER_KEYS = {
     "edge_provenance",
+    "edge_metadata",
     "evidence_metadata",
+    "inference",
     "inference_metadata",
     "lineage",
     "provenance",
@@ -585,8 +587,34 @@ def _is_provenance_container_key(key: str) -> bool:
     return (
         key in _PROVENANCE_CONTAINER_KEYS
         or "provenance" in key
-        or key.endswith("_lineage")
-        or key.endswith("_evidence_metadata")
+        or "inference" in key
+        or "lineage" in key
+        or "evidence_metadata" in key
+        or "edge_metadata" in key
+    )
+
+
+def _key_tokens(key: str) -> Set[str]:
+    return {token for token in re.split(r"[^a-z0-9]+", key.lower()) if token}
+
+
+def _is_provider_context_key(key: str) -> bool:
+    return bool(
+        _key_tokens(key).intersection(
+            {"circuit", "provider", "request", "transport"}
+        )
+    )
+
+
+def _is_grounding_status_context_key(key: str) -> bool:
+    return any(token in key for token in ("artifact", "evidence", "reference"))
+
+
+def _is_missing_evidence_context_key(key: str) -> bool:
+    return any(
+        token in key for token in ("missing", "unresolved", "truncated", "gap")
+    ) and any(
+        token in key for token in ("artifact", "evidence", "reference")
     )
 
 
@@ -666,6 +694,43 @@ class _ConfirmationFactTreeResult:
     candidate_semantic_fragments: Tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _FactTreeContext:
+    in_provider_context: bool = False
+    in_provenance_context: bool = False
+    in_grounding_status_context: bool = False
+    in_missing_evidence_context: bool = False
+    artifact_envelope_ref: str = ""
+
+    def descend(
+        self,
+        key: str,
+        *,
+        artifact_envelope_ref: Optional[str] = None,
+    ) -> "_FactTreeContext":
+        return _FactTreeContext(
+            in_provider_context=(
+                self.in_provider_context or _is_provider_context_key(key)
+            ),
+            in_provenance_context=(
+                self.in_provenance_context or _is_provenance_container_key(key)
+            ),
+            in_grounding_status_context=(
+                self.in_grounding_status_context
+                or _is_grounding_status_context_key(key)
+            ),
+            in_missing_evidence_context=(
+                self.in_missing_evidence_context
+                or _is_missing_evidence_context_key(key)
+            ),
+            artifact_envelope_ref=(
+                self.artifact_envelope_ref
+                if artifact_envelope_ref is None
+                else artifact_envelope_ref
+            ),
+        )
+
+
 class _ConfirmationFactTreeValidator:
     """Validate every confirmation fact twice before exposing grounded semantics."""
 
@@ -677,7 +742,9 @@ class _ConfirmationFactTreeValidator:
         self.validated_manifests: Set[int] = set()
         self.hydrated_artifact_nodes: Set[int] = set()
         self.hydrated_artifact_refs: Set[str] = set()
-        self.pending_artifact_statuses: List[Tuple[Mapping[str, Any], str]] = []
+        self.pending_artifact_statuses: List[
+            Tuple[Mapping[str, Any], str, str]
+        ] = []
         self.validated_artifact_status_nodes: Set[int] = set()
         self.roots = (
             ("candidate_reference", request.candidate_reference),
@@ -694,7 +761,7 @@ class _ConfirmationFactTreeValidator:
                 value,
                 path=path,
                 parent_key="",
-                in_provenance_context=False,
+                context=_FactTreeContext().descend(path),
             )
         self._validate_artifact_statuses()
         self._validate_required_roots()
@@ -704,7 +771,7 @@ class _ConfirmationFactTreeValidator:
                 path=path,
                 parent_key="",
                 candidate_local=False,
-                in_provenance_context=False,
+                context=_FactTreeContext().descend(path),
             )
         self._validate_competing_hypotheses()
         if self.errors:
@@ -816,12 +883,10 @@ class _ConfirmationFactTreeValidator:
         *,
         path: str,
         parent_key: str,
-        in_provenance_context: bool,
+        context: _FactTreeContext,
     ) -> None:
         if isinstance(value, Mapping):
-            artifact_status_shaped = parent_key == "artifact_status" and bool(
-                _TASK2_ARTIFACT_STATUS_KEYS.intersection(value)
-            )
+            artifact_status_shaped = parent_key == "artifact_status"
             envelope_shaped = (
                 bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
                 and not artifact_status_shaped
@@ -835,10 +900,11 @@ class _ConfirmationFactTreeValidator:
                     )
                 provenance_errors.extend(self._inference_errors(value))
             temporal_errors = self._temporal_errors(
-                value, in_provenance_context=in_provenance_context
+                value, in_provenance_context=context.in_provenance_context
             )
             for error in provenance_errors + temporal_errors:
                 self._error(path, error)
+            current_artifact_ref = context.artifact_envelope_ref
             if envelope_shaped:
                 envelope_errors = self._envelope_errors(value)
                 for error in envelope_errors:
@@ -853,19 +919,24 @@ class _ConfirmationFactTreeValidator:
                     self.resolved_envelopes[id(value)] = resolved_ref
                     self._register_ref(value.get("raw_ref"))
                     self._register_ref(resolved_ref)
+                    if resolved_ref.startswith("artifact:"):
+                        current_artifact_ref = resolved_ref
             if parent_key == "artifact_hydration":
                 self._register_hydration_manifest(value, path=path)
             if artifact_status_shaped:
-                self.pending_artifact_statuses.append((value, path))
+                self.pending_artifact_statuses.append(
+                    (value, path, context.artifact_envelope_ref)
+                )
+            child_context = context.descend(
+                "", artifact_envelope_ref=current_artifact_ref
+            )
             for raw_key, child in value.items():
                 key = str(raw_key).strip().lower()
                 self._pass_one(
                     child,
                     path="{0}.{1}".format(path, raw_key),
                     parent_key=key,
-                    in_provenance_context=(
-                        in_provenance_context or _is_provenance_container_key(key)
-                    ),
+                    context=child_context.descend(key),
                 )
             return
         if isinstance(value, (list, tuple)):
@@ -874,7 +945,7 @@ class _ConfirmationFactTreeValidator:
                     child,
                     path="{0}[{1}]".format(path, index),
                     parent_key=parent_key,
-                    in_provenance_context=in_provenance_context,
+                    context=context,
                 )
 
     def _artifact_id_list(self, value: Any, *, path: str) -> Optional[Set[str]]:
@@ -959,8 +1030,12 @@ class _ConfirmationFactTreeValidator:
             self._register_ref("artifact:{0}".format(artifact_id))
 
     def _validate_artifact_statuses(self) -> None:
-        for value, path in self.pending_artifact_statuses:
+        for value, path, parent_artifact_ref in self.pending_artifact_statuses:
             errors: List[str] = []
+            if not parent_artifact_ref:
+                errors.append(
+                    "Task 2 artifact status requires a validated parent artifact envelope"
+                )
             missing_keys = _TASK2_ARTIFACT_STATUS_KEYS - set(value)
             if missing_keys:
                 errors.append(
@@ -978,12 +1053,25 @@ class _ConfirmationFactTreeValidator:
                 errors.append("Task 2 artifact status canonical_ref is not canonical")
             if raw_id != canonical_id:
                 errors.append("Task 2 artifact status raw_ref contradicts canonical_ref")
+            if canonical_ref != parent_artifact_ref:
+                errors.append(
+                    "Task 2 artifact status canonical_ref contradicts parent artifact envelope"
+                )
+            parent_artifact_id = _normalized_artifact_id(parent_artifact_ref)
+            if raw_id != parent_artifact_id:
+                errors.append(
+                    "Task 2 artifact status raw_ref contradicts parent artifact envelope"
+                )
             resolved_ref = str(value.get("resolved_ref") or "").strip()
             if resolved_ref and resolved_ref != canonical_ref:
                 errors.append("Task 2 artifact status resolved_ref contradicts canonical_ref")
             artifact_id = _normalized_artifact_id(value.get("artifact_id"))
             if artifact_id and artifact_id != canonical_id:
                 errors.append("Task 2 artifact status artifact_id contradicts canonical_ref")
+            if artifact_id and artifact_id != parent_artifact_id:
+                errors.append(
+                    "Task 2 artifact status artifact_id contradicts parent artifact envelope"
+                )
             if str(value.get("resolution_status") or "").strip().lower() != "resolved":
                 errors.append("Task 2 artifact status is unresolved")
             if str(value.get("availability") or "").strip().lower() != "available":
@@ -1000,13 +1088,19 @@ class _ConfirmationFactTreeValidator:
             errors.extend(
                 self._temporal_errors(value, in_provenance_context=False)
             )
-            errors.extend(self._blocking_errors(value))
+            errors.extend(
+                self._blocking_errors(
+                    value,
+                    context=_FactTreeContext(
+                        in_grounding_status_context=True,
+                        artifact_envelope_ref=parent_artifact_ref,
+                    ),
+                )
+            )
             for error in errors:
                 self._error(path, error)
             if not errors:
                 self.validated_artifact_status_nodes.add(id(value))
-                self._register_ref(raw_ref)
-                self._register_ref(canonical_ref)
 
     def _validate_required_roots(self) -> None:
         candidate = self.resolved_envelopes.get(id(self.request.candidate_reference))
@@ -1051,11 +1145,28 @@ class _ConfirmationFactTreeValidator:
                         "fact requires a complete resolved reference envelope",
                     )
 
-    def _blocking_errors(self, value: Mapping[str, Any]) -> List[str]:
+    def _blocking_errors(
+        self,
+        value: Mapping[str, Any],
+        *,
+        context: _FactTreeContext,
+    ) -> List[str]:
         errors: List[str] = []
         for raw_key, child in value.items():
             key = str(raw_key).strip().lower()
-            if (
+            key_tokens = _key_tokens(key)
+            provider_context = (
+                context.in_provider_context or _is_provider_context_key(key)
+            )
+            grounding_status_context = (
+                context.in_grounding_status_context
+                or _is_grounding_status_context_key(key)
+            )
+            missing_evidence_context = (
+                context.in_missing_evidence_context
+                or _is_missing_evidence_context_key(key)
+            )
+            status_like = (
                 key == "status"
                 or key.endswith("_status")
                 or key.endswith("_state")
@@ -1068,14 +1179,63 @@ class _ConfirmationFactTreeValidator:
                     "result",
                     "state",
                 }
-            ) and isinstance(child, str):
+            )
+            if status_like and isinstance(child, str):
                 status = child.strip().lower()
                 if status in _BLOCKING_STATUS_VALUES:
                     errors.append("blocking {0}={1}".format(key, status))
-            if isinstance(child, bool) and not child and (
-                key == "available" or key.endswith("_available")
+                if (provider_context or missing_evidence_context) and status in {
+                    "error",
+                    "failed",
+                    "open",
+                    "timeout",
+                    "unavailable",
+                }:
+                    errors.append("blocking contextual {0}={1}".format(key, status))
+            if (
+                provider_context
+                and key_tokens.intersection({"error", "reason"})
+                and _nonempty(child)
             ):
-                errors.append("blocking {0}=false".format(key))
+                errors.append("blocking provider {0}".format(key))
+            if isinstance(child, bool):
+                true_blockers = {
+                    "error",
+                    "exhausted",
+                    "missing",
+                    "truncated",
+                    "unresolved",
+                }
+                if provider_context:
+                    true_blockers.update({"failed", "open", "unavailable"})
+                if child and key_tokens.intersection(true_blockers):
+                    errors.append("blocking {0}=true".format(key))
+                if (
+                    not child
+                    and grounding_status_context
+                    and key_tokens.intersection(
+                        {"available", "complete", "grounded", "hydrated", "resolved"}
+                    )
+                ):
+                    errors.append("blocking {0}=false".format(key))
+            if (
+                isinstance(child, (int, float))
+                and not isinstance(child, bool)
+                and math.isfinite(float(child))
+                and child > 0
+                and key_tokens.intersection(
+                    {
+                        "error",
+                        "exhausted",
+                        "failed",
+                        "gap",
+                        "missing",
+                        "truncated",
+                        "unresolved",
+                    }
+                )
+            ):
+                errors.append("blocking positive {0}".format(key))
             if not _nonempty(child):
                 continue
             if key in {
@@ -1108,19 +1268,6 @@ class _ConfirmationFactTreeValidator:
                 errors.append("blocking {0}".format(key))
             elif key.startswith("provider_") and any(
                 token in key for token in ("error", "unavailable", "circuit_reason")
-            ):
-                errors.append("blocking {0}".format(key))
-            elif isinstance(child, bool) and child and (
-                key
-                in {
-                    "budget_exhausted",
-                    "missing",
-                    "provider_circuit_open",
-                    "truncated",
-                }
-                or key.endswith("_missing")
-                or key.endswith("_truncated")
-                or key.endswith("_budget_exhausted")
             ):
                 errors.append("blocking {0}".format(key))
         return errors
@@ -1164,34 +1311,40 @@ class _ConfirmationFactTreeValidator:
         path: str,
         parent_key: str,
         candidate_local: bool,
-        in_provenance_context: bool,
+        context: _FactTreeContext,
     ) -> None:
         if isinstance(value, Mapping):
-            artifact_status_shaped = parent_key == "artifact_status" and bool(
-                _TASK2_ARTIFACT_STATUS_KEYS.intersection(value)
-            )
+            artifact_status_shaped = parent_key == "artifact_status"
             envelope_shaped = (
                 bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
                 and not artifact_status_shaped
             )
             current_local = candidate_local
+            current_artifact_ref = context.artifact_envelope_ref
             if envelope_shaped:
                 for error in self._envelope_errors(value):
                     self._error(path, error)
                 resolved = self.resolved_envelopes.get(id(value))
                 if resolved:
                     current_local = resolved == self.request.candidate_ref
+                    if resolved.startswith("artifact:"):
+                        current_artifact_ref = resolved
             owner = value.get("owner_reference")
             if isinstance(owner, Mapping):
                 owner_ref = self.resolved_envelopes.get(id(owner))
                 if owner_ref == self.request.candidate_ref:
                     current_local = True
             for error in self._temporal_errors(
-                value, in_provenance_context=in_provenance_context
+                value, in_provenance_context=context.in_provenance_context
             ):
                 self._error(path, error)
-            for error in self._blocking_errors(value):
+            for error in self._blocking_errors(value, context=context):
                 self._error(path, error)
+            if (
+                artifact_status_shaped
+                and id(value) not in self.validated_artifact_status_nodes
+            ):
+                self._error(path, "artifact_status is not valid for its parent envelope")
             artifact_fact = _looks_like_artifact_fact(value, parent_key)
             hydrated_item = id(value) in self.hydrated_artifact_nodes
             if artifact_fact and not hydrated_item and not envelope_shaped:
@@ -1205,6 +1358,9 @@ class _ConfirmationFactTreeValidator:
                     owner_ref = self.resolved_envelopes.get(id(owner))
                     if owner_ref and owner_ref != self.request.candidate_ref:
                         self._error(path, "candidate artifact has a contradictory owner")
+            child_context = context.descend(
+                "", artifact_envelope_ref=current_artifact_ref
+            )
             for raw_key, child in value.items():
                 key = str(raw_key).strip().lower()
                 child_path = "{0}.{1}".format(path, raw_key)
@@ -1231,9 +1387,7 @@ class _ConfirmationFactTreeValidator:
                     path=child_path,
                     parent_key=key,
                     candidate_local=current_local,
-                    in_provenance_context=(
-                        in_provenance_context or _is_provenance_container_key(key)
-                    ),
+                    context=child_context.descend(key),
                 )
             return
         if isinstance(value, (list, tuple)):
@@ -1243,7 +1397,7 @@ class _ConfirmationFactTreeValidator:
                     path="{0}[{1}]".format(path, index),
                     parent_key=parent_key,
                     candidate_local=candidate_local,
-                    in_provenance_context=in_provenance_context,
+                    context=context,
                 )
 
     def _validate_competing_hypotheses(self) -> None:

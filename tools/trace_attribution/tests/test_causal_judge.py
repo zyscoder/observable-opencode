@@ -786,6 +786,68 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
                 )
 
+    def test_contextual_blocking_normalization_covers_reviewer_representations(self):
+        blocking_values = (
+            {"provider": {"status": "error"}},
+            {"provider_response": {"status": "failed"}},
+            {"circuit_breaker": {"state": "open"}},
+            {"transport": {"status": "timeout"}},
+            {"request": {"status": "failed"}},
+            {"request_status": "failed"},
+            {"missing_evidence_status": "failed"},
+            {"request_failure_state": {"reason": "request could not complete"}},
+            {"provider": {"error": "backend rejected the request"}},
+            {"reference_status": {"resolved": False}},
+            {"artifact_state": {"hydrated": False}},
+            {"evidence_status": {"available": False}},
+            {"reference_status": {"complete": False}},
+            {"evidence_status": {"grounded": False}},
+            {"diagnostics": {"missing": True}},
+            {"diagnostics": {"truncated": True}},
+            {"diagnostics": {"unresolved": True}},
+            {"diagnostics": {"error": True}},
+            {"diagnostics": {"exhausted": True}},
+            {"provider_circuit_open": True},
+            {"metrics": {"missing_artifact_count": 1}},
+            {"metrics": {"unresolved_reference_count": 2}},
+            {"metrics": {"truncated_artifact_count": 1}},
+            {"metrics": {"provider_error_count": 1}},
+            {"metrics": {"evidence_gap_count": 3}},
+            {"metrics": {"failed_request_count": 1}},
+            {"metrics": {"exhausted_budget_count": 1}},
+        )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for blocking in blocking_values:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                "nested_analysis": blocking,
+            }
+            with self.subTest(blocking=blocking), self.assertRaisesRegex(
+                ValueError, "blocking"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_ordinary_grounded_tool_failure_remains_eligible(self):
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "tool_execution": {
+                "status": "failed",
+                "reason": "The tool returned invalid output.",
+            },
+        }
+
+        result = validate_recursive_confirmation(
+            {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]},
+            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+        )
+
+        self.assertEqual(result.status, "confirmed")
+
     def test_structured_provenance_context_preserves_temporal_exclusion(self):
         temporal_containers = (
             {
@@ -802,6 +864,7 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     }
                 }
             },
+            {"inference": {"type": "temporal_order"}},
         )
         payload = valid_confirmation_payload()
         payload["evidence_refs"] = ["record:decision"]
@@ -909,6 +972,57 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 validate_recursive_confirmation(
                     valid_confirmation_payload(), request=request_for(status)
                 )
+
+        with self.assertRaisesRegex(ValueError, "artifact_status|artifact status"):
+            validate_recursive_confirmation(
+                {**valid_confirmation_payload(), "evidence_refs": ["artifact:decision-payload"]},
+                request=request_for({}),
+            )
+
+        standalone_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "artifact_hydration": manifest,
+            "artifact_status": valid_status,
+        }
+        with self.assertRaisesRegex(ValueError, "artifact_status|artifact status|parent"):
+            validate_recursive_confirmation(
+                {**valid_confirmation_payload(), "evidence_refs": ["artifact:decision-payload"]},
+                request=sample_confirmation_request(supporting_evidence=(standalone_fact,)),
+            )
+
+        two_artifact_manifest = {
+            **manifest,
+            "referenced_artifact_ids": ["decision-payload", "other-payload"],
+            "hydrated_artifacts": [
+                *manifest["hydrated_artifacts"],
+                {
+                    "artifact_id": "other-payload",
+                    "content": "Unrelated artifact content.",
+                    "missing": False,
+                    "truncated": False,
+                },
+            ],
+        }
+        mismatched_parent_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "artifact_hydration": two_artifact_manifest,
+            "artifact_reference": {
+                **reference_envelope("artifact:other-payload"),
+                "reference_kind": "artifact",
+                "artifact_id": "other-payload",
+                "owner_reference": reference_envelope("record:decision"),
+                "artifact_status": valid_status,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "artifact_status|artifact status|parent"):
+            validate_recursive_confirmation(
+                {**valid_confirmation_payload(), "evidence_refs": ["artifact:decision-payload"]},
+                request=sample_confirmation_request(
+                    supporting_evidence=(mismatched_parent_fact,)
+                ),
+            )
 
     def test_recursive_blockers_apply_to_candidate_path_opposition_and_competition(self):
         gap = {"nested_analysis": {"missing_evidence": ["record:missing"]}}
