@@ -27,6 +27,9 @@ CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
 COUNTERFACTUAL_STATUSES = frozenset(
     {"supports_causality", "rejects_causality", "unknown"}
 )
+CONFIRMATION_FACTOR_ROLES = frozenset(
+    {"necessary_cause", "contributing_condition", "amplifying_factor", "unrelated", "unknown"}
+)
 BLOCKING_METADATA_KEYS = frozenset(
     {
         "unresolved_reason",
@@ -724,6 +727,10 @@ class RootConfirmation:
     confidence: float = 0.0
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     counterfactual_status: str = ""
+    hypothesis_id: str = ""
+    defect_fingerprint: str = ""
+    recursive_path: Tuple[str, ...] = field(default_factory=tuple)
+    factor_role: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.status not in CONFIRMATION_STATUSES:
@@ -750,8 +757,11 @@ class RootConfirmation:
                 )
             )
         object.__setattr__(self, "counterfactual_status", counterfactual_status)
+        if self.factor_role not in CONFIRMATION_FACTOR_ROLES:
+            raise ValueError("unsupported confirmation factor_role: {0}".format(self.factor_role))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
+        object.__setattr__(self, "recursive_path", _frozen_strings(self.recursive_path))
 
     @classmethod
     def confirmed(
@@ -764,6 +774,7 @@ class RootConfirmation:
         confidence: float,
         evidence_refs: Optional[List[str]] = None,
         counterfactual_status: str = "supports_causality",
+        factor_role: str = "necessary_cause",
     ) -> "RootConfirmation":
         return cls(
             candidate_ref,
@@ -774,16 +785,25 @@ class RootConfirmation:
             confidence,
             list(evidence_refs or []),
             counterfactual_status,
+            factor_role=factor_role,
         )
 
     @classmethod
-    def rejected(cls, candidate_ref: str, reason: str, evidence_refs: Optional[List[str]] = None) -> "RootConfirmation":
+    def rejected(
+        cls,
+        candidate_ref: str,
+        reason: str,
+        evidence_refs: Optional[List[str]] = None,
+        *,
+        factor_role: str = "unrelated",
+    ) -> "RootConfirmation":
         return cls(
             candidate_ref,
             "rejected",
             reason=reason,
             evidence_refs=list(evidence_refs or []),
             counterfactual_status="rejects_causality",
+            factor_role=factor_role,
         )
 
     @classmethod
@@ -794,6 +814,7 @@ class RootConfirmation:
             reason=reason,
             evidence_refs=list(evidence_refs or []),
             counterfactual_status="unknown",
+            factor_role="unknown",
         )
 
     def to_dict(self) -> JsonDict:
@@ -806,6 +827,10 @@ class RootConfirmation:
             "confidence": self.confidence,
             "evidence_refs": list(self.evidence_refs),
             "counterfactual_status": self.counterfactual_status,
+            "hypothesis_id": self.hypothesis_id,
+            "defect_fingerprint": self.defect_fingerprint,
+            "recursive_path": list(self.recursive_path),
+            "factor_role": self.factor_role,
         }
 
     @classmethod
@@ -827,6 +852,17 @@ class RootConfirmation:
                     "unknown": "unknown",
                 }.get(status, "unknown")
             ),
+            hypothesis_id=str(value.get("hypothesis_id") or ""),
+            defect_fingerprint=str(value.get("defect_fingerprint") or ""),
+            recursive_path=_string_list(value.get("recursive_path")),
+            factor_role=str(
+                value.get("factor_role")
+                or {
+                    "confirmed": "necessary_cause",
+                    "rejected": "unrelated",
+                    "unknown": "unknown",
+                }.get(status, "unknown")
+            ),
         )
 
 
@@ -845,12 +881,21 @@ class ConfirmedRoot:
     episode_id: str = ""
     episode_member_refs: Tuple[str, ...] = field(default_factory=tuple)
     observed_defect_refs: Tuple[str, ...] = field(default_factory=tuple)
+    hypothesis_id: str = ""
+    recursive_path: Tuple[str, ...] = field(default_factory=tuple)
+    excerpt: str = ""
+    confirmation_status: str = "confirmed"
+    provenance: JsonDict = field(default_factory=FrozenMapping)
+    confirmation: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
         object.__setattr__(self, "episode_member_refs", _frozen_strings(self.episode_member_refs))
         object.__setattr__(self, "observed_defect_refs", _frozen_strings(self.observed_defect_refs))
+        object.__setattr__(self, "recursive_path", _frozen_strings(self.recursive_path))
+        object.__setattr__(self, "provenance", FrozenMapping(_thaw(self.provenance)))
+        object.__setattr__(self, "confirmation", FrozenMapping(_thaw(self.confirmation)))
 
     def to_dict(self) -> JsonDict:
         return {
@@ -867,6 +912,12 @@ class ConfirmedRoot:
             "episode_id": self.episode_id,
             "episode_member_refs": list(self.episode_member_refs),
             "observed_defect_refs": list(self.observed_defect_refs),
+            "hypothesis_id": self.hypothesis_id,
+            "recursive_path": list(self.recursive_path),
+            "excerpt": self.excerpt,
+            "confirmation_status": self.confirmation_status,
+            "provenance": _thaw(self.provenance),
+            "confirmation": _thaw(self.confirmation),
         }
 
     def to_legacy_root_cause(self) -> JsonDict:
@@ -899,6 +950,12 @@ class ConfirmedRoot:
             episode_id=str(value.get("episode_id") or ""),
             episode_member_refs=_string_list(value.get("episode_member_refs")),
             observed_defect_refs=_string_list(value.get("observed_defect_refs")),
+            hypothesis_id=str(value.get("hypothesis_id") or ""),
+            recursive_path=_string_list(value.get("recursive_path")),
+            excerpt=str(value.get("excerpt") or ""),
+            confirmation_status=str(value.get("confirmation_status") or "confirmed"),
+            provenance=_json_dict(value.get("provenance")),
+            confirmation=_json_dict(value.get("confirmation")),
         )
 
 
@@ -909,12 +966,20 @@ class CausalFactor:
     reason: str
     confidence: float = 0.0
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    recursive_path: Tuple[str, ...] = field(default_factory=tuple)
+    factor_label: str = ""
+    confirmation_status: str = ""
+    confirmation: JsonDict = field(default_factory=FrozenMapping)
+    provenance: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
             raise ValueError("unsupported causal relation: {0}".format(self.relation))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
+        object.__setattr__(self, "recursive_path", _frozen_strings(self.recursive_path))
+        object.__setattr__(self, "confirmation", FrozenMapping(_thaw(self.confirmation)))
+        object.__setattr__(self, "provenance", FrozenMapping(_thaw(self.provenance)))
 
     def to_dict(self) -> JsonDict:
         return {
@@ -923,6 +988,11 @@ class CausalFactor:
             "reason": self.reason,
             "confidence": self.confidence,
             "evidence_refs": list(self.evidence_refs),
+            "recursive_path": list(self.recursive_path),
+            "factor_label": self.factor_label,
+            "confirmation_status": self.confirmation_status,
+            "confirmation": _thaw(self.confirmation),
+            "provenance": _thaw(self.provenance),
         }
 
     @classmethod
@@ -933,6 +1003,11 @@ class CausalFactor:
             reason=str(value.get("reason") or ""),
             confidence=_confidence(value.get("confidence", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
+            recursive_path=_string_list(value.get("recursive_path")),
+            factor_label=str(value.get("factor_label") or ""),
+            confirmation_status=str(value.get("confirmation_status") or ""),
+            confirmation=_json_dict(value.get("confirmation")),
+            provenance=_json_dict(value.get("provenance")),
         )
 
 
@@ -941,12 +1016,32 @@ class RejectedCandidate:
     node_ref: str
     reason: str
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    hypothesis_id: str = ""
+    recursive_path: Tuple[str, ...] = field(default_factory=tuple)
+    confirmation_status: str = ""
+    confidence: float = 0.0
+    confirmation: JsonDict = field(default_factory=FrozenMapping)
+    provenance: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
+        object.__setattr__(self, "recursive_path", _frozen_strings(self.recursive_path))
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
+        object.__setattr__(self, "confirmation", FrozenMapping(_thaw(self.confirmation)))
+        object.__setattr__(self, "provenance", FrozenMapping(_thaw(self.provenance)))
 
     def to_dict(self) -> JsonDict:
-        return {"node_ref": self.node_ref, "reason": self.reason, "evidence_refs": list(self.evidence_refs)}
+        return {
+            "node_ref": self.node_ref,
+            "reason": self.reason,
+            "evidence_refs": list(self.evidence_refs),
+            "hypothesis_id": self.hypothesis_id,
+            "recursive_path": list(self.recursive_path),
+            "confirmation_status": self.confirmation_status,
+            "confidence": self.confidence,
+            "confirmation": _thaw(self.confirmation),
+            "provenance": _thaw(self.provenance),
+        }
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RejectedCandidate":
@@ -954,6 +1049,12 @@ class RejectedCandidate:
             node_ref=str(value.get("node_ref") or ""),
             reason=str(value.get("reason") or ""),
             evidence_refs=_string_list(value.get("evidence_refs")),
+            hypothesis_id=str(value.get("hypothesis_id") or ""),
+            recursive_path=_string_list(value.get("recursive_path")),
+            confirmation_status=str(value.get("confirmation_status") or ""),
+            confidence=_confidence(value.get("confidence", 0.0)),
+            confirmation=_json_dict(value.get("confirmation")),
+            provenance=_json_dict(value.get("provenance")),
         )
 
 
@@ -1060,7 +1161,10 @@ class RecursiveAttributionReport:
             "amplifying_factors": [item.to_dict() for item in self.amplifying_factors],
             "rejected_candidates": [item.to_dict() for item in self.rejected_candidates],
             "unresolved_hypotheses": [item.to_dict() for item in self.unresolved_hypotheses],
-            "root_causes": [item.to_legacy_root_cause() for item in self.confirmed_roots],
+            "root_causes": [
+                item.to_legacy_root_cause()
+                for item in (*self.confirmed_roots, *self.co_roots)
+            ],
             "taint_paths": [list(path) for path in self.taint_paths],
             "visited_order": list(self.visited_order),
             "unresolved_refs": list(self.unresolved_refs),

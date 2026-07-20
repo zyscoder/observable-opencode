@@ -2,7 +2,177 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Set
 
+from .causal_state import RecursiveAttributionReport
 from .models import AttributionReport, JsonDict, RootCauseCandidate, TraceNode
+
+
+def build_recursive_trace_improvement_report(
+    graph: Any, report: RecursiveAttributionReport
+) -> JsonDict:
+    """Derive recursive-attribution observability gaps without model calls."""
+    blocking_gaps: List[JsonDict] = []
+    recommendations: List[JsonDict] = []
+
+    def add_recursive_gap(
+        gap_type: str,
+        *,
+        node_ref: str,
+        why: str,
+        missing_fields: Iterable[str],
+        related_refs: Iterable[str],
+    ) -> None:
+        node = graph.nodes.get(node_ref) if node_ref else None
+        blocking_gaps.append(
+            {
+                "gap_type": gap_type,
+                "node_ref": node_ref,
+                "component": node.component if node is not None else "attribution",
+                "event_type": node.event_type if node is not None else "recursive_analysis",
+                "why_it_blocks_root_cause_analysis": why,
+                "missing_semantic_fields": list(missing_fields),
+                "related_refs": list(dict.fromkeys(str(ref) for ref in related_refs if ref)),
+                "confidence": 1.0,
+            }
+        )
+        recommendations.append(
+            {
+                "component": node.component if node is not None else "attribution",
+                "priority": "high",
+                "change": "Record {0} for {1}.".format(
+                    ", ".join(missing_fields), node_ref or "the recursive analysis"
+                ),
+                "unblocks": [gap_type],
+            }
+        )
+
+    paths = [tuple(path) for path in report.taint_paths]
+    paths.extend(tuple(item.recursive_path) for item in report.confirmations)
+    for path in dict.fromkeys(paths):
+        for upstream, downstream in zip(path, path[1:]):
+            edge_context = graph.edge_context(upstream, downstream)
+            eligible = any(
+                bool(edge.get("eligible_for_attribution", True))
+                and str(edge.get("relation") or "") not in {
+                    "temporal_proximity",
+                    "temporal_sequence",
+                }
+                for edge in edge_context
+            )
+            if not eligible:
+                add_recursive_gap(
+                    "recursive_path_missing_edge",
+                    node_ref=upstream,
+                    why="A recursive path hop has no grounded non-temporal causal edge.",
+                    missing_fields=("causal_edge", "edge_provenance", "edge_reason"),
+                    related_refs=(upstream, downstream),
+                )
+
+    for relation in report.causal_relations:
+        if relation.relation != "defect_transformation":
+            continue
+        transformed = relation.upstream_defect
+        if transformed is None or not transformed.transformation_reason:
+            add_recursive_gap(
+                "defect_transformation_missing_intermediate",
+                node_ref=relation.ref,
+                why="The transformation does not preserve the intermediate defect mechanism.",
+                missing_fields=(
+                    "upstream_defect_state",
+                    "transformation_reason",
+                    "intermediate_node_ref",
+                ),
+                related_refs=(relation.ref,),
+            )
+
+    unresolved = [
+        item
+        for item in report.unresolved_hypotheses
+        if item.status in {"active", "supported", "unresolved"}
+    ]
+    if unresolved:
+        add_recursive_gap(
+            "competing_hypotheses_unresolved",
+            node_ref=unresolved[0].candidate_root_ref,
+            why="One or more grounded competing explanations remain unresolved.",
+            missing_fields=("independent_comparison", "falsification_result"),
+            related_refs=(item.candidate_root_ref for item in unresolved),
+        )
+
+    confirmed_refs = {
+        item.node_ref for item in (*report.confirmed_roots, *report.co_roots)
+    }
+    for confirmation in report.confirmations:
+        if confirmation.status == "unknown":
+            add_recursive_gap(
+                "root_confirmation_missing_evidence",
+                node_ref=confirmation.candidate_ref,
+                why=confirmation.reason or "Independent confirmation lacked decisive evidence.",
+                missing_fields=(
+                    "candidate_local_excerpt",
+                    "grounded_counterfactual",
+                    "resolved_evidence_refs",
+                ),
+                related_refs=confirmation.recursive_path,
+            )
+    confirmed_or_attempted = confirmed_refs | {
+        item.candidate_ref for item in report.confirmations
+    }
+    for candidate in report.introduction_candidates:
+        if candidate.ref not in confirmed_or_attempted:
+            add_recursive_gap(
+                "root_confirmation_missing_evidence",
+                node_ref=candidate.ref,
+                why="The introduction candidate was not independently confirmed.",
+                missing_fields=("root_confirmation_request", "independent_verdict"),
+                related_refs=(candidate.ref,),
+            )
+
+    bindings = report.metadata.get("introduction_bindings") or ()
+    identities: Dict[str, Set[tuple[str, str]]] = {}
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        hypothesis_id = str(binding.get("hypothesis_id") or "")
+        identities.setdefault(hypothesis_id, set()).add(
+            (
+                str(binding.get("candidate_ref") or ""),
+                str(binding.get("defect_fingerprint") or ""),
+            )
+        )
+    for hypothesis_id, values in identities.items():
+        if hypothesis_id and len(values) > 1:
+            refs = sorted(ref for ref, _ in values if ref)
+            add_recursive_gap(
+                "semantic_anchor_unstable",
+                node_ref=refs[0] if refs else "",
+                why="One hypothesis identity maps to multiple candidate or defect anchors.",
+                missing_fields=(
+                    "stable_hypothesis_id",
+                    "candidate_ref",
+                    "defect_fingerprint",
+                ),
+                related_refs=refs,
+            )
+
+    blocking_gaps = dedupe_gaps(blocking_gaps)
+    recommendations = dedupe_recommendations(recommendations)
+    return {
+        "summary": {
+            "blocking_gap_count": len(blocking_gaps),
+            "advisory_gap_count": 0,
+            "recommended_change_count": len(recommendations),
+            "analysis_confidence": (
+                "blocked"
+                if blocking_gaps and not confirmed_refs
+                else "partial"
+                if blocking_gaps
+                else "high"
+            ),
+        },
+        "blocking_gaps": blocking_gaps,
+        "advisory_gaps": [],
+        "recommended_trace_changes": recommendations,
+    }
 
 
 def build_trace_improvement_report(graph: Any, report: AttributionReport) -> JsonDict:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .causal_judge import (
@@ -12,6 +13,9 @@ from .causal_judge import (
     CausalJudge,
     CausalStepRequest,
     OfflineJudgeCapability,
+    RootConfirmationRequest,
+    bind_root_confirmation,
+    preflight_root_confirmation_request,
 )
 from .causal_retrieval import SemanticPredecessorRetriever
 from .causal_state import (
@@ -19,11 +23,13 @@ from .causal_state import (
     CausalCandidate,
     CausalFactor,
     CausalStepJudgment,
+    ConfirmedRoot,
     DefectState,
     FrontierItem,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RejectedCandidate,
+    RootConfirmation,
 )
 from .errors import JudgeProviderError, JudgeProviderUnavailable
 from .graph import TraceGraph
@@ -174,6 +180,99 @@ def _provider_circuit(judge: CausalJudge) -> JsonDict:
     }
 
 
+def _reference_envelope(ref: str, *, content: str = "", fact_kind: str = "") -> JsonDict:
+    value: JsonDict = {
+        "raw_ref": ref,
+        "resolved_ref": ref,
+        "resolution_status": "resolved",
+        "provenance_class": "recorded",
+    }
+    if content:
+        value["content"] = content
+    if fact_kind:
+        value["fact_kind"] = fact_kind
+    return value
+
+
+def _node_semantic_content(node: TraceNode) -> str:
+    def without_hydrated_artifacts(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): without_hydrated_artifacts(child)
+                for key, child in value.items()
+                if str(key) != "hydrated_artifacts"
+            }
+        if isinstance(value, (list, tuple)):
+            return [without_hydrated_artifacts(child) for child in value]
+        return copy.deepcopy(value)
+
+    data = without_hydrated_artifacts(node.data)
+    return stable_json(
+        {
+            "component": node.component,
+            "event_type": node.event_type,
+            "title": node.title,
+            "status": node.status,
+            "data": data,
+        }
+    )
+
+
+def _artifact_hydration_manifest(node: TraceNode) -> Optional[JsonDict]:
+    artifacts = node.data.get("hydrated_artifacts")
+    if not isinstance(artifacts, (list, tuple)) or not artifacts:
+        return None
+    referenced: List[str] = []
+    hydrated: List[JsonDict] = []
+    missing: List[str] = []
+    truncated: List[str] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "").strip().removeprefix(
+            "artifact:"
+        )
+        if not artifact_id:
+            continue
+        referenced.append(artifact_id)
+        is_missing = bool(artifact.get("missing")) or not isinstance(
+            artifact.get("content"), str
+        )
+        is_truncated = bool(artifact.get("truncated"))
+        if is_missing:
+            missing.append(artifact_id)
+            continue
+        content = str(artifact.get("content") or "")
+        if is_truncated:
+            truncated.append(artifact_id)
+        hydrated.append(
+            {
+                "artifact_id": artifact_id,
+                "content": content,
+                "content_hash": str(artifact.get("hash") or hashlib.sha256(content.encode("utf-8")).hexdigest()),
+                "byte_range": [0, len(content.encode("utf-8"))],
+                "missing": False,
+                "truncated": is_truncated,
+            }
+        )
+    if not referenced:
+        return None
+    return {
+        "node_ref": node.ref,
+        "referenced_artifact_ids": list(dict.fromkeys(referenced)),
+        "hydrated_artifacts": hydrated,
+        "missing_artifact_ids": list(dict.fromkeys(missing)),
+        "truncated_artifact_ids": list(dict.fromkeys(truncated)),
+    }
+
+
+def _perspective_tokens(value: str) -> Set[str]:
+    return {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9_]{3,}", value)
+    }
+
+
 def _rejudge_success_terminal_state(
     judgment: CausalStepJudgment,
     *,
@@ -237,6 +336,12 @@ class RecursiveAnalysisState:
     control_directive_ids: Set[str] = field(default_factory=set)
     confirmation_queue: List[JsonDict] = field(default_factory=list)
     confirmation_queue_keys: Set[Tuple[str, str, str]] = field(default_factory=set)
+    confirmations: List[RootConfirmation] = field(default_factory=list)
+    confirmed_roots: List[ConfirmedRoot] = field(default_factory=list)
+    co_roots: List[ConfirmedRoot] = field(default_factory=list)
+    amplifying_factors: List[CausalFactor] = field(default_factory=list)
+    confirmation_journal: List[JsonDict] = field(default_factory=list)
+    logical_confirmation_calls: int = 0
     pending_rejudge_journal: Dict[str, List[int]] = field(default_factory=dict)
     seed_count: int = 0
 
@@ -832,7 +937,9 @@ class RecursiveAnalysisState:
         hypotheses = [AttributionHypothesis.from_dict(item) for item in self.ledger.snapshot()]
         by_id = {item.hypothesis_id: item for item in hypotheses}
         unresolved_ids = self.unresolved_hypothesis_ids | self.introduction_hypothesis_ids
-        if self.present_hypothesis_ids and not unresolved_ids:
+        if self.present_hypothesis_ids and not unresolved_ids and not (
+            self.confirmed_roots or self.co_roots
+        ):
             unresolved_ids.update(self.present_hypothesis_ids)
             self.unresolved_hypothesis_ids.update(self.present_hypothesis_ids)
             for judgment in self.step_judgments:
@@ -884,8 +991,10 @@ class RecursiveAnalysisState:
             "frontier_checkpoint": self.frontier.checkpoint(),
             "hypothesis_snapshot": self.ledger.snapshot(),
             "provider_circuit": provider,
-            "independent_confirmation": "deferred_to_task_7",
+            "independent_confirmation": "completed",
             "confirmation_queue": list(self.confirmation_queue),
+            "confirmation_journal": list(self.confirmation_journal),
+            "logical_confirmation_call_count": self.logical_confirmation_calls,
         }
         return RecursiveAttributionReport(
             case_id=self.graph.case_id,
@@ -898,8 +1007,11 @@ class RecursiveAnalysisState:
             step_judgments=tuple(self.step_judgments),
             hypotheses=tuple(hypotheses),
             introduction_candidates=tuple(self.introduction_candidates),
-            confirmed_roots=(),
+            confirmations=tuple(self.confirmations),
+            confirmed_roots=tuple(self.confirmed_roots),
+            co_roots=tuple(self.co_roots),
             contributing_conditions=tuple(self.contributing_conditions),
+            amplifying_factors=tuple(self.amplifying_factors),
             rejected_candidates=tuple(self.rejected_candidates),
             unresolved_hypotheses=tuple(unresolved_hypotheses),
             taint_paths=tuple(dict.fromkeys(self.taint_paths)),
@@ -1261,7 +1373,433 @@ class AgenticRecursiveAnalyzer:
                     "The recursive frontier item budget is exhausted.",
                     exhausted_budget="frontier_items",
                 )
-        return state.build_report(judge=self.judge)
+        self._confirm_queued_roots(state)
+        report = state.build_report(judge=self.judge)
+        from .trace_improvement import build_recursive_trace_improvement_report
+
+        metadata = dict(report.metadata)
+        metadata["trace_improvement_report"] = build_recursive_trace_improvement_report(
+            analysis_graph, report
+        )
+        return replace(report, metadata=metadata)
+
+    def _confirm_queued_roots(self, state: RecursiveAnalysisState) -> None:
+        pending_confirmations = list(state.confirmation_queue)
+        while pending_confirmations:
+            queued = pending_confirmations.pop(0)
+            try:
+                request = self._build_confirmation_request(state, queued)
+                preflight_root_confirmation_request(request)
+            except (KeyError, TypeError, ValueError) as exc:
+                confirmation = RootConfirmation(
+                    candidate_ref=str(queued.get("candidate_ref") or ""),
+                    status="unknown",
+                    reason="confirmation_request_ineligible: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    counterfactual_status="unknown",
+                    hypothesis_id=str(queued.get("hypothesis_id") or ""),
+                    defect_fingerprint=str(queued.get("defect_fingerprint") or ""),
+                    recursive_path=tuple(queued.get("recursive_path") or ()),
+                )
+                self._record_confirmation(state, queued, confirmation, 0)
+                continue
+
+            bounded_judge = isinstance(self.judge, BoundedJudgeCapability)
+            offline_judge = isinstance(self.judge, OfflineJudgeCapability)
+            if not bounded_judge and not offline_judge:
+                confirmation = RootConfirmation(
+                    candidate_ref=request.candidate_ref,
+                    status="unknown",
+                    reason="confirmation_budget_unenforceable: Judge has no explicit bounded or offline capability",
+                    counterfactual_status="unknown",
+                    hypothesis_id=request.hypothesis_id,
+                    defect_fingerprint=request.defect_state.fingerprint,
+                    recursive_path=request.recursive_path,
+                )
+                self._record_confirmation(state, queued, confirmation, 0)
+                continue
+
+            remaining = max(0, self.max_judge_requests - state.judge_requests)
+            before = _judge_request_count(self.judge)
+            state.logical_judge_calls += 1
+            state.logical_confirmation_calls += 1
+            try:
+                if bounded_judge:
+                    raw = self.judge.confirm_candidate_bounded(
+                        request, max_physical_requests=remaining
+                    )
+                else:
+                    raw = self.judge.confirm_candidate_offline(request)
+                if not isinstance(raw, RootConfirmation):
+                    raise TypeError(
+                        "confirmation Judge returned {0}, expected RootConfirmation".format(
+                            type(raw).__name__
+                        )
+                    )
+                confirmation = bind_root_confirmation(raw, request=request)
+            except (JudgeProviderError, JudgeProviderUnavailable, TypeError, ValueError) as exc:
+                confirmation = RootConfirmation(
+                    candidate_ref=request.candidate_ref,
+                    status="unknown",
+                    reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
+                    counterfactual_status="unknown",
+                    hypothesis_id=request.hypothesis_id,
+                    defect_fingerprint=request.defect_state.fingerprint,
+                    recursive_path=request.recursive_path,
+                )
+            except Exception as exc:
+                confirmation = RootConfirmation(
+                    candidate_ref=request.candidate_ref,
+                    status="unknown",
+                    reason="confirmation_capability_error: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    counterfactual_status="unknown",
+                    hypothesis_id=request.hypothesis_id,
+                    defect_fingerprint=request.defect_state.fingerprint,
+                    recursive_path=request.recursive_path,
+                )
+            after = _judge_request_count(self.judge)
+            physical_delta = (
+                max(0, after - before)
+                if before is not None and after is not None
+                else 0
+            )
+            state.judge_requests += physical_delta
+            normalized_reason = confirmation.reason.casefold()
+            if any(
+                marker in normalized_reason
+                for marker in (
+                    "judge_request_budget_exhausted",
+                    "request_budget_exhausted",
+                    "budget_exhausted",
+                )
+            ):
+                state._increment_budget("judge_requests")
+            self._record_confirmation(state, queued, confirmation, physical_delta)
+            if confirmation.status == "rejected":
+                backtrack_id = str(
+                    state.confirmation_journal[-1].get(
+                        "backtracked_to_hypothesis_id"
+                    )
+                    or ""
+                )
+                for index, pending in enumerate(pending_confirmations):
+                    if pending.get("hypothesis_id") == backtrack_id:
+                        pending_confirmations.insert(
+                            0, pending_confirmations.pop(index)
+                        )
+                        break
+
+        self._rank_confirmed_roots(state)
+
+    def _build_confirmation_request(
+        self, state: RecursiveAnalysisState, queued: Mapping[str, Any]
+    ) -> RootConfirmationRequest:
+        hypothesis_id = str(queued.get("hypothesis_id") or "")
+        candidate_ref = str(queued.get("candidate_ref") or "")
+        fingerprint = str(queued.get("defect_fingerprint") or "")
+        hypothesis = state.ledger.get(hypothesis_id)
+        if (
+            hypothesis.candidate_root_ref != candidate_ref
+            or hypothesis.active_defect_fingerprint != fingerprint
+        ):
+            raise ValueError("queued confirmation is cross-bound to another hypothesis")
+        binding = next(
+            (
+                item
+                for item in state.introduction_bindings
+                if item.get("candidate_ref") == candidate_ref
+                and item.get("hypothesis_id") == hypothesis_id
+                and item.get("defect_fingerprint") == fingerprint
+                and item.get("hypothesis_semantic_hash") == hypothesis.semantic_hash
+            ),
+            None,
+        )
+        if binding is None:
+            raise ValueError("queued confirmation has no exact introduction binding")
+        defect_state = state.defect_states.get(fingerprint)
+        if defect_state is None:
+            raise ValueError("queued confirmation defect state is unavailable")
+        node = state.graph.nodes.get(candidate_ref)
+        if node is None:
+            raise ValueError("queued confirmation candidate is unresolved")
+        path = tuple(str(ref) for ref in queued.get("recursive_path") or ())
+        if not path or path[0] != candidate_ref:
+            raise ValueError("queued confirmation path is not candidate-rooted")
+        if any(state.graph.resolve(ref) != ref for ref in path):
+            raise ValueError("queued confirmation path contains unresolved references")
+        for upstream, downstream in zip(path, path[1:]):
+            edges = state.graph.edge_context(upstream, downstream)
+            if not any(
+                bool(edge.get("eligible_for_attribution", True))
+                and str(edge.get("relation") or "")
+                not in {"temporal_proximity", "temporal_sequence"}
+                for edge in edges
+            ):
+                raise ValueError(
+                    "queued confirmation path lacks a grounded non-temporal edge: {0}->{1}".format(
+                        upstream, downstream
+                    )
+                )
+
+        candidate_reference = _reference_envelope(
+            candidate_ref,
+            content=_node_semantic_content(state.graph.hydrate_node(candidate_ref)),
+            fact_kind="candidate_fact",
+        )
+        candidate_reference["decisive"] = True
+        artifact_manifest = _artifact_hydration_manifest(
+            state.graph.hydrate_node(candidate_ref)
+        )
+        if artifact_manifest is not None:
+            candidate_reference["artifact_hydration"] = artifact_manifest
+        path_references = tuple(_reference_envelope(ref) for ref in path)
+
+        def evidence_facts(refs: Iterable[str], fact_kind: str) -> Tuple[JsonDict, ...]:
+            output: List[JsonDict] = []
+            for raw_ref in _dedupe_strings(refs):
+                resolved = state.graph.resolve(raw_ref)
+                if not resolved or resolved not in state.graph.nodes:
+                    raise ValueError("confirmation evidence ref is unresolved: {0}".format(raw_ref))
+                output.append(
+                    _reference_envelope(
+                        resolved,
+                        content=_node_semantic_content(state.graph.hydrate_node(resolved)),
+                        fact_kind=fact_kind,
+                    )
+                )
+            return tuple(output)
+
+        supporting_refs = [candidate_ref]
+        supporting_refs.extend(item.ref for item in hypothesis.supporting_evidence)
+        supporting_refs.extend(queued.get("checked_evidence_refs") or ())
+        opposing_refs = [item.ref for item in hypothesis.opposing_evidence]
+        competitors: List[JsonDict] = []
+        for value in state.ledger.snapshot():
+            if value.get("hypothesis_id") == hypothesis_id:
+                continue
+            competitor_ref = str(value.get("candidate_root_ref") or "")
+            resolved = state.graph.resolve(competitor_ref)
+            if not resolved:
+                raise ValueError("competing hypothesis candidate is unresolved")
+            support = value.get("supporting_evidence") or []
+            opposition = value.get("opposing_evidence") or []
+            evidence_refs = [
+                str(item.get("ref") or "")
+                for item in [*support, *opposition]
+                if isinstance(item, Mapping) and item.get("ref")
+            ]
+            competitors.append(
+                {
+                    "hypothesis_id": str(value.get("hypothesis_id") or ""),
+                    "status": str(value.get("status") or "unresolved"),
+                    "candidate_reference": _reference_envelope(resolved),
+                    "evidence_references": list(
+                        evidence_facts(evidence_refs, "competing_hypothesis_evidence")
+                    ),
+                }
+            )
+
+        obligations: List[JsonDict] = []
+        for item in queued.get("task_obligations") or ():
+            if not isinstance(item, Mapping):
+                continue
+            safe = {
+                key: copy.deepcopy(item[key])
+                for key in (
+                    "source",
+                    "text",
+                    "description",
+                    "expected",
+                    "requirement",
+                    "criterion",
+                )
+                if key in item and item[key] not in (None, "", [], {})
+            }
+            if safe:
+                obligations.append(safe)
+
+        return RootConfirmationRequest(
+            candidate_ref=candidate_ref,
+            defect_state=defect_state,
+            recursive_path=path,
+            candidate_reference=candidate_reference,
+            recursive_path_references=path_references,
+            supporting_evidence=evidence_facts(
+                supporting_refs, "supporting_evidence"
+            ),
+            opposing_evidence=evidence_facts(
+                opposing_refs, "opposing_evidence"
+            ),
+            competing_hypotheses=tuple(competitors),
+            task_obligations=tuple(obligations),
+            analysis_perspective=state.analysis_perspective,
+            hypothesis_id=hypothesis_id,
+            hypothesis_semantic_hash=hypothesis.semantic_hash,
+        )
+
+    def _record_confirmation(
+        self,
+        state: RecursiveAnalysisState,
+        queued: JsonDict,
+        confirmation: RootConfirmation,
+        physical_request_delta: int,
+    ) -> None:
+        queued["status"] = confirmation.status
+        queued["confirmation"] = confirmation.to_dict()
+        hypothesis_id = str(queued.get("hypothesis_id") or "")
+        state.confirmations.append(confirmation)
+        state.confirmation_journal.append(
+            {
+                "semantic_identity": queued.get("semantic_identity"),
+                "candidate_ref": confirmation.candidate_ref,
+                "hypothesis_id": hypothesis_id,
+                "defect_fingerprint": confirmation.defect_fingerprint,
+                "recursive_path": list(confirmation.recursive_path),
+                "status": confirmation.status,
+                "physical_request_delta": physical_request_delta,
+                "confirmation": confirmation.to_dict(),
+            }
+        )
+        if confirmation.status == "confirmed":
+            state.introduction_hypothesis_ids.discard(hypothesis_id)
+            state.unresolved_hypothesis_ids.discard(hypothesis_id)
+            node = state.graph.nodes[confirmation.candidate_ref]
+            defect_state = state.defect_states[confirmation.defect_fingerprint]
+            state.confirmed_roots.append(
+                ConfirmedRoot(
+                    node_ref=confirmation.candidate_ref,
+                    defect_state=defect_state,
+                    reason=confirmation.reason,
+                    counterfactual=confirmation.counterfactual,
+                    confidence=confirmation.confidence,
+                    evidence_refs=confirmation.evidence_refs,
+                    component=node.component,
+                    event_type=node.event_type,
+                    defect_type=defect_state.label,
+                    observed_defect_refs=state.start_refs,
+                    hypothesis_id=hypothesis_id,
+                    recursive_path=confirmation.recursive_path,
+                    excerpt=confirmation.excerpt,
+                    provenance={
+                        "confirmation_semantic_identity": queued.get("semantic_identity"),
+                        "defect_fingerprint": confirmation.defect_fingerprint,
+                    },
+                    confirmation=confirmation.to_dict(),
+                )
+            )
+            return
+        if confirmation.status == "rejected":
+            state.introduction_hypothesis_ids.discard(hypothesis_id)
+            state.unresolved_hypothesis_ids.discard(hypothesis_id)
+            hypothesis = state.ledger.get(hypothesis_id)
+            if hypothesis.status in {"active", "supported"}:
+                state.ledger.reject(hypothesis_id, confirmation.reason)
+            state.rejected_candidates.append(
+                RejectedCandidate(
+                    confirmation.candidate_ref,
+                    confirmation.reason,
+                    confirmation.evidence_refs,
+                    hypothesis_id=hypothesis_id,
+                    recursive_path=confirmation.recursive_path,
+                    confirmation_status="rejected",
+                    confidence=confirmation.confidence,
+                    confirmation=confirmation.to_dict(),
+                    provenance={
+                        "confirmation_semantic_identity": queued.get("semantic_identity"),
+                        "defect_fingerprint": confirmation.defect_fingerprint,
+                    },
+                )
+            )
+            if confirmation.factor_role in {
+                "contributing_condition",
+                "amplifying_factor",
+            }:
+                factor = CausalFactor(
+                    node_ref=confirmation.candidate_ref,
+                    relation="contributing_condition",
+                    reason=confirmation.reason,
+                    confidence=confirmation.confidence,
+                    evidence_refs=confirmation.evidence_refs,
+                    recursive_path=confirmation.recursive_path,
+                    factor_label="{0} for {1}".format(
+                        confirmation.factor_role.replace("_", " "),
+                        state.analysis_perspective,
+                    ),
+                    confirmation_status="rejected",
+                    confirmation=confirmation.to_dict(),
+                    provenance={
+                        "confirmation_semantic_identity": queued.get("semantic_identity"),
+                        "defect_fingerprint": confirmation.defect_fingerprint,
+                    },
+                )
+                if confirmation.factor_role == "amplifying_factor":
+                    state.amplifying_factors.append(factor)
+                else:
+                    state.contributing_conditions.append(factor)
+            pending_alternatives = [
+                item
+                for item in state.confirmation_queue
+                if item.get("status") == "queued"
+                and item.get("hypothesis_id") != hypothesis_id
+            ]
+            pending_alternatives.sort(
+                key=lambda item: (
+                    -sum(
+                        evidence.confidence
+                        for evidence in state.ledger.get(
+                            str(item.get("hypothesis_id") or "")
+                        ).supporting_evidence
+                    ),
+                    str(item.get("hypothesis_id") or ""),
+                )
+            )
+            state.confirmation_journal[-1]["backtracked_to_hypothesis_id"] = (
+                str(pending_alternatives[0].get("hypothesis_id") or "")
+                if pending_alternatives
+                else ""
+            )
+            state.confirmation_journal[-1]["backtrack_status"] = (
+                "pending_confirmation_queue"
+                if pending_alternatives
+                else "no_queued_unresolved_alternative"
+            )
+            return
+
+        state.unresolved_hypothesis_ids.add(hypothesis_id)
+        state.unresolved_refs.append(confirmation.candidate_ref)
+        state.unresolved_branches.append(
+            {
+                "node_ref": confirmation.candidate_ref,
+                "defect_state_id": "defect:{0}".format(
+                    confirmation.defect_fingerprint
+                ),
+                "hypothesis_id": hypothesis_id,
+                "reason": "root_confirmation_unknown",
+                "details": confirmation.reason,
+                "depth": max(0, len(confirmation.recursive_path) - 1),
+            }
+        )
+
+    def _rank_confirmed_roots(self, state: RecursiveAnalysisState) -> None:
+        perspective = _perspective_tokens(state.analysis_perspective)
+
+        def rank(root: ConfirmedRoot) -> Tuple[int, float, int, int, str]:
+            node = state.graph.nodes[root.node_ref]
+            semantic_tokens = _perspective_tokens(_node_semantic_content(node))
+            return (
+                -len(perspective.intersection(semantic_tokens)),
+                -root.confidence,
+                len(root.recursive_path),
+                state.graph.position(root.node_ref),
+                root.node_ref,
+            )
+
+        ordered = sorted(state.confirmed_roots, key=rank)
+        state.confirmed_roots = ordered[:1]
+        state.co_roots = ordered[1:]
 
     def _handle_investigation(
         self,
@@ -1520,10 +2058,18 @@ class AgenticRecursiveAnalyzer:
                             "candidate_ref": candidate_ref,
                             "defect_fingerprint": defect_fingerprint,
                             "requested_by_ref": item.node_ref,
+                            "recursive_path": list(item.downstream_path),
+                            "checked_evidence_refs": sorted(
+                                state.visit_evidence.get(item.visit_key, set())
+                            ),
+                            "task_obligations": copy.deepcopy(
+                                list(request.recursive_context.get("task_obligations") or [])
+                            ),
+                            "analysis_perspective": state.analysis_perspective,
                             "semantic_identity": hashlib.sha256(
                                 stable_json(queue_key).encode("utf-8")
                             ).hexdigest(),
-                            "status": "pending_task_7_independent_confirmation",
+                            "status": "queued",
                         }
                     )
                 status = "deferred"

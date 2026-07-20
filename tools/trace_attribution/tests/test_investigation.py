@@ -15,6 +15,7 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     FrontierItem,
     PredecessorAssessment,
+    RootConfirmation,
 )
 from trace_attribution.errors import JudgeProviderUnavailable
 from trace_attribution.graph import TraceGraph
@@ -72,8 +73,10 @@ class ScriptedInvestigatingJudge(OfflineJudgeCapability):
         value = self.responses.pop(0)
         return value(request) if callable(value) else value
 
-    def confirm_candidate(self, request):  # pragma: no cover - forbidden in Task 6
-        raise AssertionError("Task 6 must not confirm roots")
+    def confirm_candidate(self, request):
+        return RootConfirmation.unknown(
+            request.candidate_ref, "The Task 6 evidence remains insufficient."
+        )
 
 
 class CountingAdjacency(dict):
@@ -1057,7 +1060,7 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.assertEqual(len(judge.requests), 1)
         self.assertEqual(report.investigation_journal[0]["status"], "rejected")
 
-    def test_request_root_confirmation_is_journaled_but_not_executed(self):
+    def test_request_root_confirmation_is_journaled_then_independently_executed(self):
         def request_confirmation(request):
             return judgment(
                 "record:decision",
@@ -1083,12 +1086,13 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         )
         self.assertEqual(report.investigation_journal[0]["directive_kind"], "attribution_control")
         self.assertEqual(report.investigation_journal[0]["status"], "deferred")
-        self.assertEqual(report.confirmations, ())
+        self.assertEqual([item.status for item in report.confirmations], ["unknown"])
         self.assertEqual(report.confirmed_roots, ())
         self.assertEqual(len(report.metadata["confirmation_queue"]), 1)
         queued = report.metadata["confirmation_queue"][0]
         self.assertEqual(queued["candidate_ref"], "record:decision")
         self.assertEqual(queued["defect_fingerprint"], report.defect_states[0].fingerprint)
+        self.assertEqual(queued["status"], "unknown")
         restored = type(report).from_dict(report.to_dict())
         self.assertEqual(restored.investigation_journal, report.investigation_journal)
 

@@ -4,10 +4,12 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
+    BoundedJudgeCapability,
     ClaudeCausalJudge,
     OfflineCausalJudgeAdapter,
     OfflineJudgeCapability,
@@ -16,6 +18,7 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
     PredecessorAssessment,
+    RootConfirmation,
 )
 from trace_attribution.errors import JudgeProviderUnavailable
 from trace_attribution.graph import TraceGraph
@@ -132,6 +135,7 @@ def step(
     predecessors: tuple[PredecessorAssessment, ...] = (),
     introduction: bool = False,
     missing: tuple[str, ...] = (),
+    suggested: dict | None = None,
 ) -> CausalStepJudgment:
     return CausalStepJudgment(
         current_node_ref=ref,
@@ -140,6 +144,7 @@ def step(
         predecessors=predecessors,
         candidate_introduction=introduction,
         missing_evidence=missing,
+        suggested_investigation=suggested,
         confidence=0.9 if status != "unknown" else 0.0,
     )
 
@@ -159,6 +164,8 @@ class ScriptedCausalJudge(OfflineJudgeCapability):
         value = self.script.get(key, self.script.get(request.current_node.ref))
         if isinstance(value, list):
             value = value.pop(0)
+        if callable(value):
+            value = value(request)
         if isinstance(value, Exception):
             self.provider_circuit_open = isinstance(value, JudgeProviderUnavailable)
             self.provider_circuit_reason = str(value)
@@ -166,6 +173,55 @@ class ScriptedCausalJudge(OfflineJudgeCapability):
         if value is None:
             return step(request.current_node.ref, status="absent")
         return value
+
+
+class ConfirmingScriptedJudge(ScriptedCausalJudge):
+    def __init__(self, script, confirmations):
+        super().__init__(script)
+        self.confirmations = dict(confirmations)
+        self.confirmation_requests = []
+
+    def confirm_candidate(self, request):
+        self.confirmation_requests.append(request)
+        return self.confirmations[request.candidate_ref]
+
+
+class BoundedConfirmingJudge(BoundedJudgeCapability):
+    def __init__(self):
+        self.transport = ScriptedTransport([])
+        self.step_allowances = []
+        self.confirmation_allowances = []
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_allowances.append(max_physical_requests)
+        if not max_physical_requests:
+            return step(
+                request.current_node.ref,
+                status="unknown",
+                missing=("judge_request_budget_exhausted",),
+            )
+        self.transport.request_count += 1
+        return RecursiveRootRankingTest._confirmation_step(request)
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        self.confirmation_allowances.append(max_physical_requests)
+        if not max_physical_requests:
+            return RootConfirmation.unknown(
+                request.candidate_ref, "judge_request_budget_exhausted"
+            )
+        self.transport.request_count += 1
+        node_content = request.candidate_reference["content"]
+        excerpt = "The decision is incomplete."
+        if excerpt not in node_content:
+            excerpt = "premature closure"
+        return RootConfirmation.confirmed(
+            request.candidate_ref,
+            excerpt=excerpt,
+            reason="The candidate contains the tracked defect.",
+            counterfactual="Correcting the candidate prevents the defect.",
+            confidence=0.9,
+            evidence_refs=[request.candidate_ref],
+        )
 
 
 class ScriptedTransport:
@@ -993,6 +1049,282 @@ class RecursiveBudgetTest(unittest.TestCase):
 
         self.assertEqual(graph.nodes, nodes_before)
         self.assertEqual(graph.artifact_hydration, hydration_before)
+
+
+class RecursiveRootRankingTest(unittest.TestCase):
+    @staticmethod
+    def _confirmation_step(request):
+        return step(
+            request.current_node.ref,
+            introduction=True,
+            suggested={
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "hypothesis_id": request.recursive_context["active_hypothesis_id"],
+                    "candidate_ref": request.current_node.ref,
+                    "defect_fingerprint": request.defect_state.fingerprint,
+                },
+                "reason": "Independently verify this introduction candidate.",
+            },
+        )
+
+    def test_unknown_confirmation_never_becomes_root(self):
+        judge = ConfirmingScriptedJudge(
+            {"record:only": self._confirmation_step},
+            {
+                "record:only": RootConfirmation.unknown(
+                    "record:only", "missing candidate-local evidence"
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertIn(
+            "root_confirmation_missing_evidence",
+            {
+                item["gap_type"]
+                for item in report.metadata["trace_improvement_report"]["blocking_gaps"]
+            },
+        )
+        self.assertEqual(judge.confirmation_requests.__len__(), 1)
+
+    def test_rejected_candidate_backtracks_to_independently_confirmed_alternative(self):
+        def first_step(request):
+            return step(
+                "record:change",
+                predecessors=(
+                    relation("record:decision", "same_defect_propagation"),
+                    relation("record:context", "same_defect_propagation"),
+                ),
+            )
+
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": first_step,
+                "record:decision": self._confirmation_step,
+                "record:context": self._confirmation_step,
+            },
+            {
+                "record:context": RootConfirmation.rejected(
+                    "record:context",
+                    "availability alone did not introduce the defect",
+                    factor_role="contributing_condition",
+                ),
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision stopped repository discovery.",
+                    counterfactual="A complete search would prevent the omission.",
+                    confidence=0.91,
+                    evidence_refs=["record:decision"],
+                ),
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+            analysis_perspective="Improve Agent repository reasoning.",
+        )
+
+        self.assertEqual(
+            [root.node_ref for root in report.confirmed_roots], ["record:decision"]
+        )
+        self.assertEqual(
+            [item.node_ref for item in report.contributing_conditions],
+            ["record:context"],
+        )
+        self.assertEqual(
+            [item.node_ref for item in report.rejected_candidates if item.confirmation_status == "rejected"],
+            ["record:context"],
+        )
+        requests = {item.candidate_ref: item for item in judge.confirmation_requests}
+        decision_request = requests["record:decision"]
+        self.assertTrue(decision_request.hypothesis_id)
+        self.assertEqual(
+            decision_request.defect_state.fingerprint,
+            next(
+                item["defect_fingerprint"]
+                for item in report.metadata["introduction_bindings"]
+                if item["candidate_ref"] == "record:decision"
+            ),
+        )
+        self.assertNotIn(
+            "The decision semantically explains the current defect.",
+            json.dumps(decision_request.to_dict()),
+        )
+
+    def test_successful_no_defect_does_not_invoke_confirmation(self):
+        judge = ConfirmingScriptedJudge(
+            {"record:only": step("record:only", status="absent")}, {}
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Check the decision.",
+        )
+
+        self.assertEqual(report.analysis_outcome, "no_defect")
+        self.assertEqual(judge.confirmation_requests, [])
+
+    def test_step_and_confirmation_share_one_exact_physical_request_budget(self):
+        exhausted = BoundedConfirmingJudge()
+        unresolved = AgenticRecursiveAnalyzer(
+            judge=exhausted, max_judge_requests=1
+        ).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(exhausted.step_allowances, [1])
+        self.assertEqual(exhausted.confirmation_allowances, [0])
+        self.assertEqual(exhausted.transport.request_count, 1)
+        self.assertEqual(unresolved.confirmed_roots, ())
+        self.assertEqual(unresolved.metadata["judge_request_count"], 1)
+
+        sufficient = BoundedConfirmingJudge()
+        confirmed = AgenticRecursiveAnalyzer(
+            judge=sufficient, max_judge_requests=2
+        ).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(sufficient.step_allowances, [2])
+        self.assertEqual(sufficient.confirmation_allowances, [1])
+        self.assertEqual(sufficient.transport.request_count, 2)
+        self.assertEqual([item.node_ref for item in confirmed.confirmed_roots], ["record:only"])
+        self.assertEqual(confirmed.metadata["judge_request_count"], 2)
+
+    def test_multiple_independently_confirmed_roots_are_ranked_deterministically(self):
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+                "record:context": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision was independently necessary.",
+                    counterfactual="Correcting it prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                ),
+                "record:context": RootConfirmation.confirmed(
+                    "record:context",
+                    excerpt="The complete compatibility contract is documented here.",
+                    reason="The context defect was independently necessary.",
+                    counterfactual="Correcting it prevents the omission.",
+                    confidence=0.8,
+                    evidence_refs=["record:context"],
+                ),
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find every necessary cause.",
+        )
+
+        self.assertEqual([item.node_ref for item in report.confirmed_roots], ["record:decision"])
+        self.assertEqual([item.node_ref for item in report.co_roots], ["record:context"])
+        self.assertEqual(
+            [item["node_ref"] for item in report.to_dict()["root_causes"]],
+            ["record:decision", "record:context"],
+        )
+
+    def test_confirmation_cannot_cross_bind_hypothesis_defect_or_path_identity(self):
+        forged = replace(
+            RootConfirmation.confirmed(
+                "record:only",
+                excerpt="The decision is incomplete.",
+                reason="A forged confirmation attempts to cross-bind another branch.",
+                counterfactual="Correcting it prevents the defect.",
+                confidence=0.9,
+                evidence_refs=["record:only"],
+            ),
+            hypothesis_id="hyp:other",
+            defect_fingerprint="defect:other",
+            recursive_path=("record:other",),
+        )
+        judge = ConfirmingScriptedJudge(
+            {"record:only": self._confirmation_step},
+            {"record:only": forged},
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertIn("cross-bound", report.confirmations[0].reason)
+
+    def test_candidate_artifact_excerpt_keeps_exact_identity_hash_and_byte_range(self):
+        artifact_text = "Unique hydrated evidence: repository search stopped before call sites."
+        judge = ConfirmingScriptedJudge(
+            {"record:only": self._confirmation_step},
+            {
+                "record:only": RootConfirmation.confirmed(
+                    "record:only",
+                    excerpt=artifact_text,
+                    reason="The hydrated candidate artifact contains the stopping decision.",
+                    counterfactual="Continuing the search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:only"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(
+                single_node_trace(
+                    hydrated_artifacts=[
+                        {
+                            "artifact_id": "decision-evidence",
+                            "hash": "sha256:decision-evidence",
+                            "content": artifact_text,
+                        }
+                    ]
+                )
+            ),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual([item.node_ref for item in report.confirmed_roots], ["record:only"])
+        manifest = judge.confirmation_requests[0].candidate_reference[
+            "artifact_hydration"
+        ]
+        hydrated = manifest["hydrated_artifacts"][0]
+        self.assertEqual(hydrated["artifact_id"], "decision-evidence")
+        self.assertEqual(hydrated["content_hash"], "sha256:decision-evidence")
+        self.assertEqual(
+            hydrated["byte_range"], (0, len(artifact_text.encode("utf-8")))
+        )
 
 
 if __name__ == "__main__":

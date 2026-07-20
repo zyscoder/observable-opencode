@@ -5,6 +5,7 @@ from .causal_judge import (
     BoundedJudgeCapability,
     OfflineCausalJudgeAdapter,
     OfflineJudgeCapability,
+    RootConfirmationRequest,
 )
 from .causal_state import (
     AttributionHypothesis,
@@ -56,6 +57,7 @@ __all__ = [
     "RecursiveAnalysisState",
     "RejectedCandidate",
     "RootConfirmation",
+    "RootConfirmationRequest",
     "TaintInfluence",
     "TraceGraph",
     "TraceNode",

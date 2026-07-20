@@ -130,6 +130,8 @@ class RootConfirmationRequest:
     competing_hypotheses: Tuple[Mapping[str, Any], ...]
     task_obligations: Tuple[Mapping[str, Any], ...]
     analysis_perspective: str
+    hypothesis_id: str = ""
+    hypothesis_semantic_hash: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recursive_path", tuple(str(item) for item in self.recursive_path))
@@ -159,6 +161,8 @@ class RootConfirmationRequest:
             "competing_hypotheses": _thaw_json(self.competing_hypotheses),
             "task_obligations": _thaw_json(self.task_obligations),
             "analysis_perspective": self.analysis_perspective,
+            "hypothesis_id": self.hypothesis_id,
+            "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
         }
 
 
@@ -181,6 +185,14 @@ class BoundedJudgeCapability:
     ) -> CausalStepJudgment:
         raise NotImplementedError
 
+    def confirm_candidate_bounded(
+        self,
+        request: RootConfirmationRequest,
+        *,
+        max_physical_requests: Optional[int],
+    ) -> RootConfirmation:
+        raise NotImplementedError
+
 
 class OfflineJudgeCapability:
     """Nominal capability for Judges guaranteed to perform no transport requests."""
@@ -190,6 +202,11 @@ class OfflineJudgeCapability:
 
     def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
         raise NotImplementedError
+
+    def confirm_candidate_offline(
+        self, request: RootConfirmationRequest
+    ) -> RootConfirmation:
+        return self.confirm_candidate(request)
 
 
 class OfflineCausalJudgeAdapter(OfflineJudgeCapability):
@@ -273,6 +290,7 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 TEMPORAL_CAUSALITY_RULE,
                 "Try to falsify the candidate independently; no first-pass verdict is supplied.",
                 "Any component may be confirmed when the grounded semantics support it.",
+                "analysis_perspective may affect ranking and factor labels only; it must not change fact visibility, component eligibility, or causal truth.",
                 *RELATION_DEFINITIONS,
                 "The causal-step response must contain exactly one assessment for every offered candidate.",
                 "A reference is grounded only by an explicit reference envelope containing resolved_ref, resolution_status=resolved, and provenance_class; candidate_ref and recursive path strings are navigation only.",
@@ -284,15 +302,17 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 "Inspect every nested mapping and list without stopping at a valid parent envelope; every reference-bearing key must resolve through a complete offered envelope or validated hydration manifest.",
                 "Any nested unknown, unresolved, missing, truncated, provider_error, provider_unavailable, provider circuit, missing_evidence, unresolved reference, or true *_budget_exhausted state requires unknown.",
                 "Only provenance_class=recorded|reconstructed|inferred is valid. Inferred provenance requires auditable non-temporal inference metadata, and temporal-only evidence can never confirm a root.",
-                "Every competing hypothesis must have resolved reference envelopes; only explicitly rejected or superseded alternatives are closed, while active, supported, unresolved, or status-less alternatives require unknown.",
+                "Every competing hypothesis must have resolved reference envelopes. Independently compare active, supported, and unresolved alternatives; a grounded open alternative does not by itself decide the result.",
                 "candidate_introduction requires no viable defective predecessor.",
                 "Use unknown when evidence is missing, unresolved, ambiguous, truncated, or insufficient.",
                 "The counterfactual object must use intervention_ref=candidate_ref and intervention_kind=replace_with_semantically_correct_behavior.",
                 "confirmed requires predicted_defect_status=absent and causal_effect=prevents_defect; unknown requires unknown and unknown; rejected allows present with does_not_prevent_defect or unknown with unknown.",
+                "confirmed requires factor_role=necessary_cause; rejected may classify a grounded contributing_condition, amplifying_factor, unrelated alternative, or unknown; unknown requires factor_role=unknown.",
             ],
             "required_json_schema": {
                 "candidate_ref": request.candidate_ref,
                 "status": "confirmed|rejected|unknown",
+                "factor_role": "necessary_cause|contributing_condition|amplifying_factor|unrelated|unknown",
                 "excerpt": "candidate-local excerpt; required for confirmed",
                 "reason": "falsification result or missing evidence",
                 "counterfactual": {
@@ -1493,10 +1513,10 @@ class _ConfirmationFactTreeValidator:
         for index, hypothesis in enumerate(self.request.competing_hypotheses):
             path = "competing hypothesis[{0}]".format(index)
             status = str(hypothesis.get("status") or "").strip().lower()
-            if status not in {"rejected", "superseded"}:
+            if status not in {"active", "supported", "unresolved", "rejected", "superseded"}:
                 self._error(
                     path,
-                    "must be explicitly rejected or superseded, not {0}".format(
+                    "has an invalid lifecycle status {0}".format(
                         status or "missing status"
                     ),
                 )
@@ -1611,6 +1631,28 @@ def validate_recursive_confirmation(
         "does_not_prevent_defect": "rejects_causality",
         "unknown": "unknown",
     }[causal_effect]
+    factor_role = str(
+        value.get("factor_role")
+        or {
+            "confirmed": "necessary_cause",
+            "rejected": "unrelated",
+            "unknown": "unknown",
+        }[status]
+    ).strip().lower()
+    allowed_factor_roles = {
+        "confirmed": {"necessary_cause"},
+        "rejected": {
+            "contributing_condition",
+            "amplifying_factor",
+            "unrelated",
+            "unknown",
+        },
+        "unknown": {"unknown"},
+    }[status]
+    if factor_role not in allowed_factor_roles:
+        raise ValueError(
+            "factor_role is inconsistent with confirmation status={0}".format(status)
+        )
     counterfactual = (
         "replace_with_semantically_correct_behavior({0}) predicts defect_status={1}; "
         "causal_effect={2}"
@@ -1635,6 +1677,82 @@ def validate_recursive_confirmation(
         confidence=confidence,
         evidence_refs=evidence_refs,
         counterfactual_status=counterfactual_status,
+        hypothesis_id=request.hypothesis_id,
+        defect_fingerprint=request.defect_state.fingerprint,
+        recursive_path=request.recursive_path,
+        factor_role=factor_role,
+    )
+
+
+def preflight_root_confirmation_request(
+    request: RootConfirmationRequest,
+) -> _ConfirmationFactTreeResult:
+    """Validate the complete independent-verifier fact tree before any capability call."""
+    return _ConfirmationFactTreeValidator(request).validate()
+
+
+def bind_root_confirmation(
+    confirmation: RootConfirmation,
+    *,
+    request: RootConfirmationRequest,
+) -> RootConfirmation:
+    """Bind and validate an offline confirmation result against its exact request."""
+    facts = preflight_root_confirmation_request(request)
+    if confirmation.candidate_ref != request.candidate_ref:
+        raise ValueError("confirmation candidate_ref does not match its request")
+    if confirmation.hypothesis_id and confirmation.hypothesis_id != request.hypothesis_id:
+        raise ValueError("confirmation is cross-bound to another hypothesis")
+    if (
+        confirmation.defect_fingerprint
+        and confirmation.defect_fingerprint != request.defect_state.fingerprint
+    ):
+        raise ValueError("confirmation is cross-bound to another defect")
+    if confirmation.recursive_path and confirmation.recursive_path != request.recursive_path:
+        raise ValueError("confirmation is cross-bound to another recursive path")
+    allowed_factor_roles = {
+        "confirmed": {"necessary_cause"},
+        "rejected": {
+            "contributing_condition",
+            "amplifying_factor",
+            "unrelated",
+            "unknown",
+        },
+        "unknown": {"unknown"},
+    }[confirmation.status]
+    if confirmation.factor_role not in allowed_factor_roles:
+        raise ValueError("confirmation factor_role contradicts its status")
+    if confirmation.status == "confirmed":
+        if confirmation.counterfactual_status != "supports_causality":
+            raise ValueError("confirmed root requires a causality-supporting counterfactual")
+        evidence_refs = _validate_evidence_refs(
+            confirmation.evidence_refs,
+            grounded_refs=facts.grounded_refs,
+            field_name="root confirmation evidence_refs",
+        )
+        excerpt = re.sub(r"\s+", " ", confirmation.excerpt).strip().lower()
+        if not excerpt or not any(
+            excerpt in fragment for fragment in facts.candidate_semantic_fragments
+        ):
+            raise ValueError("confirmed root requires a grounded excerpt from candidate facts")
+    else:
+        evidence_refs = _validate_evidence_refs(
+            confirmation.evidence_refs,
+            grounded_refs=facts.grounded_refs,
+            field_name="root confirmation evidence_refs",
+        )
+    return RootConfirmation(
+        candidate_ref=confirmation.candidate_ref,
+        status=confirmation.status,
+        excerpt=confirmation.excerpt,
+        reason=confirmation.reason,
+        counterfactual=confirmation.counterfactual,
+        confidence=confirmation.confidence,
+        evidence_refs=evidence_refs,
+        counterfactual_status=confirmation.counterfactual_status,
+        hypothesis_id=request.hypothesis_id,
+        defect_fingerprint=request.defect_state.fingerprint,
+        recursive_path=request.recursive_path,
+        factor_role=confirmation.factor_role,
     )
 
 

@@ -197,6 +197,8 @@ def sample_confirmation_request(
             {"source": "task", "text": "Preserve the existing parser compatibility contract."},
         ),
         analysis_perspective="Find the primary controllable cause.",
+        hypothesis_id="hyp:decision",
+        hypothesis_semantic_hash="semantic:decision",
     )
 
 
@@ -636,7 +638,7 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     request=sample_confirmation_request(supporting_evidence=(fact,)),
                 )
 
-    def test_open_or_unresolved_competing_hypothesis_blocks_confirmation(self):
+    def test_grounded_open_competitor_is_visible_but_unresolved_facts_block_confirmation(self):
         closed = {
             "hypothesis_id": "hyp_closed",
             "status": "rejected",
@@ -659,7 +661,11 @@ class RootConfirmationValidationTest(unittest.TestCase):
             valid_confirmation_payload(),
             request=sample_confirmation_request(competing_hypotheses=(closed,)),
         )
-        for hypothesis in (open_hypothesis, missing_status, unresolved_evidence):
+        validate_recursive_confirmation(
+            valid_confirmation_payload(),
+            request=sample_confirmation_request(competing_hypotheses=(open_hypothesis,)),
+        )
+        for hypothesis in (missing_status, unresolved_evidence):
             with self.subTest(hypothesis=hypothesis), self.assertRaisesRegex(
                 ValueError, "competing hypothesis"
             ):
@@ -1821,6 +1827,41 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
 
                 self.assertEqual(result.status, "unknown")
                 self.assertIn("judge", result.reason.lower())
+
+
+class CausalRootConfirmationTest(unittest.TestCase):
+    def test_confirmation_prompt_binds_branch_without_first_judge_verdict(self):
+        request = sample_confirmation_request()
+
+        prompt = build_recursive_confirmation_prompt(request)
+        payload = json.loads(prompt)
+
+        self.assertEqual(payload["request"]["hypothesis_id"], "hyp:decision")
+        self.assertEqual(
+            payload["request"]["hypothesis_semantic_hash"], "semantic:decision"
+        )
+        self.assertNotIn("first Judge verdict", prompt)
+        self.assertNotIn("current_defect_reason", prompt)
+
+    def test_bounded_confirmation_cache_hit_uses_zero_physical_requests(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            transport = ScriptedTransport([json.dumps(valid_confirmation_payload())])
+            judge = ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(Path(tempdir) / "cache.jsonl"),
+            )
+            request = sample_confirmation_request()
+            first = judge.confirm_candidate_bounded(
+                request, max_physical_requests=1
+            )
+            second = judge.confirm_candidate_bounded(
+                request, max_physical_requests=0
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.hypothesis_id, "hyp:decision")
+        self.assertEqual(first.defect_fingerprint, request.defect_state.fingerprint)
+        self.assertEqual(transport.request_count, 1)
 
 
 if __name__ == "__main__":
