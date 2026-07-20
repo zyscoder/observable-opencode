@@ -102,6 +102,32 @@ def _has_blocking_metadata(metadata: Mapping[str, Any]) -> bool:
     return False
 
 
+def _assessment_is_unresolved(assessment: "PredecessorAssessment") -> bool:
+    return assessment.relation == "unknown" or bool(assessment.missing_evidence)
+
+
+def _has_unresolved_judgment_state(
+    step_judgments: Tuple["CausalStepJudgment", ...],
+    causal_relations: Tuple["PredecessorAssessment", ...],
+) -> bool:
+    latest_steps = {}
+    for judgment in step_judgments:
+        latest_steps[judgment.current_node_ref] = judgment
+    latest_nested_assessments = {}
+    for judgment in latest_steps.values():
+        if judgment.current_defect_status == "unknown" or judgment.missing_evidence:
+            return True
+        for assessment in judgment.predecessors:
+            latest_nested_assessments[(judgment.current_node_ref, assessment.ref)] = assessment
+    if any(_assessment_is_unresolved(item) for item in latest_nested_assessments.values()):
+        return True
+
+    latest_relations = {}
+    for assessment in causal_relations:
+        latest_relations[assessment.ref] = assessment
+    return any(_assessment_is_unresolved(item) for item in latest_relations.values())
+
+
 def _hash(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
@@ -908,6 +934,7 @@ class RecursiveAttributionReport:
             self.unresolved_refs
             or self.unresolved_hypotheses
             or has_unknown_non_root_confirmation
+            or _has_unresolved_judgment_state(self.step_judgments, self.causal_relations)
             or _has_blocking_metadata(self.metadata)
         )
         if confirmed_root_refs:

@@ -347,6 +347,101 @@ class CausalStateTest(unittest.TestCase):
             "partial_root_found",
         )
 
+    def test_nested_judgment_uncertainty_blocks_report_outcome(self):
+        unknown_status = CausalStepJudgment(
+            current_node_ref="record:change",
+            current_defect_status="unknown",
+            current_defect_reason="artifact truncated",
+        )
+        missing_evidence = CausalStepJudgment(
+            current_node_ref="record:decision",
+            current_defect_status="present",
+            current_defect_reason="plan incomplete",
+            missing_evidence=["artifact:decision"],
+        )
+        unknown_predecessor = CausalStepJudgment(
+            current_node_ref="record:response",
+            current_defect_status="present",
+            current_defect_reason="response repeats the plan",
+            predecessors=[
+                PredecessorAssessment(
+                    ref="record:decision",
+                    relation="unknown",
+                    reason="the decision artifact is unavailable",
+                )
+            ],
+        )
+        direct_unknown_relation = PredecessorAssessment(
+            ref="record:prompt",
+            relation="unknown",
+            reason="prompt evidence is missing",
+        )
+        for report in (
+            RecursiveAttributionReport(
+                case_id="unknown-status", objective="Find root.", step_judgments=[unknown_status]
+            ),
+            RecursiveAttributionReport(
+                case_id="missing-step-evidence", objective="Find root.", step_judgments=[missing_evidence]
+            ),
+            RecursiveAttributionReport(
+                case_id="unknown-predecessor", objective="Find root.", step_judgments=[unknown_predecessor]
+            ),
+            RecursiveAttributionReport(
+                case_id="unknown-relation", objective="Find root.", causal_relations=[direct_unknown_relation]
+            ),
+        ):
+            self.assertEqual(report.analysis_outcome, "inconclusive")
+
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            reason="The decision stopped discovery.",
+            counterfactual="Searching call sites would reveal the contract.",
+            confidence=0.9,
+        )
+        partial = RecursiveAttributionReport(
+            case_id="root-plus-unknown-step",
+            objective="Find root.",
+            confirmed_roots=[root],
+            confirmations=[confirmation_for(root)],
+            step_judgments=[unknown_status],
+        )
+        self.assertEqual(partial.analysis_outcome, "partial_root_found")
+
+    def test_latest_nested_judgment_resolves_earlier_unknown_state(self):
+        earlier = CausalStepJudgment(
+            current_node_ref="record:change",
+            current_defect_status="unknown",
+            current_defect_reason="artifact truncated",
+            missing_evidence=["artifact:change"],
+            predecessors=[
+                PredecessorAssessment(
+                    ref="record:decision",
+                    relation="unknown",
+                    reason="decision artifact unavailable",
+                    missing_evidence=["artifact:decision"],
+                )
+            ],
+        )
+        later = CausalStepJudgment(
+            current_node_ref="record:change",
+            current_defect_status="present",
+            current_defect_reason="the hydrated change omits the method",
+            predecessors=[
+                PredecessorAssessment(
+                    ref="record:decision",
+                    relation="defect_transformation",
+                    reason="the incomplete plan produced the incomplete change",
+                )
+            ],
+        )
+        report = RecursiveAttributionReport(
+            case_id="resolved-rejudgment",
+            objective="Find root.",
+            step_judgments=[earlier, later],
+        )
+        self.assertEqual(report.analysis_outcome, "no_defect")
+
     def test_report_outcome_is_derived_from_roots_and_blocking_facts(self):
         root = ConfirmedRoot(
             node_ref="record:decision",
