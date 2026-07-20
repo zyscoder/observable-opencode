@@ -863,7 +863,7 @@ class CausalInvestigationTools:
         resolved, _ = self._resolve_node(raw_ref)
         limit = _bounded_int(directive.arguments, "limit", default=24, minimum=1, maximum=96)
         relation_filter = set(_strings(directive.arguments.get("relation_filter") or []))
-        refs, truncated = (
+        scan = (
             self.graph.bounded_upstream_refs(
                 resolved, limit=limit, relation_filter=relation_filter
             )
@@ -873,7 +873,7 @@ class CausalInvestigationTools:
             )
         )
         rows: List[JsonDict] = []
-        for ref in refs:
+        for ref in scan.refs:
             edges = (
                 self.graph.edge_context(ref, resolved)
                 if upstream
@@ -893,14 +893,21 @@ class CausalInvestigationTools:
         for row in selected:
             provenance.append(self._record_provenance(str(row["ref"])))
             provenance.extend(dict(edge) for edge in row["edges"])
+        payload = {
+            "direction": "upstream" if upstream else "downstream",
+            "nodes": selected,
+            "inspected_count": scan.inspected_count,
+            "scan_limit": scan.scan_limit,
+            "scan_truncated": scan.scan_truncated,
+        }
         return InvestigationResult.success(
             directive,
             requested_refs=[raw_ref],
             resolved_refs=[resolved, *(str(row["ref"]) for row in selected)],
             provenance=provenance,
-            payload={"direction": "upstream" if upstream else "downstream", "nodes": selected},
-            truncated=truncated,
-            byte_count=len(stable_json(selected).encode("utf-8")),
+            payload=payload,
+            truncated=scan.truncated,
+            byte_count=len(stable_json(payload).encode("utf-8")),
         )
 
     def _inspect_artifact(self, directive: InvestigationDirective) -> InvestigationResult:
@@ -1017,25 +1024,39 @@ class CausalInvestigationTools:
         if node.event_type == "progress.episode":
             episode_refs.append(resolved)
         remaining = MAX_EPISODE_REFS - len(episode_refs)
-        upstream_refs, truncated = self.graph.bounded_upstream_refs(
+        total_scan_limit = MAX_EPISODE_REFS + 1
+        upstream_scan = self.graph.bounded_upstream_refs(
             resolved,
             limit=remaining,
             event_type="progress.episode",
             exclude=episode_refs,
+            scan_limit=total_scan_limit,
         )
-        episode_refs.extend(upstream_refs)
+        episode_refs.extend(upstream_scan.refs)
+        inspected_count = upstream_scan.inspected_count
+        scan_truncated = upstream_scan.scan_truncated
+        truncated = upstream_scan.truncated
         if not truncated:
             remaining = MAX_EPISODE_REFS - len(episode_refs)
-            downstream_refs, truncated = self.graph.bounded_downstream_refs(
+            downstream_scan = self.graph.bounded_downstream_refs(
                 resolved,
                 limit=remaining,
                 event_type="progress.episode",
                 exclude=episode_refs,
+                scan_limit=max(0, total_scan_limit - inspected_count),
             )
-            episode_refs.extend(downstream_refs)
+            episode_refs.extend(downstream_scan.refs)
+            inspected_count += downstream_scan.inspected_count
+            scan_truncated = scan_truncated or downstream_scan.scan_truncated
+            truncated = truncated or downstream_scan.truncated
         payload = {
             "anchor": node.compact(),
             "episodes": [self.graph.nodes[ref].compact(max_chars=16_000) for ref in episode_refs],
+            "adjacency_scan": {
+                "inspected_count": inspected_count,
+                "scan_limit": total_scan_limit,
+                "scan_truncated": scan_truncated,
+            },
         }
         return InvestigationResult.success(
             directive,

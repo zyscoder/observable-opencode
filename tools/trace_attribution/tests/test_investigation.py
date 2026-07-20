@@ -76,6 +76,17 @@ class ScriptedInvestigatingJudge(OfflineJudgeCapability):
         raise AssertionError("Task 6 must not confirm roots")
 
 
+class CountingAdjacency(dict):
+    def __init__(self, values):
+        super().__init__(values)
+        self.visits = 0
+
+    def __iter__(self):
+        for ref in super().__iter__():
+            self.visits += 1
+            yield ref
+
+
 def trace_with_artifact() -> dict:
     return {
         "case_id": "investigation-case",
@@ -618,22 +629,109 @@ class InvestigationToolTest(unittest.TestCase):
         trace["dataflow_edges"] = []
         graph = TraceGraph.from_trace(trace)
 
-        class CountingAdjacency(dict):
-            visits = 0
-
-            def __iter__(self):
-                for ref in super().__iter__():
-                    self.visits += 1
-                    yield ref
-
         adjacency = CountingAdjacency(
             (ref, None) for ref in graph._upstream["record:target"]
         )
         graph._upstream["record:target"] = adjacency
-        refs, truncated = graph.bounded_upstream_refs("record:target", limit=1)
-        self.assertEqual(refs, ["record:source_000"])
-        self.assertTrue(truncated)
+        scan = graph.bounded_upstream_refs("record:target", limit=1)
+        self.assertEqual(scan.refs, ("record:source_000",))
+        self.assertTrue(scan.truncated)
+        self.assertEqual(scan.inspected_count, 2)
+        self.assertTrue(scan.scan_truncated)
         self.assertEqual(adjacency.visits, 2)
+
+    def test_relation_filter_cannot_scan_102_entries_to_fill_one_match(self):
+        records = [
+            {
+                "record_id": "source_{0:03d}".format(index),
+                "component": "context",
+                "event_type": "context.snapshot",
+                "data": {"text": "source {0}".format(index)},
+            }
+            for index in range(102)
+        ] + [
+            {
+                "record_id": "target",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"failure_type": "bounded relation scan"},
+            }
+        ]
+        edges = [
+            {
+                "from": {"type": "record", "id": "source_{0:03d}".format(index)},
+                "to": {"type": "record", "id": "target"},
+                "relation": "wanted" if index == 101 else "noise",
+                "evidence_type": "recorded_dataflow",
+                "eligible_for_attribution": True,
+            }
+            for index in range(102)
+        ]
+        graph = TraceGraph.from_trace(
+            {"case_id": "mixed-adjacency", "records": records, "dataflow_edges": edges}
+        )
+        adjacency = CountingAdjacency(
+            (ref, None) for ref in graph._upstream["record:target"]
+        )
+        graph._upstream["record:target"] = adjacency
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "expand_upstream",
+                {
+                    "ref": "record:target",
+                    "limit": 1,
+                    "relation_filter": ["wanted"],
+                },
+                requested_by_ref="record:target",
+                reason="Bound both physical scanning and matched output.",
+            )
+        )
+        self.assertEqual(adjacency.visits, 2)
+        self.assertEqual(result.payload["nodes"], ())
+        self.assertEqual(result.payload["inspected_count"], 2)
+        self.assertTrue(result.payload["scan_truncated"])
+        self.assertTrue(result.truncated)
+
+    def test_episode_scan_has_one_total_physical_budget_across_adjacency(self):
+        records = [
+            {
+                "record_id": "source_{0:03d}".format(index),
+                "component": "context",
+                "event_type": "context.snapshot",
+                "data": {"text": "not an episode"},
+            }
+            for index in range(165)
+        ] + [
+            {
+                "record_id": "target",
+                "component": "agent",
+                "event_type": "decision",
+                "source_refs": [
+                    "record:source_{0:03d}".format(index) for index in range(165)
+                ],
+                "data": {"failure_type": "bounded episode scan"},
+            }
+        ]
+        graph = TraceGraph.from_trace(
+            {"case_id": "mixed-episode", "records": records, "dataflow_edges": []}
+        )
+        adjacency = CountingAdjacency(
+            (ref, None) for ref in graph._upstream["record:target"]
+        )
+        graph._upstream["record:target"] = adjacency
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_episode",
+                {"ref": "record:target"},
+                requested_by_ref="record:target",
+                reason="Bound total episode-neighbor scanning.",
+            )
+        )
+        self.assertEqual(adjacency.visits, 65)
+        self.assertEqual(result.payload["episodes"], ())
+        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 65)
+        self.assertTrue(result.payload["adjacency_scan"]["scan_truncated"])
+        self.assertTrue(result.truncated)
 
     def test_expand_and_episode_never_use_full_adjacency_materialization(self):
         tools = CausalInvestigationTools(self.graph)

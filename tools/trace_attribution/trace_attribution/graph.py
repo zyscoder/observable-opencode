@@ -3,13 +3,23 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
+
+
+@dataclass(frozen=True)
+class BoundedAdjacencyResult:
+    refs: Tuple[str, ...]
+    truncated: bool
+    inspected_count: int
+    scan_limit: int
+    scan_truncated: bool
 
 
 class TraceGraph:
@@ -303,7 +313,8 @@ class TraceGraph:
         relation_filter: Iterable[str] = (),
         event_type: str = "",
         exclude: Iterable[str] = (),
-    ) -> Tuple[List[str], bool]:
+        scan_limit: Optional[int] = None,
+    ) -> BoundedAdjacencyResult:
         return self._bounded_adjacent_refs(
             ref,
             adjacency=self._upstream,
@@ -312,6 +323,7 @@ class TraceGraph:
             relation_filter=relation_filter,
             event_type=event_type,
             exclude=exclude,
+            scan_limit=scan_limit,
         )
 
     def bounded_downstream_refs(
@@ -322,7 +334,8 @@ class TraceGraph:
         relation_filter: Iterable[str] = (),
         event_type: str = "",
         exclude: Iterable[str] = (),
-    ) -> Tuple[List[str], bool]:
+        scan_limit: Optional[int] = None,
+    ) -> BoundedAdjacencyResult:
         return self._bounded_adjacent_refs(
             ref,
             adjacency=self._downstream,
@@ -331,6 +344,7 @@ class TraceGraph:
             relation_filter=relation_filter,
             event_type=event_type,
             exclude=exclude,
+            scan_limit=scan_limit,
         )
 
     def _bounded_adjacent_refs(
@@ -343,14 +357,25 @@ class TraceGraph:
         relation_filter: Iterable[str],
         event_type: str,
         exclude: Iterable[str],
-    ) -> Tuple[List[str], bool]:
-        """Return deterministic insertion-order adjacency with bounded eligible work."""
+        scan_limit: Optional[int],
+    ) -> BoundedAdjacencyResult:
+        """Return deterministic adjacency under independent output and scan bounds."""
         resolved = self.resolve(ref) or ref
         maximum = max(0, int(limit))
+        declared_scan_limit = maximum + 1
+        physical_limit = (
+            declared_scan_limit
+            if scan_limit is None
+            else min(max(0, int(scan_limit)), declared_scan_limit)
+        )
         relations = {str(item) for item in relation_filter if str(item)}
         excluded = {str(item) for item in exclude}
         eligible: List[str] = []
-        for adjacent in adjacency.get(resolved, {}):
+        inspected = 0
+        output_truncated = False
+        adjacent_items = adjacency.get(resolved, {})
+        for adjacent in islice(adjacent_items, physical_limit):
+            inspected += 1
             if adjacent in excluded:
                 continue
             node = self.nodes.get(adjacent)
@@ -364,10 +389,18 @@ class TraceGraph:
                 )
                 if not any(str(edge.get("relation") or "") in relations for edge in edges):
                     continue
-            eligible.append(adjacent)
-            if len(eligible) > maximum:
-                return eligible[:maximum], True
-        return eligible, False
+            if len(eligible) < maximum:
+                eligible.append(adjacent)
+            else:
+                output_truncated = True
+        scan_truncated = inspected < len(adjacent_items)
+        return BoundedAdjacencyResult(
+            refs=tuple(eligible),
+            truncated=output_truncated or scan_truncated,
+            inspected_count=inspected,
+            scan_limit=physical_limit,
+            scan_truncated=scan_truncated,
+        )
 
     def edge_context(self, from_ref: str, to_ref: str) -> List[JsonDict]:
         source = self.resolve(from_ref) or from_ref
