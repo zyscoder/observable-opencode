@@ -57,6 +57,18 @@ def confirmation_for(root):
 
 
 class CausalStateTest(unittest.TestCase):
+    def test_legacy_direct_confirmation_infers_structured_counterfactual_status(self):
+        confirmation = RootConfirmation(
+            candidate_ref="record:decision",
+            status="confirmed",
+            excerpt="Stop discovery.",
+            reason="The decision omitted required discovery.",
+            counterfactual="Searching would have prevented the omission.",
+            confidence=0.8,
+        )
+
+        self.assertEqual(confirmation.counterfactual_status, "supports_causality")
+
     def test_numeric_fields_reject_nonfinite_and_out_of_range_values(self):
         defect_state = sample_defect_state()
         node = TraceNode(
@@ -234,6 +246,7 @@ class CausalStateTest(unittest.TestCase):
             counterfactual="Searching call sites would reveal the method.",
             confidence=0.9,
             evidence_refs=[node.ref],
+            counterfactual_status="supports_causality",
         )
         root = ConfirmedRoot(
             node_ref=node.ref,

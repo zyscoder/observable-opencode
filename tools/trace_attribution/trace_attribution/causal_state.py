@@ -24,6 +24,9 @@ CAUSAL_RELATIONS = frozenset(
 )
 HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded", "unresolved"})
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
+COUNTERFACTUAL_STATUSES = frozenset(
+    {"supports_causality", "rejects_causality", "unknown"}
+)
 BLOCKING_METADATA_KEYS = frozenset(
     {
         "unresolved_reason",
@@ -720,10 +723,28 @@ class RootConfirmation:
     counterfactual: str = ""
     confidence: float = 0.0
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    counterfactual_status: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in CONFIRMATION_STATUSES:
             raise ValueError("unsupported root confirmation status: {0}".format(self.status))
+        expected_counterfactual = {
+            "confirmed": "supports_causality",
+            "rejected": "rejects_causality",
+            "unknown": "unknown",
+        }[self.status]
+        counterfactual_status = self.counterfactual_status or expected_counterfactual
+        if counterfactual_status not in COUNTERFACTUAL_STATUSES:
+            raise ValueError(
+                "unsupported counterfactual status: {0}".format(counterfactual_status)
+            )
+        if counterfactual_status != expected_counterfactual:
+            raise ValueError(
+                "{0} confirmation requires counterfactual_status={1}".format(
+                    self.status, expected_counterfactual
+                )
+            )
+        object.__setattr__(self, "counterfactual_status", counterfactual_status)
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
@@ -737,16 +758,38 @@ class RootConfirmation:
         counterfactual: str,
         confidence: float,
         evidence_refs: Optional[List[str]] = None,
+        counterfactual_status: str = "supports_causality",
     ) -> "RootConfirmation":
-        return cls(candidate_ref, "confirmed", excerpt, reason, counterfactual, confidence, list(evidence_refs or []))
+        return cls(
+            candidate_ref,
+            "confirmed",
+            excerpt,
+            reason,
+            counterfactual,
+            confidence,
+            list(evidence_refs or []),
+            counterfactual_status,
+        )
 
     @classmethod
     def rejected(cls, candidate_ref: str, reason: str, evidence_refs: Optional[List[str]] = None) -> "RootConfirmation":
-        return cls(candidate_ref, "rejected", reason=reason, evidence_refs=list(evidence_refs or []))
+        return cls(
+            candidate_ref,
+            "rejected",
+            reason=reason,
+            evidence_refs=list(evidence_refs or []),
+            counterfactual_status="rejects_causality",
+        )
 
     @classmethod
     def unknown(cls, candidate_ref: str, reason: str, evidence_refs: Optional[List[str]] = None) -> "RootConfirmation":
-        return cls(candidate_ref, "unknown", reason=reason, evidence_refs=list(evidence_refs or []))
+        return cls(
+            candidate_ref,
+            "unknown",
+            reason=reason,
+            evidence_refs=list(evidence_refs or []),
+            counterfactual_status="unknown",
+        )
 
     def to_dict(self) -> JsonDict:
         return {
@@ -757,18 +800,28 @@ class RootConfirmation:
             "counterfactual": self.counterfactual,
             "confidence": self.confidence,
             "evidence_refs": list(self.evidence_refs),
+            "counterfactual_status": self.counterfactual_status,
         }
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RootConfirmation":
+        status = str(value.get("status") or "unknown")
         return cls(
             candidate_ref=str(value.get("candidate_ref") or ""),
-            status=str(value.get("status") or "unknown"),
+            status=status,
             excerpt=str(value.get("excerpt") or ""),
             reason=str(value.get("reason") or ""),
             counterfactual=str(value.get("counterfactual") or ""),
             confidence=_confidence(value.get("confidence", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
+            counterfactual_status=str(
+                value.get("counterfactual_status")
+                or {
+                    "confirmed": "supports_causality",
+                    "rejected": "rejects_causality",
+                    "unknown": "unknown",
+                }.get(status, "unknown")
+            ),
         )
 
 

@@ -6,7 +6,7 @@ import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .models import JsonDict, NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
@@ -44,6 +44,7 @@ class JudgmentCache:
         self._hits = 0
         self._misses = 0
         self._writes = 0
+        self._invalid_entries = 0
         self._corrupt_entries = 0
         self._write_errors: List[str] = []
         self._load()
@@ -55,6 +56,27 @@ class JudgmentCache:
         return judgment_from_dict(payload, node)
 
     def get_payload(self, *, key: str) -> Optional[JsonDict]:
+        payload = self.peek_payload(key=key)
+        if payload is None:
+            self._misses += 1
+            return None
+        self._hits += 1
+        return payload
+
+    def peek_payload(self, *, key: str) -> Optional[JsonDict]:
+        entry = self._entries.get(key)
+        if not entry:
+            return None
+        payload = entry.get("payload")
+        if payload is None:
+            payload = entry.get("judgment")
+        if not isinstance(payload, dict):
+            return None
+        return dict(payload)
+
+    def get_validated_payload(
+        self, *, key: str, validator: Callable[[JsonDict], Any]
+    ) -> Optional[JsonDict]:
         entry = self._entries.get(key)
         if not entry:
             self._misses += 1
@@ -64,9 +86,17 @@ class JudgmentCache:
             payload = entry.get("judgment")
         if not isinstance(payload, dict):
             self._misses += 1
+            self._invalid_entries += 1
+            return None
+        payload = dict(payload)
+        try:
+            validator(payload)
+        except (TypeError, ValueError):
+            self._misses += 1
+            self._invalid_entries += 1
             return None
         self._hits += 1
-        return dict(payload)
+        return payload
 
     def put(
         self,
@@ -147,6 +177,7 @@ class JudgmentCache:
             "hits": self._hits,
             "misses": self._misses,
             "writes": self._writes,
+            "invalid_entries": self._invalid_entries,
             "corrupt_entries": self._corrupt_entries,
             "write_error_count": len(self._write_errors),
             "write_errors": list(self._write_errors),
