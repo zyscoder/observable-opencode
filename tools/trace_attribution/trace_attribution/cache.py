@@ -49,16 +49,24 @@ class JudgmentCache:
         self._load()
 
     def get(self, *, key: str, node: TraceNode) -> Optional[NodeJudgment]:
+        payload = self.get_payload(key=key)
+        if payload is None:
+            return None
+        return judgment_from_dict(payload, node)
+
+    def get_payload(self, *, key: str) -> Optional[JsonDict]:
         entry = self._entries.get(key)
         if not entry:
             self._misses += 1
             return None
-        payload = entry.get("judgment")
+        payload = entry.get("payload")
+        if payload is None:
+            payload = entry.get("judgment")
         if not isinstance(payload, dict):
             self._misses += 1
             return None
         self._hits += 1
-        return judgment_from_dict(payload, node)
+        return dict(payload)
 
     def put(
         self,
@@ -69,17 +77,56 @@ class JudgmentCache:
         node: TraceNode,
         judgment: NodeJudgment,
     ) -> None:
+        self.put_payload(
+            key=key,
+            stage=stage,
+            model=model,
+            node_ref=node.ref,
+            payload=asdict(judgment),
+        )
+
+    def put_payload(
+        self,
+        *,
+        key: str,
+        stage: str,
+        model: str,
+        node_ref: str,
+        payload: JsonDict,
+    ) -> None:
         if not self.path:
             return
-        entry = {
+        entry = self._entry(
+            key=key,
+            stage=stage,
+            model=model,
+            node_ref=node_ref,
+            payload=payload,
+        )
+        self._append_and_fsync(entry)
+
+    def _entry(
+        self,
+        *,
+        key: str,
+        stage: str,
+        model: str,
+        node_ref: str,
+        payload: JsonDict,
+    ) -> JsonDict:
+        return {
             "cache_version": JUDGMENT_CACHE_VERSION,
             "key": key,
             "stage": stage,
-            "node_ref": node.ref,
+            "node_ref": node_ref,
             "model": model,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "judgment": asdict(judgment),
+            "payload": dict(payload),
         }
+
+    def _append_and_fsync(self, entry: JsonDict) -> None:
+        if not self.path:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
@@ -89,7 +136,7 @@ class JudgmentCache:
         except OSError as exc:
             self._write_errors.append(f"{type(exc).__name__}: {exc}")
             return
-        self._entries[key] = entry
+        self._entries[str(entry["key"])] = entry
         self._writes += 1
 
     def stats(self) -> JsonDict:
@@ -119,9 +166,10 @@ class JudgmentCache:
                     except json.JSONDecodeError:
                         self._corrupt_entries += 1
                         continue
-                    if not isinstance(entry, dict) or not entry.get("key") or not isinstance(
-                        entry.get("judgment"), dict
-                    ):
+                    payload = entry.get("payload") if isinstance(entry, dict) else None
+                    if payload is None and isinstance(entry, dict):
+                        payload = entry.get("judgment")
+                    if not isinstance(entry, dict) or not entry.get("key") or not isinstance(payload, dict):
                         self._corrupt_entries += 1
                         continue
                     self._entries[str(entry["key"])] = entry

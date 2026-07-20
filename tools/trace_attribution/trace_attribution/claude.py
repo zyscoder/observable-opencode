@@ -589,6 +589,11 @@ class ClaudeJudgeClient(JudgeClient):
         self.consecutive_provider_errors = 0
         return text
 
+    def create_message_text(
+        self, *, system: str, messages: List[Dict[str, str]], max_tokens: int
+    ) -> str:
+        return self._create_message_text(system=system, messages=messages, max_tokens=max_tokens)
+
 
 def build_judgment_prompt(
     *,
