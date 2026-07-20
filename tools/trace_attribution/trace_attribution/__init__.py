@@ -1,6 +1,11 @@
 """Offline causal attribution for observable-opencode semantic traces."""
 
 from .analyzer import BackwardTaintAnalyzer
+from .causal_judge import (
+    BoundedJudgeCapability,
+    OfflineCausalJudgeAdapter,
+    OfflineJudgeCapability,
+)
 from .causal_state import (
     AttributionHypothesis,
     CausalCandidate,
@@ -25,6 +30,7 @@ __all__ = [
     "AttributionHypothesis",
     "AgenticRecursiveAnalyzer",
     "BackwardTaintAnalyzer",
+    "BoundedJudgeCapability",
     "CausalCandidate",
     "CausalFactor",
     "CausalStepJudgment",
@@ -33,6 +39,8 @@ __all__ = [
     "FrontierItem",
     "HypothesisEvidence",
     "NodeJudgment",
+    "OfflineCausalJudgeAdapter",
+    "OfflineJudgeCapability",
     "PredecessorAssessment",
     "RecursiveAttributionReport",
     "RecursiveAnalysisState",

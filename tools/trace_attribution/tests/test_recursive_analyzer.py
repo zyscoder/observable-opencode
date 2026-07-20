@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 
 from trace_attribution.cache import JudgmentCache
-from trace_attribution.causal_judge import ClaudeCausalJudge
+from trace_attribution.causal_judge import (
+    ClaudeCausalJudge,
+    OfflineCausalJudgeAdapter,
+    OfflineJudgeCapability,
+)
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
@@ -140,7 +144,7 @@ def step(
     )
 
 
-class ScriptedCausalJudge:
+class ScriptedCausalJudge(OfflineJudgeCapability):
     def __init__(self, script):
         self.script = script
         self.requests = []
@@ -184,6 +188,28 @@ class ScriptedTransport:
         if isinstance(value, BaseException):
             raise value
         return value
+
+
+class UnboundedProviderJudge:
+    """Protocol-compatible Judge whose one logical call spends two requests."""
+
+    def __init__(self):
+        self.transport = ScriptedTransport([])
+        self.calls = []
+
+    def judge_step(self, request):
+        self.calls.append(request)
+        self.transport.request_count += 2
+        return step(request.current_node.ref, introduction=True)
+
+
+class LegacyOfflineJudge:
+    def __init__(self):
+        self.calls = []
+
+    def judge_step(self, request):
+        self.calls.append(request)
+        return step(request.current_node.ref, introduction=True)
 
 
 def single_node_trace(*, content: str = "", hydrated_artifacts=None) -> dict:
@@ -685,6 +711,42 @@ class RecursiveTraversalTest(unittest.TestCase):
 
 
 class RecursiveBudgetTest(unittest.TestCase):
+    def test_unbounded_provider_judge_is_rejected_before_any_side_effect(self):
+        judge = UnboundedProviderJudge()
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=1).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(judge.transport.request_count, 0)
+        self.assertEqual(report.metadata["judge_request_count"], 0)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 0)
+        self.assertIn(
+            "judge_budget_unenforceable",
+            [item["reason"] for item in report.metadata["unresolved_branches"]],
+        )
+        self.assertEqual(report.introduction_candidates, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def test_explicit_adapter_preserves_legacy_zero_transport_judge(self):
+        legacy = LegacyOfflineJudge()
+        judge = OfflineCausalJudgeAdapter(legacy)
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=0).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(len(legacy.calls), 1)
+        self.assertEqual(report.metadata["judge_request_count"], 0)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertNotIn("judge_requests", report.metadata["exhausted_budgets"])
+        self.assertEqual([item.ref for item in report.introduction_candidates], ["record:only"])
+
     def test_ordinary_content_text_does_not_consume_artifact_budget(self):
         judge = ScriptedCausalJudge({"record:only": step("record:only", status="absent")})
 
@@ -887,7 +949,7 @@ class RecursiveBudgetTest(unittest.TestCase):
         self.assertEqual(report.metadata["exhausted_budgets"]["artifact_bytes"], 1)
         self.assertIn("record:decision", report.unresolved_refs)
 
-    def test_judge_request_limit_is_checked_before_call(self):
+    def test_explicit_offline_judge_uses_no_physical_request_budget(self):
         judge = ScriptedCausalJudge({"record:change": step("record:change", introduction=True)})
 
         report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=0).analyze(
@@ -896,9 +958,10 @@ class RecursiveBudgetTest(unittest.TestCase):
             objective="Find the defect.",
         )
 
-        self.assertEqual(judge.requests, [])
-        self.assertEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
-        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertEqual(len(judge.requests), 1)
+        self.assertEqual(report.metadata["judge_request_count"], 0)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertNotIn("judge_requests", report.metadata["exhausted_budgets"])
 
     def test_provider_circuit_is_unresolved_and_preserves_no_root(self):
         judge = ScriptedCausalJudge(

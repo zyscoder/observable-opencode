@@ -170,6 +170,41 @@ class CausalJudge(Protocol):
         raise NotImplementedError
 
 
+class BoundedJudgeCapability:
+    """Nominal capability for Judges that enforce a physical request allowance."""
+
+    def judge_step_bounded(
+        self,
+        request: CausalStepRequest,
+        *,
+        max_physical_requests: Optional[int],
+    ) -> CausalStepJudgment:
+        raise NotImplementedError
+
+
+class OfflineJudgeCapability:
+    """Nominal capability for Judges guaranteed to perform no transport requests."""
+
+    def judge_step_offline(self, request: CausalStepRequest) -> CausalStepJudgment:
+        return self.judge_step(request)
+
+    def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
+        raise NotImplementedError
+
+
+class OfflineCausalJudgeAdapter(OfflineJudgeCapability):
+    """Explicitly opt a legacy in-process Judge into zero-transport execution."""
+
+    def __init__(self, judge: CausalJudge):
+        self.judge = judge
+
+    def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
+        return self.judge.judge_step(request)
+
+    def confirm_candidate(self, request: RootConfirmationRequest) -> RootConfirmation:
+        return self.judge.confirm_candidate(request)
+
+
 def build_causal_step_prompt(request: CausalStepRequest) -> str:
     return stable_json(
         {
@@ -1612,7 +1647,7 @@ class _RequestOutcome:
     error_detail: str = ""
 
 
-class ClaudeCausalJudge:
+class ClaudeCausalJudge(BoundedJudgeCapability):
     def __init__(self, *, transport: ClaudeJudgeClient, cache: JudgmentCache):
         self.transport = transport
         self.cache = cache

@@ -7,7 +7,12 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .causal_judge import CausalJudge, CausalStepRequest
+from .causal_judge import (
+    BoundedJudgeCapability,
+    CausalJudge,
+    CausalStepRequest,
+    OfflineJudgeCapability,
+)
 from .causal_retrieval import SemanticPredecessorRetriever
 from .causal_state import (
     AttributionHypothesis,
@@ -141,6 +146,8 @@ def _judge_transport(judge: CausalJudge) -> Any:
 
 
 def _judge_request_count(judge: CausalJudge) -> Optional[int]:
+    if isinstance(judge, OfflineJudgeCapability):
+        return 0
     value = getattr(_judge_transport(judge), "request_count", None)
     return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 
@@ -821,25 +828,25 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             remaining_requests = max(0, self.max_judge_requests - state.judge_requests)
-            bounded_judge_step = getattr(self.judge, "judge_step_bounded", None)
-            if not callable(bounded_judge_step) and remaining_requests == 0:
+            bounded_judge = isinstance(self.judge, BoundedJudgeCapability)
+            offline_judge = isinstance(self.judge, OfflineJudgeCapability)
+            if not bounded_judge and not offline_judge:
                 state.complete_unresolved(
                     item,
-                    "judge_request_limit",
-                    "The Judge physical request budget is exhausted.",
-                    exhausted_budget="judge_requests",
+                    "judge_budget_unenforceable",
+                    "The Judge exposes neither a bounded transport capability nor an explicit zero-transport capability.",
                 )
                 continue
             before = _judge_request_count(self.judge)
             state.logical_judge_calls += 1
             try:
-                if callable(bounded_judge_step):
-                    judgment = bounded_judge_step(
+                if bounded_judge:
+                    judgment = self.judge.judge_step_bounded(
                         request,
                         max_physical_requests=remaining_requests,
                     )
                 else:
-                    judgment = self.judge.judge_step(request)
+                    judgment = self.judge.judge_step_offline(request)
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 after = _judge_request_count(self.judge)
                 state.judge_requests += (
