@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Tuple
@@ -142,11 +143,28 @@ def _json_dict(value: Any) -> JsonDict:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _float(value: Any) -> float:
+def _finite_float(value: Any, field_name: str, *, unit_interval: bool = False) -> float:
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
-        return 0.0
+        raise ValueError("{0} must be a finite number".format(field_name))
+    if not math.isfinite(result):
+        raise ValueError("{0} must be finite".format(field_name))
+    if unit_interval and not 0.0 <= result <= 1.0:
+        raise ValueError("{0} must be between 0 and 1".format(field_name))
+    return result
+
+
+def _confidence(value: Any) -> float:
+    return _finite_float(value, "confidence", unit_interval=True)
+
+
+def _score(value: Any) -> float:
+    return _finite_float(value, "score", unit_interval=True)
+
+
+def _priority(value: Any) -> float:
+    return _finite_float(value, "priority")
 
 
 def _trace_node_to_dict(node: TraceNode) -> JsonDict:
@@ -300,6 +318,7 @@ class CausalCandidate:
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "score", _score(self.score))
         object.__setattr__(self, "node", _freeze_trace_node(self.node))
         object.__setattr__(self, "edge", FrozenMapping(_thaw(self.edge)))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
@@ -321,7 +340,7 @@ class CausalCandidate:
             node=_trace_node_from_dict(_json_dict(value.get("node"))),
             source=str(value.get("source") or ""),
             edge=_json_dict(value.get("edge")),
-            score=_float(value.get("score")),
+            score=_score(value.get("score", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
         )
 
@@ -340,6 +359,7 @@ class PredecessorAssessment:
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
             raise ValueError("unsupported causal relation: {0}".format(self.relation))
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
         object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
 
@@ -362,7 +382,7 @@ class PredecessorAssessment:
             ref=str(value.get("ref") or ""),
             relation=str(value.get("relation") or "unknown"),
             reason=str(value.get("reason") or ""),
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
             recurse=bool(value.get("recurse")),
             upstream_defect=DefectState.from_dict(upstream) if isinstance(upstream, dict) else None,
             evidence_refs=_string_list(value.get("evidence_refs")),
@@ -382,6 +402,7 @@ class CausalStepJudgment:
     confidence: float = 0.0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "predecessors", tuple(self.predecessors))
         object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
         if self.suggested_investigation is not None:
@@ -418,7 +439,7 @@ class CausalStepJudgment:
             suggested_investigation=_json_dict(value.get("suggested_investigation"))
             if isinstance(value.get("suggested_investigation"), dict)
             else None,
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
         )
 
 
@@ -439,6 +460,7 @@ class FrontierItem:
     graph_position: int = 0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "priority", _priority(self.priority))
         object.__setattr__(self, "downstream_path", _frozen_strings(self.downstream_path))
         object.__setattr__(self, "checked_evidence_refs", _frozen_strings(self.checked_evidence_refs))
 
@@ -523,7 +545,7 @@ class FrontierItem:
             hypothesis_semantic_hash=str(value.get("hypothesis_semantic_hash") or ""),
             depth=int(value.get("depth") or 0),
             candidate_source=str(value.get("candidate_source") or ""),
-            priority=_float(value.get("priority")),
+            priority=_priority(value.get("priority", 0.0)),
             checked_evidence_refs=_string_list(value.get("checked_evidence_refs")),
             evidence_hash=str(value.get("evidence_hash") or ""),
             reopen_reason=str(value.get("reopen_reason") or ""),
@@ -544,12 +566,19 @@ class HypothesisEvidence:
     reason: str
     confidence: float = 0.0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
+
     def to_dict(self) -> JsonDict:
         return {"ref": self.ref, "reason": self.reason, "confidence": self.confidence}
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "HypothesisEvidence":
-        return cls(str(value.get("ref") or ""), str(value.get("reason") or ""), _float(value.get("confidence")))
+        return cls(
+            str(value.get("ref") or ""),
+            str(value.get("reason") or ""),
+            _confidence(value.get("confidence", 0.0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -572,6 +601,7 @@ class AttributionHypothesis:
     def __post_init__(self) -> None:
         if self.status not in HYPOTHESIS_STATUSES:
             raise ValueError("unsupported hypothesis status: {0}".format(self.status))
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "supporting_evidence", tuple(self.supporting_evidence))
         object.__setattr__(self, "opposing_evidence", tuple(self.opposing_evidence))
         object.__setattr__(self, "unresolved_questions", _frozen_strings(self.unresolved_questions))
@@ -675,7 +705,7 @@ class AttributionHypothesis:
             alternative_hypothesis_ids=_string_list(value.get("alternative_hypothesis_ids")),
             counterfactual=_json_dict(value.get("counterfactual")),
             status=str(value.get("status") or "active"),
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
             resolution_reason=str(value.get("resolution_reason") or ""),
             semantic_hash=semantic_hash,
         )
@@ -694,6 +724,7 @@ class RootConfirmation:
     def __post_init__(self) -> None:
         if self.status not in CONFIRMATION_STATUSES:
             raise ValueError("unsupported root confirmation status: {0}".format(self.status))
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     @classmethod
@@ -736,7 +767,7 @@ class RootConfirmation:
             excerpt=str(value.get("excerpt") or ""),
             reason=str(value.get("reason") or ""),
             counterfactual=str(value.get("counterfactual") or ""),
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
         )
 
@@ -758,6 +789,7 @@ class ConfirmedRoot:
     observed_defect_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
         object.__setattr__(self, "episode_member_refs", _frozen_strings(self.episode_member_refs))
         object.__setattr__(self, "observed_defect_refs", _frozen_strings(self.observed_defect_refs))
@@ -800,7 +832,7 @@ class ConfirmedRoot:
             defect_state=DefectState.from_dict(_json_dict(value.get("defect_state"))),
             reason=str(value.get("reason") or ""),
             counterfactual=str(value.get("counterfactual") or ""),
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
             component=str(value.get("component") or ""),
             event_type=str(value.get("event_type") or ""),
@@ -823,6 +855,7 @@ class CausalFactor:
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
             raise ValueError("unsupported causal relation: {0}".format(self.relation))
+        object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     def to_dict(self) -> JsonDict:
@@ -840,7 +873,7 @@ class CausalFactor:
             node_ref=str(value.get("node_ref") or ""),
             relation=str(value.get("relation") or "unknown"),
             reason=str(value.get("reason") or ""),
-            confidence=_float(value.get("confidence")),
+            confidence=_confidence(value.get("confidence", 0.0)),
             evidence_refs=_string_list(value.get("evidence_refs")),
         )
 

@@ -1,3 +1,4 @@
+import math
 import unittest
 
 from trace_attribution.causal_state import (
@@ -56,6 +57,105 @@ def confirmation_for(root):
 
 
 class CausalStateTest(unittest.TestCase):
+    def test_numeric_fields_reject_nonfinite_and_out_of_range_values(self):
+        defect_state = sample_defect_state()
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="agent",
+            event_type="decision",
+        )
+        valid_hypothesis = AttributionHypothesis.create("Decision is root", node.ref, defect_state)
+        constructors = (
+            ("candidate score", lambda value: CausalCandidate(node.ref, node, "edge", score=value)),
+            ("assessment confidence", lambda value: PredecessorAssessment(node.ref, confidence=value)),
+            (
+                "judgment confidence",
+                lambda value: CausalStepJudgment(node.ref, "present", "reason", confidence=value),
+            ),
+            (
+                "frontier priority",
+                lambda value: FrontierItem.create(
+                    node_ref=node.ref,
+                    defect_state=defect_state,
+                    downstream_path=[node.ref],
+                    hypothesis_id=valid_hypothesis.hypothesis_id,
+                    hypothesis_semantic_hash=valid_hypothesis.semantic_hash,
+                    priority=value,
+                ),
+            ),
+            ("evidence confidence", lambda value: HypothesisEvidence(node.ref, "reason", value)),
+            ("hypothesis confidence", lambda value: valid_hypothesis.with_updates(confidence=value)),
+            (
+                "confirmation confidence",
+                lambda value: RootConfirmation.confirmed(
+                    node.ref,
+                    excerpt="excerpt",
+                    reason="reason",
+                    counterfactual="counterfactual",
+                    confidence=value,
+                ),
+            ),
+            (
+                "root confidence",
+                lambda value: ConfirmedRoot(node.ref, defect_state, "reason", "counterfactual", value),
+            ),
+            ("factor confidence", lambda value: CausalFactor(node.ref, "unknown", "reason", value)),
+        )
+
+        for name, constructor in constructors:
+            invalid_values = (math.nan, math.inf, -math.inf)
+            if name != "frontier priority":
+                invalid_values += (-0.01, 1.01)
+            for value in invalid_values:
+                with self.subTest(field=name, value=value):
+                    with self.assertRaisesRegex(ValueError, "finite|between"):
+                        constructor(value)
+
+    def test_numeric_deserialization_rejects_invalid_values(self):
+        defect_state = sample_defect_state()
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="agent",
+            event_type="decision",
+        )
+        hypothesis = AttributionHypothesis.create("Decision is root", node.ref, defect_state)
+        values = (
+            (CausalCandidate(node.ref, node, "edge").to_dict(), CausalCandidate.from_dict, "score"),
+            (PredecessorAssessment(node.ref).to_dict(), PredecessorAssessment.from_dict, "confidence"),
+            (
+                CausalStepJudgment(node.ref, "present", "reason").to_dict(),
+                CausalStepJudgment.from_dict,
+                "confidence",
+            ),
+            (sample_frontier_item().to_dict(), FrontierItem.from_dict, "priority"),
+            (HypothesisEvidence(node.ref, "reason").to_dict(), HypothesisEvidence.from_dict, "confidence"),
+            (hypothesis.to_dict(), AttributionHypothesis.from_dict, "confidence"),
+            (
+                RootConfirmation.confirmed(
+                    node.ref,
+                    excerpt="excerpt",
+                    reason="reason",
+                    counterfactual="counterfactual",
+                    confidence=0.5,
+                ).to_dict(),
+                RootConfirmation.from_dict,
+                "confidence",
+            ),
+            (
+                ConfirmedRoot(node.ref, defect_state, "reason", "counterfactual", 0.5).to_dict(),
+                ConfirmedRoot.from_dict,
+                "confidence",
+            ),
+            (CausalFactor(node.ref, "unknown", "reason").to_dict(), CausalFactor.from_dict, "confidence"),
+        )
+
+        for payload, loader, field in values:
+            payload[field] = math.nan
+            with self.subTest(loader=loader.__qualname__, field=field):
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    loader(payload)
     def test_transformed_defect_preserves_chain_and_changes_visit_identity(self):
         downstream = sample_defect_state()
         upstream = downstream.transformed(

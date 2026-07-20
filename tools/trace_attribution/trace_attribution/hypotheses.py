@@ -4,23 +4,33 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .causal_state import AttributionHypothesis, DefectState, FrontierItem, HypothesisEvidence
 from .models import JsonDict
 
 
+def _normalized_evidence_reason(reason: str) -> str:
+    return " ".join(str(reason).split()).casefold()
+
+
+def _evidence_identity(item: HypothesisEvidence) -> Tuple[str, str]:
+    return (str(item.ref).strip(), _normalized_evidence_reason(item.reason))
+
+
 def dedupe_evidence(items: Iterable[HypothesisEvidence]) -> Tuple[HypothesisEvidence, ...]:
-    """Keep first-seen immutable evidence records in their auditable order."""
+    """Dedupe semantic evidence and retain the strongest finite confidence."""
     output: List[HypothesisEvidence] = []
-    seen = set()
+    positions: Dict[Tuple[str, str], int] = {}
     for item in items:
-        key = (item.ref, item.reason, item.confidence)
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(item)
+        key = _evidence_identity(item)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(output)
+            output.append(item)
+        elif item.confidence > output[position].confidence:
+            output[position] = item
     return tuple(output)
 
 
@@ -35,11 +45,23 @@ def _dedupe_strings(items: Iterable[str]) -> Tuple[str, ...]:
     seen: Set[str] = set()
     for item in items:
         value = str(item)
-        if value in seen:
-            continue
-        seen.add(value)
-        output.append(value)
+        if value not in seen:
+            seen.add(value)
+            output.append(value)
     return tuple(output)
+
+
+@dataclass(frozen=True)
+class _CompletedFrontierItem:
+    item: FrontierItem
+    evidence_hash: str
+
+
+@dataclass(frozen=True)
+class _FrontierMigration:
+    queued: Tuple[FrontierItem, ...]
+    in_flight: Tuple[FrontierItem, ...]
+    completed: Tuple[_CompletedFrontierItem, ...]
 
 
 class HypothesisLedger:
@@ -85,14 +107,40 @@ class HypothesisLedger:
             item.with_updates(opposing_evidence=dedupe_evidence([*item.opposing_evidence, evidence])),
         )
 
-    def add_unresolved_question(self, hypothesis_id: str, question: str) -> AttributionHypothesis:
+    def add_unresolved_question(
+        self,
+        hypothesis_id: str,
+        question: str,
+        *,
+        frontier: Optional["RecursiveFrontier"] = None,
+    ) -> AttributionHypothesis:
         item = self.get(hypothesis_id)
-        return self._replace_item(
-            hypothesis_id,
-            item.with_updates(
-                unresolved_questions=_dedupe_strings([*item.unresolved_questions, question])
-            ),
-        )
+        changes = {
+            "unresolved_questions": _dedupe_strings([*item.unresolved_questions, question])
+        }
+        if frontier is not None:
+            return self.update_with_frontier(frontier, hypothesis_id, **changes)
+        return self._replace_item(hypothesis_id, item.with_updates(**changes))
+
+    def update_with_frontier(
+        self,
+        frontier: "RecursiveFrontier",
+        hypothesis_id: str,
+        **changes: Any,
+    ) -> AttributionHypothesis:
+        """Atomically rekey ledger and every frontier lifecycle state."""
+        item = self.get(hypothesis_id)
+        updated = item.with_updates(**changes)
+        replacement_items = self._replacement_items(hypothesis_id, updated)
+        migration = frontier.plan_hypothesis_migration(item, updated)
+        previous_items = self._items
+        try:
+            frontier.apply_hypothesis_migration(migration)
+            self._items = replacement_items
+        except Exception:
+            self._items = previous_items
+            raise
+        return updated
 
     def reject(self, hypothesis_id: str, reason: str) -> AttributionHypothesis:
         item = self.get(hypothesis_id)
@@ -139,6 +187,12 @@ class HypothesisLedger:
     def _replace_item(
         self, previous_hypothesis_id: str, updated: AttributionHypothesis
     ) -> AttributionHypothesis:
+        self._items = self._replacement_items(previous_hypothesis_id, updated)
+        return updated
+
+    def _replacement_items(
+        self, previous_hypothesis_id: str, updated: AttributionHypothesis
+    ) -> Dict[str, AttributionHypothesis]:
         if previous_hypothesis_id not in self._items:
             raise KeyError(previous_hypothesis_id)
         if (
@@ -147,36 +201,32 @@ class HypothesisLedger:
         ):
             raise ValueError("updated hypothesis duplicates an existing semantic identity")
 
-        self._items.pop(previous_hypothesis_id)
-        self._items[updated.hypothesis_id] = updated
-        if updated.hypothesis_id != previous_hypothesis_id:
-            self._replace_alternative_references(previous_hypothesis_id, updated.hypothesis_id)
-        return updated
-
-    def _replace_alternative_references(self, previous_hypothesis_id: str, updated_hypothesis_id: str) -> None:
-        for hypothesis_id, item in list(self._items.items()):
-            alternatives = tuple(
-                updated_hypothesis_id if item_id == previous_hypothesis_id else item_id
+        output = dict(self._items)
+        output.pop(previous_hypothesis_id)
+        output[updated.hypothesis_id] = updated
+        if updated.hypothesis_id == previous_hypothesis_id:
+            return output
+        for hypothesis_id, item in list(output.items()):
+            alternatives = _dedupe_strings(
+                updated.hypothesis_id if item_id == previous_hypothesis_id else item_id
                 for item_id in item.alternative_hypothesis_ids
             )
-            alternatives = _dedupe_strings(alternatives)
-            if alternatives == item.alternative_hypothesis_ids:
-                continue
-            self._items[hypothesis_id] = item.with_updates(
-                alternative_hypothesis_ids=alternatives
-            )
+            if alternatives != item.alternative_hypothesis_ids:
+                output[hypothesis_id] = item.with_updates(alternative_hypothesis_ids=alternatives)
+        return output
 
 
 class RecursiveFrontier:
-    """Heap-backed recursive work queue with semantic merge and resume support."""
+    """Heap-backed recursive work queue with explicit lifecycle and resume support."""
 
     def __init__(self) -> None:
         self._heap: List[Tuple[Tuple[float, int, int, str], FrontierItem]] = []
         self._queued: Set[str] = set()
-        self._completed_evidence: Dict[str, str] = {}
+        self._in_flight: Dict[str, FrontierItem] = {}
+        self._completed: Dict[str, _CompletedFrontierItem] = {}
 
     def push(self, item: FrontierItem) -> bool:
-        if item.visit_key in self._queued or item.visit_key in self._completed_evidence:
+        if self._visit_exists(item.visit_key):
             return False
         heapq.heappush(self._heap, (item.heap_key, item))
         self._queued.add(item.visit_key)
@@ -185,13 +235,21 @@ class RecursiveFrontier:
     def pop(self) -> FrontierItem:
         _, item = heapq.heappop(self._heap)
         self._queued.remove(item.visit_key)
+        self._in_flight[item.visit_key] = item
         return item
 
     def __bool__(self) -> bool:
         return bool(self._heap)
 
+    def in_flight_items(self) -> List[FrontierItem]:
+        return sorted(self._in_flight.values(), key=lambda item: item.heap_key)
+
     def mark_completed(self, item: FrontierItem, evidence_hash: str) -> None:
-        self._completed_evidence[item.visit_key] = evidence_hash
+        in_flight = self._in_flight.get(item.visit_key)
+        if in_flight != item:
+            raise ValueError("mark_completed requires the exact in-flight item")
+        self._in_flight.pop(item.visit_key)
+        self._completed[item.visit_key] = _CompletedFrontierItem(item, str(evidence_hash))
 
     def reopen(
         self,
@@ -201,15 +259,25 @@ class RecursiveFrontier:
         reason: str,
         root_verifier_rejected: bool = False,
     ) -> bool:
-        completed_evidence_hash = self._completed_evidence.get(item.visit_key)
-        if completed_evidence_hash is None:
+        completed = self._completed.get(item.visit_key)
+        if completed is None or completed.item != item:
             return False
-        if completed_evidence_hash == evidence_hash and not root_verifier_rejected:
+        if completed.evidence_hash == evidence_hash and not root_verifier_rejected:
             return False
-        self._completed_evidence.pop(item.visit_key)
-        return self.push(
-            replace(item, reopen_reason=reason, evidence_hash=evidence_hash)
-        )
+        replacement = replace(item, reopen_reason=reason, evidence_hash=evidence_hash)
+        if self._visit_exists(replacement.visit_key, excluding_completed=item.visit_key):
+            return False
+
+        heap = list(self._heap)
+        queued = set(self._queued)
+        completed_items = dict(self._completed)
+        heapq.heappush(heap, (replacement.heap_key, replacement))
+        queued.add(replacement.visit_key)
+        completed_items.pop(item.visit_key)
+        self._heap = heap
+        self._queued = queued
+        self._completed = completed_items
+        return True
 
     def snapshot(self) -> List[JsonDict]:
         return [item.to_dict() for _, item in sorted(self._heap)]
@@ -226,27 +294,152 @@ class RecursiveFrontier:
     def checkpoint(self) -> JsonDict:
         return {
             "queued": self.snapshot(),
-            "completed_evidence": [
-                {"visit_key": visit_key, "evidence_hash": evidence_hash}
-                for visit_key, evidence_hash in sorted(self._completed_evidence.items())
+            "in_flight": [item.to_dict() for item in self.in_flight_items()],
+            "completed": [
+                {"item": completed.item.to_dict(), "evidence_hash": completed.evidence_hash}
+                for _, completed in sorted(self._completed.items())
             ],
         }
 
     @classmethod
     def from_checkpoint(cls, checkpoint: Mapping[str, object]) -> "RecursiveFrontier":
-        queued = checkpoint.get("queued")
-        frontier = cls.from_snapshot(queued if isinstance(queued, list) else [])
-        completed_evidence = checkpoint.get("completed_evidence")
-        if not isinstance(completed_evidence, list):
-            return frontier
-        for value in completed_evidence:
-            if not isinstance(value, Mapping):
-                continue
-            visit_key = str(value.get("visit_key") or "")
-            evidence_hash = str(value.get("evidence_hash") or "")
-            if not visit_key or visit_key in frontier._completed_evidence:
-                raise ValueError("invalid completed evidence in frontier checkpoint")
-            if visit_key in frontier._queued:
-                raise ValueError("frontier checkpoint repeats a queued visit as completed")
-            frontier._completed_evidence[visit_key] = evidence_hash
+        """Restore completed work and requeue interrupted work by its stable heap key."""
+        queued = cls._load_checkpoint_items(checkpoint.get("queued"), "queued")
+        in_flight = cls._load_checkpoint_items(checkpoint.get("in_flight"), "in_flight")
+        completed = cls._load_completed_items(checkpoint.get("completed"))
+        all_visits: Dict[str, str] = {}
+        for state, items in (("queued", queued), ("in-flight", in_flight)):
+            for item in items:
+                cls._register_visit(all_visits, item.visit_key, state)
+        for item in completed:
+            cls._register_visit(all_visits, item.item.visit_key, "completed")
+
+        frontier = cls()
+        frontier._set_state(
+            tuple([*queued, *in_flight]),
+            tuple(),
+            tuple(completed),
+        )
         return frontier
+
+    def plan_hypothesis_migration(
+        self, previous: AttributionHypothesis, updated: AttributionHypothesis
+    ) -> _FrontierMigration:
+        queued = tuple(
+            self._migrate_item(item, previous, updated) for _, item in self._heap
+        )
+        in_flight = tuple(
+            self._migrate_item(item, previous, updated) for item in self._in_flight.values()
+        )
+        completed = tuple(
+            _CompletedFrontierItem(
+                self._migrate_item(value.item, previous, updated), value.evidence_hash
+            )
+            for value in self._completed.values()
+        )
+        self._validate_lifecycle_state(queued, in_flight, completed)
+        return _FrontierMigration(queued, in_flight, completed)
+
+    def apply_hypothesis_migration(self, migration: _FrontierMigration) -> None:
+        self._validate_lifecycle_state(
+            migration.queued, migration.in_flight, migration.completed
+        )
+        self._set_state(migration.queued, migration.in_flight, migration.completed)
+
+    @staticmethod
+    def _load_checkpoint_items(value: object, state: str) -> Tuple[FrontierItem, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValueError("frontier checkpoint {0} must be a list".format(state))
+        items: List[FrontierItem] = []
+        for raw_item in value:
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("frontier checkpoint {0} contains an invalid item".format(state))
+            items.append(FrontierItem.from_dict(dict(raw_item)))
+        return tuple(items)
+
+    @staticmethod
+    def _load_completed_items(value: object) -> Tuple[_CompletedFrontierItem, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValueError("frontier checkpoint completed must be a list")
+        items: List[_CompletedFrontierItem] = []
+        for raw_item in value:
+            if not isinstance(raw_item, Mapping) or not isinstance(raw_item.get("item"), Mapping):
+                raise ValueError("frontier checkpoint completed contains an invalid item")
+            items.append(
+                _CompletedFrontierItem(
+                    FrontierItem.from_dict(dict(raw_item["item"])),
+                    str(raw_item.get("evidence_hash") or ""),
+                )
+            )
+        return tuple(items)
+
+    @staticmethod
+    def _register_visit(visits: Dict[str, str], visit_key: str, state: str) -> None:
+        existing = visits.get(visit_key)
+        if existing is not None:
+            raise ValueError(
+                "frontier checkpoint repeats visit in {0} and {1}".format(existing, state)
+            )
+        visits[visit_key] = state
+
+    def _set_state(
+        self,
+        queued: Sequence[FrontierItem],
+        in_flight: Sequence[FrontierItem],
+        completed: Sequence[_CompletedFrontierItem],
+    ) -> None:
+        heap: List[Tuple[Tuple[float, int, int, str], FrontierItem]] = []
+        for item in queued:
+            heapq.heappush(heap, (item.heap_key, item))
+        self._heap = heap
+        self._queued = {item.visit_key for item in queued}
+        self._in_flight = {item.visit_key: item for item in in_flight}
+        self._completed = {item.item.visit_key: item for item in completed}
+
+    @staticmethod
+    def _validate_lifecycle_state(
+        queued: Sequence[FrontierItem],
+        in_flight: Sequence[FrontierItem],
+        completed: Sequence[_CompletedFrontierItem],
+    ) -> None:
+        visits: Dict[str, str] = {}
+        for state, items in (("queued", queued), ("in-flight", in_flight)):
+            for item in items:
+                RecursiveFrontier._register_visit(visits, item.visit_key, state)
+        for completed_item in completed:
+            RecursiveFrontier._register_visit(visits, completed_item.item.visit_key, "completed")
+
+    @staticmethod
+    def _migrate_item(
+        item: FrontierItem, previous: AttributionHypothesis, updated: AttributionHypothesis
+    ) -> FrontierItem:
+        if (
+            item.hypothesis_id != previous.hypothesis_id
+            or item.hypothesis_semantic_hash != previous.semantic_hash
+        ):
+            return item
+        return FrontierItem.create(
+            node_ref=item.node_ref,
+            defect_state=item.defect_state,
+            downstream_path=list(item.downstream_path),
+            hypothesis_id=updated.hypothesis_id,
+            hypothesis_semantic_hash=updated.semantic_hash,
+            depth=item.depth,
+            candidate_source=item.candidate_source,
+            priority=item.priority,
+            checked_evidence_refs=list(item.checked_evidence_refs),
+            evidence_hash=item.evidence_hash,
+            reopen_reason=item.reopen_reason,
+            graph_position=item.graph_position,
+        )
+
+    def _visit_exists(self, visit_key: str, *, excluding_completed: str = "") -> bool:
+        return (
+            visit_key in self._queued
+            or visit_key in self._in_flight
+            or (visit_key in self._completed and visit_key != excluding_completed)
+        )
