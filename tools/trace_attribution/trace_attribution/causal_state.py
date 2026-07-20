@@ -891,9 +891,23 @@ class RecursiveAttributionReport:
         overlapping_refs = confirmed_root_refs.intersection(self.unresolved_refs)
         if overlapping_refs:
             raise ValueError("a node cannot be both confirmed and unresolved")
+        confirmation_statuses = {}
+        for confirmation in self.confirmations:
+            confirmation_statuses.setdefault(confirmation.candidate_ref, set()).add(confirmation.status)
+        for root_ref in confirmed_root_refs:
+            statuses = confirmation_statuses.get(root_ref, set())
+            if not statuses:
+                raise ValueError("missing confirmed root confirmation for {0}".format(root_ref))
+            if statuses != {"confirmed"}:
+                raise ValueError("root has unknown or rejected confirmation for {0}".format(root_ref))
+        has_unknown_non_root_confirmation = any(
+            confirmation.status == "unknown" and confirmation.candidate_ref not in confirmed_root_refs
+            for confirmation in self.confirmations
+        )
         has_blocking_evidence = bool(
             self.unresolved_refs
             or self.unresolved_hypotheses
+            or has_unknown_non_root_confirmation
             or _has_blocking_metadata(self.metadata)
         )
         if confirmed_root_refs:

@@ -44,6 +44,17 @@ def sample_frontier_item():
     )
 
 
+def confirmation_for(root):
+    return RootConfirmation.confirmed(
+        root.node_ref,
+        excerpt="The decision ended discovery.",
+        reason=root.reason,
+        counterfactual=root.counterfactual,
+        confidence=root.confidence,
+        evidence_refs=[root.node_ref],
+    )
+
+
 class CausalStateTest(unittest.TestCase):
     def test_transformed_defect_preserves_chain_and_changes_visit_identity(self):
         downstream = sample_defect_state()
@@ -221,6 +232,7 @@ class CausalStateTest(unittest.TestCase):
             objective="Find the root.",
             analysis_outcome="inconclusive",
             confirmed_roots=[root],
+            confirmations=[confirmation_for(root)],
             unresolved_refs=["record:prompt"],
         )
         self.assertEqual(partial.analysis_outcome, "partial_root_found")
@@ -278,6 +290,63 @@ class CausalStateTest(unittest.TestCase):
                 unresolved_refs=[root.node_ref],
             )
 
+    def test_report_requires_confirmed_root_confirmation(self):
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            reason="The decision stopped discovery.",
+            counterfactual="Searching call sites would reveal the contract.",
+            confidence=0.9,
+        )
+        with self.assertRaisesRegex(ValueError, "missing confirmed root confirmation"):
+            RecursiveAttributionReport(
+                case_id="missing-confirmation",
+                objective="Find the root.",
+                confirmed_roots=[root],
+            )
+        with self.assertRaisesRegex(ValueError, "unknown or rejected confirmation"):
+            RecursiveAttributionReport(
+                case_id="unknown-root-confirmation",
+                objective="Find the root.",
+                confirmed_roots=[root],
+                confirmations=[RootConfirmation.unknown(root.node_ref, "artifact missing")],
+            )
+        with self.assertRaisesRegex(ValueError, "unknown or rejected confirmation"):
+            RecursiveAttributionReport(
+                case_id="rejected-root-confirmation",
+                objective="Find the root.",
+                confirmed_roots=[root],
+                confirmations=[RootConfirmation.rejected(root.node_ref, "better predecessor exists")],
+            )
+
+    def test_unknown_non_root_confirmation_is_blocking_evidence(self):
+        unknown = RootConfirmation.unknown("record:prompt", "artifact missing")
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="unknown-without-root",
+                objective="Find the root.",
+                confirmations=[unknown],
+            ).analysis_outcome,
+            "inconclusive",
+        )
+
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            reason="The decision stopped discovery.",
+            counterfactual="Searching call sites would reveal the contract.",
+            confidence=0.9,
+        )
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="unknown-with-root",
+                objective="Find the root.",
+                confirmed_roots=[root],
+                confirmations=[confirmation_for(root), unknown],
+            ).analysis_outcome,
+            "partial_root_found",
+        )
+
     def test_report_outcome_is_derived_from_roots_and_blocking_facts(self):
         root = ConfirmedRoot(
             node_ref="record:decision",
@@ -292,6 +361,7 @@ class CausalStateTest(unittest.TestCase):
                 objective="Find the root.",
                 analysis_outcome="no_defect",
                 confirmed_roots=[root],
+                confirmations=[confirmation_for(root)],
             ).analysis_outcome,
             "root_found",
         )
@@ -339,6 +409,7 @@ class CausalStateTest(unittest.TestCase):
                 objective="Find the root.",
                 analysis_outcome="no_defect",
                 confirmed_roots=[root],
+                confirmations=[confirmation_for(root)],
                 metadata={"provider_unavailable": True},
             ).analysis_outcome,
             "partial_root_found",
@@ -480,7 +551,12 @@ class CausalStateTest(unittest.TestCase):
                 "observed_defect_refs": ["record:observed"],
             },
         )
-        report = RecursiveAttributionReport(case_id="legacy", objective="Find root.", confirmed_roots=[root])
+        report = RecursiveAttributionReport(
+            case_id="legacy",
+            objective="Find root.",
+            confirmed_roots=[root],
+            confirmations=[confirmation_for(root)],
+        )
         self.assertEqual(report.to_dict()["confirmed_roots"], [root.to_dict()])
         self.assertEqual(report.to_dict()["root_causes"], [root.to_legacy_root_cause()])
 
