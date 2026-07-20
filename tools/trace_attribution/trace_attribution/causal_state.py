@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import JsonDict, TraceNode, stable_json
 
@@ -24,12 +24,55 @@ HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded"
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
 
 
+class FrozenDict(dict):
+    """JSON-compatible mapping that rejects ordinary in-place mutation."""
+
+    def __init__(self, value: Optional[Dict[str, Any]] = None) -> None:
+        dict.__init__(self)
+        for key, item in (value or {}).items():
+            dict.__setitem__(self, key, _freeze(item))
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("recursive causal state mappings are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return FrozenDict(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _frozen_strings(value: Any) -> Tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item) for item in value)
+
+
 def _hash(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
 def _string_list(value: Any) -> List[str]:
-    if not isinstance(value, list):
+    if not isinstance(value, (list, tuple)):
         return []
     return [str(item) for item in value]
 
@@ -54,7 +97,7 @@ def _trace_node_to_dict(node: TraceNode) -> JsonDict:
         "title": node.title,
         "status": node.status,
         "timestamp": node.timestamp,
-        "data": dict(node.data),
+        "data": _thaw(node.data),
         "source_refs": list(node.source_refs),
     }
 
@@ -70,6 +113,20 @@ def _trace_node_from_dict(value: JsonDict) -> TraceNode:
         timestamp=str(value.get("timestamp") or ""),
         data=_json_dict(value.get("data")),
         source_refs=_string_list(value.get("source_refs")),
+    )
+
+
+def _freeze_trace_node(node: TraceNode) -> TraceNode:
+    return TraceNode(
+        ref=node.ref,
+        record_id=node.record_id,
+        component=node.component,
+        event_type=node.event_type,
+        title=node.title,
+        status=node.status,
+        timestamp=node.timestamp,
+        data=FrozenDict(_thaw(node.data)),
+        source_refs=_frozen_strings(node.source_refs),
     )
 
 
@@ -144,17 +201,22 @@ class DefectState:
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "DefectState":
-        return cls(
-            defect_state_id=str(value.get("defect_state_id") or ""),
+        state = cls.create(
             label=str(value.get("label") or ""),
             expected=str(value.get("expected") or ""),
             actual=str(value.get("actual") or ""),
             mechanism=str(value.get("mechanism") or ""),
             scope=str(value.get("scope") or ""),
-            fingerprint=str(value.get("fingerprint") or ""),
             derived_from_defect_state_id=str(value.get("derived_from_defect_state_id") or ""),
             transformation_reason=str(value.get("transformation_reason") or ""),
         )
+        fingerprint = str(value.get("fingerprint") or "")
+        if fingerprint and fingerprint != state.fingerprint:
+            raise ValueError("DefectState fingerprint does not match semantic fields")
+        defect_state_id = str(value.get("defect_state_id") or "")
+        if defect_state_id and defect_state_id != state.defect_state_id:
+            raise ValueError("DefectState defect_state_id does not match semantic fields")
+        return state
 
 
 def semantic_visit_key(node_ref: str, defect_state: DefectState, hypothesis_semantic_hash: str) -> str:
@@ -172,16 +234,21 @@ class CausalCandidate:
     ref: str
     node: TraceNode
     source: str
-    edge: JsonDict = field(default_factory=dict)
+    edge: JsonDict = field(default_factory=FrozenDict)
     score: float = 0.0
-    evidence_refs: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "node", _freeze_trace_node(self.node))
+        object.__setattr__(self, "edge", FrozenDict(_thaw(self.edge)))
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     def to_dict(self) -> JsonDict:
         return {
             "ref": self.ref,
             "node": _trace_node_to_dict(self.node),
             "source": self.source,
-            "edge": dict(self.edge),
+            "edge": _thaw(self.edge),
             "score": self.score,
             "evidence_refs": list(self.evidence_refs),
         }
@@ -206,12 +273,14 @@ class PredecessorAssessment:
     confidence: float = 0.0
     recurse: bool = False
     upstream_defect: Optional[DefectState] = None
-    evidence_refs: List[str] = field(default_factory=list)
-    missing_evidence: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
             raise ValueError("unsupported causal relation: {0}".format(self.relation))
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
+        object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
 
     def to_dict(self) -> JsonDict:
         return {
@@ -245,11 +314,19 @@ class CausalStepJudgment:
     current_node_ref: str
     current_defect_status: str
     current_defect_reason: str
-    predecessors: List[PredecessorAssessment] = field(default_factory=list)
+    predecessors: Tuple[PredecessorAssessment, ...] = field(default_factory=tuple)
     candidate_introduction: bool = False
-    missing_evidence: List[str] = field(default_factory=list)
+    missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
     suggested_investigation: Optional[JsonDict] = None
     confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "predecessors", tuple(self.predecessors))
+        object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
+        if self.suggested_investigation is not None:
+            object.__setattr__(
+                self, "suggested_investigation", FrozenDict(_thaw(self.suggested_investigation))
+            )
 
     def to_dict(self) -> JsonDict:
         return {
@@ -259,7 +336,7 @@ class CausalStepJudgment:
             "predecessors": [item.to_dict() for item in self.predecessors],
             "candidate_introduction": self.candidate_introduction,
             "missing_evidence": list(self.missing_evidence),
-            "suggested_investigation": dict(self.suggested_investigation)
+            "suggested_investigation": _thaw(self.suggested_investigation)
             if self.suggested_investigation
             else None,
             "confidence": self.confidence,
@@ -289,16 +366,20 @@ class FrontierItem:
     item_id: str
     node_ref: str
     defect_state: DefectState
-    downstream_path: List[str]
+    downstream_path: Tuple[str, ...]
     hypothesis_id: str
     hypothesis_semantic_hash: str
     depth: int = 0
     candidate_source: str = ""
     priority: float = 0.0
-    checked_evidence_refs: List[str] = field(default_factory=list)
+    checked_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     evidence_hash: str = ""
     reopen_reason: str = ""
     graph_position: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "downstream_path", _frozen_strings(self.downstream_path))
+        object.__setattr__(self, "checked_evidence_refs", _frozen_strings(self.checked_evidence_refs))
 
     @classmethod
     def create(
@@ -333,13 +414,13 @@ class FrontierItem:
             item_id=item_id,
             node_ref=node_ref,
             defect_state=defect_state,
-            downstream_path=list(downstream_path),
+            downstream_path=tuple(downstream_path),
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis_semantic_hash,
             depth=depth,
             candidate_source=candidate_source,
             priority=priority,
-            checked_evidence_refs=list(checked_evidence_refs or []),
+            checked_evidence_refs=tuple(checked_evidence_refs or []),
             evidence_hash=evidence_hash,
             reopen_reason=reopen_reason,
             graph_position=graph_position,
@@ -368,12 +449,12 @@ class FrontierItem:
             "evidence_hash": self.evidence_hash,
             "reopen_reason": self.reopen_reason,
             "graph_position": self.graph_position,
+            "visit_key": self.visit_key,
         }
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "FrontierItem":
-        return cls(
-            item_id=str(value.get("item_id") or ""),
+        item = cls.create(
             node_ref=str(value.get("node_ref") or ""),
             defect_state=DefectState.from_dict(_json_dict(value.get("defect_state"))),
             downstream_path=_string_list(value.get("downstream_path")),
@@ -387,6 +468,13 @@ class FrontierItem:
             reopen_reason=str(value.get("reopen_reason") or ""),
             graph_position=int(value.get("graph_position") or 0),
         )
+        item_id = str(value.get("item_id") or "")
+        if item_id and item_id != item.item_id:
+            raise ValueError("FrontierItem item_id does not match semantic fields")
+        visit_key = str(value.get("visit_key") or "")
+        if visit_key and visit_key != item.visit_key:
+            raise ValueError("FrontierItem visit_key does not match semantic fields")
+        return item
 
 
 @dataclass(frozen=True)
@@ -410,11 +498,11 @@ class AttributionHypothesis:
     candidate_root_ref: str
     active_defect_state_id: str
     active_defect_fingerprint: str
-    supporting_evidence: List[HypothesisEvidence] = field(default_factory=list)
-    opposing_evidence: List[HypothesisEvidence] = field(default_factory=list)
-    unresolved_questions: List[str] = field(default_factory=list)
-    alternative_hypothesis_ids: List[str] = field(default_factory=list)
-    counterfactual: JsonDict = field(default_factory=dict)
+    supporting_evidence: Tuple[HypothesisEvidence, ...] = field(default_factory=tuple)
+    opposing_evidence: Tuple[HypothesisEvidence, ...] = field(default_factory=tuple)
+    unresolved_questions: Tuple[str, ...] = field(default_factory=tuple)
+    alternative_hypothesis_ids: Tuple[str, ...] = field(default_factory=tuple)
+    counterfactual: JsonDict = field(default_factory=FrozenDict)
     status: str = "active"
     confidence: float = 0.0
     resolution_reason: str = ""
@@ -423,6 +511,11 @@ class AttributionHypothesis:
     def __post_init__(self) -> None:
         if self.status not in HYPOTHESIS_STATUSES:
             raise ValueError("unsupported hypothesis status: {0}".format(self.status))
+        object.__setattr__(self, "supporting_evidence", tuple(self.supporting_evidence))
+        object.__setattr__(self, "opposing_evidence", tuple(self.opposing_evidence))
+        object.__setattr__(self, "unresolved_questions", _frozen_strings(self.unresolved_questions))
+        object.__setattr__(self, "alternative_hypothesis_ids", _frozen_strings(self.alternative_hypothesis_ids))
+        object.__setattr__(self, "counterfactual", FrozenDict(_thaw(self.counterfactual)))
 
     @classmethod
     def create(
@@ -440,7 +533,7 @@ class AttributionHypothesis:
 
     @staticmethod
     def _semantic_hash(
-        claim: str, candidate_root_ref: str, defect_fingerprint: str, unresolved_questions: List[str]
+        claim: str, candidate_root_ref: str, defect_fingerprint: str, unresolved_questions: Tuple[str, ...]
     ) -> str:
         return _hash(
             {
@@ -459,7 +552,11 @@ class AttributionHypothesis:
             updated.active_defect_fingerprint,
             updated.unresolved_questions,
         )
-        return replace(updated, semantic_hash=semantic_hash)
+        return replace(
+            updated,
+            hypothesis_id="hyp:{0}".format(semantic_hash[:20]),
+            semantic_hash=semantic_hash,
+        )
 
     def to_dict(self) -> JsonDict:
         return {
@@ -472,7 +569,7 @@ class AttributionHypothesis:
             "opposing_evidence": [item.to_dict() for item in self.opposing_evidence],
             "unresolved_questions": list(self.unresolved_questions),
             "alternative_hypothesis_ids": list(self.alternative_hypothesis_ids),
-            "counterfactual": dict(self.counterfactual),
+            "counterfactual": _thaw(self.counterfactual),
             "status": self.status,
             "confidence": self.confidence,
             "resolution_reason": self.resolution_reason,
@@ -483,25 +580,43 @@ class AttributionHypothesis:
     def from_dict(cls, value: JsonDict) -> "AttributionHypothesis":
         supporting = value.get("supporting_evidence")
         opposing = value.get("opposing_evidence")
+        claim = str(value.get("claim") or "")
+        candidate_root_ref = str(value.get("candidate_root_ref") or "")
+        active_defect_fingerprint = str(value.get("active_defect_fingerprint") or "")
+        unresolved_questions = _frozen_strings(value.get("unresolved_questions"))
+        semantic_hash = cls._semantic_hash(
+            claim, candidate_root_ref, active_defect_fingerprint, unresolved_questions
+        )
+        hypothesis_id = "hyp:{0}".format(semantic_hash[:20])
+        persisted_semantic_hash = str(value.get("semantic_hash") or "")
+        if persisted_semantic_hash and persisted_semantic_hash != semantic_hash:
+            raise ValueError("AttributionHypothesis semantic_hash does not match semantic fields")
+        persisted_hypothesis_id = str(value.get("hypothesis_id") or "")
+        if persisted_hypothesis_id and persisted_hypothesis_id != hypothesis_id:
+            raise ValueError("AttributionHypothesis hypothesis_id does not match semantic fields")
+        active_defect_state_id = str(value.get("active_defect_state_id") or "")
+        expected_defect_state_id = "defect:{0}".format(active_defect_fingerprint)
+        if active_defect_state_id and active_defect_state_id != expected_defect_state_id:
+            raise ValueError("AttributionHypothesis active_defect_state_id does not match fingerprint")
         return cls(
-            hypothesis_id=str(value.get("hypothesis_id") or ""),
-            claim=str(value.get("claim") or ""),
-            candidate_root_ref=str(value.get("candidate_root_ref") or ""),
-            active_defect_state_id=str(value.get("active_defect_state_id") or ""),
-            active_defect_fingerprint=str(value.get("active_defect_fingerprint") or ""),
+            hypothesis_id=hypothesis_id,
+            claim=claim,
+            candidate_root_ref=candidate_root_ref,
+            active_defect_state_id=expected_defect_state_id,
+            active_defect_fingerprint=active_defect_fingerprint,
             supporting_evidence=[HypothesisEvidence.from_dict(item) for item in supporting if isinstance(item, dict)]
             if isinstance(supporting, list)
             else [],
             opposing_evidence=[HypothesisEvidence.from_dict(item) for item in opposing if isinstance(item, dict)]
             if isinstance(opposing, list)
             else [],
-            unresolved_questions=_string_list(value.get("unresolved_questions")),
+            unresolved_questions=unresolved_questions,
             alternative_hypothesis_ids=_string_list(value.get("alternative_hypothesis_ids")),
             counterfactual=_json_dict(value.get("counterfactual")),
             status=str(value.get("status") or "active"),
             confidence=_float(value.get("confidence")),
             resolution_reason=str(value.get("resolution_reason") or ""),
-            semantic_hash=str(value.get("semantic_hash") or ""),
+            semantic_hash=semantic_hash,
         )
 
 
@@ -513,11 +628,12 @@ class RootConfirmation:
     reason: str = ""
     counterfactual: str = ""
     confidence: float = 0.0
-    evidence_refs: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.status not in CONFIRMATION_STATUSES:
             raise ValueError("unsupported root confirmation status: {0}".format(self.status))
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     @classmethod
     def confirmed(
@@ -571,7 +687,19 @@ class ConfirmedRoot:
     reason: str
     counterfactual: str
     confidence: float
-    evidence_refs: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    component: str = ""
+    event_type: str = ""
+    defect_type: str = ""
+    causal_role: str = "defect_introduction"
+    episode_id: str = ""
+    episode_member_refs: Tuple[str, ...] = field(default_factory=tuple)
+    observed_defect_refs: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
+        object.__setattr__(self, "episode_member_refs", _frozen_strings(self.episode_member_refs))
+        object.__setattr__(self, "observed_defect_refs", _frozen_strings(self.observed_defect_refs))
 
     def to_dict(self) -> JsonDict:
         return {
@@ -581,6 +709,27 @@ class ConfirmedRoot:
             "counterfactual": self.counterfactual,
             "confidence": self.confidence,
             "evidence_refs": list(self.evidence_refs),
+            "component": self.component,
+            "event_type": self.event_type,
+            "defect_type": self.defect_type,
+            "causal_role": self.causal_role,
+            "episode_id": self.episode_id,
+            "episode_member_refs": list(self.episode_member_refs),
+            "observed_defect_refs": list(self.observed_defect_refs),
+        }
+
+    def to_legacy_root_cause(self) -> JsonDict:
+        return {
+            "node_ref": self.node_ref,
+            "component": self.component,
+            "event_type": self.event_type,
+            "defect_type": self.defect_type,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "causal_role": self.causal_role,
+            "episode_id": self.episode_id,
+            "episode_member_refs": list(self.episode_member_refs),
+            "observed_defect_refs": list(self.observed_defect_refs),
         }
 
     @classmethod
@@ -592,6 +741,13 @@ class ConfirmedRoot:
             counterfactual=str(value.get("counterfactual") or ""),
             confidence=_float(value.get("confidence")),
             evidence_refs=_string_list(value.get("evidence_refs")),
+            component=str(value.get("component") or ""),
+            event_type=str(value.get("event_type") or ""),
+            defect_type=str(value.get("defect_type") or ""),
+            causal_role=str(value.get("causal_role") or "defect_introduction"),
+            episode_id=str(value.get("episode_id") or ""),
+            episode_member_refs=_string_list(value.get("episode_member_refs")),
+            observed_defect_refs=_string_list(value.get("observed_defect_refs")),
         )
 
 
@@ -601,11 +757,12 @@ class CausalFactor:
     relation: str
     reason: str
     confidence: float = 0.0
-    evidence_refs: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
             raise ValueError("unsupported causal relation: {0}".format(self.relation))
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     def to_dict(self) -> JsonDict:
         return {
@@ -631,7 +788,10 @@ class CausalFactor:
 class RejectedCandidate:
     node_ref: str
     reason: str
-    evidence_refs: List[str] = field(default_factory=list)
+    evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
 
     def to_dict(self) -> JsonDict:
         return {"node_ref": self.node_ref, "reason": self.reason, "evidence_refs": list(self.evidence_refs)}
@@ -649,26 +809,55 @@ class RejectedCandidate:
 class RecursiveAttributionReport:
     case_id: str
     objective: str
-    start_refs: List[str] = field(default_factory=list)
+    start_refs: Tuple[str, ...] = field(default_factory=tuple)
     analysis_outcome: str = "inconclusive"
     analysis_perspective: str = ""
-    defect_states: List[DefectState] = field(default_factory=list)
-    causal_candidates: List[CausalCandidate] = field(default_factory=list)
-    causal_relations: List[PredecessorAssessment] = field(default_factory=list)
-    step_judgments: List[CausalStepJudgment] = field(default_factory=list)
-    hypotheses: List[AttributionHypothesis] = field(default_factory=list)
-    introduction_candidates: List[CausalCandidate] = field(default_factory=list)
-    confirmations: List[RootConfirmation] = field(default_factory=list)
-    confirmed_roots: List[ConfirmedRoot] = field(default_factory=list)
-    co_roots: List[ConfirmedRoot] = field(default_factory=list)
-    contributing_conditions: List[CausalFactor] = field(default_factory=list)
-    amplifying_factors: List[CausalFactor] = field(default_factory=list)
-    rejected_candidates: List[RejectedCandidate] = field(default_factory=list)
-    unresolved_hypotheses: List[AttributionHypothesis] = field(default_factory=list)
-    taint_paths: List[List[str]] = field(default_factory=list)
-    visited_order: List[str] = field(default_factory=list)
-    unresolved_refs: List[str] = field(default_factory=list)
-    metadata: JsonDict = field(default_factory=dict)
+    defect_states: Tuple[DefectState, ...] = field(default_factory=tuple)
+    causal_candidates: Tuple[CausalCandidate, ...] = field(default_factory=tuple)
+    causal_relations: Tuple[PredecessorAssessment, ...] = field(default_factory=tuple)
+    step_judgments: Tuple[CausalStepJudgment, ...] = field(default_factory=tuple)
+    hypotheses: Tuple[AttributionHypothesis, ...] = field(default_factory=tuple)
+    introduction_candidates: Tuple[CausalCandidate, ...] = field(default_factory=tuple)
+    confirmations: Tuple[RootConfirmation, ...] = field(default_factory=tuple)
+    confirmed_roots: Tuple[ConfirmedRoot, ...] = field(default_factory=tuple)
+    co_roots: Tuple[ConfirmedRoot, ...] = field(default_factory=tuple)
+    contributing_conditions: Tuple[CausalFactor, ...] = field(default_factory=tuple)
+    amplifying_factors: Tuple[CausalFactor, ...] = field(default_factory=tuple)
+    rejected_candidates: Tuple[RejectedCandidate, ...] = field(default_factory=tuple)
+    unresolved_hypotheses: Tuple[AttributionHypothesis, ...] = field(default_factory=tuple)
+    taint_paths: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
+    visited_order: Tuple[str, ...] = field(default_factory=tuple)
+    unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: JsonDict = field(default_factory=FrozenDict)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "defect_states",
+            "causal_candidates",
+            "causal_relations",
+            "step_judgments",
+            "hypotheses",
+            "introduction_candidates",
+            "confirmations",
+            "confirmed_roots",
+            "co_roots",
+            "contributing_conditions",
+            "amplifying_factors",
+            "rejected_candidates",
+            "unresolved_hypotheses",
+        ):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        object.__setattr__(self, "start_refs", _frozen_strings(self.start_refs))
+        object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
+        object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
+        object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
+        object.__setattr__(self, "metadata", FrozenDict(_thaw(self.metadata)))
+        if self.confirmed_roots or self.co_roots:
+            has_unresolved_branches = bool(self.unresolved_refs or self.unresolved_hypotheses)
+            if has_unresolved_branches:
+                object.__setattr__(self, "analysis_outcome", "partial_root_found")
+            elif self.analysis_outcome == "inconclusive":
+                object.__setattr__(self, "analysis_outcome", "root_found")
 
     def to_dict(self) -> JsonDict:
         return {
@@ -690,11 +879,11 @@ class RecursiveAttributionReport:
             "amplifying_factors": [item.to_dict() for item in self.amplifying_factors],
             "rejected_candidates": [item.to_dict() for item in self.rejected_candidates],
             "unresolved_hypotheses": [item.to_dict() for item in self.unresolved_hypotheses],
-            "root_causes": [item.to_dict() for item in self.confirmed_roots],
+            "root_causes": [item.to_legacy_root_cause() for item in self.confirmed_roots],
             "taint_paths": [list(path) for path in self.taint_paths],
             "visited_order": list(self.visited_order),
             "unresolved_refs": list(self.unresolved_refs),
-            "metadata": dict(self.metadata),
+            "metadata": _thaw(self.metadata),
         }
 
     @classmethod
