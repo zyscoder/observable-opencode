@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import types
 import unittest
@@ -9,11 +10,13 @@ from pathlib import Path
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
     ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
+    BoundedJudgeCallResult,
     CausalStepRequest,
     ClaudeCausalJudge,
     RootConfirmationRequest,
     build_causal_step_prompt,
     build_recursive_confirmation_prompt,
+    bind_root_confirmation,
     validate_causal_step_payload,
     validate_recursive_confirmation,
 )
@@ -216,6 +219,30 @@ def valid_confirmation_payload() -> dict:
         },
         "confidence": 0.88,
         "evidence_refs": ["record:decision", "record:evidence"],
+        "competitor_comparisons": [],
+        "factor_mechanism": {},
+    }
+
+
+def strict_manifest(content: str, *, owner_ref: str = "record:decision", start: int = 0, end=None):
+    encoded = content.encode("utf-8")
+    if end is None:
+        end = len(encoded)
+    return {
+        "node_ref": owner_ref,
+        "referenced_artifact_ids": ["decision-payload"],
+        "hydrated_artifacts": [{
+            "artifact_id": "decision-payload",
+            "content": content,
+            "content_hash": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+            "byte_count": len(encoded),
+            "byte_range": [start, end],
+            "owner_reference": reference_envelope(owner_ref),
+            "missing": False,
+            "truncated": False,
+        }],
+        "missing_artifact_ids": [],
+        "truncated_artifact_ids": [],
     }
 
 
@@ -337,6 +364,155 @@ class CausalJudgeValidationTest(unittest.TestCase):
 
 
 class RootConfirmationValidationTest(unittest.TestCase):
+    def test_binding_rejects_foreign_hypothesis_semantic_hash(self):
+        request = sample_confirmation_request()
+        confirmation = validate_recursive_confirmation(
+            valid_confirmation_payload(), request=request
+        )
+        from dataclasses import replace
+        with self.assertRaisesRegex(ValueError, "semantic hash"):
+            bind_root_confirmation(
+                replace(confirmation, hypothesis_semantic_hash="semantic:foreign"),
+                request=request,
+            )
+
+    def test_artifact_confirmation_recomputes_hash_owner_and_utf8_range(self):
+        content = "prefix-需求描述质量-suffix"
+        encoded = content.encode("utf-8")
+        start = encoded.index("需求".encode("utf-8"))
+        end = start + len("需求描述质量".encode("utf-8"))
+        manifest = strict_manifest(content, start=start, end=end)
+        candidate = {
+            **reference_envelope("record:decision"),
+            "artifact_hydration": manifest,
+        }
+        payload = valid_confirmation_payload()
+        payload["excerpt"] = "需求描述质量"
+        payload["evidence_refs"] = ["record:decision"]
+
+        result = validate_recursive_confirmation(
+            payload, request=sample_confirmation_request(candidate_reference=candidate)
+        )
+        self.assertEqual(result.status, "confirmed")
+
+        mutations = (
+            ("content_hash", "sha256:" + "0" * 64, "content_hash"),
+            ("byte_range", [end, start], "byte_range"),
+            ("byte_range", [0, len(encoded) + 1], "byte_range"),
+            ("byte_count", len(encoded) + 1, "byte_count"),
+            ("owner_reference", reference_envelope("record:other"), "owner"),
+            ("artifact_id", "artifact:decision-payload", "canonical"),
+        )
+        for field, value, error in mutations:
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                forged = strict_manifest(content, start=start, end=end)
+                forged["hydrated_artifacts"][0][field] = value
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(candidate_reference={
+                        **reference_envelope("record:decision"),
+                        "artifact_hydration": forged,
+                    }),
+                )
+
+        outside = valid_confirmation_payload()
+        outside["excerpt"] = "prefix"
+        outside["evidence_refs"] = ["record:decision"]
+        with self.assertRaisesRegex(ValueError, "grounded excerpt"):
+            validate_recursive_confirmation(
+                outside, request=sample_confirmation_request(candidate_reference=candidate)
+            )
+
+    def test_open_competitor_requires_auditable_structured_comparison(self):
+        competitor = {
+            "hypothesis_id": "hyp:alternative",
+            "hypothesis_semantic_hash": "semantic:alternative",
+            "status": "active",
+            "claim": "The prompt omission introduced the defect.",
+            "active_defect": sample_step_request().defect_state.to_dict(),
+            "candidate_reference": {
+                **reference_envelope("record:prompt"),
+                "content": "The prompt omitted the compatibility requirement.",
+            },
+            "supporting_evidence": [{
+                "reason": "The requirement is absent.",
+                "confidence": 0.8,
+                "evidence_reference": reference_envelope("record:prompt"),
+            }],
+            "opposing_evidence": [],
+            "unresolved_questions": ["Could repository discovery compensate?"],
+            "counterfactual": {"intervention_ref": "record:prompt"},
+        }
+        request = sample_confirmation_request(competing_hypotheses=(competitor,))
+        payload = valid_confirmation_payload()
+        with self.assertRaisesRegex(ValueError, "competitor_comparisons"):
+            validate_recursive_confirmation(payload, request=request)
+
+        payload["competitor_comparisons"] = [{
+            "hypothesis_id": "hyp:alternative",
+            "hypothesis_semantic_hash": "semantic:alternative",
+            "candidate_ref": "record:prompt",
+            "defect_fingerprint": sample_step_request().defect_state.fingerprint,
+            "status": "unresolved",
+            "reason": "The alternative remains nondominated.",
+            "evidence_refs": ["record:prompt"],
+        }]
+        forged = dict(payload)
+        forged["competitor_comparisons"] = [
+            {**payload["competitor_comparisons"][0], "candidate_ref": "record:other"}
+        ]
+        with self.assertRaisesRegex(ValueError, "competitor.*identity"):
+            validate_recursive_confirmation(forged, request=request)
+        with self.assertRaisesRegex(ValueError, "unresolved competitor"):
+            validate_recursive_confirmation(payload, request=request)
+
+        payload["status"] = "unknown"
+        payload["factor_role"] = "unknown"
+        payload["excerpt"] = ""
+        payload["counterfactual"] = {
+            "intervention_ref": "record:decision",
+            "intervention_kind": "replace_with_semantically_correct_behavior",
+            "predicted_defect_status": "unknown",
+            "causal_effect": "unknown",
+        }
+        self.assertEqual(
+            validate_recursive_confirmation(payload, request=request).status, "unknown"
+        )
+
+    def test_factor_role_requires_grounded_evidence_and_structured_mechanism(self):
+        payload = valid_confirmation_payload()
+        payload.update({
+            "status": "rejected",
+            "factor_role": "amplifying_factor",
+            "excerpt": "",
+            "evidence_refs": [],
+            "counterfactual": {
+                "intervention_ref": "record:decision",
+                "intervention_kind": "replace_with_semantically_correct_behavior",
+                "predicted_defect_status": "present",
+                "causal_effect": "does_not_prevent_defect",
+            },
+            "factor_mechanism": {
+                "mechanism_type": "amplification",
+                "source_ref": "record:decision",
+                "target_ref": "record:change",
+                "effect": "Increases defect severity.",
+            },
+        })
+        with self.assertRaisesRegex(ValueError, "factor.*evidence"):
+            validate_recursive_confirmation(payload, request=sample_confirmation_request())
+        payload["evidence_refs"] = ["record:decision"]
+        with self.assertRaisesRegex(ValueError, "source and target"):
+            validate_recursive_confirmation(payload, request=sample_confirmation_request())
+        payload["evidence_refs"] = ["record:decision", "record:change"]
+        result = validate_recursive_confirmation(payload, request=sample_confirmation_request())
+        self.assertEqual(result.factor_mechanism["mechanism_type"], "amplification")
+
+    def test_factual_prompt_omits_analysis_perspective(self):
+        request = sample_confirmation_request()
+        prompt = build_recursive_confirmation_prompt(request)
+        self.assertNotIn(request.analysis_perspective, prompt)
+        self.assertNotIn("analysis_perspective", request.factual_dict())
     def test_confirmation_requires_grounded_refs_and_excerpt(self):
         result = validate_recursive_confirmation(
             valid_confirmation_payload(), request=sample_confirmation_request()
@@ -511,24 +687,12 @@ class RootConfirmationValidationTest(unittest.TestCase):
             )
 
     def test_resolved_task2_hydration_manifest_can_ground_candidate_excerpt(self):
+        artifact_content = "Implement only the explicitly listed methods."
         candidate_fact = {
             **reference_envelope("record:decision"),
             "fact_kind": "candidate_fact",
             "decisive": True,
-            "artifact_hydration": {
-                "node_ref": "record:decision",
-                "referenced_artifact_ids": ["decision-payload"],
-                "hydrated_artifacts": [
-                    {
-                        "artifact_id": "decision-payload",
-                        "content": "Implement only the explicitly listed methods.",
-                        "missing": False,
-                        "truncated": False,
-                    }
-                ],
-                "missing_artifact_ids": [],
-                "truncated_artifact_ids": [],
-            },
+            "artifact_hydration": strict_manifest(artifact_content),
         }
         payload = valid_confirmation_payload()
         payload["evidence_refs"] = ["record:decision"]
@@ -543,10 +707,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
         noncandidate_fact = {
             **reference_envelope("record:evidence"),
             "fact_kind": "supporting_evidence",
-            "artifact_hydration": {
-                **candidate_fact["artifact_hydration"],
-                "node_ref": "record:evidence",
-            },
+            "artifact_hydration": strict_manifest(
+                artifact_content, owner_ref="record:evidence"
+            ),
         }
         with self.assertRaisesRegex(ValueError, "grounded excerpt"):
             validate_recursive_confirmation(
@@ -646,23 +809,49 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "evidence_references": [reference_envelope("record:alternative_evidence")],
         }
         open_hypothesis = {
-            **closed,
             "hypothesis_id": "hyp_open",
+            "hypothesis_semantic_hash": "semantic:open",
             "status": "supported",
+            "claim": "The alternative decision introduced the defect.",
+            "active_defect": sample_step_request().defect_state.to_dict(),
+            "candidate_reference": {
+                **reference_envelope("record:alternative"),
+                "content": "The alternative decision omitted discovery.",
+            },
+            "supporting_evidence": [{
+                "reason": "The evidence supports the alternative.",
+                "confidence": 0.8,
+                "evidence_reference": reference_envelope("record:alternative_evidence"),
+            }],
+            "opposing_evidence": [],
+            "unresolved_questions": [],
+            "counterfactual": {"intervention_ref": "record:alternative"},
         }
         missing_status = {key: value for key, value in closed.items() if key != "status"}
-        unresolved_evidence = {
-            **closed,
-            "evidence_references": [
-                reference_envelope("record:alternative_evidence", status="unresolved")
-            ],
-        }
+        unresolved_evidence = dict(open_hypothesis)
+        unresolved_evidence["supporting_evidence"] = [{
+            "reason": "Unresolved evidence.",
+            "confidence": 0.8,
+            "evidence_reference": reference_envelope(
+                "record:alternative_evidence", status="unresolved"
+            ),
+        }]
         validate_recursive_confirmation(
             valid_confirmation_payload(),
             request=sample_confirmation_request(competing_hypotheses=(closed,)),
         )
+        open_payload = valid_confirmation_payload()
+        open_payload["competitor_comparisons"] = [{
+            "hypothesis_id": "hyp_open",
+            "hypothesis_semantic_hash": "semantic:open",
+            "candidate_ref": "record:alternative",
+            "defect_fingerprint": sample_step_request().defect_state.fingerprint,
+            "status": "outperformed",
+            "reason": "The candidate has stronger causal evidence.",
+            "evidence_refs": ["record:alternative"],
+        }]
         validate_recursive_confirmation(
-            valid_confirmation_payload(),
+            open_payload,
             request=sample_confirmation_request(competing_hypotheses=(open_hypothesis,)),
         )
         for hypothesis in (missing_status, unresolved_evidence):
@@ -1112,20 +1301,7 @@ class RootConfirmationValidationTest(unittest.TestCase):
         self.assertEqual(result.status, "confirmed")
 
     def test_task2_artifact_status_schema_accepts_only_available_hydrated_identity(self):
-        manifest = {
-            "node_ref": "record:decision",
-            "referenced_artifact_ids": ["decision-payload"],
-            "hydrated_artifacts": [
-                {
-                    "artifact_id": "decision-payload",
-                    "content": "Implement only the explicitly listed methods.",
-                    "missing": False,
-                    "truncated": False,
-                }
-            ],
-            "missing_artifact_ids": [],
-            "truncated_artifact_ids": [],
-        }
+        manifest = strict_manifest("Implement only the explicitly listed methods.")
 
         def request_for(status):
             fact = {
@@ -1447,7 +1623,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v3")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v4")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):
@@ -1526,7 +1702,8 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             sample_step_request(), max_physical_requests=1
         )
 
-        self.assertEqual(result.current_defect_status, "present")
+        self.assertEqual(result.value.current_defect_status, "present")
+        self.assertEqual(result.physical_requests, 1)
         self.assertEqual(transport.request_count, 1)
 
     def test_bounded_step_cache_hit_costs_zero_requests(self):
@@ -1536,13 +1713,15 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
                 transport=transport,
                 cache=JudgmentCache(Path(tempdir) / "cache.jsonl"),
             )
-            judge.judge_step_bounded(sample_step_request(), max_physical_requests=1)
+            first = judge.judge_step_bounded(sample_step_request(), max_physical_requests=1)
 
             result = judge.judge_step_bounded(
                 sample_step_request(), max_physical_requests=0
             )
 
-        self.assertEqual(result.current_defect_status, "present")
+        self.assertEqual(first.physical_requests, 1)
+        self.assertEqual(result.value.current_defect_status, "present")
+        self.assertEqual(result.physical_requests, 0)
         self.assertEqual(transport.request_count, 1)
 
     def test_bounded_step_blocks_repair_after_one_physical_request(self):
@@ -1555,9 +1734,10 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             sample_step_request(), max_physical_requests=1
         )
 
-        self.assertEqual(result.current_defect_status, "unknown")
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertEqual(result.physical_requests, 1)
         self.assertTrue(
-            any("judge_request_budget_exhausted" in item for item in result.missing_evidence)
+            any("judge_request_budget_exhausted" in item for item in result.value.missing_evidence)
         )
         self.assertEqual(transport.request_count, 1)
         self.assertEqual(cache.stats()["writes"], 0)
@@ -1858,9 +2038,11 @@ class CausalRootConfirmationTest(unittest.TestCase):
                 request, max_physical_requests=0
             )
 
-        self.assertEqual(first, second)
-        self.assertEqual(first.hypothesis_id, "hyp:decision")
-        self.assertEqual(first.defect_fingerprint, request.defect_state.fingerprint)
+        self.assertEqual(first.value, second.value)
+        self.assertEqual(first.physical_requests, 1)
+        self.assertEqual(second.physical_requests, 0)
+        self.assertEqual(first.value.hypothesis_id, "hyp:decision")
+        self.assertEqual(first.value.defect_fingerprint, request.defect_state.fingerprint)
         self.assertEqual(transport.request_count, 1)
 
 

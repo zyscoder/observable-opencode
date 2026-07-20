@@ -26,7 +26,7 @@ from .models import JsonDict, TraceNode, stable_json
 
 
 CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v1"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v3"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v4"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (
@@ -151,6 +151,13 @@ class RootConfirmationRequest:
 
     def to_dict(self) -> JsonDict:
         return {
+            **self.factual_dict(),
+            "analysis_perspective": self.analysis_perspective,
+        }
+
+    def factual_dict(self) -> JsonDict:
+        """Return perspective-neutral facts used by verifier prompts and cache identity."""
+        return {
             "candidate_ref": self.candidate_ref,
             "defect_state": self.defect_state.to_dict(),
             "recursive_path": list(self.recursive_path),
@@ -160,7 +167,6 @@ class RootConfirmationRequest:
             "opposing_evidence": _thaw_json(self.opposing_evidence),
             "competing_hypotheses": _thaw_json(self.competing_hypotheses),
             "task_obligations": _thaw_json(self.task_obligations),
-            "analysis_perspective": self.analysis_perspective,
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
         }
@@ -182,7 +188,7 @@ class BoundedJudgeCapability:
         request: CausalStepRequest,
         *,
         max_physical_requests: Optional[int],
-    ) -> CausalStepJudgment:
+    ) -> "BoundedJudgeCallResult":
         raise NotImplementedError
 
     def confirm_candidate_bounded(
@@ -190,8 +196,24 @@ class BoundedJudgeCapability:
         request: RootConfirmationRequest,
         *,
         max_physical_requests: Optional[int],
-    ) -> RootConfirmation:
+    ) -> "BoundedJudgeCallResult":
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class BoundedJudgeCallResult:
+    """A bounded Judge result with exact physical transport accounting."""
+
+    value: Any
+    physical_requests: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.physical_requests, bool)
+            or not isinstance(self.physical_requests, int)
+            or self.physical_requests < 0
+        ):
+            raise ValueError("physical_requests must be a non-negative integer")
 
 
 class OfflineJudgeCapability:
@@ -277,7 +299,7 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
 def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str:
     return stable_json(
         {
-            "request": request.to_dict(),
+            "request": request.factual_dict(),
             "falsification_checks": [
                 "The candidate directly contains the tracked defect or a causally explanatory upstream defect.",
                 "The candidate precedes the downstream result.",
@@ -290,7 +312,7 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 TEMPORAL_CAUSALITY_RULE,
                 "Try to falsify the candidate independently; no first-pass verdict is supplied.",
                 "Any component may be confirmed when the grounded semantics support it.",
-                "analysis_perspective may affect ranking and factor labels only; it must not change fact visibility, component eligibility, or causal truth.",
+                "This is perspective-neutral factual confirmation; presentation perspective is applied only after the confirmed set is fixed.",
                 *RELATION_DEFINITIONS,
                 "The causal-step response must contain exactly one assessment for every offered candidate.",
                 "A reference is grounded only by an explicit reference envelope containing resolved_ref, resolution_status=resolved, and provenance_class; candidate_ref and recursive path strings are navigation only.",
@@ -323,6 +345,23 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 },
                 "confidence": 0.0,
                 "evidence_refs": [],
+                "competitor_comparisons": [
+                    {
+                        "hypothesis_id": "one offered open competitor",
+                        "hypothesis_semantic_hash": "offered semantic hash",
+                        "candidate_ref": "offered competitor candidate",
+                        "defect_fingerprint": "offered active defect fingerprint",
+                        "status": "outperformed|rejected|co_root|unresolved",
+                        "reason": "grounded comparison",
+                        "evidence_refs": [],
+                    }
+                ],
+                "factor_mechanism": {
+                    "mechanism_type": "enabling_condition|amplification",
+                    "source_ref": request.candidate_ref,
+                    "target_ref": "grounded recursive path ref",
+                    "effect": "non-empty causal mechanism",
+                },
             },
         }
     )
@@ -839,6 +878,7 @@ class _ConfirmationFactTreeValidator:
         self.validated_manifests: Set[int] = set()
         self.hydrated_artifact_nodes: Set[int] = set()
         self.hydrated_artifact_refs: Set[str] = set()
+        self.hydrated_artifact_fragments: Dict[int, str] = {}
         self.pending_artifact_statuses: List[
             Tuple[Mapping[str, Any], str, str]
         ] = []
@@ -1093,11 +1133,18 @@ class _ConfirmationFactTreeValidator:
             return
         if referenced is None or missing is None or truncated is None:
             return
+        node_ref = str(value.get("node_ref") or "").strip()
+        if not node_ref:
+            self._error(path, "manifest owner identity is missing")
         hydrated: Set[str] = set()
-        valid_items: List[Tuple[Mapping[str, Any], str]] = []
+        valid_items: List[Tuple[Mapping[str, Any], str, str]] = []
         for index, artifact in enumerate(hydrated_value):
             item_path = "{0}.hydrated_artifacts[{1}]".format(path, index)
-            artifact_id = _normalized_artifact_id(artifact.get("artifact_id"))
+            raw_artifact_id = artifact.get("artifact_id")
+            artifact_id = _normalized_artifact_id(raw_artifact_id)
+            if not isinstance(raw_artifact_id, str) or raw_artifact_id != artifact_id:
+                self._error(item_path, "artifact_id must be a canonical unprefixed string")
+                continue
             if not artifact_id or artifact_id in hydrated:
                 self._error(item_path, "has an empty or duplicate artifact_id")
                 continue
@@ -1114,11 +1161,61 @@ class _ConfirmationFactTreeValidator:
             if artifact_id in missing or artifact_id in truncated:
                 self._error(item_path, "artifact is missing or truncated")
                 continue
+            content = artifact.get("content")
+            if not isinstance(content, str):
+                self._error(item_path, "content must be UTF-8 text")
+                continue
+            content_bytes = content.encode("utf-8")
+            content_hash = artifact.get("content_hash")
+            expected_hash = "sha256:{0}".format(hashlib.sha256(content_bytes).hexdigest())
+            if not isinstance(content_hash, str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", content_hash
+            ):
+                self._error(item_path, "content_hash must be canonical sha256")
+                continue
+            if content_hash != expected_hash:
+                self._error(item_path, "content_hash does not match actual bytes")
+                continue
+            byte_count = artifact.get("byte_count")
+            if (
+                isinstance(byte_count, bool)
+                or not isinstance(byte_count, int)
+                or byte_count != len(content_bytes)
+            ):
+                self._error(item_path, "byte_count must equal the actual UTF-8 byte count")
+                continue
+            byte_range = artifact.get("byte_range")
+            if (
+                not isinstance(byte_range, (list, tuple))
+                or len(byte_range) != 2
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in byte_range)
+            ):
+                self._error(item_path, "byte_range must contain two integers")
+                continue
+            start, end = byte_range
+            if start < 0 or end < start or end > len(content_bytes):
+                self._error(item_path, "byte_range is out of bounds or reversed")
+                continue
+            try:
+                fragment = content_bytes[start:end].decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                self._error(item_path, "byte_range must align to UTF-8 boundaries")
+                continue
+            owner = artifact.get("owner_reference")
+            if not isinstance(owner, Mapping) or self._envelope_errors(owner):
+                self._error(item_path, "owner_reference must be a resolved reference envelope")
+                continue
+            if (
+                str(owner.get("resolution_status") or "") != "resolved"
+                or str(owner.get("resolved_ref") or "") != node_ref
+            ):
+                self._error(item_path, "owner_reference contradicts manifest owner identity")
+                continue
             if _ENVELOPE_SHAPE_KEYS.intersection(artifact) and self._envelope_errors(
                 artifact
             ):
                 continue
-            valid_items.append((artifact, artifact_id))
+            valid_items.append((artifact, artifact_id, fragment))
         if not missing.issubset(referenced) or not truncated.issubset(referenced):
             self._error(path, "contains artifact ids absent from referenced_artifact_ids")
         if referenced != hydrated | missing:
@@ -1126,8 +1223,9 @@ class _ConfirmationFactTreeValidator:
         if missing or truncated or len(valid_items) != len(hydrated_value):
             return
         self.validated_manifests.add(id(value))
-        for artifact, artifact_id in valid_items:
+        for artifact, artifact_id, fragment in valid_items:
             self.hydrated_artifact_nodes.add(id(artifact))
+            self.hydrated_artifact_fragments[id(artifact)] = fragment
             self.hydrated_artifact_refs.add(artifact_id)
             self._register_ref(artifact_id)
             self._register_ref("artifact:{0}".format(artifact_id))
@@ -1364,7 +1462,7 @@ class _ConfirmationFactTreeValidator:
                 errors.append("blocking {0}".format(key))
             elif (
                 key.startswith("missing_")
-                or key.startswith("unresolved_")
+                or (key.startswith("unresolved_") and key != "unresolved_questions")
                 or key.startswith("truncated_")
             ) and isinstance(child, (Mapping, list, tuple, set, str)):
                 errors.append("blocking {0}".format(key))
@@ -1520,6 +1618,41 @@ class _ConfirmationFactTreeValidator:
                         status or "missing status"
                     ),
                 )
+            if status in {"active", "supported", "unresolved"}:
+                required = {
+                    "hypothesis_id",
+                    "hypothesis_semantic_hash",
+                    "claim",
+                    "active_defect",
+                    "candidate_reference",
+                    "supporting_evidence",
+                    "opposing_evidence",
+                    "unresolved_questions",
+                    "counterfactual",
+                }
+                missing = required - set(hypothesis)
+                if missing:
+                    self._error(path, "missing auditable competitor fields {0}".format(
+                        ", ".join(sorted(missing))
+                    ))
+                if not str(hypothesis.get("claim") or "").strip():
+                    self._error(path, "competitor claim must be non-empty")
+                counterfactual = hypothesis.get("counterfactual")
+                if not isinstance(counterfactual, Mapping) or not str(
+                    counterfactual.get("intervention_ref") or ""
+                ).strip():
+                    self._error(path, "competitor counterfactual must be structured")
+                candidate = hypothesis.get("candidate_reference")
+                if not isinstance(candidate, Mapping) or not str(candidate.get("content") or "").strip():
+                    self._error(path, "competitor candidate semantics must be non-empty")
+                for evidence_kind in ("supporting_evidence", "opposing_evidence"):
+                    evidence_items = hypothesis.get(evidence_kind)
+                    if not isinstance(evidence_items, (list, tuple)):
+                        self._error(path, "{0} must be a list".format(evidence_kind))
+                        continue
+                    for item in evidence_items:
+                        if not isinstance(item, Mapping) or not str(item.get("reason") or "").strip():
+                            self._error(path, "{0} requires reasons".format(evidence_kind))
 
     def _collect_candidate_semantics(
         self,
@@ -1530,6 +1663,10 @@ class _ConfirmationFactTreeValidator:
         candidate_local: bool,
     ) -> None:
         if isinstance(value, Mapping):
+            if id(value) in self.hydrated_artifact_fragments:
+                if candidate_local:
+                    fragments.append(self.hydrated_artifact_fragments[id(value)])
+                return
             current_local = candidate_local
             resolved = self.resolved_envelopes.get(id(value))
             if resolved is not None:
@@ -1570,6 +1707,131 @@ class _ConfirmationFactTreeValidator:
                     parent_key=parent_key,
                     candidate_local=candidate_local,
                 )
+
+
+def _open_competitor_ids(request: RootConfirmationRequest) -> Tuple[str, ...]:
+    return tuple(
+        str(item.get("hypothesis_id") or "")
+        for item in request.competing_hypotheses
+        if str(item.get("status") or "").strip().lower()
+        in {"active", "supported", "unresolved"}
+    )
+
+
+def _validate_competitor_comparisons(
+    value: Any,
+    *,
+    request: RootConfirmationRequest,
+    confirmation_status: str,
+    grounded_refs: Set[str],
+) -> Tuple[JsonDict, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("competitor_comparisons must be a list")
+    open_ids = _open_competitor_ids(request)
+    open_competitors = {
+        str(item.get("hypothesis_id") or ""): item
+        for item in request.competing_hypotheses
+        if str(item.get("hypothesis_id") or "") in open_ids
+    }
+    comparisons: List[JsonDict] = []
+    seen: Set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("competitor_comparisons entries must be objects")
+        hypothesis_id = str(item.get("hypothesis_id") or "").strip()
+        if not hypothesis_id or hypothesis_id in seen or hypothesis_id not in open_ids:
+            raise ValueError("competitor_comparisons must bind each open competitor exactly once")
+        seen.add(hypothesis_id)
+        competitor = open_competitors[hypothesis_id]
+        active_defect = competitor.get("active_defect")
+        candidate_reference = competitor.get("candidate_reference")
+        expected_identity = (
+            str(competitor.get("hypothesis_semantic_hash") or ""),
+            str(candidate_reference.get("resolved_ref") or "")
+            if isinstance(candidate_reference, Mapping)
+            else "",
+            str(active_defect.get("fingerprint") or "")
+            if isinstance(active_defect, Mapping)
+            else "",
+        )
+        actual_identity = (
+            str(item.get("hypothesis_semantic_hash") or ""),
+            str(item.get("candidate_ref") or ""),
+            str(item.get("defect_fingerprint") or ""),
+        )
+        if actual_identity != expected_identity:
+            raise ValueError("competitor comparison identity does not match offered facts")
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {"outperformed", "rejected", "co_root", "unresolved"}:
+            raise ValueError("competitor comparison status is invalid")
+        reason = str(item.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("competitor comparison reason must be non-empty")
+        evidence_refs = _validate_evidence_refs(
+            item.get("evidence_refs", []),
+            grounded_refs=grounded_refs,
+            field_name="competitor comparison evidence_refs",
+        )
+        if status != "unresolved" and not evidence_refs:
+            raise ValueError("decisive competitor comparison requires grounded evidence refs")
+        comparisons.append(
+            {
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_semantic_hash": actual_identity[0],
+                "candidate_ref": actual_identity[1],
+                "defect_fingerprint": actual_identity[2],
+                "status": status,
+                "reason": reason,
+                "evidence_refs": list(evidence_refs),
+            }
+        )
+    if set(open_ids) != seen:
+        raise ValueError("competitor_comparisons must cover every open competitor")
+    if confirmation_status == "confirmed" and any(
+        item["status"] == "unresolved" for item in comparisons
+    ):
+        raise ValueError("unresolved competitor blocks confirmed root")
+    return tuple(comparisons)
+
+
+def _validate_factor_mechanism(
+    value: Any,
+    *,
+    role: str,
+    request: RootConfirmationRequest,
+    evidence_refs: Tuple[str, ...],
+) -> JsonDict:
+    if role not in {"contributing_condition", "amplifying_factor"}:
+        if value not in (None, {}, FrozenMapping()):
+            raise ValueError("factor_mechanism is allowed only for a causal factor")
+        return {}
+    if not evidence_refs:
+        raise ValueError("factor role requires grounded factor evidence")
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role requires a structured factor_mechanism")
+    expected_type = (
+        "enabling_condition" if role == "contributing_condition" else "amplification"
+    )
+    mechanism_type = str(value.get("mechanism_type") or "").strip()
+    source_ref = str(value.get("source_ref") or "").strip()
+    target_ref = str(value.get("target_ref") or "").strip()
+    effect = str(value.get("effect") or "").strip()
+    if mechanism_type != expected_type:
+        raise ValueError("factor mechanism_type contradicts factor role")
+    if source_ref != request.candidate_ref:
+        raise ValueError("factor mechanism source_ref must match candidate")
+    if target_ref not in request.recursive_path:
+        raise ValueError("factor mechanism target_ref must be grounded in recursive path")
+    if source_ref not in evidence_refs or target_ref not in evidence_refs:
+        raise ValueError("factor evidence must ground both mechanism source and target")
+    if not effect:
+        raise ValueError("factor mechanism effect must be non-empty")
+    return {
+        "mechanism_type": mechanism_type,
+        "source_ref": source_ref,
+        "target_ref": target_ref,
+        "effect": effect,
+    }
 
 
 def validate_recursive_confirmation(
@@ -1653,6 +1915,18 @@ def validate_recursive_confirmation(
         raise ValueError(
             "factor_role is inconsistent with confirmation status={0}".format(status)
         )
+    competitor_comparisons = _validate_competitor_comparisons(
+        value.get("competitor_comparisons", []),
+        request=request,
+        confirmation_status=status,
+        grounded_refs=fact_tree.grounded_refs,
+    )
+    factor_mechanism = _validate_factor_mechanism(
+        value.get("factor_mechanism", {}),
+        role=factor_role,
+        request=request,
+        evidence_refs=evidence_refs,
+    )
     counterfactual = (
         "replace_with_semantically_correct_behavior({0}) predicts defect_status={1}; "
         "causal_effect={2}"
@@ -1678,9 +1952,12 @@ def validate_recursive_confirmation(
         evidence_refs=evidence_refs,
         counterfactual_status=counterfactual_status,
         hypothesis_id=request.hypothesis_id,
+        hypothesis_semantic_hash=request.hypothesis_semantic_hash,
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
         factor_role=factor_role,
+        competitor_comparisons=competitor_comparisons,
+        factor_mechanism=factor_mechanism,
     )
 
 
@@ -1703,6 +1980,11 @@ def bind_root_confirmation(
     if confirmation.hypothesis_id and confirmation.hypothesis_id != request.hypothesis_id:
         raise ValueError("confirmation is cross-bound to another hypothesis")
     if (
+        confirmation.hypothesis_semantic_hash
+        and confirmation.hypothesis_semantic_hash != request.hypothesis_semantic_hash
+    ):
+        raise ValueError("confirmation is cross-bound to another hypothesis semantic hash")
+    if (
         confirmation.defect_fingerprint
         and confirmation.defect_fingerprint != request.defect_state.fingerprint
     ):
@@ -1721,6 +2003,12 @@ def bind_root_confirmation(
     }[confirmation.status]
     if confirmation.factor_role not in allowed_factor_roles:
         raise ValueError("confirmation factor_role contradicts its status")
+    competitor_comparisons = _validate_competitor_comparisons(
+        confirmation.competitor_comparisons,
+        request=request,
+        confirmation_status=confirmation.status,
+        grounded_refs=facts.grounded_refs,
+    )
     if confirmation.status == "confirmed":
         if confirmation.counterfactual_status != "supports_causality":
             raise ValueError("confirmed root requires a causality-supporting counterfactual")
@@ -1740,6 +2028,12 @@ def bind_root_confirmation(
             grounded_refs=facts.grounded_refs,
             field_name="root confirmation evidence_refs",
         )
+    factor_mechanism = _validate_factor_mechanism(
+        confirmation.factor_mechanism,
+        role=confirmation.factor_role,
+        request=request,
+        evidence_refs=evidence_refs,
+    )
     return RootConfirmation(
         candidate_ref=confirmation.candidate_ref,
         status=confirmation.status,
@@ -1750,9 +2044,12 @@ def bind_root_confirmation(
         evidence_refs=evidence_refs,
         counterfactual_status=confirmation.counterfactual_status,
         hypothesis_id=request.hypothesis_id,
+        hypothesis_semantic_hash=request.hypothesis_semantic_hash,
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
         factor_role=confirmation.factor_role,
+        competitor_comparisons=competitor_comparisons,
+        factor_mechanism=factor_mechanism,
     )
 
 
@@ -1767,6 +2064,7 @@ class _RequestOutcome:
     payload: Optional[JsonDict]
     error_kind: str = ""
     error_detail: str = ""
+    physical_requests: int = 0
 
 
 class ClaudeCausalJudge(BoundedJudgeCapability):
@@ -1775,14 +2073,14 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
         self.cache = cache
 
     def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
-        return self.judge_step_bounded(request, max_physical_requests=None)
+        return self.judge_step_bounded(request, max_physical_requests=None).value
 
     def judge_step_bounded(
         self,
         request: CausalStepRequest,
         *,
         max_physical_requests: Optional[int],
-    ) -> CausalStepJudgment:
+    ) -> BoundedJudgeCallResult:
         prompt = build_causal_step_prompt(request)
         outcome = self._request_validated(
             stage="recursive_causal_step",
@@ -1796,9 +2094,12 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
-            return causal_step_from_payload(outcome.payload, request=request)
+            return BoundedJudgeCallResult(
+                causal_step_from_payload(outcome.payload, request=request),
+                outcome.physical_requests,
+            )
         detail = "judge_{0}: {1}".format(outcome.error_kind or "error", outcome.error_detail)
-        return CausalStepJudgment(
+        return BoundedJudgeCallResult(CausalStepJudgment(
             current_node_ref=request.current_node.ref,
             current_defect_status="unknown",
             current_defect_reason="The causal relation judge could not produce a validated result.",
@@ -1807,23 +2108,26 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             missing_evidence=(detail,),
             suggested_investigation={"kind": "judge_retry", "reason": detail},
             confidence=0.0,
-        )
+        ), outcome.physical_requests)
 
     def confirm_candidate(self, request: RootConfirmationRequest) -> RootConfirmation:
-        return self.confirm_candidate_bounded(request, max_physical_requests=None)
+        return self.confirm_candidate_bounded(request, max_physical_requests=None).value
 
     def confirm_candidate_bounded(
         self,
         request: RootConfirmationRequest,
         *,
         max_physical_requests: Optional[int],
-    ) -> RootConfirmation:
+    ) -> BoundedJudgeCallResult:
         try:
             _ConfirmationFactTreeValidator(request).validate()
         except (TypeError, ValueError) as exc:
-            return RootConfirmation.unknown(
-                request.candidate_ref,
-                "Judge request_ineligible: {0}: {1}".format(type(exc).__name__, exc),
+            return BoundedJudgeCallResult(
+                RootConfirmation.unknown(
+                    request.candidate_ref,
+                    "Judge request_ineligible: {0}: {1}".format(type(exc).__name__, exc),
+                ),
+                0,
             )
         prompt = build_recursive_confirmation_prompt(request)
         outcome = self._request_validated(
@@ -1832,16 +2136,22 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             system=ROOT_CONFIRMATION_SYSTEM_PROMPT,
             prompt=prompt,
             node_ref=request.candidate_ref,
-            request_context=request.to_dict(),
+            request_context=request.factual_dict(),
             validator=lambda value: validate_recursive_confirmation(value, request=request),
             max_tokens=min(int(getattr(self.transport, "max_tokens", 4096)), 2048),
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
-            return root_confirmation_from_payload(outcome.payload, request=request)
-        return RootConfirmation.unknown(
-            request.candidate_ref,
-            "Judge {0}: {1}".format(outcome.error_kind or "error", outcome.error_detail),
+            return BoundedJudgeCallResult(
+                root_confirmation_from_payload(outcome.payload, request=request),
+                outcome.physical_requests,
+            )
+        return BoundedJudgeCallResult(
+            RootConfirmation.unknown(
+                request.candidate_ref,
+                "Judge {0}: {1}".format(outcome.error_kind or "error", outcome.error_detail),
+            ),
+            outcome.physical_requests,
         )
 
     def _request_validated(
@@ -1878,7 +2188,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
         )
         cached = self.cache.get_validated_payload(key=cache_key, validator=validator)
         if cached is not None:
-            return _RequestOutcome(cached)
+            return _RequestOutcome(cached, physical_requests=0)
         remaining_requests = (
             None
             if max_physical_requests is None
@@ -1889,10 +2199,12 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 None,
                 "request_budget_exhausted",
                 "judge_request_budget_exhausted before initial request",
+                0,
             )
         if remaining_requests is not None:
             remaining_requests -= 1
         messages = [{"role": "user", "content": prompt}]
+        physical_requests = 1
         try:
             text = self.transport.create_message_text(
                 system=system,
@@ -1900,7 +2212,12 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 max_tokens=max_tokens,
             )
         except (JudgeProviderError, JudgeProviderUnavailable) as exc:
-            return _RequestOutcome(None, "provider_error", "{0}: {1}".format(type(exc).__name__, exc))
+            return _RequestOutcome(
+                None,
+                "provider_error",
+                "{0}: {1}".format(type(exc).__name__, exc),
+                physical_requests,
+            )
         try:
             payload = _parse_single_json_object(text)
             validator(payload)
@@ -1913,9 +2230,11 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                     "{0}; judge_request_budget_exhausted before focused repair".format(
                         exact_error
                     ),
+                    physical_requests,
                 )
             if remaining_requests is not None:
                 remaining_requests -= 1
+            physical_requests += 1
             try:
                 repaired = self.transport.create_message_text(
                     system=REPAIR_SYSTEM_PROMPT,
@@ -1944,6 +2263,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                     "{0}; repair provider error: {1}: {2}".format(
                         exact_error, type(exc).__name__, exc
                     ),
+                    physical_requests,
                 )
             try:
                 payload = _parse_single_json_object(repaired)
@@ -1955,6 +2275,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                     "{0}; focused repair invalid: {1}: {2}".format(
                         exact_error, type(repair_error).__name__, repair_error
                     ),
+                    physical_requests,
                 )
         self.cache.put_payload(
             key=cache_key,
@@ -1963,7 +2284,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             node_ref=node_ref,
             payload=payload,
         )
-        return _RequestOutcome(payload)
+        return _RequestOutcome(payload, physical_requests=physical_requests)
 
 
 def _parse_single_json_object(text: str) -> JsonDict:
@@ -1974,6 +2295,8 @@ def _parse_single_json_object(text: str) -> JsonDict:
 
 
 __all__ = [
+    "BoundedJudgeCallResult",
+    "BoundedJudgeCapability",
     "CAUSAL_STEP_PROMPT_SCHEMA_VERSION",
     "CAUSAL_STEP_SYSTEM_PROMPT",
     "ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION",

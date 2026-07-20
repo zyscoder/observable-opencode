@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
     BoundedJudgeCapability,
     OfflineJudgeCapability,
 )
@@ -1497,7 +1498,7 @@ class AnalyzerInvestigationTest(unittest.TestCase):
 
             def judge_step_bounded(self, request, *, max_physical_requests):
                 self.requests.append(request)
-                return self.responses.pop(0)
+                return BoundedJudgeCallResult(self.responses.pop(0), 0)
 
         report = AgenticRecursiveAnalyzer(judge=CachedBoundedJudge()).analyze(
             self.graph,

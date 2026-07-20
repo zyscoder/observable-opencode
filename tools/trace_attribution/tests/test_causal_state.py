@@ -1,5 +1,6 @@
 import math
 import unittest
+from dataclasses import replace
 
 from trace_attribution.causal_state import (
     AttributionHypothesis,
@@ -57,6 +58,103 @@ def confirmation_for(root):
 
 
 class CausalStateTest(unittest.TestCase):
+    def test_report_keeps_distinct_confirmation_identities_on_same_node(self):
+        defect = sample_defect_state()
+        path = ("record:decision", "record:change")
+        confirmed = replace(
+            RootConfirmation.confirmed(
+                "record:decision",
+                excerpt="The decision ended discovery.",
+                reason="The first hypothesis is causal.",
+                counterfactual="Correcting it prevents the defect.",
+                confidence=0.9,
+                evidence_refs=["record:decision"],
+            ),
+            hypothesis_id="hyp:first",
+            hypothesis_semantic_hash="semantic:first",
+            defect_fingerprint=defect.fingerprint,
+            recursive_path=path,
+        )
+        rejected = replace(
+            RootConfirmation.rejected("record:decision", "The second claim is weaker."),
+            hypothesis_id="hyp:second",
+            hypothesis_semantic_hash="semantic:second",
+            defect_fingerprint=defect.fingerprint,
+            recursive_path=path,
+        )
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=defect,
+            reason=confirmed.reason,
+            counterfactual=confirmed.counterfactual,
+            confidence=confirmed.confidence,
+            hypothesis_id="hyp:first",
+            recursive_path=path,
+            confirmation=confirmed.to_dict(),
+        )
+
+        report = RecursiveAttributionReport(
+            case_id="multi-identity",
+            objective="Find roots.",
+            confirmations=[confirmed, rejected],
+            confirmed_roots=[root],
+        )
+
+        self.assertEqual(report.analysis_outcome, "root_found")
+        self.assertEqual(report.metadata["confirmation_node_summary"]["record:decision"]["status"], "mixed")
+
+    def test_legacy_root_causes_require_explicit_independent_confirmation_migration(self):
+        with self.assertRaisesRegex(ValueError, "legacy root_causes.*independent confirmation"):
+            RecursiveAttributionReport.from_dict({
+                "case_id": "legacy",
+                "objective": "Find root.",
+                "root_causes": [{
+                    "node_ref": "record:decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "reason": "Legacy root.",
+                    "confidence": 0.9,
+                }],
+            })
+
+    def test_modern_confirmation_roundtrip_rejects_forged_full_identity(self):
+        confirmation = replace(
+            RootConfirmation.confirmed(
+                "record:decision",
+                excerpt="The decision is causal.",
+                reason="Evidence is complete.",
+                counterfactual="Correcting it prevents the defect.",
+                confidence=0.9,
+                evidence_refs=["record:decision"],
+            ),
+            hypothesis_id="hyp:one",
+            hypothesis_semantic_hash="semantic:one",
+            defect_fingerprint=sample_defect_state().fingerprint,
+            recursive_path=("record:decision", "record:change"),
+        )
+        payload = confirmation.to_dict()
+        self.assertEqual(RootConfirmation.from_dict(payload), confirmation)
+        payload["confirmation_identity"] = "confirmation:forged"
+        with self.assertRaisesRegex(ValueError, "confirmation_identity"):
+            RootConfirmation.from_dict(payload)
+
+        root = ConfirmedRoot(
+            node_ref=confirmation.candidate_ref,
+            defect_state=sample_defect_state(),
+            reason="Candidate is causal.",
+            counterfactual="Correcting it prevents the defect.",
+            confidence=0.9,
+            hypothesis_id="hyp:foreign",
+            recursive_path=confirmation.recursive_path,
+            confirmation=confirmation.to_dict(),
+        )
+        with self.assertRaisesRegex(ValueError, "root confirmation identity"):
+            RecursiveAttributionReport(
+                case_id="forged-root",
+                objective="Find roots.",
+                confirmations=[confirmation],
+                confirmed_roots=[root],
+            )
     def test_legacy_direct_confirmation_infers_structured_counterfactual_status(self):
         confirmation = RootConfirmation(
             candidate_ref="record:decision",
@@ -387,7 +485,7 @@ class CausalStateTest(unittest.TestCase):
         )
         self.assertEqual(partial.analysis_outcome, "inconclusive")
 
-    def test_report_rejects_confirmed_root_and_unresolved_ref_overlap(self):
+    def test_report_allows_node_level_mixed_outcomes_without_cross_closing_identity(self):
         root = ConfirmedRoot(
             node_ref="record:decision",
             defect_state=sample_defect_state(),
@@ -395,13 +493,20 @@ class CausalStateTest(unittest.TestCase):
             counterfactual="Searching call sites would reveal the contract.",
             confidence=0.9,
         )
-        with self.assertRaisesRegex(ValueError, "both confirmed and unresolved"):
-            RecursiveAttributionReport(
-                case_id="contradictory",
-                objective="Find the root.",
-                confirmed_roots=[root],
-                unresolved_refs=[root.node_ref],
-            )
+        report = RecursiveAttributionReport(
+            case_id="mixed-identities",
+            objective="Find the root.",
+            confirmed_roots=[root],
+            confirmations=[
+                confirmation_for(root),
+                replace(
+                    RootConfirmation.unknown(root.node_ref, "A separate hypothesis is unresolved."),
+                    hypothesis_id="hyp:other",
+                ),
+            ],
+            unresolved_refs=[root.node_ref],
+        )
+        self.assertEqual(report.analysis_outcome, "partial_root_found")
 
     def test_report_requires_confirmed_root_confirmation(self):
         root = ConfirmedRoot(

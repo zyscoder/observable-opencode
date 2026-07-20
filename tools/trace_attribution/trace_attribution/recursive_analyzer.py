@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .causal_judge import (
+    BoundedJudgeCallResult,
     BoundedJudgeCapability,
     CausalJudge,
     CausalStepRequest,
@@ -157,13 +159,6 @@ def _judge_transport(judge: CausalJudge) -> Any:
     return getattr(judge, "transport", judge)
 
 
-def _judge_request_count(judge: CausalJudge) -> Optional[int]:
-    if isinstance(judge, OfflineJudgeCapability):
-        return 0
-    value = getattr(_judge_transport(judge), "request_count", None)
-    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _provider_circuit(judge: CausalJudge) -> JsonDict:
     target = _judge_transport(judge)
     stats = getattr(target, "provider_circuit_stats", None)
@@ -249,8 +244,12 @@ def _artifact_hydration_manifest(node: TraceNode) -> Optional[JsonDict]:
             {
                 "artifact_id": artifact_id,
                 "content": content,
-                "content_hash": str(artifact.get("hash") or hashlib.sha256(content.encode("utf-8")).hexdigest()),
+                "content_hash": "sha256:{0}".format(
+                    hashlib.sha256(content.encode("utf-8")).hexdigest()
+                ),
+                "byte_count": len(content.encode("utf-8")),
                 "byte_range": [0, len(content.encode("utf-8"))],
+                "owner_reference": _reference_envelope(node.ref),
                 "missing": False,
                 "truncated": is_truncated,
             }
@@ -267,10 +266,44 @@ def _artifact_hydration_manifest(node: TraceNode) -> Optional[JsonDict]:
 
 
 def _perspective_tokens(value: str) -> Set[str]:
-    return {
-        token.casefold()
-        for token in re.findall(r"[A-Za-z0-9_]{3,}", value)
-    }
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    output: Set[str] = set()
+    word: List[str] = []
+
+    def flush_word() -> None:
+        if word:
+            token = "".join(word)
+            if len(token) >= 2:
+                output.add(token)
+            word.clear()
+
+    cjk_run: List[str] = []
+    for char in normalized:
+        if "\u3400" <= char <= "\u9fff":
+            flush_word()
+            cjk_run.append(char)
+            continue
+        if cjk_run:
+            output.update(cjk_run)
+            output.update(
+                "".join(cjk_run[index : index + size])
+                for size in (2, 3, 4)
+                for index in range(max(0, len(cjk_run) - size + 1))
+            )
+            cjk_run.clear()
+        if char.isalnum() or char == "_":
+            word.append(char)
+        else:
+            flush_word()
+    flush_word()
+    if cjk_run:
+        output.update(cjk_run)
+        output.update(
+            "".join(cjk_run[index : index + size])
+            for size in (2, 3, 4)
+            for index in range(max(0, len(cjk_run) - size + 1))
+        )
+    return output
 
 
 def _rejudge_success_terminal_state(
@@ -1232,24 +1265,26 @@ class AgenticRecursiveAnalyzer:
                     "The Judge exposes neither a bounded transport capability nor an explicit zero-transport capability.",
                 )
                 continue
-            before = _judge_request_count(self.judge)
             state.logical_judge_calls += 1
+            physical_delta = 0
             try:
                 if bounded_judge:
-                    judgment = self.judge.judge_step_bounded(
+                    bounded_result = self.judge.judge_step_bounded(
                         request,
                         max_physical_requests=remaining_requests,
                     )
+                    if not isinstance(bounded_result, BoundedJudgeCallResult):
+                        raise TypeError(
+                            "bounded Judge must return BoundedJudgeCallResult"
+                        )
+                    physical_delta = bounded_result.physical_requests
+                    if physical_delta > remaining_requests:
+                        raise ValueError("bounded Judge exceeded its physical request allowance")
+                    judgment = bounded_result.value
                 else:
                     judgment = self.judge.judge_step_offline(request)
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
-                after = _judge_request_count(self.judge)
-                physical_delta = (
-                    max(0, after - before)
-                    if before is not None and after is not None
-                    else None
-                )
-                state.judge_requests += physical_delta or 0
+                state.judge_requests += physical_delta
                 state.complete_rejudge(
                     item,
                     terminal_state=(
@@ -1272,13 +1307,7 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             except Exception as exc:
-                after = _judge_request_count(self.judge)
-                physical_delta = (
-                    max(0, after - before)
-                    if before is not None and after is not None
-                    else None
-                )
-                state.judge_requests += physical_delta or 0
+                state.judge_requests += physical_delta
                 state.complete_rejudge(
                     item,
                     terminal_state="judge_error",
@@ -1291,13 +1320,7 @@ class AgenticRecursiveAnalyzer:
                     "{0}: {1}".format(type(exc).__name__, exc),
                 )
                 continue
-            after = _judge_request_count(self.judge)
-            physical_delta = (
-                max(0, after - before)
-                if before is not None and after is not None
-                else None
-            )
-            state.judge_requests += physical_delta or 0
+            state.judge_requests += physical_delta
             if not isinstance(judgment, CausalStepJudgment):
                 detail = "Judge returned {0}, expected CausalStepJudgment.".format(
                     type(judgment).__name__
@@ -1421,14 +1444,22 @@ class AgenticRecursiveAnalyzer:
                 continue
 
             remaining = max(0, self.max_judge_requests - state.judge_requests)
-            before = _judge_request_count(self.judge)
             state.logical_judge_calls += 1
             state.logical_confirmation_calls += 1
+            physical_delta = 0
             try:
                 if bounded_judge:
-                    raw = self.judge.confirm_candidate_bounded(
+                    bounded_result = self.judge.confirm_candidate_bounded(
                         request, max_physical_requests=remaining
                     )
+                    if not isinstance(bounded_result, BoundedJudgeCallResult):
+                        raise TypeError(
+                            "bounded Judge must return BoundedJudgeCallResult"
+                        )
+                    physical_delta = bounded_result.physical_requests
+                    if physical_delta > remaining:
+                        raise ValueError("bounded Judge exceeded its physical request allowance")
+                    raw = bounded_result.value
                 else:
                     raw = self.judge.confirm_candidate_offline(request)
                 if not isinstance(raw, RootConfirmation):
@@ -1460,12 +1491,6 @@ class AgenticRecursiveAnalyzer:
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
                 )
-            after = _judge_request_count(self.judge)
-            physical_delta = (
-                max(0, after - before)
-                if before is not None and after is not None
-                else 0
-            )
             state.judge_requests += physical_delta
             normalized_reason = confirmation.reason.casefold()
             if any(
@@ -1492,7 +1517,47 @@ class AgenticRecursiveAnalyzer:
                         )
                         break
 
+        self._reconcile_competing_confirmations(state)
         self._rank_confirmed_roots(state)
+
+    def _reconcile_competing_confirmations(self, state: RecursiveAnalysisState) -> None:
+        confirmed_hypotheses = {
+            item.hypothesis_id
+            for item in state.confirmations
+            if item.status == "confirmed" and item.hypothesis_id
+        }
+        blocked_hypotheses: Set[str] = set()
+        for confirmation in state.confirmations:
+            if confirmation.status != "confirmed":
+                continue
+            required_co_roots = {
+                str(item.get("hypothesis_id") or "")
+                for item in confirmation.competitor_comparisons
+                if str(item.get("status") or "") == "co_root"
+            }
+            if not required_co_roots.issubset(confirmed_hypotheses):
+                blocked_hypotheses.add(confirmation.hypothesis_id)
+        if not blocked_hypotheses:
+            return
+        retained: List[ConfirmedRoot] = []
+        for root in state.confirmed_roots:
+            if root.hypothesis_id not in blocked_hypotheses:
+                retained.append(root)
+                continue
+            state.unresolved_hypothesis_ids.add(root.hypothesis_id)
+            if root.node_ref not in state.unresolved_refs:
+                state.unresolved_refs.append(root.node_ref)
+            state.unresolved_branches.append(
+                {
+                    "node_ref": root.node_ref,
+                    "defect_state_id": root.defect_state.defect_state_id,
+                    "hypothesis_id": root.hypothesis_id,
+                    "reason": "co_root_confirmation_incomplete",
+                    "details": "A declared co-root lacks its own independent confirmation.",
+                    "depth": max(0, len(root.recursive_path) - 1),
+                }
+            )
+        state.confirmed_roots = retained
 
     def _build_confirmation_request(
         self, state: RecursiveAnalysisState, queued: Mapping[str, Any]
@@ -1586,18 +1651,61 @@ class AgenticRecursiveAnalyzer:
                 raise ValueError("competing hypothesis candidate is unresolved")
             support = value.get("supporting_evidence") or []
             opposition = value.get("opposing_evidence") or []
-            evidence_refs = [
-                str(item.get("ref") or "")
-                for item in [*support, *opposition]
-                if isinstance(item, Mapping) and item.get("ref")
-            ]
+
+            def competitor_evidence(items: Any, kind: str) -> List[JsonDict]:
+                output: List[JsonDict] = []
+                for item in items if isinstance(items, (list, tuple)) else ():
+                    if not isinstance(item, Mapping):
+                        continue
+                    ref = str(item.get("ref") or "")
+                    resolved_ref = state.graph.resolve(ref)
+                    if not resolved_ref or resolved_ref not in state.graph.nodes:
+                        raise ValueError("competing hypothesis evidence is unresolved")
+                    output.append(
+                        {
+                            "reason": str(item.get("reason") or ""),
+                            "confidence": float(item.get("confidence", 0.0)),
+                            "evidence_reference": _reference_envelope(
+                                resolved_ref,
+                                content=_node_semantic_content(
+                                    state.graph.hydrate_node(resolved_ref)
+                                ),
+                                fact_kind=kind,
+                            ),
+                        }
+                    )
+                return output
+
+            competitor_fingerprint = str(value.get("active_defect_fingerprint") or "")
+            competitor_defect = state.defect_states.get(competitor_fingerprint)
+            if competitor_defect is None:
+                raise ValueError("competing hypothesis defect is unresolved")
             competitors.append(
                 {
                     "hypothesis_id": str(value.get("hypothesis_id") or ""),
+                    "hypothesis_semantic_hash": str(value.get("semantic_hash") or ""),
                     "status": str(value.get("status") or "unresolved"),
-                    "candidate_reference": _reference_envelope(resolved),
-                    "evidence_references": list(
-                        evidence_facts(evidence_refs, "competing_hypothesis_evidence")
+                    "claim": str(value.get("claim") or ""),
+                    "active_defect": competitor_defect.to_dict(),
+                    "candidate_reference": _reference_envelope(
+                        resolved,
+                        content=_node_semantic_content(state.graph.hydrate_node(resolved)),
+                        fact_kind="competing_hypothesis_candidate",
+                    ),
+                    "supporting_evidence": competitor_evidence(
+                        support, "competing_hypothesis_support"
+                    ),
+                    "opposing_evidence": competitor_evidence(
+                        opposition, "competing_hypothesis_opposition"
+                    ),
+                    "unresolved_questions": list(value.get("unresolved_questions") or ()),
+                    "counterfactual": copy.deepcopy(
+                        value.get("counterfactual")
+                        or {
+                            "intervention_ref": resolved,
+                            "intervention_kind": "replace_with_semantically_correct_behavior",
+                            "causal_question": "Would this intervention prevent the active defect?",
+                        }
                     ),
                 }
             )
@@ -1635,7 +1743,7 @@ class AgenticRecursiveAnalyzer:
             ),
             competing_hypotheses=tuple(competitors),
             task_obligations=tuple(obligations),
-            analysis_perspective=state.analysis_perspective,
+            analysis_perspective="",
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis.semantic_hash,
         )
@@ -1719,7 +1827,11 @@ class AgenticRecursiveAnalyzer:
             }:
                 factor = CausalFactor(
                     node_ref=confirmation.candidate_ref,
-                    relation="contributing_condition",
+                    relation=(
+                        "amplifying_factor"
+                        if confirmation.factor_role == "amplifying_factor"
+                        else "contributing_condition"
+                    ),
                     reason=confirmation.reason,
                     confidence=confirmation.confidence,
                     evidence_refs=confirmation.evidence_refs,
@@ -1734,6 +1846,7 @@ class AgenticRecursiveAnalyzer:
                         "confirmation_semantic_identity": queued.get("semantic_identity"),
                         "defect_fingerprint": confirmation.defect_fingerprint,
                     },
+                    mechanism=dict(confirmation.factor_mechanism),
                 )
                 if confirmation.factor_role == "amplifying_factor":
                     state.amplifying_factors.append(factor)
@@ -1786,7 +1899,7 @@ class AgenticRecursiveAnalyzer:
     def _rank_confirmed_roots(self, state: RecursiveAnalysisState) -> None:
         perspective = _perspective_tokens(state.analysis_perspective)
 
-        def rank(root: ConfirmedRoot) -> Tuple[int, float, int, int, str]:
+        def rank(root: ConfirmedRoot) -> Tuple[int, float, int, int, str, str]:
             node = state.graph.nodes[root.node_ref]
             semantic_tokens = _perspective_tokens(_node_semantic_content(node))
             return (
@@ -1795,6 +1908,7 @@ class AgenticRecursiveAnalyzer:
                 len(root.recursive_path),
                 state.graph.position(root.node_ref),
                 root.node_ref,
+                root.hypothesis_id,
             )
 
         ordered = sorted(state.confirmed_roots, key=rank)

@@ -2,6 +2,7 @@
 
 from .analyzer import BackwardTaintAnalyzer
 from .causal_judge import (
+    BoundedJudgeCallResult,
     BoundedJudgeCapability,
     OfflineCausalJudgeAdapter,
     OfflineJudgeCapability,
@@ -39,6 +40,7 @@ __all__ = [
     "AgenticRecursiveAnalyzer",
     "BackwardTaintAnalyzer",
     "BoundedJudgeCapability",
+    "BoundedJudgeCallResult",
     "CausalCandidate",
     "CausalFactor",
     "CausalInvestigationTools",

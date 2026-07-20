@@ -9,6 +9,7 @@ from pathlib import Path
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
     BoundedJudgeCapability,
     ClaudeCausalJudge,
     OfflineCausalJudgeAdapter,
@@ -183,7 +184,58 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
 
     def confirm_candidate(self, request):
         self.confirmation_requests.append(request)
-        return self.confirmations[request.candidate_ref]
+        result = self.confirmations[request.candidate_ref]
+        if request.competing_hypotheses and not result.competitor_comparisons:
+            result = replace(
+                result,
+                competitor_comparisons=tuple(
+                    {
+                        "hypothesis_id": item["hypothesis_id"],
+                        "hypothesis_semantic_hash": item["hypothesis_semantic_hash"],
+                        "candidate_ref": item["candidate_reference"]["resolved_ref"],
+                        "defect_fingerprint": item["active_defect"]["fingerprint"],
+                        "status": (
+                            "co_root"
+                            if result.status == "confirmed"
+                            and (
+                                (
+                                    item["candidate_reference"]["resolved_ref"] in self.confirmations
+                                    and self.confirmations[
+                                        item["candidate_reference"]["resolved_ref"]
+                                    ].status == "confirmed"
+                                )
+                                or item["candidate_reference"]["resolved_ref"]
+                                in getattr(self, "force_co_root_candidates", set())
+                            )
+                            else "outperformed"
+                        ),
+                        "reason": "The independent verifier compared this alternative.",
+                        "evidence_refs": [item["candidate_reference"]["resolved_ref"]],
+                    }
+                    for item in request.competing_hypotheses
+                    if item["status"] in {"active", "supported", "unresolved"}
+                ),
+            )
+        if result.factor_role in {"contributing_condition", "amplifying_factor"}:
+            result = replace(
+                result,
+                evidence_refs=tuple(dict.fromkeys((
+                    *result.evidence_refs,
+                    request.candidate_ref,
+                    request.recursive_path[-1],
+                ))),
+                factor_mechanism={
+                    "mechanism_type": (
+                        "amplification"
+                        if result.factor_role == "amplifying_factor"
+                        else "enabling_condition"
+                    ),
+                    "source_ref": request.candidate_ref,
+                    "target_ref": request.recursive_path[-1],
+                    "effect": "The factor changes defect exposure without independently causing it.",
+                },
+            )
+        return result
 
 
 class BoundedConfirmingJudge(BoundedJudgeCapability):
@@ -195,32 +247,80 @@ class BoundedConfirmingJudge(BoundedJudgeCapability):
     def judge_step_bounded(self, request, *, max_physical_requests):
         self.step_allowances.append(max_physical_requests)
         if not max_physical_requests:
-            return step(
-                request.current_node.ref,
-                status="unknown",
-                missing=("judge_request_budget_exhausted",),
+            return BoundedJudgeCallResult(
+                step(
+                    request.current_node.ref,
+                    status="unknown",
+                    missing=("judge_request_budget_exhausted",),
+                ),
+                0,
             )
         self.transport.request_count += 1
-        return RecursiveRootRankingTest._confirmation_step(request)
+        return BoundedJudgeCallResult(
+            RecursiveRootRankingTest._confirmation_step(request), 1
+        )
 
     def confirm_candidate_bounded(self, request, *, max_physical_requests):
         self.confirmation_allowances.append(max_physical_requests)
         if not max_physical_requests:
-            return RootConfirmation.unknown(
-                request.candidate_ref, "judge_request_budget_exhausted"
+            return BoundedJudgeCallResult(
+                RootConfirmation.unknown(
+                    request.candidate_ref, "judge_request_budget_exhausted"
+                ),
+                0,
             )
         self.transport.request_count += 1
         node_content = request.candidate_reference["content"]
         excerpt = "The decision is incomplete."
         if excerpt not in node_content:
             excerpt = "premature closure"
-        return RootConfirmation.confirmed(
-            request.candidate_ref,
-            excerpt=excerpt,
-            reason="The candidate contains the tracked defect.",
-            counterfactual="Correcting the candidate prevents the defect.",
-            confidence=0.9,
-            evidence_refs=[request.candidate_ref],
+        return BoundedJudgeCallResult(
+            RootConfirmation.confirmed(
+                request.candidate_ref,
+                excerpt=excerpt,
+                reason="The candidate contains the tracked defect.",
+                counterfactual="Correcting the candidate prevents the defect.",
+                confidence=0.9,
+                evidence_refs=[request.candidate_ref],
+            ),
+            1,
+        )
+
+
+class CounterlessBoundedConfirmingJudge(BoundedJudgeCapability):
+    def __init__(self):
+        self.physical_calls = 0
+        self.allowances = []
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.allowances.append(("step", max_physical_requests))
+        if not max_physical_requests:
+            return BoundedJudgeCallResult(
+                step(request.current_node.ref, status="unknown", missing=("budget_exhausted",)),
+                0,
+            )
+        self.physical_calls += 1
+        return BoundedJudgeCallResult(
+            RecursiveRootRankingTest._confirmation_step(request), 1
+        )
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        self.allowances.append(("confirmation", max_physical_requests))
+        if not max_physical_requests:
+            return BoundedJudgeCallResult(
+                RootConfirmation.unknown(request.candidate_ref, "budget_exhausted"), 0
+            )
+        self.physical_calls += 1
+        return BoundedJudgeCallResult(
+            RootConfirmation.confirmed(
+                request.candidate_ref,
+                excerpt="The decision is incomplete.",
+                reason="The candidate contains the tracked defect.",
+                counterfactual="Correcting it prevents the defect.",
+                confidence=0.9,
+                evidence_refs=[request.candidate_ref],
+            ),
+            1,
         )
 
 
@@ -1077,7 +1177,6 @@ class RecursiveRootRankingTest(unittest.TestCase):
                 )
             },
         )
-
         report = AgenticRecursiveAnalyzer(judge=judge).analyze(
             TraceGraph.from_trace(single_node_trace()),
             start_refs=["record:only"],
@@ -1208,6 +1307,20 @@ class RecursiveRootRankingTest(unittest.TestCase):
         self.assertEqual([item.node_ref for item in confirmed.confirmed_roots], ["record:only"])
         self.assertEqual(confirmed.metadata["judge_request_count"], 2)
 
+    def test_global_budget_uses_explicit_physical_delta_without_transport_counter(self):
+        judge = CounterlessBoundedConfirmingJudge()
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=1).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(judge.allowances, [("step", 1), ("confirmation", 0)])
+        self.assertEqual(judge.physical_calls, 1)
+        self.assertEqual(report.metadata["judge_request_count"], 1)
+        self.assertEqual(report.confirmed_roots, ())
+
     def test_multiple_independently_confirmed_roots_are_ranked_deterministically(self):
         judge = ConfirmingScriptedJudge(
             {
@@ -1253,6 +1366,45 @@ class RecursiveRootRankingTest(unittest.TestCase):
             [item["node_ref"] for item in report.to_dict()["root_causes"]],
             ["record:decision", "record:context"],
         )
+
+    def test_declared_co_root_blocks_single_root_until_competitor_is_independently_confirmed(self):
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+                "record:context": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision requires its co-root alternative.",
+                    counterfactual="Correcting both prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                ),
+                "record:context": RootConfirmation.unknown(
+                    "record:context", "The alternative lacks decisive evidence."
+                ),
+            },
+        )
+        judge.force_co_root_candidates = {"record:context"}
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find every necessary cause.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
 
     def test_confirmation_cannot_cross_bind_hypothesis_defect_or_path_identity(self):
         forged = replace(
@@ -1321,9 +1473,69 @@ class RecursiveRootRankingTest(unittest.TestCase):
         ]
         hydrated = manifest["hydrated_artifacts"][0]
         self.assertEqual(hydrated["artifact_id"], "decision-evidence")
-        self.assertEqual(hydrated["content_hash"], "sha256:decision-evidence")
+        import hashlib
+        self.assertEqual(
+            hydrated["content_hash"],
+            "sha256:" + hashlib.sha256(artifact_text.encode("utf-8")).hexdigest(),
+        )
         self.assertEqual(
             hydrated["byte_range"], (0, len(artifact_text.encode("utf-8")))
+        )
+
+    def test_chinese_perspective_changes_only_post_confirmation_ranking(self):
+        trace = observed_trace(branching=True)
+        trace["records"][1]["data"]["rationale"] = "任务编排策略提前结束代码搜索。"
+        trace["records"][2]["data"]["text"] = "需求描述质量存在歧义。"
+
+        def run(perspective):
+            judge = ConfirmingScriptedJudge(
+                {
+                    "record:change": step(
+                        "record:change",
+                        predecessors=(
+                            relation("record:decision", "same_defect_propagation"),
+                            relation("record:context", "same_defect_propagation"),
+                        ),
+                    ),
+                    "record:decision": self._confirmation_step,
+                    "record:context": self._confirmation_step,
+                },
+                {
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="任务编排策略提前结束代码搜索。",
+                        reason="Independent task-orchestration cause.",
+                        counterfactual="Correct orchestration prevents the defect.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    ),
+                    "record:context": RootConfirmation.confirmed(
+                        "record:context",
+                        excerpt="需求描述质量存在歧义。",
+                        reason="Independent requirement-quality cause.",
+                        counterfactual="Clear requirements prevent the defect.",
+                        confidence=0.9,
+                        evidence_refs=["record:context"],
+                    ),
+                },
+            )
+            report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find every necessary cause.",
+                analysis_perspective=perspective,
+            )
+            return report, judge
+
+        requirement, requirement_judge = run("重点评估需求描述质量")
+        orchestration, orchestration_judge = run("重点评估任务编排策略")
+
+        self.assertEqual(requirement.confirmed_roots[0].node_ref, "record:context")
+        self.assertEqual(orchestration.confirmed_roots[0].node_ref, "record:decision")
+        self.assertTrue(all(not item.analysis_perspective for item in requirement_judge.confirmation_requests))
+        self.assertEqual(
+            [item.factual_dict() for item in requirement_judge.confirmation_requests],
+            [item.factual_dict() for item in orchestration_judge.confirmation_requests],
         )
 
 
