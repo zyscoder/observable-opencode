@@ -3,6 +3,7 @@
 from .analyzer import BackwardTaintAnalyzer
 from .causal_judge import (
     BoundedJudgeCallResult,
+    BoundedJudgeCallError,
     BoundedJudgeCapability,
     OfflineCausalJudgeAdapter,
     OfflineJudgeCapability,
@@ -22,6 +23,7 @@ from .causal_state import (
     RejectedCandidate,
     RootConfirmation,
     semantic_visit_key,
+    confirmation_identity_for,
 )
 from .graph import TraceGraph
 from .investigation import (
@@ -41,6 +43,7 @@ __all__ = [
     "BackwardTaintAnalyzer",
     "BoundedJudgeCapability",
     "BoundedJudgeCallResult",
+    "BoundedJudgeCallError",
     "CausalCandidate",
     "CausalFactor",
     "CausalInvestigationTools",
@@ -64,4 +67,5 @@ __all__ = [
     "TraceGraph",
     "TraceNode",
     "semantic_visit_key",
+    "confirmation_identity_for",
 ]

@@ -6,7 +6,7 @@ import hashlib
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .models import JsonDict, TraceNode, stable_json
 
@@ -45,6 +45,8 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
+LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 
 
 class FrozenMapping(Mapping[str, Any]):
@@ -94,6 +96,26 @@ def _frozen_strings(value: Any) -> Tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
+
+
+def confirmation_identity_for(
+    *,
+    hypothesis_id: str,
+    hypothesis_semantic_hash: str,
+    candidate_ref: str,
+    defect_fingerprint: str,
+    recursive_path: Tuple[str, ...],
+) -> str:
+    semantic = {
+        "hypothesis_id": hypothesis_id,
+        "hypothesis_semantic_hash": hypothesis_semantic_hash,
+        "candidate_ref": candidate_ref,
+        "defect_fingerprint": defect_fingerprint,
+        "recursive_path": list(recursive_path),
+    }
+    return "confirmation:{0}".format(
+        hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
+    )
 
 
 def _has_blocking_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -775,15 +797,12 @@ class RootConfirmation:
 
     @property
     def confirmation_identity(self) -> str:
-        semantic = {
-            "hypothesis_id": self.hypothesis_id,
-            "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
-            "candidate_ref": self.candidate_ref,
-            "defect_fingerprint": self.defect_fingerprint,
-            "recursive_path": list(self.recursive_path),
-        }
-        return "confirmation:{0}".format(
-            hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
+        return confirmation_identity_for(
+            hypothesis_id=self.hypothesis_id,
+            hypothesis_semantic_hash=self.hypothesis_semantic_hash,
+            candidate_ref=self.candidate_ref,
+            defect_fingerprint=self.defect_fingerprint,
+            recursive_path=self.recursive_path,
         )
 
     @classmethod
@@ -862,6 +881,9 @@ class RootConfirmation:
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RootConfirmation":
+        persisted_identity = str(value.get("confirmation_identity") or "")
+        if not persisted_identity:
+            raise ValueError("RootConfirmation confirmation_identity is required")
         status = str(value.get("status") or "unknown")
         result = cls(
             candidate_ref=str(value.get("candidate_ref") or ""),
@@ -896,8 +918,7 @@ class RootConfirmation:
             ),
             factor_mechanism=_json_dict(value.get("factor_mechanism")),
         )
-        persisted_identity = str(value.get("confirmation_identity") or "")
-        if persisted_identity and persisted_identity != result.confirmation_identity:
+        if persisted_identity != result.confirmation_identity:
             raise ValueError("RootConfirmation confirmation_identity does not match semantic fields")
         return result
 
@@ -1102,6 +1123,7 @@ class RejectedCandidate:
 class RecursiveAttributionReport:
     case_id: str
     objective: str
+    schema_version: str = MODERN_REPORT_SCHEMA_VERSION
     start_refs: Tuple[str, ...] = field(default_factory=tuple)
     analysis_outcome: str = "inconclusive"
     analysis_perspective: str = ""
@@ -1125,6 +1147,8 @@ class RecursiveAttributionReport:
     metadata: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
+        if self.schema_version != MODERN_REPORT_SCHEMA_VERSION:
+            raise ValueError("unsupported modern report schema_version: {0}".format(self.schema_version))
         for name in (
             "defect_states",
             "causal_candidates",
@@ -1156,57 +1180,172 @@ class RecursiveAttributionReport:
         for confirmation in self.confirmations:
             identity = confirmation.confirmation_identity
             prior = confirmation_by_identity.get(identity)
-            if prior is not None and prior.status != confirmation.status:
-                raise ValueError("conflicting statuses for confirmation identity {0}".format(identity))
+            if prior is not None:
+                if prior.status != confirmation.status:
+                    raise ValueError("conflicting statuses for confirmation identity {0}".format(identity))
+                raise ValueError("duplicate confirmation identity {0}".format(identity))
             confirmation_by_identity[identity] = confirmation
             node_statuses.setdefault(confirmation.candidate_ref, set()).add(confirmation.status)
             node_identities.setdefault(confirmation.candidate_ref, []).append(identity)
 
-        def root_identity(root: ConfirmedRoot) -> str:
-            persisted_identity = str(root.confirmation.get("confirmation_identity") or "")
-            semantic_hash = str(root.confirmation.get("hypothesis_semantic_hash") or "")
-            semantic = {
-                "hypothesis_id": root.hypothesis_id,
-                "hypothesis_semantic_hash": semantic_hash,
-                "candidate_ref": root.node_ref,
-                "defect_fingerprint": root.defect_state.fingerprint,
-                "recursive_path": list(root.recursive_path),
-            }
-            computed_identity = "confirmation:{0}".format(
-                hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
-            )
-            if persisted_identity and persisted_identity != computed_identity:
-                raise ValueError("root confirmation identity contradicts root semantic fields")
-            return computed_identity
+        def embedded_confirmation(
+            value: Mapping[str, Any], *, role: str
+        ) -> RootConfirmation:
+            if not value:
+                raise ValueError(
+                    "modern {0} requires a full confirmation identity".format(role)
+                )
+            confirmation = RootConfirmation.from_dict(_thaw(value))
+            canonical = confirmation_by_identity.get(confirmation.confirmation_identity)
+            if canonical is None or canonical != confirmation:
+                raise ValueError(
+                    "{0} confirmation is absent from top-level confirmations".format(role)
+                )
+            return confirmation
 
-        root_identities = set()
-        for root in (*self.confirmed_roots, *self.co_roots):
-            identity = root_identity(root)
-            confirmation = confirmation_by_identity.get(identity)
-            if confirmation is None and not root.confirmation:
-                compatible = [
-                    item
-                    for item in self.confirmations
-                    if item.candidate_ref == root.node_ref
-                    and item.status == "confirmed"
-                    and (not root.hypothesis_id or item.hypothesis_id == root.hypothesis_id)
-                    and (not root.recursive_path or item.recursive_path == root.recursive_path)
-                ]
-                confirmation = compatible[0] if len(compatible) == 1 else None
-                if confirmation is not None:
-                    identity = confirmation.confirmation_identity
-            if confirmation is None:
-                node_confirmations = [
-                    item for item in self.confirmations if item.candidate_ref == root.node_ref
-                ]
-                if node_confirmations:
+        def root_identity(root: ConfirmedRoot, *, role: str) -> str:
+            if not root.hypothesis_id or not root.recursive_path or not root.confirmation:
+                raise ValueError(
+                    "modern root requires hypothesis, path, and full confirmation identity"
+                )
+            confirmation = embedded_confirmation(root.confirmation, role=role)
+            if (
+                confirmation.status != "confirmed"
+                or confirmation.factor_role != "necessary_cause"
+                or root.confirmation_status != "confirmed"
+                or confirmation.candidate_ref != root.node_ref
+                or confirmation.hypothesis_id != root.hypothesis_id
+                or confirmation.defect_fingerprint != root.defect_state.fingerprint
+                or confirmation.recursive_path != root.recursive_path
+            ):
+                raise ValueError("root confirmation identity contradicts root semantic fields")
+            return confirmation.confirmation_identity
+
+        primary_identities = [
+            root_identity(root, role="primary root") for root in self.confirmed_roots
+        ]
+        co_root_identities = [
+            root_identity(root, role="co-root") for root in self.co_roots
+        ]
+        if len(primary_identities) != len(set(primary_identities)) or len(
+            co_root_identities
+        ) != len(set(co_root_identities)):
+            raise ValueError("duplicate root role confirmation identity")
+        if set(primary_identities).intersection(co_root_identities):
+            raise ValueError("primary and co-root roles share a confirmation identity")
+        root_identities = set(primary_identities).union(co_root_identities)
+        ordered_root_identities = sorted(root_identities)
+        for index, left_identity in enumerate(ordered_root_identities):
+            left = confirmation_by_identity[left_identity]
+            for right_identity in ordered_root_identities[index + 1 :]:
+                right = confirmation_by_identity[right_identity]
+
+                def reciprocal(
+                    source: RootConfirmation, target_identity: str
+                ) -> List[Mapping[str, Any]]:
+                    return [
+                        item
+                        for item in source.competitor_comparisons
+                        if str(item.get("confirmation_identity") or "")
+                        == target_identity
+                    ]
+
+                left_to_right = reciprocal(left, right_identity)
+                right_to_left = reciprocal(right, left_identity)
+                if (
+                    len(left_to_right) != 1
+                    or len(right_to_left) != 1
+                    or str(left_to_right[0].get("status") or "") != "co_root"
+                    or str(right_to_left[0].get("status") or "") != "co_root"
+                    or left_to_right[0].get("requires_independent_confirmation")
+                    is not True
+                    or right_to_left[0].get("requires_independent_confirmation")
+                    is not True
+                ):
                     raise ValueError(
-                        "root has unknown or rejected confirmation for {0}".format(root.node_ref)
+                        "published root confirmation graph is not reciprocal and non-dominated"
                     )
-                raise ValueError("missing confirmed root confirmation for {0}".format(root.node_ref))
-            if confirmation.status != "confirmed":
-                raise ValueError("root has unknown or rejected confirmation for {0}".format(root.node_ref))
-            root_identities.add(identity)
+
+        factor_role_identities: Dict[str, Set[str]] = {
+            "contributing_condition": set(),
+            "amplifying_factor": set(),
+        }
+        for role, factors in (
+            ("contributing_condition", self.contributing_conditions),
+            ("amplifying_factor", self.amplifying_factors),
+        ):
+            for factor in factors:
+                confirmation = embedded_confirmation(factor.confirmation, role=role)
+                identity = confirmation.confirmation_identity
+                if (
+                    confirmation.status != "rejected"
+                    or confirmation.factor_role != role
+                    or factor.confirmation_status != "rejected"
+                    or factor.node_ref != confirmation.candidate_ref
+                    or factor.recursive_path != confirmation.recursive_path
+                    or factor.relation != role
+                    or not factor.evidence_refs
+                    or not factor.mechanism
+                ):
+                    raise ValueError("{0} has an inconsistent grounded role".format(role))
+                if identity in factor_role_identities[role]:
+                    raise ValueError("duplicate {0} confirmation identity".format(role))
+                factor_role_identities[role].add(identity)
+        if factor_role_identities["contributing_condition"].intersection(
+            factor_role_identities["amplifying_factor"]
+        ):
+            raise ValueError("condition and amplifier roles share a confirmation identity")
+
+        rejected_identities: Set[str] = set()
+        for rejected in self.rejected_candidates:
+            confirmation = embedded_confirmation(
+                rejected.confirmation, role="rejected candidate"
+            )
+            identity = confirmation.confirmation_identity
+            if (
+                confirmation.status != "rejected"
+                or rejected.confirmation_status != "rejected"
+                or rejected.node_ref != confirmation.candidate_ref
+                or rejected.hypothesis_id != confirmation.hypothesis_id
+                or rejected.recursive_path != confirmation.recursive_path
+            ):
+                raise ValueError("rejected candidate has an inconsistent confirmation role")
+            if identity in rejected_identities:
+                raise ValueError("duplicate rejected candidate confirmation identity")
+            rejected_identities.add(identity)
+
+        factor_identities = set().union(*factor_role_identities.values())
+        if root_identities.intersection(factor_identities | rejected_identities):
+            raise ValueError("confirmation role conflict between root and non-root roles")
+        unresolved_hypothesis_ids = {
+            item.hypothesis_id for item in self.unresolved_hypotheses
+        }
+        root_hypothesis_ids = {
+            confirmation_by_identity[identity].hypothesis_id for identity in root_identities
+        }
+        if root_hypothesis_ids.intersection(unresolved_hypothesis_ids):
+            raise ValueError("root and unresolved roles share a hypothesis identity")
+
+        orphan_confirmed = {
+            identity: confirmation
+            for identity, confirmation in confirmation_by_identity.items()
+            if confirmation.status == "confirmed" and identity not in root_identities
+        }
+        explicit_unresolved_identities = {
+            str(item.get("confirmation_identity") or "")
+            for item in _thaw(self.metadata).get("unresolved_branches", [])
+            if isinstance(item, Mapping)
+        }
+        for identity, confirmation in orphan_confirmed.items():
+            explicitly_unresolved = bool(
+                identity in explicit_unresolved_identities
+                or confirmation.hypothesis_id in unresolved_hypothesis_ids
+                or confirmation.candidate_ref in self.unresolved_refs
+            )
+            if not explicitly_unresolved:
+                raise ValueError(
+                    "orphan confirmed confirmation requires explicit unresolved state"
+                )
 
         metadata = _thaw(self.metadata)
         summary = {}
@@ -1236,6 +1375,7 @@ class RecursiveAttributionReport:
         has_blocking_evidence = bool(
             self.unresolved_refs
             or self.unresolved_hypotheses
+            or orphan_confirmed
             or has_unknown_non_root_confirmation
             or _has_unresolved_judgment_state(self.step_judgments, self.causal_relations)
             or _has_blocking_metadata(self.metadata)
@@ -1248,6 +1388,7 @@ class RecursiveAttributionReport:
 
     def to_dict(self) -> JsonDict:
         return {
+            "schema_version": self.schema_version,
             "case_id": self.case_id,
             "objective": self.objective,
             "start_refs": list(self.start_refs),
@@ -1283,6 +1424,33 @@ class RecursiveAttributionReport:
             raw = value.get(key)
             return [factory(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
+        schema_version = str(value.get("schema_version") or "")
+        if schema_version == LEGACY_REPORT_SCHEMA_VERSION:
+            legacy_roots = value.get("root_causes")
+            if not isinstance(legacy_roots, list):
+                legacy_roots = []
+            unresolved_refs = tuple(
+                dict.fromkeys(
+                    str(item.get("node_ref") or "")
+                    for item in legacy_roots
+                    if isinstance(item, dict) and str(item.get("node_ref") or "")
+                )
+            )
+            metadata = _json_dict(value.get("metadata"))
+            metadata.update({
+                "legacy_migration_status": "independent_confirmation_required",
+                "legacy_unconfirmed_root_causes": [
+                    dict(item) for item in legacy_roots if isinstance(item, dict)
+                ],
+            })
+            return cls(
+                case_id=str(value.get("case_id") or ""),
+                objective=str(value.get("objective") or ""),
+                unresolved_refs=unresolved_refs,
+                metadata=metadata,
+            )
+        if schema_version and schema_version != MODERN_REPORT_SCHEMA_VERSION:
+            raise ValueError("unsupported report schema_version: {0}".format(schema_version))
         confirmed_roots = items("confirmed_roots", ConfirmedRoot.from_dict)
         if not confirmed_roots and value.get("root_causes"):
             raise ValueError(
@@ -1291,6 +1459,7 @@ class RecursiveAttributionReport:
         return cls(
             case_id=str(value.get("case_id") or ""),
             objective=str(value.get("objective") or ""),
+            schema_version=MODERN_REPORT_SCHEMA_VERSION,
             start_refs=_string_list(value.get("start_refs")),
             analysis_outcome=str(value.get("analysis_outcome") or "inconclusive"),
             analysis_perspective=str(value.get("analysis_perspective") or ""),
@@ -1334,4 +1503,5 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "semantic_visit_key",
+    "confirmation_identity_for",
 ]

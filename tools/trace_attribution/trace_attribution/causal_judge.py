@@ -19,6 +19,7 @@ from .causal_state import (
     FrozenMapping,
     PredecessorAssessment,
     RootConfirmation,
+    confirmation_identity_for,
 )
 from .claude import ClaudeJudgeClient
 from .errors import JudgeProviderError, JudgeProviderUnavailable
@@ -216,6 +217,20 @@ class BoundedJudgeCallResult:
             raise ValueError("physical_requests must be a non-negative integer")
 
 
+class BoundedJudgeCallError(RuntimeError):
+    """A bounded capability failure that preserves exact physical usage."""
+
+    def __init__(self, message: str, *, physical_requests: int) -> None:
+        if (
+            isinstance(physical_requests, bool)
+            or not isinstance(physical_requests, int)
+            or physical_requests < 0
+        ):
+            raise ValueError("physical_requests must be a non-negative integer")
+        super().__init__(message)
+        self.physical_requests = physical_requests
+
+
 class OfflineJudgeCapability:
     """Nominal capability for Judges guaranteed to perform no transport requests."""
 
@@ -351,6 +366,9 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                         "hypothesis_semantic_hash": "offered semantic hash",
                         "candidate_ref": "offered competitor candidate",
                         "defect_fingerprint": "offered active defect fingerprint",
+                        "confirmation_identity": "offered complete confirmation identity",
+                        "recursive_path": [],
+                        "requires_independent_confirmation": True,
                         "status": "outperformed|rejected|co_root|unresolved",
                         "reason": "grounded comparison",
                         "evidence_refs": [],
@@ -1629,6 +1647,9 @@ class _ConfirmationFactTreeValidator:
                     "opposing_evidence",
                     "unresolved_questions",
                     "counterfactual",
+                    "confirmation_identity",
+                    "recursive_path",
+                    "requires_independent_confirmation",
                 }
                 missing = required - set(hypothesis)
                 if missing:
@@ -1642,6 +1663,45 @@ class _ConfirmationFactTreeValidator:
                     counterfactual.get("intervention_ref") or ""
                 ).strip():
                     self._error(path, "competitor counterfactual must be structured")
+                recursive_path = hypothesis.get("recursive_path")
+                requires_confirmation = hypothesis.get(
+                    "requires_independent_confirmation"
+                )
+                if (
+                    not isinstance(recursive_path, (list, tuple))
+                    or any(not isinstance(item, str) for item in recursive_path)
+                ):
+                    self._error(path, "competitor recursive_path must be a list of strings")
+                if not isinstance(requires_confirmation, bool):
+                    self._error(
+                        path,
+                        "competitor requires_independent_confirmation must be boolean",
+                    )
+                active_defect = hypothesis.get("active_defect")
+                candidate_reference = hypothesis.get("candidate_reference")
+                expected_identity = confirmation_identity_for(
+                    hypothesis_id=str(hypothesis.get("hypothesis_id") or ""),
+                    hypothesis_semantic_hash=str(
+                        hypothesis.get("hypothesis_semantic_hash") or ""
+                    ),
+                    candidate_ref=(
+                        str(candidate_reference.get("resolved_ref") or "")
+                        if isinstance(candidate_reference, Mapping)
+                        else ""
+                    ),
+                    defect_fingerprint=(
+                        str(active_defect.get("fingerprint") or "")
+                        if isinstance(active_defect, Mapping)
+                        else ""
+                    ),
+                    recursive_path=(
+                        tuple(recursive_path)
+                        if isinstance(recursive_path, (list, tuple))
+                        else ()
+                    ),
+                )
+                if str(hypothesis.get("confirmation_identity") or "") != expected_identity:
+                    self._error(path, "competitor confirmation identity is invalid")
                 candidate = hypothesis.get("candidate_reference")
                 if not isinstance(candidate, Mapping) or not str(candidate.get("content") or "").strip():
                     self._error(path, "competitor candidate semantics must be non-empty")
@@ -1753,11 +1813,17 @@ def _validate_competitor_comparisons(
             str(active_defect.get("fingerprint") or "")
             if isinstance(active_defect, Mapping)
             else "",
+            str(competitor.get("confirmation_identity") or ""),
+            tuple(str(value) for value in competitor.get("recursive_path") or ()),
+            competitor.get("requires_independent_confirmation"),
         )
         actual_identity = (
             str(item.get("hypothesis_semantic_hash") or ""),
             str(item.get("candidate_ref") or ""),
             str(item.get("defect_fingerprint") or ""),
+            str(item.get("confirmation_identity") or ""),
+            tuple(str(value) for value in item.get("recursive_path") or ()),
+            item.get("requires_independent_confirmation"),
         )
         if actual_identity != expected_identity:
             raise ValueError("competitor comparison identity does not match offered facts")
@@ -1780,6 +1846,9 @@ def _validate_competitor_comparisons(
                 "hypothesis_semantic_hash": actual_identity[0],
                 "candidate_ref": actual_identity[1],
                 "defect_fingerprint": actual_identity[2],
+                "confirmation_identity": actual_identity[3],
+                "recursive_path": list(actual_identity[4]),
+                "requires_independent_confirmation": actual_identity[5],
                 "status": status,
                 "reason": reason,
                 "evidence_refs": list(evidence_refs),
@@ -2094,10 +2163,16 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
-            return BoundedJudgeCallResult(
-                causal_step_from_payload(outcome.payload, request=request),
-                outcome.physical_requests,
-            )
+            try:
+                value = causal_step_from_payload(outcome.payload, request=request)
+            except Exception as exc:
+                raise BoundedJudgeCallError(
+                    "post-validation adapter failed: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    physical_requests=outcome.physical_requests,
+                ) from exc
+            return BoundedJudgeCallResult(value, outcome.physical_requests)
         detail = "judge_{0}: {1}".format(outcome.error_kind or "error", outcome.error_detail)
         return BoundedJudgeCallResult(CausalStepJudgment(
             current_node_ref=request.current_node.ref,
@@ -2142,10 +2217,18 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
-            return BoundedJudgeCallResult(
-                root_confirmation_from_payload(outcome.payload, request=request),
-                outcome.physical_requests,
-            )
+            try:
+                value = root_confirmation_from_payload(
+                    outcome.payload, request=request
+                )
+            except Exception as exc:
+                raise BoundedJudgeCallError(
+                    "post-validation adapter failed: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    physical_requests=outcome.physical_requests,
+                ) from exc
+            return BoundedJudgeCallResult(value, outcome.physical_requests)
         return BoundedJudgeCallResult(
             RootConfirmation.unknown(
                 request.candidate_ref,
@@ -2218,10 +2301,17 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 "{0}: {1}".format(type(exc).__name__, exc),
                 physical_requests,
             )
+        except Exception as exc:
+            return _RequestOutcome(
+                None,
+                "adapter_error",
+                "{0}: {1}".format(type(exc).__name__, exc),
+                physical_requests,
+            )
         try:
             payload = _parse_single_json_object(text)
             validator(payload)
-        except (TypeError, ValueError, json.JSONDecodeError) as first_error:
+        except Exception as first_error:
             exact_error = "{0}: {1}".format(type(first_error).__name__, first_error)
             if remaining_requests == 0:
                 return _RequestOutcome(
@@ -2265,10 +2355,19 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                     ),
                     physical_requests,
                 )
+            except Exception as exc:
+                return _RequestOutcome(
+                    None,
+                    "adapter_error",
+                    "{0}; repair adapter error: {1}: {2}".format(
+                        exact_error, type(exc).__name__, exc
+                    ),
+                    physical_requests,
+                )
             try:
                 payload = _parse_single_json_object(repaired)
                 validator(payload)
-            except (TypeError, ValueError, json.JSONDecodeError) as repair_error:
+            except Exception as repair_error:
                 return _RequestOutcome(
                     None,
                     "validation_error",
@@ -2277,13 +2376,21 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                     ),
                     physical_requests,
                 )
-        self.cache.put_payload(
-            key=cache_key,
-            stage=stage,
-            model=str(getattr(self.transport, "model", "")),
-            node_ref=node_ref,
-            payload=payload,
-        )
+        try:
+            self.cache.put_payload(
+                key=cache_key,
+                stage=stage,
+                model=str(getattr(self.transport, "model", "")),
+                node_ref=node_ref,
+                payload=payload,
+            )
+        except Exception as exc:
+            raise BoundedJudgeCallError(
+                "cache adapter failed after validated transport: {0}: {1}".format(
+                    type(exc).__name__, exc
+                ),
+                physical_requests=physical_requests,
+            ) from exc
         return _RequestOutcome(payload, physical_requests=physical_requests)
 
 
@@ -2296,6 +2403,7 @@ def _parse_single_json_object(text: str) -> JsonDict:
 
 __all__ = [
     "BoundedJudgeCallResult",
+    "BoundedJudgeCallError",
     "BoundedJudgeCapability",
     "CAUSAL_STEP_PROMPT_SCHEMA_VERSION",
     "CAUSAL_STEP_SYSTEM_PROMPT",

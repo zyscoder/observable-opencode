@@ -10,6 +10,7 @@ from pathlib import Path
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
     BoundedJudgeCallResult,
+    BoundedJudgeCallError,
     BoundedJudgeCapability,
     ClaudeCausalJudge,
     OfflineCausalJudgeAdapter,
@@ -194,7 +195,17 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
                         "hypothesis_semantic_hash": item["hypothesis_semantic_hash"],
                         "candidate_ref": item["candidate_reference"]["resolved_ref"],
                         "defect_fingerprint": item["active_defect"]["fingerprint"],
-                        "status": (
+                        "confirmation_identity": item["confirmation_identity"],
+                        "recursive_path": list(item["recursive_path"]),
+                        "requires_independent_confirmation": item[
+                            "requires_independent_confirmation"
+                        ],
+                        "status": getattr(self, "comparison_statuses", {}).get(
+                            (
+                                request.candidate_ref,
+                                item["candidate_reference"]["resolved_ref"],
+                            ),
+                            (
                             "co_root"
                             if result.status == "confirmed"
                             and (
@@ -208,6 +219,7 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
                                 in getattr(self, "force_co_root_candidates", set())
                             )
                             else "outperformed"
+                            ),
                         ),
                         "reason": "The independent verifier compared this alternative.",
                         "evidence_refs": [item["candidate_reference"]["resolved_ref"]],
@@ -867,6 +879,57 @@ class RecursiveTraversalTest(unittest.TestCase):
 
 
 class RecursiveBudgetTest(unittest.TestCase):
+    def test_typed_bounded_exception_atomically_consumes_usage_before_next_branch(self):
+        class FailingThenExhaustedJudge(BoundedJudgeCapability):
+            def __init__(self):
+                self.allowances = []
+
+            def judge_step_bounded(self, request, *, max_physical_requests):
+                self.allowances.append(max_physical_requests)
+                if len(self.allowances) == 1:
+                    raise BoundedJudgeCallError(
+                        "adapter failed after request", physical_requests=1
+                    )
+                return BoundedJudgeCallResult(
+                    step(
+                        request.current_node.ref,
+                        status="unknown",
+                        missing=("judge_request_budget_exhausted",),
+                    ),
+                    0,
+                )
+
+        trace = {
+            "case_id": "two-branch-budget",
+            "records": [
+                {
+                    "record_id": "first",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"failure_type": "first defect"},
+                },
+                {
+                    "record_id": "second",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"failure_type": "second defect"},
+                },
+            ],
+        }
+        judge = FailingThenExhaustedJudge()
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge, max_judge_requests=1
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:first", "record:second"],
+            objective="Inspect both failures.",
+        )
+
+        self.assertEqual(judge.allowances, [1, 0])
+        self.assertEqual(report.metadata["physical_judge_request_count"], 1)
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
     def test_unbounded_provider_judge_is_rejected_before_any_side_effect(self):
         judge = UnboundedProviderJudge()
 
@@ -1405,6 +1468,90 @@ class RecursiveRootRankingTest(unittest.TestCase):
         self.assertEqual(report.confirmed_roots, ())
         self.assertEqual(report.co_roots, ())
         self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def test_mutual_dominance_cannot_publish_primary_and_co_root(self):
+        judge = self._two_confirmed_competitor_judge()
+        judge.comparison_statuses = {
+            ("record:decision", "record:context"): "outperformed",
+            ("record:context", "record:decision"): "outperformed",
+        }
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find every necessary cause.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def test_dominance_and_co_root_disagreement_blocks_both_confirmations(self):
+        judge = self._two_confirmed_competitor_judge()
+        judge.comparison_statuses = {
+            ("record:decision", "record:context"): "outperformed",
+            ("record:context", "record:decision"): "co_root",
+        }
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find every necessary cause.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def test_rejected_and_confirmed_disagreement_blocks_both_confirmations(self):
+        judge = self._two_confirmed_competitor_judge()
+        judge.comparison_statuses = {
+            ("record:decision", "record:context"): "rejected",
+            ("record:context", "record:decision"): "co_root",
+        }
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find every necessary cause.",
+        )
+
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def _two_confirmed_competitor_judge(self):
+        return ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+                "record:context": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision was independently necessary.",
+                    counterfactual="Correcting it prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                ),
+                "record:context": RootConfirmation.confirmed(
+                    "record:context",
+                    excerpt="The complete compatibility contract is documented here.",
+                    reason="The context was independently necessary.",
+                    counterfactual="Correcting it prevents the omission.",
+                    confidence=0.8,
+                    evidence_refs=["record:context"],
+                ),
+            },
+        )
 
     def test_confirmation_cannot_cross_bind_hypothesis_defect_or_path_identity(self):
         forged = replace(

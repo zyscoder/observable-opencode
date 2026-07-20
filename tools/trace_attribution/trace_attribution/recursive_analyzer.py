@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from .causal_judge import (
     BoundedJudgeCallResult,
+    BoundedJudgeCallError,
     BoundedJudgeCapability,
     CausalJudge,
     CausalStepRequest,
@@ -32,6 +33,7 @@ from .causal_state import (
     RecursiveAttributionReport,
     RejectedCandidate,
     RootConfirmation,
+    confirmation_identity_for,
 )
 from .errors import JudgeProviderError, JudgeProviderUnavailable
 from .graph import TraceGraph
@@ -799,21 +801,9 @@ class RecursiveAnalysisState:
         for assessment in judgment.predecessors:
             self.causal_relations.append(assessment)
             if assessment.relation == "contributing_condition":
-                self.contributing_conditions.append(
-                    CausalFactor(
-                        node_ref=assessment.ref,
-                        relation=assessment.relation,
-                        reason=assessment.reason,
-                        confidence=assessment.confidence,
-                        evidence_refs=assessment.evidence_refs,
-                    )
-                )
                 continue
             if assessment.relation in {"unrelated", "unknown"}:
                 if assessment.relation == "unrelated":
-                    self.rejected_candidates.append(
-                        RejectedCandidate(assessment.ref, assessment.reason, assessment.evidence_refs)
-                    )
                     self.ledger.add_opposition(
                         item.hypothesis_id,
                         assessment.ref,
@@ -1283,6 +1273,21 @@ class AgenticRecursiveAnalyzer:
                     judgment = bounded_result.value
                 else:
                     judgment = self.judge.judge_step_offline(request)
+            except BoundedJudgeCallError as exc:
+                physical_delta = exc.physical_requests
+                state.judge_requests += physical_delta
+                state.complete_rejudge(
+                    item,
+                    terminal_state="judge_error",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_delta=physical_delta,
+                )
+                state.complete_unresolved(
+                    item,
+                    "judge_error",
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                )
+                continue
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 state.judge_requests += physical_delta
                 state.complete_rejudge(
@@ -1422,6 +1427,9 @@ class AgenticRecursiveAnalyzer:
                     ),
                     counterfactual_status="unknown",
                     hypothesis_id=str(queued.get("hypothesis_id") or ""),
+                    hypothesis_semantic_hash=str(
+                        queued.get("hypothesis_semantic_hash") or ""
+                    ),
                     defect_fingerprint=str(queued.get("defect_fingerprint") or ""),
                     recursive_path=tuple(queued.get("recursive_path") or ()),
                 )
@@ -1437,6 +1445,7 @@ class AgenticRecursiveAnalyzer:
                     reason="confirmation_budget_unenforceable: Judge has no explicit bounded or offline capability",
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
+                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
                 )
@@ -1469,6 +1478,18 @@ class AgenticRecursiveAnalyzer:
                         )
                     )
                 confirmation = bind_root_confirmation(raw, request=request)
+            except BoundedJudgeCallError as exc:
+                physical_delta = exc.physical_requests
+                confirmation = RootConfirmation(
+                    candidate_ref=request.candidate_ref,
+                    status="unknown",
+                    reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
+                    counterfactual_status="unknown",
+                    hypothesis_id=request.hypothesis_id,
+                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+                    defect_fingerprint=request.defect_state.fingerprint,
+                    recursive_path=request.recursive_path,
+                )
             except (JudgeProviderError, JudgeProviderUnavailable, TypeError, ValueError) as exc:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
@@ -1476,6 +1497,7 @@ class AgenticRecursiveAnalyzer:
                     reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
+                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
                 )
@@ -1488,6 +1510,7 @@ class AgenticRecursiveAnalyzer:
                     ),
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
+                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
                 )
@@ -1521,27 +1544,96 @@ class AgenticRecursiveAnalyzer:
         self._rank_confirmed_roots(state)
 
     def _reconcile_competing_confirmations(self, state: RecursiveAnalysisState) -> None:
-        confirmed_hypotheses = {
-            item.hypothesis_id
-            for item in state.confirmations
-            if item.status == "confirmed" and item.hypothesis_id
+        confirmations = {
+            item.confirmation_identity: item for item in state.confirmations
         }
-        blocked_hypotheses: Set[str] = set()
-        for confirmation in state.confirmations:
-            if confirmation.status != "confirmed":
-                continue
-            required_co_roots = {
-                str(item.get("hypothesis_id") or "")
+        blocked_identities: Set[str] = set()
+        reasons: Dict[str, Set[str]] = {}
+
+        def block(identity: str, reason: str) -> None:
+            if not identity:
+                return
+            blocked_identities.add(identity)
+            reasons.setdefault(identity, set()).add(reason)
+
+        def comparison_to(
+            confirmation: RootConfirmation, target_identity: str
+        ) -> Optional[Mapping[str, Any]]:
+            matches = [
+                item
                 for item in confirmation.competitor_comparisons
-                if str(item.get("status") or "") == "co_root"
-            }
-            if not required_co_roots.issubset(confirmed_hypotheses):
-                blocked_hypotheses.add(confirmation.hypothesis_id)
-        if not blocked_hypotheses:
+                if str(item.get("confirmation_identity") or "") == target_identity
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        confirmed_items = sorted(
+            (
+                (identity, confirmation)
+                for identity, confirmation in confirmations.items()
+                if confirmation.status == "confirmed"
+            ),
+            key=lambda item: item[0],
+        )
+        for index, (left_identity, left) in enumerate(confirmed_items):
+            for right_identity, right in confirmed_items[index + 1 :]:
+                left_to_right = comparison_to(left, right_identity)
+                right_to_left = comparison_to(right, left_identity)
+                if (
+                    left_to_right is None
+                    or right_to_left is None
+                    or str(left_to_right.get("status") or "") != "co_root"
+                    or str(right_to_left.get("status") or "") != "co_root"
+                    or left_to_right.get("requires_independent_confirmation")
+                    is not True
+                    or right_to_left.get("requires_independent_confirmation")
+                    is not True
+                ):
+                    block(left_identity, "confirmed_competitor_graph_inconsistent")
+                    block(right_identity, "confirmed_competitor_graph_inconsistent")
+
+        for source_identity, source in sorted(confirmations.items()):
+            if source.status != "confirmed":
+                continue
+            for comparison in source.competitor_comparisons:
+                target_identity = str(
+                    comparison.get("confirmation_identity") or ""
+                )
+                status = str(comparison.get("status") or "")
+                requires_confirmation = bool(
+                    comparison.get("requires_independent_confirmation")
+                )
+                target = confirmations.get(target_identity)
+                if not requires_confirmation:
+                    if status == "co_root":
+                        block(source_identity, "co_root_lacks_independent_confirmation")
+                    continue
+                if target is None:
+                    block(source_identity, "competitor_confirmation_missing")
+                    continue
+                if target.status == "unknown":
+                    block(source_identity, "competitor_confirmation_unresolved")
+                    continue
+                if target.status == "rejected":
+                    if status not in {"outperformed", "rejected"}:
+                        block(source_identity, "rejected_competitor_relation_conflict")
+                    continue
+
+                reciprocal = comparison_to(target, source_identity)
+                if reciprocal is None:
+                    block(source_identity, "competitor_comparison_missing_reciprocal")
+                    block(target_identity, "competitor_comparison_missing_reciprocal")
+                    continue
+                reciprocal_status = str(reciprocal.get("status") or "")
+                if status != "co_root" or reciprocal_status != "co_root":
+                    block(source_identity, "confirmed_competitor_relation_conflict")
+                    block(target_identity, "confirmed_competitor_relation_conflict")
+
+        if not blocked_identities:
             return
         retained: List[ConfirmedRoot] = []
         for root in state.confirmed_roots:
-            if root.hypothesis_id not in blocked_hypotheses:
+            identity = str(root.confirmation.get("confirmation_identity") or "")
+            if identity not in blocked_identities:
                 retained.append(root)
                 continue
             state.unresolved_hypothesis_ids.add(root.hypothesis_id)
@@ -1552,8 +1644,9 @@ class AgenticRecursiveAnalyzer:
                     "node_ref": root.node_ref,
                     "defect_state_id": root.defect_state.defect_state_id,
                     "hypothesis_id": root.hypothesis_id,
-                    "reason": "co_root_confirmation_incomplete",
-                    "details": "A declared co-root lacks its own independent confirmation.",
+                    "confirmation_identity": identity,
+                    "reason": "confirmation_graph_inconsistent",
+                    "details": ", ".join(sorted(reasons.get(identity, ()))),
                     "depth": max(0, len(root.recursive_path) - 1),
                 }
             )
@@ -1680,10 +1773,41 @@ class AgenticRecursiveAnalyzer:
             competitor_defect = state.defect_states.get(competitor_fingerprint)
             if competitor_defect is None:
                 raise ValueError("competing hypothesis defect is unresolved")
+            competitor_hypothesis_id = str(value.get("hypothesis_id") or "")
+            competitor_semantic_hash = str(value.get("semantic_hash") or "")
+            queued_competitor = next(
+                (
+                    item
+                    for item in state.confirmation_queue
+                    if str(item.get("hypothesis_id") or "") == competitor_hypothesis_id
+                    and str(item.get("candidate_ref") or "") == resolved
+                    and str(item.get("defect_fingerprint") or "")
+                    == competitor_fingerprint
+                ),
+                None,
+            )
+            competitor_path = tuple(
+                str(item)
+                for item in (
+                    queued_competitor.get("recursive_path")
+                    if queued_competitor is not None
+                    else ()
+                )
+            )
+            competitor_confirmation_identity = confirmation_identity_for(
+                hypothesis_id=competitor_hypothesis_id,
+                hypothesis_semantic_hash=competitor_semantic_hash,
+                candidate_ref=resolved,
+                defect_fingerprint=competitor_fingerprint,
+                recursive_path=competitor_path,
+            )
             competitors.append(
                 {
-                    "hypothesis_id": str(value.get("hypothesis_id") or ""),
-                    "hypothesis_semantic_hash": str(value.get("semantic_hash") or ""),
+                    "hypothesis_id": competitor_hypothesis_id,
+                    "hypothesis_semantic_hash": competitor_semantic_hash,
+                    "confirmation_identity": competitor_confirmation_identity,
+                    "recursive_path": list(competitor_path),
+                    "requires_independent_confirmation": queued_competitor is not None,
                     "status": str(value.get("status") or "unresolved"),
                     "claim": str(value.get("claim") or ""),
                     "active_defect": competitor_defect.to_dict(),

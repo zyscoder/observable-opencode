@@ -11,6 +11,7 @@ from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
     ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
     BoundedJudgeCallResult,
+    BoundedJudgeCallError,
     CausalStepRequest,
     ClaudeCausalJudge,
     RootConfirmationRequest,
@@ -20,7 +21,11 @@ from trace_attribution.causal_judge import (
     validate_causal_step_payload,
     validate_recursive_confirmation,
 )
-from trace_attribution.causal_state import CausalCandidate, DefectState
+from trace_attribution.causal_state import (
+    CausalCandidate,
+    DefectState,
+    confirmation_identity_for,
+)
 from trace_attribution.claude import ClaudeJudgeClient
 from trace_attribution.errors import JudgeProviderError, JudgeProviderUnavailable
 from trace_attribution.models import NodeJudgment, TraceNode
@@ -424,6 +429,14 @@ class RootConfirmationValidationTest(unittest.TestCase):
             )
 
     def test_open_competitor_requires_auditable_structured_comparison(self):
+        competitor_path = ("record:prompt", "record:change")
+        competitor_identity = confirmation_identity_for(
+            hypothesis_id="hyp:alternative",
+            hypothesis_semantic_hash="semantic:alternative",
+            candidate_ref="record:prompt",
+            defect_fingerprint=sample_step_request().defect_state.fingerprint,
+            recursive_path=competitor_path,
+        )
         competitor = {
             "hypothesis_id": "hyp:alternative",
             "hypothesis_semantic_hash": "semantic:alternative",
@@ -442,6 +455,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "opposing_evidence": [],
             "unresolved_questions": ["Could repository discovery compensate?"],
             "counterfactual": {"intervention_ref": "record:prompt"},
+            "confirmation_identity": competitor_identity,
+            "recursive_path": list(competitor_path),
+            "requires_independent_confirmation": True,
         }
         request = sample_confirmation_request(competing_hypotheses=(competitor,))
         payload = valid_confirmation_payload()
@@ -453,6 +469,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "hypothesis_semantic_hash": "semantic:alternative",
             "candidate_ref": "record:prompt",
             "defect_fingerprint": sample_step_request().defect_state.fingerprint,
+            "confirmation_identity": competitor_identity,
+            "recursive_path": list(competitor_path),
+            "requires_independent_confirmation": True,
             "status": "unresolved",
             "reason": "The alternative remains nondominated.",
             "evidence_refs": ["record:prompt"],
@@ -808,6 +827,14 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "candidate_reference": reference_envelope("record:alternative"),
             "evidence_references": [reference_envelope("record:alternative_evidence")],
         }
+        competitor_path = ("record:alternative", "record:change")
+        competitor_identity = confirmation_identity_for(
+            hypothesis_id="hyp_open",
+            hypothesis_semantic_hash="semantic:open",
+            candidate_ref="record:alternative",
+            defect_fingerprint=sample_step_request().defect_state.fingerprint,
+            recursive_path=competitor_path,
+        )
         open_hypothesis = {
             "hypothesis_id": "hyp_open",
             "hypothesis_semantic_hash": "semantic:open",
@@ -826,6 +853,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "opposing_evidence": [],
             "unresolved_questions": [],
             "counterfactual": {"intervention_ref": "record:alternative"},
+            "confirmation_identity": competitor_identity,
+            "recursive_path": list(competitor_path),
+            "requires_independent_confirmation": True,
         }
         missing_status = {key: value for key, value in closed.items() if key != "status"}
         unresolved_evidence = dict(open_hypothesis)
@@ -846,6 +876,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
             "hypothesis_semantic_hash": "semantic:open",
             "candidate_ref": "record:alternative",
             "defect_fingerprint": sample_step_request().defect_state.fingerprint,
+            "confirmation_identity": competitor_identity,
+            "recursive_path": list(competitor_path),
+            "requires_independent_confirmation": True,
             "status": "outperformed",
             "reason": "The candidate has stronger causal evidence.",
             "evidence_refs": ["record:alternative"],
@@ -1694,6 +1727,35 @@ class ClaudeTransportAdapterTest(unittest.TestCase):
 
 
 class ClaudeCausalJudgeTest(unittest.TestCase):
+    def test_cache_adapter_failure_after_transport_raises_typed_usage_error(self):
+        class FailingCache(JudgmentCache):
+            def put_payload(self, **kwargs):
+                raise RuntimeError("cache adapter failed")
+
+        transport = ScriptedTransport([json.dumps(valid_step_payload())])
+        judge = ClaudeCausalJudge(transport=transport, cache=FailingCache())
+
+        with self.assertRaises(BoundedJudgeCallError) as raised:
+            judge.judge_step_bounded(
+                sample_step_request(), max_physical_requests=1
+            )
+
+        self.assertEqual(raised.exception.physical_requests, 1)
+        self.assertEqual(transport.request_count, 1)
+
+    def test_bounded_runtime_failure_after_transport_attempt_preserves_physical_usage(self):
+        transport = ScriptedTransport([RuntimeError("adapter decode failed")])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=1
+        )
+
+        self.assertEqual(result.physical_requests, 1)
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertIn("RuntimeError", " ".join(result.value.missing_evidence))
+        self.assertEqual(transport.request_count, 1)
+
     def test_bounded_step_allows_one_valid_physical_request(self):
         transport = ScriptedTransport([json.dumps(valid_step_payload())])
         judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
