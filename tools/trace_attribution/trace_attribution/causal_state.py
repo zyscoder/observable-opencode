@@ -728,20 +728,25 @@ class RootConfirmation:
     def __post_init__(self) -> None:
         if self.status not in CONFIRMATION_STATUSES:
             raise ValueError("unsupported root confirmation status: {0}".format(self.status))
-        expected_counterfactual = {
+        default_counterfactual = {
             "confirmed": "supports_causality",
             "rejected": "rejects_causality",
             "unknown": "unknown",
         }[self.status]
-        counterfactual_status = self.counterfactual_status or expected_counterfactual
+        counterfactual_status = self.counterfactual_status or default_counterfactual
         if counterfactual_status not in COUNTERFACTUAL_STATUSES:
             raise ValueError(
                 "unsupported counterfactual status: {0}".format(counterfactual_status)
             )
-        if counterfactual_status != expected_counterfactual:
+        allowed_counterfactuals = {
+            "confirmed": {"supports_causality"},
+            "rejected": {"rejects_causality", "unknown"},
+            "unknown": {"unknown"},
+        }[self.status]
+        if counterfactual_status not in allowed_counterfactuals:
             raise ValueError(
-                "{0} confirmation requires counterfactual_status={1}".format(
-                    self.status, expected_counterfactual
+                "{0} confirmation does not allow counterfactual_status={1}".format(
+                    self.status, counterfactual_status
                 )
             )
         object.__setattr__(self, "counterfactual_status", counterfactual_status)

@@ -140,12 +140,15 @@ def valid_step_payload(
     }
 
 
-def reference_envelope(ref: str, *, status: str = "resolved") -> dict:
+def reference_envelope(
+    ref: str, *, status: str = "resolved", provenance: str = "recorded", **metadata
+) -> dict:
     return {
         "raw_ref": ref,
         "resolved_ref": ref if status == "resolved" else "",
         "resolution_status": status,
-        "provenance_class": "recorded",
+        "provenance_class": provenance,
+        **metadata,
     }
 
 
@@ -155,6 +158,7 @@ def sample_confirmation_request(
     path_references=None,
     supporting_evidence=None,
     opposing_evidence=(),
+    competing_hypotheses=(),
 ) -> RootConfirmationRequest:
     return RootConfirmationRequest(
         candidate_ref="record:decision",
@@ -185,7 +189,7 @@ def sample_confirmation_request(
             },
         ),
         opposing_evidence=opposing_evidence,
-        competing_hypotheses=(),
+        competing_hypotheses=competing_hypotheses,
         task_obligations=(
             {"source": "task", "text": "Preserve the existing parser compatibility contract."},
         ),
@@ -199,8 +203,12 @@ def valid_confirmation_payload() -> dict:
         "status": "confirmed",
         "excerpt": "Implement only the explicitly listed methods.",
         "reason": "The decision excluded a required compatibility method.",
-        "counterfactual_status": "supports_causality",
-        "counterfactual_explanation": "Searching call sites would have retained the method.",
+        "counterfactual": {
+            "intervention_ref": "record:decision",
+            "intervention_kind": "replace_with_semantically_correct_behavior",
+            "predicted_defect_status": "absent",
+            "causal_effect": "prevents_defect",
+        },
         "confidence": 0.88,
         "evidence_refs": ["record:decision", "record:evidence"],
     }
@@ -450,26 +458,289 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
             )
 
-    def test_structured_counterfactual_must_match_confirmation_status_and_text(self):
-        cases = (
-            ("confirmed", "rejects_causality", "The defect would still occur.", "confirmed"),
-            ("confirmed", "supports_causality", "The defect would still occur.", "contradicts"),
-            ("rejected", "supports_causality", "Correct behavior prevents it.", "rejected"),
-            ("unknown", "rejects_causality", "The candidate is not causal.", "unknown"),
-            ("rejected", "rejects_causality", "Correct behavior would prevent the defect.", "contradicts"),
-            ("unknown", "unknown", "Correct behavior would prevent the defect.", "contradicts"),
-        )
-        for status, counterfactual_status, explanation, error in cases:
-            payload = valid_confirmation_payload()
-            payload.update(
-                status=status,
-                counterfactual_status=counterfactual_status,
-                counterfactual_explanation=explanation,
+    def test_task2_hydration_manifest_recursively_rejects_missing_envelope_less_artifact(self):
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "fact_kind": "candidate_fact",
+            "decisive": True,
+            "artifact_hydration": {
+                "node_ref": "record:decision",
+                "referenced_artifact_ids": ["decision-payload"],
+                "hydrated_artifacts": [
+                    {
+                        "artifact_id": "decision-payload",
+                        "content": "Implement only the explicitly listed methods.",
+                        "missing": True,
+                        "truncated": False,
+                    }
+                ],
+                "missing_artifact_ids": [],
+                "truncated_artifact_ids": [],
+            },
+        }
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+
+        with self.assertRaisesRegex(ValueError, "missing"):
+            validate_recursive_confirmation(
+                payload,
+                request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
             )
-            with self.subTest(status=status, counterfactual=counterfactual_status), self.assertRaisesRegex(
-                ValueError, error
+
+    def test_resolved_task2_hydration_manifest_can_ground_candidate_excerpt(self):
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "fact_kind": "candidate_fact",
+            "decisive": True,
+            "artifact_hydration": {
+                "node_ref": "record:decision",
+                "referenced_artifact_ids": ["decision-payload"],
+                "hydrated_artifacts": [
+                    {
+                        "artifact_id": "decision-payload",
+                        "content": "Implement only the explicitly listed methods.",
+                        "missing": False,
+                        "truncated": False,
+                    }
+                ],
+                "missing_artifact_ids": [],
+                "truncated_artifact_ids": [],
+            },
+        }
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+
+        result = validate_recursive_confirmation(
+            payload,
+            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+        )
+
+        self.assertEqual(result.status, "confirmed")
+
+        noncandidate_fact = {
+            **reference_envelope("record:evidence"),
+            "fact_kind": "supporting_evidence",
+            "artifact_hydration": {
+                **candidate_fact["artifact_hydration"],
+                "node_ref": "record:evidence",
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "grounded excerpt"):
+            validate_recursive_confirmation(
+                payload,
+                request=sample_confirmation_request(supporting_evidence=(noncandidate_fact,)),
+            )
+
+    def test_arbitrarily_nested_artifact_requires_resolved_candidate_local_envelope(self):
+        nested_artifact = {
+            **reference_envelope("artifact:decision-payload"),
+            "artifact_id": "decision-payload",
+            "owner_reference": reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "missing": False,
+            "truncated": False,
+        }
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "fact_kind": "candidate_fact",
+            "details": {"captures": {"attachments": [nested_artifact]}},
+        }
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+
+        result = validate_recursive_confirmation(
+            payload,
+            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+        )
+        self.assertEqual(result.status, "confirmed")
+
+        nested_artifact["missing"] = True
+        with self.assertRaisesRegex(ValueError, "missing"):
+            validate_recursive_confirmation(
+                payload,
+                request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+            )
+
+        metadata_payload = valid_confirmation_payload()
+        metadata_payload["excerpt"] = "decision-payload.json"
+        metadata_payload["evidence_refs"] = ["record:decision"]
+        nested_artifact["missing"] = False
+        nested_artifact["path"] = "decision-payload.json"
+        with self.assertRaisesRegex(ValueError, "grounded excerpt"):
+            validate_recursive_confirmation(
+                metadata_payload,
+                request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+            )
+
+    def test_task2_manifest_rejects_missing_truncated_and_contradictory_entries(self):
+        base_manifest = {
+            "node_ref": "record:decision",
+            "referenced_artifact_ids": ["decision-payload"],
+            "hydrated_artifacts": [
+                {
+                    "artifact_id": "decision-payload",
+                    "content": "Implement only the explicitly listed methods.",
+                    "missing": False,
+                    "truncated": False,
+                }
+            ],
+            "missing_artifact_ids": [],
+            "truncated_artifact_ids": [],
+        }
+        manifests = []
+        missing = dict(base_manifest)
+        missing["hydrated_artifacts"] = []
+        missing["missing_artifact_ids"] = ["decision-payload"]
+        manifests.append((missing, "missing"))
+        truncated = dict(base_manifest)
+        truncated["hydrated_artifacts"] = [
+            {**base_manifest["hydrated_artifacts"][0], "truncated": True}
+        ]
+        truncated["truncated_artifact_ids"] = ["decision-payload"]
+        manifests.append((truncated, "truncated"))
+        contradictory = dict(base_manifest)
+        contradictory["hydrated_artifacts"] = [
+            {**base_manifest["hydrated_artifacts"][0], "resolution_status": "unresolved"}
+        ]
+        manifests.append((contradictory, "reference envelope|unresolved|contradictory"))
+
+        for manifest, error in manifests:
+            fact = {
+                **reference_envelope("record:decision"),
+                "artifact_hydration": manifest,
+            }
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(),
+                    request=sample_confirmation_request(supporting_evidence=(fact,)),
+                )
+
+    def test_open_or_unresolved_competing_hypothesis_blocks_confirmation(self):
+        closed = {
+            "hypothesis_id": "hyp_closed",
+            "status": "rejected",
+            "candidate_reference": reference_envelope("record:alternative"),
+            "evidence_references": [reference_envelope("record:alternative_evidence")],
+        }
+        open_hypothesis = {
+            **closed,
+            "hypothesis_id": "hyp_open",
+            "status": "supported",
+        }
+        missing_status = {key: value for key, value in closed.items() if key != "status"}
+        unresolved_evidence = {
+            **closed,
+            "evidence_references": [
+                reference_envelope("record:alternative_evidence", status="unresolved")
+            ],
+        }
+        validate_recursive_confirmation(
+            valid_confirmation_payload(),
+            request=sample_confirmation_request(competing_hypotheses=(closed,)),
+        )
+        for hypothesis in (open_hypothesis, missing_status, unresolved_evidence):
+            with self.subTest(hypothesis=hypothesis), self.assertRaisesRegex(
+                ValueError, "competing hypothesis"
             ):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(),
+                    request=sample_confirmation_request(competing_hypotheses=(hypothesis,)),
+                )
+
+    def test_provenance_class_and_inference_metadata_are_confirmation_eligible(self):
+        semantic_inferred = reference_envelope(
+            "record:decision",
+            provenance="inferred",
+            evidence_type="semantic_inferred",
+            inference_method="semantic_similarity_v1",
+            edge_origin="offline.semantic_search",
+        )
+        validate_recursive_confirmation(
+            valid_confirmation_payload(),
+            request=sample_confirmation_request(candidate_reference=semantic_inferred),
+        )
+        invalid_envelopes = (
+            reference_envelope("record:decision", provenance="fabricated"),
+            reference_envelope("record:decision", provenance="Recorded"),
+            reference_envelope("record:decision", provenance="inferred"),
+            reference_envelope(
+                "record:decision",
+                provenance="inferred",
+                evidence_type="temporal_inferred",
+                inference_method="temporal_adjacency",
+                edge_origin="offline.temporal",
+            ),
+            {
+                **reference_envelope("record:decision"),
+                "resolution_status": "unresolved",
+            },
+        )
+        for envelope in invalid_envelopes:
+            with self.subTest(envelope=envelope), self.assertRaisesRegex(
+                ValueError, "provenance|inference|temporal|contradictory"
+            ):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(),
+                    request=sample_confirmation_request(candidate_reference=envelope),
+                )
+
+    def test_v3_counterfactual_all_status_combinations(self):
+        allowed = {
+            "confirmed": {("absent", "prevents_defect")},
+            "unknown": {("unknown", "unknown")},
+            "rejected": {
+                ("present", "does_not_prevent_defect"),
+                ("unknown", "unknown"),
+            },
+        }
+        for status in ("confirmed", "rejected", "unknown"):
+            for predicted in ("absent", "present", "unknown"):
+                for effect in ("prevents_defect", "does_not_prevent_defect", "unknown"):
+                    payload = valid_confirmation_payload()
+                    payload["status"] = status
+                    payload["counterfactual"] = {
+                        "intervention_ref": "record:decision",
+                        "intervention_kind": "replace_with_semantically_correct_behavior",
+                        "predicted_defect_status": predicted,
+                        "causal_effect": effect,
+                    }
+                    if (predicted, effect) in allowed[status]:
+                        result = validate_recursive_confirmation(
+                            payload, request=sample_confirmation_request()
+                        )
+                        self.assertEqual(result.status, status)
+                        self.assertEqual(
+                            result.counterfactual,
+                            "replace_with_semantically_correct_behavior(record:decision) "
+                            "predicts defect_status={0}; causal_effect={1}".format(
+                                predicted, effect
+                            ),
+                        )
+                        continue
+                    with self.subTest(status=status, predicted=predicted, effect=effect), self.assertRaisesRegex(
+                        ValueError, "counterfactual"
+                    ):
+                        validate_recursive_confirmation(
+                            payload, request=sample_confirmation_request()
+                        )
+
+    def test_v3_counterfactual_requires_exact_intervention(self):
+        for field, value in (
+            ("intervention_ref", "record:other"),
+            ("intervention_kind", "delete_candidate"),
+        ):
+            payload = valid_confirmation_payload()
+            payload["counterfactual"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 validate_recursive_confirmation(payload, request=sample_confirmation_request())
+
+    def test_model_counterfactual_text_cannot_override_structured_result(self):
+        payload = valid_confirmation_payload()
+        payload["counterfactual_explanation"] = "The defect would still occur."
+
+        result = validate_recursive_confirmation(payload, request=sample_confirmation_request())
+
+        self.assertNotIn("still occur", result.counterfactual)
 
 
 class CausalJudgePromptTest(unittest.TestCase):
@@ -492,13 +763,15 @@ class CausalJudgePromptTest(unittest.TestCase):
             "recurse=true",
             "direct evidence",
             "candidate_introduction",
-            "counterfactual_status",
+            "intervention_ref",
+            "predicted_defect_status",
+            "causal_effect",
         )
         for prompt in prompts:
             for phrase in required:
                 with self.subTest(phrase=phrase):
                     self.assertIn(phrase, prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v2")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v3")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):
