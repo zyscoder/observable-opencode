@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .causal_state import AttributionHypothesis, CausalCandidate, CausalStepJudgment, DefectState
 from .episodes import CausalEpisodeIndex
-from .graph import TraceGraph
+from .graph import TraceGraph, is_temporal_only_edge
 from .models import JsonDict, NodeJudgment, TraceNode, stable_json
 from .progress import progress_navigation_window
 
@@ -84,22 +84,17 @@ def build_recursive_judgment_context(
     if not isinstance(graph, TraceGraph):
         raise TypeError("graph must be a TraceGraph")
     node_ref = str(values["node_ref"])
-    defect_state = values["defect_state"]
-    hypothesis = values["hypothesis"]
-    if not isinstance(defect_state, DefectState):
-        raise TypeError("defect_state must be a DefectState")
-    if not isinstance(hypothesis, AttributionHypothesis):
-        raise TypeError("hypothesis must be an AttributionHypothesis")
+    defect_state = coerce_defect_state(values["defect_state"])
+    hypothesis = coerce_hypothesis(values["hypothesis"])
     resolved = graph.resolve(node_ref) or node_ref
     if resolved not in graph.nodes:
         raise KeyError("unknown recursive judgment node: {0}".format(node_ref))
-    candidates = list(values.get("candidates") or [])
-    if not all(isinstance(item, CausalCandidate) for item in candidates):
-        raise TypeError("candidates must contain CausalCandidate values")
-    downstream_path = [graph.resolve(str(item)) or str(item) for item in values.get("downstream_path") or []]
+    candidates = [coerce_candidate(item) for item in values.get("candidates") or []]
+    downstream_path_raw = [str(item) for item in values.get("downstream_path") or []]
+    downstream_path = [graph.resolve(item) or item for item in downstream_path_raw]
     if not downstream_path:
         downstream_path = [resolved]
-    downstream_judgments = list(values.get("downstream_judgments") or [])
+    downstream_judgments = [coerce_recursive_judgment(item) for item in values.get("downstream_judgments") or []]
     transformation_chain = normalize_defect_chain(
         values.get("defect_transformation_chain") or [], defect_state
     )
@@ -107,6 +102,8 @@ def build_recursive_judgment_context(
     episode_index = CausalEpisodeIndex.from_graph(graph)
     graph.hydrate_node(resolved)
     candidate_context = [recursive_candidate_context(graph, item) for item in candidates]
+    downstream_path_references = [ground_reference(graph, item, "recorded") for item in downstream_path_raw]
+    hypothesis_evidence_references = grounded_hypothesis_evidence(graph, hypothesis)
     legacy_judgments = {
         item.node_ref: item for item in downstream_judgments if isinstance(item, NodeJudgment)
     }
@@ -122,11 +119,14 @@ def build_recursive_judgment_context(
         "context_version": "2.0",
         "behavior_impact": "none_offline_analysis_only",
         "current_ref": resolved,
+        "current_reference": ground_reference(graph, node_ref, "recorded"),
         "defect_state": defect_state.to_dict(),
         "defect_transformation_chain": [item.to_dict() for item in transformation_chain],
         "hypothesis": hypothesis.to_dict(),
+        "hypothesis_evidence_references": hypothesis_evidence_references,
         "candidate_predecessors": candidate_context,
         "downstream_path": downstream_path,
+        "downstream_path_references": downstream_path_references,
         "downstream_judgments": [compact_recursive_judgment(item) for item in downstream_judgments],
         "task_obligations": task_obligations(graph, objective),
         "agent_scope": agent_scope(graph.hydrate_node(resolved)),
@@ -138,6 +138,13 @@ def build_recursive_judgment_context(
         "temporal_adjacency": temporal_adjacency_context(graph, resolved),
         "artifact_hydration": dict(graph.artifact_hydration),
     }
+    unresolved_references = unresolved_context_references(
+        downstream_path_references, candidate_context, hypothesis_evidence_references
+    )
+    missing_artifacts, truncated_artifacts = artifact_context_gaps(candidate_context)
+    context["unresolved_references"] = unresolved_references
+    context["missing_artifacts"] = missing_artifacts
+    context["truncated_artifacts"] = truncated_artifacts
     context["context_manifest"] = {
         "candidate_count": len(candidate_context),
         "defect_transformation_count": len(transformation_chain),
@@ -146,13 +153,16 @@ def build_recursive_judgment_context(
         "obligation_count": len(context["task_obligations"]),
         "hydrated_candidate_count": len(candidate_context),
         "temporal_adjacency_count": len(context["temporal_adjacency"]),
+        "unresolved_reference_count": len(unresolved_references),
+        "missing_artifact_count": len(missing_artifacts),
+        "truncated_artifact_count": len(truncated_artifacts),
         "legacy_context_manifest": legacy_context["context_manifest"],
     }
     return context
 
 
 def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[DefectState]:
-    chain = [item for item in value if isinstance(item, DefectState)]
+    chain = [coerce_defect_state(item) for item in value]
     if not chain or chain[-1].fingerprint != active.fingerprint:
         chain.append(active)
     return chain
@@ -160,12 +170,24 @@ def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[De
 
 def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -> JsonDict:
     hydrated = graph.hydrate_node(candidate.ref)
+    edge = dict(candidate.edge)
+    edge_evidence_references = [
+        ground_reference(graph, ref, edge_provenance_class(edge))
+        for ref in dedupe_raw_refs(list(edge.get("evidence_refs") or []) + list(candidate.evidence_refs))
+    ]
     return {
         "ref": candidate.ref,
+        "reference": ground_reference(graph, candidate.ref, edge_provenance_class(edge)),
         "source": candidate.source,
         "score": candidate.score,
-        "edge": dict(candidate.edge),
+        "edge": edge,
+        "edge_endpoint_references": {
+            "from": ground_reference(graph, edge.get("from_ref") or candidate.ref, edge_provenance_class(edge)),
+            "to": ground_reference(graph, edge.get("to_ref"), edge_provenance_class(edge)),
+        },
         "evidence_refs": list(candidate.evidence_refs),
+        "edge_evidence_references": edge_evidence_references,
+        "artifact_hydration": graph.artifact_hydration_manifest(candidate.ref),
         "node": hydrated.compact(),
     }
 
@@ -178,6 +200,146 @@ def compact_recursive_judgment(value: Any) -> JsonDict:
     if isinstance(value, Mapping):
         return dict(value)
     raise TypeError("downstream judgments must be causal judgments or mappings")
+
+
+def coerce_defect_state(value: Any) -> DefectState:
+    if isinstance(value, DefectState):
+        return value
+    if isinstance(value, Mapping):
+        return DefectState.from_dict(dict(value))
+    raise TypeError("defect_state must be a DefectState or serialized DefectState mapping")
+
+
+def coerce_hypothesis(value: Any) -> AttributionHypothesis:
+    if isinstance(value, AttributionHypothesis):
+        return value
+    if isinstance(value, Mapping):
+        return AttributionHypothesis.from_dict(dict(value))
+    raise TypeError("hypothesis must be an AttributionHypothesis or serialized mapping")
+
+
+def coerce_candidate(value: Any) -> CausalCandidate:
+    if isinstance(value, CausalCandidate):
+        return value
+    if isinstance(value, Mapping):
+        return CausalCandidate.from_dict(dict(value))
+    raise TypeError("candidates must contain CausalCandidate values or serialized mappings")
+
+
+def coerce_recursive_judgment(value: Any) -> Any:
+    if isinstance(value, (CausalStepJudgment, NodeJudgment)):
+        return value
+    if isinstance(value, Mapping):
+        data = dict(value)
+        if "current_node_ref" in data:
+            return CausalStepJudgment.from_dict(data)
+        return data
+    raise TypeError("downstream judgments must be causal judgments or mappings")
+
+
+def ground_reference(graph: TraceGraph, raw_ref: Any, provenance_class: str) -> JsonDict:
+    raw = str(raw_ref or "")
+    resolved = graph.resolve(raw)
+    if resolved in graph.nodes:
+        return {
+            "raw_ref": raw,
+            "resolved_ref": resolved,
+            "provenance_class": provenance_class,
+            "resolution_status": "resolved",
+        }
+    return {
+        "raw_ref": raw,
+        "resolved_ref": "",
+        "provenance_class": provenance_class,
+        "resolution_status": "unresolved",
+    }
+
+
+def edge_provenance_class(edge: Mapping[str, Any]) -> str:
+    evidence_type = str(edge.get("evidence_type") or "").lower()
+    origin = str(edge.get("edge_origin") or "").lower()
+    if evidence_type in {"semantic_inferred", "temporal_inferred"} or "semantic" in origin:
+        return "inferred"
+    if "offline" in origin or "reconstruction" in evidence_type:
+        return "reconstructed"
+    return "recorded"
+
+
+def dedupe_raw_refs(values: Iterable[Any]) -> List[str]:
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        ref = str(value or "")
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        output.append(ref)
+    return output
+
+
+def grounded_hypothesis_evidence(graph: TraceGraph, hypothesis: AttributionHypothesis) -> List[JsonDict]:
+    output = []
+    for evidence_class, evidence_items in (
+        ("supporting", hypothesis.supporting_evidence),
+        ("opposing", hypothesis.opposing_evidence),
+    ):
+        for evidence in evidence_items:
+            output.append(
+                {
+                    **ground_reference(graph, evidence.ref, "recorded"),
+                    "evidence_class": evidence_class,
+                    "reason": evidence.reason,
+                    "confidence": evidence.confidence,
+                }
+            )
+    return output
+
+
+def unresolved_context_references(
+    path_references: List[JsonDict],
+    candidate_context: List[JsonDict],
+    hypothesis_evidence_references: List[JsonDict],
+) -> List[JsonDict]:
+    output = [item for item in path_references if item["resolution_status"] != "resolved"]
+    output.extend(
+        item for item in hypothesis_evidence_references if item["resolution_status"] != "resolved"
+    )
+    for candidate in candidate_context:
+        output.extend(
+            item
+            for item in candidate["edge_endpoint_references"].values()
+            if item["resolution_status"] != "resolved"
+        )
+        output.extend(
+            item
+            for item in candidate["edge_evidence_references"]
+            if item["resolution_status"] != "resolved"
+        )
+    return dedupe_reference_facts(output)
+
+
+def artifact_context_gaps(candidate_context: List[JsonDict]) -> tuple:
+    missing = []
+    truncated = []
+    for candidate in candidate_context:
+        hydration = candidate["artifact_hydration"]
+        for artifact_id in hydration["missing_artifact_ids"]:
+            missing.append({"candidate_ref": candidate["ref"], "artifact_id": artifact_id})
+        for artifact_id in hydration["truncated_artifact_ids"]:
+            truncated.append({"candidate_ref": candidate["ref"], "artifact_id": artifact_id})
+    return missing, truncated
+
+
+def dedupe_reference_facts(values: Iterable[JsonDict]) -> List[JsonDict]:
+    output: List[JsonDict] = []
+    seen = set()
+    for value in values:
+        key = (value.get("raw_ref"), value.get("provenance_class"), value.get("resolution_status"))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
 
 
 def task_obligations(graph: TraceGraph, objective: str) -> List[JsonDict]:
@@ -232,8 +394,13 @@ def temporal_adjacency_context(graph: TraceGraph, node_ref: str) -> List[JsonDic
         if not isinstance(edge, Mapping):
             continue
         metadata = edge.get("metadata") if isinstance(edge.get("metadata"), Mapping) else {}
-        evidence_type = str(edge.get("evidence_type") or metadata.get("evidence_type") or "")
-        if evidence_type != "temporal_inferred":
+        normalized_edge = {
+            "evidence_type": edge.get("evidence_type") or metadata.get("evidence_type"),
+            "relation": edge.get("relation") or metadata.get("relation"),
+            "edge_origin": edge.get("edge_origin") or metadata.get("edge_origin"),
+            "inference_method": edge.get("inference_method") or metadata.get("inference_method"),
+        }
+        if not is_temporal_only_edge(normalized_edge):
             continue
         target = raw_edge_ref(graph, edge.get("to"))
         if target != node_ref:
@@ -246,27 +413,44 @@ def temporal_adjacency_context(graph: TraceGraph, node_ref: str) -> List[JsonDic
                 "from_ref": source,
                 "to_ref": target,
                 "relation": str(edge.get("relation") or metadata.get("relation") or "temporal_availability"),
-                "evidence_type": "temporal_inferred",
+                "evidence_type": str(edge.get("evidence_type") or metadata.get("evidence_type") or "temporal_only"),
                 "evidence_refs": list(edge.get("evidence_refs") or metadata.get("evidence_refs") or []),
                 "confidence": edge.get("confidence", metadata.get("confidence", 0.0)),
-                "eligible_for_attribution": False,
+                "recorded_eligible_for_attribution": raw_edge_eligibility(edge, metadata),
+                "direct_predecessor_eligible": False,
                 "inference_method": str(
                     edge.get("inference_method") or metadata.get("inference_method") or "temporal_adjacency"
                 ),
-                "edge_origin": "trace.dataflow_edges",
+                "edge_origin": str(edge.get("edge_origin") or metadata.get("edge_origin") or "trace.dataflow_edges"),
             }
         )
     for edge in graph.message_lineage.get("edges") or []:
-        if not isinstance(edge, Mapping) or str(edge.get("evidence_type") or "") != "temporal_inferred":
+        if not isinstance(edge, Mapping) or not is_temporal_only_edge(dict(edge)):
             continue
         target = graph.resolve(str(edge.get("to_ref") or "")) or str(edge.get("to_ref") or "")
         if target != node_ref:
             continue
         source = graph.resolve(str(edge.get("from_ref") or "")) or str(edge.get("from_ref") or "")
         if source:
-            output.append({**dict(edge), "from_ref": source, "to_ref": target, "eligible_for_attribution": False})
+            output.append(
+                {
+                    **dict(edge),
+                    "from_ref": source,
+                    "to_ref": target,
+                    "recorded_eligible_for_attribution": edge.get("eligible_for_attribution"),
+                    "direct_predecessor_eligible": False,
+                }
+            )
     output.sort(key=lambda item: (graph.position(str(item["from_ref"])), str(item.get("relation") or "")))
     return output
+
+
+def raw_edge_eligibility(edge: Mapping[str, Any], metadata: Mapping[str, Any]) -> Optional[bool]:
+    if "eligible_for_attribution" in edge:
+        return bool(edge.get("eligible_for_attribution"))
+    if "eligible_for_attribution" in metadata:
+        return bool(metadata.get("eligible_for_attribution"))
+    return None
 
 
 def raw_edge_ref(graph: TraceGraph, value: Any) -> str:

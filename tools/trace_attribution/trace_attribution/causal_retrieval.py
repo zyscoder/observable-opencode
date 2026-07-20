@@ -8,14 +8,11 @@ from typing import Any, Iterable, List, Sequence, Tuple
 
 from .causal_state import AttributionHypothesis, CausalCandidate, DefectState
 from .episodes import CausalEpisodeIndex
-from .graph import TraceGraph
+from .graph import TraceGraph, is_temporal_only_edge
 from .models import TraceNode
 from .progress import progress_navigation_window
 
 
-CONCRETE_EPISODE_EVENT_TYPES = frozenset(
-    {"decision", "change", "verification", "tool.call", "mcp.call", "skill.load"}
-)
 SIBLING_REFERENCE_KEYS = (
     "candidate_context_refs",
     "grounding_candidate_refs",
@@ -55,7 +52,7 @@ class SemanticPredecessorRetriever:
         for edge in graph.semantic_predecessor_edges(node_ref):
             ref = str(edge.get("ref") or "")
             node = graph.nodes.get(ref)
-            if not node or node.event_type == "progress.episode":
+            if not node or is_navigation_node(node) or is_temporal_only_edge(edge):
                 continue
             evidence_type = str(edge.get("evidence_type") or "")
             source = "confirmed_edge" if evidence_type in {"confirmed", "content_matched"} else "attribution_edge"
@@ -77,7 +74,7 @@ class SemanticPredecessorRetriever:
         source = "episode_candidate"
         if current.event_type == "progress.episode":
             window = progress_navigation_window(graph.nodes, node_ref)
-            refs = [str(item) for item in window.get("candidate_member_refs") or []]
+            refs = [str(item) for item in window.get("member_refs") or []]
             source = "progress_window"
         else:
             episode = CausalEpisodeIndex.from_graph(graph).episode_for(node_ref)
@@ -86,12 +83,12 @@ class SemanticPredecessorRetriever:
                 for ref in episode.member_refs
                 if graph.position(ref) < graph.position(node_ref)
                 and graph.nodes.get(ref)
-                and graph.nodes[ref].event_type in CONCRETE_EPISODE_EVENT_TYPES
+                and not is_navigation_node(graph.nodes[ref])
             ]
         candidates: List[CausalCandidate] = []
         for ref in dedupe_refs(graph, refs):
             node = graph.nodes.get(ref)
-            if not node or node.event_type == "progress.episode":
+            if not node or ref == node_ref or is_navigation_node(node):
                 continue
             candidates.append(
                 CausalCandidate(
@@ -127,13 +124,13 @@ class SemanticPredecessorRetriever:
                 node.ref
                 for node in graph.nodes.values()
                 if graph.position(node.ref) < graph.position(node_ref)
-                and node.event_type in CONCRETE_EPISODE_EVENT_TYPES
+                and not is_navigation_node(node)
                 and identity_value(node, "messageid", "message_id") == message_id
             )
         candidates: List[CausalCandidate] = []
         for ref in dedupe_refs(graph, refs):
             node = graph.nodes.get(ref)
-            if not node or ref in direct_refs or node.event_type == "progress.episode":
+            if not node or ref == node_ref or ref in direct_refs or is_navigation_node(node):
                 continue
             candidates.append(
                 CausalCandidate(
@@ -274,3 +271,12 @@ def identity_value(node: TraceNode, *keys: str) -> str:
             if isinstance(child, Mapping):
                 stack.append(child)
     return ""
+
+
+def is_navigation_node(node: TraceNode) -> bool:
+    role = str(node.data.get("semantic_role") or node.data.get("navigation_role") or "").strip().lower()
+    return node.event_type == "progress.episode" or bool(node.data.get("offline_only")) or role in {
+        "aggregate",
+        "navigation",
+        "progress_episode",
+    }

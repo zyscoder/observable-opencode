@@ -306,7 +306,7 @@ class TraceGraph:
         output: List[JsonDict] = []
         for upstream_ref in self.upstream_refs(resolved):
             for edge in self.edge_context(upstream_ref, resolved):
-                if not edge.get("eligible_for_attribution"):
+                if is_temporal_only_edge(edge) or not edge.get("eligible_for_attribution"):
                     continue
                 output.append({"ref": upstream_ref, **edge})
         return sorted(
@@ -348,6 +348,29 @@ class TraceGraph:
             scored,
             key=lambda item: (-float(item["score"]), self.position(str(item["ref"]))),
         )[:limit]
+
+    def artifact_hydration_manifest(self, ref: str) -> JsonDict:
+        """Return per-node artifact hydration facts, including unavailable evidence."""
+        resolved = self.resolve(ref) or ref
+        node = self.hydrate_node(resolved)
+        record = self._artifact_records.get(resolved) or {}
+        artifact_ids = collect_artifact_ids(record, node.data)
+        hydrated = node.data.get("hydrated_artifacts")
+        hydrated_items = [dict(item) for item in hydrated if isinstance(item, dict)] if isinstance(hydrated, list) else []
+        hydrated_ids = {str(item.get("artifact_id") or "") for item in hydrated_items}
+        missing_ids = [artifact_id for artifact_id in artifact_ids if artifact_id not in hydrated_ids]
+        truncated_ids = [
+            str(item.get("artifact_id") or "")
+            for item in hydrated_items
+            if item.get("truncated") and item.get("artifact_id")
+        ]
+        return {
+            "node_ref": resolved,
+            "referenced_artifact_ids": artifact_ids,
+            "hydrated_artifacts": hydrated_items,
+            "missing_artifact_ids": missing_ids,
+            "truncated_artifact_ids": truncated_ids,
+        }
 
     def incoming_edge_context(
         self,
@@ -776,6 +799,19 @@ def normalized_confidence(value: Any) -> float:
     except (TypeError, ValueError):
         return 1.0
     return max(0.0, min(1.0, confidence))
+
+
+def is_temporal_only_edge(edge: JsonDict) -> bool:
+    """Identify advisory time adjacency even when a producer marked it eligible."""
+    evidence_type = str(edge.get("evidence_type") or "").strip().lower()
+    relation = str(edge.get("relation") or "").strip().lower()
+    origin = str(edge.get("edge_origin") or "").strip().lower()
+    method = str(edge.get("inference_method") or "").strip().lower()
+    if evidence_type in {"temporal_inferred", "temporal_only", "temporal_advisory"}:
+        return True
+    if relation in {"temporal_availability", "available_to_next_request", "temporal_adjacency"}:
+        return True
+    return "temporal" in origin or "temporal" in method
 
 
 def dedupe(items: Iterable[str]) -> List[str]:
