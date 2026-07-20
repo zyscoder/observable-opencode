@@ -209,11 +209,14 @@ class RecursiveAnalysisState:
     judge_requests: int = 0
     logical_judge_calls: int = 0
     investigation_rounds: int = 0
+    investigation_result_bytes: int = 0
     investigation_journal: List[JsonDict] = field(default_factory=list)
     investigation_evidence: Dict[str, List[JsonDict]] = field(default_factory=dict)
     investigation_evidence_hashes: Dict[str, Set[str]] = field(default_factory=dict)
     control_directive_ids: Set[str] = field(default_factory=set)
     confirmation_queue: List[JsonDict] = field(default_factory=list)
+    confirmation_queue_keys: Set[Tuple[str, str, str]] = field(default_factory=set)
+    pending_rejudge_journal: Dict[str, List[int]] = field(default_factory=dict)
     seed_count: int = 0
 
     @classmethod
@@ -365,6 +368,20 @@ class RecursiveAnalysisState:
         context["evidence_hash"] = hashlib.sha256(
             stable_json(context).encode("utf-8")
         ).hexdigest()
+        context_snapshot = copy.deepcopy(context)
+        context_hash = hashlib.sha256(
+            stable_json(context_snapshot).encode("utf-8")
+        ).hexdigest()
+        for index in self.pending_rejudge_journal.pop(item.visit_key, []):
+            entry = self.investigation_journal[index]
+            entry["context_after"] = context_snapshot
+            entry["context_after_hash"] = context_hash
+            entry["rejudge_linkage"] = {
+                **entry["rejudge_linkage"],
+                "status": "linked",
+                "rejudge_visit_key": item.visit_key,
+                "context_after_hash": context_hash,
+            }
         return CausalStepRequest(
             recursive_context=context,
             current_node=graph.hydrate_node(item.node_ref),
@@ -377,29 +394,124 @@ class RecursiveAnalysisState:
         item: FrontierItem,
         directive: InvestigationDirective,
         result: InvestigationResult,
+        judgment: CausalStepJudgment,
+        request: CausalStepRequest,
     ) -> bool:
-        journal = {**directive.to_dict(), **result.to_dict()}
-        self.investigation_journal.append(journal)
-        if result.status != "success":
-            return False
+        context_before = copy.deepcopy(request.to_dict()["recursive_context"])
+        context_before_hash = hashlib.sha256(
+            stable_json(context_before).encode("utf-8")
+        ).hexdigest()
         seen = self.investigation_evidence_hashes.setdefault(item.visit_key, set())
-        if result.evidence_hash in seen:
+        changed = result.status == "success" and result.evidence_hash not in seen
+        linkage_status = "scheduled" if changed else "not_scheduled"
+        journal = {
+            **directive.to_dict(),
+            **result.to_dict(),
+            "active_visit": self._active_visit_snapshot(item),
+            "judgment_before_investigation": judgment.to_dict(),
+            "context_before": context_before,
+            "context_before_hash": context_before_hash,
+            "result": result.to_dict(),
+            "context_after": None if changed else context_before,
+            "context_after_hash": "" if changed else context_before_hash,
+            "rejudge_linkage": {
+                "status": linkage_status,
+                "source_visit_key": item.visit_key,
+                "source_context_hash": context_before_hash,
+                "evidence_hash": result.evidence_hash,
+            },
+        }
+        self.investigation_journal.append(journal)
+        if not changed:
             return False
         seen.add(result.evidence_hash)
         self.investigation_evidence.setdefault(item.visit_key, []).append(result.to_dict())
         self._merge_visit_evidence(item.visit_key, result.resolved_refs)
+        self.pending_rejudge_journal.setdefault(item.visit_key, []).append(
+            len(self.investigation_journal) - 1
+        )
         return True
+
+    def record_terminal_action(
+        self,
+        *,
+        item: FrontierItem,
+        judgment: CausalStepJudgment,
+        request: CausalStepRequest,
+        directive: Mapping[str, Any],
+        status: str,
+        rejection_reason: str,
+        result: Optional[Mapping[str, Any]] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        context_before = copy.deepcopy(request.to_dict()["recursive_context"])
+        context_hash = hashlib.sha256(
+            stable_json(context_before).encode("utf-8")
+        ).hexdigest()
+        terminal_result = dict(
+            result
+            or {
+                "status": status,
+                "rejection_reason": rejection_reason,
+                "evidence_hash": hashlib.sha256(
+                    stable_json(
+                        {"status": status, "rejection_reason": rejection_reason}
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        self.investigation_journal.append(
+            {
+                **dict(directive),
+                "status": status,
+                "rejection_reason": rejection_reason,
+                "active_visit": self._active_visit_snapshot(item),
+                "judgment_before_investigation": judgment.to_dict(),
+                "context_before": context_before,
+                "context_before_hash": context_hash,
+                "result": terminal_result,
+                "context_after": context_before,
+                "context_after_hash": context_hash,
+                "rejudge_linkage": {
+                    "status": "not_scheduled",
+                    "source_visit_key": item.visit_key,
+                    "source_context_hash": context_hash,
+                },
+                **dict(extra or {}),
+            }
+        )
+
+    @staticmethod
+    def _active_visit_snapshot(item: FrontierItem) -> JsonDict:
+        return {
+            "visit_key": item.visit_key,
+            "node_ref": item.node_ref,
+            "hypothesis_id": item.hypothesis_id,
+            "defect_state_id": item.defect_state.defect_state_id,
+            "defect_fingerprint": item.defect_state.fingerprint,
+            "depth": item.depth,
+        }
 
     def record_intermediate_judgment(
         self, item: FrontierItem, judgment: CausalStepJudgment
     ) -> str:
-        if self.investigation_journal:
-            self.investigation_journal[-1][
-                "judgment_before_investigation"
-            ] = judgment.to_dict()
         return hashlib.sha256(
             stable_json(judgment.to_dict()).encode("utf-8")
         ).hexdigest()
+
+    def finalize_pending_rejudges(self) -> None:
+        for indexes in self.pending_rejudge_journal.values():
+            for index in indexes:
+                entry = self.investigation_journal[index]
+                entry["context_after"] = entry["context_before"]
+                entry["context_after_hash"] = entry["context_before_hash"]
+                entry["rejudge_linkage"] = {
+                    **entry["rejudge_linkage"],
+                    "status": "not_executed",
+                    "reason": "recursive traversal terminated before re-judgment",
+                    "context_after_hash": entry["context_before_hash"],
+                }
+        self.pending_rejudge_journal.clear()
 
     def reserve_artifact_bytes(self, request: CausalStepRequest, limit: int) -> bool:
         new_payloads: Dict[str, bytes] = {}
@@ -645,6 +757,7 @@ class RecursiveAnalysisState:
         self.frontier.mark_completed(item, "unresolved:{0}".format(reason))
 
     def build_report(self, *, judge: CausalJudge) -> RecursiveAttributionReport:
+        self.finalize_pending_rejudges()
         hypotheses = [AttributionHypothesis.from_dict(item) for item in self.ledger.snapshot()]
         by_id = {item.hypothesis_id: item for item in hypotheses}
         unresolved_ids = self.unresolved_hypothesis_ids | self.introduction_hypothesis_ids
@@ -689,6 +802,7 @@ class RecursiveAnalysisState:
             "logical_judge_call_count": self.logical_judge_calls,
             "artifact_bytes": self.artifact_bytes,
             "investigation_rounds": self.investigation_rounds,
+            "investigation_result_bytes": self.investigation_result_bytes,
             "investigation_budget_exhausted": bool(
                 self.exhausted_budgets.get("investigation_rounds")
             ),
@@ -949,6 +1063,18 @@ class AgenticRecursiveAnalyzer:
             ):
                 state._increment_budget("judge_requests")
             if judgment.suggested_investigation is not None:
+                is_confirmation_request = (
+                    isinstance(judgment.suggested_investigation, Mapping)
+                    and judgment.suggested_investigation.get("action")
+                    == "request_root_confirmation"
+                )
+                if is_confirmation_request:
+                    state.apply_step(
+                        item,
+                        judgment,
+                        graph_position=analysis_graph.position,
+                        max_hypotheses=self.max_hypotheses,
+                    )
                 handled = self._handle_investigation(
                     state=state,
                     tools=tools,
@@ -956,7 +1082,11 @@ class AgenticRecursiveAnalyzer:
                     judgment=judgment,
                     request=request,
                 )
-                if handled in {"reopened", "completed"}:
+                if is_confirmation_request or handled in {
+                    "reopened",
+                    "completed",
+                    "branch_rejected",
+                }:
                     continue
             state.apply_step(
                 item,
@@ -989,8 +1119,9 @@ class AgenticRecursiveAnalyzer:
         if not isinstance(suggestion, Mapping):
             return "not_handled"
         if suggestion.get("action"):
-            self._apply_control_directive(state, item, suggestion)
-            return "control"
+            return self._apply_control_directive(
+                state, item, judgment, request, suggestion
+            )
         try:
             directive = InvestigationDirective.from_suggestion(
                 suggestion,
@@ -998,17 +1129,19 @@ class AgenticRecursiveAnalyzer:
                 hypothesis_id=item.hypothesis_id,
             )
         except ValueError as exc:
-            state.investigation_journal.append(
-                {
+            reason = "invalid_investigation_directive: {0}".format(exc)
+            state.record_terminal_action(
+                item=item,
+                judgment=judgment,
+                request=request,
+                directive={
                     "directive_kind": "evidence_investigation",
-                    "tool_name": str(
-                        suggestion.get("tool") or suggestion.get("tool_name") or ""
-                    ),
-                    "status": "rejected",
+                    "tool_name": str(suggestion.get("tool") or ""),
                     "requested_by_ref": item.node_ref,
                     "hypothesis_id": item.hypothesis_id,
-                    "rejection_reason": "invalid_investigation_directive: {0}".format(exc),
-                }
+                },
+                status="rejected",
+                rejection_reason=reason,
             )
             state._mark_ref_unresolved(
                 item.node_ref,
@@ -1021,14 +1154,18 @@ class AgenticRecursiveAnalyzer:
             result = InvestigationResult.rejected(
                 directive, "investigation_not_evidence_eligible"
             )
-            state.record_investigation_result(item, directive, result)
+            state.record_investigation_result(
+                item, directive, result, judgment, request
+            )
             return "rejected"
         if state.investigation_rounds >= self.max_investigation_rounds:
             state._increment_budget("investigation_rounds")
             result = InvestigationResult.rejected(
                 directive, "investigation_round_budget_exhausted"
             )
-            state.record_investigation_result(item, directive, result)
+            state.record_investigation_result(
+                item, directive, result, judgment, request
+            )
             state._mark_ref_unresolved(
                 item.node_ref,
                 item,
@@ -1041,9 +1178,12 @@ class AgenticRecursiveAnalyzer:
             0, self.max_artifact_bytes - state.artifact_bytes
         )
         result = tools.execute(directive)
-        if result.status == "success" and result.byte_count:
-            state.artifact_bytes += result.byte_count
-        changed = state.record_investigation_result(item, directive, result)
+        state.investigation_result_bytes += result.byte_count
+        if result.status == "success" and result.artifact_byte_count:
+            state.artifact_bytes += result.artifact_byte_count
+        changed = state.record_investigation_result(
+            item, directive, result, judgment, request
+        )
         if changed:
             judgment_hash = state.record_intermediate_judgment(item, judgment)
             state.frontier.mark_completed(item, judgment_hash)
@@ -1096,39 +1236,45 @@ class AgenticRecursiveAnalyzer:
             for key in ("missing_artifacts", "truncated_artifacts", "unresolved_references")
         ):
             return True
-        return str(suggestion.get("evidence_state") or "") in {
-            "conflicting",
-            "truncated",
-            "missing",
-            "unknown",
-        }
+        return False
 
     def _apply_control_directive(
         self,
         state: RecursiveAnalysisState,
         item: FrontierItem,
+        judgment: CausalStepJudgment,
+        request: CausalStepRequest,
         suggestion: Mapping[str, Any],
-    ) -> None:
+    ) -> str:
         try:
             directive = AttributionControlDirective.from_suggestion(
                 suggestion, requested_by_ref=item.node_ref
             )
         except ValueError as exc:
-            state.investigation_journal.append(
-                {
+            reason = "invalid_control_directive: {0}".format(exc)
+            state.record_terminal_action(
+                item=item,
+                judgment=judgment,
+                request=request,
+                directive={
                     "directive_kind": "attribution_control",
                     "action": str(suggestion.get("action") or ""),
-                    "status": "rejected",
                     "requested_by_ref": item.node_ref,
-                    "rejection_reason": "invalid_control_directive: {0}".format(exc),
-                }
+                },
+                status="rejected",
+                rejection_reason=reason,
             )
-            return
+            return "rejected"
         if directive.directive_id in state.control_directive_ids:
-            state.investigation_journal.append(
-                {**directive.to_dict(), "status": "unchanged", "rejection_reason": "duplicate_control_directive"}
+            state.record_terminal_action(
+                item=item,
+                judgment=judgment,
+                request=request,
+                directive=directive.to_dict(),
+                status="unchanged",
+                rejection_reason="duplicate_control_directive",
             )
-            return
+            return "control"
         state.control_directive_ids.add(directive.directive_id)
         before = state.ledger.snapshot()
         arguments = directive.arguments
@@ -1136,12 +1282,21 @@ class AgenticRecursiveAnalyzer:
         rejection_reason = ""
         try:
             if directive.action == "record_hypothesis":
-                if len(before) >= self.max_hypotheses:
-                    raise ValueError("hypothesis budget exhausted")
                 candidate_ref = str(arguments["candidate_ref"])
                 resolved = state.graph.resolve(candidate_ref)
                 if not resolved:
                     raise ValueError("candidate_ref is unresolved")
+                proposed = AttributionHypothesis.create(
+                    str(arguments["claim"]), resolved, item.defect_state
+                )
+                existing_ids = {
+                    str(value.get("hypothesis_id") or "") for value in before
+                }
+                if (
+                    proposed.hypothesis_id not in existing_ids
+                    and len(before) >= self.max_hypotheses
+                ):
+                    raise ValueError("hypothesis budget exhausted")
                 state.ledger.create(
                     str(arguments["claim"]), resolved, item.defect_state
                 )
@@ -1165,39 +1320,80 @@ class AgenticRecursiveAnalyzer:
                 state.ledger.reject(hypothesis_id, directive.reason)
             elif directive.action == "request_root_confirmation":
                 hypothesis_id = str(arguments["hypothesis_id"])
-                if hypothesis_id == "active":
-                    hypothesis_id = item.hypothesis_id
-                state.ledger.get(hypothesis_id)
+                if hypothesis_id != item.hypothesis_id:
+                    raise ValueError("confirmation hypothesis_id must exactly match the active hypothesis")
+                hypothesis = state.ledger.get(hypothesis_id)
                 candidate_ref = state.graph.resolve(str(arguments["candidate_ref"]))
                 if not candidate_ref:
                     raise ValueError("candidate_ref is unresolved")
-                state.confirmation_queue.append(
-                    {
-                        "hypothesis_id": hypothesis_id,
-                        "candidate_ref": candidate_ref,
-                        "requested_by_ref": item.node_ref,
-                        "status": "pending_task_7_independent_confirmation",
-                    }
+                defect_fingerprint = str(arguments["defect_fingerprint"])
+                if (
+                    candidate_ref != item.node_ref
+                    or candidate_ref != hypothesis.candidate_root_ref
+                ):
+                    raise ValueError("confirmation candidate_ref does not match the active hypothesis root")
+                if (
+                    defect_fingerprint != item.defect_state.fingerprint
+                    or defect_fingerprint != hypothesis.active_defect_fingerprint
+                ):
+                    raise ValueError("confirmation defect_fingerprint does not match the active defect")
+                binding_exists = any(
+                    binding.get("candidate_ref") == candidate_ref
+                    and binding.get("hypothesis_id") == hypothesis_id
+                    and binding.get("defect_fingerprint") == defect_fingerprint
+                    for binding in state.introduction_bindings
                 )
+                if not binding_exists:
+                    raise ValueError("confirmation requires an existing introduction binding")
+                queue_key = (hypothesis_id, candidate_ref, defect_fingerprint)
+                if queue_key not in state.confirmation_queue_keys:
+                    state.confirmation_queue_keys.add(queue_key)
+                    state.confirmation_queue.append(
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "candidate_ref": candidate_ref,
+                            "defect_fingerprint": defect_fingerprint,
+                            "requested_by_ref": item.node_ref,
+                            "semantic_identity": hashlib.sha256(
+                                stable_json(queue_key).encode("utf-8")
+                            ).hexdigest(),
+                            "status": "pending_task_7_independent_confirmation",
+                        }
+                    )
                 status = "deferred"
         except (KeyError, ValueError) as exc:
             status = "rejected"
             rejection_reason = str(exc)
-        state.investigation_journal.append(
-            {
-                **directive.to_dict(),
-                "status": status,
-                "rejection_reason": rejection_reason,
+        after = state.ledger.snapshot()
+        state.record_terminal_action(
+            item=item,
+            judgment=judgment,
+            request=request,
+            directive=directive.to_dict(),
+            status=status,
+            rejection_reason=rejection_reason,
+            extra={
                 "ledger_before": before,
-                "ledger_after": state.ledger.snapshot(),
+                "ledger_after": after,
                 "ledger_before_hash": hashlib.sha256(
                     stable_json(before).encode("utf-8")
                 ).hexdigest(),
                 "ledger_after_hash": hashlib.sha256(
-                    stable_json(state.ledger.snapshot()).encode("utf-8")
+                    stable_json(after).encode("utf-8")
                 ).hexdigest(),
-            }
+            },
         )
+        if directive.action == "reject_hypothesis" and status == "applied":
+            state.frontier.mark_completed(
+                item,
+                hashlib.sha256(
+                    stable_json(
+                        {"directive": directive.to_dict(), "ledger_after": after}
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            return "branch_rejected"
+        return "control"
 
 
 __all__ = ["AgenticRecursiveAnalyzer", "RecursiveAnalysisState"]

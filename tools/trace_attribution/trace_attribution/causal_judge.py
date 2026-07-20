@@ -228,7 +228,8 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "Use unknown and list missing evidence when the grounded facts are insufficient.",
                 "Suggest at most one bounded evidence investigation only for unknown, conflicting, truncated, or missing evidence.",
                 "Evidence investigations are limited to inspect_node, expand_upstream, expand_downstream, inspect_artifact, inspect_episode, inspect_context_lineage, inspect_task_obligations, compare_causal_paths, and search_semantic_nodes; provide validated arguments and a concrete evidence-gap reason.",
-                "Attribution controls record_hypothesis, reject_hypothesis, and request_root_confirmation are separate from evidence tools; rejection requires cited opposing evidence or an independent verifier rejection, and root confirmation is deferred to an independent verifier.",
+                "Attribution controls record_hypothesis, reject_hypothesis, and request_root_confirmation are separate from evidence tools; Task 6 rejection requires cited grounded opposing evidence and never trusts a model-authored verifier result.",
+                "A root-confirmation request must cite the exact active hypothesis_id, its candidate_root_ref, and the active defect_fingerprint; execution remains deferred to the independent Task 7 verifier.",
                 "Independent confirmation uses a structured counterfactual with intervention_ref, intervention_kind, predicted_defect_status, and causal_effect; model-authored explanation text is not authoritative.",
             ],
             "required_json_schema": {
@@ -249,7 +250,7 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 ],
                 "candidate_introduction": False,
                 "missing_evidence": [],
-                "suggested_investigation": "null | {tool, arguments, reason, evidence_state?} | {action, arguments, reason}",
+                "suggested_investigation": "null | {tool, arguments, reason} | {action, arguments, reason}",
                 "confidence": 0.0,
             },
         }
