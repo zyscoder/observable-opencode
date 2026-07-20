@@ -18,10 +18,12 @@ from .causal_state import (
 )
 from .graph import TraceGraph
 from .models import AttributionReport, NodeJudgment, TaintInfluence, TraceNode
+from .recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
 
 __all__ = [
     "AttributionReport",
     "AttributionHypothesis",
+    "AgenticRecursiveAnalyzer",
     "BackwardTaintAnalyzer",
     "CausalCandidate",
     "CausalFactor",
@@ -33,6 +35,7 @@ __all__ = [
     "NodeJudgment",
     "PredecessorAssessment",
     "RecursiveAttributionReport",
+    "RecursiveAnalysisState",
     "RejectedCandidate",
     "RootConfirmation",
     "TaintInfluence",
