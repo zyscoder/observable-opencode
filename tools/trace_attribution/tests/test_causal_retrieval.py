@@ -216,6 +216,77 @@ def trace_with_unresolved_evidence_and_artifact():
     }
 
 
+def trace_with_same_message_temporal_candidate():
+    return {
+        "case_id": "same-message-temporal-candidate",
+        "records": [
+            {
+                "record_id": "temporal_result",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {"metadata": {"messageID": "msg_shared"}, "text": "Only temporally available."},
+            },
+            {
+                "record_id": "decision",
+                "component": "processor",
+                "event_type": "decision",
+                "data": {"metadata": {"messageID": "msg_shared"}, "rationale": "Choose a response."},
+            },
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": "temporal_result"},
+                "to": {"type": "record", "id": "decision"},
+                "relation": "temporal_availability",
+                "evidence_type": "temporal_inferred",
+                "eligible_for_attribution": True,
+            }
+        ],
+    }
+
+
+def trace_with_artifact_evidence():
+    return {
+        "case_id": "artifact-reference-case",
+        "artifacts": [
+            {
+                "artifact_id": "known_payload",
+                "kind": "text",
+                "path": "artifacts/known-payload.txt",
+            },
+            {
+                "artifact_id": "missing_payload",
+                "kind": "text",
+                "path": "artifacts/missing-payload.txt",
+            },
+        ],
+        "records": [
+            {
+                "record_id": "prompt",
+                "component": "prompt",
+                "event_type": "message.input",
+                "data": {"payload_ref": "artifact:known_payload", "text": "Artifact-backed prompt."},
+            },
+            {
+                "record_id": "decision",
+                "component": "processor",
+                "event_type": "decision",
+                "data": {"rationale": "Use artifact evidence."},
+            },
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": "prompt"},
+                "to": {"type": "record", "id": "decision"},
+                "relation": "prompt_informed_decision",
+                "evidence_type": "confirmed",
+                "evidence_refs": ["artifact:known_payload", "artifact:missing_payload", "unknown_payload"],
+                "eligible_for_attribution": True,
+            }
+        ],
+    }
+
+
 class CausalRetrievalTest(unittest.TestCase):
     def test_retriever_prefers_confirmed_edges_without_dropping_inferred_candidates(self):
         graph = TraceGraph.from_trace(trace_with_confirmed_and_inferred_predecessors())
@@ -302,6 +373,23 @@ class CausalRetrievalTest(unittest.TestCase):
             {item.ref for item in candidates},
         )
         self.assertTrue(all(item.source == "sibling_context" for item in candidates))
+
+    def test_same_message_temporal_node_is_context_candidate_not_attribution_edge(self):
+        graph = TraceGraph.from_trace(trace_with_same_message_temporal_candidate())
+        defect_state = sample_defect_state()
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:decision",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+        )
+
+        self.assertEqual([item.ref for item in candidates], ["record:temporal_result"])
+        self.assertEqual(candidates[0].source, "sibling_context")
+        self.assertFalse(candidates[0].edge["eligible_for_attribution"])
+        self.assertTrue(candidates[0].edge["retrieval_candidate"])
 
     def test_semantic_search_is_retrieval_only(self):
         graph = TraceGraph.from_trace(trace_with_confirmed_and_inferred_predecessors())
@@ -444,6 +532,59 @@ class CausalRetrievalTest(unittest.TestCase):
         )
 
         self.assertEqual(rebuilt_context, typed_context)
+
+    def test_ground_reference_resolves_indexed_artifacts_without_inventing_nodes(self):
+        defect_state = sample_defect_state()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "known-payload.txt").write_text("artifact evidence", encoding="utf-8")
+            trace_file = root / "trace.json"
+            trace_file.write_text(json.dumps(trace_with_artifact_evidence()), encoding="utf-8")
+            graph = TraceGraph.from_file(trace_file)
+            candidates = SemanticPredecessorRetriever().retrieve(
+                graph=graph,
+                node_ref="record:decision",
+                defect_state=defect_state,
+                hypothesis=sample_hypothesis(defect_state),
+                limit=8,
+            )
+            context = build_recursive_judgment_context(
+                graph=graph,
+                node_ref="record:decision",
+                defect_state=defect_state,
+                hypothesis=sample_hypothesis(defect_state),
+                candidates=candidates,
+                downstream_path=["record:decision"],
+            )
+
+        known, missing, unknown = context["candidate_predecessors"][0]["edge_evidence_references"]
+        self.assertEqual(known["raw_ref"], "artifact:known_payload")
+        self.assertEqual(known["resolved_ref"], "artifact:known_payload")
+        self.assertEqual(known["reference_kind"], "artifact")
+        self.assertEqual(known["artifact_status"]["availability"], "available")
+        self.assertEqual(missing["resolved_ref"], "artifact:missing_payload")
+        self.assertEqual(missing["artifact_status"]["availability"], "missing")
+        self.assertEqual(unknown["raw_ref"], "unknown_payload")
+        self.assertEqual(unknown["resolution_status"], "unresolved")
+        self.assertEqual(graph.artifact_reference_status("known_payload")["canonical_ref"], "artifact:known_payload")
+
+    def test_unresolved_downstream_path_never_emits_an_eligible_causal_edge(self):
+        graph = TraceGraph.from_trace(trace_with_confirmed_and_inferred_predecessors())
+        defect_state = sample_defect_state()
+        context = build_recursive_judgment_context(
+            graph=graph,
+            node_ref="record:decision",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            candidates=[],
+            downstream_path=["record:missing_downstream", "record:decision"],
+        )
+
+        self.assertEqual(context["outgoing_edges_on_active_path"][0]["relation"], "unresolved_path_advisory")
+        self.assertFalse(context["outgoing_edges_on_active_path"][0]["eligible_for_attribution"])
+        self.assertEqual(context["outgoing_edges_on_active_path"][0]["confidence"], 0.0)
+        self.assertEqual(context["outgoing_edges_on_active_path"][0]["resolution_status"], "unresolved")
 
 
 if __name__ == "__main__":

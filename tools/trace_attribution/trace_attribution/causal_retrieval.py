@@ -102,7 +102,8 @@ class SemanticPredecessorRetriever:
                         "evidence_type": "offline_reconstruction",
                         "evidence_refs": [ref],
                         "confidence": 0.7,
-                        "eligible_for_attribution": True,
+                        "eligible_for_attribution": False,
+                        "retrieval_candidate": True,
                         "inference_method": "delivery_bounded_progress_window"
                         if source == "progress_window"
                         else "causal_episode_membership",
@@ -144,7 +145,8 @@ class SemanticPredecessorRetriever:
                         "evidence_type": "recorded_context_reference",
                         "evidence_refs": [ref],
                         "confidence": 0.55,
-                        "eligible_for_attribution": True,
+                        "eligible_for_attribution": False,
+                        "retrieval_candidate": True,
                         "inference_method": "candidate_context_or_message_scope",
                         "edge_origin": "offline.sibling_retrieval",
                     },
@@ -182,6 +184,7 @@ class SemanticPredecessorRetriever:
                         "evidence_refs": [ref],
                         "confidence": score,
                         "eligible_for_attribution": False,
+                        "retrieval_candidate": True,
                         "inference_method": "token_overlap_retrieval",
                         "edge_origin": "offline.semantic_retrieval",
                     },

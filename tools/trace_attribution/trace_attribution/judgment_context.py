@@ -247,6 +247,16 @@ def ground_reference(graph: TraceGraph, raw_ref: Any, provenance_class: str) -> 
             "provenance_class": provenance_class,
             "resolution_status": "resolved",
         }
+    artifact_status = graph.artifact_reference_status(raw)
+    if artifact_status:
+        return {
+            "raw_ref": raw,
+            "resolved_ref": artifact_status["canonical_ref"],
+            "provenance_class": "recorded",
+            "resolution_status": "resolved",
+            "reference_kind": "artifact",
+            "artifact_status": artifact_status,
+        }
     return {
         "raw_ref": raw,
         "resolved_ref": "",
@@ -516,7 +526,25 @@ def active_path_outgoing_edges(graph: TraceGraph, current_ref: str, path: List[s
         return []
     if current_index == 0:
         return []
+    raw_downstream_ref = str(path[current_index - 1])
     downstream_ref = resolved_path[current_index - 1]
+    current_resolved = graph.resolve(current_ref)
+    downstream_resolved = graph.resolve(raw_downstream_ref)
+    if current_resolved not in graph.nodes or downstream_resolved not in graph.nodes:
+        return [
+            {
+                "from_ref": current_ref,
+                "to_ref": downstream_ref,
+                "relation": "unresolved_path_advisory",
+                "evidence_type": "unresolved_path",
+                "evidence_refs": [str(current_ref), raw_downstream_ref],
+                "confidence": 0.0,
+                "eligible_for_attribution": False,
+                "resolution_status": "unresolved",
+                "inference_method": "active_backward_path_unresolved_endpoint",
+                "edge_origin": "offline.analyzer_path",
+            }
+        ]
     edges = graph.edge_context(current_ref, downstream_ref)
     if edges:
         return edges

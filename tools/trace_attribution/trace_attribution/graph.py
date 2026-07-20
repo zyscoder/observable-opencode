@@ -372,6 +372,46 @@ class TraceGraph:
             "truncated_artifact_ids": truncated_ids,
         }
 
+    def artifact_reference_status(self, ref: str) -> Optional[JsonDict]:
+        """Resolve a manifest artifact reference without pretending it is a trace node."""
+        raw_ref = str(ref or "")
+        artifact_id = raw_ref.removeprefix("artifact:")
+        artifact = self._artifact_index.get(artifact_id)
+        if not artifact:
+            return None
+        availability = "unavailable"
+        path_value = artifact.get("path")
+        if not path_value:
+            availability = "missing"
+        elif self._artifact_root is not None:
+            root = self._artifact_root.resolve()
+            candidate = (root / str(path_value)).resolve()
+            try:
+                candidate.relative_to(root)
+                availability = "available" if candidate.is_file() else "missing"
+            except ValueError:
+                availability = "missing"
+        hydration_status = "not_requested"
+        for node in self.nodes.values():
+            hydrated = node.data.get("hydrated_artifacts")
+            if not isinstance(hydrated, list):
+                continue
+            if any(str(item.get("artifact_id") or "") == artifact_id for item in hydrated if isinstance(item, dict)):
+                hydration_status = "hydrated"
+                break
+        return {
+            "raw_ref": raw_ref,
+            "artifact_id": artifact_id,
+            "canonical_ref": "artifact:{0}".format(artifact_id),
+            "resolution_status": "resolved",
+            "availability": availability,
+            "hydration_status": hydration_status,
+            "kind": artifact.get("kind"),
+            "label": artifact.get("label"),
+            "path": path_value,
+            "hash": artifact.get("hash"),
+        }
+
     def incoming_edge_context(
         self,
         ref: str,
