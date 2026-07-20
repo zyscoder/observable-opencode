@@ -114,25 +114,28 @@ Conclusion-leaking `observed_defect.mechanism` wording was removed. Human labels
 separate top-level section and are removed before graph construction, prompting, caching, or
 checkpointing.
 
-## Blind Semantic And Metamorphic Regression
+## Deterministic Rule-Based Semantic Smoke Test
 
-A second suite runs six cases without `scripted_analysis`. Its deterministic Judge classifies
-only event/data semantics; it cannot branch on fixture ref, component, answer table, or human
-label. Each case is rerun after randomizing record refs, component aliases, and record insertion
-order. Original and transformed runs must preserve semantic anchors and exact root/condition/
-amplifier roles.
+A second deterministic suite runs six cases without reading `scripted_analysis` by ref. Its
+fixture-specific phrase classifier recognizes tokens such as `constant initialization`,
+`skip audit`, `despite the warning`, and `without investigating`. Randomized refs, component
+aliases, and insertion order preserve the expected plumbing output, but this does not prove
+general semantic understanding or answer-table independence beyond those structural fields.
 
-The six blind cases are wrong prompt, compaction loss, ignored Tool error, ignored Subagent
-warning, multi-root, and timeout amplifier. All six transformations pass. This is stronger
-than answer-table plumbing but remains a deterministic semantic regression, not a substitute
-for a real LLM suite.
+The explicit paraphrase probe changes `Use a constant initialization vector` to the equivalent
+`Reuse one fixed IV`. The rule suite then drops `record:encryption_decision` and retains only
+`record:audit_decision`, instead of preserving both roots. This known limitation is recorded
+as a passing characterization test, not hidden as a quality success. Scripted and rule-smoke
+metrics are excluded from attribution-quality/default gates. Only the real LLM Provider suite
+is semantic acceptance evidence.
 
 ## Independent Acceptance Contract
 
 The evaluator requires an immutable `--trace` source. Report-only acceptance is invalid. It:
 
 - strictly parses exact report/label schemas and recomputes the report outcome state machine;
-- rebuilds a `TraceGraph`, recomputes `semantic-anchor/v2` and the full index/collision set;
+- rebuilds a `TraceGraph`, recomputes content-only `semantic-anchor/v2`, relation-aware
+  `semantic-occurrence/v1`, and both full index/collision sets;
 - resolves candidate snapshots, judgments, hypotheses, confirmations, roots, factors, and
   compatibility projections against source facts;
 - validates every confirmed/factor path as directed, attribution-eligible, and non-temporal;
@@ -144,8 +147,10 @@ The evaluator requires an immutable `--trace` source. Report-only acceptance is 
 
 Metrics separate confirmed-root recall/precision from introduction-candidate recall/precision.
 Multi-root metrics are fractions. Empty expected roots use explicit
-`negative_control_correct`; Top-1 is `null`. All ratios are bounded. A historical report may be
-described separately, but cannot ground its own acceptance facts.
+`negative_control_correct`; Top-1 is `null`. Recall/precision/rate metrics are bounded.
+Request performance separately reports signed `(legacy-current)/legacy`,
+`request_ratio=current/legacy`, and `request_delta=legacy-current`, so regressions remain
+visible. A historical report may be described separately, but cannot ground its own facts.
 
 ## Exact Real Commands
 
@@ -173,7 +178,7 @@ PYTHONPATH=tools/trace_attribution python3 \
   --report /private/tmp/observable-opencode-task9-real/pydantic/recursive.attribution.json \
   --labels /private/tmp/observable-opencode-task9-real/pydantic/human-labels.v2.json \
   --legacy-report docs/superpowers/reports/2026-07-13-loop3-featurebench-pydantic-attribution-improved-v2.json \
-  --out /private/tmp/observable-opencode-task9-real/pydantic/comparison.v2.json
+  --out /private/tmp/observable-opencode-task9-real/pydantic/comparison.v3.json
 ```
 
 For semantic requirement/architecture/verification runs, substitute one exact inventory path
@@ -186,10 +191,10 @@ the parent task will execute authorized comparisons after review.
 The default cannot switch until real Sphinx, Pydantic, requirement understanding, context
 compaction, and successful no-defect cases have audited v2 labels and pass source-backed
 evaluation; request reduction and cold/resumed checkpoint reuse must also be measured from
-real Provider runs. Scripted and blind deterministic suites can never satisfy these gates.
+real Provider runs. Scripted and rule-based deterministic suites can never satisfy these gates.
 
 ## Offline Verification
 
-Task 9 focused tests: 32 passed. Complete offline suite: 424 passed. Production modules
+Task 9 focused tests: 38 passed. Complete offline suite: 430 passed. Production modules
 compile with an isolated Python bytecode cache. No model, network, Agent mutation, or Trace
 mutation was performed.

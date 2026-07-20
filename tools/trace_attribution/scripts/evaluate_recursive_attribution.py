@@ -15,6 +15,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     confirmation_identity_for,
     semantic_anchor_index,
+    semantic_occurrence_index,
 )
 from trace_attribution.graph import TraceGraph, collect_artifact_ids, resolve_edge_endpoint
 from trace_attribution.models import TraceNode, stable_json
@@ -22,7 +23,7 @@ from trace_attribution.models import TraceNode, stable_json
 
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v2"
-COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v2"
+COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v3"
 REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 TEMPORAL_RELATIONS = frozenset(
@@ -273,7 +274,7 @@ def _without_projection_fields(value: Any) -> Any:
         return {
             str(key): _without_projection_fields(item)
             for key, item in value.items()
-            if str(key) != "semantic_anchor_id"
+            if str(key) not in {"semantic_anchor_id", "semantic_occurrence_id"}
         }
     if isinstance(value, list):
         return [_without_projection_fields(item) for item in value]
@@ -462,7 +463,7 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
             identities.append(
                 stable_json(
                     {
-                        "anchor": item.get("semantic_anchor_id"),
+                        "occurrence": item.get("semantic_occurrence_id"),
                         "edge": {
                             key: edge.get(key)
                             for key in (
@@ -497,7 +498,7 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
         judgment_identities.append(
             stable_json(
                 {
-                    "anchor": item.get("semantic_anchor_id"),
+                    "occurrence": item.get("semantic_occurrence_id"),
                     "current_defect_status": item.get("current_defect_status"),
                     "candidate_introduction": item.get("candidate_introduction"),
                     "predecessors": sorted(predecessors, key=stable_json),
@@ -508,19 +509,28 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
         )
     duplicates("step_judgments", judgment_identities)
 
-    role_anchors: Dict[str, List[str]] = {
-        "roots": _anchors(
-            [
+    role_occurrences: Dict[str, List[str]] = {
+        "roots": [
+            str(item.get("semantic_occurrence_id") or "")
+            for item in [
                 *_items(report.get("confirmed_roots")),
                 *_items(report.get("co_roots")),
             ]
-        ),
-        "conditions": _anchors(_items(report.get("contributing_conditions"))),
-        "amplifiers": _anchors(_items(report.get("amplifying_factors"))),
+        ],
+        "conditions": [
+            str(item.get("semantic_occurrence_id") or "")
+            for item in _items(report.get("contributing_conditions"))
+        ],
+        "amplifiers": [
+            str(item.get("semantic_occurrence_id") or "")
+            for item in _items(report.get("amplifying_factors"))
+        ],
     }
-    for role, anchors in role_anchors.items():
-        duplicates(role, anchors)
-    role_sets = {role: set(anchors) for role, anchors in role_anchors.items()}
+    for role, occurrences in role_occurrences.items():
+        duplicates(role, occurrences)
+    role_sets = {
+        role: set(occurrences) for role, occurrences in role_occurrences.items()
+    }
     for left, right in (("roots", "conditions"), ("roots", "amplifiers"), ("conditions", "amplifiers")):
         if role_sets[left].intersection(role_sets[right]):
             violations.append("semantic_identity_role_conflict:{0}:{1}".format(left, right))
@@ -754,6 +764,7 @@ def _trace_backed_safety_violations(
     if metadata.get("fabricated_refs"):
         violations.append("fabricated_refs_present")
     anchors = semantic_anchor_index(graph.case_id, graph)
+    occurrences = semantic_occurrence_index(graph.case_id, graph)
     label_roles: Dict[str, str] = {}
     for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
         for label in labels[role]:
@@ -785,8 +796,44 @@ def _trace_backed_safety_violations(
         violations.append("semantic_anchor_schema_version_mismatch")
     if metadata.get("semantic_anchor_collisions") != expected_collisions:
         violations.append("semantic_anchor_collision_report_mismatch")
-    if expected_collisions:
-        violations.append("semantic_anchor_collisions_present")
+    collisions_by_occurrence: Dict[str, List[str]] = {}
+    for ref, occurrence in occurrences.items():
+        collisions_by_occurrence.setdefault(occurrence, []).append(ref)
+    expected_occurrence_collisions = [
+        {"semantic_occurrence_id": occurrence, "node_refs": sorted(refs)}
+        for occurrence, refs in sorted(collisions_by_occurrence.items())
+        if len(refs) > 1
+    ]
+    if metadata.get("semantic_occurrence_schema_version") != "semantic-occurrence/v1":
+        violations.append("semantic_occurrence_schema_version_mismatch")
+    reported_occurrences = metadata.get("semantic_occurrence_index")
+    if not isinstance(reported_occurrences, Mapping) or dict(reported_occurrences) != occurrences:
+        violations.append("semantic_occurrence_index_mismatch")
+    if metadata.get("semantic_occurrence_collisions") != expected_occurrence_collisions:
+        violations.append("semantic_occurrence_collision_report_mismatch")
+
+    for section, ref_key in (
+        ("causal_candidates", "ref"),
+        ("introduction_candidates", "ref"),
+        ("confirmed_roots", "node_ref"),
+        ("co_roots", "node_ref"),
+        ("contributing_conditions", "node_ref"),
+        ("amplifying_factors", "node_ref"),
+        ("rejected_candidates", "node_ref"),
+        ("root_causes", "node_ref"),
+        ("confirmations", "candidate_ref"),
+        ("step_judgments", "current_node_ref"),
+        ("causal_relations", "ref"),
+    ):
+        for item in _items(report.get(section)):
+            ref = str(item.get(ref_key) or "")
+            if item.get("semantic_occurrence_id") != occurrences.get(ref):
+                violations.append("{0}_occurrence_mismatch:{1}".format(section, ref))
+            embedded = item.get("confirmation")
+            if isinstance(embedded, Mapping) and embedded.get("semantic_occurrence_id") != occurrences.get(ref):
+                violations.append(
+                    "{0}_confirmation_occurrence_mismatch:{1}".format(section, ref)
+                )
     violations.extend(_duplicate_full_identities(report))
     violations.extend(_semantic_duplicate_identities(report))
 
@@ -916,8 +963,12 @@ def compare_report(
     current_requests = _request_count(report)
     legacy_requests = _request_count(legacy_report)
     request_reduction = None
+    request_ratio = None
+    request_delta = None
     if current_requests is not None and legacy_requests is not None and legacy_requests > 0:
-        request_reduction = _safe_rate(legacy_requests - current_requests, legacy_requests)
+        request_delta = legacy_requests - current_requests
+        request_reduction = round(request_delta / legacy_requests, 6)
+        request_ratio = round(current_requests / legacy_requests, 6)
 
     path_lengths = [
         len(item.get("recursive_path") or []) for item in confirmed
@@ -1003,6 +1054,7 @@ def compare_report(
             "top1_match": top1_match,
             "negative_control_correct": negative_control_correct,
             "judge_request_reduction": request_reduction,
+            "request_ratio": request_ratio,
             "mean_causal_path_length": mean_path_length,
             "factor_role_precision": factor_precision,
             "unknown_rate": _safe_rate(unknown_count, semantic_decisions),
@@ -1019,6 +1071,7 @@ def compare_report(
             "introduction_candidate_count": len(introduced_set),
             "judge_request_count": current_requests,
             "legacy_judge_request_count": legacy_requests,
+            "request_delta": request_delta,
             "causal_path_count": len(path_lengths),
             "unknown_decision_count": unknown_count,
             "semantic_decision_count": semantic_decisions,

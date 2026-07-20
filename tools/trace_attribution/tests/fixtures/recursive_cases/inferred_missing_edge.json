@@ -25,7 +25,7 @@
     "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:3388a2875269dd993816c376"}],
     "conditions": [],
     "amplifiers": [],
-    "forbidden_roots": [{"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:ef937088773bc20afa8673e6"}],
+    "forbidden_roots": [{"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:874029abeecd088c45a25de5"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

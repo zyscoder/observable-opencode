@@ -5,9 +5,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import ntpath
+import posixpath
 import re
 import unicodedata
-from pathlib import PurePosixPath
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -53,6 +54,8 @@ MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
+SEMANTIC_OCCURRENCE_SCHEMA_VERSION = "semantic-occurrence/v1"
+SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 
 _ANCHOR_VOLATILE_KEYS = frozenset(
     {
@@ -118,6 +121,25 @@ _ANCHOR_SET_LIKE_KEYS = frozenset(
         "missing_artifact_ids",
         "truncated_artifact_ids",
         "quality_flags",
+    }
+)
+_ANCHOR_IDENTIFIER_KEYS = frozenset(
+    {
+        "action",
+        "action_name",
+        "chosen_action",
+        "identifier",
+        "symbol",
+        "symbol_name",
+        "method",
+        "method_name",
+        "function",
+        "function_name",
+        "class_name",
+        "module",
+        "module_name",
+        "operation",
+        "operation_name",
     }
 )
 _RUNTIME_ID_PATTERN = re.compile(
@@ -346,33 +368,75 @@ def _anchor_normalized_text(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold()
 
 
+def _anchor_identifier(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _is_windows_path(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:[\\/]", value))
+
+
+def _within_posix_root(path: str, root: str) -> bool:
+    try:
+        return posixpath.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
 def _anchor_path(value: str, roots: Tuple[str, ...]) -> str:
-    normalized = unicodedata.normalize("NFKC", value).replace("\\", "/")
+    normalized = unicodedata.normalize("NFKC", value)
+    windows = _is_windows_path(normalized)
+    if windows:
+        canonical = ntpath.normpath(normalized).replace("\\", "/")
+        escaped: List[str] = []
+        for root in roots:
+            root_value = unicodedata.normalize("NFKC", root)
+            if not _is_windows_path(root_value):
+                continue
+            canonical_root = ntpath.normpath(root_value).replace("\\", "/").rstrip("/")
+            try:
+                relative = ntpath.relpath(canonical, canonical_root).replace("\\", "/")
+            except ValueError:
+                continue
+            if relative == ".":
+                relative = ""
+            if relative == ".." or relative.startswith("../"):
+                escaped.append(relative.casefold())
+                continue
+            return "repo-relative:windows:" + relative.casefold()
+        if escaped:
+            return "unresolved-path:windows-repo-root-escape:" + sorted(
+                escaped, key=lambda item: (item.count("/"), len(item), item)
+            )[0]
+        return "absolute-windows:" + canonical.casefold()
+
+    normalized = normalized.replace("\\", "/")
+    canonical = posixpath.normpath(normalized)
+    escaped = []
     for root in roots:
-        candidate = unicodedata.normalize("NFKC", root).replace("\\", "/").rstrip("/")
-        if (
-            candidate.startswith("/")
-            and normalized.startswith("/")
-            and (normalized == candidate or normalized.startswith(candidate + "/"))
-        ):
-            relative = normalized[len(candidate) :].lstrip("/")
-            return "repo-relative:" + _anchor_normalized_text(relative)
-        if (
-            re.match(r"^[A-Za-z]:/", candidate)
-            and re.match(r"^[A-Za-z]:/", normalized)
-            and (normalized.casefold() == candidate.casefold() or normalized.casefold().startswith(candidate.casefold() + "/"))
-        ):
-            relative = normalized[len(candidate) :].lstrip("/")
-            return "repo-relative:" + _anchor_normalized_text(relative)
-    if normalized.startswith("/"):
-        return "absolute-posix:" + _anchor_normalized_text(str(PurePosixPath(normalized)))
-    if re.match(r"^[A-Za-z]:/", normalized):
-        return "absolute-windows:" + _anchor_normalized_text(normalized)
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    if not normalized:
+        root_value = unicodedata.normalize("NFKC", root).replace("\\", "/")
+        if not root_value.startswith("/"):
+            continue
+        canonical_root = posixpath.normpath(root_value)
+        resolved = canonical if canonical.startswith("/") else posixpath.normpath(
+            posixpath.join(canonical_root, canonical)
+        )
+        relative = posixpath.relpath(resolved, canonical_root)
+        if not _within_posix_root(resolved, canonical_root):
+            escaped.append(relative)
+            continue
+        return "repo-relative:posix:" + ("" if relative == "." else relative)
+    if escaped:
+        return "unresolved-path:posix-repo-root-escape:" + sorted(
+            escaped, key=lambda item: (item.count("/"), len(item), item)
+        )[0]
+    if canonical.startswith("/"):
+        return "absolute-posix:" + canonical
+    if canonical in ("", "."):
         return "unresolved-path:<empty>"
-    return "repo-relative:" + _anchor_normalized_text(str(PurePosixPath(normalized)))
+    if canonical == ".." or canonical.startswith("../"):
+        return "unresolved-path:relative-escape:" + canonical
+    return "repo-relative:posix:" + canonical
 
 
 def _anchor_text(value: str, roots: Tuple[str, ...]) -> str:
@@ -388,34 +452,38 @@ def _anchor_text(value: str, roots: Tuple[str, ...]) -> str:
 
 
 def _anchor_value(value: Any, *, key: str, roots: Tuple[str, ...]) -> Any:
-    normalized_key = key.strip().lower()
+    normalized_key = unicodedata.normalize("NFKC", key.strip())
+    lookup_key = normalized_key.casefold()
     if isinstance(value, Mapping):
         output = {}
-        for child_key in sorted(value, key=lambda item: str(item)):
+        for child_key in sorted(value, key=lambda item: unicodedata.normalize("NFKC", str(item))):
             child_name = str(child_key)
-            lowered = _anchor_normalized_text(child_name.strip())
-            if lowered in _ANCHOR_VOLATILE_KEYS:
+            normalized_child_name = unicodedata.normalize("NFKC", child_name.strip())
+            child_lookup = normalized_child_name.casefold()
+            if child_lookup in _ANCHOR_VOLATILE_KEYS:
                 continue
-            if "provider" in lowered and ("id" in lowered or "request" in lowered):
+            if "provider" in child_lookup and ("id" in child_lookup or "request" in child_lookup):
                 continue
             child_value = value[child_key]
             normalized = _anchor_value(child_value, key=child_name, roots=roots)
             if normalized not in (None, "", [], {}):
-                output[lowered] = normalized
+                output[normalized_child_name] = normalized
         return output
     if isinstance(value, (list, tuple)):
         normalized = [
-            _anchor_value(item, key=normalized_key, roots=roots) for item in value
+            _anchor_value(item, key=key, roots=roots) for item in value
         ]
         values = [item for item in normalized if item not in (None, "", [], {})]
-        if normalized_key in _ANCHOR_SET_LIKE_KEYS:
+        if lookup_key in _ANCHOR_SET_LIKE_KEYS:
             return sorted(values, key=stable_json)
         return values
     if isinstance(value, str):
-        if normalized_key in _ANCHOR_PATH_KEYS:
+        if lookup_key in _ANCHOR_PATH_KEYS:
             return _anchor_path(value, roots)
-        if normalized_key in _ANCHOR_ARTIFACT_HASH_KEYS:
+        if lookup_key in _ANCHOR_ARTIFACT_HASH_KEYS:
             return None
+        if lookup_key in _ANCHOR_IDENTIFIER_KEYS or lookup_key.endswith("_identifier"):
+            return _anchor_identifier(value)
         return _anchor_text(value, roots)
     return value
 
@@ -467,62 +535,102 @@ def normalized_anchor_semantics(node: TraceNode) -> JsonDict:
 def semantic_anchor_id(
     case_id: str,
     node: TraceNode,
-    *,
-    occurrence_identity: str = "",
 ) -> str:
-    """Return a versioned identity stable across transport-local execution metadata."""
+    """Return content semantics independent of graph occurrence count or position."""
 
     identity = {
         "schema_version": SEMANTIC_ANCHOR_SCHEMA_VERSION,
-        "case_id": _anchor_normalized_text(str(case_id)),
-        "event_type": _anchor_normalized_text(node.event_type.strip()),
+        "case_id": _anchor_identifier(str(case_id)),
+        "event_type": _anchor_identifier(node.event_type.strip()),
         "semantic_role": _anchor_semantic_role(node),
         "normalized_semantics": normalized_anchor_semantics(node),
     }
-    if occurrence_identity:
-        identity["causal_occurrence_identity"] = occurrence_identity
     digest = hashlib.sha256(stable_json(identity).encode("utf-8")).hexdigest()[:24]
     return SEMANTIC_ANCHOR_PREFIX + digest
 
 
 def semantic_anchor_index(case_id: str, graph_or_nodes: Any) -> Dict[str, str]:
-    """Build full-graph anchors and disambiguate semantic twins by causal neighborhood."""
+    """Build content-only anchors without collision-conditioned identity changes."""
+
+    nodes = graph_or_nodes.nodes if hasattr(graph_or_nodes, "nodes") else graph_or_nodes
+    return {ref: semantic_anchor_id(case_id, node) for ref, node in nodes.items()}
+
+
+def semantic_occurrence_id(
+    case_id: str,
+    semantic_anchor: str,
+    causal_neighborhood: Mapping[str, Any],
+) -> str:
+    """Return a versioned causal occurrence identity distinct from content semantics."""
+
+    identity = {
+        "schema_version": SEMANTIC_OCCURRENCE_SCHEMA_VERSION,
+        "case_id": _anchor_identifier(str(case_id)),
+        "semantic_anchor_id": semantic_anchor,
+        "causal_neighborhood": dict(causal_neighborhood),
+    }
+    digest = hashlib.sha256(stable_json(identity).encode("utf-8")).hexdigest()[:24]
+    return SEMANTIC_OCCURRENCE_PREFIX + digest
+
+
+def semantic_occurrence_index(case_id: str, graph_or_nodes: Any) -> Dict[str, str]:
+    """Build occurrence identities for every node from relation-aware causal context."""
 
     graph = graph_or_nodes if hasattr(graph_or_nodes, "nodes") else None
     nodes = graph.nodes if graph is not None else graph_or_nodes
-    base = {ref: semantic_anchor_id(case_id, node) for ref, node in nodes.items()}
-    groups: Dict[str, List[str]] = {}
-    for ref, anchor in base.items():
-        groups.setdefault(anchor, []).append(ref)
-    output = dict(base)
-    for refs in groups.values():
-        if len(refs) < 2:
-            continue
-        for ref in refs:
-            node = nodes[ref]
-            if graph is not None:
-                upstream = sorted(base[item] for item in graph.upstream_refs(ref) if item in base)
-                downstream = sorted(base[item] for item in graph.downstream_refs(ref) if item in base)
-            else:
-                upstream = sorted(
-                    base[item]
-                    for item in node.source_refs
-                    if item in base
-                )
-                downstream = []
-            neighborhood = {
-                "upstream_semantics": upstream,
-                "downstream_semantics": downstream,
-            }
-            occurrence = hashlib.sha256(
-                stable_json(neighborhood).encode("utf-8")
-            ).hexdigest()[:24]
-            output[ref] = semantic_anchor_id(
-                case_id,
-                node,
-                occurrence_identity=occurrence,
+    anchors = semantic_anchor_index(case_id, nodes)
+
+    def related(ref: str, *, upstream: bool) -> List[JsonDict]:
+        node = nodes[ref]
+        refs = (
+            graph.upstream_refs(ref)
+            if graph is not None and upstream
+            else graph.downstream_refs(ref)
+            if graph is not None
+            else list(node.source_refs)
+            if upstream
+            else []
+        )
+        entries: List[JsonDict] = []
+        for related_ref in refs:
+            if related_ref not in anchors:
+                continue
+            edges = (
+                graph.edge_context(related_ref, ref)
+                if graph is not None and upstream
+                else graph.edge_context(ref, related_ref)
+                if graph is not None
+                else []
             )
-    return output
+            edge_semantics = [
+                {
+                    "relation": str(edge.get("relation") or ""),
+                    "evidence_type": str(edge.get("evidence_type") or ""),
+                    "eligible_for_attribution": edge.get("eligible_for_attribution") is True,
+                    "inference_method": str(edge.get("inference_method") or ""),
+                    "edge_origin": str(edge.get("edge_origin") or ""),
+                }
+                for edge in edges
+            ]
+            entries.append(
+                {
+                    "semantic_anchor_id": anchors[related_ref],
+                    "edges": sorted(edge_semantics, key=stable_json),
+                }
+            )
+        return sorted(entries, key=stable_json)
+
+    return {
+        ref: semantic_occurrence_id(
+            case_id,
+            anchors[ref],
+            {
+                "upstream": related(ref, upstream=True),
+                "downstream": related(ref, upstream=False),
+            },
+        )
+        for ref in nodes
+    }
 
 
 def annotate_report_semantic_anchors(
@@ -536,9 +644,12 @@ def annotate_report_semantic_anchors(
 
     projected = copy.deepcopy(dict(report))
     anchors_by_ref = semantic_anchor_index(case_id, graph or nodes)
+    occurrences_by_ref = semantic_occurrence_index(case_id, graph or nodes)
     refs_by_anchor: Dict[str, Set[str]] = {}
+    refs_by_occurrence: Dict[str, Set[str]] = {}
     for ref, anchor in anchors_by_ref.items():
         refs_by_anchor.setdefault(anchor, set()).add(ref)
+        refs_by_occurrence.setdefault(occurrences_by_ref[ref], set()).add(ref)
 
     def anchor_for(ref: Any) -> str:
         value = str(ref or "")
@@ -557,9 +668,11 @@ def annotate_report_semantic_anchors(
             anchor = anchor_for(item.get(ref_key))
             if anchor:
                 item["semantic_anchor_id"] = anchor
+                item["semantic_occurrence_id"] = occurrences_by_ref[str(item.get(ref_key))]
                 embedded = item.get("confirmation")
                 if isinstance(embedded, dict):
                     embedded["semantic_anchor_id"] = anchor
+                    embedded["semantic_occurrence_id"] = occurrences_by_ref[str(item.get(ref_key))]
 
     for section, ref_key in (
         ("causal_candidates", "ref"),
@@ -581,12 +694,21 @@ def annotate_report_semantic_anchors(
         metadata = {}
         projected["metadata"] = metadata
     metadata["semantic_anchor_schema_version"] = SEMANTIC_ANCHOR_SCHEMA_VERSION
+    metadata["semantic_occurrence_schema_version"] = SEMANTIC_OCCURRENCE_SCHEMA_VERSION
     metadata["semantic_anchor_index"] = {
         ref: anchor for ref, anchor in sorted(anchors_by_ref.items())
     }
     metadata["semantic_anchor_collisions"] = [
         {"semantic_anchor_id": anchor, "node_refs": sorted(refs)}
         for anchor, refs in sorted(refs_by_anchor.items())
+        if len(refs) > 1
+    ]
+    metadata["semantic_occurrence_index"] = {
+        ref: occurrence for ref, occurrence in sorted(occurrences_by_ref.items())
+    }
+    metadata["semantic_occurrence_collisions"] = [
+        {"semantic_occurrence_id": occurrence, "node_refs": sorted(refs)}
+        for occurrence, refs in sorted(refs_by_occurrence.items())
         if len(refs) > 1
     ]
     return projected
@@ -1869,10 +1991,13 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
+    "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",
     "annotate_report_semantic_anchors",
     "normalized_anchor_semantics",
     "semantic_anchor_id",
     "semantic_anchor_index",
+    "semantic_occurrence_id",
+    "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
 ]

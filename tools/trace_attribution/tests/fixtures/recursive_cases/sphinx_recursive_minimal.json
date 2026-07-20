@@ -18,7 +18,7 @@
     "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v2:ab9849be297bbfb72e04a1e7"}],
     "forbidden_roots": [
       {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:98204061fc42c7e51c84f00c"},
-      {"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:5fda9110e032202b12fa9e2e"}
+      {"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:878fe4dbbbe4313d825144ea"}
     ],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },

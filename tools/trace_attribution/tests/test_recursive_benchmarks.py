@@ -307,6 +307,7 @@ class RecursiveMetricTest(unittest.TestCase):
             graph=graph,
         )
 
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v3")
         self.assertEqual(
             set(result),
             {
@@ -328,6 +329,7 @@ class RecursiveMetricTest(unittest.TestCase):
                 "top1_match",
                 "negative_control_correct",
                 "judge_request_reduction",
+                "request_ratio",
                 "mean_causal_path_length",
                 "factor_role_precision",
                 "unknown_rate",
@@ -341,8 +343,10 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
         self.assertTrue(result["metrics"]["top1_match"])
         self.assertEqual(result["metrics"]["judge_request_reduction"], 1.0)
+        self.assertEqual(result["metrics"]["request_ratio"], 0.0)
+        self.assertEqual(result["counts"]["request_delta"], 10)
         for key, value in result["metrics"].items():
-            if key in {"top1_match", "negative_control_correct", "judge_request_reduction", "mean_causal_path_length"}:
+            if key in {"top1_match", "negative_control_correct", "judge_request_reduction", "request_ratio", "mean_causal_path_length"}:
                 continue
             self.assertGreaterEqual(value, 0.0, key)
             self.assertLessEqual(value, 1.0, key)
@@ -356,6 +360,8 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertIsNone(result["metrics"]["top1_match"])
         self.assertTrue(result["metrics"]["negative_control_correct"])
         self.assertIsNone(result["metrics"]["judge_request_reduction"])
+        self.assertIsNone(result["metrics"]["request_ratio"])
+        self.assertIsNone(result["counts"]["request_delta"])
         self.assertEqual(result["metrics"]["mean_causal_path_length"], 0.0)
         self.assertEqual(result["metrics"]["unknown_rate"], 0.0)
         self.assertEqual(result["metrics"]["confirmation_rejection_rate"], 0.0)
@@ -381,6 +387,23 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertIsNone(result["counts"]["judge_request_count"])
         self.assertEqual(result["counts"]["legacy_judge_request_count"], 10)
         self.assertIsNone(result["metrics"]["judge_request_reduction"])
+        self.assertIsNone(result["metrics"]["request_ratio"])
+        self.assertIsNone(result["counts"]["request_delta"])
+
+    def test_request_performance_reports_signed_regression(self):
+        report, labels, _, graph = self.fixture()
+        report["metadata"]["physical_judge_request_count"] = 12
+
+        result = compare_report(
+            report,
+            labels,
+            {"metadata": {"physical_judge_request_count": 10}},
+            graph=graph,
+        )
+
+        self.assertEqual(result["metrics"]["judge_request_reduction"], -0.2)
+        self.assertEqual(result["metrics"]["request_ratio"], 1.2)
+        self.assertEqual(result["counts"]["request_delta"], -2)
 
     def test_fabricated_unresolved_duplicate_and_budget_states_fail_closed(self):
         base, labels, _, graph = self.fixture()

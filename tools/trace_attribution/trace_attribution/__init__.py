@@ -25,6 +25,8 @@ from .causal_state import (
     annotate_report_semantic_anchors,
     semantic_anchor_id,
     semantic_anchor_index,
+    semantic_occurrence_id,
+    semantic_occurrence_index,
     semantic_visit_key,
     confirmation_identity_for,
 )
@@ -84,6 +86,8 @@ __all__ = [
     "annotate_report_semantic_anchors",
     "semantic_anchor_id",
     "semantic_anchor_index",
+    "semantic_occurrence_id",
+    "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
     "build_checkpoint_config",

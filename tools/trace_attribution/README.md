@@ -323,14 +323,18 @@ spells out which LLM/context/message fields need to be added to future traces.
 
 ## Recursive Attribution Acceptance
 
-Every CLI output projects `semantic_anchor:v2:*` identities onto recursive roots,
-co-roots, factors, candidates, confirmations, judgments, and the compatibility
-`root_causes` view. Version 2 applies Unicode NFKC and case-folding, sorts only
-field-declared set-like values such as file/artifact/evidence sets, preserves ordered paths
-and turns, and uses a full-graph causal-neighborhood occurrence identity for semantic twins.
-Verified repository roots produce relative paths. Unverified absolute paths retain a
-namespaced full canonical path rather than a collision-prone suffix. The full graph is
-scanned for collisions and the anchor schema/index are explicit report metadata.
+Every CLI output projects two independent identities onto recursive facts:
+
+- `semantic_anchor:v2:*` is always content semantics and never depends on graph collision
+  count or occurrence position;
+- `semantic_occurrence:v1:*` is always relation-aware causal-neighborhood identity.
+
+Both normalize Unicode with NFKC. Human text is case-folded, while POSIX paths and code
+identifiers preserve case. Paths are lexically normalized; verified repository roots produce
+relative paths, root escapes become explicit unresolved markers, and unverified absolute
+paths retain a namespaced full canonical path. Windows paths use a platform-tagged,
+case-insensitive form. Full-graph semantic and occurrence collision maps are explicit report
+metadata. Adding a duplicate occurrence therefore cannot change an existing semantic anchor.
 
 The nine offline regression fixtures live under
 `tests/fixtures/recursive_cases/`. Each fixture has three isolated top-level sections:
@@ -347,11 +351,13 @@ by the **deterministic plumbing suite**. That suite validates traversal, persist
 projection, role wiring, and evaluator safety; it is excluded from attribution-quality
 acceptance.
 
-`tests.test_recursive_acceptance_review.BlindSemanticMetamorphicTest` is a separate blind
-semantic regression. Its Judge reads event/data semantics only, never fixture refs,
-components, scripts, or human labels. The test randomizes record refs, component aliases,
-and record insertion order and requires stable roles and v2 anchors. It is still a
-deterministic offline test, not evidence that a real LLM Judge meets quality gates.
+`tests.test_recursive_acceptance_review.DeterministicRuleSemanticSmokeTest` is a separate
+fixture-phrase rule smoke test. It randomizes refs, component aliases, and insertion order to
+exercise plumbing without the scripted ref table. Its keyword rules are fixture-specific and
+do not establish answer-table independence or paraphrase invariance. A characterization probe
+shows that replacing "constant initialization vector" with the equivalent "fixed IV" wording
+causes one expected root to disappear. Only an authorized real LLM Provider suite can satisfy
+semantic attribution-quality gates.
 
 Run the fixture and metric suite:
 
@@ -373,28 +379,30 @@ python3 tools/trace_attribution/scripts/evaluate_recursive_attribution.py \
 ```
 
 Acceptance requires `--trace`; report-only scoring is invalid. The evaluator strictly loads
-the recursive report and source `TraceGraph`, recomputes the v2 anchor index and confirmation
-identities, and resolves every candidate, root, factor, judgment, confirmation, path hop,
+the recursive report and source `TraceGraph`, recomputes anchor and occurrence indexes plus
+confirmation identities, and resolves every candidate, root, factor, judgment, confirmation, path hop,
 evidence ref, and artifact against source facts. Artifact checks include canonical SHA-256,
 owner, path containment, byte range, and actual content. Directed causal paths may contain
 only attribution-eligible non-temporal hops.
 
 The exact comparison schema reports confirmed-root recall/precision separately from
 introduction-candidate recall/precision, Top-1 (`null` for empty expected roots), explicit
-negative-control correctness, physical Judge request reduction, mean causal-path length,
+negative-control correctness, signed physical Judge request reduction, request ratio and
+signed request delta, mean causal-path length,
 factor precision, unknown rate, confirmation rejection, investigation yield, checkpoint
 reuse, and human/LLM disagreement. Multi-root recall is a fraction, not any-hit success.
-Every ratio is bounded and missing request measurements remain `null`.
+Recall/precision/rate metrics are bounded to `[0,1]`. Request reduction is signed, request
+ratio may exceed 1, and missing request measurements remain `null`.
 
 Evaluation exits nonzero and writes no comparison when the source Trace is absent or when it
-finds fabricated/unresolved refs, schema/index mismatch, duplicate semantic identities,
-anchor collisions, disconnected paths, invalid artifacts, inconsistent outcome state,
+finds fabricated/unresolved refs, schema/index mismatch, duplicate occurrence identities,
+collision-map mismatch, disconnected paths, invalid artifacts, inconsistent outcome state,
 disallowed unresolved outcomes, missing/mismatched independent confirmations, forbidden
 roots, or a budget/Provider/unknown branch promoted to a root. Historical report-only
 metrics may be documented descriptively, but they are never acceptance evidence.
 
-Neither scripted nor blind deterministic fixtures can switch the CLI default. `--engine
-legacy` remains the default until authorized real Sphinx, Pydantic,
+Neither the scripted matrix nor the rule-based smoke suite contributes to quality acceptance
+or default selection. `--engine legacy` remains the default until authorized real Sphinx, Pydantic,
 requirements-understanding, context-compaction, and successful-control gates all pass.
 
 The current frozen baseline, exact local artifact hashes, unavailable measurements, and

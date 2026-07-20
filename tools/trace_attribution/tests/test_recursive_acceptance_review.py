@@ -27,6 +27,7 @@ from trace_attribution.causal_state import (
     confirmation_identity_for,
     semantic_anchor_id,
     semantic_anchor_index,
+    semantic_occurrence_index,
 )
 from trace_attribution.causal_judge import OfflineJudgeCapability
 from trace_attribution.graph import TraceGraph
@@ -83,6 +84,62 @@ class SemanticAnchorV2ReviewTest(unittest.TestCase):
 
         self.assertEqual(semantic_anchor_id("case", left), semantic_anchor_id("case", right))
 
+    def test_posix_paths_and_code_identifiers_preserve_case(self):
+        upper_path = node(data={"repository_root": "/repo", "path": "/repo/src/Foo.py"})
+        lower_path = node(data={"repository_root": "/repo", "path": "/repo/src/foo.py"})
+        upper_identifier = node(data={"chosen_action": "ParseNamespaceObject"})
+        lower_identifier = node(data={"chosen_action": "parseNamespaceObject"})
+
+        self.assertNotEqual(
+            semantic_anchor_id("case", upper_path), semantic_anchor_id("case", lower_path)
+        )
+        self.assertNotEqual(
+            semantic_anchor_id("case", upper_identifier),
+            semantic_anchor_id("case", lower_identifier),
+        )
+
+    def test_path_normpath_equivalence_and_repo_root_escape_marker(self):
+        direct = node(data={"repository_root": "/repo", "path": "/repo/src/a.py"})
+        dotted = node(data={"repository_root": "/repo", "path": "/repo/src/../src/./a.py"})
+        escaped_a = node(data={"repository_root": "/repo", "path": "/repo/../secret.txt"})
+        escaped_b = node(
+            data={"repository_root": "/different/repo", "path": "/different/repo/../secret.txt"}
+        )
+        in_root_secret = node(data={"repository_root": "/repo", "path": "/repo/secret.txt"})
+        nfc_path = node(
+            data={
+                "repository_root": "/repo",
+                "path": unicodedata.normalize("NFC", "/repo/src/Café.py"),
+            }
+        )
+        nfd_path = node(
+            data={
+                "repository_root": "/repo",
+                "path": unicodedata.normalize("NFD", "/repo/src/Café.py"),
+            }
+        )
+        windows_upper = node(
+            data={"repository_root": "C:\\Repo", "path": "C:\\Repo\\src\\Foo.py"}
+        )
+        windows_lower = node(
+            data={"repository_root": "c:\\repo", "path": "c:\\repo\\src\\foo.py"}
+        )
+
+        self.assertEqual(semantic_anchor_id("case", direct), semantic_anchor_id("case", dotted))
+        self.assertEqual(
+            semantic_anchor_id("case", escaped_a), semantic_anchor_id("case", escaped_b)
+        )
+        self.assertNotEqual(
+            semantic_anchor_id("case", escaped_a), semantic_anchor_id("case", in_root_secret)
+        )
+        self.assertEqual(
+            semantic_anchor_id("case", nfc_path), semantic_anchor_id("case", nfd_path)
+        )
+        self.assertEqual(
+            semantic_anchor_id("case", windows_upper),
+            semantic_anchor_id("case", windows_lower),
+        )
+
     def test_artifact_hydration_envelope_does_not_change_node_identity(self):
         plain = node(data={"rationale": "inspect the contract", "artifact_hash": "sha256:" + "a" * 64})
         hydrated = node(
@@ -101,7 +158,7 @@ class SemanticAnchorV2ReviewTest(unittest.TestCase):
 
         self.assertEqual(semantic_anchor_id("case", plain), semantic_anchor_id("case", hydrated))
 
-    def test_causal_neighborhood_distinguishes_same_semantics_and_scan_covers_full_graph(self):
+    def test_semantic_anchor_is_content_only_and_occurrence_uses_causal_neighborhood(self):
         trace = {
             "case_id": "neighborhood-case",
             "records": [
@@ -114,11 +171,46 @@ class SemanticAnchorV2ReviewTest(unittest.TestCase):
         }
         graph = TraceGraph.from_trace(trace)
         anchors = semantic_anchor_index(graph.case_id, graph)
-        self.assertNotEqual(anchors["record:decision-a"], anchors["record:decision-b"])
+        occurrences = semantic_occurrence_index(graph.case_id, graph)
+        self.assertEqual(anchors["record:decision-a"], anchors["record:decision-b"])
+        self.assertNotEqual(
+            occurrences["record:decision-a"], occurrences["record:decision-b"]
+        )
 
         report = {"case_id": graph.case_id, "root_causes": [{"node_ref": "record:decision-a"}], "metadata": {}}
         projected = annotate_report_semantic_anchors(graph.case_id, graph.nodes, report, graph=graph)
         self.assertEqual(set(projected["metadata"]["semantic_anchor_index"]), set(graph.nodes))
+        self.assertEqual(
+            set(projected["metadata"]["semantic_occurrence_index"]), set(graph.nodes)
+        )
+
+    def test_existing_semantic_anchor_does_not_change_when_duplicate_is_added(self):
+        base = {
+            "case_id": "stable-case",
+            "records": [
+                {"record_id": "prompt-a", "component": "input", "event_type": "prompt.assembly", "data": {"text": "alpha"}},
+                {"record_id": "decision-a", "component": "planner", "event_type": "decision", "source_refs": ["record:prompt-a"], "data": {"rationale": "apply contract"}},
+            ],
+            "dataflow_edges": [],
+        }
+        expanded = copy.deepcopy(base)
+        expanded["records"].extend(
+            [
+                {"record_id": "prompt-b", "component": "input", "event_type": "prompt.assembly", "data": {"text": "beta"}},
+                {"record_id": "decision-b", "component": "planner-alias", "event_type": "decision", "source_refs": ["record:prompt-b"], "data": {"rationale": "apply contract"}},
+            ]
+        )
+        base_graph = TraceGraph.from_trace(base)
+        expanded_graph = TraceGraph.from_trace(expanded)
+
+        before = semantic_anchor_index(base_graph.case_id, base_graph)["record:decision-a"]
+        after = semantic_anchor_index(expanded_graph.case_id, expanded_graph)["record:decision-a"]
+        occurrences = semantic_occurrence_index(expanded_graph.case_id, expanded_graph)
+
+        self.assertEqual(before, after)
+        self.assertNotEqual(
+            occurrences["record:decision-a"], occurrences["record:decision-b"]
+        )
 
     def test_full_graph_collision_is_reported_even_for_unpublished_node(self):
         trace = {
@@ -139,6 +231,7 @@ class SemanticAnchorV2ReviewTest(unittest.TestCase):
             projected["metadata"]["semantic_anchor_collisions"][0]["node_refs"],
             ["record:same-a", "record:same-b"],
         )
+        self.assertEqual(len(projected["metadata"]["semantic_occurrence_collisions"]), 1)
 
 
 class TraceBackedAcceptanceReviewTest(unittest.TestCase):
@@ -242,6 +335,27 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         candidate["edge"]["to_ref"] = "record:invented"
         with self.assertRaises(EvaluationSafetyError):
             self.compare(ungrounded_candidate_edge)
+
+    def test_valid_semantic_collision_uses_occurrences_without_invalidating_existing_label(self):
+        trace = json.loads((FIXTURE_ROOT / "sphinx_recursive_minimal.json").read_text())
+        trace.pop("human_labels")
+        trace.pop("scripted_analysis")
+        duplicate = copy.deepcopy(
+            next(item for item in trace["records"] if item["record_id"] == "decision")
+        )
+        duplicate["record_id"] = "decision-repeat"
+        duplicate["source_refs"] = []
+        trace["records"].append(duplicate)
+        graph = TraceGraph.from_trace(trace)
+        report = annotate_report_semantic_anchors(
+            graph.case_id, graph.nodes, self.report, graph=graph
+        )
+
+        result = compare_report(report, self.labels, None, graph=graph)
+
+        self.assertTrue(result["safety"]["passed"])
+        self.assertEqual(len(report["metadata"]["semantic_anchor_collisions"]), 1)
+        self.assertEqual(report["metadata"]["semantic_occurrence_collisions"], [])
 
     def test_outcome_state_machine_unresolved_policy_and_ratio_bounds_are_enforced(self):
         contradictory = copy.deepcopy(self.report)
@@ -431,7 +545,7 @@ def _semantic_payload(node_value):
     }
 
 
-def _semantic_class(node_value):
+def _fixture_rule_class(node_value):
     payload = _semantic_payload(node_value)
     event_type = payload["event_type"]
     text = stable_json(payload["data"]).casefold()
@@ -488,8 +602,8 @@ def _reference_node(reference):
     return dict(content) if isinstance(content, dict) else {}
 
 
-class BlindSemanticJudge(OfflineJudgeCapability):
-    """Deterministic semantic probe: no fixture script, ref lookup, or component branching."""
+class DeterministicRuleSemanticJudge(OfflineJudgeCapability):
+    """Fixture-phrase rule smoke probe; never attribution-quality evidence."""
 
     def __init__(self):
         self.request_count = 0
@@ -503,14 +617,14 @@ class BlindSemanticJudge(OfflineJudgeCapability):
             "data": dict(request.current_node.data),
         }
         self.semantic_inputs.append(_semantic_payload(current))
-        current_class = _semantic_class(current)
+        current_class = _fixture_rule_class(current)
         predecessors = []
         for candidate in request.candidates:
             candidate_value = {
                 "event_type": candidate.node.event_type,
                 "data": dict(candidate.node.data),
             }
-            predecessor_class = _semantic_class(candidate_value)
+            predecessor_class = _fixture_rule_class(candidate_value)
             propagates = (
                 current_class != "absent"
                 and predecessor_class != "absent"
@@ -549,7 +663,7 @@ class BlindSemanticJudge(OfflineJudgeCapability):
         )
 
     def confirm_candidate(self, request):
-        candidate_class = _semantic_class(_reference_node(request.candidate_reference))
+        candidate_class = _fixture_rule_class(_reference_node(request.candidate_reference))
         if candidate_class == "root":
             result = RootConfirmation.confirmed(
                 request.candidate_ref,
@@ -585,7 +699,7 @@ class BlindSemanticJudge(OfflineJudgeCapability):
         for hypothesis in request.competing_hypotheses:
             if hypothesis.get("status") not in {"active", "supported", "unresolved"}:
                 continue
-            competitor_class = _semantic_class(
+            competitor_class = _fixture_rule_class(
                 _reference_node(hypothesis["candidate_reference"])
             )
             comparisons.append(
@@ -611,7 +725,7 @@ def metamorphic_trace(name, seed):
     rng = random.Random(seed)
     old_ids = [item["record_id"] for item in transformed["records"]]
     mapping = {
-        old: "blind_{0:08x}".format(rng.getrandbits(32)) for old in old_ids
+        old: "rule_{0:08x}".format(rng.getrandbits(32)) for old in old_ids
     }
     component_aliases = {}
     for index, record in enumerate(transformed["records"]):
@@ -637,9 +751,9 @@ def metamorphic_trace(name, seed):
     return transformed
 
 
-def run_blind(trace):
+def run_rule_smoke(trace):
     graph = TraceGraph.from_trace(trace)
-    judge = BlindSemanticJudge()
+    judge = DeterministicRuleSemanticJudge()
     start = next(
         ref
         for ref, node in graph.nodes.items()
@@ -656,7 +770,7 @@ def run_blind(trace):
     ), judge
 
 
-class BlindSemanticMetamorphicTest(unittest.TestCase):
+class DeterministicRuleSemanticSmokeTest(unittest.TestCase):
     CASES = (
         "prompt_wrong_agent_faithful.json",
         "context_compaction_loss.json",
@@ -666,12 +780,12 @@ class BlindSemanticMetamorphicTest(unittest.TestCase):
         "timeout_amplifier.json",
     )
 
-    def test_semantic_roles_and_anchors_survive_ref_component_and_order_changes(self):
+    def test_fixture_phrase_rules_survive_ref_component_and_order_changes(self):
         for name in self.CASES:
             with self.subTest(name=name):
                 original_trace, human_labels, _ = load_fixture(FIXTURE_ROOT / name)
-                original, original_judge = run_blind(original_trace)
-                variant, variant_judge = run_blind(metamorphic_trace(name, 73))
+                original, original_judge = run_rule_smoke(original_trace)
+                variant, variant_judge = run_rule_smoke(metamorphic_trace(name, 73))
 
                 def signature(report):
                     return {
@@ -706,3 +820,28 @@ class BlindSemanticMetamorphicTest(unittest.TestCase):
                 self.assertTrue(variant_judge.semantic_inputs)
                 self.assertNotIn("component", stable_json(original_judge.semantic_inputs))
                 self.assertNotIn("record:", stable_json(original_judge.semantic_inputs))
+
+    def test_paraphrase_probe_records_fixture_phrase_rule_limitation(self):
+        trace, _, _ = load_fixture(FIXTURE_ROOT / "multi_root_failure.json")
+        original, _ = run_rule_smoke(trace)
+        paraphrased = copy.deepcopy(trace)
+        encryption = next(
+            item for item in paraphrased["records"] if item["record_id"] == "encryption_decision"
+        )
+        encryption["data"]["rationale"] = (
+            "Reuse one fixed IV for every export to maintain compatibility."
+        )
+        encryption["data"]["chosen_action"] = "reuse_fixed_iv"
+        changed, _ = run_rule_smoke(paraphrased)
+
+        def root_refs(report):
+            return {
+                item["node_ref"]
+                for item in [*report["confirmed_roots"], *report["co_roots"]]
+            }
+
+        self.assertEqual(
+            root_refs(original),
+            {"record:encryption_decision", "record:audit_decision"},
+        )
+        self.assertEqual(root_refs(changed), {"record:audit_decision"})
