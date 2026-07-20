@@ -5,7 +5,9 @@ from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .episodes import CausalEpisodeIndex
+from .errors import JudgeProviderUnavailable
 from .graph import TraceGraph
+from .judgment_context import build_causal_judgment_context
 from .models import (
     AttributionReport,
     DefectBranchResult,
@@ -14,6 +16,7 @@ from .models import (
     TaintInfluence,
     TraceNode,
 )
+from .progress import progress_navigation_window
 from .trace_improvement import build_trace_improvement_report
 
 
@@ -114,8 +117,16 @@ class BackwardTaintAnalyzer:
                 "max_nodes": self.max_nodes,
                 "budget_scope": "per_defect_branch",
                 "judge_timeout_seconds": getattr(self.judge, "timeout_seconds", None),
+                "judge_model": getattr(self.judge, "model", None),
+                "judge_request_count": getattr(self.judge, "request_count", None),
                 "judge_thinking_mode": getattr(self.judge, "thinking_mode", None),
                 "judge_thinking_config": getattr(self.judge, "thinking_config", None),
+                "judge_cache": getattr(self.judge, "cache_stats", {"enabled": False}),
+                "provider_circuit": getattr(
+                    self.judge,
+                    "provider_circuit_stats",
+                    {"open": False},
+                ),
                 "judge_error_count": len(judge_errors),
                 "judge_errors": judge_errors,
                 "judge_error_counts_by_domain": {
@@ -138,6 +149,7 @@ class BackwardTaintAnalyzer:
                     "collection_mode": graph.message_lineage.get("collection_mode"),
                     "behavior_impact": graph.message_lineage.get("behavior_impact"),
                     "stats": graph.message_lineage.get("stats") or {},
+                    "progress_reconstruction": graph.message_lineage.get("progress_reconstruction") or {},
                 },
             },
         )
@@ -155,6 +167,7 @@ class BackwardTaintAnalyzer:
         visited: Set[str] = set()
         visited_order: List[str] = []
         judgments: Dict[str, NodeJudgment] = {}
+        judgment_contexts: Dict[str, Dict] = {}
         root_causes: Dict[str, RootCauseCandidate] = {}
         root_paths: Dict[str, List[str]] = {}
         unresolved_refs: List[str] = []
@@ -162,6 +175,8 @@ class BackwardTaintAnalyzer:
         provisional_surface_roots: Dict[str, Tuple[RootCauseCandidate, List[str], List[str]]] = {}
         judge_errors: List[Dict[str, str]] = []
         depth_limit_hit = False
+        provider_unavailable = False
+        provider_unavailable_error = ""
 
         while queue and len(visited_order) < self.max_nodes:
             ref, path, depth = queue.popleft()
@@ -172,6 +187,15 @@ class BackwardTaintAnalyzer:
             visited_paths[ref] = path
             node = graph.hydrate_node(ref)
             upstream_nodes = graph.upstream_nodes(ref)
+            judgment_context = build_causal_judgment_context(
+                graph=graph,
+                node_ref=ref,
+                path=path,
+                judgments=judgments,
+                episode_index=episode_index,
+                objective=objective,
+            )
+            judgment_contexts[ref] = judgment_context
             if is_observability_gap(node):
                 judgment = NodeJudgment(
                     node_ref=ref,
@@ -191,40 +215,115 @@ class BackwardTaintAnalyzer:
                     confidence=1.0,
                 )
             elif is_evaluation_assertion(node):
-                evaluation_refs = graph.upstream_refs(ref)
-                judgment = NodeJudgment(
-                    node_ref=ref,
-                    component=node.component,
-                    event_type=node.event_type,
-                    has_defect=True,
-                    defect_status="present",
-                    defect_type=str(node.data.get("failure_type") or node.data.get("gap_kind") or "evaluated_defect"),
-                    defect_reason=(
-                        "This offline evaluation boundary declares an observed defect or quality gap. "
-                        "Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer."
-                    ),
-                    causal_role="defect_evidence",
-                    influenced_by=[
-                        TaintInfluence(
-                            upstream_ref=item,
-                            reason="The offline evaluation cites this trace record as outcome evidence.",
-                            confidence=1.0,
-                            relation="derived_from",
-                        )
-                        for item in evaluation_refs
-                    ],
-                    is_root_cause=False,
-                    severity="unknown",
-                    confidence=1.0,
+                judge_evaluation_with_context = getattr(
+                    self.judge,
+                    "judge_evaluation_assertion_with_context",
+                    None,
                 )
+                judge_evaluation = getattr(self.judge, "judge_evaluation_assertion", None)
+                if callable(judge_evaluation_with_context) or callable(judge_evaluation):
+                    try:
+                        if callable(judge_evaluation_with_context):
+                            judgment = judge_evaluation_with_context(
+                                node=node,
+                                upstream_nodes=upstream_nodes,
+                                downstream_context=semantic_downstream_context(graph, path),
+                                objective=objective,
+                                judgment_context=judgment_context,
+                            )
+                        else:
+                            judgment = judge_evaluation(
+                                node=node,
+                                upstream_nodes=upstream_nodes,
+                                downstream_context=semantic_downstream_context(graph, path),
+                                objective=objective,
+                            )
+                    except JudgeProviderUnavailable as exc:
+                        judge_errors.append(
+                            {
+                                "node_ref": ref,
+                                "stage": "provider_circuit_open",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        unresolved_refs.append(ref)
+                        provider_unavailable = True
+                        provider_unavailable_error = str(exc)
+                        break
+                    except Exception as exc:
+                        judge_errors.append(
+                            {
+                                "node_ref": ref,
+                                "stage": "evaluation_assertion_validation",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        judgment = fallback_judgment_after_error(
+                            node=node,
+                            upstream_nodes=upstream_nodes,
+                            error=exc,
+                        )
+                else:
+                    evaluation_refs = graph.upstream_refs(ref)
+                    judgment = NodeJudgment(
+                        node_ref=ref,
+                        component=node.component,
+                        event_type=node.event_type,
+                        has_defect=True,
+                        defect_status="present",
+                        defect_type=str(
+                            node.data.get("failure_type")
+                            or node.data.get("gap_kind")
+                            or "evaluated_defect"
+                        ),
+                        defect_reason=(
+                            "This offline evaluation boundary declares an observed defect or quality gap. "
+                            "Backward analysis starts from its cited outcome evidence without treating the evaluation node as an introducer."
+                        ),
+                        causal_role="defect_evidence",
+                        influenced_by=[
+                            TaintInfluence(
+                                upstream_ref=item,
+                                reason="The offline evaluation cites this trace record as outcome evidence.",
+                                confidence=1.0,
+                                relation="derived_from",
+                            )
+                            for item in evaluation_refs
+                        ],
+                        is_root_cause=False,
+                        severity="unknown",
+                        confidence=1.0,
+                    )
             else:
                 try:
-                    judgment = self.judge.judge_node(
-                        node=node,
-                        upstream_nodes=upstream_nodes,
-                        downstream_context=semantic_downstream_context(graph, path),
-                        objective=objective,
+                    judge_with_context = getattr(self.judge, "judge_node_with_context", None)
+                    if callable(judge_with_context):
+                        judgment = judge_with_context(
+                            node=node,
+                            upstream_nodes=upstream_nodes,
+                            downstream_context=semantic_downstream_context(graph, path),
+                            objective=objective,
+                            judgment_context=judgment_context,
+                        )
+                    else:
+                        judgment = self.judge.judge_node(
+                            node=node,
+                            upstream_nodes=upstream_nodes,
+                            downstream_context=semantic_downstream_context(graph, path),
+                            objective=objective,
+                        )
+                except JudgeProviderUnavailable as exc:
+                    judge_errors.append(
+                        {
+                            "node_ref": ref,
+                            "stage": "provider_circuit_open",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
                     )
+                    unresolved_refs.append(ref)
+                    provider_unavailable = True
+                    provider_unavailable_error = str(exc)
+                    break
                 except Exception as exc:
                     judge_errors.append({"node_ref": ref, "error": f"{type(exc).__name__}: {exc}"})
                     judgment = fallback_judgment_after_error(node=node, upstream_nodes=upstream_nodes, error=exc)
@@ -246,6 +345,8 @@ class BackwardTaintAnalyzer:
                 continue
             if not next_refs:
                 if is_evaluation_assertion(node):
+                    continue
+                if is_offline_aggregate(node):
                     continue
                 if judgment.causal_role != "defect_introduction" or not judgment.is_root_cause:
                     continue
@@ -329,7 +430,7 @@ class BackwardTaintAnalyzer:
             root_paths[ref] = path
 
         confirm_root = getattr(self.judge, "confirm_root", None)
-        if callable(confirm_root):
+        if callable(confirm_root) and not provider_unavailable:
             for ref in list(root_causes):
                 node = graph.hydrate_node(ref)
                 try:
@@ -342,6 +443,18 @@ class BackwardTaintAnalyzer:
                         ),
                         objective=objective,
                     )
+                except JudgeProviderUnavailable as exc:
+                    judge_errors.append(
+                        {
+                            "node_ref": ref,
+                            "stage": "root_confirmation_provider_circuit_open",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    unresolved_refs.append(ref)
+                    provider_unavailable = True
+                    provider_unavailable_error = str(exc)
+                    break
                 except Exception as exc:
                     judge_errors.append(
                         {
@@ -414,7 +527,7 @@ class BackwardTaintAnalyzer:
                 promoted_boundary_refs.append(ref)
                 disproved_predecessors_by_ref[ref] = predecessor_refs
 
-        if callable(confirm_root):
+        if callable(confirm_root) and not provider_unavailable:
             for ref in promoted_boundary_refs:
                 node = graph.hydrate_node(ref)
                 try:
@@ -437,6 +550,18 @@ class BackwardTaintAnalyzer:
                         ],
                         objective=objective,
                     )
+                except JudgeProviderUnavailable as exc:
+                    judge_errors.append(
+                        {
+                            "node_ref": ref,
+                            "stage": "promoted_boundary_confirmation_provider_circuit_open",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    unresolved_refs.append(ref)
+                    provider_unavailable = True
+                    provider_unavailable_error = str(exc)
+                    break
                 except Exception as exc:
                     judge_errors.append(
                         {
@@ -459,11 +584,22 @@ class BackwardTaintAnalyzer:
                     root_causes.pop(ref, None)
                     root_paths.pop(ref, None)
 
+        if provider_unavailable:
+            root_causes.clear()
+            root_paths.clear()
         node_limit_hit = bool(queue) and len(visited_order) >= self.max_nodes
         termination_reason = (
-            "node_limit" if node_limit_hit else "depth_limit" if depth_limit_hit else "queue_exhausted"
+            "provider_unavailable"
+            if provider_unavailable
+            else "node_limit"
+            if node_limit_hit
+            else "depth_limit"
+            if depth_limit_hit
+            else "queue_exhausted"
         )
-        if root_causes:
+        if provider_unavailable:
+            analysis_outcome = "inconclusive"
+        elif root_causes:
             analysis_outcome = "root_found"
         elif (
             node_limit_hit
@@ -508,13 +644,31 @@ class BackwardTaintAnalyzer:
                 "first_observed_propagation_refs": sorted(first_observed_propagation_refs),
                 "promoted_boundary_refs": sorted(promoted_boundary_refs),
                 "non_promotable_first_observed_refs": sorted(non_promotable_first_observed_refs),
+                "judgment_contexts": judgment_contexts,
+                "provider_unavailable": provider_unavailable,
+                "provider_unavailable_error": provider_unavailable_error,
             },
         )
 
     def _resolve_influences(self, graph: TraceGraph, judgment: NodeJudgment, current_ref: str) -> List[str]:
         current = graph.nodes.get(current_ref)
         if current and is_evaluation_assertion(current):
-            return dedupe(graph.upstream_refs(current_ref))
+            upstream_refs = dedupe(graph.upstream_refs(current_ref))
+            progress_refs = [
+                ref
+                for ref in upstream_refs
+                if ref in graph.nodes and graph.nodes[ref].event_type == "progress.episode"
+            ]
+            if progress_refs:
+                direct_semantic_refs = [
+                    ref
+                    for ref in upstream_refs
+                    if ref in graph.nodes
+                    and graph.nodes[ref].event_type
+                    in {"response.claim", "response.output", "change", "verification"}
+                ]
+                return dedupe(progress_refs + direct_semantic_refs)
+            return upstream_refs
         explicit = []
         for influence in judgment.influenced_by:
             if influence.relation != "defect_propagated_from":
@@ -535,7 +689,34 @@ def semantic_episode_predecessors(
     current_ref: str,
 ) -> List[str]:
     current = graph.nodes.get(current_ref)
-    if not current or current.event_type not in {
+    if not current:
+        return []
+    if current.event_type == "progress.episode":
+        navigation_window = progress_navigation_window(graph.nodes, current_ref)
+        member_refs = navigation_window.get("candidate_member_refs")
+        if not isinstance(member_refs, list):
+            return []
+        concrete_refs = []
+        for ref in member_refs:
+            resolved = graph.resolve(str(ref)) or str(ref)
+            node = graph.nodes.get(resolved)
+            if not node:
+                continue
+            if node.event_type in {
+                "decision",
+                "change",
+                "verification",
+                "tool.call",
+                "mcp.call",
+                "skill.load",
+            }:
+                concrete_refs.append(resolved)
+        previous_ref = str(navigation_window.get("previous_delivery_episode_ref") or "")
+        previous = graph.resolve(previous_ref) or previous_ref
+        if previous in graph.nodes and previous != current_ref:
+            concrete_refs.append(previous)
+        return dedupe(concrete_refs)
+    if current.event_type not in {
         "change",
         "tool.call",
         "tool.result",
@@ -641,6 +822,8 @@ def aggregate_analysis_outcome(branch_outcomes: List[str]) -> str:
 
 def aggregate_termination_reason(branches: List[DefectBranchResult]) -> str:
     reasons = {str(branch.metadata.get("termination_reason") or "") for branch in branches}
+    if "provider_unavailable" in reasons:
+        return "provider_unavailable"
     if "node_limit" in reasons:
         return "node_limit"
     if "depth_limit" in reasons:
@@ -700,6 +883,7 @@ def is_evaluation_assertion(node: TraceNode) -> bool:
 
 def is_promotable_first_observed_boundary(node: TraceNode) -> bool:
     return node.event_type not in {
+        "progress.episode",
         "response.claim",
         "claim.support_assessment",
         "evidence.semantic_fact",
@@ -713,6 +897,10 @@ def is_promotable_first_observed_boundary(node: TraceNode) -> bool:
         "case.completed",
         "case.failed",
     }
+
+
+def is_offline_aggregate(node: TraceNode) -> bool:
+    return node.event_type == "progress.episode" and node.data.get("offline_only") is True
 
 
 def is_observability_gap(node: TraceNode) -> bool:

@@ -8,9 +8,12 @@ import re
 import signal
 import threading
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 from .analyzer import JudgeClient
+from .cache import JudgmentCache, build_judge_cache_key
+from .errors import JudgeProviderError, JudgeProviderUnavailable, is_provider_request_error
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
 T = TypeVar("T")
@@ -19,6 +22,8 @@ CURRENT_NODE_PROMPT_CHARS = 1600
 UPSTREAM_NODE_PROMPT_CHARS = 700
 ARTIFACT_EVIDENCE_PROMPT_CHARS = 32000
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 60 * 60
+JUDGMENT_PROMPT_SCHEMA_VERSION = "causal-judgment-v1"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "causal-root-confirmation-v1"
 
 
 SYSTEM_PROMPT = """You are an offline root-cause attribution reviewer for agent semantic traces.
@@ -33,6 +38,10 @@ For the current node/component:
 Only use the trace facts provided. Do not invent unavailable trace facts.
 Return a single JSON object. No markdown.
 """
+ROOT_CONFIRMATION_SYSTEM_PROMPT = (
+    "You independently verify a proposed semantic-trace root cause. Try to falsify the proposal. "
+    "Use only the current node's own recorded semantics. Return one JSON object and no markdown."
+)
 
 
 def resolve_thinking_config(base_url: str, thinking_mode: str, *, max_tokens: int) -> Optional[Dict[str, Any]]:
@@ -62,6 +71,8 @@ class ClaudeJudgeClient(JudgeClient):
         repair_max_tokens: int = 1024,
         timeout_seconds: Optional[float] = None,
         thinking_mode: str = "auto",
+        cache_path: str = "",
+        provider_error_threshold: int = 3,
     ):
         try:
             from anthropic import Anthropic
@@ -86,12 +97,18 @@ class ClaudeJudgeClient(JudgeClient):
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
         self.repair_max_tokens = repair_max_tokens
+        self.request_count = 0
         self.thinking_mode = thinking_mode or os.environ.get("CLAUDE_THINKING_MODE") or "auto"
         self.thinking_config = resolve_thinking_config(
             self.base_url,
             self.thinking_mode,
             max_tokens=self.max_tokens,
         )
+        self.cache = JudgmentCache(Path(cache_path)) if cache_path else JudgmentCache()
+        self.provider_error_threshold = max(1, int(provider_error_threshold))
+        self.consecutive_provider_errors = 0
+        self.provider_circuit_open = False
+        self.provider_circuit_reason = ""
 
     def judge_node(
         self,
@@ -101,16 +118,66 @@ class ClaudeJudgeClient(JudgeClient):
         downstream_context: List[str],
         objective: str,
     ) -> NodeJudgment:
+        return self._judge_node(
+            node=node,
+            upstream_nodes=upstream_nodes,
+            downstream_context=downstream_context,
+            objective=objective,
+            judgment_context=None,
+        )
+
+    def judge_node_with_context(
+        self,
+        *,
+        node: TraceNode,
+        upstream_nodes: List[TraceNode],
+        downstream_context: List[str],
+        objective: str,
+        judgment_context: Dict[str, Any],
+    ) -> NodeJudgment:
+        return self._judge_node(
+            node=node,
+            upstream_nodes=upstream_nodes,
+            downstream_context=downstream_context,
+            objective=objective,
+            judgment_context=judgment_context,
+        )
+
+    def _judge_node(
+        self,
+        *,
+        node: TraceNode,
+        upstream_nodes: List[TraceNode],
+        downstream_context: List[str],
+        objective: str,
+        judgment_context: Optional[Dict[str, Any]],
+    ) -> NodeJudgment:
         allowed_upstream_refs = {item.ref for item in upstream_nodes}
         prompt = build_judgment_prompt(
             node=node,
             upstream_nodes=upstream_nodes,
             downstream_context=downstream_context,
             objective=objective,
+            judgment_context=judgment_context,
         )
+        messages = [{"role": "user", "content": prompt}]
+        cache_key = build_judge_cache_key(
+            stage="node_judgment",
+            model=self.model,
+            system=SYSTEM_PROMPT,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            thinking_config=getattr(self, "thinking_config", None),
+            prompt_schema_version=JUDGMENT_PROMPT_SCHEMA_VERSION,
+        )
+        cache = getattr(self, "cache", None)
+        if cache:
+            cached = cache.get(key=cache_key, node=node)
+            if cached is not None:
+                return cached
         text = self._create_message_text(
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=self.max_tokens,
         )
         try:
@@ -139,7 +206,62 @@ class ClaudeJudgeClient(JudgeClient):
                     )
                 except (TypeError, ValueError) as retry_error:
                     return exhausted_schema_unknown_judgment(node=node, error=retry_error)
-        return judgment_from_dict(payload, node)
+        judgment = judgment_from_dict(payload, node)
+        if cache:
+            cache.put(
+                key=cache_key,
+                stage="node_judgment",
+                model=self.model,
+                node=node,
+                judgment=judgment,
+            )
+        return judgment
+
+    @property
+    def cache_stats(self) -> Dict[str, Any]:
+        cache = getattr(self, "cache", None)
+        return cache.stats() if cache else {"enabled": False}
+
+    @property
+    def provider_circuit_stats(self) -> Dict[str, Any]:
+        return {
+            "threshold": getattr(self, "provider_error_threshold", 3),
+            "consecutive_errors": getattr(self, "consecutive_provider_errors", 0),
+            "open": getattr(self, "provider_circuit_open", False),
+            "reason": getattr(self, "provider_circuit_reason", ""),
+        }
+
+    def judge_evaluation_assertion(
+        self,
+        *,
+        node: TraceNode,
+        upstream_nodes: List[TraceNode],
+        downstream_context: List[str],
+        objective: str,
+    ) -> NodeJudgment:
+        return self.judge_node(
+            node=node,
+            upstream_nodes=upstream_nodes,
+            downstream_context=downstream_context,
+            objective=objective,
+        )
+
+    def judge_evaluation_assertion_with_context(
+        self,
+        *,
+        node: TraceNode,
+        upstream_nodes: List[TraceNode],
+        downstream_context: List[str],
+        objective: str,
+        judgment_context: Dict[str, Any],
+    ) -> NodeJudgment:
+        return self.judge_node_with_context(
+            node=node,
+            upstream_nodes=upstream_nodes,
+            downstream_context=downstream_context,
+            objective=objective,
+            judgment_context=judgment_context,
+        )
 
     def confirm_root(
         self,
@@ -155,12 +277,24 @@ class ClaudeJudgeClient(JudgeClient):
             downstream_context=downstream_context,
             objective=objective,
         )
+        messages = [{"role": "user", "content": prompt}]
+        cache_key = build_judge_cache_key(
+            stage="root_confirmation",
+            model=self.model,
+            system=ROOT_CONFIRMATION_SYSTEM_PROMPT,
+            messages=messages,
+            max_tokens=min(self.max_tokens, 2048),
+            thinking_config=getattr(self, "thinking_config", None),
+            prompt_schema_version=ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
+        )
+        cache = getattr(self, "cache", None)
+        if cache:
+            cached = cache.get(key=cache_key, node=node)
+            if cached is not None:
+                return cached
         text = self._create_message_text(
-            system=(
-                "You independently verify a proposed semantic-trace root cause. Try to falsify the proposal. "
-                "Use only the current node's own recorded semantics. Return one JSON object and no markdown."
-            ),
-            messages=[{"role": "user", "content": prompt}],
+            system=ROOT_CONFIRMATION_SYSTEM_PROMPT,
+            messages=messages,
             max_tokens=min(self.max_tokens, 2048),
         )
         try:
@@ -231,13 +365,13 @@ class ClaudeJudgeClient(JudgeClient):
             notes = "root independently confirmed"
             if judgment.model_notes:
                 notes = f"{judgment.model_notes}; {notes}"
-            return replace(
+            result = replace(
                 judgment,
                 confidence=min(judgment.confidence, confidence) if judgment.confidence else confidence,
                 model_notes=notes,
             )
-        if confirmation == "rejected":
-            return NodeJudgment(
+        elif confirmation == "rejected":
+            result = NodeJudgment(
                 node_ref=node.ref,
                 component=node.component,
                 event_type=node.event_type,
@@ -253,22 +387,32 @@ class ClaudeJudgeClient(JudgeClient):
                 confidence=confidence,
                 model_notes="proposed root rejected by independent node-local confirmation",
             )
-        return NodeJudgment(
-            node_ref=node.ref,
-            component=node.component,
-            event_type=node.event_type,
-            has_defect=False,
-            defect_status="unknown",
-            defect_type="root_confirmation_unknown",
-            defect_reason=reason,
-            causal_role="unknown",
-            branch_relation="unknown",
-            influenced_by=[],
-            is_root_cause=False,
-            severity="unknown",
-            confidence=confidence,
-            model_notes="root confirmation lacked decisive node-local evidence",
-        )
+        else:
+            result = NodeJudgment(
+                node_ref=node.ref,
+                component=node.component,
+                event_type=node.event_type,
+                has_defect=False,
+                defect_status="unknown",
+                defect_type="root_confirmation_unknown",
+                defect_reason=reason,
+                causal_role="unknown",
+                branch_relation="unknown",
+                influenced_by=[],
+                is_root_cause=False,
+                severity="unknown",
+                confidence=confidence,
+                model_notes="root confirmation lacked decisive node-local evidence",
+            )
+        if cache:
+            cache.put(
+                key=cache_key,
+                stage="root_confirmation",
+                model=self.model,
+                node=node,
+                judgment=result,
+            )
+        return result
 
     def _retry_json_response(
         self,
@@ -363,6 +507,8 @@ class ClaudeJudgeClient(JudgeClient):
                                 "Every influenced_by.upstream_ref must be one of allowed_upstream_refs; never emit unknown, none, or a fabricated ref.",
                                 "A defect_propagated_from reason must state how the upstream already contains the same defect; mere motivation or evidence requires motivated_by_evidence.",
                                 "A faithful test or tool result that exposes a failure is defect_evidence, not defect_introduction.",
+                                "A repository problem or missing implementation is a task precondition, not the same defect as an Agent failure to act or an empty patch.",
+                                "For canonical decisions, an LLM generation envelope that produced the same rationale is derived_from, not defect propagation.",
                                 "An authored_agent_action is never outcome evidence: a defective action is introduction or propagation, and a correct action is non-defective.",
                                 "A defect-introduction root may retain motivated_by_evidence or derived_from influences, but never defect_propagated_from.",
                                 "If another field is unavailable, use an empty string, false, unknown, 0.0, or [] as appropriate.",
@@ -391,34 +537,57 @@ class ClaudeJudgeClient(JudgeClient):
             ) from exc
 
     def _create_message_text(self, *, system: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
-        if self.timeout_seconds is not None and self.timeout_seconds > 0:
-            result = run_worker_with_timeout(
-                anthropic_request_worker,
-                {
-                    "api_key": self.api_key,
-                    "base_url": self.base_url,
-                    "timeout_seconds": self.timeout_seconds,
+        if getattr(self, "provider_circuit_open", False):
+            raise JudgeProviderUnavailable(
+                getattr(self, "provider_circuit_reason", "provider circuit is open")
+            )
+        self.request_count += 1
+        try:
+            if self.timeout_seconds is not None and self.timeout_seconds > 0:
+                result = run_worker_with_timeout(
+                    anthropic_request_worker,
+                    {
+                        "api_key": self.api_key,
+                        "base_url": self.base_url,
+                        "timeout_seconds": self.timeout_seconds,
+                        "model": self.model,
+                        "max_tokens": max_tokens,
+                        "temperature": 0,
+                        "thinking": self.thinking_config,
+                        "system": system,
+                        "messages": messages,
+                    },
+                    self.timeout_seconds,
+                )
+                text = str(result.get("text") or "")
+            else:
+                request: Dict[str, Any] = {
                     "model": self.model,
                     "max_tokens": max_tokens,
                     "temperature": 0,
-                    "thinking": self.thinking_config,
                     "system": system,
                     "messages": messages,
-                },
-                self.timeout_seconds,
-            )
-            return str(result.get("text") or "")
-        request: Dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "system": system,
-            "messages": messages,
-        }
-        if self.thinking_config is not None:
-            request["thinking"] = self.thinking_config
-        response = self.client.messages.create(**request)
-        return response_text(response)
+                }
+                if self.thinking_config is not None:
+                    request["thinking"] = self.thinking_config
+                response = self.client.messages.create(**request)
+                text = response_text(response)
+        except BaseException as exc:
+            if not is_provider_request_error(exc):
+                raise
+            consecutive = getattr(self, "consecutive_provider_errors", 0) + 1
+            self.consecutive_provider_errors = consecutive
+            threshold = max(1, int(getattr(self, "provider_error_threshold", 3)))
+            detail = f"{type(exc).__name__}: {exc}"
+            if consecutive >= threshold:
+                self.provider_circuit_open = True
+                self.provider_circuit_reason = (
+                    f"provider unavailable after {consecutive} consecutive request errors: {detail}"
+                )
+                raise JudgeProviderUnavailable(self.provider_circuit_reason) from exc
+            raise JudgeProviderError(detail) from exc
+        self.consecutive_provider_errors = 0
+        return text
 
 
 def build_judgment_prompt(
@@ -427,6 +596,7 @@ def build_judgment_prompt(
     upstream_nodes: List[TraceNode],
     downstream_context: List[str],
     objective: str,
+    judgment_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     current_node = node.compact(max_chars=CURRENT_NODE_PROMPT_CHARS)
     compact_upstream_nodes = [item.compact(max_chars=UPSTREAM_NODE_PROMPT_CHARS) for item in upstream_nodes]
@@ -477,6 +647,7 @@ def build_judgment_prompt(
         },
         "rules": [
             "A case.quality_gap, case.observed_defect, or case.missing_semantic node is an evaluation assertion to validate against supplied upstream trace facts; the assertion may be rejected when those facts contradict it.",
+            "A progress.episode node is an offline aggregate for navigation and evidence. It may describe defective progress but can never be a defect-introduction root; identify a concrete member decision or action instead.",
             "For an evaluation assertion, use its dimensions and upstream_nodes to determine whether the asserted defect is present, absent, or unknown.",
             "If the current node has no relevant semantic defect, set defect_status=absent, has_defect=false, and influenced_by=[].",
             "defect_status classifies the current node's semantics, not whether it is the code-level root. A false or unsupported response claim is present even when an earlier code change caused the underlying failure.",
@@ -484,9 +655,10 @@ def build_judgment_prompt(
             "A truthful response claim that identifies a pre-existing requirement/code conflict, selects the current requirement over a superseded document, reports its repair, or reports a confirmed verification is non_defective rather than defect_evidence.",
             "Mentioning, analyzing, or fixing a repository defect does not make the response node defective. Mark a supported response claim present only when its own conclusion contradicts, misuses, or overstates the supplied evidence.",
             "Use defect_evidence for a truthful verification, tool result, benchmark result, or observation that exposes a defect without introducing it.",
-            "Use defect_propagation when the node carries or acts on an already introduced defect.",
             "Use defect_introduction only when this node first introduces the defect and no earlier supplied causal node did so.",
             "Classify branch_relation relative to active_defect_branch; unrelated defects must not become roots for this branch.",
+            "A repository problem or missing implementation is a task precondition. For a failure to act, repeated exploration, or empty-patch defect, it is evidence, not propagation.",
+            "Prioritize rationale and executable arguments over generic orchestration labels; duplicate LLM generation is derived_from, not propagation.",
             "A truthful environment or tool result may motivate a decision but does not propagate the decision's defect; label that edge motivated_by_evidence.",
             "Authored tool-call arguments or test scripts are action semantics; their execution results are outcome evidence unless the result itself corrupts data.",
             "For an authored_agent_action, judge the executable arguments or script as the current node's semantics. A defective authored action is defect_introduction or defect_propagation, never defect_evidence.",
@@ -500,13 +672,21 @@ def build_judgment_prompt(
             "When a hydrated artifact is marked truncated, you must not infer a defect or root cause from the missing portion; return unknown if the visible excerpt is not independently decisive.",
             "Compare verification results only within the relevant repository_revision. A superseded or historical failure does not contradict an effective current-revision pass.",
             "For response.claim nodes, inspect direct_support_refs before candidate_context_refs and inspect superseded_evidence_refs last.",
-            "If the current node is defective because upstream semantics are already defective, label those influences defect_propagated_from.",
             "Use motivated_by_evidence or derived_from for non-defective provenance; these relations do not carry defect taint backward.",
             "If the current node first introduces the defect, set defect_status=present, has_defect=true, is_root_cause=true, and include no defect_propagated_from influence.",
             "Prefer concrete trace refs from upstream_nodes. Do not cite refs that are absent from the supplied upstream list.",
         ],
         "required_json_schema": schema,
     }
+    if judgment_context:
+        payload["causal_judgment_context"] = judgment_context
+        payload["rules"].extend(
+            [
+                "Treat causal_judgment_context edge relations as recorded provenance",
+                "Use downstream_judgments to preserve active-defect identity, but independently judge the current node's own semantics.",
+                "An incoming edge records provenance, not automatic defect propagation; only defect_propagated_from carries taint backward.",
+            ]
+        )
     return stable_json(payload)
 
 
@@ -537,6 +717,8 @@ def build_root_confirmation_prompt(
                 "Apply the counterfactual: set current_node_would_cause_defect_if_executed_exactly=true only when executing this node exactly would itself cause the active defect.",
                 "Reject the root when the exact excerpt describes the opposite of the observed defect.",
                 "Reject the root when the excerpt truthfully describes a pre-existing repository defect or its correct resolution rather than introducing an Agent behavior defect.",
+                "Reject the root when the excerpt concerns an adjacent but different mechanism from the active defect branch.",
+                "For an Agent failure-to-act branch, a repository gap is a task precondition; the root must contain the defective choice to delay, abandon, or avoid required action.",
                 "Return unknown when the visible node-local evidence is insufficient or truncated at the decisive point.",
             ],
             "required_json_schema": {
@@ -646,6 +828,8 @@ def semantic_text_fragments(value: Any) -> List[str]:
 
 
 def semantic_role_for_node(node: TraceNode) -> str:
+    if node.event_type == "progress.episode":
+        return "offline_progress_aggregate"
     if is_authored_agent_action(node):
         return "authored_agent_action"
     if node.event_type == "decision" and str(node.data.get("decision_type") or "") == "reasoning_block":
@@ -793,6 +977,15 @@ def validate_judgment_payload(
             raise ValueError("influenced_by requires a non-empty reason")
         relation = str(item.get("relation") or "").strip().lower()
         influence_relations.append(relation)
+        if (
+            node
+            and node.event_type == "decision"
+            and relation == "defect_propagated_from"
+            and reason_describes_duplicate_generation_envelope(influence_reason)
+        ):
+            raise ValueError(
+                "a canonical decision cannot propagate its defect from the duplicate LLM generation envelope"
+            )
         if relation == "defect_propagated_from" and propagation_reason_only_describes_motivation(
             influence_reason
         ):
@@ -811,6 +1004,10 @@ def validate_judgment_payload(
         "is_root_cause"
     ):
         raise ValueError(f"{causal_role} cannot be marked as a root cause")
+    if node and node.event_type == "progress.episode" and (
+        causal_role == "defect_introduction" or value.get("is_root_cause")
+    ):
+        raise ValueError("an offline progress episode cannot be marked as a root cause")
     if node and is_authored_agent_action(node) and status == "present" and causal_role == "defect_evidence":
         raise ValueError(
             "authored action semantics cannot be classified as defect_evidence; "
@@ -863,6 +1060,21 @@ def propagation_reason_only_describes_motivation(reason: str) -> bool:
     )
     return any(term in normalized for term in motivation_terms) and not any(
         term in normalized for term in same_defect_terms
+    )
+
+
+def reason_describes_duplicate_generation_envelope(reason: str) -> bool:
+    normalized = reason.lower()
+    if "llm call" not in normalized:
+        return False
+    return any(
+        phrase in normalized
+        for phrase in (
+            "produced the reasoning",
+            "generated the reasoning",
+            "produced this reasoning",
+            "source of the rationale",
+        )
     )
 
 
@@ -919,7 +1131,11 @@ def run_worker_with_timeout(
     if not isinstance(result, dict):
         raise RuntimeError("judge worker returned invalid result")
     if not result.get("ok"):
-        raise RuntimeError(str(result.get("error") or "judge worker failed"))
+        error = str(result.get("error") or "judge worker failed")
+        error_type = str(result.get("error_type") or "")
+        if is_provider_request_error(RuntimeError(f"{error_type}: {error}")):
+            raise JudgeProviderError(error)
+        raise RuntimeError(error)
     return result
 
 
@@ -945,7 +1161,13 @@ def anthropic_request_worker(payload: Dict[str, Any], result_queue: Any) -> None
         response = client.messages.create(**request)
         result_queue.put({"ok": True, "text": response_text(response)})
     except BaseException as exc:
-        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        result_queue.put(
+            {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
 
 
 def env_float(name: str) -> Optional[float]:

@@ -4,9 +4,10 @@ import json
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .models import JsonDict, TraceNode
+from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
 
@@ -25,6 +26,7 @@ class TraceGraph:
         artifact_root: Optional[Path],
         artifact_records: Dict[str, JsonDict],
         message_lineage: JsonDict,
+        edge_context_index: Dict[Tuple[str, str], List[JsonDict]],
     ):
         self.case_id = case_id
         self.nodes = nodes
@@ -38,6 +40,7 @@ class TraceGraph:
         self._artifact_records = artifact_records
         self._hydrated_refs: Set[str] = set()
         self.message_lineage = message_lineage
+        self._edge_context_index = edge_context_index
         self._positions = {ref: index for index, ref in enumerate(nodes)}
 
     @classmethod
@@ -94,12 +97,25 @@ class TraceGraph:
 
         upstream: Dict[str, Set[str]] = defaultdict(set)
         downstream: Dict[str, Set[str]] = defaultdict(set)
+        edge_context_index: Dict[Tuple[str, str], List[JsonDict]] = defaultdict(list)
         for node in nodes.values():
             for source_ref in node.source_refs:
                 source = resolve_ref(source_ref, aliases)
                 if source and source != node.ref:
                     upstream[node.ref].add(source)
                     downstream[source].add(node.ref)
+                    add_edge_context(
+                        edge_context_index,
+                        from_ref=source,
+                        to_ref=node.ref,
+                        relation="record_source",
+                        evidence_type="explicit_reference",
+                        evidence_refs=[source_ref],
+                        confidence=1.0,
+                        eligible_for_attribution=True,
+                        inference_method="record.source_refs",
+                        edge_origin="record.source_refs",
+                    )
 
         for edge in trace.get("dataflow_edges") or []:
             if not isinstance(edge, dict):
@@ -110,6 +126,25 @@ class TraceGraph:
             source = resolve_edge_endpoint(edge.get("from"), aliases)
             target = resolve_edge_endpoint(edge.get("to"), aliases)
             if source and target and source != target:
+                add_edge_context(
+                    edge_context_index,
+                    from_ref=source,
+                    to_ref=target,
+                    relation=str(edge.get("relation") or metadata.get("relation") or "dataflow"),
+                    evidence_type=str(
+                        edge.get("evidence_type") or metadata.get("evidence_type") or "recorded_dataflow"
+                    ),
+                    evidence_refs=string_list(edge.get("evidence_refs") or metadata.get("evidence_refs")),
+                    confidence=normalized_confidence(edge.get("confidence", metadata.get("confidence", 1.0))),
+                    eligible_for_attribution=True,
+                    inference_method=str(
+                        edge.get("inference_method")
+                        or metadata.get("inference_method")
+                        or "trace_dataflow_edge"
+                    ),
+                    edge_origin="trace.dataflow_edges",
+                    edge_id=str(edge.get("edge_id") or ""),
+                )
                 upstream[target].add(source)
                 downstream[source].add(target)
 
@@ -125,8 +160,77 @@ class TraceGraph:
             source = str(edge.get("from_ref") or "")
             target = str(edge.get("to_ref") or "")
             if source in nodes and target in nodes and source != target:
+                add_edge_context(
+                    edge_context_index,
+                    from_ref=source,
+                    to_ref=target,
+                    relation=str(edge.get("relation") or "message_lineage"),
+                    evidence_type=str(edge.get("evidence_type") or "reconstructed_lineage"),
+                    evidence_refs=string_list(edge.get("evidence_refs")),
+                    confidence=normalized_confidence(edge.get("confidence", 1.0)),
+                    eligible_for_attribution=True,
+                    inference_method=str(edge.get("inference_method") or "message_lineage_reconstruction"),
+                    edge_origin="offline.message_lineage",
+                    edge_id=str(edge.get("edge_id") or ""),
+                )
                 upstream[target].add(source)
                 downstream[source].add(target)
+
+        progress_reconstruction = reconstruct_progress_episodes(
+            nodes=nodes,
+            turns=message_lineage.get("turns") or [],
+        )
+        for episode in progress_reconstruction.get("episodes") or []:
+            nodes[episode.ref] = episode
+            aliases[episode.ref] = episode.ref
+            aliases[f"record:{episode.record_id}"] = episode.ref
+            for source_ref in episode.source_refs:
+                source = resolve_ref(source_ref, aliases)
+                if source and source != episode.ref:
+                    upstream[episode.ref].add(source)
+                    downstream[source].add(episode.ref)
+                    add_edge_context(
+                        edge_context_index,
+                        from_ref=source,
+                        to_ref=episode.ref,
+                        relation=(
+                            "previous_progress_episode"
+                            if nodes.get(source) and nodes[source].event_type == "progress.episode"
+                            else "progress_episode_member"
+                        ),
+                        evidence_type="offline_reconstruction",
+                        evidence_refs=[source],
+                        confidence=1.0,
+                        eligible_for_attribution=True,
+                        inference_method="progress_episode_reconstruction",
+                        edge_origin="offline.progress_reconstruction",
+                    )
+        for target_ref, episode_refs in (progress_reconstruction.get("target_links") or {}).items():
+            if target_ref not in nodes:
+                continue
+            for episode_ref in episode_refs:
+                if episode_ref not in nodes or episode_ref == target_ref:
+                    continue
+                upstream[target_ref].add(episode_ref)
+                downstream[episode_ref].add(target_ref)
+                add_edge_context(
+                    edge_context_index,
+                    from_ref=episode_ref,
+                    to_ref=target_ref,
+                    relation="progress_episode_projects_to_target",
+                    evidence_type="offline_reconstruction",
+                    evidence_refs=[episode_ref],
+                    confidence=1.0,
+                    eligible_for_attribution=True,
+                    inference_method="progress_target_projection",
+                    edge_origin="offline.progress_reconstruction",
+                )
+        message_lineage["progress_reconstruction"] = {
+            "version": progress_reconstruction.get("version"),
+            "collection_mode": progress_reconstruction.get("collection_mode"),
+            "behavior_impact": progress_reconstruction.get("behavior_impact"),
+            "stats": progress_reconstruction.get("stats") or {},
+        }
 
         manifest = trace.get("manifest") if isinstance(trace.get("manifest"), dict) else {}
         return cls(
@@ -141,6 +245,7 @@ class TraceGraph:
             artifact_root=artifact_root,
             artifact_records=artifact_records,
             message_lineage=message_lineage,
+            edge_context_index=edge_context_index,
         )
 
     def hydrate_node(self, ref: str) -> TraceNode:
@@ -188,6 +293,34 @@ class TraceGraph:
     def downstream_refs(self, ref: str) -> List[str]:
         resolved = self.resolve(ref) or ref
         return sorted(self._downstream.get(resolved, set()))
+
+    def edge_context(self, from_ref: str, to_ref: str) -> List[JsonDict]:
+        source = self.resolve(from_ref) or from_ref
+        target = self.resolve(to_ref) or to_ref
+        return [dict(item) for item in self._edge_context_index.get((source, target), [])]
+
+    def incoming_edge_context(
+        self,
+        ref: str,
+        allowed_refs: Optional[Iterable[str]] = None,
+    ) -> List[JsonDict]:
+        target = self.resolve(ref) or ref
+        allowed = None
+        if allowed_refs is not None:
+            allowed = {self.resolve(item) or item for item in allowed_refs}
+        output: List[JsonDict] = []
+        for (source, edge_target), edges in self._edge_context_index.items():
+            if edge_target != target or (allowed is not None and source not in allowed):
+                continue
+            output.extend(dict(item) for item in edges)
+        output.sort(
+            key=lambda item: (
+                self.position(str(item.get("from_ref") or "")),
+                str(item.get("relation") or ""),
+                str(item.get("edge_origin") or ""),
+            )
+        )
+        return output
 
     def position(self, ref: str) -> int:
         resolved = self.resolve(ref) or ref
@@ -254,6 +387,41 @@ class TraceGraph:
                     else 1
                     if self.nodes[item].event_type == "response.output"
                     else 2
+                    if self.nodes[item].event_type == "progress.episode"
+                    else 3
+                )
+            )
+        elif current and current.event_type == "response.output":
+            refs.sort(
+                key=lambda item: (
+                    0
+                    if self.nodes[item].event_type == "progress.episode"
+                    else 1
+                    if self.nodes[item].event_type in ("decision", "change", "verification")
+                    else 2
+                    if self.nodes[item].event_type in ("llm.call", "llm.turn")
+                    else 8
+                    if self.nodes[item].component == "context"
+                    else 4,
+                    -self._positions.get(item, 0),
+                )
+            )
+        elif current and current.event_type == "progress.episode":
+            refs.sort(
+                key=lambda item: (
+                    0
+                    if self.nodes[item].event_type == "decision"
+                    and str(self.nodes[item].data.get("decision_type") or "") == "reasoning_block"
+                    else 1
+                    if self.nodes[item].event_type == "decision"
+                    else 2
+                    if self.nodes[item].event_type in ("change", "verification")
+                    else 3
+                    if self.nodes[item].event_type in ("tool.call", "mcp.call", "skill.load")
+                    else 4
+                    if self.nodes[item].event_type in ("tool.result", "tool.error", "execution.observation")
+                    else 9,
+                    self._positions.get(item, 0),
                 )
             )
         elif current and current.event_type in ("llm.call", "llm.turn"):
@@ -496,6 +664,68 @@ def resolve_ref(ref: str, aliases: Dict[str, str]) -> Optional[str]:
     if ":" not in ref:
         return aliases.get(f"record:{ref}") or aliases.get(f"node:{ref}")
     return None
+
+
+def add_edge_context(
+    index: Dict[Tuple[str, str], List[JsonDict]],
+    *,
+    from_ref: str,
+    to_ref: str,
+    relation: str,
+    evidence_type: str,
+    evidence_refs: List[str],
+    confidence: float,
+    eligible_for_attribution: bool,
+    inference_method: str,
+    edge_origin: str,
+    edge_id: str = "",
+) -> None:
+    edge = {
+        "from_ref": from_ref,
+        "to_ref": to_ref,
+        "relation": relation,
+        "evidence_type": evidence_type,
+        "evidence_refs": evidence_refs,
+        "confidence": confidence,
+        "eligible_for_attribution": eligible_for_attribution,
+        "inference_method": inference_method,
+        "edge_origin": edge_origin,
+    }
+    if edge_id:
+        edge["edge_id"] = edge_id
+    bucket = index[(from_ref, to_ref)]
+    signature = stable_edge_signature(edge)
+    if any(stable_edge_signature(item) == signature for item in bucket):
+        return
+    bucket.append(edge)
+
+
+def stable_edge_signature(edge: JsonDict) -> tuple:
+    return (
+        str(edge.get("from_ref") or ""),
+        str(edge.get("to_ref") or ""),
+        str(edge.get("relation") or ""),
+        str(edge.get("evidence_type") or ""),
+        tuple(str(item) for item in edge.get("evidence_refs") or []),
+        str(edge.get("inference_method") or ""),
+        str(edge.get("edge_origin") or ""),
+    )
+
+
+def string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    if value in (None, ""):
+        return []
+    return [str(value)]
+
+
+def normalized_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(1.0, confidence))
 
 
 def dedupe(items: Iterable[str]) -> List[str]:

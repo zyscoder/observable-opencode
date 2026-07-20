@@ -197,10 +197,20 @@ def build_turns(
             grouped[(session_id, message_id)].append(ref)
     output = []
     for index, ((session_id, message_id), refs) in enumerate(
-        sorted(grouped.items(), key=lambda item: min(positions[ref] for ref in item[1])),
+        sorted(
+            grouped.items(),
+            key=lambda item: turn_chronology_key(
+                nodes=nodes,
+                refs=item[1],
+                positions=positions,
+            ),
+        ),
         start=1,
     ):
-        ordered = sorted(refs, key=lambda item: positions[item])
+        ordered = sorted(
+            refs,
+            key=lambda item: record_chronology_key(nodes[item], positions[item]),
+        )
         output.append(
             {
                 "turn_id": f"turn_{index}",
@@ -224,6 +234,24 @@ def build_turns(
     for index, turn in enumerate(output):
         turn["previous_turn_ref"] = output[index - 1]["turn_id"] if index else ""
     return output
+
+
+def record_chronology_key(node: TraceNode, fallback_position: int) -> Tuple[int, str, int]:
+    timestamp = str(node.timestamp or "").strip()
+    if timestamp:
+        return (0, timestamp, fallback_position)
+    return (1, "", fallback_position)
+
+
+def turn_chronology_key(
+    *,
+    nodes: Dict[str, TraceNode],
+    refs: List[str],
+    positions: Dict[str, int],
+) -> Tuple[int, str, int]:
+    decision_refs = [ref for ref in refs if nodes[ref].event_type == "decision"]
+    candidates = decision_refs or refs
+    return min(record_chronology_key(nodes[ref], positions[ref]) for ref in candidates)
 
 
 def build_snapshots(*, nodes: Dict[str, TraceNode], identities: Dict[str, JsonDict]) -> List[JsonDict]:

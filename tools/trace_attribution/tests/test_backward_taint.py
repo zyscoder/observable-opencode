@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from trace_attribution.analyzer import BackwardTaintAnalyzer
+from trace_attribution.analyzer import BackwardTaintAnalyzer, semantic_episode_predecessors
 from trace_attribution import claude as claude_module
 from trace_attribution.claude import (
     ClaudeJudgeClient,
@@ -20,7 +20,9 @@ from trace_attribution.claude import (
     validate_judgment_payload,
     validate_root_confirmation_payload,
 )
-from trace_attribution.cli import lineage_output_path, parse_args
+from trace_attribution.cli import judge_cache_output_path, lineage_output_path, parse_args
+from trace_attribution.episodes import CausalEpisodeIndex
+from trace_attribution.errors import JudgeProviderUnavailable
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence, judgment_from_dict, stable_json
 from trace_attribution.models import TraceNode
@@ -106,6 +108,410 @@ def slow_worker(payload, result_queue):
 
 
 class TraceGraphTest(unittest.TestCase):
+    def test_preserves_normalized_causal_edge_semantics(self):
+        trace = {
+            "case_id": "edge-context-case",
+            "records": [
+                {
+                    "record_id": "evidence",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {"text": "The relevant test currently fails."},
+                },
+                {
+                    "record_id": "decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"rationale": "Change the implementation because the test fails."},
+                },
+                {
+                    "record_id": "source_only",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:evidence"],
+                    "data": {"rationale": "Use the recorded evidence."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "evidence"},
+                    "to": {"type": "record", "id": "decision"},
+                    "relation": "motivated_by_evidence",
+                    "evidence_type": "confirmed",
+                    "confidence": 0.97,
+                    "eligible_for_attribution": True,
+                    "inference_method": "recorded_dataflow",
+                }
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        edge = graph.edge_context("record:evidence", "record:decision")[0]
+        self.assertEqual(edge["relation"], "motivated_by_evidence")
+        self.assertEqual(edge["evidence_type"], "confirmed")
+        self.assertEqual(edge["confidence"], 0.97)
+        self.assertEqual(edge["inference_method"], "recorded_dataflow")
+        self.assertEqual(edge["edge_origin"], "trace.dataflow_edges")
+        source_edge = graph.edge_context("record:evidence", "record:source_only")[0]
+        self.assertEqual(source_edge["relation"], "record_source")
+        self.assertEqual(source_edge["edge_origin"], "record.source_refs")
+
+    def test_builds_structured_causal_judgment_context(self):
+        try:
+            from trace_attribution.judgment_context import build_causal_judgment_context
+        except ModuleNotFoundError as exc:
+            self.fail(f"judgment context module is missing: {exc}")
+        trace = {
+            "case_id": "judgment-context-case",
+            "records": [
+                {
+                    "record_id": "reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Keep searching before making any change.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:01.000Z",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "grep",
+                        "rationale": "Search one more location instead of implementing.",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_1",
+                        },
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "timestamp": "2026-07-17T10:30:00.000Z",
+                    "data": {
+                        "failure_type": "deadline_reached_with_empty_patch",
+                        "description": "The case ended with an empty patch.",
+                        "expected": "Implement and verify the requested change.",
+                        "actual": "No repository change was produced.",
+                        "scope": "task_delivery",
+                    },
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "reasoning"},
+                    "to": {"type": "record", "id": "action"},
+                    "relation": "reasoning_selected_action",
+                    "evidence_type": "confirmed",
+                    "confidence": 1.0,
+                    "eligible_for_attribution": True,
+                    "inference_method": "same_message_call_identity",
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        episode_index = CausalEpisodeIndex.from_graph(graph)
+        progress_ref = next(
+            ref
+            for ref, node in graph.nodes.items()
+            if node.event_type == "progress.episode" and "record:action" in node.data["member_refs"]
+        )
+        observed_judgment = NodeJudgment(
+            node_ref="record:observed",
+            component="evaluation",
+            event_type="case.observed_defect",
+            has_defect=True,
+            defect_status="present",
+            defect_type="empty_patch",
+            defect_reason="The requested implementation was not delivered.",
+            causal_role="defect_evidence",
+            branch_relation="same_defect",
+            confidence=0.98,
+        )
+
+        context = build_causal_judgment_context(
+            graph=graph,
+            node_ref="record:action",
+            path=["record:observed", progress_ref, "record:action"],
+            judgments={"record:observed": observed_judgment},
+            episode_index=episode_index,
+            objective="Implement and verify the requested change.",
+        )
+
+        self.assertEqual(context["active_defect"]["observed_ref"], "record:observed")
+        self.assertEqual(context["active_defect"]["expected"], "Implement and verify the requested change.")
+        self.assertEqual(context["active_defect"]["actual"], "No repository change was produced.")
+        self.assertEqual(context["active_defect"]["mechanism"], "deadline_reached_with_empty_patch")
+        self.assertEqual(context["outgoing_edges_on_active_path"][0]["to_ref"], progress_ref)
+        self.assertEqual(context["downstream_judgments"][0]["defect_type"], "empty_patch")
+        self.assertIn("record:action", context["causal_episode"]["member_refs"])
+        self.assertEqual(context["progress_episode"]["ref"], progress_ref)
+        self.assertIn("record:reasoning", context["progress_episode"]["member_refs"])
+        self.assertEqual(
+            context["progress_navigation_window"]["anchor_episode_ref"],
+            progress_ref,
+        )
+        self.assertIn(
+            "record:action",
+            context["progress_navigation_window"]["candidate_member_refs"],
+        )
+
+    def test_reconstructs_progress_episodes_and_projects_observed_defect(self):
+        trace = {
+            "case_id": "progress-reconstruction-case",
+            "records": [
+                {
+                    "record_id": "search_reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Search the installed package for a reference implementation.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "search_action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:01.000Z",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "grep",
+                        "rationale": "Search the installed package.",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_1",
+                        },
+                    },
+                },
+                {
+                    "record_id": "search_result",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "timestamp": "2026-07-17T10:00:02.000Z",
+                    "data": {
+                        "tool_name": "grep",
+                        "call_id": "call_1",
+                        "output": "No separate installation exists.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "repeat_reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:01:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Check the installed package again before implementing.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_2"},
+                    },
+                },
+                {
+                    "record_id": "repeat_action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:01:01.000Z",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "bash",
+                        "rationale": "Run pip show for the same package.",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_2",
+                            "callID": "call_2",
+                        },
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "timestamp": "2026-07-17T10:30:00.000Z",
+                    "source_refs": ["record:lifecycle_only"],
+                    "data": {
+                        "failure_type": "deadline_reached_with_empty_patch",
+                        "description": "The case ended with an empty patch.",
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        episode_refs = [ref for ref, node in graph.nodes.items() if node.event_type == "progress.episode"]
+
+        self.assertEqual(len(episode_refs), 2)
+        first, second = episode_refs
+        self.assertIn("record:search_reasoning", graph.upstream_refs(first))
+        self.assertIn("record:repeat_reasoning", graph.upstream_refs(second))
+        self.assertIn(first, graph.upstream_refs(second))
+        self.assertIn(second, graph.upstream_refs("record:observed"))
+        self.assertTrue(graph.nodes[second].data["offline_only"])
+        self.assertEqual(graph.nodes[second].data["behavior_impact"], "none")
+        self.assertEqual(graph.nodes[second].data["consecutive_no_delivery_episodes"], 2)
+
+    def test_projects_final_response_to_latest_prior_progress_episode(self):
+        trace = {
+            "case_id": "response-progress-projection-case",
+            "records": [
+                {
+                    "record_id": "reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Cancel every task a second time after gather is interrupted.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:00:01.000Z",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "write",
+                        "metadata": {
+                            "sessionID": "ses_1",
+                            "messageID": "msg_1",
+                            "callID": "call_1",
+                        },
+                    },
+                },
+                {
+                    "record_id": "final_output",
+                    "component": "result",
+                    "event_type": "response.output",
+                    "timestamp": "2026-07-17T10:00:05.000Z",
+                    "data": {
+                        "text": "All asynchronous cleanup always completes.",
+                        "is_final_for_case": True,
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        episode_ref = next(ref for ref, node in graph.nodes.items() if node.event_type == "progress.episode")
+
+        self.assertIn(episode_ref, graph.upstream_refs("record:final_output"))
+        self.assertNotIn("record:final_output", graph.upstream_refs(episode_ref))
+
+    def test_orders_progress_episodes_by_timestamp_not_record_insertion(self):
+        trace = {
+            "case_id": "out-of-order-progress-case",
+            "records": [
+                {
+                    "record_id": "late_turn_old_context",
+                    "component": "context",
+                    "event_type": "context.compaction_check",
+                    "timestamp": "2026-07-17T09:00:00.000Z",
+                    "data": {
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_2"},
+                    },
+                },
+                {
+                    "record_id": "late_reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:02:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_2"},
+                    },
+                },
+                {
+                    "record_id": "early_reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:01:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "data": {"failure_type": "empty_patch"},
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        episodes = [node for node in graph.nodes.values() if node.event_type == "progress.episode"]
+
+        self.assertEqual(episodes[0].data["member_refs"], ["record:early_reasoning"])
+        self.assertEqual(episodes[1].data["member_refs"], ["record:late_reasoning"])
+        self.assertEqual(episodes[1].data["previous_episode_ref"], episodes[0].ref)
+        self.assertIn(episodes[1].ref, graph.upstream_refs("record:observed"))
+
+    def test_progress_episode_separates_full_members_from_judgment_candidates(self):
+        trace = {
+            "case_id": "progress-candidate-case",
+            "records": [
+                {
+                    "record_id": "reasoning",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "The interface is understood; decide whether to implement.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "search_action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "grep",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "write_action",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "llm_tool_call",
+                        "chosen_action": "write",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+        episode = next(node for node in graph.nodes.values() if node.event_type == "progress.episode")
+
+        self.assertEqual(
+            episode.data["member_refs"],
+            ["record:reasoning", "record:search_action", "record:write_action"],
+        )
+        self.assertEqual(
+            episode.data["candidate_member_refs"],
+            ["record:reasoning", "record:write_action"],
+        )
+        self.assertEqual(episode.data["excluded_member_refs"], ["record:search_action"])
+        self.assertEqual(episode.data["candidate_selection_method"], "offline_semantic_role_projection_v1")
+
     def test_reconstructs_same_message_reasoning_before_action_decision(self):
         trace = {
             "case_id": "same-message-lineage-case",
@@ -905,6 +1311,396 @@ class TraceGraphTest(unittest.TestCase):
 
 
 class BackwardTaintAnalyzerTest(unittest.TestCase):
+    def test_reports_judge_cache_and_provider_circuit_metrics(self):
+        class MetricsJudge(FakeJudge):
+            model = "metrics-model"
+            request_count = 4
+            timeout_seconds = 3600
+            thinking_mode = "disabled"
+            thinking_config = {"type": "disabled"}
+            cache_stats = {
+                "enabled": True,
+                "path": "/tmp/judge-cache.jsonl",
+                "loaded_entries": 3,
+                "hits": 2,
+                "misses": 1,
+                "writes": 1,
+                "corrupt_entries": 0,
+            }
+            provider_circuit_stats = {
+                "threshold": 3,
+                "consecutive_errors": 0,
+                "open": False,
+                "reason": "",
+            }
+
+        report = BackwardTaintAnalyzer(judge=MetricsJudge({})).analyze(
+            TraceGraph.from_trace(
+                {
+                    "case_id": "judge-metrics-case",
+                    "records": [
+                        {
+                            "record_id": "response",
+                            "component": "result",
+                            "event_type": "response.output",
+                            "data": {"text": "Completed."},
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertEqual(report.metadata["judge_cache"]["hits"], 2)
+        self.assertEqual(report.metadata["judge_cache"]["writes"], 1)
+        self.assertEqual(report.metadata["provider_circuit"]["threshold"], 3)
+        self.assertFalse(report.metadata["provider_circuit"]["open"])
+
+    def test_stops_branch_when_provider_circuit_opens(self):
+        try:
+            from trace_attribution.errors import JudgeProviderUnavailable
+        except ModuleNotFoundError as exc:
+            self.fail(f"provider error module is missing: {exc}")
+
+        class CircuitJudge(FakeJudge):
+            def __init__(self):
+                super().__init__({})
+                self.calls = []
+
+            def judge_node(self, *, node, upstream_nodes, downstream_context, objective):
+                self.calls.append(node.ref)
+                if len(self.calls) == 3:
+                    raise JudgeProviderUnavailable("provider circuit opened")
+                upstream_ref = node.source_refs[0] if node.source_refs else ""
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="propagated_plan_defect",
+                    defect_reason="The same plan defect is present in the upstream decision.",
+                    causal_role="defect_propagation",
+                    influenced_by=(
+                        [
+                            TaintInfluence(
+                                upstream_ref=upstream_ref,
+                                reason="The upstream decision already contains the same defect.",
+                                relation="defect_propagated_from",
+                                confidence=1.0,
+                            )
+                        ]
+                        if upstream_ref
+                        else []
+                    ),
+                    confidence=0.9,
+                )
+
+        trace = {
+            "case_id": "provider-circuit-case",
+            "records": [
+                {
+                    "record_id": "n0",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"rationale": "Earliest decision."},
+                },
+                {
+                    "record_id": "n1",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:n0"],
+                    "data": {"rationale": "First upstream decision."},
+                },
+                {
+                    "record_id": "n2",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:n1"],
+                    "data": {"rationale": "Second upstream decision."},
+                },
+                {
+                    "record_id": "n3",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "source_refs": ["record:n2"],
+                    "data": {"rationale": "Latest decision."},
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:n3"],
+                    "data": {"failure_type": "bad_result"},
+                },
+            ],
+        }
+        judge = CircuitJudge()
+
+        report = BackwardTaintAnalyzer(judge=judge, max_depth=8, max_nodes=16).analyze(
+            TraceGraph.from_trace(trace)
+        )
+
+        branch = report.defect_branches[0]
+        self.assertEqual(branch.metadata["termination_reason"], "provider_unavailable")
+        self.assertTrue(branch.metadata["provider_unavailable"])
+        self.assertEqual(judge.calls, ["record:n3", "record:n2", "record:n1"])
+        self.assertNotIn("record:n0", report.visited_order)
+        self.assertIn("record:n1", branch.unresolved_refs)
+        self.assertNotIn("record:n1", branch.node_judgments)
+
+    def test_progress_navigation_collapses_no_delivery_turns_without_losing_candidates(self):
+        def decision(record_id, message_id, *, rationale="", action=""):
+            data = {
+                "decision_type": "llm_tool_call" if action else "reasoning_block",
+                "rationale": rationale,
+                "metadata": {"sessionID": "ses_1", "messageID": message_id},
+            }
+            if action:
+                data["chosen_action"] = action
+            return {
+                "record_id": record_id,
+                "component": "processor",
+                "event_type": "decision",
+                "timestamp": f"2026-07-17T10:00:0{message_id[-1]}.000Z",
+                "data": data,
+            }
+
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "progress-window-case",
+                "records": [
+                    decision("before_delivery", "msg_1", rationale="Understand the requirement."),
+                    decision("delivery", "msg_2", rationale="Edit the implementation.", action="edit"),
+                    decision("reason_after", "msg_3", rationale="Inspect the remaining failure."),
+                    decision("search_after", "msg_4", rationale="Search another location.", action="grep"),
+                    decision("reason_latest", "msg_5", rationale="Continue searching without a new patch."),
+                ],
+            }
+        )
+        episodes = sorted(
+            (node for node in graph.nodes.values() if node.event_type == "progress.episode"),
+            key=lambda node: node.data["chronology_index"],
+        )
+        latest = episodes[-1]
+        delivery_episode = next(
+            node for node in episodes if "record:delivery" in node.data["member_refs"]
+        )
+
+        predecessors = semantic_episode_predecessors(
+            graph,
+            CausalEpisodeIndex.from_graph(graph),
+            latest.ref,
+        )
+
+        self.assertIn("record:reason_after", predecessors)
+        self.assertIn("record:search_after", predecessors)
+        self.assertIn("record:reason_latest", predecessors)
+        self.assertIn(delivery_episode.ref, predecessors)
+        self.assertNotIn(episodes[-2].ref, predecessors)
+
+        from trace_attribution.judgment_context import build_causal_judgment_context
+
+        window_member_context = build_causal_judgment_context(
+            graph=graph,
+            node_ref="record:reason_after",
+            path=[latest.ref, "record:reason_after"],
+            judgments={},
+            episode_index=CausalEpisodeIndex.from_graph(graph),
+            objective="Find why delivery stalled.",
+        )
+        direct_member_context = build_causal_judgment_context(
+            graph=graph,
+            node_ref="record:reason_latest",
+            path=[latest.ref, "record:reason_latest"],
+            judgments={},
+            episode_index=CausalEpisodeIndex.from_graph(graph),
+            objective="Find why delivery stalled.",
+        )
+
+        self.assertEqual(
+            window_member_context["outgoing_edges_on_active_path"][0]["relation"],
+            "progress_window_member",
+        )
+        self.assertEqual(
+            direct_member_context["outgoing_edges_on_active_path"][0]["relation"],
+            "progress_episode_member",
+        )
+
+    def test_passes_structured_context_to_context_aware_judge(self):
+        class ContextAwareJudge(FakeJudge):
+            def __init__(self):
+                super().__init__({})
+                self.contexts = {}
+
+            def judge_node_with_context(
+                self,
+                *,
+                node,
+                upstream_nodes,
+                downstream_context,
+                objective,
+                judgment_context,
+            ):
+                self.contexts[node.ref] = judgment_context
+                return self.judge_node(
+                    node=node,
+                    upstream_nodes=upstream_nodes,
+                    downstream_context=downstream_context,
+                    objective=objective,
+                )
+
+        graph = TraceGraph.from_trace(sample_trace())
+        judge = ContextAwareJudge()
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(
+            graph,
+            start_refs=["record:claim_bad"],
+            objective="Return a truthful final implementation summary.",
+        )
+
+        context = judge.contexts["record:claim_bad"]
+        self.assertEqual(context["current_ref"], "record:claim_bad")
+        self.assertEqual(context["active_defect"]["observed_ref"], "record:claim_bad")
+        self.assertTrue(context["incoming_edges"])
+        self.assertEqual(context["behavior_impact"], "none_offline_analysis_only")
+        recorded = report.defect_branches[0].metadata["judgment_contexts"]["record:claim_bad"]
+        self.assertEqual(recorded["active_defect"]["fingerprint"], context["active_defect"]["fingerprint"])
+        self.assertEqual(recorded["context_manifest"], context["context_manifest"])
+
+    def test_progress_episode_expands_to_concrete_decision_and_is_not_a_root(self):
+        trace = {
+            "case_id": "progress-traversal-case",
+            "records": [
+                {
+                    "record_id": "wrong_plan",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Keep searching instead of implementing the requested change.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+                    },
+                },
+                {
+                    "record_id": "later_plan",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-17T10:01:00.000Z",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Report that no implementation was completed.",
+                        "metadata": {"sessionID": "ses_1", "messageID": "msg_2"},
+                    },
+                },
+                {
+                    "record_id": "shutdown",
+                    "component": "lifecycle",
+                    "event_type": "lifecycle.signal",
+                    "timestamp": "2026-07-17T10:02:00.000Z",
+                    "data": {"signal": "SIGTERM"},
+                },
+                {
+                    "record_id": "observed",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:shutdown"],
+                    "data": {"failure_type": "deadline_reached_with_empty_patch"},
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        episode_refs = [ref for ref, node in graph.nodes.items() if node.event_type == "progress.episode"]
+        judge = FakeJudge(
+            {
+                episode_refs[-1]: NodeJudgment(
+                    node_ref=episode_refs[-1],
+                    component="progress",
+                    event_type="progress.episode",
+                    has_defect=True,
+                    defect_type="no_delivery_progress",
+                    defect_reason="The aggregate records a no-delivery episode.",
+                    causal_role="defect_introduction",
+                    is_root_cause=True,
+                ),
+                "record:wrong_plan": NodeJudgment(
+                    node_ref="record:wrong_plan",
+                    component="processor",
+                    event_type="decision",
+                    has_defect=True,
+                    defect_type="abandoned_implementation",
+                    defect_reason="The plan explicitly chooses continued search over implementation.",
+                    causal_role="defect_introduction",
+                    is_root_cause=True,
+                    confidence=0.9,
+                ),
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(graph)
+
+        self.assertIn(episode_refs[-1], report.visited_order)
+        self.assertNotIn(episode_refs[0], report.visited_order)
+        self.assertIn("record:wrong_plan", report.visited_order)
+        self.assertNotIn("record:shutdown", report.visited_order)
+        self.assertEqual([root.node_ref for root in report.root_causes], ["record:wrong_plan"])
+        latest_context = report.defect_branches[0].metadata["judgment_contexts"][episode_refs[-1]]
+        self.assertEqual(
+            latest_context["progress_navigation_window"]["member_episode_refs"],
+            episode_refs,
+        )
+
+    def test_uses_optional_judge_to_validate_evaluation_assertion(self):
+        class EvaluationAwareJudge(FakeJudge):
+            def __init__(self):
+                super().__init__({})
+                self.evaluation_calls = []
+                self.model = "evaluation-aware-test-model"
+                self.request_count = 1
+
+            def judge_evaluation_assertion(
+                self, *, node, upstream_nodes, downstream_context, objective
+            ):
+                self.evaluation_calls.append(node.ref)
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_status="absent",
+                    defect_reason="The supplied successful verification contradicts the asserted gap.",
+                    causal_role="non_defective",
+                    branch_relation="unrelated",
+                    confidence=0.95,
+                )
+
+        trace = {
+            "case_id": "evaluation-validation-case",
+            "records": [
+                {
+                    "record_id": "passing_verification",
+                    "component": "verification",
+                    "event_type": "verification",
+                    "data": {"status": "passed", "exit_code": 0},
+                },
+                {
+                    "record_id": "quality_gap",
+                    "component": "evaluation",
+                    "event_type": "case.quality_gap",
+                    "source_refs": ["record:passing_verification"],
+                    "data": {"dimension": "implementation_correctness"},
+                },
+            ],
+        }
+        judge = EvaluationAwareJudge()
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
+
+        self.assertEqual(judge.evaluation_calls, ["record:quality_gap"])
+        self.assertEqual(report.node_judgments["record:quality_gap"].defect_status, "absent")
+        self.assertEqual(report.metadata["analysis_outcome"], "no_defect")
+        self.assertEqual(report.metadata["judge_model"], "evaluation-aware-test-model")
+        self.assertEqual(report.metadata["judge_request_count"], 1)
+
     def test_judges_shared_node_independently_for_each_observed_defect(self):
         class BranchJudge(FakeJudge):
             def __init__(self):
@@ -1209,7 +2005,11 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
 
         report = BackwardTaintAnalyzer(judge=judge).analyze(TraceGraph.from_trace(trace))
 
-        self.assertEqual(judge.calls[0], "record:change")
+        self.assertEqual(
+            TraceGraph.from_trace(trace).nodes[judge.calls[0]].event_type,
+            "progress.episode",
+        )
+        self.assertIn("record:change", judge.calls)
         self.assertIn("record:reasoning", judge.calls)
         self.assertIn("record:action", judge.calls)
         self.assertNotIn("record:tool_call", judge.calls)
@@ -2750,8 +3550,76 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
                 for fragment in expected_fragments:
                     self.assertIn(fragment, judgment.defect_reason)
 
+    def test_provider_circuit_during_root_confirmation_preserves_preliminary_judgment(self):
+        class ConfirmationCircuitJudge(FakeJudge):
+            def confirm_root(self, *, node, judgment, downstream_context, objective):
+                raise JudgeProviderUnavailable("provider circuit opened during root confirmation")
+
+        root_ref = "record:change_bad"
+        judge = ConfirmationCircuitJudge(
+            {
+                root_ref: NodeJudgment(
+                    node_ref=root_ref,
+                    component="tool",
+                    event_type="change",
+                    defect_status="present",
+                    has_defect=True,
+                    defect_type="wrong_discount_change",
+                    defect_reason="The authored change introduced the wrong discount behavior.",
+                    causal_role="defect_introduction",
+                    branch_relation="same_defect",
+                    is_root_cause=True,
+                    confidence=0.9,
+                )
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge, max_depth=4).analyze(
+            TraceGraph.from_trace(sample_trace()),
+            start_refs=[root_ref],
+            objective="Find why the discount change is wrong.",
+        )
+
+        self.assertEqual(report.root_causes, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
+        self.assertEqual(report.metadata["termination_reason"], "provider_unavailable")
+        self.assertEqual(report.metadata["judge_error_count"], 1)
+        self.assertEqual(
+            report.metadata["judge_errors"][0]["stage"],
+            "root_confirmation_provider_circuit_open",
+        )
+        self.assertEqual(report.node_judgments[root_ref].defect_status, "present")
+        self.assertEqual(report.node_judgments[root_ref].causal_role, "defect_introduction")
+
 
 class NodeJudgmentTest(unittest.TestCase):
+    def test_decision_compaction_preserves_authored_semantics_before_context_collections(self):
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "reasoning_block",
+                "chosen_action": "search_installed_package",
+                "intent": "model requested repository exploration",
+                "rationale": (
+                    "The missing interfaces are already understood, but I will search the installed "
+                    "package for an unavailable reference implementation before writing code."
+                ),
+                "selected_context_refs": [f"record:context_{index}" for index in range(200)],
+                "message_transforms": [{"name": "transform", "payload": "x" * 4000}],
+                "hydrated_artifacts": [{"content": "y" * 16000}],
+            },
+        )
+
+        compacted = node.compact(max_chars=1600)
+
+        self.assertTrue(compacted["truncated"])
+        self.assertEqual(compacted["data"]["decision_type"], "reasoning_block")
+        self.assertEqual(compacted["data"]["chosen_action"], "search_installed_package")
+        self.assertIn("missing interfaces are already understood", compacted["data"]["rationale"])
+
     def test_missing_defect_boolean_is_unknown(self):
         node = TraceNode(ref="record:test", record_id="test", component="result", event_type="response.claim")
 
@@ -2772,7 +3640,410 @@ class NodeJudgmentTest(unittest.TestCase):
         self.assertFalse(absent.has_defect)
 
 
+class JudgmentCacheTest(unittest.TestCase):
+    def test_persists_judgment_and_recovers_after_corrupt_tail(self):
+        try:
+            from trace_attribution.cache import JudgmentCache
+        except ModuleNotFoundError as exc:
+            self.fail(f"judgment cache module is missing: {exc}")
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="processor",
+            event_type="decision",
+        )
+        judgment = NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_status="present",
+            defect_type="wrong_plan",
+            defect_reason="The plan abandons the required implementation.",
+            causal_role="defect_introduction",
+            is_root_cause=True,
+            confidence=0.91,
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache_path = Path(tempdir) / "judge-cache.jsonl"
+            cache = JudgmentCache(cache_path)
+            cache.put(
+                key="cache-key",
+                stage="node_judgment",
+                model="test-model",
+                node=node,
+                judgment=judgment,
+            )
+            with cache_path.open("a", encoding="utf-8") as handle:
+                handle.write("{corrupt-tail\n")
+
+            reopened = JudgmentCache(cache_path)
+            restored = reopened.get(key="cache-key", node=node)
+
+        self.assertEqual(restored, judgment)
+        self.assertEqual(reopened.stats()["loaded_entries"], 1)
+        self.assertEqual(reopened.stats()["corrupt_entries"], 1)
+        self.assertEqual(reopened.stats()["hits"], 1)
+
+    def test_cache_key_changes_with_request_semantics(self):
+        try:
+            from trace_attribution.cache import build_judge_cache_key
+        except ModuleNotFoundError as exc:
+            self.fail(f"judgment cache module is missing: {exc}")
+        base = {
+            "stage": "node_judgment",
+            "model": "test-model",
+            "system": "judge system",
+            "messages": [{"role": "user", "content": "objective A"}],
+            "max_tokens": 1024,
+            "thinking_config": None,
+            "prompt_schema_version": "causal-judge-v1",
+        }
+
+        key = build_judge_cache_key(**base)
+
+        for field, changed in (
+            ("model", "other-model"),
+            ("messages", [{"role": "user", "content": "objective B"}]),
+            ("prompt_schema_version", "causal-judge-v2"),
+        ):
+            with self.subTest(field=field):
+                candidate = dict(base)
+                candidate[field] = changed
+                self.assertNotEqual(key, build_judge_cache_key(**candidate))
+
+
 class ClaudeJudgeClientTest(unittest.TestCase):
+    def test_provider_circuit_opens_after_three_consecutive_connection_errors(self):
+        try:
+            from trace_attribution.errors import JudgeProviderError, JudgeProviderUnavailable
+        except ModuleNotFoundError as exc:
+            self.fail(f"provider error module is missing: {exc}")
+
+        class FailingMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                raise ConnectionError("provider connection dropped")
+
+        messages = FailingMessages()
+        client = object.__new__(ClaudeJudgeClient)
+        client.timeout_seconds = None
+        client.thinking_config = None
+        client.model = "test-model"
+        client.client = types.SimpleNamespace(messages=messages)
+        client.request_count = 0
+        client.provider_error_threshold = 3
+        client.consecutive_provider_errors = 0
+        client.provider_circuit_open = False
+
+        with self.assertRaises(JudgeProviderError):
+            client._create_message_text(system="system", messages=[], max_tokens=8)
+        with self.assertRaises(JudgeProviderError):
+            client._create_message_text(system="system", messages=[], max_tokens=8)
+        with self.assertRaises(JudgeProviderUnavailable):
+            client._create_message_text(system="system", messages=[], max_tokens=8)
+        with self.assertRaises(JudgeProviderUnavailable):
+            client._create_message_text(system="system", messages=[], max_tokens=8)
+
+        self.assertEqual(messages.calls, 3)
+        self.assertEqual(client.request_count, 3)
+        self.assertTrue(client.provider_circuit_open)
+
+    def test_successful_request_resets_consecutive_provider_errors(self):
+        class SuccessfulMessages:
+            def create(self, **kwargs):
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text="ok")])
+
+        client = object.__new__(ClaudeJudgeClient)
+        client.timeout_seconds = None
+        client.thinking_config = None
+        client.model = "test-model"
+        client.client = types.SimpleNamespace(messages=SuccessfulMessages())
+        client.request_count = 0
+        client.provider_error_threshold = 3
+        client.consecutive_provider_errors = 2
+        client.provider_circuit_open = False
+
+        text = client._create_message_text(system="system", messages=[], max_tokens=8)
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.consecutive_provider_errors, 0)
+        self.assertFalse(client.provider_circuit_open)
+
+    def test_reuses_cached_node_judgment_without_second_provider_request(self):
+        from trace_attribution.cache import JudgmentCache
+
+        payload = {
+            "node_ref": "record:decision",
+            "component": "processor",
+            "event_type": "decision",
+            "defect_status": "absent",
+            "has_defect": False,
+            "defect_type": "",
+            "defect_reason": "The decision is consistent with the task objective.",
+            "causal_role": "non_defective",
+            "branch_relation": "unrelated",
+            "influenced_by": [],
+            "is_root_cause": False,
+            "severity": "low",
+            "confidence": 0.95,
+            "model_notes": "",
+        }
+
+        class FakeMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(
+                    content=[types.SimpleNamespace(text=json.dumps(payload))]
+                )
+
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="processor",
+            event_type="decision",
+            data={"rationale": "Implement the requested behavior."},
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            messages = FakeMessages()
+            client = object.__new__(ClaudeJudgeClient)
+            client.timeout_seconds = None
+            client.thinking_config = None
+            client.model = "test-model"
+            client.client = types.SimpleNamespace(messages=messages)
+            client.max_tokens = 4096
+            client.repair_max_tokens = 1024
+            client.request_count = 0
+            client.cache = JudgmentCache(Path(tempdir) / "judge-cache.jsonl")
+
+            first = client.judge_node(
+                node=node,
+                upstream_nodes=[],
+                downstream_context=["record:observed event_type=case.observed_defect"],
+                objective="Implement the requested behavior.",
+            )
+            second = client.judge_node(
+                node=node,
+                upstream_nodes=[],
+                downstream_context=["record:observed event_type=case.observed_defect"],
+                objective="Implement the requested behavior.",
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(messages.calls, 1)
+        self.assertEqual(client.request_count, 1)
+        self.assertEqual(client.cache.stats()["hits"], 1)
+        self.assertEqual(client.cache.stats()["writes"], 1)
+
+    def test_reuses_cached_root_confirmation(self):
+        from trace_attribution.cache import JudgmentCache
+
+        payload = {
+            "node_ref": "record:action",
+            "confirmation": "confirmed",
+            "exact_semantic_excerpt": "Skip the required implementation.",
+            "current_node_would_cause_defect_if_executed_exactly": True,
+            "reason": "The action explicitly skips the required implementation.",
+            "confidence": 0.94,
+        }
+
+        class FakeMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(
+                    content=[types.SimpleNamespace(text=json.dumps(payload))]
+                )
+
+        node = TraceNode(
+            ref="record:action",
+            record_id="action",
+            component="processor",
+            event_type="decision",
+            data={"rationale": "Skip the required implementation."},
+        )
+        judgment = NodeJudgment(
+            node_ref=node.ref,
+            component=node.component,
+            event_type=node.event_type,
+            has_defect=True,
+            defect_status="present",
+            defect_type="skipped_implementation",
+            defect_reason="The action skips required work.",
+            causal_role="defect_introduction",
+            is_root_cause=True,
+            confidence=0.9,
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            messages = FakeMessages()
+            client = object.__new__(ClaudeJudgeClient)
+            client.timeout_seconds = None
+            client.thinking_config = None
+            client.model = "test-model"
+            client.client = types.SimpleNamespace(messages=messages)
+            client.max_tokens = 4096
+            client.repair_max_tokens = 1024
+            client.request_count = 0
+            client.cache = JudgmentCache(Path(tempdir) / "judge-cache.jsonl")
+
+            first = client.confirm_root(
+                node=node,
+                judgment=judgment,
+                downstream_context=["record:observed event_type=case.observed_defect"],
+                objective="Implement the requested behavior.",
+            )
+            second = client.confirm_root(
+                node=node,
+                judgment=judgment,
+                downstream_context=["record:observed event_type=case.observed_defect"],
+                objective="Implement the requested behavior.",
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(messages.calls, 1)
+        self.assertEqual(client.cache.stats()["hits"], 1)
+        self.assertEqual(client.cache.stats()["writes"], 1)
+
+    def test_judgment_prompt_includes_structured_causal_context(self):
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="processor",
+            event_type="decision",
+            data={"rationale": "Keep searching instead of implementing."},
+        )
+        judgment_context = {
+            "context_version": "1.0",
+            "active_defect": {
+                "fingerprint": "defect-123",
+                "expected": "Implement the change.",
+                "actual": "No change was produced.",
+                "mechanism": "empty_patch",
+            },
+            "incoming_edges": [
+                {
+                    "from_ref": "record:evidence",
+                    "to_ref": "record:decision",
+                    "relation": "motivated_by_evidence",
+                    "evidence_type": "confirmed",
+                    "confidence": 1.0,
+                }
+            ],
+            "downstream_judgments": [
+                {
+                    "node_ref": "record:observed",
+                    "defect_status": "present",
+                    "causal_role": "defect_evidence",
+                }
+            ],
+        }
+
+        prompt = json.loads(
+            build_judgment_prompt(
+                node=node,
+                upstream_nodes=[],
+                downstream_context=["record:observed event_type=case.observed_defect"],
+                objective="Find the root cause.",
+                judgment_context=judgment_context,
+            )
+        )
+
+        self.assertEqual(prompt["causal_judgment_context"]["active_defect"]["fingerprint"], "defect-123")
+        self.assertEqual(
+            prompt["causal_judgment_context"]["incoming_edges"][0]["relation"],
+            "motivated_by_evidence",
+        )
+        self.assertIn(
+            "Treat causal_judgment_context edge relations as recorded provenance",
+            prompt["rules"],
+        )
+
+    def test_evaluation_assertion_reuses_node_judgment_pipeline(self):
+        client = object.__new__(ClaudeJudgeClient)
+        expected = NodeJudgment(
+            node_ref="record:gap",
+            component="evaluation",
+            event_type="case.quality_gap",
+            has_defect=False,
+            defect_status="absent",
+            defect_reason="The assertion is contradicted by the supplied facts.",
+        )
+        client.judge_node = mock.Mock(return_value=expected)
+        node = TraceNode(
+            ref="record:gap",
+            record_id="gap",
+            component="evaluation",
+            event_type="case.quality_gap",
+        )
+
+        actual = client.judge_evaluation_assertion(
+            node=node,
+            upstream_nodes=[],
+            downstream_context=["record:gap"],
+            objective="Validate the asserted quality gap.",
+        )
+
+        self.assertIs(actual, expected)
+        client.judge_node.assert_called_once()
+
+    def test_counts_each_actual_model_request(self):
+        class FakeMessages:
+            def create(self, **kwargs):
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text="ok")])
+
+        client = object.__new__(ClaudeJudgeClient)
+        client.timeout_seconds = None
+        client.thinking_config = None
+        client.model = "fake-model"
+        client.client = types.SimpleNamespace(messages=FakeMessages())
+        client.request_count = 0
+
+        text = client._create_message_text(
+            system="system",
+            messages=[{"role": "user", "content": "prompt"}],
+            max_tokens=8,
+        )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.request_count, 1)
+
+    def test_rejects_offline_progress_aggregate_as_root_cause(self):
+        node = TraceNode(
+            ref="progress_episode:progress_1",
+            record_id="progress_1",
+            component="progress",
+            event_type="progress.episode",
+            data={"offline_only": True},
+        )
+
+        with self.assertRaisesRegex(ValueError, "progress episode"):
+            validate_judgment_payload(
+                {
+                    "node_ref": node.ref,
+                    "component": node.component,
+                    "event_type": node.event_type,
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "no_delivery_progress",
+                    "defect_reason": "The aggregate summarizes no delivery progress.",
+                    "causal_role": "defect_introduction",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [],
+                    "is_root_cause": True,
+                    "confidence": 0.9,
+                },
+                node=node,
+                allowed_upstream_refs=set(),
+            )
+
     def test_cli_derives_lineage_output_next_to_attribution_report(self):
         self.assertEqual(
             lineage_output_path(Path("/tmp/result.json"), ""),
@@ -2923,6 +4194,42 @@ class ClaudeJudgeClientTest(unittest.TestCase):
                 allowed_upstream_refs={"record:environment_failure"},
             )
 
+    def test_rejects_decision_propagation_from_duplicate_llm_generation_envelope(self):
+        node = TraceNode(
+            ref="record:decision",
+            record_id="decision",
+            component="processor",
+            event_type="decision",
+            data={"decision_type": "reasoning_block"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "generation envelope"):
+            validate_judgment_payload(
+                {
+                    "node_ref": node.ref,
+                    "component": node.component,
+                    "event_type": node.event_type,
+                    "defect_status": "present",
+                    "has_defect": True,
+                    "defect_type": "excessive_exploration",
+                    "defect_reason": "The decision continues exploring after understanding the task.",
+                    "causal_role": "defect_propagation",
+                    "branch_relation": "same_defect",
+                    "influenced_by": [
+                        {
+                            "upstream_ref": "record:llm_call",
+                            "reason": "The LLM call produced the reasoning that already exhibited excessive exploration.",
+                            "relation": "defect_propagated_from",
+                            "confidence": 0.8,
+                        }
+                    ],
+                    "is_root_cause": False,
+                    "confidence": 0.9,
+                },
+                node=node,
+                allowed_upstream_refs={"record:llm_call"},
+            )
+
     def test_rejects_influence_ref_outside_supplied_upstream_nodes(self):
         with self.assertRaisesRegex(ValueError, "not in the supplied upstream node set"):
             validate_judgment_payload(
@@ -3055,6 +4362,32 @@ class ClaudeJudgeClientTest(unittest.TestCase):
 
         self.assertEqual(args.judge_timeout_sec, 60 * 60)
 
+    def test_cli_exposes_default_resume_cache_and_provider_threshold(self):
+        args = parse_args(["--trace", "trace.json", "--out", "/tmp/case.attribution.json"])
+        explicit = parse_args(
+            [
+                "--trace",
+                "trace.json",
+                "--out",
+                "/tmp/case.attribution.json",
+                "--judge-cache",
+                "/tmp/shared-cache.jsonl",
+                "--provider-error-threshold",
+                "5",
+            ]
+        )
+
+        self.assertEqual(
+            judge_cache_output_path(Path(args.out), args.judge_cache),
+            Path("/tmp/case.attribution.judge-cache.jsonl"),
+        )
+        self.assertEqual(args.provider_error_threshold, 3)
+        self.assertEqual(
+            judge_cache_output_path(Path(explicit.out), explicit.judge_cache),
+            Path("/tmp/shared-cache.jsonl"),
+        )
+        self.assertEqual(explicit.provider_error_threshold, 5)
+
     def test_call_with_wall_timeout_raises_timeout_error(self):
         started = time.time()
 
@@ -3175,6 +4508,9 @@ class ClaudeJudgeClientTest(unittest.TestCase):
         self.assertIn("evaluate answer quality only", rules)
         self.assertIn("pre-existing requirement/code conflict", rules)
         self.assertIn("does not make the response node defective", rules)
+        self.assertIn("repository problem or missing implementation is a task precondition", rules)
+        self.assertIn("failure to act, repeated exploration, or empty-patch defect", rules)
+        self.assertIn("rationale and executable arguments over generic orchestration labels", rules)
 
     def test_judgment_prompt_identifies_authored_action_semantics(self):
         prompt = build_judgment_prompt(

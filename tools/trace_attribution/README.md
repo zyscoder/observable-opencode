@@ -66,6 +66,14 @@ The analyzer also reconstructs agent turns and message-context lineage from exis
 records and artifact payloads. Reconstruction is an offline passive sidecar: it does not
 replay requests, modify trace input, or feed findings back into the agent.
 
+The same offline pass reconstructs `progress.episode` nodes from task-semantic turn members.
+Episodes are ordered by decision timestamps, linked to the previous episode, and projected onto
+later evaluation/final-response nodes. Each episode preserves every member for audit while exposing
+a smaller `candidate_member_refs` set for LLM judgment. The candidate projection prioritizes
+reasoning, authored actions, mutations, verification, delegation, MCP/skill activity, and errors;
+excluded members remain in the report and source Trace unchanged. Progress episodes are navigation
+aggregates and can never be reported as root causes.
+
 ## Install
 
 ```bash
@@ -99,8 +107,10 @@ Optional:
 --review /tmp/observable-opencode-loop-auto/reports/tool-failure-hallucination.trace-review.json
 --start-ref record:responseclaim_claim_147_e7906af6
 --base-url https://api.deepseek.com/anthropic
+--judge-cache /tmp/observable-opencode-attribution/tool-failure.judge-cache.jsonl
 --judge-max-tokens 4096
 --judge-timeout-sec 3600
+--provider-error-threshold 3
 --thinking-mode auto
 --lineage-out /tmp/observable-opencode-attribution/message-lineage.json
 --max-depth 8
@@ -118,6 +128,26 @@ worth the additional latency and token cost.
 large or difficult branch from consuming the search budget needed to analyze other observed
 defects.
 
+## Resumable Judge Runs
+
+Every CLI run durably checkpoints validated node judgments and root confirmations. When
+`--judge-cache` is omitted, the cache is written next to `--out` as
+`<attribution-output-stem>.judge-cache.jsonl`. Re-run the same command after a timeout, provider
+disconnect, or process restart: exact request matches are loaded from the checkpoint, while only
+failed or not-yet-visited judgments call the provider again.
+
+The cache key covers the stage, model, complete system/user messages, token budget, thinking
+configuration, and prompt-schema version. A prompt, model, context, or configuration change cannot
+silently reuse a stale judgment. Only schema-valid judgments are persisted; prompts, API keys, and
+provider responses that failed validation are not stored in the checkpoint.
+
+Consecutive connection or timeout failures open a provider circuit after
+`--provider-error-threshold` failures (default `3`). The current branch then terminates as
+`inconclusive` with `termination_reason=provider_unavailable` instead of manufacturing many
+fallback `unknown` judgments. `metadata.judge_cache` reports loaded entries, hits, misses, and
+writes; `metadata.provider_circuit` reports provider failures and circuit state. Delete or point
+`--judge-cache` to a new path only when a complete re-evaluation is intended.
+
 When `--lineage-out` is omitted, the CLI writes `<attribution-output-stem>.message-lineage.json`
 next to the attribution report. The lineage output contains normalized agent turns, prompt/context/
 compaction/LLM snapshots, and reconstructed edges. Edge evidence is classified as:
@@ -128,6 +158,19 @@ compaction/LLM snapshots, and reconstructed edges. Edge evidence is classified a
 
 Only confirmed and content-matched edges are eligible for backward attribution. Temporal-only
 edges remain visible for review but cannot establish a root cause.
+
+## Structured Judge Context
+
+The offline analyzer builds a passive `causal_judgment_context` for every visited node. It preserves
+the active-defect fingerprint, normalized incoming edge semantics, the active-path edge, previously
+completed downstream judgments, the concrete causal episode, and the containing progress episode.
+The same compact context is retained under each defect branch's `metadata.judgment_contexts` so a
+reviewer can audit what the model received without replaying the Agent or modifying `trace.json`.
+
+Long runs retain every turn-level `progress.episode`, but backward navigation groups adjacent
+no-delivery turns into a delivery-bounded window. The analyzer expands every concrete candidate in
+that window and then jumps to the preceding delivery episode. This reduces artificial search depth
+without deleting turn facts or promoting an aggregate node to root cause.
 
 ## Quality Gap Attribution
 

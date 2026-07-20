@@ -21,6 +21,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="",
         help="Optional message-lineage JSON path; defaults next to --out as <stem>.message-lineage.json",
     )
+    parser.add_argument(
+        "--judge-cache",
+        default="",
+        help="Optional judgment checkpoint path; defaults next to --out as <stem>.judge-cache.jsonl",
+    )
     parser.add_argument("--objective", default="Find the root cause of the observed bad final result.")
     parser.add_argument("--start-ref", action="append", default=[], help="Trace ref to start from; repeatable")
     parser.add_argument("--model", default="", help="Claude model id; defaults to CLAUDE_MODEL or claude-sonnet-4-5")
@@ -47,12 +52,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--max-nodes", type=int, default=48)
+    parser.add_argument(
+        "--provider-error-threshold",
+        type=int,
+        default=3,
+        help="Open the provider circuit after this many consecutive connection/timeout errors.",
+    )
     return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     graph = load_graph(Path(args.trace), Path(args.review) if args.review else None)
+    out = Path(args.out)
+    cache_path = judge_cache_output_path(out, args.judge_cache)
     judge = ClaudeJudgeClient(
         model=args.model,
         api_key_env=args.api_key_env,
@@ -61,13 +74,14 @@ def main() -> int:
         max_tokens=args.judge_max_tokens,
         timeout_seconds=args.judge_timeout_sec,
         thinking_mode=args.thinking_mode,
+        cache_path=str(cache_path),
+        provider_error_threshold=args.provider_error_threshold,
     )
     report = BackwardTaintAnalyzer(judge=judge, max_depth=args.max_depth, max_nodes=args.max_nodes).analyze(
         graph,
         start_refs=args.start_ref or None,
         objective=args.objective,
     )
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     lineage_out = lineage_output_path(out, args.lineage_out)
@@ -84,6 +98,12 @@ def lineage_output_path(attribution_out: Path, configured: str) -> Path:
     if configured:
         return Path(configured)
     return attribution_out.with_name(f"{attribution_out.stem}.message-lineage.json")
+
+
+def judge_cache_output_path(attribution_out: Path, configured: str) -> Path:
+    if configured:
+        return Path(configured)
+    return attribution_out.with_name(f"{attribution_out.stem}.judge-cache.jsonl")
 
 
 def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGraph:
