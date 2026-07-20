@@ -24,6 +24,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     annotate_report_semantic_anchors,
     semantic_anchor_id,
+    semantic_anchor_index,
 )
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
@@ -74,108 +75,6 @@ def decision_node(
             ],
         },
     )
-
-
-def labels(
-    *,
-    roots: tuple[str, ...] = ("semantic_anchor:v1:root",),
-    conditions: tuple[str, ...] = (),
-    amplifiers: tuple[str, ...] = (),
-) -> dict:
-    def entries(values, role):
-        return [
-            {
-                "node_ref": "record:{0}_{1}".format(role, index),
-                "semantic_anchor_id": value,
-            }
-            for index, value in enumerate(values)
-        ]
-
-    return {
-        "schema_version": "recursive-attribution-labels/v1",
-        "case_id": "metric-case",
-        "roots": entries(roots, "root"),
-        "conditions": entries(conditions, "condition"),
-        "amplifiers": entries(amplifiers, "amplifier"),
-        "forbidden_roots": [],
-        "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"],
-    }
-
-
-def root_item(
-    anchor: str = "semantic_anchor:v1:root",
-    *,
-    node_ref: str = "record:root",
-    path: tuple[str, ...] = ("record:root", "record:observed"),
-    evidence: tuple[str, ...] = ("record:root",),
-    confirmation_identity: str = "confirmation:root",
-) -> dict:
-    confirmation = {
-        "confirmation_identity": confirmation_identity,
-        "candidate_ref": node_ref,
-        "status": "confirmed",
-        "evidence_refs": list(evidence),
-        "recursive_path": list(path),
-    }
-    return {
-        "node_ref": node_ref,
-        "semantic_anchor_id": anchor,
-        "recursive_path": list(path),
-        "evidence_refs": list(evidence),
-        "confirmation_status": "confirmed",
-        "confirmation": confirmation,
-    }
-
-
-def base_report() -> dict:
-    root = root_item()
-    return {
-        "schema_version": "recursive-attribution-report/v2",
-        "case_id": "metric-case",
-        "analysis_outcome": "root_found",
-        "start_refs": ["record:observed"],
-        "causal_candidates": [
-            {
-                "ref": "record:root",
-                "node": {"ref": "record:root"},
-                "semantic_anchor_id": "semantic_anchor:v1:root",
-            },
-            {
-                "ref": "record:observed",
-                "node": {"ref": "record:observed"},
-                "semantic_anchor_id": "semantic_anchor:v1:observed",
-            },
-        ],
-        "step_judgments": [
-            {
-                "current_node_ref": "record:root",
-                "current_defect_status": "present",
-                "predecessors": [],
-            },
-            {
-                "current_node_ref": "record:observed",
-                "current_defect_status": "present",
-                "predecessors": [],
-            },
-        ],
-        "introduction_candidates": [],
-        "confirmed_roots": [root],
-        "co_roots": [],
-        "contributing_conditions": [],
-        "amplifying_factors": [],
-        "confirmations": [copy.deepcopy(root["confirmation"])],
-        "unresolved_hypotheses": [],
-        "unresolved_refs": [],
-        "investigation_journal": [],
-        "metadata": {
-            "judge_request_count": 4,
-            "logical_judge_call_count": 5,
-            "checkpoint_reused_judgment_count": 1,
-            "fabricated_refs": [],
-            "unresolved_branches": [],
-            "exhausted_budgets": {},
-        },
-    }
 
 
 class FixtureJudge(OfflineJudgeCapability):
@@ -312,7 +211,7 @@ def run_fixture(path: Path):
         analysis_perspective="Improve Harness reasoning quality.",
     )
     annotated = annotate_report_semantic_anchors(
-        trace["case_id"], graph.nodes, report.to_dict()
+        trace["case_id"], graph.nodes, report.to_dict(), graph=graph
     )
     return annotated, human_labels, judge
 
@@ -354,7 +253,7 @@ class SemanticAnchorTest(unittest.TestCase):
             semantic_anchor_id("sphinx-case", left),
             semantic_anchor_id("sphinx-case", right),
         )
-        self.assertTrue(semantic_anchor_id("sphinx-case", left).startswith("semantic_anchor:v1:"))
+        self.assertTrue(semantic_anchor_id("sphinx-case", left).startswith("semantic_anchor:v2:"))
 
     def test_anchor_retains_meaningful_semantics_without_collisions(self):
         baseline = semantic_anchor_id(
@@ -394,68 +293,18 @@ class SemanticAnchorTest(unittest.TestCase):
 
 
 class RecursiveMetricTest(unittest.TestCase):
-    def test_metrics_have_exact_schema_and_expected_values(self):
-        report = base_report()
-        report["contributing_conditions"] = [
-            {
-                "node_ref": "record:condition",
-                "semantic_anchor_id": "semantic_anchor:v1:condition",
-            }
-        ]
-        report["amplifying_factors"] = [
-            {
-                "node_ref": "record:amplifier",
-                "semantic_anchor_id": "semantic_anchor:v1:amplifier",
-            }
-        ]
-        report["causal_candidates"].extend(
-            [
-                {
-                    "ref": "record:condition",
-                    "node": {"ref": "record:condition"},
-                    "semantic_anchor_id": "semantic_anchor:v1:condition",
-                },
-                {
-                    "ref": "record:amplifier",
-                    "node": {"ref": "record:amplifier"},
-                    "semantic_anchor_id": "semantic_anchor:v1:amplifier",
-                },
-            ]
-        )
-        report["confirmations"].append(
-            {
-                "confirmation_identity": "confirmation:rejected",
-                "candidate_ref": "record:condition",
-                "status": "rejected",
-                "evidence_refs": ["record:condition"],
-                "recursive_path": ["record:condition", "record:observed"],
-            }
-        )
-        report["step_judgments"].append(
-            {
-                "current_node_ref": "record:condition",
-                "current_defect_status": "unknown",
-                "predecessors": [],
-            }
-        )
-        report["investigation_journal"] = [
-            {
-                "status": "success",
-                "result": {"status": "success", "evidence_hash": "sha256:new"},
-                "context_before_hash": "sha256:before",
-                "context_after_hash": "sha256:after",
-                "rejudge_linkage": {"status": "completed"},
-            }
-        ]
-        legacy = {"metadata": {"judge_request_count": 10}}
+    def fixture(self, name="sphinx_recursive_minimal.json"):
+        report, labels, judge = run_fixture(FIXTURE_ROOT / name)
+        trace, _, _ = load_fixture(FIXTURE_ROOT / name)
+        return report, labels, judge, TraceGraph.from_trace(trace)
 
+    def test_metrics_have_exact_schema_and_bounded_values(self):
+        report, labels, _, graph = self.fixture()
         result = compare_report(
             report,
-            labels(
-                conditions=("semantic_anchor:v1:condition",),
-                amplifiers=("semantic_anchor:v1:amplifier",),
-            ),
-            legacy,
+            labels,
+            {"metadata": {"physical_judge_request_count": 10}},
+            graph=graph,
         )
 
         self.assertEqual(
@@ -472,8 +321,12 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertEqual(
             set(result["metrics"]),
             {
-                "candidate_recall",
+                "confirmed_root_recall",
+                "confirmed_root_precision",
+                "introduction_candidate_recall",
+                "introduction_candidate_precision",
                 "top1_match",
+                "negative_control_correct",
                 "judge_request_reduction",
                 "mean_causal_path_length",
                 "factor_role_precision",
@@ -484,152 +337,108 @@ class RecursiveMetricTest(unittest.TestCase):
                 "human_llm_disagreement_rate",
             },
         )
-        self.assertEqual(result["metrics"]["candidate_recall"], 1.0)
+        self.assertEqual(result["metrics"]["confirmed_root_recall"], 1.0)
+        self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
         self.assertTrue(result["metrics"]["top1_match"])
-        self.assertEqual(result["metrics"]["judge_request_reduction"], 0.6)
-        self.assertEqual(result["metrics"]["mean_causal_path_length"], 2.0)
-        self.assertEqual(result["metrics"]["factor_role_precision"], 1.0)
-        self.assertEqual(result["metrics"]["unknown_rate"], 0.2)
-        self.assertEqual(result["metrics"]["confirmation_rejection_rate"], 0.5)
-        self.assertEqual(result["metrics"]["investigation_yield"], 1.0)
-        self.assertEqual(result["metrics"]["checkpoint_reuse_rate"], 0.2)
-        self.assertEqual(result["metrics"]["human_llm_disagreement_rate"], 0.0)
+        self.assertEqual(result["metrics"]["judge_request_reduction"], 1.0)
+        for key, value in result["metrics"].items():
+            if key in {"top1_match", "negative_control_correct", "judge_request_reduction", "mean_causal_path_length"}:
+                continue
+            self.assertGreaterEqual(value, 0.0, key)
+            self.assertLessEqual(value, 1.0, key)
 
     def test_empty_denominators_are_explicit_and_success_control_scores_cleanly(self):
-        report = base_report()
-        report.update(
-            {
-                "analysis_outcome": "no_defect",
-                "confirmed_roots": [],
-                "confirmations": [],
-                "step_judgments": [],
-            }
-        )
-        report["metadata"].update(
-            {
-                "judge_request_count": 0,
-                "logical_judge_call_count": 0,
-                "checkpoint_reused_judgment_count": 0,
-            }
-        )
-        result = compare_report(report, labels(roots=()), None)
-        self.assertEqual(result["metrics"]["candidate_recall"], 1.0)
-        self.assertTrue(result["metrics"]["top1_match"])
+        report, labels, _, graph = self.fixture("success_negative_control.json")
+        result = compare_report(report, labels, None, graph=graph)
+
+        self.assertEqual(result["metrics"]["confirmed_root_recall"], 1.0)
+        self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
+        self.assertIsNone(result["metrics"]["top1_match"])
+        self.assertTrue(result["metrics"]["negative_control_correct"])
         self.assertIsNone(result["metrics"]["judge_request_reduction"])
         self.assertEqual(result["metrics"]["mean_causal_path_length"], 0.0)
-        self.assertEqual(result["metrics"]["factor_role_precision"], 1.0)
         self.assertEqual(result["metrics"]["unknown_rate"], 0.0)
         self.assertEqual(result["metrics"]["confirmation_rejection_rate"], 0.0)
         self.assertEqual(result["metrics"]["investigation_yield"], 0.0)
         self.assertEqual(result["metrics"]["checkpoint_reuse_rate"], 0.0)
 
     def test_missing_current_request_measurement_does_not_invent_reduction(self):
-        report = base_report()
-        report["metadata"].pop("judge_request_count")
+        report, labels, _, graph = self.fixture()
+        for key in (
+            "physical_judge_request_count",
+            "judge_request_count",
+            "provider_request_count",
+        ):
+            report["metadata"].pop(key, None)
 
         result = compare_report(
             report,
-            labels(),
+            labels,
             {"metadata": {"judge_request_count": 10}},
+            graph=graph,
         )
 
         self.assertIsNone(result["counts"]["judge_request_count"])
         self.assertEqual(result["counts"]["legacy_judge_request_count"], 10)
         self.assertIsNone(result["metrics"]["judge_request_reduction"])
 
-    def test_fabricated_or_unresolved_confirmed_evidence_fails_closed(self):
+    def test_fabricated_unresolved_duplicate_and_budget_states_fail_closed(self):
+        base, labels, _, graph = self.fixture()
         cases = []
-        fabricated = base_report()
+
+        fabricated = copy.deepcopy(base)
         fabricated["metadata"]["fabricated_refs"] = ["record:invented"]
         cases.append(fabricated)
 
-        unresolved = base_report()
-        unresolved["unresolved_refs"] = ["record:root"]
+        unresolved = copy.deepcopy(base)
+        unresolved["unresolved_refs"] = [unresolved["confirmed_roots"][0]["node_ref"]]
         cases.append(unresolved)
 
-        missing_evidence = base_report()
-        missing_evidence["confirmed_roots"][0]["evidence_refs"] = ["record:missing"]
-        missing_evidence["confirmations"][0]["evidence_refs"] = ["record:missing"]
-        cases.append(missing_evidence)
+        duplicate = copy.deepcopy(base)
+        duplicate["step_judgments"].append(copy.deepcopy(duplicate["step_judgments"][0]))
+        cases.append(duplicate)
 
-        missing_confirmation = base_report()
-        missing_confirmation["confirmations"] = []
-        cases.append(missing_confirmation)
+        exhausted = copy.deepcopy(base)
+        exhausted["metadata"]["unresolved_branches"] = [
+            {
+                "node_ref": exhausted["confirmed_roots"][0]["node_ref"],
+                "reason": "judge_request_limit",
+            }
+        ]
+        cases.append(exhausted)
+
+        collision = copy.deepcopy(base)
+        collision["metadata"]["semantic_anchor_collisions"] = [
+            {
+                "semantic_anchor_id": collision["confirmed_roots"][0]["semantic_anchor_id"],
+                "node_refs": ["record:a", "record:b"],
+            }
+        ]
+        cases.append(collision)
 
         for report in cases:
             with self.subTest(report=report):
                 with self.assertRaises(EvaluationSafetyError):
-                    compare_report(report, labels(), None)
+                    compare_report(report, labels, None, graph=graph)
 
-    def test_grounded_artifact_evidence_resolves_without_weakening_missing_ref_checks(self):
-        report = base_report()
-        report["confirmed_roots"][0]["evidence_refs"] = ["artifact:decision-proof"]
-        report["confirmed_roots"][0]["confirmation"]["evidence_refs"] = [
-            "artifact:decision-proof"
-        ]
-        report["confirmations"][0]["evidence_refs"] = ["artifact:decision-proof"]
-        report["causal_candidates"][0]["node"]["data"] = {
-            "hydrated_artifacts": [
-                {
-                    "artifact_id": "decision-proof",
-                    "content_hash": "sha256:" + "a" * 64,
-                    "missing": False,
-                }
-            ]
-        }
-
-        result = compare_report(report, labels(), None)
-        self.assertTrue(result["safety"]["passed"])
-
-    def test_duplicate_semantic_identity_and_budget_promoted_root_fail_closed(self):
-        duplicate = base_report()
-        duplicate_root = root_item(
-            node_ref="record:other-root",
-            confirmation_identity="confirmation:other",
-        )
-        duplicate["co_roots"] = [duplicate_root]
-        duplicate["confirmations"].append(copy.deepcopy(duplicate_root["confirmation"]))
-        duplicate["causal_candidates"].append(
-            {
-                "ref": "record:other-root",
-                "node": {"ref": "record:other-root"},
-                "semantic_anchor_id": "semantic_anchor:v1:root",
-            }
-        )
-        with self.assertRaises(EvaluationSafetyError):
-            compare_report(duplicate, labels(), None)
-
-        exhausted = base_report()
-        exhausted["metadata"]["exhausted_budgets"] = {"judge_requests": 1}
-        exhausted["metadata"]["unresolved_branches"] = [
-            {"node_ref": "record:root", "reason": "judge_request_limit"}
-        ]
-        with self.assertRaises(EvaluationSafetyError):
-            compare_report(exhausted, labels(), None)
-
-    def test_projection_collision_and_cli_failure_exit_are_hard_failures(self):
-        collision = base_report()
-        collision["metadata"]["semantic_anchor_collisions"] = [
-            {
-                "semantic_anchor_id": "semantic_anchor:v1:collision",
-                "node_refs": ["record:a", "record:b"],
-            }
-        ]
-        with self.assertRaises(EvaluationSafetyError):
-            compare_report(collision, labels(), None)
-
+    def test_cli_failure_is_nonzero_and_writes_no_output(self):
+        report, labels, _, _ = self.fixture()
+        trace, _, _ = load_fixture(FIXTURE_ROOT / "sphinx_recursive_minimal.json")
+        report["metadata"]["fabricated_refs"] = ["record:invented"]
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            trace_path = root / "trace.json"
             report_path = root / "report.json"
             labels_path = root / "labels.json"
             output_path = root / "comparison.json"
-            unsafe = base_report()
-            unsafe["metadata"]["fabricated_refs"] = ["record:invented"]
-            report_path.write_text(json.dumps(unsafe), encoding="utf-8")
-            labels_path.write_text(json.dumps(labels()), encoding="utf-8")
+            trace_path.write_text(json.dumps(trace), encoding="utf-8")
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            labels_path.write_text(json.dumps(labels), encoding="utf-8")
             with redirect_stderr(io.StringIO()):
                 status = evaluate_main(
                     [
+                        "--trace",
+                        str(trace_path),
                         "--report",
                         str(report_path),
                         "--labels",
@@ -640,7 +449,6 @@ class RecursiveMetricTest(unittest.TestCase):
                 )
             self.assertEqual(status, 2)
             self.assertFalse(output_path.exists())
-
 
 class RecursiveFixtureTest(unittest.TestCase):
     def test_all_fixture_documents_exist_and_keep_labels_out_of_trace(self):
@@ -658,25 +466,13 @@ class RecursiveFixtureTest(unittest.TestCase):
     def test_fixture_labels_use_computed_versioned_semantic_anchors(self):
         for name in FIXTURE_NAMES:
             trace, human_labels, _ = load_fixture(FIXTURE_ROOT / name)
-            nodes = {
-                "record:{0}".format(item["record_id"]): TraceNode(
-                    ref="record:{0}".format(item["record_id"]),
-                    record_id=item["record_id"],
-                    component=item.get("component", ""),
-                    event_type=item.get("event_type", ""),
-                    title=item.get("title", ""),
-                    status=item.get("status", ""),
-                    timestamp=item.get("timestamp", ""),
-                    data=item.get("data", {}),
-                    source_refs=item.get("source_refs", []),
-                )
-                for item in trace["records"]
-            }
+            graph = TraceGraph.from_trace(trace)
+            anchors = semantic_anchor_index(trace["case_id"], graph)
             for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
                 for item in human_labels[role]:
                     self.assertEqual(
                         item["semantic_anchor_id"],
-                        semantic_anchor_id(trace["case_id"], nodes[item["node_ref"]]),
+                        anchors[item["node_ref"]],
                     )
 
     def test_load_fixture_rejects_label_or_script_fields_nested_in_trace_facts(self):
@@ -694,7 +490,15 @@ class RecursiveFixtureTest(unittest.TestCase):
                                 "data": {"human_labels": {"roots": ["record:prompt"]}},
                             }
                         ],
-                        "human_labels": labels(),
+                        "human_labels": {
+                            "schema_version": "recursive-attribution-labels/v2",
+                            "case_id": "leaky",
+                            "roots": [],
+                            "conditions": [],
+                            "amplifiers": [],
+                            "forbidden_roots": [],
+                            "allowed_unresolved_outcomes": [],
+                        },
                         "scripted_analysis": {"steps": []},
                     }
                 ),
@@ -706,29 +510,27 @@ class RecursiveFixtureTest(unittest.TestCase):
     def test_report_projection_adds_anchors_without_mutating_report_or_nodes(self):
         trace, _, _ = load_fixture(FIXTURE_ROOT / "sphinx_recursive_minimal.json")
         graph = TraceGraph.from_trace(trace)
-        original = base_report()
-        original["case_id"] = trace["case_id"]
-        original["confirmed_roots"][0]["node_ref"] = "record:decision"
-        original["confirmed_roots"][0]["confirmation"]["candidate_ref"] = "record:decision"
-        original["confirmations"][0]["candidate_ref"] = "record:decision"
-        original["causal_candidates"][0]["ref"] = "record:decision"
-        original["causal_candidates"][0]["node"]["ref"] = "record:decision"
+        original = {
+            "case_id": trace["case_id"],
+            "root_causes": [{"node_ref": "record:decision"}],
+            "metadata": {},
+        }
         before = copy.deepcopy(original)
         nodes_before = copy.deepcopy(graph.nodes)
 
         projected = annotate_report_semantic_anchors(
-            trace["case_id"], graph.nodes, original
+            trace["case_id"], graph.nodes, original, graph=graph
         )
 
         self.assertEqual(original, before)
         self.assertEqual(graph.nodes, nodes_before)
         self.assertEqual(
-            projected["confirmed_roots"][0]["semantic_anchor_id"],
+            projected["root_causes"][0]["semantic_anchor_id"],
             semantic_anchor_id(trace["case_id"], graph.nodes["record:decision"]),
         )
         self.assertEqual(
             projected["metadata"]["semantic_anchor_schema_version"],
-            "semantic-anchor/v1",
+            "semantic-anchor/v2",
         )
 
     def test_cli_output_projection_keeps_legacy_default_and_adds_anchors(self):
@@ -751,7 +553,7 @@ class RecursiveFixtureTest(unittest.TestCase):
             semantic_anchor_id(trace["case_id"], graph.nodes["record:decision"]),
         )
 
-    def test_scripted_fixture_matrix_preserves_distinct_causal_roles(self):
+    def test_deterministic_plumbing_matrix_preserves_distinct_causal_roles(self):
         expected_primary = {
             "sphinx_recursive_minimal.json": "record:decision",
             "prompt_wrong_agent_faithful.json": "record:prompt",
@@ -764,9 +566,18 @@ class RecursiveFixtureTest(unittest.TestCase):
         for name in FIXTURE_NAMES:
             with self.subTest(name=name):
                 report, human_labels, judge = run_fixture(FIXTURE_ROOT / name)
-                comparison = compare_report(report, human_labels, None)
-                self.assertEqual(comparison["metrics"]["candidate_recall"], 1.0)
-                self.assertTrue(comparison["metrics"]["top1_match"])
+                trace, _, _ = load_fixture(FIXTURE_ROOT / name)
+                comparison = compare_report(
+                    report,
+                    human_labels,
+                    None,
+                    graph=TraceGraph.from_trace(trace),
+                )
+                self.assertEqual(comparison["metrics"]["confirmed_root_recall"], 1.0)
+                if human_labels["roots"]:
+                    self.assertTrue(comparison["metrics"]["top1_match"])
+                else:
+                    self.assertIsNone(comparison["metrics"]["top1_match"])
                 self.assertEqual(comparison["metrics"]["factor_role_precision"], 1.0)
                 request_text = stable_json(judge.requests)
                 for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):

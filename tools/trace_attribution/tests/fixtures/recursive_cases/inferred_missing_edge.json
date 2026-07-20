@@ -5,7 +5,7 @@
     {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Preserve the parser compatibility method."}},
     {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "The compatibility method has no callers and can be removed.", "chosen_action": "remove_compatibility_method"}},
     {"record_id": "change", "component": "tool", "event_type": "change", "data": {"files": ["parser/compat.py"], "summary": "Removed the compatibility method; authored-action edge is missing from the trace."}},
-    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "missing_direct_causal_edge", "expected": "Compatibility method remains available.", "actual": "The method was removed.", "mechanism": "Semantic retrieval must recover the authored decision despite one missing direct edge.", "scope": "causal_ir_reconstruction"}}
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "compatibility_method_removed", "expected": "Compatibility method remains available.", "actual": "The method was removed.", "mechanism": "The delivered repository state violates the compatibility contract.", "scope": "causal_ir_reconstruction"}}
   ],
   "dataflow_edges": [
     {
@@ -20,12 +20,12 @@
     }
   ],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "inferred-missing-edge",
-    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:da14525625de78fc55960a8a"}],
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:3388a2875269dd993816c376"}],
     "conditions": [],
     "amplifiers": [],
-    "forbidden_roots": [{"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v1:94005a1c72f67175fe2c11ca"}],
+    "forbidden_roots": [{"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:ef937088773bc20afa8673e6"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

@@ -7,16 +7,16 @@
     {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["compat/api.py"], "summary": "Omitted one required compatibility method."}},
     {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "failed", "failure": "compatibility method missing"}},
     {"record_id": "timeout", "component": "harness", "event_type": "run.interruption", "source_refs": ["record:verification"], "data": {"reason": "request deadline exceeded", "timeout_seconds": 300}},
-    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification", "record:timeout"], "data": {"failure_type": "implementation_failure_with_timeout_amplification", "expected": "Complete implementation returns normally.", "actual": "Implementation is incomplete and the case is interrupted.", "mechanism": "The decision introduces the defect; timeout only limits recovery and visibility.", "scope": "harness_amplification"}}
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification", "record:timeout"], "data": {"failure_type": "missing_compatibility_method_and_interruption", "expected": "Complete implementation returns normally.", "actual": "Implementation is incomplete and the case is interrupted.", "mechanism": "The observed run has an incomplete result and an interruption.", "scope": "harness_amplification"}}
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "timeout-amplifier",
-    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:59e194efaa08eafd81eb473f"}],
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:a70611adf1582fa8f16e4502"}],
     "conditions": [],
-    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v1:6686483cc09fca37f7cef687"}],
-    "forbidden_roots": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v1:82bce6bf6e4badf220802821"}],
+    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v2:33da54951b6ccb2a76e677b3"}],
+    "forbidden_roots": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:699651f4d075be3b0a079a4b"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

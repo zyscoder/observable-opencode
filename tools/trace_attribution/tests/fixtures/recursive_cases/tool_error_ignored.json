@@ -6,14 +6,14 @@
     {"record_id": "tool_error", "component": "tool", "event_type": "tool.result", "source_refs": ["record:prompt"], "data": {"tool_name": "pytest", "status": "failed", "exit_code": 1, "error_message": "test_round_trip failed"}},
     {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:tool_error"], "data": {"rationale": "The failure looks unrelated; finish without investigating it.", "chosen_action": "ignore_failed_verification"}},
     {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["serializer/core.py"], "summary": "Kept the serializer change despite the failing test."}},
-    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "known_tool_error_ignored", "expected": "Known failing verification is resolved.", "actual": "The agent completed with the failure unresolved.", "mechanism": "A decision discarded actionable tool evidence.", "scope": "verification_handling"}}
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "unresolved_round_trip_failure", "expected": "Known failing verification is resolved.", "actual": "The agent completed with the failure unresolved.", "mechanism": "The delivered result still exhibits the recorded round-trip failure.", "scope": "verification_handling"}}
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "tool-error-ignored",
-    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:182d0823449beffc21937d6b"}],
-    "conditions": [{"node_ref": "record:tool_error", "semantic_anchor_id": "semantic_anchor:v1:ee4ff34df5f1da73dafc5b8c"}],
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:025ca2348d79ad1cce954446"}],
+    "conditions": [{"node_ref": "record:tool_error", "semantic_anchor_id": "semantic_anchor:v2:612784486562d5055bd0e5ce"}],
     "amplifiers": [],
     "forbidden_roots": [],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]

@@ -24,6 +24,7 @@ from .causal_state import (
     RootConfirmation,
     annotate_report_semantic_anchors,
     semantic_anchor_id,
+    semantic_anchor_index,
     semantic_visit_key,
     confirmation_identity_for,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "TraceNode",
     "annotate_report_semantic_anchors",
     "semantic_anchor_id",
+    "semantic_anchor_index",
     "semantic_visit_key",
     "confirmation_identity_for",
     "build_checkpoint_config",

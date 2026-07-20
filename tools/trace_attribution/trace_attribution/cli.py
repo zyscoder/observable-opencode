@@ -260,7 +260,7 @@ def main() -> int:
 
 def attribution_output_payload(report: Any, graph: TraceGraph) -> dict[str, Any]:
     return annotate_report_semantic_anchors(
-        graph.case_id, graph.nodes, report.to_dict()
+        graph.case_id, graph.nodes, report.to_dict(), graph=graph
     )
 
 

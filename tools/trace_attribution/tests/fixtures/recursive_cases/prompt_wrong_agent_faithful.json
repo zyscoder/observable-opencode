@@ -6,16 +6,16 @@
     {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Follow the explicit requirement exactly.", "chosen_action": "remove_authorization_check"}},
     {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["service/admin.py"], "summary": "Removed the authorization guard as requested."}},
     {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "failed", "failure": "unauthorized user can call admin endpoint"}},
-    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification"], "data": {"failure_type": "explicitly_wrong_requirement", "expected": "Authorization remains enforced.", "actual": "Authorization was removed.", "mechanism": "The supplied requirement explicitly requested unsafe behavior.", "scope": "requirement_quality"}}
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification"], "data": {"failure_type": "authorization_removed", "expected": "Authorization remains enforced.", "actual": "Authorization was removed.", "mechanism": "The observed endpoint behavior violates the authorization invariant.", "scope": "requirement_quality"}}
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "prompt-wrong-agent-faithful",
-    "roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:9848480c5163e2a2e60565eb"}],
+    "roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:d4aa3e8863945526cd781660"}],
     "conditions": [],
     "amplifiers": [],
-    "forbidden_roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:f753f043c9564959264b8077"}],
+    "forbidden_roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:0d41680f4c314f7e56e09e40"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

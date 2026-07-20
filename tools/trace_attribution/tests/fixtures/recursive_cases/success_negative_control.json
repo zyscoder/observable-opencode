@@ -10,15 +10,15 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "success-negative-control",
     "roots": [],
     "conditions": [],
     "amplifiers": [],
     "forbidden_roots": [
-      {"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:70800c9e1a22d9a86747fa52"},
-      {"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:9b196cfb0c6ccac129fb4ca5"},
-      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v1:0c66a8a81359bf8ee34199ea"}
+      {"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:6911af0e33ca6889c53007ee"},
+      {"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:13785fac83fdfe99ffa60473"},
+      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:e1d8b159c44234872411e448"}
     ],
     "allowed_unresolved_outcomes": []
   },

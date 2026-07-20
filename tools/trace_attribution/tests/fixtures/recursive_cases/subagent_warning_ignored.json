@@ -6,14 +6,14 @@
     {"record_id": "subagent_warning", "component": "subagent", "event_type": "subagent.result", "source_refs": ["record:prompt"], "data": {"summary": "The proposed key omits tenant_id and can leak cached data across tenants.", "status": "warning"}},
     {"record_id": "main_agent_decision", "component": "processor", "event_type": "decision", "source_refs": ["record:subagent_warning"], "data": {"rationale": "Use the shorter cache key despite the warning.", "chosen_action": "omit_tenant_from_cache_key"}},
     {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:main_agent_decision"], "data": {"files": ["cache/key.py"], "summary": "Removed tenant_id from the cache key."}},
-    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "subagent_warning_ignored", "expected": "Tenant isolation remains intact.", "actual": "Cache keys collide across tenants.", "mechanism": "The main agent explicitly rejected a grounded subagent warning.", "scope": "subagent_orchestration"}}
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "tenant_cache_collision", "expected": "Tenant isolation remains intact.", "actual": "Cache keys collide across tenants.", "mechanism": "The delivered cache key does not preserve tenant isolation.", "scope": "subagent_orchestration"}}
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v1",
+    "schema_version": "recursive-attribution-labels/v2",
     "case_id": "subagent-warning-ignored",
-    "roots": [{"node_ref": "record:main_agent_decision", "semantic_anchor_id": "semantic_anchor:v1:4d06b1a5e8a66eb9e8322c1f"}],
-    "conditions": [{"node_ref": "record:subagent_warning", "semantic_anchor_id": "semantic_anchor:v1:ddf7f2afd576e3388348db44"}],
+    "roots": [{"node_ref": "record:main_agent_decision", "semantic_anchor_id": "semantic_anchor:v2:d4760866ad0034f3f277cff0"}],
+    "conditions": [{"node_ref": "record:subagent_warning", "semantic_anchor_id": "semantic_anchor:v2:40b8bb6f149965887efa2cbb"}],
     "amplifiers": [],
     "forbidden_roots": [],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
