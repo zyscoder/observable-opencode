@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from trace_attribution.causal_judge import OfflineJudgeCapability
+from trace_attribution.causal_judge import BoundedJudgeCapability, OfflineJudgeCapability
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     RecursiveAttributionReport,
@@ -17,10 +18,14 @@ from trace_attribution.checkpoint import (
     CheckpointBundle,
     CheckpointCompatibilityError,
     CheckpointCorruptionError,
+    _sha256,
     build_checkpoint_config,
 )
 from trace_attribution.graph import TraceGraph
-from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
+from trace_attribution.recursive_analyzer import (
+    AgenticRecursiveAnalyzer,
+    RecursiveAnalysisState,
+)
 
 
 def sample_trace() -> dict:
@@ -59,6 +64,13 @@ def sample_config(**changes: object) -> dict:
         },
         "model_identity": "offline:test",
         "cache_identity": "cache:test",
+        "runtime_identity": {
+            "judge_timeout_sec": 3600.0,
+            "judge_max_tokens": 4096,
+            "thinking_mode": "disabled",
+            "base_url": "offline://test",
+            "provider_error_threshold": 3,
+        },
     }
     values.update(changes)
     return build_checkpoint_config(**values)
@@ -89,6 +101,23 @@ class InterruptingOfflineJudge(CountingOfflineJudge):
     def judge_step_offline(self, request):
         self.step_calls += 1
         raise KeyboardInterrupt("simulated SIGINT inside Judge boundary")
+
+
+class InterruptingBoundedJudge(BoundedJudgeCapability):
+    def __init__(self, *, interrupt: bool) -> None:
+        self.interrupt = interrupt
+        self.step_calls = 0
+        self.allowances = []
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_calls += 1
+        self.allowances.append(max_physical_requests)
+        if self.interrupt:
+            raise KeyboardInterrupt("provider may have received the request")
+        raise AssertionError("an in-flight bounded request must not be repeated")
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        raise AssertionError("confirmation is not expected")
 
 
 class InvestigationJudge(CountingOfflineJudge):
@@ -184,6 +213,172 @@ class InterruptingTools:
 
 
 class CausalCheckpointTest(unittest.TestCase):
+    def test_snapshot_commit_has_one_run_id_and_global_transaction_sequence(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            bundle.initialize(sample_config())
+            commit = bundle.commit_snapshot(
+                semantic_key="snapshot:a",
+                frontier_payload={"frontier": ["a"]},
+                hypothesis_payload={"hypotheses": ["a"]},
+                action_payload={"state": "a"},
+            )
+            records = [
+                json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+                for path in (
+                    bundle.frontier_path,
+                    bundle.hypotheses_path,
+                    bundle.actions_path,
+                )
+            ]
+            self.assertEqual({item["run_id"] for item in records}, {commit["run_id"]})
+            self.assertEqual(
+                {item["transaction_sequence"] for item in records},
+                {commit["transaction_sequence"]},
+            )
+            self.assertEqual(
+                commit["journal_heads"]["frontier"]["record_hash"],
+                records[0]["record_hash"],
+            )
+
+    def test_recursive_restore_rejects_state_members_from_different_transactions(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=bundle,
+                checkpoint_config=sample_config(),
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            stable = bundle.restore(expected_config=sample_config())
+            bundle.record_frontier(
+                "snapshot", "forged:mixed", stable.frontier_payload
+            )
+            mixed = bundle.restore(expected_config=sample_config())
+            with self.assertRaises(ValueError):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(sample_trace()), checkpoint=mixed
+                )
+
+    def test_restore_rejects_cross_run_journal_mix(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            left = CheckpointBundle(Path(tempdir) / "left.checkpoint")
+            right = CheckpointBundle(Path(tempdir) / "right.checkpoint")
+            left.initialize(sample_config())
+            right.initialize(sample_config())
+            left.commit_snapshot(
+                semantic_key="snapshot:left",
+                frontier_payload={"run": "left"},
+                hypothesis_payload={"run": "left"},
+                action_payload={"run": "left"},
+            )
+            right.commit_snapshot(
+                semantic_key="snapshot:right",
+                frontier_payload={"run": "right"},
+                hypothesis_payload={"run": "right"},
+                action_payload={"run": "right"},
+            )
+            shutil.copyfile(right.hypotheses_path, left.hypotheses_path)
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(left.root).restore(expected_config=sample_config())
+
+    def test_restore_rejects_deletion_of_a_committed_valid_tail(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            bundle.initialize(sample_config())
+            bundle.record_action("queued", "call:a", {"status": "queued"})
+            bundle.record_action("completed", "call:a", {"status": "completed"})
+            lines = bundle.actions_path.read_text(encoding="utf-8").splitlines()
+            bundle.actions_path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(bundle.root).restore(expected_config=sample_config())
+
+    def test_parseable_record_without_newline_is_repaired_before_append(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            bundle.initialize(sample_config())
+            bundle.record_action("queued", "call:a", {"status": "queued"})
+            bundle.actions_path.write_bytes(bundle.actions_path.read_bytes().rstrip(b"\n"))
+
+            reopened = CheckpointBundle(bundle.root)
+            reopened.initialize(sample_config())
+            reopened.record_action("completed", "call:a", {"status": "completed"})
+            restored = CheckpointBundle(bundle.root).restore(expected_config=sample_config())
+            self.assertEqual(len(restored.actions), 2)
+            self.assertGreaterEqual(restored.tail_repair_count, 1)
+            self.assertTrue(reopened.actions_path.read_bytes().endswith(b"\n"))
+
+    def test_uncommitted_cross_journal_crash_tail_is_not_mixed_into_restore(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            stable = CheckpointBundle(root)
+            stable.initialize(sample_config())
+            stable.commit_snapshot(
+                semantic_key="stable",
+                frontier_payload={"version": "stable"},
+                hypothesis_payload={"version": "stable"},
+                action_payload={"version": "stable"},
+            )
+
+            def crash(stage):
+                if stage == "snapshot_after_hypotheses":
+                    raise KeyboardInterrupt("crash before action member and commit publish")
+
+            crashing = CheckpointBundle(root, fault_hook=crash)
+            crashing.initialize(sample_config())
+            with self.assertRaises(KeyboardInterrupt):
+                crashing.commit_snapshot(
+                    semantic_key="unstable",
+                    frontier_payload={"version": "unstable"},
+                    hypothesis_payload={"version": "unstable"},
+                    action_payload={"version": "unstable"},
+                )
+
+            reopened = CheckpointBundle(root)
+            reopened.initialize(sample_config())
+            restored = reopened.restore(expected_config=sample_config())
+            self.assertEqual(restored.frontier_payload, {"version": "stable"})
+            self.assertEqual(restored.hypothesis_payload, {"version": "stable"})
+            self.assertEqual(restored.actions[-1]["payload"], {"version": "stable"})
+            self.assertGreaterEqual(restored.tail_repair_count, 2)
+
+    def test_initialize_creates_and_directory_fsyncs_all_journals(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            with mock.patch("trace_attribution.checkpoint.os.fsync") as fsync:
+                bundle = CheckpointBundle(root)
+                bundle.initialize(sample_config())
+            self.assertTrue(bundle.frontier_path.is_file())
+            self.assertTrue(bundle.hypotheses_path.is_file())
+            self.assertTrue(bundle.actions_path.is_file())
+            self.assertTrue(bundle.commit_path.is_file())
+            self.assertGreaterEqual(fsync.call_count, 6)
+
+    def test_directory_durability_boundary_is_reached_during_initialize(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            stages = []
+            bundle = CheckpointBundle(
+                Path(tempdir) / "case.checkpoint", fault_hook=stages.append
+            )
+            bundle.initialize(sample_config())
+            self.assertIn("checkpoint_directory_durable", stages)
+
+    def test_timeout_drift_is_checkpoint_incompatible(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            changed_runtime = dict(sample_config()["runtime_identity"])
+            changed_runtime["judge_timeout_sec"] = 120.0
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(root).restore(
+                    expected_config=sample_config(runtime_identity=changed_runtime)
+                )
+
     def test_three_journals_are_fsynced_and_restore_after_corrupt_tail(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"
@@ -209,8 +404,10 @@ class CausalCheckpointTest(unittest.TestCase):
                 set(raw),
                 {
                     "schema_version",
+                    "run_id",
                     "journal",
                     "sequence",
+                    "transaction_sequence",
                     "timestamp",
                     "operation",
                     "semantic_key",
@@ -258,6 +455,38 @@ class CausalCheckpointTest(unittest.TestCase):
                 bundle.actions_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 with self.assertRaises(CheckpointCorruptionError):
                     CheckpointBundle(root).restore(expected_config=sample_config())
+
+    def test_restore_rejects_nonmonotonic_global_transaction_sequence(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            bundle.record_action("queued", "call:a", {"status": "queued"})
+            bundle.record_action("completed", "call:a", {"status": "completed"})
+
+            records = [
+                json.loads(line)
+                for line in bundle.actions_path.read_text(encoding="utf-8").splitlines()
+            ]
+            records[1]["transaction_sequence"] = records[0]["transaction_sequence"]
+            records[1]["record_hash"] = _sha256(
+                {key: value for key, value in records[1].items() if key != "record_hash"}
+            )
+            bundle.actions_path.write_text(
+                "\n".join(json.dumps(item, sort_keys=True) for item in records) + "\n",
+                encoding="utf-8",
+            )
+            commit = json.loads(bundle.commit_path.read_text(encoding="utf-8"))
+            commit["journal_heads"]["actions"]["record_hash"] = records[1]["record_hash"]
+            commit["commit_hash"] = _sha256(
+                {key: value for key, value in commit.items() if key != "commit_hash"}
+            )
+            bundle.commit_path.write_text(
+                json.dumps(commit, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(root).restore(expected_config=sample_config())
 
     def test_restore_rejects_stale_trace_or_runtime_configuration(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -369,6 +598,44 @@ class CausalCheckpointTest(unittest.TestCase):
                     for item in report.metadata.get("unresolved_branches", [])
                 )
             )
+
+    def test_inflight_bounded_call_conservatively_keeps_max_one_budget_debited(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            budgets = dict(sample_config()["budgets"])
+            budgets["max_judge_requests"] = 1
+            config = sample_config(budgets=budgets)
+            first = InterruptingBoundedJudge(interrupt=True)
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=first,
+                    checkpoint=CheckpointBundle(root),
+                    checkpoint_config=config,
+                    max_judge_requests=1,
+                ).analyze(
+                    TraceGraph.from_trace(sample_trace()),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+            self.assertEqual(first.allowances, [1])
+
+            resumed_judge = InterruptingBoundedJudge(interrupt=False)
+            report = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+                max_judge_requests=1,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(report.metadata["physical_judge_request_count"], 1)
+            self.assertEqual(report.metadata["judge_request_uncertainty_count"], 1)
+            self.assertGreaterEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
 
     def test_resume_never_repeats_an_inflight_investigation(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -507,8 +774,7 @@ class CausalCheckpointTest(unittest.TestCase):
             )
             actions_path = root / "investigation-actions.jsonl"
             lines = actions_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(json.loads(lines[-1])["operation"], "analysis_completed")
-            actions_path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            self.assertEqual(json.loads(lines[-1])["operation"], "analysis_ready")
 
             resumed_judge = UnknownConfirmationJudge()
             resumed = AgenticRecursiveAnalyzer(
@@ -545,7 +811,7 @@ class CausalCheckpointTest(unittest.TestCase):
             actions = (root / "investigation-actions.jsonl").read_text(
                 encoding="utf-8"
             ).splitlines()
-            self.assertEqual(json.loads(actions[-1])["operation"], "analysis_interrupted")
+            self.assertEqual(json.loads(actions[-1])["operation"], "analysis_ready")
 
     def test_resumed_signal_checkpoint_converges_to_uninterrupted_report(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -583,6 +849,49 @@ class CausalCheckpointTest(unittest.TestCase):
                 analysis_perspective="Improve repository reasoning.",
             )
             self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+
+    def test_tail_repair_audit_is_persisted_in_report_metadata(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            with bundle.actions_path.open("ab") as handle:
+                handle.write(b'{"partial"')
+            reopened = CheckpointBundle(root)
+            reopened.initialize(sample_config())
+            report = AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=reopened,
+                checkpoint_config=sample_config(),
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertGreaterEqual(
+                report.metadata["checkpoint_audit"]["tail_repair_count"], 1
+            )
+
+    def test_restore_rejects_nonexact_tail_repair_event_schema(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            with bundle.actions_path.open("ab") as handle:
+                handle.write(b'{"partial"')
+            bundle.initialize(sample_config())
+
+            commit = json.loads(bundle.commit_path.read_text(encoding="utf-8"))
+            commit["tail_repair_events"][0]["unexpected"] = True
+            commit["commit_hash"] = _sha256(
+                {key: value for key, value in commit.items() if key != "commit_hash"}
+            )
+            bundle.commit_path.write_text(
+                json.dumps(commit, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(root).restore(expected_config=sample_config())
 
 
 if __name__ == "__main__":

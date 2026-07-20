@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import signal
 from pathlib import Path
 from unittest import mock
 
+from trace_attribution.checkpoint import (
+    CheckpointBundle,
+    build_checkpoint_config,
+    publish_output_transaction,
+)
 from trace_attribution.cli import (
     GracefulSignalState,
     atomic_write_json,
@@ -14,6 +20,33 @@ from trace_attribution.cli import (
     parse_args,
     recursive_checkpoint_path,
 )
+
+
+def output_config():
+    return build_checkpoint_config(
+        trace={"case_id": "output-case", "records": []},
+        case_id="output-case",
+        objective="Find the defect.",
+        analysis_perspective="Improve reasoning.",
+        start_refs=[],
+        budgets={
+            "max_frontier_items": 96,
+            "max_depth": 20,
+            "max_hypotheses": 24,
+            "max_investigation_rounds": 12,
+            "max_artifact_bytes": 1_048_576,
+            "max_judge_requests": 128,
+        },
+        model_identity="offline:test",
+        cache_identity="cache:test",
+        runtime_identity={
+            "judge_timeout_sec": 3600.0,
+            "judge_max_tokens": 4096,
+            "thinking_mode": "disabled",
+            "base_url": "offline://test",
+            "provider_error_threshold": 3,
+        },
+    )
 
 
 class RecursiveCliTest(unittest.TestCase):
@@ -124,6 +157,95 @@ class RecursiveCliTest(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), '{\n  "outcome": "inconclusive"\n}\n')
             self.assertGreaterEqual(fsync.call_count, 2)
             self.assertEqual(list(Path(tempdir).glob("*.tmp")), [])
+
+    def test_output_transaction_repairs_crash_between_two_publications(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle = CheckpointBundle(root / "case.checkpoint")
+            bundle.initialize(output_config())
+            attribution = root / "case.attribution.json"
+            lineage = root / "case.message-lineage.json"
+            report = {"case_id": "output-case", "analysis_outcome": "inconclusive"}
+            message_lineage = {"turns": [], "edges": []}
+
+            def crash(stage):
+                if stage == "output_after_attribution_publish":
+                    raise KeyboardInterrupt("crash between output files")
+
+            with self.assertRaises(KeyboardInterrupt):
+                publish_output_transaction(
+                    bundle=bundle,
+                    attribution_path=attribution,
+                    lineage_path=lineage,
+                    report=report,
+                    message_lineage=message_lineage,
+                    fault_hook=crash,
+                )
+            self.assertTrue(attribution.is_file())
+            self.assertFalse(lineage.exists())
+            self.assertIsNone(bundle.restore(expected_config=output_config()).final_report)
+
+            output_commit = publish_output_transaction(
+                bundle=bundle,
+                attribution_path=attribution,
+                lineage_path=lineage,
+                report=report,
+                message_lineage=message_lineage,
+            )
+            self.assertEqual(output_commit["status"], "published")
+            bundle.mark_analysis_completed(report=report, output_commit=output_commit)
+            restored = bundle.restore(expected_config=output_config())
+            self.assertEqual(restored.final_report, report)
+            self.assertEqual(json.loads(attribution.read_text(encoding="utf-8")), report)
+            self.assertEqual(
+                json.loads(lineage.read_text(encoding="utf-8")), message_lineage
+            )
+
+    def test_published_outputs_are_not_complete_before_checkpoint_marker(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle = CheckpointBundle(root / "case.checkpoint")
+            bundle.initialize(output_config())
+            report = {"case_id": "output-case", "analysis_outcome": "inconclusive"}
+            output_commit = publish_output_transaction(
+                bundle=bundle,
+                attribution_path=root / "attribution.json",
+                lineage_path=root / "lineage.json",
+                report=report,
+                message_lineage={"turns": []},
+                stop_requested=lambda: True,
+            )
+            self.assertIsNone(bundle.restore(expected_config=output_config()).final_report)
+            bundle.mark_analysis_completed(report=report, output_commit=output_commit)
+            self.assertEqual(
+                bundle.restore(expected_config=output_config()).final_report, report
+            )
+
+    def test_signal_between_output_publications_does_not_split_transaction(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle = CheckpointBundle(root / "case.checkpoint")
+            bundle.initialize(output_config())
+            shutdown = GracefulSignalState()
+
+            def request_stop(stage):
+                if stage == "output_after_attribution_publish":
+                    shutdown.handle(signal.SIGTERM, None)
+
+            output_commit = publish_output_transaction(
+                bundle=bundle,
+                attribution_path=root / "attribution.json",
+                lineage_path=root / "lineage.json",
+                report={"case_id": "output-case", "analysis_outcome": "inconclusive"},
+                message_lineage={"turns": []},
+                stop_requested=shutdown.stop_requested,
+                fault_hook=request_stop,
+            )
+            self.assertTrue(shutdown.stop_requested())
+            self.assertEqual(output_commit["status"], "published")
+            self.assertTrue((root / "attribution.json").is_file())
+            self.assertTrue((root / "lineage.json").is_file())
+            self.assertIsNone(bundle.restore(expected_config=output_config()).final_report)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,11 @@ from typing import Any, Mapping, Optional
 from .analyzer import BackwardTaintAnalyzer
 from .cache import JudgmentCache
 from .causal_judge import ClaudeCausalJudge
-from .checkpoint import CheckpointBundle, build_checkpoint_config
+from .checkpoint import (
+    CheckpointBundle,
+    build_checkpoint_config,
+    publish_output_transaction,
+)
 from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
 from .graph import TraceGraph
 from .models import stable_json
@@ -153,6 +157,7 @@ def main() -> int:
     )
     if args.engine == "recursive-agentic":
         checkpoint_path = recursive_checkpoint_path(out, args.checkpoint_dir)
+        lineage_out = lineage_output_path(out, args.lineage_out)
         starts = tuple(args.start_ref or graph.default_start_refs())
         budgets = {
             "max_frontier_items": args.max_frontier_items,
@@ -180,6 +185,13 @@ def main() -> int:
             budgets=budgets,
             model_identity=model_identity,
             cache_identity=str(cache_path.expanduser().resolve()),
+            runtime_identity={
+                "judge_timeout_sec": args.judge_timeout_sec,
+                "judge_max_tokens": transport.max_tokens,
+                "thinking_mode": stable_json(transport.thinking_config),
+                "base_url": transport.base_url,
+                "provider_error_threshold": transport.provider_error_threshold,
+            },
         )
         causal_judge = ClaudeCausalJudge(
             transport=transport,
@@ -187,6 +199,7 @@ def main() -> int:
             if isinstance(transport.cache, JudgmentCache)
             else JudgmentCache(cache_path),
         )
+        checkpoint = CheckpointBundle(checkpoint_path)
         with GracefulSignalState() as shutdown:
             report = AgenticRecursiveAnalyzer(
                 judge=causal_judge,
@@ -196,7 +209,7 @@ def main() -> int:
                 max_investigation_rounds=args.max_investigation_rounds,
                 max_artifact_bytes=args.max_artifact_bytes,
                 max_judge_requests=args.max_judge_requests,
-                checkpoint=CheckpointBundle(checkpoint_path),
+                checkpoint=checkpoint,
                 checkpoint_config=checkpoint_config,
                 stop_requested=shutdown.stop_requested,
             ).analyze(
@@ -205,6 +218,29 @@ def main() -> int:
                 objective=args.objective,
                 analysis_perspective=args.analysis_perspective,
             )
+            output_commit = publish_output_transaction(
+                bundle=checkpoint,
+                attribution_path=out,
+                lineage_path=lineage_out,
+                report=report.to_dict(),
+                message_lineage=graph.message_lineage,
+                stop_requested=shutdown.stop_requested,
+            )
+            if report.metadata.get("termination_reason") == "signal_interrupted":
+                checkpoint.record_action(
+                    "analysis_interrupted",
+                    "analysis:result",
+                    {
+                        "report": report.to_dict(),
+                        "interrupted": True,
+                        "output_transaction_id": output_commit["transaction_id"],
+                        "output_commit_hash": output_commit["output_commit_hash"],
+                    },
+                )
+            else:
+                checkpoint.mark_analysis_completed(
+                    report=report.to_dict(), output_commit=output_commit
+                )
     else:
         report = BackwardTaintAnalyzer(
             judge=transport, max_depth=args.max_depth, max_nodes=args.max_nodes
@@ -213,9 +249,9 @@ def main() -> int:
             start_refs=args.start_ref or None,
             objective=args.objective,
         )
-    atomic_write_json(out, report.to_dict())
-    lineage_out = lineage_output_path(out, args.lineage_out)
-    atomic_write_json(lineage_out, graph.message_lineage)
+        atomic_write_json(out, report.to_dict())
+        lineage_out = lineage_output_path(out, args.lineage_out)
+        atomic_write_json(lineage_out, graph.message_lineage)
     print(str(out))
     return 0
 

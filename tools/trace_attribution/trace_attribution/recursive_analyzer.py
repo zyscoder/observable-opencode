@@ -392,6 +392,7 @@ class RecursiveAnalysisState:
     artifact_bytes: int = 0
     processed_items: int = 0
     judge_requests: int = 0
+    judge_request_uncertainty_count: int = 0
     logical_judge_calls: int = 0
     investigation_rounds: int = 0
     investigation_result_bytes: int = 0
@@ -572,6 +573,7 @@ class RecursiveAnalysisState:
             "artifact_bytes": self.artifact_bytes,
             "processed_items": self.processed_items,
             "judge_requests": self.judge_requests,
+            "judge_request_uncertainty_count": self.judge_request_uncertainty_count,
             "logical_judge_calls": self.logical_judge_calls,
             "investigation_rounds": self.investigation_rounds,
             "investigation_result_bytes": self.investigation_result_bytes,
@@ -613,6 +615,23 @@ class RecursiveAnalysisState:
         )
         if not frontier_payload or not hypothesis_payload or action_record is None:
             raise ValueError("checkpoint does not contain a complete recursive state snapshot")
+        snapshot_records = (
+            checkpoint.frontier_records[-1],
+            checkpoint.hypothesis_records[-1],
+            action_record,
+        )
+        if len(
+            {
+                (
+                    item.get("transaction_sequence"),
+                    item.get("semantic_key"),
+                )
+                for item in snapshot_records
+            }
+        ) != 1:
+            raise ValueError(
+                "checkpoint recursive state members do not share one committed transaction"
+            )
         action_payload = dict(action_record["payload"])
         _require_exact_checkpoint_keys(
             frontier_payload,
@@ -683,6 +702,7 @@ class RecursiveAnalysisState:
             "artifact_bytes",
             "processed_items",
             "judge_requests",
+            "judge_request_uncertainty_count",
             "logical_judge_calls",
             "investigation_rounds",
             "investigation_result_bytes",
@@ -1240,6 +1260,7 @@ class RecursiveAnalysisState:
             "processed_frontier_items": self.processed_items,
             "judge_request_count": self.judge_requests,
             "physical_judge_request_count": self.judge_requests,
+            "judge_request_uncertainty_count": self.judge_request_uncertainty_count,
             "logical_judge_call_count": self.logical_judge_calls,
             "artifact_bytes": self.artifact_bytes,
             "investigation_rounds": self.investigation_rounds,
@@ -1386,14 +1407,11 @@ class AgenticRecursiveAnalyzer:
     def _checkpoint_state(self, state: RecursiveAnalysisState, semantic_key: str) -> None:
         if self.checkpoint is None:
             return
-        self.checkpoint.record_frontier(
-            "snapshot", semantic_key, state.frontier_checkpoint_payload()
-        )
-        self.checkpoint.record_hypothesis(
-            "snapshot", semantic_key, state.hypothesis_checkpoint_payload()
-        )
-        self.checkpoint.record_action(
-            "state_snapshot", semantic_key, state.action_checkpoint_payload()
+        self.checkpoint.commit_snapshot(
+            semantic_key=semantic_key,
+            frontier_payload=state.frontier_checkpoint_payload(),
+            hypothesis_payload=state.hypothesis_checkpoint_payload(),
+            action_payload=state.action_checkpoint_payload(),
         )
         target = _judge_transport(self.judge)
         self.checkpoint.record_action(
@@ -1466,7 +1484,40 @@ class AgenticRecursiveAnalyzer:
             )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
-                return RecursiveAttributionReport.from_dict(final_report)
+                report = RecursiveAttributionReport.from_dict(final_report)
+                if restored_checkpoint.tail_repair_count:
+                    metadata = dict(report.metadata)
+                    metadata["checkpoint_audit"] = {
+                        "tail_repair_count": restored_checkpoint.tail_repair_count,
+                        "tail_repair_events": [
+                            dict(item)
+                            for item in restored_checkpoint.tail_repair_events
+                        ],
+                    }
+                    report = replace(report, metadata=metadata)
+                return report
+            pending_report = restored_checkpoint.pending_report
+            pending_action = restored_checkpoint.latest_actions.get("analysis:result")
+            pending_interrupted = bool(
+                isinstance(pending_action, Mapping)
+                and isinstance(pending_action.get("payload"), Mapping)
+                and pending_action["payload"].get("interrupted")
+            )
+            if pending_report is not None and (
+                not pending_interrupted or self.checkpoint.output_commit_path.exists()
+            ):
+                report = RecursiveAttributionReport.from_dict(pending_report)
+                if restored_checkpoint.tail_repair_count:
+                    metadata = dict(report.metadata)
+                    metadata["checkpoint_audit"] = {
+                        "tail_repair_count": restored_checkpoint.tail_repair_count,
+                        "tail_repair_events": [
+                            dict(item)
+                            for item in restored_checkpoint.tail_repair_events
+                        ],
+                    }
+                    report = replace(report, metadata=metadata)
+                return report
         if (
             restored_checkpoint is not None
             and restored_checkpoint.frontier_payload
@@ -1611,7 +1662,21 @@ class AgenticRecursiveAnalyzer:
             evidence_hash = str(request.recursive_context.get("evidence_hash") or "")
             provider_action_key = "step:{0}:{1}".format(item.visit_key, evidence_hash)
             replay_action = self._replay_action(state, provider_action_key)
-            if replay_action is not None and replay_action.get("operation") == "provider_call_started":
+            if replay_action is not None and replay_action.get("operation") in {
+                "provider_call_started",
+                "provider_call_failed",
+                "provider_call_interrupted",
+            }:
+                replay_payload = replay_action.get("payload")
+                if not isinstance(replay_payload, Mapping):
+                    raise ValueError("in-flight Provider action payload is invalid")
+                if replay_action.get("operation") == "provider_call_started" or (
+                    replay_action.get("operation") == "provider_call_failed"
+                    and not replay_payload.get("physical_request_exact", False)
+                ):
+                    state.judge_request_uncertainty_count += 1
+                if state.judge_requests >= self.max_judge_requests:
+                    state._increment_budget("judge_requests")
                 state.complete_rejudge(
                     item,
                     terminal_state="interrupted_judge_call",
@@ -1637,6 +1702,7 @@ class AgenticRecursiveAnalyzer:
                 continue
             replayed_judgment: Optional[CausalStepJudgment] = None
             replayed_physical_delta = 0
+            reserved_requests = 0
             if replay_action is not None and replay_action.get("operation") == "provider_call_completed":
                 replay_payload = replay_action.get("payload")
                 if not isinstance(replay_payload, Mapping):
@@ -1645,8 +1711,13 @@ class AgenticRecursiveAnalyzer:
                     dict(replay_payload.get("judgment") or {})
                 )
                 replayed_physical_delta = int(replay_payload.get("physical_request_delta") or 0)
+                reserved_requests = int(
+                    replay_payload.get("physical_requests_reserved") or 0
+                )
             if replay_action is None:
                 state.logical_judge_calls += 1
+                reserved_requests = remaining_requests if bounded_judge else 0
+                state.judge_requests += reserved_requests
                 self._checkpoint_state(state, "provider:before:{0}".format(item.visit_key))
                 self._checkpoint_action(
                     "provider_call_started",
@@ -1656,7 +1727,7 @@ class AgenticRecursiveAnalyzer:
                         "visit_key": item.visit_key,
                         "evidence_hash": evidence_hash,
                         "status": "in_flight",
-                        "physical_requests_reserved": remaining_requests,
+                        "physical_requests_reserved": reserved_requests,
                     },
                 )
             physical_delta = 0
@@ -1681,7 +1752,7 @@ class AgenticRecursiveAnalyzer:
                     judgment = self.judge.judge_step_offline(request)
             except BoundedJudgeCallError as exc:
                 physical_delta = exc.physical_requests
-                state.judge_requests += physical_delta
+                state.judge_requests += physical_delta - reserved_requests
                 state.complete_rejudge(
                     item,
                     terminal_state="judge_error",
@@ -1700,13 +1771,16 @@ class AgenticRecursiveAnalyzer:
                         "call_kind": "step",
                         "visit_key": item.visit_key,
                         "status": "failed",
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
                         "error": "{0}: {1}".format(type(exc).__name__, exc),
                     },
                 )
                 continue
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
-                state.judge_requests += physical_delta
+                if bounded_judge:
+                    state.judge_request_uncertainty_count += 1
                 state.complete_rejudge(
                     item,
                     terminal_state=(
@@ -1734,13 +1808,16 @@ class AgenticRecursiveAnalyzer:
                         "call_kind": "step",
                         "visit_key": item.visit_key,
                         "status": "failed",
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": not bounded_judge,
                         "error": "{0}: {1}".format(type(exc).__name__, exc),
                     },
                 )
                 continue
             except Exception as exc:
-                state.judge_requests += physical_delta
+                if bounded_judge:
+                    state.judge_request_uncertainty_count += 1
                 state.complete_rejudge(
                     item,
                     terminal_state="judge_error",
@@ -1759,12 +1836,14 @@ class AgenticRecursiveAnalyzer:
                         "call_kind": "step",
                         "visit_key": item.visit_key,
                         "status": "failed",
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": not bounded_judge,
                         "error": "{0}: {1}".format(type(exc).__name__, exc),
                     },
                 )
                 continue
-            state.judge_requests += physical_delta
+            state.judge_requests += physical_delta - reserved_requests
             if not isinstance(judgment, CausalStepJudgment):
                 detail = "Judge returned {0}, expected CausalStepJudgment.".format(
                     type(judgment).__name__
@@ -1783,7 +1862,9 @@ class AgenticRecursiveAnalyzer:
                         "call_kind": "step",
                         "visit_key": item.visit_key,
                         "status": "failed",
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
                         "error": detail,
                     },
                 )
@@ -1796,7 +1877,9 @@ class AgenticRecursiveAnalyzer:
                         "call_kind": "step",
                         "visit_key": item.visit_key,
                         "status": "completed",
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
                         "judgment": judgment.to_dict(),
                     },
                 )
@@ -1888,6 +1971,16 @@ class AgenticRecursiveAnalyzer:
         from .trace_improvement import build_recursive_trace_improvement_report
 
         metadata = dict(report.metadata)
+        if (
+            restored_checkpoint is not None
+            and restored_checkpoint.tail_repair_count
+        ):
+            metadata["checkpoint_audit"] = {
+                "tail_repair_count": restored_checkpoint.tail_repair_count,
+                "tail_repair_events": [
+                    dict(item) for item in restored_checkpoint.tail_repair_events
+                ],
+            }
         metadata["trace_improvement_report"] = build_recursive_trace_improvement_report(
             analysis_graph, report
         )
@@ -1897,7 +1990,7 @@ class AgenticRecursiveAnalyzer:
         report = replace(report, metadata=metadata)
         self._checkpoint_state(state, "analysis:final_state")
         self._checkpoint_action(
-            "analysis_interrupted" if interrupted else "analysis_completed",
+            "analysis_ready",
             "analysis:result",
             {"report": report.to_dict(), "interrupted": interrupted},
         )
@@ -1966,7 +2059,16 @@ class AgenticRecursiveAnalyzer:
             replay_action = self._replay_action(state, confirmation_action_key)
             replayed_confirmation: Optional[RootConfirmation] = None
             replayed_physical_delta = 0
-            if replay_action is not None and replay_action.get("operation") == "confirmation_started":
+            replayed_physical_exact = True
+            reserved_requests = 0
+            if replay_action is not None and replay_action.get("operation") in {
+                "confirmation_started",
+                "confirmation_failed",
+            }:
+                if replay_action.get("operation") == "confirmation_started":
+                    state.judge_request_uncertainty_count += 1
+                if state.judge_requests >= self.max_judge_requests:
+                    state._increment_budget("judge_requests")
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
@@ -1999,9 +2101,17 @@ class AgenticRecursiveAnalyzer:
                 replayed_physical_delta = int(
                     replay_payload.get("physical_request_delta") or 0
                 )
+                reserved_requests = int(
+                    replay_payload.get("physical_requests_reserved") or 0
+                )
+                replayed_physical_exact = bool(
+                    replay_payload.get("physical_request_exact", True)
+                )
             if replay_action is None:
                 state.logical_judge_calls += 1
                 state.logical_confirmation_calls += 1
+                reserved_requests = remaining if bounded_judge else 0
+                state.judge_requests += reserved_requests
                 self._checkpoint_state(state, confirmation_action_key)
                 self._checkpoint_action(
                     "confirmation_started",
@@ -2011,14 +2121,16 @@ class AgenticRecursiveAnalyzer:
                         "candidate_ref": request.candidate_ref,
                         "hypothesis_id": request.hypothesis_id,
                         "confirmation_identity": confirmation_action_key.split(":", 1)[1],
-                        "physical_requests_reserved": remaining,
+                        "physical_requests_reserved": reserved_requests,
                     },
                 )
             physical_delta = 0
+            physical_exact = not bounded_judge
             try:
                 if replayed_confirmation is not None:
                     confirmation = replayed_confirmation
                     physical_delta = replayed_physical_delta
+                    physical_exact = replayed_physical_exact
                 elif bounded_judge:
                     bounded_result = self.judge.confirm_candidate_bounded(
                         request, max_physical_requests=remaining
@@ -2028,6 +2140,7 @@ class AgenticRecursiveAnalyzer:
                             "bounded Judge must return BoundedJudgeCallResult"
                         )
                     physical_delta = bounded_result.physical_requests
+                    physical_exact = True
                     if physical_delta > remaining:
                         raise ValueError("bounded Judge exceeded its physical request allowance")
                     raw = bounded_result.value
@@ -2043,6 +2156,7 @@ class AgenticRecursiveAnalyzer:
                     confirmation = bind_root_confirmation(raw, request=request)
             except BoundedJudgeCallError as exc:
                 physical_delta = exc.physical_requests
+                physical_exact = True
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
@@ -2077,14 +2191,19 @@ class AgenticRecursiveAnalyzer:
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
                 )
-            state.judge_requests += physical_delta
+            if physical_exact:
+                state.judge_requests += physical_delta - reserved_requests
+            else:
+                state.judge_request_uncertainty_count += 1
             if replayed_confirmation is None:
                 self._checkpoint_action(
                     "confirmation_completed",
                     confirmation_action_key,
                     {
                         "status": confirmation.status,
+                        "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
+                        "physical_request_exact": physical_exact,
                         "confirmation": confirmation.to_dict(),
                     },
                 )

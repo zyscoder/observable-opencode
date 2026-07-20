@@ -31,6 +31,7 @@ from .checkpoint import (
     CheckpointCorruptionError,
     CheckpointState,
     build_checkpoint_config,
+    publish_output_transaction,
 )
 from .graph import TraceGraph
 from .investigation import (
@@ -80,4 +81,5 @@ __all__ = [
     "semantic_visit_key",
     "confirmation_identity_for",
     "build_checkpoint_config",
+    "publish_output_transaction",
 ]

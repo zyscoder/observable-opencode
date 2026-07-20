@@ -163,41 +163,60 @@ provider responses that failed validation are not stored in the checkpoint.
 
 ### Recursive checkpoint and resume
 
-For `--engine recursive-agentic`, the CLI additionally creates three fsync-backed,
-append-only journals under `<attribution-output-stem>.checkpoint/`:
+For `--engine recursive-agentic`, the CLI creates three fsync-backed, append-only
+journals plus transactional commit manifests under
+`<attribution-output-stem>.checkpoint/`:
 
 ```text
 case.attribution.checkpoint/
   manifest.json
+  commit.json
   frontier.jsonl
   hypotheses.jsonl
   investigation-actions.jsonl
+  output-commit.json
 ```
 
 `frontier.jsonl` preserves queued, in-flight, and completed semantic visits;
 `hypotheses.jsonl` preserves candidate-specific hypotheses and transformed defect state;
 `investigation-actions.jsonl` preserves Judge, investigation, control, confirmation, budget,
-cache identity, and Provider-circuit lifecycle. Every record has an exact schema version,
-monotonic sequence, semantic key, timestamp, previous hash, and record hash. Only a truncated
-final JSON fragment is ignored and counted. Interior corruption, reordering, hash-chain breaks,
-or a stale trace/configuration stop resume with an explicit error.
+cache identity, and Provider-circuit lifecycle. Every record has an immutable run ID, exact
+schema version, journal sequence, globally monotonic transaction sequence, semantic key,
+timestamp, previous hash, and record hash. A recursive state checkpoint appends and fsyncs all
+three members before atomically publishing `commit.json`, which anchors every committed journal
+count and hash. Restore never combines uncommitted members from different snapshots. A deleted
+committed tail, mixed run ID, wrong head, interior corruption, reorder, hash-chain break, or stale
+configuration stops resume with an explicit error.
+
+A parseable final record without its newline is still treated as incomplete. Initialization
+durably repairs its delimiter only when the committed head proves its identity; otherwise it
+truncates the crash tail. Complete records beyond the committed heads are also truncated. Repair
+events and counts are persisted in `commit.json` and exposed as `metadata.checkpoint_audit`.
 
 Resume by running the exact same command. A custom directory can be selected with
 `--checkpoint-dir /path/to/case.checkpoint`. The compatibility fingerprint binds the effective
 Trace (including an injected review), objective, start refs, perspective, every recursive budget,
-model/endpoint/thinking configuration, Provider threshold, and Judge cache path. Changing any of
-those values requires a new checkpoint directory.
+model, effective endpoint, thinking configuration, maximum output tokens, request timeout,
+Provider threshold, and Judge cache path. Changing any of those values requires a new checkpoint
+directory.
 
 Validated completed Judge and confirmation results, completed investigations, physical/logical
 budgets, artifact bytes, and Provider circuit state are replayed without repeating calls. A call
 that has only a durable `*_started` record is conservatively closed as unknown: it is never called
-again and is never treated as a fabricated success.
+again and is never treated as a fabricated success. A bounded Provider allowance is durably
+reserved before crossing the Provider boundary. A completed call reconciles that reservation to
+the exact physical delta; an in-flight call keeps the reservation consumed and increments
+`metadata.judge_request_uncertainty_count`.
 
-SIGINT and SIGTERM use the same graceful behavior. The handler only sets a stop flag; at the next
-safe analysis boundary all three journals are fsynced and an explicit inconclusive/partial
-attribution JSON plus message-lineage JSON is atomically written. The same command can then resume.
-SIGKILL cannot execute a process handler, so recovery is limited to the last record already fsynced
-before the kill. No claim is made that in-memory work after that record survived.
+SIGINT and SIGTERM use the same graceful behavior. The handler only sets a stop flag and remains
+installed through output publication. At the next safe analysis boundary all journals are fsynced
+and an explicit inconclusive/partial report is prepared. The attribution and message-lineage files
+are both staged and fsynced, then published under the recoverable `output-commit.json` transaction;
+only after both files and their directories are durable is `analysis_completed` committed. A crash
+between output files or before the completion marker is repaired by the same resume command.
+SIGKILL cannot execute a process handler. Recovery is limited to the last journal or output
+transaction state already fsynced before the kill; no SIGKILL handler or survival of in-memory work
+is claimed.
 
 Recursive outputs are deterministic relative to `--out` unless overridden:
 
