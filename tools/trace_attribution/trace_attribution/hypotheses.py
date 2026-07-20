@@ -191,10 +191,17 @@ class HypothesisLedger:
         ledger = cls()
         for value in snapshot:
             hypothesis = AttributionHypothesis.from_dict(dict(value))
+            cls._validate_snapshot_evidence(hypothesis.supporting_evidence)
+            cls._validate_snapshot_evidence(hypothesis.opposing_evidence)
             if hypothesis.hypothesis_id in ledger._items:
                 raise ValueError("duplicate hypothesis in ledger snapshot")
             ledger._items[hypothesis.hypothesis_id] = hypothesis
         return ledger
+
+    @staticmethod
+    def _validate_snapshot_evidence(items: Tuple[HypothesisEvidence, ...]) -> None:
+        if tuple(items) != dedupe_evidence(items):
+            raise ValueError("hypothesis snapshot contains noncanonical evidence")
 
     def _replace_item(
         self, previous_hypothesis_id: str, updated: AttributionHypothesis
@@ -324,7 +331,8 @@ class RecursiveFrontier:
             raise ValueError("frontier checkpoint must be a mapping")
         if checkpoint.get("schema") != FRONTIER_CHECKPOINT_SCHEMA:
             raise ValueError("unsupported frontier checkpoint schema")
-        if checkpoint.get("version") != FRONTIER_CHECKPOINT_VERSION:
+        version = checkpoint.get("version")
+        if type(version) is not int or version != FRONTIER_CHECKPOINT_VERSION:
             raise ValueError("unsupported frontier checkpoint version")
         for section in ("queued", "in_flight", "completed"):
             if section not in checkpoint:

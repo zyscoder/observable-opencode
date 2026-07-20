@@ -110,6 +110,48 @@ class HypothesisLedgerTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             ledger.add_unresolved_question(hypothesis.hypothesis_id, "Were call sites searched?")
 
+    def test_snapshot_rejects_noncanonical_or_duplicate_evidence(self):
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root", "record:decision", sample_defect_state()
+        )
+        snapshot = ledger.snapshot()
+
+        for field in ("supporting_evidence", "opposing_evidence"):
+            payload = dict(snapshot[0])
+            payload[field] = [
+                {
+                    "ref": " record:decision ",
+                    "reason": " Plan   declares completion ",
+                    "confidence": 0.4,
+                },
+                {
+                    "ref": "record:decision",
+                    "reason": "plan declares completion",
+                    "confidence": 0.9,
+                },
+            ]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "canonical evidence"):
+                    HypothesisLedger.from_snapshot([payload])
+
+    def test_snapshot_rejects_whitespace_polluted_evidence_ref(self):
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root", "record:decision", sample_defect_state()
+        )
+        payload = dict(ledger.snapshot()[0])
+        payload["supporting_evidence"] = [
+            {
+                "ref": " record:decision ",
+                "reason": "Plan declares completion",
+                "confidence": 0.9,
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "canonical evidence"):
+            HypothesisLedger.from_snapshot([payload])
+
     def test_explicit_frontier_transition_migrates_queued_item_identity(self):
         ledger = HypothesisLedger()
         frontier = RecursiveFrontier()
@@ -316,6 +358,20 @@ class RecursiveFrontierTest(unittest.TestCase):
             RecursiveFrontier.from_checkpoint(unknown_version)
 
         self.assertFalse(frontier.push(completed))
+
+    def test_checkpoint_version_must_be_the_exact_supported_integer(self):
+        checkpoint = RecursiveFrontier().checkpoint()
+        invalid_versions = (True, 1.0, "1", None, 2)
+
+        for version in invalid_versions:
+            payload = dict(checkpoint)
+            if version is None:
+                payload.pop("version")
+            else:
+                payload["version"] = version
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "version"):
+                    RecursiveFrontier.from_checkpoint(payload)
 
     def test_corrupt_checkpoint_and_reopen_rollback_preserve_completed_state(self):
         frontier = RecursiveFrontier()
