@@ -980,6 +980,7 @@ class RecursiveAttributionReport:
     taint_paths: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
     visited_order: Tuple[str, ...] = field(default_factory=tuple)
     unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
+    investigation_journal: Tuple[JsonDict, ...] = field(default_factory=tuple)
     metadata: JsonDict = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
@@ -1003,6 +1004,11 @@ class RecursiveAttributionReport:
         object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
         object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
         object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
+        object.__setattr__(
+            self,
+            "investigation_journal",
+            tuple(FrozenMapping(_thaw(item)) for item in self.investigation_journal),
+        )
         object.__setattr__(self, "metadata", FrozenMapping(_thaw(self.metadata)))
         confirmed_root_refs = {item.node_ref for item in (*self.confirmed_roots, *self.co_roots)}
         overlapping_refs = confirmed_root_refs.intersection(self.unresolved_refs)
@@ -1058,6 +1064,7 @@ class RecursiveAttributionReport:
             "taint_paths": [list(path) for path in self.taint_paths],
             "visited_order": list(self.visited_order),
             "unresolved_refs": list(self.unresolved_refs),
+            "investigation_journal": [_thaw(item) for item in self.investigation_journal],
             "metadata": _thaw(self.metadata),
         }
 
@@ -1092,6 +1099,11 @@ class RecursiveAttributionReport:
             taint_paths=[_string_list(path) for path in value.get("taint_paths", []) if isinstance(path, list)],
             visited_order=_string_list(value.get("visited_order")),
             unresolved_refs=_string_list(value.get("unresolved_refs")),
+            investigation_journal=tuple(
+                item
+                for item in value.get("investigation_journal", [])
+                if isinstance(item, dict)
+            ),
             metadata=_json_dict(value.get("metadata")),
         )
 

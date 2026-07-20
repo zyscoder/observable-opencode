@@ -28,6 +28,12 @@ from .causal_state import (
 from .errors import JudgeProviderError, JudgeProviderUnavailable
 from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
+from .investigation import (
+    AttributionControlDirective,
+    CausalInvestigationTools,
+    InvestigationDirective,
+    InvestigationResult,
+)
 from .judgment_context import build_recursive_judgment_context
 from .models import JsonDict, TraceNode, stable_json
 
@@ -203,6 +209,11 @@ class RecursiveAnalysisState:
     judge_requests: int = 0
     logical_judge_calls: int = 0
     investigation_rounds: int = 0
+    investigation_journal: List[JsonDict] = field(default_factory=list)
+    investigation_evidence: Dict[str, List[JsonDict]] = field(default_factory=dict)
+    investigation_evidence_hashes: Dict[str, Set[str]] = field(default_factory=dict)
+    control_directive_ids: Set[str] = field(default_factory=set)
+    confirmation_queue: List[JsonDict] = field(default_factory=list)
     seed_count: int = 0
 
     @classmethod
@@ -348,6 +359,9 @@ class RecursiveAnalysisState:
         context["active_hypothesis_id"] = hypothesis.hypothesis_id
         context["active_visit_key"] = item.visit_key
         context["checked_evidence_refs"] = sorted(self.visit_evidence.get(item.visit_key, set()))
+        investigated = self.investigation_evidence.get(item.visit_key, [])
+        if investigated:
+            context["investigation_evidence"] = copy.deepcopy(investigated)
         context["evidence_hash"] = hashlib.sha256(
             stable_json(context).encode("utf-8")
         ).hexdigest()
@@ -357,6 +371,35 @@ class RecursiveAnalysisState:
             defect_state=item.defect_state,
             candidates=tuple(candidates),
         )
+
+    def record_investigation_result(
+        self,
+        item: FrontierItem,
+        directive: InvestigationDirective,
+        result: InvestigationResult,
+    ) -> bool:
+        journal = {**directive.to_dict(), **result.to_dict()}
+        self.investigation_journal.append(journal)
+        if result.status != "success":
+            return False
+        seen = self.investigation_evidence_hashes.setdefault(item.visit_key, set())
+        if result.evidence_hash in seen:
+            return False
+        seen.add(result.evidence_hash)
+        self.investigation_evidence.setdefault(item.visit_key, []).append(result.to_dict())
+        self._merge_visit_evidence(item.visit_key, result.resolved_refs)
+        return True
+
+    def record_intermediate_judgment(
+        self, item: FrontierItem, judgment: CausalStepJudgment
+    ) -> str:
+        if self.investigation_journal:
+            self.investigation_journal[-1][
+                "judgment_before_investigation"
+            ] = judgment.to_dict()
+        return hashlib.sha256(
+            stable_json(judgment.to_dict()).encode("utf-8")
+        ).hexdigest()
 
     def reserve_artifact_bytes(self, request: CausalStepRequest, limit: int) -> bool:
         new_payloads: Dict[str, bytes] = {}
@@ -646,6 +689,9 @@ class RecursiveAnalysisState:
             "logical_judge_call_count": self.logical_judge_calls,
             "artifact_bytes": self.artifact_bytes,
             "investigation_rounds": self.investigation_rounds,
+            "investigation_budget_exhausted": bool(
+                self.exhausted_budgets.get("investigation_rounds")
+            ),
             "exhausted_budgets": dict(sorted(self.exhausted_budgets.items())),
             "unresolved_branches": list(self.unresolved_branches),
             "merged_visit_evidence": merged,
@@ -654,6 +700,7 @@ class RecursiveAnalysisState:
             "hypothesis_snapshot": self.ledger.snapshot(),
             "provider_circuit": provider,
             "independent_confirmation": "deferred_to_task_7",
+            "confirmation_queue": list(self.confirmation_queue),
         }
         return RecursiveAttributionReport(
             case_id=self.graph.case_id,
@@ -673,6 +720,7 @@ class RecursiveAnalysisState:
             taint_paths=tuple(dict.fromkeys(self.taint_paths)),
             visited_order=_dedupe_strings(self.visited_order),
             unresolved_refs=_dedupe_strings(self.unresolved_refs),
+            investigation_journal=tuple(self.investigation_journal),
             metadata=metadata,
         )
 
@@ -749,6 +797,7 @@ class AgenticRecursiveAnalyzer:
         *,
         judge: CausalJudge,
         retriever: Optional[SemanticPredecessorRetriever] = None,
+        tools: Optional[CausalInvestigationTools] = None,
         max_frontier_items: int = 96,
         max_depth: int = 20,
         max_hypotheses: int = 24,
@@ -758,6 +807,7 @@ class AgenticRecursiveAnalyzer:
     ) -> None:
         self.judge = judge
         self.retriever = retriever or SemanticPredecessorRetriever()
+        self.tools = tools
         self.max_frontier_items = max(0, int(max_frontier_items))
         self.max_depth = max(0, int(max_depth))
         self.max_hypotheses = max(0, int(max_hypotheses))
@@ -783,6 +833,15 @@ class AgenticRecursiveAnalyzer:
             objective=objective,
             analysis_perspective=analysis_perspective,
             max_hypotheses=self.max_hypotheses,
+        )
+        tools = (
+            self.tools.for_graph(
+                analysis_graph, max_artifact_bytes=self.max_artifact_bytes
+            )
+            if self.tools is not None
+            else CausalInvestigationTools(
+                analysis_graph, max_artifact_bytes=self.max_artifact_bytes
+            )
         )
         if not requested_starts:
             state._mark_seed_unresolved(
@@ -889,23 +948,22 @@ class AgenticRecursiveAnalyzer:
                 for detail in judgment.missing_evidence
             ):
                 state._increment_budget("judge_requests")
+            if judgment.suggested_investigation is not None:
+                handled = self._handle_investigation(
+                    state=state,
+                    tools=tools,
+                    item=item,
+                    judgment=judgment,
+                    request=request,
+                )
+                if handled in {"reopened", "completed"}:
+                    continue
             state.apply_step(
                 item,
                 judgment,
                 graph_position=analysis_graph.position,
                 max_hypotheses=self.max_hypotheses,
             )
-            if judgment.suggested_investigation is not None:
-                if state.investigation_rounds >= self.max_investigation_rounds:
-                    state._increment_budget("investigation_rounds")
-                else:
-                    state.investigation_rounds += 1
-                state._mark_ref_unresolved(
-                    item.node_ref,
-                    item,
-                    "investigation_deferred",
-                    "Bounded investigation tools are introduced in Task 6.",
-                )
 
         if state.frontier:
             while state.frontier:
@@ -917,6 +975,229 @@ class AgenticRecursiveAnalyzer:
                     exhausted_budget="frontier_items",
                 )
         return state.build_report(judge=self.judge)
+
+    def _handle_investigation(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        tools: CausalInvestigationTools,
+        item: FrontierItem,
+        judgment: CausalStepJudgment,
+        request: CausalStepRequest,
+    ) -> str:
+        suggestion = judgment.suggested_investigation
+        if not isinstance(suggestion, Mapping):
+            return "not_handled"
+        if suggestion.get("action"):
+            self._apply_control_directive(state, item, suggestion)
+            return "control"
+        try:
+            directive = InvestigationDirective.from_suggestion(
+                suggestion,
+                requested_by_ref=item.node_ref,
+                hypothesis_id=item.hypothesis_id,
+            )
+        except ValueError as exc:
+            state.investigation_journal.append(
+                {
+                    "directive_kind": "evidence_investigation",
+                    "tool_name": str(
+                        suggestion.get("tool") or suggestion.get("tool_name") or ""
+                    ),
+                    "status": "rejected",
+                    "requested_by_ref": item.node_ref,
+                    "hypothesis_id": item.hypothesis_id,
+                    "rejection_reason": "invalid_investigation_directive: {0}".format(exc),
+                }
+            )
+            state._mark_ref_unresolved(
+                item.node_ref,
+                item,
+                "investigation_rejected",
+                str(exc),
+            )
+            return "rejected"
+        if not self._evidence_investigation_eligible(judgment, request, suggestion):
+            result = InvestigationResult.rejected(
+                directive, "investigation_not_evidence_eligible"
+            )
+            state.record_investigation_result(item, directive, result)
+            return "rejected"
+        if state.investigation_rounds >= self.max_investigation_rounds:
+            state._increment_budget("investigation_rounds")
+            result = InvestigationResult.rejected(
+                directive, "investigation_round_budget_exhausted"
+            )
+            state.record_investigation_result(item, directive, result)
+            state._mark_ref_unresolved(
+                item.node_ref,
+                item,
+                "investigation_budget_exhausted",
+                "The exact investigation round budget is exhausted.",
+            )
+            return "exhausted"
+        state.investigation_rounds += 1
+        tools.max_artifact_bytes = tools.artifact_bytes_used + max(
+            0, self.max_artifact_bytes - state.artifact_bytes
+        )
+        result = tools.execute(directive)
+        if result.status == "success" and result.byte_count:
+            state.artifact_bytes += result.byte_count
+        changed = state.record_investigation_result(item, directive, result)
+        if changed:
+            judgment_hash = state.record_intermediate_judgment(item, judgment)
+            state.frontier.mark_completed(item, judgment_hash)
+            reopened = state.frontier.reopen(
+                item,
+                evidence_hash=result.evidence_hash,
+                reason="investigation_evidence_changed",
+            )
+            if reopened:
+                return "reopened"
+            state._mark_ref_unresolved(
+                item.node_ref,
+                item,
+                "investigation_reentry_failed",
+                "Changed evidence could not reopen the completed semantic visit.",
+            )
+            return "completed"
+        reason = (
+            "investigation_unchanged"
+            if result.status == "unchanged"
+            else "investigation_rejected"
+        )
+        if result.rejection_reason == "artifact_byte_budget_exhausted":
+            state._increment_budget("artifact_bytes")
+            reason = "artifact_byte_limit"
+        state._mark_ref_unresolved(
+            item.node_ref,
+            item,
+            reason,
+            result.rejection_reason or result.error or "No new grounded evidence was produced.",
+        )
+        return "unchanged"
+
+    @staticmethod
+    def _evidence_investigation_eligible(
+        judgment: CausalStepJudgment,
+        request: CausalStepRequest,
+        suggestion: Mapping[str, Any],
+    ) -> bool:
+        if judgment.current_defect_status == "unknown" or judgment.missing_evidence:
+            return True
+        if any(
+            item.relation == "unknown" or item.missing_evidence
+            for item in judgment.predecessors
+        ):
+            return True
+        context = request.recursive_context
+        if any(
+            context.get(key)
+            for key in ("missing_artifacts", "truncated_artifacts", "unresolved_references")
+        ):
+            return True
+        return str(suggestion.get("evidence_state") or "") in {
+            "conflicting",
+            "truncated",
+            "missing",
+            "unknown",
+        }
+
+    def _apply_control_directive(
+        self,
+        state: RecursiveAnalysisState,
+        item: FrontierItem,
+        suggestion: Mapping[str, Any],
+    ) -> None:
+        try:
+            directive = AttributionControlDirective.from_suggestion(
+                suggestion, requested_by_ref=item.node_ref
+            )
+        except ValueError as exc:
+            state.investigation_journal.append(
+                {
+                    "directive_kind": "attribution_control",
+                    "action": str(suggestion.get("action") or ""),
+                    "status": "rejected",
+                    "requested_by_ref": item.node_ref,
+                    "rejection_reason": "invalid_control_directive: {0}".format(exc),
+                }
+            )
+            return
+        if directive.directive_id in state.control_directive_ids:
+            state.investigation_journal.append(
+                {**directive.to_dict(), "status": "unchanged", "rejection_reason": "duplicate_control_directive"}
+            )
+            return
+        state.control_directive_ids.add(directive.directive_id)
+        before = state.ledger.snapshot()
+        arguments = directive.arguments
+        status = "applied"
+        rejection_reason = ""
+        try:
+            if directive.action == "record_hypothesis":
+                if len(before) >= self.max_hypotheses:
+                    raise ValueError("hypothesis budget exhausted")
+                candidate_ref = str(arguments["candidate_ref"])
+                resolved = state.graph.resolve(candidate_ref)
+                if not resolved:
+                    raise ValueError("candidate_ref is unresolved")
+                state.ledger.create(
+                    str(arguments["claim"]), resolved, item.defect_state
+                )
+            elif directive.action == "reject_hypothesis":
+                hypothesis_id = str(arguments["hypothesis_id"])
+                if hypothesis_id == "active":
+                    hypothesis_id = item.hypothesis_id
+                opposing = tuple(
+                    str(ref) for ref in arguments.get("opposing_evidence_refs") or []
+                )
+                resolved = [state.graph.resolve(ref) for ref in opposing]
+                if opposing and any(ref is None for ref in resolved):
+                    raise ValueError("opposing evidence contains unresolved refs")
+                for ref in resolved:
+                    state.ledger.add_opposition(
+                        hypothesis_id,
+                        str(ref),
+                        directive.reason,
+                        1.0,
+                    )
+                state.ledger.reject(hypothesis_id, directive.reason)
+            elif directive.action == "request_root_confirmation":
+                hypothesis_id = str(arguments["hypothesis_id"])
+                if hypothesis_id == "active":
+                    hypothesis_id = item.hypothesis_id
+                state.ledger.get(hypothesis_id)
+                candidate_ref = state.graph.resolve(str(arguments["candidate_ref"]))
+                if not candidate_ref:
+                    raise ValueError("candidate_ref is unresolved")
+                state.confirmation_queue.append(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "candidate_ref": candidate_ref,
+                        "requested_by_ref": item.node_ref,
+                        "status": "pending_task_7_independent_confirmation",
+                    }
+                )
+                status = "deferred"
+        except (KeyError, ValueError) as exc:
+            status = "rejected"
+            rejection_reason = str(exc)
+        state.investigation_journal.append(
+            {
+                **directive.to_dict(),
+                "status": status,
+                "rejection_reason": rejection_reason,
+                "ledger_before": before,
+                "ledger_after": state.ledger.snapshot(),
+                "ledger_before_hash": hashlib.sha256(
+                    stable_json(before).encode("utf-8")
+                ).hexdigest(),
+                "ledger_after_hash": hashlib.sha256(
+                    stable_json(state.ledger.snapshot()).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
 
 
 __all__ = ["AgenticRecursiveAnalyzer", "RecursiveAnalysisState"]
