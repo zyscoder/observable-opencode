@@ -221,6 +221,37 @@ class RecursiveCliTest(unittest.TestCase):
                 bundle.restore(expected_config=output_config()).final_report, report
             )
 
+    def test_completion_rejects_report_different_from_published_attribution(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle = CheckpointBundle(root / "case.checkpoint")
+            bundle.initialize(output_config())
+            published = {
+                "case_id": "output-case",
+                "analysis_outcome": "inconclusive",
+            }
+            output_commit = publish_output_transaction(
+                bundle=bundle,
+                attribution_path=root / "attribution.json",
+                lineage_path=root / "lineage.json",
+                report=published,
+                message_lineage={"turns": []},
+            )
+            actions_before = len(
+                bundle.restore(expected_config=output_config()).actions
+            )
+            with self.assertRaises(ValueError):
+                bundle.mark_analysis_completed(
+                    report={
+                        "case_id": "output-case",
+                        "analysis_outcome": "no_defect",
+                    },
+                    output_commit=output_commit,
+                )
+            restored = bundle.restore(expected_config=output_config())
+            self.assertIsNone(restored.final_report)
+            self.assertEqual(len(restored.actions), actions_before)
+
     def test_signal_between_output_publications_does_not_split_transaction(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

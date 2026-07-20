@@ -4,10 +4,16 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from trace_attribution.causal_judge import BoundedJudgeCapability, OfflineJudgeCapability
+from trace_attribution.causal_judge import (
+    BoundedJudgeCallError,
+    BoundedJudgeCallResult,
+    BoundedJudgeCapability,
+    OfflineJudgeCapability,
+)
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     RecursiveAttributionReport,
@@ -118,6 +124,130 @@ class InterruptingBoundedJudge(BoundedJudgeCapability):
 
     def confirm_candidate_bounded(self, request, *, max_physical_requests):
         raise AssertionError("confirmation is not expected")
+
+
+class ExactFailureJudge(BoundedJudgeCapability):
+    def __init__(self) -> None:
+        self.step_calls = 0
+        self.provider_circuit_open = False
+        self.provider_circuit_reason = ""
+        self.consecutive_provider_errors = 0
+        self.provider_error_threshold = 3
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_calls += 1
+        raise BoundedJudgeCallError("exact step failure", physical_requests=1)
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        raise AssertionError("confirmation is not expected")
+
+
+class ExactRejudgeFailureJudge(ExactFailureJudge):
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_calls += 1
+        if self.step_calls > 1:
+            raise BoundedJudgeCallError("exact rejudge failure", physical_requests=1)
+        return BoundedJudgeCallResult(
+            CausalStepJudgment(
+                current_node_ref=request.current_node.ref,
+                current_defect_status="unknown",
+                current_defect_reason="Inspect the local node before deciding.",
+                predecessors=(),
+                candidate_introduction=False,
+                missing_evidence=("inspect current node",),
+                suggested_investigation={
+                    "tool": "inspect_node",
+                    "arguments": {"ref": request.current_node.ref},
+                    "reason": "Resolve current node semantics.",
+                },
+                confidence=0.2,
+            ),
+            1,
+        )
+
+
+class ExactConfirmationFailureJudge(ExactFailureJudge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.confirmation_calls = 0
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_calls += 1
+        return BoundedJudgeCallResult(
+            CausalStepJudgment(
+                current_node_ref=request.current_node.ref,
+                current_defect_status="present",
+                current_defect_reason="The answer is incomplete.",
+                predecessors=(),
+                candidate_introduction=True,
+                suggested_investigation={
+                    "action": "request_root_confirmation",
+                    "arguments": {
+                        "hypothesis_id": request.recursive_context[
+                            "active_hypothesis_id"
+                        ],
+                        "candidate_ref": request.current_node.ref,
+                        "defect_fingerprint": request.defect_state.fingerprint,
+                    },
+                    "reason": "Confirm the introduction candidate.",
+                },
+                confidence=0.9,
+            ),
+            1,
+        )
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        self.confirmation_calls += 1
+        raise BoundedJudgeCallError(
+            "exact confirmation failure", physical_requests=1
+        )
+
+
+class CrashAfterDurableAction(CheckpointBundle):
+    def __init__(self, root, *, operation):
+        super().__init__(root)
+        self.operation = operation
+
+    def record_action(self, operation, semantic_key, payload):
+        record = super().record_action(operation, semantic_key, payload)
+        if operation == self.operation:
+            raise KeyboardInterrupt("crash after durable action")
+        return record
+
+
+class ResettingSuccessJudge(BoundedJudgeCapability):
+    def __init__(self, *, errors=2) -> None:
+        self.step_calls = 0
+        self.provider_circuit_open = False
+        self.provider_circuit_reason = ""
+        self.consecutive_provider_errors = errors
+        self.provider_error_threshold = 3
+
+    def judge_step_bounded(self, request, *, max_physical_requests):
+        self.step_calls += 1
+        self.consecutive_provider_errors = 0
+        return BoundedJudgeCallResult(
+            CausalStepJudgment(
+                current_node_ref=request.current_node.ref,
+                current_defect_status="absent",
+                current_defect_reason="No defect.",
+                predecessors=(),
+                candidate_introduction=False,
+                confidence=1.0,
+            ),
+            1,
+        )
+
+    def confirm_candidate_bounded(self, request, *, max_physical_requests):
+        raise AssertionError("confirmation is not expected")
+
+
+class CrashAfterFrontierCompleteSnapshot(CheckpointBundle):
+    def commit_snapshot(self, **kwargs):
+        commit = super().commit_snapshot(**kwargs)
+        if kwargs["semantic_key"] == "analysis:frontier_complete":
+            raise KeyboardInterrupt("crash immediately after the global snapshot")
+        return commit
 
 
 class InvestigationJudge(CountingOfflineJudge):
@@ -637,6 +767,146 @@ class CausalCheckpointTest(unittest.TestCase):
             self.assertEqual(report.metadata["judge_request_uncertainty_count"], 1)
             self.assertGreaterEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
 
+    def test_exact_failed_step_replays_terminal_semantics_and_exact_debit(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            budgets = dict(sample_config()["budgets"])
+            budgets["max_judge_requests"] = 5
+            config = sample_config(budgets=budgets)
+            graph = TraceGraph.from_trace(sample_trace())
+            uninterrupted = AgenticRecursiveAnalyzer(
+                judge=ExactFailureJudge(), max_judge_requests=5
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            root = Path(tempdir) / "case.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=ExactFailureJudge(),
+                    max_judge_requests=5,
+                    checkpoint=CrashAfterDurableAction(
+                        root, operation="provider_call_failed"
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    graph,
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+            resumed_judge = ExactFailureJudge()
+            resumed = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                max_judge_requests=5,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+            self.assertEqual(resumed.metadata["physical_judge_request_count"], 1)
+            self.assertEqual(
+                resumed.metadata["unresolved_branches"][0]["reason"], "judge_error"
+            )
+
+    def test_exact_failed_rejudge_replays_without_becoming_interrupted(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            budgets = dict(sample_config()["budgets"])
+            budgets["max_judge_requests"] = 5
+            config = sample_config(budgets=budgets)
+            graph = TraceGraph.from_trace(sample_trace())
+            uninterrupted = AgenticRecursiveAnalyzer(
+                judge=ExactRejudgeFailureJudge(), max_judge_requests=5
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            root = Path(tempdir) / "case.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=ExactRejudgeFailureJudge(),
+                    max_judge_requests=5,
+                    checkpoint=CrashAfterDurableAction(
+                        root, operation="provider_call_failed"
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    graph,
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+            resumed_judge = ExactRejudgeFailureJudge()
+            resumed = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                max_judge_requests=5,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+            self.assertEqual(resumed.metadata["physical_judge_request_count"], 2)
+
+    def test_exact_failed_confirmation_replays_exact_unknown_result(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            budgets = dict(sample_config()["budgets"])
+            budgets["max_judge_requests"] = 5
+            config = sample_config(budgets=budgets)
+            graph = TraceGraph.from_trace(sample_trace())
+            uninterrupted = AgenticRecursiveAnalyzer(
+                judge=ExactConfirmationFailureJudge(), max_judge_requests=5
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            root = Path(tempdir) / "case.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=ExactConfirmationFailureJudge(),
+                    max_judge_requests=5,
+                    checkpoint=CrashAfterDurableAction(
+                        root, operation="confirmation_completed"
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    graph,
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+            resumed_judge = ExactConfirmationFailureJudge()
+            resumed = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                max_judge_requests=5,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(resumed_judge.confirmation_calls, 0)
+            self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+            self.assertEqual(resumed.metadata["physical_judge_request_count"], 2)
+
     def test_resume_never_repeats_an_inflight_investigation(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"
@@ -756,6 +1026,95 @@ class CausalCheckpointTest(unittest.TestCase):
             self.assertEqual(resumed_judge.step_calls, 0)
             self.assertTrue(report.metadata["provider_circuit"]["open"])
             self.assertEqual(resumed_judge.consecutive_provider_errors, 3)
+
+    def test_provider_state_is_atomic_with_recursive_snapshot(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            budgets = dict(sample_config()["budgets"])
+            budgets["max_judge_requests"] = 5
+            config = sample_config(budgets=budgets)
+            graph = TraceGraph.from_trace(sample_trace())
+            uninterrupted = AgenticRecursiveAnalyzer(
+                judge=ResettingSuccessJudge(), max_judge_requests=5
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            root = Path(tempdir) / "case.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=ResettingSuccessJudge(),
+                    max_judge_requests=5,
+                    checkpoint=CrashAfterFrontierCompleteSnapshot(root),
+                    checkpoint_config=config,
+                ).analyze(
+                    graph,
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            snapshot = next(
+                item
+                for item in reversed(restored.actions)
+                if item["operation"] == "state_snapshot"
+            )
+            self.assertIn("provider_state", snapshot["payload"])
+            self.assertFalse(
+                any(item["operation"] == "provider_state" for item in restored.actions)
+            )
+
+            resumed_judge = ResettingSuccessJudge(errors=99)
+            resumed = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                max_judge_requests=5,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(resumed_judge.consecutive_provider_errors, 0)
+            self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+
+    def test_recursive_restore_rejects_missing_or_mismatched_provider_state(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config()
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+                stop_requested=lambda: True,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            for mutation in ("missing", "identity"):
+                with self.subTest(mutation=mutation):
+                    actions = json.loads(json.dumps(restored.actions))
+                    snapshot = next(
+                        item
+                        for item in reversed(actions)
+                        if item["operation"] == "state_snapshot"
+                    )
+                    if mutation == "missing":
+                        snapshot["payload"].pop("provider_state")
+                    else:
+                        snapshot["payload"]["provider_state"]["identity"] = "0" * 64
+                    with self.assertRaises(ValueError):
+                        RecursiveAnalysisState.from_checkpoint(
+                            graph=TraceGraph.from_trace(sample_trace()),
+                            checkpoint=replace(restored, actions=tuple(actions)),
+                        )
 
     def test_final_state_resume_does_not_repeat_an_already_recorded_confirmation(self):
         with tempfile.TemporaryDirectory() as tempdir:

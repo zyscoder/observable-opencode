@@ -458,6 +458,17 @@ class CheckpointBundle:
             path = Path(str(validated[path_key]))
             if not path.is_file() or _file_sha256(path) != validated[hash_key]:
                 raise CheckpointCorruptionError("published output is missing or changed")
+        report_bytes = _json_bytes(report)
+        report_hash = hashlib.sha256(report_bytes).hexdigest()
+        if report_hash != validated["attribution_hash"]:
+            raise CheckpointCorruptionError(
+                "completion report does not match published attribution"
+            )
+        attribution_path = Path(str(validated["attribution_path"]))
+        if attribution_path.read_bytes() != report_bytes:
+            raise CheckpointCorruptionError(
+                "completion report bytes do not match published attribution"
+            )
         return self.record_action(
             "analysis_completed",
             "analysis:result",
@@ -466,6 +477,9 @@ class CheckpointBundle:
                 "interrupted": False,
                 "output_transaction_id": validated["transaction_id"],
                 "output_commit_hash": validated["output_commit_hash"],
+                "attribution_hash": validated["attribution_hash"],
+                "lineage_hash": validated["lineage_hash"],
+                "lineage_path": validated["lineage_path"],
             },
         )
 
@@ -1008,7 +1022,9 @@ def _read_exact_json(path: Path, label: str) -> JsonDict:
 
 
 def _json_bytes(value: Mapping[str, Any]) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
 
 
 def _write_staged_file(path: Path, content: bytes) -> None:

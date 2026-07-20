@@ -5,6 +5,8 @@
 - Base Task 8 commit: `76ec68f23`.
 - Hardened the recursive checkpoint after the independent review's five P1 and two P2
   findings.
+- Closed the follow-up re-review's three remaining P1 consistency findings on top of
+  `81c8ffe3f36d79e54bf4c7eade9d8df004f75ec7`.
 - Kept `legacy` as the default engine and preserved all Task 1-7 report, Judge,
   investigation, confirmation, cache, and output compatibility behavior.
 - Added no dependency, network request, shell execution, or mutation of the input Trace,
@@ -37,6 +39,14 @@ production changes:
     accepted.
 13. Individually committed frontier, hypotheses, and action snapshots from different
     transactions could be assembled into one recursive state.
+14. A durable exact `provider_call_failed` restored as an interrupted call, retaining
+    the full reservation and changing the original terminal reason. The failing probes
+    covered initial step, investigation rejudge, and root confirmation paths.
+15. Provider circuit/cache/accounting identity was published after the three-member
+    recursive snapshot, allowing a crash to pair current frontier state with stale
+    Provider control state.
+16. `mark_analysis_completed` accepted report B after output transaction A was durably
+    published because it did not bind the report argument to the attribution bytes.
 
 ## WAL Protocol
 
@@ -64,12 +74,22 @@ production changes:
   before crossing the Provider boundary.
 - A durable exact result reconciles the reservation to the actual physical delta without
   double charging, including cache-hit zero deltas and typed bounded failures.
+- A durable exact failed step or rejudge is terminal replay state, not in-flight state.
+  Resume restores its original terminal/unresolved reason, exact physical delta, and
+  Provider circuit state without another Provider call. Exact failed confirmation is
+  likewise replayed from its completed unknown confirmation result.
 - A lone started call is never repeated and never fabricated as successful. Its
   reservation remains consumed, its result becomes explicit unknown, and
   `judge_request_uncertainty_count` is incremented. The same policy applies to recursive
   step/rejudge and root confirmation boundaries.
 - Local investigations retain their existing started/completed replay policy and do not
   consume Provider request budget.
+- Provider circuit, cache identity/statistics, and accounting are identity-bound inside
+  the action member of the same global snapshot transaction as frontier and hypotheses.
+  Missing provider state, a mismatched identity, cache identity drift, or snapshot
+  accounting mismatch rejects restore. Historical Provider-result payloads retain
+  strict schema/type/identity validation while allowing recursive accounting to have
+  advanced monotonically through later investigation work.
 
 ## Output Transaction And Signals
 
@@ -80,6 +100,10 @@ production changes:
 - Resume repairs a crash after the first output, after both replacements, or before the
   completion marker. Only after both final files and directories validate does the CLI
   append `analysis_completed`.
+- Completion canonical-serializes the supplied report to the exact deterministic bytes
+  used by output publication, requires that hash and bytes to equal the published
+  attribution, and records attribution, lineage, output transaction, and output commit
+  identities together. A mismatch raises before any completion journal side effect.
 - SIGINT and SIGTERM share one stop flag whose handler remains installed through output
   publication. A signal between the two publications cannot split the transaction.
   Interrupted analyses publish explicit partial/inconclusive outputs and remain
@@ -96,9 +120,9 @@ Changing any of them requires a new checkpoint directory.
 
 ## Verification
 
-- Checkpoint and recursive CLI adversarial suite: **35 passed**.
-- Checkpoint/CLI/recursive/legacy focused suite: **203 passed**.
-- Complete offline suite: **386 passed**.
+- Checkpoint and recursive CLI adversarial suite: **41 passed**.
+- Checkpoint/CLI/recursive/legacy focused suite: **209 passed**.
+- Complete offline suite: **392 passed**.
 - Isolated `py_compile`: passed.
 - `git diff --check`: passed.
 

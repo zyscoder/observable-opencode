@@ -55,7 +55,30 @@ EVALUATION_START_EVENTS = frozenset(
 )
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v1"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v2"
+PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
+PROVIDER_STATE_KEYS = {
+    "schema",
+    "circuit",
+    "cache_identity",
+    "cache_stats",
+    "accounting",
+    "identity",
+}
+PROVIDER_CIRCUIT_KEYS = {
+    "open",
+    "reason",
+    "consecutive_provider_errors",
+    "provider_error_threshold",
+}
+PROVIDER_ACCOUNTING_KEYS = {
+    "judge_requests",
+    "judge_request_uncertainty_count",
+    "logical_judge_calls",
+    "logical_confirmation_calls",
+    "investigation_rounds",
+    "artifact_bytes",
+}
 
 
 def _require_exact_checkpoint_keys(
@@ -205,6 +228,97 @@ def _provider_circuit(judge: CausalJudge) -> JsonDict:
         "open": bool(getattr(target, "provider_circuit_open", False)),
         "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
     }
+
+
+def _provider_state_payload(
+    judge: CausalJudge,
+    state: "RecursiveAnalysisState",
+    *,
+    cache_identity: str,
+) -> JsonDict:
+    target = _judge_transport(judge)
+    cache = getattr(judge, "cache", None) or getattr(target, "cache", None)
+    stats = getattr(cache, "stats", None)
+    cache_stats = stats() if callable(stats) else {"enabled": False}
+    unsigned = {
+        "schema": PROVIDER_STATE_SCHEMA,
+        "circuit": {
+            "open": bool(getattr(target, "provider_circuit_open", False)),
+            "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
+            "consecutive_provider_errors": int(
+                getattr(target, "consecutive_provider_errors", 0) or 0
+            ),
+            "provider_error_threshold": int(
+                getattr(target, "provider_error_threshold", 3) or 3
+            ),
+        },
+        "cache_identity": str(cache_identity),
+        "cache_stats": _checkpoint_json(cache_stats),
+        "accounting": {
+            "judge_requests": state.judge_requests,
+            "judge_request_uncertainty_count": state.judge_request_uncertainty_count,
+            "logical_judge_calls": state.logical_judge_calls,
+            "logical_confirmation_calls": state.logical_confirmation_calls,
+            "investigation_rounds": state.investigation_rounds,
+            "artifact_bytes": state.artifact_bytes,
+        },
+    }
+    return {
+        **unsigned,
+        "identity": hashlib.sha256(stable_json(unsigned).encode("utf-8")).hexdigest(),
+    }
+
+
+def _validate_provider_state(
+    value: Any,
+    state: "RecursiveAnalysisState",
+    *,
+    cache_identity: str,
+    require_accounting_match: bool = True,
+) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("provider state must be an object")
+    _require_exact_checkpoint_keys(value, PROVIDER_STATE_KEYS, "provider state")
+    provider = dict(value)
+    if provider["schema"] != PROVIDER_STATE_SCHEMA:
+        raise ValueError("unsupported provider state schema")
+    circuit = provider["circuit"]
+    _require_exact_checkpoint_keys(circuit, PROVIDER_CIRCUIT_KEYS, "provider circuit")
+    if type(circuit["open"]) is not bool:
+        raise ValueError("provider circuit open flag is invalid")
+    if not isinstance(circuit["reason"], str):
+        raise ValueError("provider circuit reason is invalid")
+    for key in ("consecutive_provider_errors", "provider_error_threshold"):
+        if type(circuit[key]) is not int or circuit[key] < 0:
+            raise ValueError("provider circuit counter is invalid: {0}".format(key))
+    if circuit["provider_error_threshold"] < 1:
+        raise ValueError("provider error threshold must be positive")
+    if provider["cache_identity"] != cache_identity:
+        raise ValueError("provider cache identity does not match checkpoint config")
+    if not isinstance(provider["cache_stats"], Mapping):
+        raise ValueError("provider cache stats must be an object")
+    accounting = provider["accounting"]
+    _require_exact_checkpoint_keys(
+        accounting, PROVIDER_ACCOUNTING_KEYS, "provider accounting"
+    )
+    for key in PROVIDER_ACCOUNTING_KEYS:
+        if type(accounting[key]) is not int or accounting[key] < 0:
+            raise ValueError("provider accounting counter is invalid: {0}".format(key))
+    expected_accounting = {
+        "judge_requests": state.judge_requests,
+        "judge_request_uncertainty_count": state.judge_request_uncertainty_count,
+        "logical_judge_calls": state.logical_judge_calls,
+        "logical_confirmation_calls": state.logical_confirmation_calls,
+        "investigation_rounds": state.investigation_rounds,
+        "artifact_bytes": state.artifact_bytes,
+    }
+    if require_accounting_match and dict(accounting) != expected_accounting:
+        raise ValueError("provider accounting does not match recursive state")
+    unsigned = {key: provider[key] for key in provider if key != "identity"}
+    identity = hashlib.sha256(stable_json(unsigned).encode("utf-8")).hexdigest()
+    if provider["identity"] != identity:
+        raise ValueError("provider state identity does not match contents")
+    return copy.deepcopy(provider)
 
 
 def _reference_envelope(ref: str, *, content: str = "", fact_kind: str = "") -> JsonDict:
@@ -410,6 +524,7 @@ class RecursiveAnalysisState:
     logical_confirmation_calls: int = 0
     pending_rejudge_journal: Dict[str, List[int]] = field(default_factory=dict)
     seed_count: int = 0
+    provider_state: JsonDict = field(default_factory=dict)
     replay_actions: Dict[str, JsonDict] = field(default_factory=dict)
 
     @classmethod
@@ -594,6 +709,7 @@ class RecursiveAnalysisState:
             "logical_confirmation_calls": self.logical_confirmation_calls,
             "pending_rejudge_journal": _checkpoint_json(self.pending_rejudge_journal),
             "seed_count": self.seed_count,
+            "provider_state": _checkpoint_json(self.provider_state),
         }
 
     @classmethod
@@ -713,6 +829,10 @@ class RecursiveAnalysisState:
             if type(value) is not int or value < 0:
                 raise ValueError("{0} checkpoint counter is invalid".format(name))
             setattr(state, name, value)
+        requeued_inflight = len(frontier_payload["frontier"]["in_flight"])
+        if requeued_inflight > state.processed_items:
+            raise ValueError("checkpoint in-flight frontier count exceeds processed items")
+        state.processed_items -= requeued_inflight
         state.investigation_journal = copy.deepcopy(action_payload["investigation_journal"])
         state.investigation_evidence = copy.deepcopy(action_payload["investigation_evidence"])
         state.investigation_evidence_hashes = {
@@ -733,6 +853,11 @@ class RecursiveAnalysisState:
             str(key): [int(item) for item in values]
             for key, values in dict(action_payload["pending_rejudge_journal"]).items()
         }
+        state.provider_state = _validate_provider_state(
+            action_payload["provider_state"],
+            state,
+            cache_identity=str(checkpoint.config["cache_identity"]),
+        )
         transient_signal_refs = {
             str(item.get("node_ref") or "")
             for item in state.unresolved_branches
@@ -1407,26 +1532,16 @@ class AgenticRecursiveAnalyzer:
     def _checkpoint_state(self, state: RecursiveAnalysisState, semantic_key: str) -> None:
         if self.checkpoint is None:
             return
+        state.provider_state = _provider_state_payload(
+            self.judge,
+            state,
+            cache_identity=str(self.checkpoint_config["cache_identity"]),
+        )
         self.checkpoint.commit_snapshot(
             semantic_key=semantic_key,
             frontier_payload=state.frontier_checkpoint_payload(),
             hypothesis_payload=state.hypothesis_checkpoint_payload(),
             action_payload=state.action_checkpoint_payload(),
-        )
-        target = _judge_transport(self.judge)
-        self.checkpoint.record_action(
-            "provider_state",
-            "provider:circuit",
-            {
-                "open": bool(getattr(target, "provider_circuit_open", False)),
-                "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
-                "consecutive_provider_errors": int(
-                    getattr(target, "consecutive_provider_errors", 0) or 0
-                ),
-                "provider_error_threshold": int(
-                    getattr(target, "provider_error_threshold", 3) or 3
-                ),
-            },
         )
 
     def _checkpoint_action(
@@ -1435,29 +1550,46 @@ class AgenticRecursiveAnalyzer:
         if self.checkpoint is not None:
             self.checkpoint.record_action(operation, semantic_key, payload)
 
-    def _restore_provider_state(self, checkpoint: CheckpointState) -> None:
-        record = checkpoint.latest_actions.get("provider:circuit")
-        if not isinstance(record, Mapping) or record.get("operation") != "provider_state":
-            return
-        payload = record.get("payload")
-        if not isinstance(payload, Mapping) or set(payload) != {
-            "open",
-            "reason",
-            "consecutive_provider_errors",
-            "provider_error_threshold",
-        }:
-            raise ValueError("provider checkpoint state schema is invalid")
+    def _restore_provider_state(self, state: RecursiveAnalysisState) -> None:
+        payload = _validate_provider_state(
+            state.provider_state,
+            state,
+            cache_identity=str(self.checkpoint_config["cache_identity"]),
+        )
+        circuit = payload["circuit"]
         target = _judge_transport(self.judge)
-        target.provider_circuit_open = bool(payload["open"])
-        target.provider_circuit_reason = str(payload["reason"])
-        consecutive = payload["consecutive_provider_errors"]
-        threshold = payload["provider_error_threshold"]
-        if type(consecutive) is not int or consecutive < 0:
-            raise ValueError("provider consecutive error checkpoint is invalid")
-        if type(threshold) is not int or threshold < 1:
-            raise ValueError("provider threshold checkpoint is invalid")
-        target.consecutive_provider_errors = consecutive
-        target.provider_error_threshold = threshold
+        target.provider_circuit_open = bool(circuit["open"])
+        target.provider_circuit_reason = str(circuit["reason"])
+        target.consecutive_provider_errors = int(
+            circuit["consecutive_provider_errors"]
+        )
+        target.provider_error_threshold = int(circuit["provider_error_threshold"])
+
+    def _capture_provider_result_state(self, state: RecursiveAnalysisState) -> JsonDict:
+        return _provider_state_payload(
+            self.judge,
+            state,
+            cache_identity=str(self.checkpoint_config.get("cache_identity") or ""),
+        )
+
+    def _apply_provider_result_state(
+        self, state: RecursiveAnalysisState, payload: Mapping[str, Any]
+    ) -> None:
+        provider = _validate_provider_state(
+            payload.get("provider_state"),
+            state,
+            cache_identity=str(self.checkpoint_config.get("cache_identity") or ""),
+            require_accounting_match=False,
+        )
+        state.provider_state = provider
+        circuit = provider["circuit"]
+        target = _judge_transport(self.judge)
+        target.provider_circuit_open = bool(circuit["open"])
+        target.provider_circuit_reason = str(circuit["reason"])
+        target.consecutive_provider_errors = int(
+            circuit["consecutive_provider_errors"]
+        )
+        target.provider_error_threshold = int(circuit["provider_error_threshold"])
 
     @staticmethod
     def _replay_action(state: RecursiveAnalysisState, semantic_key: str) -> Optional[JsonDict]:
@@ -1530,7 +1662,7 @@ class AgenticRecursiveAnalyzer:
             state = RecursiveAnalysisState.from_checkpoint(
                 graph=analysis_graph, checkpoint=restored_checkpoint
             )
-            self._restore_provider_state(restored_checkpoint)
+            self._restore_provider_state(state)
             if (
                 state.objective != objective
                 or state.analysis_perspective != analysis_perspective
@@ -1662,6 +1794,49 @@ class AgenticRecursiveAnalyzer:
             evidence_hash = str(request.recursive_context.get("evidence_hash") or "")
             provider_action_key = "step:{0}:{1}".format(item.visit_key, evidence_hash)
             replay_action = self._replay_action(state, provider_action_key)
+            if (
+                replay_action is not None
+                and replay_action.get("operation") == "provider_call_failed"
+                and isinstance(replay_action.get("payload"), Mapping)
+                and replay_action["payload"].get("physical_request_exact") is True
+            ):
+                replay_payload = replay_action["payload"]
+                reserved_requests = int(
+                    replay_payload.get("physical_requests_reserved") or 0
+                )
+                physical_delta = int(
+                    replay_payload.get("physical_request_delta") or 0
+                )
+                if physical_delta < 0 or reserved_requests < physical_delta:
+                    raise ValueError("exact failed Provider accounting is invalid")
+                state.judge_requests += physical_delta - reserved_requests
+                terminal_state = str(replay_payload.get("terminal_state") or "")
+                unresolved_reason = str(
+                    replay_payload.get("unresolved_reason") or ""
+                )
+                detail = str(replay_payload.get("detail") or "")
+                exhausted_budget = str(
+                    replay_payload.get("exhausted_budget") or ""
+                )
+                if not terminal_state or not unresolved_reason or not detail:
+                    raise ValueError("exact failed Provider semantics are incomplete")
+                self._apply_provider_result_state(state, replay_payload)
+                state.complete_rejudge(
+                    item,
+                    terminal_state=terminal_state,
+                    detail=detail,
+                    physical_request_delta=physical_delta,
+                )
+                state.complete_unresolved(
+                    item,
+                    unresolved_reason,
+                    detail,
+                    exhausted_budget=exhausted_budget,
+                )
+                self._checkpoint_state(
+                    state, "provider:exact_failure:{0}".format(item.visit_key)
+                )
+                continue
             if replay_action is not None and replay_action.get("operation") in {
                 "provider_call_started",
                 "provider_call_failed",
@@ -1675,6 +1850,8 @@ class AgenticRecursiveAnalyzer:
                     and not replay_payload.get("physical_request_exact", False)
                 ):
                     state.judge_request_uncertainty_count += 1
+                if replay_action.get("operation") == "provider_call_failed":
+                    self._apply_provider_result_state(state, replay_payload)
                 if state.judge_requests >= self.max_judge_requests:
                     state._increment_budget("judge_requests")
                 state.complete_rejudge(
@@ -1753,16 +1930,17 @@ class AgenticRecursiveAnalyzer:
             except BoundedJudgeCallError as exc:
                 physical_delta = exc.physical_requests
                 state.judge_requests += physical_delta - reserved_requests
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
                 state.complete_rejudge(
                     item,
                     terminal_state="judge_error",
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    detail=detail,
                     physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(
                     item,
                     "judge_error",
-                    "{0}: {1}".format(type(exc).__name__, exc),
+                    detail,
                 )
                 self._checkpoint_action(
                     "provider_call_failed",
@@ -1774,32 +1952,45 @@ class AgenticRecursiveAnalyzer:
                         "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": True,
-                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                        "terminal_state": "judge_error",
+                        "unresolved_reason": "judge_error",
+                        "detail": detail,
+                        "exhausted_budget": "",
+                        "error": detail,
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
                 continue
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 if bounded_judge:
                     state.judge_request_uncertainty_count += 1
+                terminal_state = (
+                    "provider_unavailable"
+                    if isinstance(exc, JudgeProviderUnavailable)
+                    else "provider_error"
+                )
+                unresolved_reason = (
+                    "provider_circuit_open"
+                    if isinstance(exc, JudgeProviderUnavailable)
+                    else "provider_error"
+                )
+                exhausted_budget = (
+                    "provider_circuit"
+                    if isinstance(exc, JudgeProviderUnavailable)
+                    else ""
+                )
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
                 state.complete_rejudge(
                     item,
-                    terminal_state=(
-                        "provider_unavailable"
-                        if isinstance(exc, JudgeProviderUnavailable)
-                        else "provider_error"
-                    ),
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    terminal_state=terminal_state,
+                    detail=detail,
                     physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(
                     item,
-                    "provider_circuit_open"
-                    if isinstance(exc, JudgeProviderUnavailable)
-                    else "provider_error",
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                    exhausted_budget="provider_circuit"
-                    if isinstance(exc, JudgeProviderUnavailable)
-                    else "",
+                    unresolved_reason,
+                    detail,
+                    exhausted_budget=exhausted_budget,
                 )
                 self._checkpoint_action(
                     "provider_call_failed",
@@ -1811,23 +2002,29 @@ class AgenticRecursiveAnalyzer:
                         "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": not bounded_judge,
-                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                        "terminal_state": terminal_state,
+                        "unresolved_reason": unresolved_reason,
+                        "detail": detail,
+                        "exhausted_budget": exhausted_budget,
+                        "error": detail,
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
                 continue
             except Exception as exc:
                 if bounded_judge:
                     state.judge_request_uncertainty_count += 1
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
                 state.complete_rejudge(
                     item,
                     terminal_state="judge_error",
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    detail=detail,
                     physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(
                     item,
                     "judge_error",
-                    "{0}: {1}".format(type(exc).__name__, exc),
+                    detail,
                 )
                 self._checkpoint_action(
                     "provider_call_failed",
@@ -1839,7 +2036,12 @@ class AgenticRecursiveAnalyzer:
                         "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": not bounded_judge,
-                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                        "terminal_state": "judge_error",
+                        "unresolved_reason": "judge_error",
+                        "detail": detail,
+                        "exhausted_budget": "",
+                        "error": detail,
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
                 continue
@@ -1865,7 +2067,12 @@ class AgenticRecursiveAnalyzer:
                         "physical_requests_reserved": reserved_requests,
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": True,
+                        "terminal_state": "validation_error",
+                        "unresolved_reason": "judge_validation_error",
+                        "detail": detail,
+                        "exhausted_budget": "",
                         "error": detail,
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
                 continue
@@ -1881,8 +2088,11 @@ class AgenticRecursiveAnalyzer:
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": True,
                         "judgment": judgment.to_dict(),
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
+            elif replay_action is not None:
+                self._apply_provider_result_state(state, replay_action["payload"])
             state.complete_rejudge(
                 item,
                 terminal_state=_rejudge_success_terminal_state(
@@ -2205,8 +2415,11 @@ class AgenticRecursiveAnalyzer:
                         "physical_request_delta": physical_delta,
                         "physical_request_exact": physical_exact,
                         "confirmation": confirmation.to_dict(),
+                        "provider_state": self._capture_provider_result_state(state),
                     },
                 )
+            elif replay_action is not None:
+                self._apply_provider_result_state(state, replay_action["payload"])
             normalized_reason = confirmation.reason.casefold()
             if any(
                 marker in normalized_reason
