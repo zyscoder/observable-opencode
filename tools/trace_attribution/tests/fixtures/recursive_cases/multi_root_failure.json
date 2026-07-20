@@ -1,0 +1,37 @@
+{
+  "case_id": "multi-root-failure",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Implement encrypted export with audit logging."}},
+    {"record_id": "encryption_decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Use a constant initialization vector for compatibility.", "chosen_action": "constant_iv"}},
+    {"record_id": "audit_decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Skip audit logging for bulk export to reduce latency.", "chosen_action": "omit_bulk_audit"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:encryption_decision", "record:audit_decision"], "data": {"files": ["export/crypto.py", "export/audit.py"], "summary": "Added constant-IV encryption and omitted bulk audit events."}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "independent_security_and_audit_failures", "expected": "Exports are semantically secure and fully audited.", "actual": "Encryption repeats ciphertext patterns and bulk exports lack audit events.", "mechanism": "Two independent decisions jointly violate separate required contracts.", "scope": "multi_root_design"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "multi-root-failure",
+    "roots": [
+      {"node_ref": "record:encryption_decision", "semantic_anchor_id": "semantic_anchor:v1:940ca1938adc1d9af249cef8"},
+      {"node_ref": "record:audit_decision", "semantic_anchor_id": "semantic_anchor:v1:93a51e45fc7f757882c991ab"}
+    ],
+    "conditions": [],
+    "amplifiers": [],
+    "forbidden_roots": [],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:encryption_decision", "relation": "defect_transformation", "upstream_label": "constant_iv_design"}, {"ref": "record:audit_decision", "relation": "defect_transformation", "upstream_label": "bulk_audit_omission"}]},
+      "record:encryption_decision": {"status": "present", "candidate_introduction": true, "predecessors": []},
+      "record:audit_decision": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {
+      "record:encryption_decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.95},
+      "record:audit_decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.94}
+    }
+  }
+}

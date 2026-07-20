@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional
 from .analyzer import BackwardTaintAnalyzer
 from .cache import JudgmentCache
 from .causal_judge import ClaudeCausalJudge
+from .causal_state import annotate_report_semantic_anchors
 from .checkpoint import (
     CheckpointBundle,
     build_checkpoint_config,
@@ -218,11 +219,12 @@ def main() -> int:
                 objective=args.objective,
                 analysis_perspective=args.analysis_perspective,
             )
+            report_payload = attribution_output_payload(report, graph)
             output_commit = publish_output_transaction(
                 bundle=checkpoint,
                 attribution_path=out,
                 lineage_path=lineage_out,
-                report=report.to_dict(),
+                report=report_payload,
                 message_lineage=graph.message_lineage,
                 stop_requested=shutdown.stop_requested,
             )
@@ -231,7 +233,7 @@ def main() -> int:
                     "analysis_interrupted",
                     "analysis:result",
                     {
-                        "report": report.to_dict(),
+                        "report": report_payload,
                         "interrupted": True,
                         "output_transaction_id": output_commit["transaction_id"],
                         "output_commit_hash": output_commit["output_commit_hash"],
@@ -239,7 +241,7 @@ def main() -> int:
                 )
             else:
                 checkpoint.mark_analysis_completed(
-                    report=report.to_dict(), output_commit=output_commit
+                    report=report_payload, output_commit=output_commit
                 )
     else:
         report = BackwardTaintAnalyzer(
@@ -249,11 +251,17 @@ def main() -> int:
             start_refs=args.start_ref or None,
             objective=args.objective,
         )
-        atomic_write_json(out, report.to_dict())
+        atomic_write_json(out, attribution_output_payload(report, graph))
         lineage_out = lineage_output_path(out, args.lineage_out)
         atomic_write_json(lineage_out, graph.message_lineage)
     print(str(out))
     return 0
+
+
+def attribution_output_payload(report: Any, graph: TraceGraph) -> dict[str, Any]:
+    return annotate_report_semantic_anchors(
+        graph.case_id, graph.nodes, report.to_dict()
+    )
 
 
 def lineage_output_path(attribution_out: Path, configured: str) -> Path:

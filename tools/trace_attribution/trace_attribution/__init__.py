@@ -22,6 +22,8 @@ from .causal_state import (
     RecursiveAttributionReport,
     RejectedCandidate,
     RootConfirmation,
+    annotate_report_semantic_anchors,
+    semantic_anchor_id,
     semantic_visit_key,
     confirmation_identity_for,
 )
@@ -78,6 +80,8 @@ __all__ = [
     "TaintInfluence",
     "TraceGraph",
     "TraceNode",
+    "annotate_report_semantic_anchors",
+    "semantic_anchor_id",
     "semantic_visit_key",
     "confirmation_identity_for",
     "build_checkpoint_config",

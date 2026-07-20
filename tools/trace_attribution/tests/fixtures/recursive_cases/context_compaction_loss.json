@@ -1,0 +1,31 @@
+{
+  "case_id": "context-compaction-loss",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Preserve backward compatibility and support legacy aliases."}},
+    {"record_id": "compaction", "component": "context", "event_type": "context.compaction", "source_refs": ["record:prompt"], "data": {"algorithm": "summary-v2", "input_message_count": 48, "output_message_count": 7, "summary": "Implement the new alias API.", "dropped_constraint": "Preserve legacy aliases."}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:compaction"], "data": {"rationale": "Only the new alias API is required by the compacted context.", "chosen_action": "replace_legacy_aliases"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["library/aliases.py"], "summary": "Removed legacy aliases."}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "compaction_dropped_constraint", "expected": "Legacy aliases remain supported.", "actual": "Legacy aliases were removed.", "mechanism": "Context compaction omitted a binding constraint before planning.", "scope": "context_management"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "context-compaction-loss",
+    "roots": [{"node_ref": "record:compaction", "semantic_anchor_id": "semantic_anchor:v1:8b551a542f855c3e854456ea"}],
+    "conditions": [],
+    "amplifiers": [],
+    "forbidden_roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:5abab8a2dbb74f3abf469e2c"}],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:decision", "relation": "same_defect_propagation"}]},
+      "record:decision": {"status": "present", "predecessors": [{"ref": "record:compaction", "relation": "defect_transformation", "upstream_label": "constraint_omission_during_compaction"}]},
+      "record:compaction": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {"record:compaction": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.95}}
+  }
+}

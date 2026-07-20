@@ -1,0 +1,30 @@
+{
+  "case_id": "success-negative-control",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Add the parser alias while preserving compatibility."}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Inspect call sites, preserve the old method, and add the alias.", "chosen_action": "compatible_alias_extension"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["parser/compat.py"], "summary": "Added the alias without removing the compatibility method."}},
+    {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "passed", "exit_code": 0, "summary": "All focused and compatibility tests pass."}},
+    {"record_id": "outcome", "component": "evaluation", "event_type": "case.observed_success", "source_refs": ["record:verification"], "data": {"status": "passed", "summary": "The requirement is satisfied without a quality gap."}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "success-negative-control",
+    "roots": [],
+    "conditions": [],
+    "amplifiers": [],
+    "forbidden_roots": [
+      {"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:70800c9e1a22d9a86747fa52"},
+      {"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:9b196cfb0c6ccac129fb4ca5"},
+      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v1:0c66a8a81359bf8ee34199ea"}
+    ],
+    "allowed_unresolved_outcomes": []
+  },
+  "scripted_analysis": {
+    "start_ref": "record:outcome",
+    "steps": {"record:outcome": {"status": "absent", "candidate_introduction": false, "predecessors": []}},
+    "confirmations": {}
+  }
+}

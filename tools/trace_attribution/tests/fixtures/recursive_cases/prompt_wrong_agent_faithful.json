@@ -1,0 +1,32 @@
+{
+  "case_id": "prompt-wrong-agent-faithful",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Remove authorization checks from the admin endpoint."}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Follow the explicit requirement exactly.", "chosen_action": "remove_authorization_check"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["service/admin.py"], "summary": "Removed the authorization guard as requested."}},
+    {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "failed", "failure": "unauthorized user can call admin endpoint"}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification"], "data": {"failure_type": "explicitly_wrong_requirement", "expected": "Authorization remains enforced.", "actual": "Authorization was removed.", "mechanism": "The supplied requirement explicitly requested unsafe behavior.", "scope": "requirement_quality"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "prompt-wrong-agent-faithful",
+    "roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:9848480c5163e2a2e60565eb"}],
+    "conditions": [],
+    "amplifiers": [],
+    "forbidden_roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:f753f043c9564959264b8077"}],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:verification", "relation": "same_defect_propagation"}]},
+      "record:verification": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:decision", "relation": "same_defect_propagation"}]},
+      "record:decision": {"status": "present", "predecessors": [{"ref": "record:prompt", "relation": "same_defect_propagation"}]},
+      "record:prompt": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {"record:prompt": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.96}}
+  }
+}

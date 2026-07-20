@@ -1,0 +1,36 @@
+{
+  "case_id": "timeout-amplifier",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Implement all compatibility methods and run the focused tests."}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"rationale": "Implement only methods returned by the first symbol search.", "chosen_action": "stop_search_early"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["compat/api.py"], "summary": "Omitted one required compatibility method."}},
+    {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "failed", "failure": "compatibility method missing"}},
+    {"record_id": "timeout", "component": "harness", "event_type": "run.interruption", "source_refs": ["record:verification"], "data": {"reason": "request deadline exceeded", "timeout_seconds": 300}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification", "record:timeout"], "data": {"failure_type": "implementation_failure_with_timeout_amplification", "expected": "Complete implementation returns normally.", "actual": "Implementation is incomplete and the case is interrupted.", "mechanism": "The decision introduces the defect; timeout only limits recovery and visibility.", "scope": "harness_amplification"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "timeout-amplifier",
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:59e194efaa08eafd81eb473f"}],
+    "conditions": [],
+    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v1:6686483cc09fca37f7cef687"}],
+    "forbidden_roots": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v1:82bce6bf6e4badf220802821"}],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:verification", "relation": "same_defect_propagation"}, {"ref": "record:timeout", "relation": "same_defect_propagation"}]},
+      "record:verification": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:decision", "relation": "same_defect_propagation"}]},
+      "record:decision": {"status": "present", "candidate_introduction": true, "predecessors": []},
+      "record:timeout": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {
+      "record:decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.95},
+      "record:timeout": {"status": "rejected", "factor_role": "amplifying_factor", "confidence": 0.9}
+    }
+  }
+}

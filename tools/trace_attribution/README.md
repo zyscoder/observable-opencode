@@ -321,6 +321,62 @@ Use this report as the feedback loop between the reasoning module and semantic t
 when attribution can only say "the defect is somewhere around LLM generation", the report
 spells out which LLM/context/message fields need to be added to future traces.
 
+## Recursive Attribution Acceptance
+
+Every CLI output now projects `semantic_anchor:v1:*` identities onto recursive roots,
+co-roots, factors, candidates, confirmations, judgments, and the compatibility
+`root_causes` view. The anchor hashes case identity, semantic role, component/event type,
+normalized action semantics, meaningful repository-relative paths, rationale, and artifact
+hashes. It removes run-local record IDs, absolute checkout prefixes, timestamps, PIDs,
+ports, session/request IDs, Provider IDs, and model transport identity. The original
+`record:*` ref remains alongside the anchor for single-run audit.
+
+The nine offline regression fixtures live under
+`tests/fixtures/recursive_cases/`. Each fixture has three isolated top-level sections:
+
+- `records` and `dataflow_edges`: factual Causal IR supplied to `TraceGraph` and Judge;
+- `scripted_analysis`: deterministic, zero-network Judge responses for algorithm tests;
+- `human_labels`: external roots, conditions, amplifiers, forbidden roots, and allowed
+  unresolved outcomes.
+
+`load_fixture()` strips the latter two sections before constructing a Trace and rejects
+label-shaped keys nested inside facts. Human labels therefore do not enter Judge prompts,
+cache keys, checkpoints, or Agent inputs.
+
+Run the fixture and metric suite:
+
+```bash
+cd tools/trace_attribution
+PYTHONPATH=. python3 -m unittest tests.test_recursive_benchmarks -v
+```
+
+Score a real recursive report with a separately reviewed label file:
+
+```bash
+python3 tools/trace_attribution/scripts/evaluate_recursive_attribution.py \
+  --report /tmp/case.recursive.attribution.json \
+  --labels /tmp/case.human-labels.json \
+  --legacy-report /tmp/case.legacy.attribution.json \
+  --out /tmp/case.recursive.comparison.json
+```
+
+The comparison schema reports candidate recall, Top-1 agreement, physical Judge request
+reduction, mean causal-path length, factor-role precision, unknown rate, confirmation
+rejection rate, investigation yield, checkpoint reuse, and human/LLM disagreement. Empty
+denominators have explicit deterministic values; request reduction is `null` when the
+legacy report has no measured physical request count.
+
+Evaluation exits nonzero and writes no comparison when it finds fabricated refs, semantic
+anchor collisions, unresolved confirmed roots or path/evidence refs, missing/mismatched
+independent confirmations, forbidden roots, or a budget/Provider/unknown branch promoted to
+a confirmed root. Scripted fixtures are regression evidence only and can never switch the
+CLI default. `--engine legacy` remains the default until the real Sphinx, Pydantic,
+requirements-understanding, context-compaction, and successful-control gates all pass.
+
+The current frozen baseline, exact local artifact hashes, unavailable measurements, and
+commands for authorized real runs are recorded in
+`docs/superpowers/reports/2026-07-20-agentic-recursive-attribution-results.md`.
+
 ## Test
 
 ```bash

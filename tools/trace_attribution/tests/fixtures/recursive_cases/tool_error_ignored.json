@@ -1,0 +1,34 @@
+{
+  "case_id": "tool-error-ignored",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Update the serializer and verify all tests."}},
+    {"record_id": "tool_error", "component": "tool", "event_type": "tool.result", "source_refs": ["record:prompt"], "data": {"tool_name": "pytest", "status": "failed", "exit_code": 1, "error_message": "test_round_trip failed"}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:tool_error"], "data": {"rationale": "The failure looks unrelated; finish without investigating it.", "chosen_action": "ignore_failed_verification"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["serializer/core.py"], "summary": "Kept the serializer change despite the failing test."}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "known_tool_error_ignored", "expected": "Known failing verification is resolved.", "actual": "The agent completed with the failure unresolved.", "mechanism": "A decision discarded actionable tool evidence.", "scope": "verification_handling"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "tool-error-ignored",
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:182d0823449beffc21937d6b"}],
+    "conditions": [{"node_ref": "record:tool_error", "semantic_anchor_id": "semantic_anchor:v1:ee4ff34df5f1da73dafc5b8c"}],
+    "amplifiers": [],
+    "forbidden_roots": [],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:decision", "relation": "same_defect_propagation"}]},
+      "record:decision": {"status": "present", "candidate_introduction": true, "predecessors": [{"ref": "record:tool_error", "relation": "same_defect_propagation"}]},
+      "record:tool_error": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {
+      "record:decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.95},
+      "record:tool_error": {"status": "rejected", "factor_role": "contributing_condition", "confidence": 0.9}
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "case_id": "subagent-warning-ignored",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Refactor cache invalidation without behavior changes."}},
+    {"record_id": "subagent_warning", "component": "subagent", "event_type": "subagent.result", "source_refs": ["record:prompt"], "data": {"summary": "The proposed key omits tenant_id and can leak cached data across tenants.", "status": "warning"}},
+    {"record_id": "main_agent_decision", "component": "processor", "event_type": "decision", "source_refs": ["record:subagent_warning"], "data": {"rationale": "Use the shorter cache key despite the warning.", "chosen_action": "omit_tenant_from_cache_key"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:main_agent_decision"], "data": {"files": ["cache/key.py"], "summary": "Removed tenant_id from the cache key."}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:change"], "data": {"failure_type": "subagent_warning_ignored", "expected": "Tenant isolation remains intact.", "actual": "Cache keys collide across tenants.", "mechanism": "The main agent explicitly rejected a grounded subagent warning.", "scope": "subagent_orchestration"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "subagent-warning-ignored",
+    "roots": [{"node_ref": "record:main_agent_decision", "semantic_anchor_id": "semantic_anchor:v1:4d06b1a5e8a66eb9e8322c1f"}],
+    "conditions": [{"node_ref": "record:subagent_warning", "semantic_anchor_id": "semantic_anchor:v1:ddf7f2afd576e3388348db44"}],
+    "amplifiers": [],
+    "forbidden_roots": [],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:main_agent_decision", "relation": "same_defect_propagation"}]},
+      "record:main_agent_decision": {"status": "present", "candidate_introduction": true, "predecessors": [{"ref": "record:subagent_warning", "relation": "same_defect_propagation"}]},
+      "record:subagent_warning": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {
+      "record:main_agent_decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.96},
+      "record:subagent_warning": {"status": "rejected", "factor_role": "contributing_condition", "confidence": 0.9}
+    }
+  }
+}

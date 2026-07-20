@@ -1,0 +1,41 @@
+{
+  "case_id": "sphinx-recursive-minimal",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {"record_id": "prompt", "component": "prompt", "event_type": "prompt.assembly", "data": {"text": "Implement the listed interfaces using the repository."}},
+    {"record_id": "decision", "component": "processor", "event_type": "decision", "source_refs": ["record:prompt"], "data": {"decision_type": "reasoning_block", "rationale": "Now I have a comprehensive understanding. Implement the five listed methods.", "chosen_action": "implement_listed_methods"}},
+    {"record_id": "change", "component": "tool", "event_type": "change", "source_refs": ["record:decision"], "data": {"files": ["sphinx/domains/c/_parser.py"], "summary": "Implemented listed methods without parse_namespace_object."}},
+    {"record_id": "verification", "component": "verification", "event_type": "verification", "source_refs": ["record:change"], "data": {"status": "failed", "failure": "parse_namespace_object is absent"}},
+    {"record_id": "timeout", "component": "harness", "event_type": "run.interruption", "source_refs": ["record:verification"], "data": {"reason": "headers timeout"}},
+    {"record_id": "observed", "component": "evaluation", "event_type": "case.observed_defect", "source_refs": ["record:verification", "record:timeout"], "data": {"failure_type": "missing_parse_namespace_object_contract", "expected": "The compatibility method exists.", "actual": "The method is absent.", "mechanism": "Repository reasoning stopped before discovering the compatibility contract.", "scope": "parser_contract_recovery"}}
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v1",
+    "case_id": "sphinx-recursive-minimal",
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v1:8231eab73edeacd70451943a"}],
+    "conditions": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v1:98748796d1fc2824f5651cf2"}],
+    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v1:9ec8dd7627c77ece4404f047"}],
+    "forbidden_roots": [
+      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v1:1aee6cb26848c39cabd3b82c"},
+      {"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v1:c216ba71486c521b97264305"}
+    ],
+    "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
+  },
+  "scripted_analysis": {
+    "start_ref": "record:observed",
+    "steps": {
+      "record:observed": {"status": "present", "predecessors": [{"ref": "record:verification", "relation": "same_defect_propagation"}, {"ref": "record:timeout", "relation": "same_defect_propagation"}]},
+      "record:verification": {"status": "present", "predecessors": [{"ref": "record:change", "relation": "same_defect_propagation"}]},
+      "record:change": {"status": "present", "predecessors": [{"ref": "record:decision", "relation": "same_defect_propagation"}]},
+      "record:decision": {"status": "present", "candidate_introduction": true, "predecessors": [{"ref": "record:prompt", "relation": "same_defect_propagation"}]},
+      "record:prompt": {"status": "present", "candidate_introduction": true, "predecessors": []},
+      "record:timeout": {"status": "present", "candidate_introduction": true, "predecessors": []}
+    },
+    "confirmations": {
+      "record:decision": {"status": "confirmed", "factor_role": "necessary_cause", "confidence": 0.95},
+      "record:prompt": {"status": "rejected", "factor_role": "contributing_condition", "confidence": 0.8},
+      "record:timeout": {"status": "rejected", "factor_role": "amplifying_factor", "confidence": 0.9}
+    }
+  }
+}

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
+import re
+from pathlib import PurePosixPath
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -47,6 +50,71 @@ BLOCKING_METADATA_KEYS = frozenset(
 )
 MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
+SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v1"
+SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v1:"
+
+_ANCHOR_VOLATILE_KEYS = frozenset(
+    {
+        "cwd",
+        "workdir",
+        "working_directory",
+        "repository_root",
+        "repo_root",
+        "workspace_root",
+        "timestamp",
+        "start_timestamp",
+        "end_timestamp",
+        "created_at",
+        "updated_at",
+        "pid",
+        "ppid",
+        "port",
+        "sessionid",
+        "session_id",
+        "messageid",
+        "message_id",
+        "requestid",
+        "request_id",
+        "providerid",
+        "provider_id",
+        "provider_request_id",
+        "span_id",
+        "trace_id",
+        "run_id",
+        "call_id",
+        "artifact_id",
+        "model",
+        "modelid",
+        "model_id",
+    }
+)
+_ANCHOR_PATH_KEYS = frozenset(
+    {
+        "path",
+        "file",
+        "file_path",
+        "filepath",
+        "files",
+        "code_location",
+        "code_locations",
+        "artifact_path",
+    }
+)
+_ANCHOR_ARTIFACT_HASH_KEYS = frozenset(
+    {"hash", "sha256", "content_hash", "artifact_hash", "digest"}
+)
+_RUNTIME_ID_PATTERN = re.compile(
+    r"\b(?:ses|msg|req|call|span|run|trace|evt|event)_[A-Za-z0-9_-]{6,}\b",
+    re.IGNORECASE,
+)
+_UUID_PATTERN = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_ISO_TIMESTAMP_PATTERN = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\b"
+)
+_URL_PORT_PATTERN = re.compile(r"(?P<host>\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)):\d{2,5}\b")
 
 
 class FrozenMapping(Mapping[str, Any]):
@@ -236,6 +304,194 @@ def _freeze_trace_node(node: TraceNode) -> TraceNode:
         data=FrozenMapping(_thaw(node.data)),
         source_refs=_frozen_strings(node.source_refs),
     )
+
+
+def _anchor_semantic_role(node: TraceNode) -> str:
+    event = node.event_type.strip().lower()
+    if "observed_defect" in event or "quality_gap" in event:
+        return "observed_quality_outcome"
+    if "decision" in event or "reasoning" in event:
+        return "authored_decision"
+    if "compaction" in event or "context" in event:
+        return "context_transformation"
+    if "verification" in event or "test" in event:
+        return "verification_evidence"
+    if "change" in event or "edit" in event:
+        return "repository_change"
+    if "interruption" in event or "timeout" in event:
+        return "execution_interruption"
+    if "prompt" in event or "message.input" in event:
+        return "task_input"
+    return event or "unknown_event"
+
+
+def _anchor_path(value: str, roots: Tuple[str, ...]) -> str:
+    normalized = value.replace("\\", "/")
+    for root in roots:
+        candidate = root.replace("\\", "/").rstrip("/")
+        if candidate and (normalized == candidate or normalized.startswith(candidate + "/")):
+            normalized = normalized[len(candidate) :].lstrip("/")
+            break
+    if normalized.startswith("/"):
+        parts = PurePosixPath(normalized).parts
+        markers = {"repository", "repo", "workspace", "worktree", "checkout"}
+        marker_index = next(
+            (index for index, part in enumerate(parts) if part.lower() in markers),
+            None,
+        )
+        if marker_index is not None and marker_index + 1 < len(parts):
+            normalized = "/".join(parts[marker_index + 1 :])
+        else:
+            normalized = "/".join(parts[-4:])
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _anchor_text(value: str, roots: Tuple[str, ...]) -> str:
+    text = " ".join(value.split())
+    for root in sorted((item for item in roots if item), key=len, reverse=True):
+        text = text.replace(root, "<repo>")
+        text = text.replace(root.replace("\\", "/"), "<repo>")
+    text = _ISO_TIMESTAMP_PATTERN.sub("<timestamp>", text)
+    text = _UUID_PATTERN.sub("<runtime-id>", text)
+    text = _RUNTIME_ID_PATTERN.sub("<runtime-id>", text)
+    text = _URL_PORT_PATTERN.sub(lambda match: match.group("host") + ":<port>", text)
+    return text
+
+
+def _anchor_value(value: Any, *, key: str, roots: Tuple[str, ...]) -> Any:
+    normalized_key = key.strip().lower()
+    if isinstance(value, Mapping):
+        output = {}
+        for child_key in sorted(value, key=lambda item: str(item)):
+            child_name = str(child_key)
+            lowered = child_name.strip().lower()
+            if lowered in _ANCHOR_VOLATILE_KEYS:
+                continue
+            if "provider" in lowered and ("id" in lowered or "request" in lowered):
+                continue
+            child_value = value[child_key]
+            normalized = _anchor_value(child_value, key=child_name, roots=roots)
+            if normalized not in (None, "", [], {}):
+                output[child_name] = normalized
+        return output
+    if isinstance(value, (list, tuple)):
+        normalized = [
+            _anchor_value(item, key=normalized_key, roots=roots) for item in value
+        ]
+        return [item for item in normalized if item not in (None, "", [], {})]
+    if isinstance(value, str):
+        if normalized_key in _ANCHOR_PATH_KEYS:
+            return _anchor_path(value, roots)
+        if normalized_key in _ANCHOR_ARTIFACT_HASH_KEYS:
+            return value.strip().lower()
+        return _anchor_text(value, roots)
+    return value
+
+
+def normalized_anchor_semantics(node: TraceNode) -> JsonDict:
+    roots = tuple(
+        str(node.data.get(key) or "")
+        for key in (
+            "repository_root",
+            "repo_root",
+            "workspace_root",
+            "cwd",
+            "workdir",
+            "working_directory",
+        )
+        if node.data.get(key)
+    )
+    data = _anchor_value(node.data, key="data", roots=roots)
+    return {
+        "title": _anchor_text(node.title, roots) if node.title else "",
+        "status": node.status.strip().lower(),
+        "data": data,
+    }
+
+
+def semantic_anchor_id(case_id: str, node: TraceNode) -> str:
+    """Return a versioned identity stable across transport-local execution metadata."""
+
+    identity = {
+        "schema_version": SEMANTIC_ANCHOR_SCHEMA_VERSION,
+        "case_id": str(case_id),
+        "component": node.component.strip().lower(),
+        "event_type": node.event_type.strip().lower(),
+        "semantic_role": _anchor_semantic_role(node),
+        "normalized_semantics": normalized_anchor_semantics(node),
+    }
+    digest = hashlib.sha256(stable_json(identity).encode("utf-8")).hexdigest()[:24]
+    return SEMANTIC_ANCHOR_PREFIX + digest
+
+
+def annotate_report_semantic_anchors(
+    case_id: str,
+    nodes: Mapping[str, TraceNode],
+    report: Mapping[str, Any],
+) -> JsonDict:
+    """Project stable anchors into a report without mutating the report or Trace nodes."""
+
+    projected = copy.deepcopy(dict(report))
+    anchors_by_ref: Dict[str, str] = {}
+    refs_by_anchor: Dict[str, Set[str]] = {}
+
+    def anchor_for(ref: Any) -> str:
+        value = str(ref or "")
+        node = nodes.get(value)
+        if node is None:
+            return ""
+        anchor = anchors_by_ref.get(value)
+        if anchor is None:
+            anchor = semantic_anchor_id(case_id, node)
+            anchors_by_ref[value] = anchor
+            refs_by_anchor.setdefault(anchor, set()).add(value)
+        return anchor
+
+    def annotate(section: str, ref_key: str) -> None:
+        values = projected.get(section)
+        if not isinstance(values, list):
+            return
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            anchor = anchor_for(item.get(ref_key))
+            if anchor:
+                item["semantic_anchor_id"] = anchor
+                embedded = item.get("confirmation")
+                if isinstance(embedded, dict):
+                    embedded["semantic_anchor_id"] = anchor
+
+    for section, ref_key in (
+        ("causal_candidates", "ref"),
+        ("introduction_candidates", "ref"),
+        ("confirmed_roots", "node_ref"),
+        ("co_roots", "node_ref"),
+        ("contributing_conditions", "node_ref"),
+        ("amplifying_factors", "node_ref"),
+        ("rejected_candidates", "node_ref"),
+        ("root_causes", "node_ref"),
+        ("confirmations", "candidate_ref"),
+        ("step_judgments", "current_node_ref"),
+        ("causal_relations", "ref"),
+    ):
+        annotate(section, ref_key)
+
+    metadata = projected.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        projected["metadata"] = metadata
+    metadata["semantic_anchor_schema_version"] = SEMANTIC_ANCHOR_SCHEMA_VERSION
+    metadata["semantic_anchor_index"] = {
+        ref: anchor for ref, anchor in sorted(anchors_by_ref.items())
+    }
+    metadata["semantic_anchor_collisions"] = [
+        {"semantic_anchor_id": anchor, "node_refs": sorted(refs)}
+        for anchor, refs in sorted(refs_by_anchor.items())
+        if len(refs) > 1
+    ]
+    return projected
 
 
 @dataclass(frozen=True)
@@ -1514,6 +1770,10 @@ __all__ = [
     "RecursiveAttributionReport",
     "RejectedCandidate",
     "RootConfirmation",
+    "SEMANTIC_ANCHOR_SCHEMA_VERSION",
+    "annotate_report_semantic_anchors",
+    "normalized_anchor_semantics",
+    "semantic_anchor_id",
     "semantic_visit_key",
     "confirmation_identity_for",
 ]
