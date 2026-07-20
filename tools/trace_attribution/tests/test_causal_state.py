@@ -278,6 +278,72 @@ class CausalStateTest(unittest.TestCase):
                 unresolved_refs=[root.node_ref],
             )
 
+    def test_report_outcome_is_derived_from_roots_and_blocking_facts(self):
+        root = ConfirmedRoot(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            reason="The decision stopped discovery.",
+            counterfactual="Searching call sites would reveal the contract.",
+            confidence=0.9,
+        )
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="root-overrides-caller",
+                objective="Find the root.",
+                analysis_outcome="no_defect",
+                confirmed_roots=[root],
+            ).analysis_outcome,
+            "root_found",
+        )
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="unresolved-overrides-caller",
+                objective="Find the root.",
+                analysis_outcome="no_defect",
+                unresolved_refs=["record:change"],
+            ).analysis_outcome,
+            "inconclusive",
+        )
+
+        unresolved_hypothesis = AttributionHypothesis.create(
+            "The decision may be the root.", "record:decision", sample_defect_state()
+        ).with_updates(status="unresolved")
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="unresolved-hypothesis",
+                objective="Find the root.",
+                analysis_outcome="no_defect",
+                unresolved_hypotheses=[unresolved_hypothesis],
+            ).analysis_outcome,
+            "inconclusive",
+        )
+
+        for metadata in (
+            {"provider_circuit_open": True},
+            {"investigation_budget_exhausted": True},
+            {"missing_evidence": ["artifact:change"]},
+        ):
+            self.assertEqual(
+                RecursiveAttributionReport(
+                    case_id="metadata-blocked",
+                    objective="Find the root.",
+                    analysis_outcome="no_defect",
+                    metadata=metadata,
+                ).analysis_outcome,
+                "inconclusive",
+            )
+
+        self.assertEqual(
+            RecursiveAttributionReport(
+                case_id="partial-metadata",
+                objective="Find the root.",
+                analysis_outcome="no_defect",
+                confirmed_roots=[root],
+                metadata={"provider_unavailable": True},
+            ).analysis_outcome,
+            "partial_root_found",
+        )
+
     def test_recursive_state_collections_are_deeply_immutable(self):
         defect_state = sample_defect_state()
         node = TraceNode(

@@ -23,6 +23,20 @@ CAUSAL_RELATIONS = frozenset(
 )
 HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded", "unresolved"})
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
+BLOCKING_METADATA_KEYS = frozenset(
+    {
+        "unresolved_reason",
+        "unresolved_reasons",
+        "unresolved_refs",
+        "missing_evidence",
+        "missing_artifact",
+        "provider_error",
+        "provider_unavailable",
+        "provider_circuit_open",
+        "blocked",
+        "blocking_reason",
+    }
+)
 
 
 class FrozenMapping(Mapping[str, Any]):
@@ -72,6 +86,20 @@ def _frozen_strings(value: Any) -> Tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
+
+
+def _has_blocking_metadata(metadata: Mapping[str, Any]) -> bool:
+    for raw_key, value in metadata.items():
+        if not value:
+            continue
+        key = str(raw_key).strip().lower()
+        if key in BLOCKING_METADATA_KEYS:
+            return True
+        if key.endswith("_budget_exhausted") or key.endswith("_blocked"):
+            return True
+        if key.startswith("missing_") or key.endswith("_missing"):
+            return True
+    return False
 
 
 def _hash(value: Any) -> str:
@@ -863,18 +891,16 @@ class RecursiveAttributionReport:
         overlapping_refs = confirmed_root_refs.intersection(self.unresolved_refs)
         if overlapping_refs:
             raise ValueError("a node cannot be both confirmed and unresolved")
+        has_blocking_evidence = bool(
+            self.unresolved_refs
+            or self.unresolved_hypotheses
+            or _has_blocking_metadata(self.metadata)
+        )
         if confirmed_root_refs:
-            has_unresolved_branches = bool(self.unresolved_refs or self.unresolved_hypotheses)
-            if has_unresolved_branches:
-                object.__setattr__(self, "analysis_outcome", "partial_root_found")
-            elif self.analysis_outcome == "inconclusive":
-                object.__setattr__(self, "analysis_outcome", "root_found")
-        elif self.analysis_outcome in {"root_found", "partial_root_found"}:
-            object.__setattr__(
-                self,
-                "analysis_outcome",
-                "inconclusive" if (self.unresolved_refs or self.unresolved_hypotheses) else "no_defect",
-            )
+            outcome = "partial_root_found" if has_blocking_evidence else "root_found"
+        else:
+            outcome = "inconclusive" if has_blocking_evidence else "no_defect"
+        object.__setattr__(self, "analysis_outcome", outcome)
 
     def to_dict(self) -> JsonDict:
         return {
