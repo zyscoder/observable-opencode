@@ -159,6 +159,7 @@ def sample_confirmation_request(
     supporting_evidence=None,
     opposing_evidence=(),
     competing_hypotheses=(),
+    task_obligations=None,
 ) -> RootConfirmationRequest:
     return RootConfirmationRequest(
         candidate_ref="record:decision",
@@ -190,7 +191,9 @@ def sample_confirmation_request(
         ),
         opposing_evidence=opposing_evidence,
         competing_hypotheses=competing_hypotheses,
-        task_obligations=(
+        task_obligations=task_obligations
+        if task_obligations is not None
+        else (
             {"source": "task", "text": "Preserve the existing parser compatibility contract."},
         ),
         analysis_perspective="Find the primary controllable cause.",
@@ -741,6 +744,172 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
                 )
 
+    def test_task_obligations_are_part_of_the_recursive_fact_tree(self):
+        obligation = {
+            "source": "task",
+            "text": "Preserve the parser contract.",
+            "nested_provider": {"provider_error": "obligation evidence unavailable"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "task_obligations|provider_error"):
+            validate_recursive_confirmation(
+                valid_confirmation_payload(),
+                request=sample_confirmation_request(task_obligations=(obligation,)),
+            )
+
+    def test_blocking_normalization_covers_exhausted_and_unavailable_states(self):
+        blocking_values = (
+            {"status": "budget_exhausted"},
+            {"budget_status": "exhausted"},
+            {"provider_status": "provider_unavailable"},
+            {"circuit_status": "circuit_open"},
+            {"availability": "unavailable"},
+            {"available": False},
+            {"artifact_status": {"availability": "missing"}},
+            {"artifact_status": {"availability": "unavailable"}},
+            {"artifact_status": {"hydration_status": "unavailable"}},
+            {"hydration_status": "not_requested"},
+        )
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        for blocking in blocking_values:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                "nested_state": blocking,
+            }
+            with self.subTest(blocking=blocking), self.assertRaisesRegex(
+                ValueError, "blocking|unavailable|exhausted|missing"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_structured_provenance_context_preserves_temporal_exclusion(self):
+        temporal_containers = (
+            {
+                "edge_provenance": {
+                    "type": "temporal_order",
+                    "kind": "recorded_edge",
+                }
+            },
+            {
+                "evidence_metadata": {
+                    "lineage": {
+                        "kind": "temporal_adjacency",
+                        "method": "recorded_lookup",
+                    }
+                }
+            },
+        )
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        for structured_provenance in temporal_containers:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                **structured_provenance,
+            }
+            with self.subTest(provenance=structured_provenance), self.assertRaisesRegex(
+                ValueError, "temporal"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_excerpt_cannot_be_synthesized_across_candidate_fact_fragments(self):
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        split_facts = (
+            {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the",
+            },
+            {
+                **reference_envelope("record:decision"),
+                "content": "explicitly listed methods.",
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "grounded excerpt"):
+            validate_recursive_confirmation(
+                payload,
+                request=sample_confirmation_request(supporting_evidence=split_facts),
+            )
+
+        whitespace_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement   only\n the explicitly listed methods.",
+        }
+        result = validate_recursive_confirmation(
+            payload,
+            request=sample_confirmation_request(supporting_evidence=(whitespace_fact,)),
+        )
+        self.assertEqual(result.status, "confirmed")
+
+    def test_task2_artifact_status_schema_accepts_only_available_hydrated_identity(self):
+        manifest = {
+            "node_ref": "record:decision",
+            "referenced_artifact_ids": ["decision-payload"],
+            "hydrated_artifacts": [
+                {
+                    "artifact_id": "decision-payload",
+                    "content": "Implement only the explicitly listed methods.",
+                    "missing": False,
+                    "truncated": False,
+                }
+            ],
+            "missing_artifact_ids": [],
+            "truncated_artifact_ids": [],
+        }
+
+        def request_for(status):
+            fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                "artifact_hydration": manifest,
+                "artifact_reference": {
+                    **reference_envelope("artifact:decision-payload"),
+                    "reference_kind": "artifact",
+                    "artifact_id": "decision-payload",
+                    "owner_reference": reference_envelope("record:decision"),
+                    "artifact_status": status,
+                },
+            }
+            return sample_confirmation_request(supporting_evidence=(fact,))
+
+        valid_status = {
+            "raw_ref": "artifact:decision-payload",
+            "canonical_ref": "artifact:decision-payload",
+            "resolution_status": "resolved",
+            "availability": "available",
+            "hydration_status": "hydrated",
+        }
+        result = validate_recursive_confirmation(
+            {**valid_confirmation_payload(), "evidence_refs": ["artifact:decision-payload"]},
+            request=request_for(valid_status),
+        )
+        self.assertEqual(result.status, "confirmed")
+
+        invalid_statuses = (
+            {**valid_status, "raw_ref": "artifact:other"},
+            {**valid_status, "canonical_ref": "artifact:other"},
+            {**valid_status, "resolved_ref": "artifact:other"},
+            {**valid_status, "resolution_status": "unresolved"},
+            {**valid_status, "availability": "missing"},
+            {**valid_status, "availability": "unavailable"},
+            {**valid_status, "hydration_status": "unavailable"},
+        )
+        for status in invalid_statuses:
+            with self.subTest(status=status), self.assertRaisesRegex(
+                ValueError, "artifact_status|artifact status|blocking|unresolved"
+            ):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(), request=request_for(status)
+                )
+
     def test_recursive_blockers_apply_to_candidate_path_opposition_and_competition(self):
         gap = {"nested_analysis": {"missing_evidence": ["record:missing"]}}
         requests = (
@@ -1189,10 +1358,16 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             "content": "Implement only the explicitly listed methods.",
             "nested_analysis": {"provider_error": "evidence provider failed"},
         }
+        provider_error_obligation = {
+            "source": "task",
+            "text": "Preserve the parser contract.",
+            "nested_analysis": {"provider_error": "obligation provider failed"},
+        }
         for request in (
             sample_confirmation_request(opposing_evidence=(unresolved_opposition,)),
             sample_confirmation_request(supporting_evidence=(missing_artifact,)),
             sample_confirmation_request(supporting_evidence=(nested_provider_error,)),
+            sample_confirmation_request(task_obligations=(provider_error_obligation,)),
         ):
             with self.subTest(request=request.to_dict()):
                 transport = ScriptedTransport(

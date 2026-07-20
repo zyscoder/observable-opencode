@@ -485,6 +485,13 @@ _TASK2_MANIFEST_KEYS = {
     "missing_artifact_ids",
     "truncated_artifact_ids",
 }
+_TASK2_ARTIFACT_STATUS_KEYS = {
+    "raw_ref",
+    "canonical_ref",
+    "resolution_status",
+    "availability",
+    "hydration_status",
+}
 _ALLOWED_PROVENANCE = {"recorded", "reconstructed", "inferred"}
 _ALLOWED_RESOLUTION = {
     "resolved",
@@ -495,6 +502,13 @@ _ALLOWED_RESOLUTION = {
     "unknown",
 }
 _BLOCKING_STATUS_VALUES = {
+    "budget_exhausted",
+    "circuit_open",
+    "exhausted",
+    "not_available",
+    "not_hydrated",
+    "not_requested",
+    "unavailable",
     "unknown",
     "unresolved",
     "ambiguous",
@@ -509,6 +523,21 @@ _PROVENANCE_FIELDS = {
     "relation",
     "inference_method",
     "edge_origin",
+}
+_PROVENANCE_CONTAINER_KEYS = {
+    "edge_provenance",
+    "evidence_metadata",
+    "inference_metadata",
+    "lineage",
+    "provenance",
+}
+_PROVENANCE_CONTEXT_FIELDS = {
+    "evidence_type",
+    "kind",
+    "method",
+    "origin",
+    "relation",
+    "type",
 }
 _SEMANTIC_TEXT_FIELDS = {
     "actual",
@@ -549,6 +578,15 @@ def _is_provenance_field(key: str) -> bool:
         or key.endswith("_origin")
         or key.endswith("_method")
         or key.endswith("_source")
+    )
+
+
+def _is_provenance_container_key(key: str) -> bool:
+    return (
+        key in _PROVENANCE_CONTAINER_KEYS
+        or "provenance" in key
+        or key.endswith("_lineage")
+        or key.endswith("_evidence_metadata")
     )
 
 
@@ -625,7 +663,7 @@ def _looks_like_artifact_fact(value: Mapping[str, Any], parent_key: str) -> bool
 @dataclass(frozen=True)
 class _ConfirmationFactTreeResult:
     grounded_refs: Set[str]
-    candidate_semantic_corpus: str
+    candidate_semantic_fragments: Tuple[str, ...]
 
 
 class _ConfirmationFactTreeValidator:
@@ -639,20 +677,35 @@ class _ConfirmationFactTreeValidator:
         self.validated_manifests: Set[int] = set()
         self.hydrated_artifact_nodes: Set[int] = set()
         self.hydrated_artifact_refs: Set[str] = set()
+        self.pending_artifact_statuses: List[Tuple[Mapping[str, Any], str]] = []
+        self.validated_artifact_status_nodes: Set[int] = set()
         self.roots = (
             ("candidate_reference", request.candidate_reference),
             ("recursive_path_references", request.recursive_path_references),
             ("supporting_evidence", request.supporting_evidence),
             ("opposing_evidence", request.opposing_evidence),
             ("competing hypothesis", request.competing_hypotheses),
+            ("task_obligations", request.task_obligations),
         )
 
     def validate(self) -> _ConfirmationFactTreeResult:
         for path, value in self.roots:
-            self._pass_one(value, path=path, parent_key="")
+            self._pass_one(
+                value,
+                path=path,
+                parent_key="",
+                in_provenance_context=False,
+            )
+        self._validate_artifact_statuses()
         self._validate_required_roots()
         for path, value in self.roots:
-            self._pass_two(value, path=path, parent_key="", candidate_local=False)
+            self._pass_two(
+                value,
+                path=path,
+                parent_key="",
+                candidate_local=False,
+                in_provenance_context=False,
+            )
         self._validate_competing_hypotheses()
         if self.errors:
             unique_errors = list(dict.fromkeys(self.errors))
@@ -674,8 +727,19 @@ class _ConfirmationFactTreeValidator:
             parent_key="supporting_evidence",
             candidate_local=False,
         )
-        corpus = re.sub(r"\s+", " ", " ".join(fragments)).strip().lower()
-        return _ConfirmationFactTreeResult(set(self.grounded_refs), corpus)
+        normalized_fragments = tuple(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    re.sub(r"\s+", " ", fragment).strip().lower()
+                    for fragment in fragments
+                )
+                if normalized
+            )
+        )
+        return _ConfirmationFactTreeResult(
+            set(self.grounded_refs), normalized_fragments
+        )
 
     def _error(self, path: str, message: str) -> None:
         self.errors.append("{0}: {1}".format(path, message))
@@ -727,20 +791,41 @@ class _ConfirmationFactTreeValidator:
             return ["inferred provenance contradicts evidence_type"]
         return []
 
-    def _temporal_errors(self, value: Mapping[str, Any]) -> List[str]:
+    def _temporal_errors(
+        self,
+        value: Mapping[str, Any],
+        *,
+        in_provenance_context: bool,
+    ) -> List[str]:
         errors: List[str] = []
         for raw_key, child in value.items():
             key = str(raw_key).strip().lower()
-            if not _is_provenance_field(key) or not isinstance(child, str):
+            provenance_value = _is_provenance_field(key) or (
+                in_provenance_context and key in _PROVENANCE_CONTEXT_FIELDS
+            )
+            if not provenance_value or not isinstance(child, str):
                 continue
             normalized = child.strip().lower()
             if normalized.startswith("temporal_") or "temporal" in normalized:
                 errors.append("temporal provenance field {0} is confirmation-ineligible".format(key))
         return errors
 
-    def _pass_one(self, value: Any, *, path: str, parent_key: str) -> None:
+    def _pass_one(
+        self,
+        value: Any,
+        *,
+        path: str,
+        parent_key: str,
+        in_provenance_context: bool,
+    ) -> None:
         if isinstance(value, Mapping):
-            envelope_shaped = bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+            artifact_status_shaped = parent_key == "artifact_status" and bool(
+                _TASK2_ARTIFACT_STATUS_KEYS.intersection(value)
+            )
+            envelope_shaped = (
+                bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+                and not artifact_status_shaped
+            )
             provenance_errors: List[str] = []
             if "provenance_class" in value:
                 provenance = str(value.get("provenance_class") or "").strip()
@@ -749,7 +834,9 @@ class _ConfirmationFactTreeValidator:
                         "provenance_class must be exactly recorded, reconstructed, or inferred",
                     )
                 provenance_errors.extend(self._inference_errors(value))
-            temporal_errors = self._temporal_errors(value)
+            temporal_errors = self._temporal_errors(
+                value, in_provenance_context=in_provenance_context
+            )
             for error in provenance_errors + temporal_errors:
                 self._error(path, error)
             if envelope_shaped:
@@ -768,9 +855,18 @@ class _ConfirmationFactTreeValidator:
                     self._register_ref(resolved_ref)
             if parent_key == "artifact_hydration":
                 self._register_hydration_manifest(value, path=path)
+            if artifact_status_shaped:
+                self.pending_artifact_statuses.append((value, path))
             for raw_key, child in value.items():
                 key = str(raw_key).strip().lower()
-                self._pass_one(child, path="{0}.{1}".format(path, raw_key), parent_key=key)
+                self._pass_one(
+                    child,
+                    path="{0}.{1}".format(path, raw_key),
+                    parent_key=key,
+                    in_provenance_context=(
+                        in_provenance_context or _is_provenance_container_key(key)
+                    ),
+                )
             return
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value):
@@ -778,6 +874,7 @@ class _ConfirmationFactTreeValidator:
                     child,
                     path="{0}[{1}]".format(path, index),
                     parent_key=parent_key,
+                    in_provenance_context=in_provenance_context,
                 )
 
     def _artifact_id_list(self, value: Any, *, path: str) -> Optional[Set[str]]:
@@ -861,6 +958,56 @@ class _ConfirmationFactTreeValidator:
             self._register_ref(artifact_id)
             self._register_ref("artifact:{0}".format(artifact_id))
 
+    def _validate_artifact_statuses(self) -> None:
+        for value, path in self.pending_artifact_statuses:
+            errors: List[str] = []
+            missing_keys = _TASK2_ARTIFACT_STATUS_KEYS - set(value)
+            if missing_keys:
+                errors.append(
+                    "Task 2 artifact status is missing {0}".format(
+                        ", ".join(sorted(missing_keys))
+                    )
+                )
+            raw_ref = str(value.get("raw_ref") or "").strip()
+            canonical_ref = str(value.get("canonical_ref") or "").strip()
+            raw_id = _normalized_artifact_id(raw_ref)
+            canonical_id = _normalized_artifact_id(canonical_ref)
+            if not raw_id or not canonical_id:
+                errors.append("Task 2 artifact status requires non-empty raw and canonical refs")
+            if canonical_ref != "artifact:{0}".format(canonical_id):
+                errors.append("Task 2 artifact status canonical_ref is not canonical")
+            if raw_id != canonical_id:
+                errors.append("Task 2 artifact status raw_ref contradicts canonical_ref")
+            resolved_ref = str(value.get("resolved_ref") or "").strip()
+            if resolved_ref and resolved_ref != canonical_ref:
+                errors.append("Task 2 artifact status resolved_ref contradicts canonical_ref")
+            artifact_id = _normalized_artifact_id(value.get("artifact_id"))
+            if artifact_id and artifact_id != canonical_id:
+                errors.append("Task 2 artifact status artifact_id contradicts canonical_ref")
+            if str(value.get("resolution_status") or "").strip().lower() != "resolved":
+                errors.append("Task 2 artifact status is unresolved")
+            if str(value.get("availability") or "").strip().lower() != "available":
+                errors.append("Task 2 artifact status is not available")
+            if str(value.get("hydration_status") or "").strip().lower() != "hydrated":
+                errors.append("Task 2 artifact status is not hydrated")
+            if canonical_id not in self.hydrated_artifact_refs:
+                errors.append(
+                    "Task 2 artifact status is absent from a validated hydration manifest"
+                )
+            provenance = value.get("provenance_class")
+            if provenance is not None and str(provenance).strip() != "recorded":
+                errors.append("Task 2 artifact status provenance must be recorded")
+            errors.extend(
+                self._temporal_errors(value, in_provenance_context=False)
+            )
+            errors.extend(self._blocking_errors(value))
+            for error in errors:
+                self._error(path, error)
+            if not errors:
+                self.validated_artifact_status_nodes.add(id(value))
+                self._register_ref(raw_ref)
+                self._register_ref(canonical_ref)
+
     def _validate_required_roots(self) -> None:
         candidate = self.resolved_envelopes.get(id(self.request.candidate_reference))
         if candidate != self.request.candidate_ref:
@@ -925,6 +1072,10 @@ class _ConfirmationFactTreeValidator:
                 status = child.strip().lower()
                 if status in _BLOCKING_STATUS_VALUES:
                     errors.append("blocking {0}={1}".format(key, status))
+            if isinstance(child, bool) and not child and (
+                key == "available" or key.endswith("_available")
+            ):
+                errors.append("blocking {0}=false".format(key))
             if not _nonempty(child):
                 continue
             if key in {
@@ -942,6 +1093,7 @@ class _ConfirmationFactTreeValidator:
                 "missing",
                 "truncated",
                 "unresolved",
+                "unavailable",
             }:
                 errors.append("blocking {0}".format(key))
             elif (
@@ -1012,9 +1164,16 @@ class _ConfirmationFactTreeValidator:
         path: str,
         parent_key: str,
         candidate_local: bool,
+        in_provenance_context: bool,
     ) -> None:
         if isinstance(value, Mapping):
-            envelope_shaped = bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+            artifact_status_shaped = parent_key == "artifact_status" and bool(
+                _TASK2_ARTIFACT_STATUS_KEYS.intersection(value)
+            )
+            envelope_shaped = (
+                bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+                and not artifact_status_shaped
+            )
             current_local = candidate_local
             if envelope_shaped:
                 for error in self._envelope_errors(value):
@@ -1027,7 +1186,9 @@ class _ConfirmationFactTreeValidator:
                 owner_ref = self.resolved_envelopes.get(id(owner))
                 if owner_ref == self.request.candidate_ref:
                     current_local = True
-            for error in self._temporal_errors(value):
+            for error in self._temporal_errors(
+                value, in_provenance_context=in_provenance_context
+            ):
                 self._error(path, error)
             for error in self._blocking_errors(value):
                 self._error(path, error)
@@ -1070,6 +1231,9 @@ class _ConfirmationFactTreeValidator:
                     path=child_path,
                     parent_key=key,
                     candidate_local=current_local,
+                    in_provenance_context=(
+                        in_provenance_context or _is_provenance_container_key(key)
+                    ),
                 )
             return
         if isinstance(value, (list, tuple)):
@@ -1079,6 +1243,7 @@ class _ConfirmationFactTreeValidator:
                     path="{0}[{1}]".format(path, index),
                     parent_key=parent_key,
                     candidate_local=candidate_local,
+                    in_provenance_context=in_provenance_context,
                 )
 
     def _validate_competing_hypotheses(self) -> None:
@@ -1212,9 +1377,10 @@ def validate_recursive_confirmation(
             raise ValueError("confirmed root requires grounded evidence refs")
         if not excerpt:
             raise ValueError("confirmed root requires a grounded excerpt")
-        if (
-            re.sub(r"\s+", " ", excerpt).strip().lower()
-            not in fact_tree.candidate_semantic_corpus
+        normalized_excerpt = re.sub(r"\s+", " ", excerpt).strip().lower()
+        if not any(
+            normalized_excerpt in fragment
+            for fragment in fact_tree.candidate_semantic_fragments
         ):
             raise ValueError("confirmed root requires a grounded excerpt from candidate facts")
     return RootConfirmation(
