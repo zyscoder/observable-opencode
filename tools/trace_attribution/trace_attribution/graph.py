@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .models import JsonDict, TraceNode
+from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
@@ -298,6 +299,55 @@ class TraceGraph:
         source = self.resolve(from_ref) or from_ref
         target = self.resolve(to_ref) or to_ref
         return [dict(item) for item in self._edge_context_index.get((source, target), [])]
+
+    def semantic_predecessor_edges(self, ref: str) -> List[JsonDict]:
+        """Return attribution-eligible incoming edges without changing the trace graph."""
+        resolved = self.resolve(ref) or ref
+        output: List[JsonDict] = []
+        for upstream_ref in self.upstream_refs(resolved):
+            for edge in self.edge_context(upstream_ref, resolved):
+                if not edge.get("eligible_for_attribution"):
+                    continue
+                output.append({"ref": upstream_ref, **edge})
+        return sorted(
+            output,
+            key=lambda item: (
+                -float(item.get("confidence", 0.0)),
+                self.position(str(item.get("ref") or "")),
+                str(item.get("relation") or ""),
+            ),
+        )
+
+    def semantic_search(
+        self,
+        query_terms: List[str],
+        *,
+        before_ref: str,
+        limit: int,
+    ) -> List[JsonDict]:
+        """Find earlier semantically overlapping records without manufacturing graph edges."""
+        before_position = self.position(self.resolve(before_ref) or before_ref)
+        terms = {term.lower() for term in query_terms if len(term) >= 3}
+        if not terms or limit <= 0:
+            return []
+        scored: List[JsonDict] = []
+        for node in self.nodes.values():
+            if node.event_type == "progress.episode" or self.position(node.ref) >= before_position:
+                continue
+            tokens = set(re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower()))
+            overlap = len(terms & tokens)
+            if overlap:
+                scored.append(
+                    {
+                        "ref": node.ref,
+                        "score": overlap / max(len(terms), 1),
+                        "evidence_type": "semantic_inferred",
+                    }
+                )
+        return sorted(
+            scored,
+            key=lambda item: (-float(item["score"]), self.position(str(item["ref"]))),
+        )[:limit]
 
     def incoming_edge_context(
         self,
