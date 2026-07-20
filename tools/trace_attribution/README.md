@@ -93,6 +93,26 @@ python3 -m trace_attribution \
   --objective "Find why the final answer quality was poor."
 ```
 
+The compatibility engine remains the default. Select the resumable recursive engine
+explicitly when running the LLM-driven recursive hypothesis, investigation, and independent
+confirmation flow:
+
+```bash
+PYTHONPATH=tools/trace_attribution \
+python3 -m trace_attribution \
+  --engine recursive-agentic \
+  --trace /tmp/case/trace.json \
+  --out /tmp/attribution/case.attribution.json \
+  --objective "Find why the final answer quality was poor." \
+  --analysis-perspective "Improve Agent repository reasoning"
+```
+
+The recursive defaults are `--max-frontier-items 96`, `--max-depth 20`,
+`--max-hypotheses 24`, `--max-investigation-rounds 12`,
+`--max-artifact-bytes 1048576`, and `--max-judge-requests 128`. The analysis perspective
+changes deterministic ranking and labels only; it never makes a node eligible or ineligible
+as a cause. The legacy defaults remain `--max-depth 8 --max-nodes 48`.
+
 For DeepSeek's Anthropic-compatible endpoint:
 
 ```bash
@@ -140,6 +160,53 @@ The cache key covers the stage, model, complete system/user messages, token budg
 configuration, and prompt-schema version. A prompt, model, context, or configuration change cannot
 silently reuse a stale judgment. Only schema-valid judgments are persisted; prompts, API keys, and
 provider responses that failed validation are not stored in the checkpoint.
+
+### Recursive checkpoint and resume
+
+For `--engine recursive-agentic`, the CLI additionally creates three fsync-backed,
+append-only journals under `<attribution-output-stem>.checkpoint/`:
+
+```text
+case.attribution.checkpoint/
+  manifest.json
+  frontier.jsonl
+  hypotheses.jsonl
+  investigation-actions.jsonl
+```
+
+`frontier.jsonl` preserves queued, in-flight, and completed semantic visits;
+`hypotheses.jsonl` preserves candidate-specific hypotheses and transformed defect state;
+`investigation-actions.jsonl` preserves Judge, investigation, control, confirmation, budget,
+cache identity, and Provider-circuit lifecycle. Every record has an exact schema version,
+monotonic sequence, semantic key, timestamp, previous hash, and record hash. Only a truncated
+final JSON fragment is ignored and counted. Interior corruption, reordering, hash-chain breaks,
+or a stale trace/configuration stop resume with an explicit error.
+
+Resume by running the exact same command. A custom directory can be selected with
+`--checkpoint-dir /path/to/case.checkpoint`. The compatibility fingerprint binds the effective
+Trace (including an injected review), objective, start refs, perspective, every recursive budget,
+model/endpoint/thinking configuration, Provider threshold, and Judge cache path. Changing any of
+those values requires a new checkpoint directory.
+
+Validated completed Judge and confirmation results, completed investigations, physical/logical
+budgets, artifact bytes, and Provider circuit state are replayed without repeating calls. A call
+that has only a durable `*_started` record is conservatively closed as unknown: it is never called
+again and is never treated as a fabricated success.
+
+SIGINT and SIGTERM use the same graceful behavior. The handler only sets a stop flag; at the next
+safe analysis boundary all three journals are fsynced and an explicit inconclusive/partial
+attribution JSON plus message-lineage JSON is atomically written. The same command can then resume.
+SIGKILL cannot execute a process handler, so recovery is limited to the last record already fsynced
+before the kill. No claim is made that in-memory work after that record survived.
+
+Recursive outputs are deterministic relative to `--out` unless overridden:
+
+```text
+case.attribution.json
+case.attribution.message-lineage.json
+case.attribution.judge-cache.jsonl
+case.attribution.checkpoint/
+```
 
 Consecutive connection or timeout failures open a provider circuit after
 `--provider-error-threshold` failures (default `3`). The current branch then terminates as

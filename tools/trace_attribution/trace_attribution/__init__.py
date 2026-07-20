@@ -25,6 +25,13 @@ from .causal_state import (
     semantic_visit_key,
     confirmation_identity_for,
 )
+from .checkpoint import (
+    CheckpointBundle,
+    CheckpointCompatibilityError,
+    CheckpointCorruptionError,
+    CheckpointState,
+    build_checkpoint_config,
+)
 from .graph import TraceGraph
 from .investigation import (
     AttributionControlDirective,
@@ -48,6 +55,10 @@ __all__ = [
     "CausalFactor",
     "CausalInvestigationTools",
     "CausalStepJudgment",
+    "CheckpointBundle",
+    "CheckpointCompatibilityError",
+    "CheckpointCorruptionError",
+    "CheckpointState",
     "ConfirmedRoot",
     "DefectState",
     "FrontierItem",
@@ -68,4 +79,5 @@ __all__ = [
     "TraceNode",
     "semantic_visit_key",
     "confirmation_identity_for",
+    "build_checkpoint_config",
 ]

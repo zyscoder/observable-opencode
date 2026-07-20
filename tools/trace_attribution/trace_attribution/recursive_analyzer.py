@@ -7,7 +7,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .causal_judge import (
     BoundedJudgeCallResult,
@@ -35,6 +35,7 @@ from .causal_state import (
     RootConfirmation,
     confirmation_identity_for,
 )
+from .checkpoint import CheckpointBundle, CheckpointState
 from .errors import JudgeProviderError, JudgeProviderUnavailable
 from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
@@ -52,6 +53,35 @@ RECURSIVE_RELATIONS = frozenset({"same_defect_propagation", "defect_transformati
 EVALUATION_START_EVENTS = frozenset(
     {"case.observed_defect", "case.quality_gap", "case.missing_semantic"}
 )
+FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
+HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v1"
+
+
+def _require_exact_checkpoint_keys(
+    value: Mapping[str, Any], expected: Set[str], label: str
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("{0} must be an object".format(label))
+    actual = {str(key) for key in value}
+    if actual != expected:
+        raise ValueError(
+            "{0} schema mismatch (missing={1}, extra={2})".format(
+                label, sorted(expected - actual), sorted(actual - expected)
+            )
+        )
+
+
+def _checkpoint_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _checkpoint_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_checkpoint_json(item) for item in value]
+    if isinstance(value, set):
+        return [_checkpoint_json(item) for item in sorted(value, key=str)]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("checkpoint state contains a non-JSON value: {0}".format(type(value).__name__))
 
 
 def _dedupe_strings(values: Iterable[str]) -> Tuple[str, ...]:
@@ -379,6 +409,7 @@ class RecursiveAnalysisState:
     logical_confirmation_calls: int = 0
     pending_rejudge_journal: Dict[str, List[int]] = field(default_factory=dict)
     seed_count: int = 0
+    replay_actions: Dict[str, JsonDict] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -492,6 +523,215 @@ class RecursiveAnalysisState:
             )
             state.frontier.push(item)
             state._merge_visit_evidence(item.visit_key, [start_ref])
+        return state
+
+    def frontier_checkpoint_payload(self) -> JsonDict:
+        return {
+            "schema": FRONTIER_STATE_SCHEMA,
+            "frontier": self.frontier.checkpoint(),
+            "visit_evidence": {
+                key: sorted(values) for key, values in sorted(self.visit_evidence.items())
+            },
+        }
+
+    def hypothesis_checkpoint_payload(self) -> JsonDict:
+        return {
+            "schema": HYPOTHESIS_STATE_SCHEMA,
+            "hypotheses": self.ledger.snapshot(),
+            "defect_states": [
+                item.to_dict() for _, item in sorted(self.defect_states.items())
+            ],
+            "transformation_chains": {
+                key: [item.to_dict() for item in chain]
+                for key, chain in sorted(self.transformation_chains.items())
+            },
+        }
+
+    def action_checkpoint_payload(self) -> JsonDict:
+        return {
+            "schema": ACTION_STATE_SCHEMA,
+            "start_refs": list(self.start_refs),
+            "objective": self.objective,
+            "analysis_perspective": self.analysis_perspective,
+            "causal_candidates": [item.to_dict() for item in self.causal_candidates],
+            "causal_relations": [item.to_dict() for item in self.causal_relations],
+            "step_judgments": [item.to_dict() for item in self.step_judgments],
+            "introduction_candidates": [item.to_dict() for item in self.introduction_candidates],
+            "introduction_bindings": _checkpoint_json(self.introduction_bindings),
+            "contributing_conditions": [item.to_dict() for item in self.contributing_conditions],
+            "rejected_candidates": [item.to_dict() for item in self.rejected_candidates],
+            "taint_paths": [list(item) for item in self.taint_paths],
+            "visited_order": list(self.visited_order),
+            "unresolved_branches": _checkpoint_json(self.unresolved_branches),
+            "unresolved_refs": list(self.unresolved_refs),
+            "unresolved_hypothesis_ids": sorted(self.unresolved_hypothesis_ids),
+            "introduction_hypothesis_ids": sorted(self.introduction_hypothesis_ids),
+            "present_hypothesis_ids": sorted(self.present_hypothesis_ids),
+            "exhausted_budgets": dict(sorted(self.exhausted_budgets.items())),
+            "artifact_identities": sorted(self.artifact_identities),
+            "artifact_bytes": self.artifact_bytes,
+            "processed_items": self.processed_items,
+            "judge_requests": self.judge_requests,
+            "logical_judge_calls": self.logical_judge_calls,
+            "investigation_rounds": self.investigation_rounds,
+            "investigation_result_bytes": self.investigation_result_bytes,
+            "investigation_journal": _checkpoint_json(self.investigation_journal),
+            "investigation_evidence": _checkpoint_json(self.investigation_evidence),
+            "investigation_evidence_hashes": {
+                key: sorted(values)
+                for key, values in sorted(self.investigation_evidence_hashes.items())
+            },
+            "control_directive_ids": sorted(self.control_directive_ids),
+            "confirmation_queue": _checkpoint_json(self.confirmation_queue),
+            "confirmation_queue_keys": [list(item) for item in sorted(self.confirmation_queue_keys)],
+            "confirmations": [item.to_dict() for item in self.confirmations],
+            "confirmed_roots": [item.to_dict() for item in self.confirmed_roots],
+            "co_roots": [item.to_dict() for item in self.co_roots],
+            "amplifying_factors": [item.to_dict() for item in self.amplifying_factors],
+            "confirmation_journal": _checkpoint_json(self.confirmation_journal),
+            "logical_confirmation_calls": self.logical_confirmation_calls,
+            "pending_rejudge_journal": _checkpoint_json(self.pending_rejudge_journal),
+            "seed_count": self.seed_count,
+        }
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        *,
+        graph: TraceGraph,
+        checkpoint: CheckpointState,
+    ) -> "RecursiveAnalysisState":
+        frontier_payload = checkpoint.frontier_payload
+        hypothesis_payload = checkpoint.hypothesis_payload
+        action_record = next(
+            (
+                item
+                for item in reversed(checkpoint.actions)
+                if item.get("operation") == "state_snapshot"
+            ),
+            None,
+        )
+        if not frontier_payload or not hypothesis_payload or action_record is None:
+            raise ValueError("checkpoint does not contain a complete recursive state snapshot")
+        action_payload = dict(action_record["payload"])
+        _require_exact_checkpoint_keys(
+            frontier_payload,
+            {"schema", "frontier", "visit_evidence"},
+            "frontier state",
+        )
+        _require_exact_checkpoint_keys(
+            hypothesis_payload,
+            {"schema", "hypotheses", "defect_states", "transformation_chains"},
+            "hypothesis state",
+        )
+        action_keys = set(cls(graph=graph, start_refs=(), objective="", analysis_perspective="").action_checkpoint_payload())
+        _require_exact_checkpoint_keys(action_payload, action_keys, "action state")
+        if frontier_payload["schema"] != FRONTIER_STATE_SCHEMA:
+            raise ValueError("unsupported recursive frontier state schema")
+        if hypothesis_payload["schema"] != HYPOTHESIS_STATE_SCHEMA:
+            raise ValueError("unsupported recursive hypothesis state schema")
+        if action_payload["schema"] != ACTION_STATE_SCHEMA:
+            raise ValueError("unsupported recursive action state schema")
+
+        state = cls(
+            graph=graph,
+            start_refs=tuple(str(item) for item in action_payload["start_refs"]),
+            objective=str(action_payload["objective"]),
+            analysis_perspective=str(action_payload["analysis_perspective"]),
+            ledger=HypothesisLedger.from_snapshot(hypothesis_payload["hypotheses"]),
+            frontier=RecursiveFrontier.from_checkpoint(frontier_payload["frontier"]),
+        )
+        state.visit_evidence = {
+            str(key): {str(item) for item in values}
+            for key, values in dict(frontier_payload["visit_evidence"]).items()
+        }
+        state.defect_states = {
+            item.fingerprint: item
+            for item in (
+                DefectState.from_dict(value) for value in hypothesis_payload["defect_states"]
+            )
+        }
+        state.transformation_chains = {
+            str(key): tuple(DefectState.from_dict(item) for item in values)
+            for key, values in dict(hypothesis_payload["transformation_chains"]).items()
+        }
+        state.causal_candidates = [CausalCandidate.from_dict(item) for item in action_payload["causal_candidates"]]
+        state.causal_relations = [PredecessorAssessment.from_dict(item) for item in action_payload["causal_relations"]]
+        state.step_judgments = [CausalStepJudgment.from_dict(item) for item in action_payload["step_judgments"]]
+        state.introduction_candidates = [CausalCandidate.from_dict(item) for item in action_payload["introduction_candidates"]]
+        state.introduction_bindings = copy.deepcopy(action_payload["introduction_bindings"])
+        state.introduction_binding_keys = {
+            (
+                str(item.get("candidate_ref") or ""),
+                str(item.get("defect_fingerprint") or ""),
+                str(item.get("hypothesis_semantic_hash") or ""),
+            )
+            for item in state.introduction_bindings
+        }
+        state.contributing_conditions = [CausalFactor.from_dict(item) for item in action_payload["contributing_conditions"]]
+        state.rejected_candidates = [RejectedCandidate.from_dict(item) for item in action_payload["rejected_candidates"]]
+        state.taint_paths = [tuple(str(ref) for ref in item) for item in action_payload["taint_paths"]]
+        state.visited_order = [str(item) for item in action_payload["visited_order"]]
+        state.unresolved_branches = copy.deepcopy(action_payload["unresolved_branches"])
+        state.unresolved_refs = [str(item) for item in action_payload["unresolved_refs"]]
+        state.unresolved_hypothesis_ids = {str(item) for item in action_payload["unresolved_hypothesis_ids"]}
+        state.introduction_hypothesis_ids = {str(item) for item in action_payload["introduction_hypothesis_ids"]}
+        state.present_hypothesis_ids = {str(item) for item in action_payload["present_hypothesis_ids"]}
+        state.exhausted_budgets = {str(key): int(value) for key, value in dict(action_payload["exhausted_budgets"]).items()}
+        state.artifact_identities = {str(item) for item in action_payload["artifact_identities"]}
+        for name in (
+            "artifact_bytes",
+            "processed_items",
+            "judge_requests",
+            "logical_judge_calls",
+            "investigation_rounds",
+            "investigation_result_bytes",
+            "logical_confirmation_calls",
+            "seed_count",
+        ):
+            value = action_payload[name]
+            if type(value) is not int or value < 0:
+                raise ValueError("{0} checkpoint counter is invalid".format(name))
+            setattr(state, name, value)
+        state.investigation_journal = copy.deepcopy(action_payload["investigation_journal"])
+        state.investigation_evidence = copy.deepcopy(action_payload["investigation_evidence"])
+        state.investigation_evidence_hashes = {
+            str(key): {str(item) for item in values}
+            for key, values in dict(action_payload["investigation_evidence_hashes"]).items()
+        }
+        state.control_directive_ids = {str(item) for item in action_payload["control_directive_ids"]}
+        state.confirmation_queue = copy.deepcopy(action_payload["confirmation_queue"])
+        state.confirmation_queue_keys = {
+            tuple(str(part) for part in item) for item in action_payload["confirmation_queue_keys"]
+        }
+        state.confirmations = [RootConfirmation.from_dict(item) for item in action_payload["confirmations"]]
+        state.confirmed_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["confirmed_roots"]]
+        state.co_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["co_roots"]]
+        state.amplifying_factors = [CausalFactor.from_dict(item) for item in action_payload["amplifying_factors"]]
+        state.confirmation_journal = copy.deepcopy(action_payload["confirmation_journal"])
+        state.pending_rejudge_journal = {
+            str(key): [int(item) for item in values]
+            for key, values in dict(action_payload["pending_rejudge_journal"]).items()
+        }
+        transient_signal_refs = {
+            str(item.get("node_ref") or "")
+            for item in state.unresolved_branches
+            if item.get("reason") == "analysis_interrupted"
+        }
+        state.unresolved_branches = [
+            item
+            for item in state.unresolved_branches
+            if item.get("reason") != "analysis_interrupted"
+        ]
+        retained_unresolved_refs = {
+            str(item.get("node_ref") or "") for item in state.unresolved_branches
+        }
+        state.unresolved_refs = [
+            ref
+            for ref in state.unresolved_refs
+            if ref not in transient_signal_refs or ref in retained_unresolved_refs
+        ]
+        state.replay_actions = checkpoint.latest_actions
         return state
 
     def build_step_request(
@@ -1124,6 +1364,9 @@ class AgenticRecursiveAnalyzer:
         max_investigation_rounds: int = 12,
         max_artifact_bytes: int = 1_048_576,
         max_judge_requests: int = 128,
+        checkpoint: Optional[CheckpointBundle] = None,
+        checkpoint_config: Optional[Mapping[str, Any]] = None,
+        stop_requested: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.judge = judge
         self.retriever = retriever or SemanticPredecessorRetriever()
@@ -1134,6 +1377,74 @@ class AgenticRecursiveAnalyzer:
         self.max_investigation_rounds = max(0, int(max_investigation_rounds))
         self.max_artifact_bytes = max(0, int(max_artifact_bytes))
         self.max_judge_requests = max(0, int(max_judge_requests))
+        if checkpoint is not None and checkpoint_config is None:
+            raise ValueError("checkpoint_config is required with checkpoint")
+        self.checkpoint = checkpoint
+        self.checkpoint_config = dict(checkpoint_config or {})
+        self.stop_requested = stop_requested or (lambda: False)
+
+    def _checkpoint_state(self, state: RecursiveAnalysisState, semantic_key: str) -> None:
+        if self.checkpoint is None:
+            return
+        self.checkpoint.record_frontier(
+            "snapshot", semantic_key, state.frontier_checkpoint_payload()
+        )
+        self.checkpoint.record_hypothesis(
+            "snapshot", semantic_key, state.hypothesis_checkpoint_payload()
+        )
+        self.checkpoint.record_action(
+            "state_snapshot", semantic_key, state.action_checkpoint_payload()
+        )
+        target = _judge_transport(self.judge)
+        self.checkpoint.record_action(
+            "provider_state",
+            "provider:circuit",
+            {
+                "open": bool(getattr(target, "provider_circuit_open", False)),
+                "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
+                "consecutive_provider_errors": int(
+                    getattr(target, "consecutive_provider_errors", 0) or 0
+                ),
+                "provider_error_threshold": int(
+                    getattr(target, "provider_error_threshold", 3) or 3
+                ),
+            },
+        )
+
+    def _checkpoint_action(
+        self, operation: str, semantic_key: str, payload: Mapping[str, Any]
+    ) -> None:
+        if self.checkpoint is not None:
+            self.checkpoint.record_action(operation, semantic_key, payload)
+
+    def _restore_provider_state(self, checkpoint: CheckpointState) -> None:
+        record = checkpoint.latest_actions.get("provider:circuit")
+        if not isinstance(record, Mapping) or record.get("operation") != "provider_state":
+            return
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "open",
+            "reason",
+            "consecutive_provider_errors",
+            "provider_error_threshold",
+        }:
+            raise ValueError("provider checkpoint state schema is invalid")
+        target = _judge_transport(self.judge)
+        target.provider_circuit_open = bool(payload["open"])
+        target.provider_circuit_reason = str(payload["reason"])
+        consecutive = payload["consecutive_provider_errors"]
+        threshold = payload["provider_error_threshold"]
+        if type(consecutive) is not int or consecutive < 0:
+            raise ValueError("provider consecutive error checkpoint is invalid")
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("provider threshold checkpoint is invalid")
+        target.consecutive_provider_errors = consecutive
+        target.provider_error_threshold = threshold
+
+    @staticmethod
+    def _replay_action(state: RecursiveAnalysisState, semantic_key: str) -> Optional[JsonDict]:
+        value = state.replay_actions.get(semantic_key)
+        return dict(value) if isinstance(value, Mapping) else None
 
     def analyze(
         self,
@@ -1147,13 +1458,44 @@ class AgenticRecursiveAnalyzer:
         requested_starts = tuple(start_refs) if start_refs is not None else ()
         if not requested_starts:
             requested_starts = tuple(analysis_graph.default_start_refs())
-        state = RecursiveAnalysisState.create(
-            graph=analysis_graph,
-            start_refs=requested_starts,
-            objective=objective,
-            analysis_perspective=analysis_perspective,
-            max_hypotheses=self.max_hypotheses,
-        )
+        restored_checkpoint: Optional[CheckpointState] = None
+        if self.checkpoint is not None:
+            self.checkpoint.initialize(self.checkpoint_config)
+            restored_checkpoint = self.checkpoint.restore(
+                expected_config=self.checkpoint_config
+            )
+            final_report = restored_checkpoint.final_report
+            if final_report is not None:
+                return RecursiveAttributionReport.from_dict(final_report)
+        if (
+            restored_checkpoint is not None
+            and restored_checkpoint.frontier_payload
+            and restored_checkpoint.hypothesis_payload
+            and any(
+                item.get("operation") == "state_snapshot"
+                for item in restored_checkpoint.actions
+            )
+        ):
+            state = RecursiveAnalysisState.from_checkpoint(
+                graph=analysis_graph, checkpoint=restored_checkpoint
+            )
+            self._restore_provider_state(restored_checkpoint)
+            if (
+                state.objective != objective
+                or state.analysis_perspective != analysis_perspective
+                or state.start_refs
+                != _dedupe_strings(analysis_graph.resolve(ref) or ref for ref in requested_starts)
+            ):
+                raise ValueError("restored recursive state does not match analysis inputs")
+        else:
+            state = RecursiveAnalysisState.create(
+                graph=analysis_graph,
+                start_refs=requested_starts,
+                objective=objective,
+                analysis_perspective=analysis_perspective,
+                max_hypotheses=self.max_hypotheses,
+            )
+            self._checkpoint_state(state, "analysis:initialized")
         tools = (
             self.tools.for_graph(
                 analysis_graph, max_artifact_bytes=self.max_artifact_bytes
@@ -1169,7 +1511,18 @@ class AgenticRecursiveAnalyzer:
                 "analysis_start_missing",
                 "The trace does not contain a concrete analysis start node.",
             )
+        interrupted = False
         while state.frontier and state.processed_items < self.max_frontier_items:
+            if self.stop_requested():
+                interrupted = True
+                state._mark_seed_unresolved(
+                    "analysis:signal",
+                    "analysis_interrupted",
+                    "SIGINT or SIGTERM requested graceful attribution shutdown.",
+                )
+                self._checkpoint_state(state, "analysis:interrupted")
+                break
+            self._checkpoint_state(state, "analysis:before_frontier_pop")
             item = state.frontier.pop()
             state.processed_items += 1
             if item.depth > self.max_depth:
@@ -1255,10 +1608,63 @@ class AgenticRecursiveAnalyzer:
                     "The Judge exposes neither a bounded transport capability nor an explicit zero-transport capability.",
                 )
                 continue
-            state.logical_judge_calls += 1
+            evidence_hash = str(request.recursive_context.get("evidence_hash") or "")
+            provider_action_key = "step:{0}:{1}".format(item.visit_key, evidence_hash)
+            replay_action = self._replay_action(state, provider_action_key)
+            if replay_action is not None and replay_action.get("operation") == "provider_call_started":
+                state.complete_rejudge(
+                    item,
+                    terminal_state="interrupted_judge_call",
+                    detail="The prior process ended after fsyncing call intent but before a durable result.",
+                    physical_request_delta=None,
+                )
+                state.complete_unresolved(
+                    item,
+                    "interrupted_judge_call",
+                    "The in-flight Judge call is not repeated and no success is fabricated.",
+                )
+                self._checkpoint_state(state, "provider:interrupted:{0}".format(item.visit_key))
+                self._checkpoint_action(
+                    "provider_call_interrupted",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "unknown",
+                        "replayed": False,
+                    },
+                )
+                continue
+            replayed_judgment: Optional[CausalStepJudgment] = None
+            replayed_physical_delta = 0
+            if replay_action is not None and replay_action.get("operation") == "provider_call_completed":
+                replay_payload = replay_action.get("payload")
+                if not isinstance(replay_payload, Mapping):
+                    raise ValueError("completed Provider action payload is invalid")
+                replayed_judgment = CausalStepJudgment.from_dict(
+                    dict(replay_payload.get("judgment") or {})
+                )
+                replayed_physical_delta = int(replay_payload.get("physical_request_delta") or 0)
+            if replay_action is None:
+                state.logical_judge_calls += 1
+                self._checkpoint_state(state, "provider:before:{0}".format(item.visit_key))
+                self._checkpoint_action(
+                    "provider_call_started",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "evidence_hash": evidence_hash,
+                        "status": "in_flight",
+                        "physical_requests_reserved": remaining_requests,
+                    },
+                )
             physical_delta = 0
             try:
-                if bounded_judge:
+                if replayed_judgment is not None:
+                    judgment = replayed_judgment
+                    physical_delta = replayed_physical_delta
+                elif bounded_judge:
                     bounded_result = self.judge.judge_step_bounded(
                         request,
                         max_physical_requests=remaining_requests,
@@ -1287,6 +1693,17 @@ class AgenticRecursiveAnalyzer:
                     "judge_error",
                     "{0}: {1}".format(type(exc).__name__, exc),
                 )
+                self._checkpoint_action(
+                    "provider_call_failed",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                    },
+                )
                 continue
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 state.judge_requests += physical_delta
@@ -1310,6 +1727,17 @@ class AgenticRecursiveAnalyzer:
                     if isinstance(exc, JudgeProviderUnavailable)
                     else "",
                 )
+                self._checkpoint_action(
+                    "provider_call_failed",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                    },
+                )
                 continue
             except Exception as exc:
                 state.judge_requests += physical_delta
@@ -1324,6 +1752,17 @@ class AgenticRecursiveAnalyzer:
                     "judge_error",
                     "{0}: {1}".format(type(exc).__name__, exc),
                 )
+                self._checkpoint_action(
+                    "provider_call_failed",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "error": "{0}: {1}".format(type(exc).__name__, exc),
+                    },
+                )
                 continue
             state.judge_requests += physical_delta
             if not isinstance(judgment, CausalStepJudgment):
@@ -1337,7 +1776,30 @@ class AgenticRecursiveAnalyzer:
                     physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(item, "judge_validation_error", detail)
+                self._checkpoint_action(
+                    "provider_call_failed",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "error": detail,
+                    },
+                )
                 continue
+            if replayed_judgment is None:
+                self._checkpoint_action(
+                    "provider_call_completed",
+                    provider_action_key,
+                    {
+                        "call_kind": "step",
+                        "visit_key": item.visit_key,
+                        "status": "completed",
+                        "physical_request_delta": physical_delta,
+                        "judgment": judgment.to_dict(),
+                    },
+                )
             state.complete_rejudge(
                 item,
                 terminal_state=_rejudge_success_terminal_state(
@@ -1387,7 +1849,7 @@ class AgenticRecursiveAnalyzer:
                 max_hypotheses=self.max_hypotheses,
             )
 
-        if state.frontier:
+        if state.frontier and not interrupted:
             while state.frontier:
                 item = state.frontier.pop()
                 state.complete_rejudge(
@@ -1401,7 +1863,27 @@ class AgenticRecursiveAnalyzer:
                     "The recursive frontier item budget is exhausted.",
                     exhausted_budget="frontier_items",
                 )
-        self._confirm_queued_roots(state)
+        self._checkpoint_state(state, "analysis:frontier_complete")
+        if not interrupted and not self.stop_requested():
+            self._confirm_queued_roots(state)
+            if self.stop_requested():
+                interrupted = True
+                state._mark_seed_unresolved(
+                    "analysis:signal",
+                    "analysis_interrupted",
+                    "SIGINT or SIGTERM requested graceful attribution shutdown during confirmation.",
+                )
+                self._checkpoint_state(
+                    state, "analysis:interrupted_during_confirmation"
+                )
+        elif not interrupted:
+            interrupted = True
+            state._mark_seed_unresolved(
+                "analysis:signal",
+                "analysis_interrupted",
+                "SIGINT or SIGTERM requested graceful attribution shutdown before confirmation.",
+            )
+            self._checkpoint_state(state, "analysis:interrupted_before_confirmation")
         report = state.build_report(judge=self.judge)
         from .trace_improvement import build_recursive_trace_improvement_report
 
@@ -1409,11 +1891,27 @@ class AgenticRecursiveAnalyzer:
         metadata["trace_improvement_report"] = build_recursive_trace_improvement_report(
             analysis_graph, report
         )
-        return replace(report, metadata=metadata)
+        if interrupted:
+            metadata["termination_reason"] = "signal_interrupted"
+            metadata["checkpoint_resume_available"] = self.checkpoint is not None
+        report = replace(report, metadata=metadata)
+        self._checkpoint_state(state, "analysis:final_state")
+        self._checkpoint_action(
+            "analysis_interrupted" if interrupted else "analysis_completed",
+            "analysis:result",
+            {"report": report.to_dict(), "interrupted": interrupted},
+        )
+        if self.checkpoint is not None:
+            self.checkpoint.flush_all()
+        return report
 
     def _confirm_queued_roots(self, state: RecursiveAnalysisState) -> None:
-        pending_confirmations = list(state.confirmation_queue)
+        pending_confirmations = [
+            item for item in state.confirmation_queue if item.get("status") == "queued"
+        ]
         while pending_confirmations:
+            if self.stop_requested():
+                break
             queued = pending_confirmations.pop(0)
             try:
                 request = self._build_confirmation_request(state, queued)
@@ -1453,11 +1951,75 @@ class AgenticRecursiveAnalyzer:
                 continue
 
             remaining = max(0, self.max_judge_requests - state.judge_requests)
-            state.logical_judge_calls += 1
-            state.logical_confirmation_calls += 1
+            confirmation_action_key = "confirmation:{0}".format(
+                str(
+                    queued.get("semantic_identity")
+                    or confirmation_identity_for(
+                        hypothesis_id=request.hypothesis_id,
+                        hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+                        candidate_ref=request.candidate_ref,
+                        defect_fingerprint=request.defect_state.fingerprint,
+                        recursive_path=request.recursive_path,
+                    )
+                )
+            )
+            replay_action = self._replay_action(state, confirmation_action_key)
+            replayed_confirmation: Optional[RootConfirmation] = None
+            replayed_physical_delta = 0
+            if replay_action is not None and replay_action.get("operation") == "confirmation_started":
+                confirmation = RootConfirmation(
+                    candidate_ref=request.candidate_ref,
+                    status="unknown",
+                    reason="confirmation_interrupted: the prior in-flight confirmation is not repeated",
+                    counterfactual_status="unknown",
+                    hypothesis_id=request.hypothesis_id,
+                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+                    defect_fingerprint=request.defect_state.fingerprint,
+                    recursive_path=request.recursive_path,
+                )
+                self._record_confirmation(state, queued, confirmation, 0)
+                self._checkpoint_state(state, confirmation_action_key)
+                self._checkpoint_action(
+                    "confirmation_failed",
+                    confirmation_action_key,
+                    {
+                        "status": "unknown",
+                        "reason": "confirmation_interrupted",
+                        "confirmation": confirmation.to_dict(),
+                    },
+                )
+                continue
+            if replay_action is not None and replay_action.get("operation") == "confirmation_completed":
+                replay_payload = replay_action.get("payload")
+                if not isinstance(replay_payload, Mapping):
+                    raise ValueError("completed confirmation action payload is invalid")
+                replayed_confirmation = RootConfirmation.from_dict(
+                    dict(replay_payload.get("confirmation") or {})
+                )
+                replayed_physical_delta = int(
+                    replay_payload.get("physical_request_delta") or 0
+                )
+            if replay_action is None:
+                state.logical_judge_calls += 1
+                state.logical_confirmation_calls += 1
+                self._checkpoint_state(state, confirmation_action_key)
+                self._checkpoint_action(
+                    "confirmation_started",
+                    confirmation_action_key,
+                    {
+                        "status": "in_flight",
+                        "candidate_ref": request.candidate_ref,
+                        "hypothesis_id": request.hypothesis_id,
+                        "confirmation_identity": confirmation_action_key.split(":", 1)[1],
+                        "physical_requests_reserved": remaining,
+                    },
+                )
             physical_delta = 0
             try:
-                if bounded_judge:
+                if replayed_confirmation is not None:
+                    confirmation = replayed_confirmation
+                    physical_delta = replayed_physical_delta
+                elif bounded_judge:
                     bounded_result = self.judge.confirm_candidate_bounded(
                         request, max_physical_requests=remaining
                     )
@@ -1471,13 +2033,14 @@ class AgenticRecursiveAnalyzer:
                     raw = bounded_result.value
                 else:
                     raw = self.judge.confirm_candidate_offline(request)
-                if not isinstance(raw, RootConfirmation):
-                    raise TypeError(
-                        "confirmation Judge returned {0}, expected RootConfirmation".format(
-                            type(raw).__name__
+                if replayed_confirmation is None:
+                    if not isinstance(raw, RootConfirmation):
+                        raise TypeError(
+                            "confirmation Judge returned {0}, expected RootConfirmation".format(
+                                type(raw).__name__
+                            )
                         )
-                    )
-                confirmation = bind_root_confirmation(raw, request=request)
+                    confirmation = bind_root_confirmation(raw, request=request)
             except BoundedJudgeCallError as exc:
                 physical_delta = exc.physical_requests
                 confirmation = RootConfirmation(
@@ -1515,6 +2078,16 @@ class AgenticRecursiveAnalyzer:
                     recursive_path=request.recursive_path,
                 )
             state.judge_requests += physical_delta
+            if replayed_confirmation is None:
+                self._checkpoint_action(
+                    "confirmation_completed",
+                    confirmation_action_key,
+                    {
+                        "status": confirmation.status,
+                        "physical_request_delta": physical_delta,
+                        "confirmation": confirmation.to_dict(),
+                    },
+                )
             normalized_reason = confirmation.reason.casefold()
             if any(
                 marker in normalized_reason
@@ -2094,7 +2667,47 @@ class AgenticRecursiveAnalyzer:
                 item, directive, result, judgment, request
             )
             return "rejected"
-        if state.investigation_rounds >= self.max_investigation_rounds:
+        investigation_action_key = "investigation:{0}".format(directive.directive_id)
+        replay_action = self._replay_action(state, investigation_action_key)
+        if replay_action is not None and replay_action.get("operation") == "investigation_started":
+            state.record_terminal_action(
+                item=item,
+                judgment=judgment,
+                request=request,
+                directive=directive.to_dict(),
+                status="rejected",
+                rejection_reason="interrupted_investigation_call",
+                extra={"resume_policy": "never_repeat_inflight_call"},
+            )
+            state._mark_ref_unresolved(
+                item.node_ref,
+                item,
+                "interrupted_investigation_call",
+                "The in-flight local investigation is not repeated and no result is fabricated.",
+            )
+            state.frontier.complete_if_in_flight(
+                item, "unresolved:interrupted_investigation_call"
+            )
+            self._checkpoint_state(state, investigation_action_key)
+            self._checkpoint_action(
+                "investigation_failed",
+                investigation_action_key,
+                {
+                    "directive_id": directive.directive_id,
+                    "status": "unknown",
+                    "reason": "interrupted_investigation_call",
+                },
+            )
+            return "completed"
+        replayed_result: Optional[InvestigationResult] = None
+        if replay_action is not None and replay_action.get("operation") == "investigation_completed":
+            replay_payload = replay_action.get("payload")
+            if not isinstance(replay_payload, Mapping):
+                raise ValueError("completed investigation action payload is invalid")
+            replayed_result = InvestigationResult.from_dict(
+                dict(replay_payload.get("result") or {})
+            )
+        if replay_action is None and state.investigation_rounds >= self.max_investigation_rounds:
             state._increment_budget("investigation_rounds")
             result = InvestigationResult.rejected(
                 directive, "investigation_round_budget_exhausted"
@@ -2109,11 +2722,33 @@ class AgenticRecursiveAnalyzer:
                 "The exact investigation round budget is exhausted.",
             )
             return "exhausted"
-        state.investigation_rounds += 1
+        if replay_action is None:
+            state.investigation_rounds += 1
+            self._checkpoint_state(state, investigation_action_key)
+            self._checkpoint_action(
+                "investigation_started",
+                investigation_action_key,
+                {
+                    "directive_id": directive.directive_id,
+                    "directive": directive.to_dict(),
+                    "visit_key": item.visit_key,
+                    "status": "in_flight",
+                },
+            )
         tools.max_artifact_bytes = tools.artifact_bytes_used + max(
             0, self.max_artifact_bytes - state.artifact_bytes
         )
-        result = tools.execute(directive)
+        result = replayed_result if replayed_result is not None else tools.execute(directive)
+        if replayed_result is None:
+            self._checkpoint_action(
+                "investigation_completed",
+                investigation_action_key,
+                {
+                    "directive_id": directive.directive_id,
+                    "status": result.status,
+                    "result": result.to_dict(),
+                },
+            )
         state.investigation_result_bytes += result.byte_count
         if result.status == "success" and result.artifact_byte_count:
             state.artifact_bytes += result.artifact_byte_count
