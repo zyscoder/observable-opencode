@@ -1618,6 +1618,14 @@ class ClaudeCausalJudge:
         self.cache = cache
 
     def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
+        return self.judge_step_bounded(request, max_physical_requests=None)
+
+    def judge_step_bounded(
+        self,
+        request: CausalStepRequest,
+        *,
+        max_physical_requests: Optional[int],
+    ) -> CausalStepJudgment:
         prompt = build_causal_step_prompt(request)
         outcome = self._request_validated(
             stage="recursive_causal_step",
@@ -1628,6 +1636,7 @@ class ClaudeCausalJudge:
             request_context=request.to_dict(),
             validator=lambda value: validate_causal_step_payload(value, request=request),
             max_tokens=int(getattr(self.transport, "max_tokens", 4096)),
+            max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
             return causal_step_from_payload(outcome.payload, request=request)
@@ -1644,6 +1653,14 @@ class ClaudeCausalJudge:
         )
 
     def confirm_candidate(self, request: RootConfirmationRequest) -> RootConfirmation:
+        return self.confirm_candidate_bounded(request, max_physical_requests=None)
+
+    def confirm_candidate_bounded(
+        self,
+        request: RootConfirmationRequest,
+        *,
+        max_physical_requests: Optional[int],
+    ) -> RootConfirmation:
         try:
             _ConfirmationFactTreeValidator(request).validate()
         except (TypeError, ValueError) as exc:
@@ -1661,6 +1678,7 @@ class ClaudeCausalJudge:
             request_context=request.to_dict(),
             validator=lambda value: validate_recursive_confirmation(value, request=request),
             max_tokens=min(int(getattr(self.transport, "max_tokens", 4096)), 2048),
+            max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
             return root_confirmation_from_payload(outcome.payload, request=request)
@@ -1680,6 +1698,7 @@ class ClaudeCausalJudge:
         request_context: JsonDict,
         validator: Callable[[JsonDict], Any],
         max_tokens: int,
+        max_physical_requests: Optional[int] = None,
     ) -> _RequestOutcome:
         evidence_hash = hashlib.sha256(stable_json(request_context).encode("utf-8")).hexdigest()
         cache_context = stable_json(
@@ -1703,6 +1722,19 @@ class ClaudeCausalJudge:
         cached = self.cache.get_validated_payload(key=cache_key, validator=validator)
         if cached is not None:
             return _RequestOutcome(cached)
+        remaining_requests = (
+            None
+            if max_physical_requests is None
+            else max(0, int(max_physical_requests))
+        )
+        if remaining_requests == 0:
+            return _RequestOutcome(
+                None,
+                "request_budget_exhausted",
+                "judge_request_budget_exhausted before initial request",
+            )
+        if remaining_requests is not None:
+            remaining_requests -= 1
         messages = [{"role": "user", "content": prompt}]
         try:
             text = self.transport.create_message_text(
@@ -1717,6 +1749,16 @@ class ClaudeCausalJudge:
             validator(payload)
         except (TypeError, ValueError, json.JSONDecodeError) as first_error:
             exact_error = "{0}: {1}".format(type(first_error).__name__, first_error)
+            if remaining_requests == 0:
+                return _RequestOutcome(
+                    None,
+                    "request_budget_exhausted",
+                    "{0}; judge_request_budget_exhausted before focused repair".format(
+                        exact_error
+                    ),
+                )
+            if remaining_requests is not None:
+                remaining_requests -= 1
             try:
                 repaired = self.transport.create_message_text(
                     system=REPAIR_SYSTEM_PROMPT,

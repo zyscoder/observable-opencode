@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from trace_attribution.cache import JudgmentCache
+from trace_attribution.causal_judge import ClaudeCausalJudge
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
@@ -159,7 +164,204 @@ class ScriptedCausalJudge:
         return value
 
 
+class ScriptedTransport:
+    model = "offline-test-model"
+    max_tokens = 2048
+    repair_max_tokens = 512
+    thinking_config = None
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.request_count = 0
+        self.calls = []
+        self.provider_circuit_open = False
+        self.provider_circuit_reason = ""
+
+    def create_message_text(self, *, system, messages, max_tokens):
+        self.request_count += 1
+        self.calls.append({"system": system, "messages": messages, "max_tokens": max_tokens})
+        value = self.responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def single_node_trace(*, content: str = "", hydrated_artifacts=None) -> dict:
+    data = {
+        "failure_type": "incomplete_decision",
+        "expected": "The decision covers the complete requirement.",
+        "actual": "The decision is incomplete.",
+        "mechanism": "premature closure",
+        "scope": "repository_reasoning",
+    }
+    if content:
+        data["content"] = content
+    if hydrated_artifacts is not None:
+        data["hydrated_artifacts"] = hydrated_artifacts
+    return {
+        "case_id": "single-node-case",
+        "records": [
+            {
+                "record_id": "only",
+                "component": "agent",
+                "event_type": "decision",
+                "data": data,
+            }
+        ],
+    }
+
+
+def valid_single_node_payload() -> dict:
+    return {
+        "current_node_ref": "record:only",
+        "current_defect_status": "present",
+        "current_defect_reason": "The decision itself contains the incomplete reasoning.",
+        "predecessors": [],
+        "candidate_introduction": True,
+        "missing_evidence": [],
+        "suggested_investigation": None,
+        "confidence": 0.9,
+    }
+
+
 class RecursiveTraversalTest(unittest.TestCase):
+    def test_present_defective_dead_end_is_explicitly_unresolved(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(relation("record:decision", "unrelated"),),
+                )
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(report.step_judgments[0].current_defect_status, "present")
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertIn("record:change", report.unresolved_refs)
+        self.assertIn(
+            "defective_dead_end",
+            [item["reason"] for item in report.metadata["unresolved_branches"]],
+        )
+
+    def test_queue_exhaustion_is_not_no_defect_after_any_present_judgment(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(relation("record:decision", "same_defect_propagation"),),
+                ),
+                "record:decision": step("record:decision", status="absent"),
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertTrue(any(item.current_defect_status == "present" for item in report.step_judgments))
+        self.assertTrue(report.unresolved_hypotheses)
+
+    def test_same_defect_competing_predecessors_get_distinct_hypotheses(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": step("record:decision", introduction=True),
+                "record:context": step("record:context", introduction=True),
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_hypotheses=3).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Compare competing same-defect explanations.",
+        )
+
+        branch_hypotheses = {
+            item.candidate_root_ref: item
+            for item in report.hypotheses
+            if item.candidate_root_ref in {"record:decision", "record:context"}
+        }
+        self.assertEqual(set(branch_hypotheses), {"record:decision", "record:context"})
+        self.assertNotEqual(
+            branch_hypotheses["record:decision"].hypothesis_id,
+            branch_hypotheses["record:context"].hypothesis_id,
+        )
+        self.assertTrue(
+            all(item.supporting_evidence for item in branch_hypotheses.values())
+        )
+        bindings = report.metadata["introduction_bindings"]
+        self.assertEqual(
+            {(item["candidate_ref"], item["hypothesis_id"]) for item in bindings},
+            {
+                (ref, hypothesis.hypothesis_id)
+                for ref, hypothesis in branch_hypotheses.items()
+            },
+        )
+
+    def test_same_defect_alternatives_obey_hypothesis_budget(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                )
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_hypotheses=1).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Compare competing same-defect explanations.",
+        )
+
+        self.assertEqual(report.metadata["exhausted_budgets"]["hypotheses"], 2)
+        self.assertEqual(
+            [item.current_node.ref for item in judge.requests], ["record:change"]
+        )
+        self.assertEqual(report.introduction_candidates, ())
+
+    def test_unrelated_candidate_is_retained_as_hypothesis_opposition(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(relation("record:decision", "unrelated"),),
+                )
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the defect.",
+        )
+
+        change_hypothesis = next(
+            item for item in report.hypotheses if item.candidate_root_ref == "record:change"
+        )
+        self.assertEqual(
+            [item.ref for item in change_hypothesis.opposing_evidence],
+            ["record:decision"],
+        )
+
     def test_recursive_state_create_uses_default_hypothesis_budget(self):
         graph = TraceGraph.from_trace(observed_trace())
 
@@ -483,6 +685,96 @@ class RecursiveTraversalTest(unittest.TestCase):
 
 
 class RecursiveBudgetTest(unittest.TestCase):
+    def test_ordinary_content_text_does_not_consume_artifact_budget(self):
+        judge = ScriptedCausalJudge({"record:only": step("record:only", status="absent")})
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_artifact_bytes=8).analyze(
+            TraceGraph.from_trace(single_node_trace(content="x" * 64)),
+            start_refs=["record:only"],
+            objective="Check the decision.",
+        )
+
+        self.assertEqual(len(judge.requests), 1)
+        self.assertEqual(report.metadata["artifact_bytes"], 0)
+        self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
+
+    def test_duplicate_grounded_artifact_payload_is_counted_once(self):
+        artifact = {
+            "artifact_id": "artifact-1",
+            "hash": "sha256:artifact-1",
+            "path": "artifacts/decision.txt",
+            "content": "abcdef",
+        }
+        judge = ScriptedCausalJudge({"record:only": step("record:only", status="absent")})
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_artifact_bytes=6).analyze(
+            TraceGraph.from_trace(
+                single_node_trace(hydrated_artifacts=[artifact, dict(artifact)])
+            ),
+            start_refs=["record:only"],
+            objective="Check the decision artifact.",
+        )
+
+        self.assertEqual(len(judge.requests), 1)
+        self.assertEqual(report.metadata["artifact_bytes"], 6)
+        self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
+
+    def test_one_physical_request_budget_allows_valid_claude_judgment(self):
+        transport = ScriptedTransport([json.dumps(valid_single_node_payload())])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=1).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(transport.request_count, 1)
+        self.assertEqual(report.metadata["judge_request_count"], 1)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertEqual([item.ref for item in report.introduction_candidates], ["record:only"])
+
+    def test_cache_hit_costs_zero_physical_requests_with_zero_remaining_budget(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            transport = ScriptedTransport([json.dumps(valid_single_node_payload())])
+            judge = ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(Path(tempdir) / "cache.jsonl"),
+            )
+            graph = TraceGraph.from_trace(single_node_trace())
+            AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=1).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+            )
+
+            report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=0).analyze(
+                graph,
+                start_refs=["record:only"],
+                objective="Find the defect.",
+            )
+
+        self.assertEqual(transport.request_count, 1)
+        self.assertEqual(report.metadata["judge_request_count"], 0)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertNotIn("judge_requests", report.metadata["exhausted_budgets"])
+
+    def test_repair_is_blocked_at_exact_physical_request_boundary(self):
+        transport = ScriptedTransport(["not-json"])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        report = AgenticRecursiveAnalyzer(judge=judge, max_judge_requests=1).analyze(
+            TraceGraph.from_trace(single_node_trace()),
+            start_refs=["record:only"],
+            objective="Find the defect.",
+        )
+
+        self.assertEqual(transport.request_count, 1)
+        self.assertEqual(report.metadata["judge_request_count"], 1)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+
     def test_frontier_budget_counts_items_that_stop_at_depth_limit(self):
         judge = ScriptedCausalJudge(
             {

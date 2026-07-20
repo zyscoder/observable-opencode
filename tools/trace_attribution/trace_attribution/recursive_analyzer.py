@@ -108,17 +108,28 @@ def _candidate_key(candidate: CausalCandidate) -> Tuple[str, str, str]:
 
 
 def _artifact_payloads(value: Any) -> Iterable[Tuple[str, bytes]]:
+    """Yield only explicitly hydrated artifact payloads with stable identities."""
     if isinstance(value, Mapping):
-        content = value.get("content")
-        if isinstance(content, str) and content:
-            identity = str(
-                value.get("hash")
-                or value.get("artifact_id")
-                or value.get("path")
-                or stable_json({"content": content})
-            )
-            yield identity, content.encode("utf-8")
-        for child in value.values():
+        hydrated = value.get("hydrated_artifacts")
+        if isinstance(hydrated, (list, tuple)):
+            for artifact in hydrated:
+                if not isinstance(artifact, Mapping):
+                    continue
+                artifact_id = str(artifact.get("artifact_id") or "").strip()
+                content = artifact.get("content")
+                if not artifact_id or not isinstance(content, str) or not content:
+                    continue
+                identity = stable_json(
+                    {
+                        "artifact_id": artifact_id,
+                        "hash": str(artifact.get("hash") or ""),
+                        "path": str(artifact.get("path") or ""),
+                    }
+                )
+                yield identity, content.encode("utf-8")
+        for key, child in value.items():
+            if key == "hydrated_artifacts":
+                continue
             yield from _artifact_payloads(child)
     elif isinstance(value, (list, tuple)):
         for child in value:
@@ -165,6 +176,8 @@ class RecursiveAnalysisState:
     causal_relations: List[PredecessorAssessment] = field(default_factory=list)
     step_judgments: List[CausalStepJudgment] = field(default_factory=list)
     introduction_candidates: List[CausalCandidate] = field(default_factory=list)
+    introduction_bindings: List[JsonDict] = field(default_factory=list)
+    introduction_binding_keys: Set[Tuple[str, str, str]] = field(default_factory=set)
     contributing_conditions: List[CausalFactor] = field(default_factory=list)
     rejected_candidates: List[RejectedCandidate] = field(default_factory=list)
     taint_paths: List[Tuple[str, ...]] = field(default_factory=list)
@@ -173,6 +186,7 @@ class RecursiveAnalysisState:
     unresolved_refs: List[str] = field(default_factory=list)
     unresolved_hypothesis_ids: Set[str] = field(default_factory=set)
     introduction_hypothesis_ids: Set[str] = field(default_factory=set)
+    present_hypothesis_ids: Set[str] = field(default_factory=set)
     visit_evidence: Dict[str, Set[str]] = field(default_factory=dict)
     transformation_chains: Dict[str, Tuple[DefectState, ...]] = field(default_factory=dict)
     exhausted_budgets: Dict[str, int] = field(default_factory=dict)
@@ -180,6 +194,7 @@ class RecursiveAnalysisState:
     artifact_bytes: int = 0
     processed_items: int = 0
     judge_requests: int = 0
+    logical_judge_calls: int = 0
     investigation_rounds: int = 0
     seed_count: int = 0
 
@@ -362,26 +377,54 @@ class RecursiveAnalysisState:
         evidence_hash = hashlib.sha256(
             stable_json(judgment.to_dict()).encode("utf-8")
         ).hexdigest()
+        is_present = judgment.current_defect_status == "present"
+        if is_present:
+            self.present_hypothesis_ids.add(item.hypothesis_id)
 
         if judgment.current_defect_status == "unknown" or judgment.missing_evidence:
             details = "; ".join(judgment.missing_evidence) or judgment.current_defect_reason
             self.mark_unresolved(item, "judge_unknown", details)
-        elif judgment.current_defect_status == "present" and judgment.candidate_introduction:
-            candidate = self._candidate_for_ref(
-                item.node_ref,
-                source="judge_introduction_candidate",
-                edge={
-                    "relation": "introduction_candidate",
-                    "evidence_type": "judge_assessment",
-                    "eligible_for_attribution": False,
-                },
-                evidence_refs=tuple(self.visit_evidence.get(item.visit_key, set())),
-            )
-            if candidate is not None:
-                self.introduction_candidates.append(candidate)
-                self._remember_candidate(candidate)
-            self.introduction_hypothesis_ids.add(item.hypothesis_id)
+        elif is_present and judgment.candidate_introduction:
+            hypothesis = self.ledger.get(item.hypothesis_id)
+            if hypothesis.candidate_root_ref != item.node_ref:
+                self.mark_unresolved(
+                    item,
+                    "introduction_hypothesis_mismatch",
+                    "The introduction candidate is not bound to the active hypothesis root.",
+                )
+            else:
+                binding_key = (
+                    item.node_ref,
+                    item.defect_state.fingerprint,
+                    hypothesis.semantic_hash,
+                )
+                if binding_key not in self.introduction_binding_keys:
+                    candidate = self._candidate_for_ref(
+                        item.node_ref,
+                        source="judge_introduction_candidate",
+                        edge={
+                            "relation": "introduction_candidate",
+                            "evidence_type": "judge_assessment",
+                            "eligible_for_attribution": False,
+                        },
+                        evidence_refs=tuple(self.visit_evidence.get(item.visit_key, set())),
+                    )
+                    if candidate is not None:
+                        self.introduction_candidates.append(candidate)
+                        self._remember_candidate(candidate)
+                        self.introduction_bindings.append(
+                            {
+                                "candidate_ref": item.node_ref,
+                                "defect_state_id": item.defect_state.defect_state_id,
+                                "defect_fingerprint": item.defect_state.fingerprint,
+                                "hypothesis_id": hypothesis.hypothesis_id,
+                                "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                            }
+                        )
+                        self.introduction_binding_keys.add(binding_key)
+                self.introduction_hypothesis_ids.add(item.hypothesis_id)
 
+        declared_recursive = False
         for assessment in judgment.predecessors:
             self.causal_relations.append(assessment)
             if assessment.relation == "contributing_condition":
@@ -400,6 +443,12 @@ class RecursiveAnalysisState:
                     self.rejected_candidates.append(
                         RejectedCandidate(assessment.ref, assessment.reason, assessment.evidence_refs)
                     )
+                    self.ledger.add_opposition(
+                        item.hypothesis_id,
+                        assessment.ref,
+                        assessment.reason,
+                        assessment.confidence,
+                    )
                 else:
                     self._mark_ref_unresolved(
                         assessment.ref,
@@ -410,6 +459,7 @@ class RecursiveAnalysisState:
                 continue
             if assessment.relation not in RECURSIVE_RELATIONS or not assessment.recurse:
                 continue
+            declared_recursive = True
             if assessment.ref not in self.graph.nodes:
                 self._mark_ref_unresolved(
                     assessment.ref,
@@ -437,7 +487,6 @@ class RecursiveAnalysisState:
                 continue
 
             upstream_defect = item.defect_state
-            hypothesis = self.ledger.get(item.hypothesis_id)
             if assessment.relation == "defect_transformation":
                 if assessment.upstream_defect is None:
                     self._mark_ref_unresolved(
@@ -449,33 +498,6 @@ class RecursiveAnalysisState:
                     continue
                 upstream_defect = assessment.upstream_defect
                 self._remember_defect(upstream_defect)
-                claim = "{0} transformed into {1} at {2}.".format(
-                    upstream_defect.label, item.defect_state.label, item.node_ref
-                )
-                proposed = AttributionHypothesis.create(
-                    claim, assessment.ref, upstream_defect
-                )
-                snapshot = self.ledger.snapshot()
-                existing_ids = {
-                    str(existing.get("hypothesis_id") or "") for existing in snapshot
-                }
-                if (
-                    proposed.hypothesis_id not in existing_ids
-                    and len(snapshot) >= max_hypotheses
-                ):
-                    self._increment_budget("hypotheses")
-                    self._mark_ref_unresolved(
-                        assessment.ref,
-                        item,
-                        "hypothesis_limit",
-                        "The transformed hypothesis budget is exhausted.",
-                    )
-                    continue
-                hypothesis = self.ledger.create(
-                    claim,
-                    assessment.ref,
-                    upstream_defect,
-                )
                 downstream_chain = self.transformation_chains.get(
                     item.defect_state.fingerprint, (item.defect_state,)
                 )
@@ -483,6 +505,37 @@ class RecursiveAnalysisState:
                     upstream_defect,
                     *downstream_chain,
                 )
+            claim = "{0} from {1} explains {2} for defect {3}: {4}".format(
+                assessment.relation,
+                assessment.ref,
+                item.node_ref,
+                upstream_defect.label,
+                " ".join(assessment.reason.split()),
+            )
+            proposed = AttributionHypothesis.create(
+                claim, assessment.ref, upstream_defect
+            )
+            snapshot = self.ledger.snapshot()
+            existing_ids = {
+                str(existing.get("hypothesis_id") or "") for existing in snapshot
+            }
+            if (
+                proposed.hypothesis_id not in existing_ids
+                and len(snapshot) >= max_hypotheses
+            ):
+                self._increment_budget("hypotheses")
+                self._mark_ref_unresolved(
+                    assessment.ref,
+                    item,
+                    "hypothesis_limit",
+                    "The recursive explanation hypothesis budget is exhausted.",
+                )
+                continue
+            hypothesis = self.ledger.create(
+                claim,
+                assessment.ref,
+                upstream_defect,
+            )
             hypothesis = self.ledger.add_support(
                 hypothesis.hypothesis_id,
                 assessment.ref,
@@ -503,6 +556,13 @@ class RecursiveAnalysisState:
             )
             self._merge_visit_evidence(predecessor.visit_key, assessment.evidence_refs)
             self.frontier.push(predecessor)
+
+        if is_present and not judgment.candidate_introduction and not declared_recursive:
+            self.mark_unresolved(
+                item,
+                "defective_dead_end",
+                "The Judge retained a present defect without a supported predecessor or introduction candidate.",
+            )
 
         self.frontier.mark_completed(item, evidence_hash)
 
@@ -538,6 +598,23 @@ class RecursiveAnalysisState:
         hypotheses = [AttributionHypothesis.from_dict(item) for item in self.ledger.snapshot()]
         by_id = {item.hypothesis_id: item for item in hypotheses}
         unresolved_ids = self.unresolved_hypothesis_ids | self.introduction_hypothesis_ids
+        if self.present_hypothesis_ids and not unresolved_ids:
+            unresolved_ids.update(self.present_hypothesis_ids)
+            self.unresolved_hypothesis_ids.update(self.present_hypothesis_ids)
+            for judgment in self.step_judgments:
+                if judgment.current_defect_status != "present":
+                    continue
+                self.unresolved_refs.append(judgment.current_node_ref)
+                self.unresolved_branches.append(
+                    {
+                        "node_ref": judgment.current_node_ref,
+                        "defect_state_id": "",
+                        "hypothesis_id": "",
+                        "reason": "defect_chain_unresolved",
+                        "details": "A visited defect remained present without an introduction candidate.",
+                        "depth": 0,
+                    }
+                )
         unresolved_hypotheses = [by_id[item] for item in sorted(unresolved_ids) if item in by_id]
         candidate_seen: Set[Tuple[str, str, str]] = set()
         causal_candidates: List[CausalCandidate] = []
@@ -558,11 +635,14 @@ class RecursiveAnalysisState:
             "seed_count": self.seed_count,
             "processed_frontier_items": self.processed_items,
             "judge_request_count": self.judge_requests,
+            "physical_judge_request_count": self.judge_requests,
+            "logical_judge_call_count": self.logical_judge_calls,
             "artifact_bytes": self.artifact_bytes,
             "investigation_rounds": self.investigation_rounds,
             "exhausted_budgets": dict(sorted(self.exhausted_budgets.items())),
             "unresolved_branches": list(self.unresolved_branches),
             "merged_visit_evidence": merged,
+            "introduction_bindings": list(self.introduction_bindings),
             "frontier_checkpoint": self.frontier.checkpoint(),
             "hypothesis_snapshot": self.ledger.snapshot(),
             "provider_circuit": provider,
@@ -703,8 +783,6 @@ class AgenticRecursiveAnalyzer:
                 "analysis_start_missing",
                 "The trace does not contain a concrete analysis start node.",
             )
-        initial_request_count = _judge_request_count(self.judge)
-
         while state.frontier and state.processed_items < self.max_frontier_items:
             item = state.frontier.pop()
             state.processed_items += 1
@@ -742,27 +820,33 @@ class AgenticRecursiveAnalyzer:
                     exhausted_budget="artifact_bytes",
                 )
                 continue
-            reserve = 2 if hasattr(self.judge, "transport") else 1
-            current_count = _judge_request_count(self.judge)
-            consumed = (
-                state.judge_requests
-                if current_count is None or initial_request_count is None
-                else max(0, current_count - initial_request_count)
-            )
-            if consumed + reserve > self.max_judge_requests:
+            remaining_requests = max(0, self.max_judge_requests - state.judge_requests)
+            bounded_judge_step = getattr(self.judge, "judge_step_bounded", None)
+            if not callable(bounded_judge_step) and remaining_requests == 0:
                 state.complete_unresolved(
                     item,
                     "judge_request_limit",
-                    "The Judge request budget cannot cover a judgment and its possible repair.",
+                    "The Judge physical request budget is exhausted.",
                     exhausted_budget="judge_requests",
                 )
                 continue
             before = _judge_request_count(self.judge)
+            state.logical_judge_calls += 1
             try:
-                judgment = self.judge.judge_step(request)
+                if callable(bounded_judge_step):
+                    judgment = bounded_judge_step(
+                        request,
+                        max_physical_requests=remaining_requests,
+                    )
+                else:
+                    judgment = self.judge.judge_step(request)
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 after = _judge_request_count(self.judge)
-                state.judge_requests += max(1, (after or 0) - (before or 0))
+                state.judge_requests += (
+                    max(0, after - before)
+                    if before is not None and after is not None
+                    else 0
+                )
                 state.complete_unresolved(
                     item,
                     "provider_circuit_open"
@@ -776,7 +860,11 @@ class AgenticRecursiveAnalyzer:
                 continue
             except Exception as exc:
                 after = _judge_request_count(self.judge)
-                state.judge_requests += max(1, (after or 0) - (before or 0))
+                state.judge_requests += (
+                    max(0, after - before)
+                    if before is not None and after is not None
+                    else 0
+                )
                 state.complete_unresolved(
                     item,
                     "judge_error",
@@ -784,7 +872,16 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             after = _judge_request_count(self.judge)
-            state.judge_requests += max(1, (after or 0) - (before or 0))
+            state.judge_requests += (
+                max(0, after - before)
+                if before is not None and after is not None
+                else 0
+            )
+            if any(
+                "judge_request_budget_exhausted" in detail
+                for detail in judgment.missing_evidence
+            ):
+                state._increment_budget("judge_requests")
             state.apply_step(
                 item,
                 judgment,

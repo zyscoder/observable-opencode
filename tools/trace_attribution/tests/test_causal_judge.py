@@ -1512,6 +1512,50 @@ class ClaudeTransportAdapterTest(unittest.TestCase):
 
 
 class ClaudeCausalJudgeTest(unittest.TestCase):
+    def test_bounded_step_allows_one_valid_physical_request(self):
+        transport = ScriptedTransport([json.dumps(valid_step_payload())])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=1
+        )
+
+        self.assertEqual(result.current_defect_status, "present")
+        self.assertEqual(transport.request_count, 1)
+
+    def test_bounded_step_cache_hit_costs_zero_requests(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            transport = ScriptedTransport([json.dumps(valid_step_payload())])
+            judge = ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(Path(tempdir) / "cache.jsonl"),
+            )
+            judge.judge_step_bounded(sample_step_request(), max_physical_requests=1)
+
+            result = judge.judge_step_bounded(
+                sample_step_request(), max_physical_requests=0
+            )
+
+        self.assertEqual(result.current_defect_status, "present")
+        self.assertEqual(transport.request_count, 1)
+
+    def test_bounded_step_blocks_repair_after_one_physical_request(self):
+        invalid = json.dumps(valid_step_payload(predecessor_ref="record:fabricated"))
+        transport = ScriptedTransport([invalid])
+        cache = JudgmentCache()
+        judge = ClaudeCausalJudge(transport=transport, cache=cache)
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=1
+        )
+
+        self.assertEqual(result.current_defect_status, "unknown")
+        self.assertTrue(
+            any("judge_request_budget_exhausted" in item for item in result.missing_evidence)
+        )
+        self.assertEqual(transport.request_count, 1)
+        self.assertEqual(cache.stats()["writes"], 0)
+
     def test_valid_result_is_cached_by_full_context(self):
         with tempfile.TemporaryDirectory() as tempdir:
             cache = JudgmentCache(Path(tempdir) / "cache.jsonl")
