@@ -840,6 +840,12 @@ class RootConfirmationValidationTest(unittest.TestCase):
             {"provider_status": "failure"},
             {"circuit_breaker": {"state": "tripped"}},
             {"provider_tool_request": {"status": "failed"}},
+            {"provider_failure": "timeout"},
+            {"circuit_open": "rate limited"},
+            {"transport_timeout": {"detail": "deadline exceeded"}},
+            {"judge_error": ["invalid response"]},
+            {"circuit_tripped": {"detail": "quota exceeded"}},
+            {"provider_unavailable": 1},
         )
         payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
         for blocking in blocking_aliases:
@@ -864,6 +870,9 @@ class RootConfirmationValidationTest(unittest.TestCase):
             {"provider_result": "succeeded"},
             {"provider_status": "available"},
             {"circuit_breaker": {"state": "closed"}},
+            {"provider_failure": ""},
+            {"circuit_open": False},
+            {"transport_error": []},
             {
                 "tool_execution": {
                     "status": "failed",
@@ -882,6 +891,7 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     "reason": "The domain tool request itself failed.",
                 }
             },
+            {"tool_failure": "timeout"},
         )
         payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
         for eligible in eligible_states:
@@ -920,6 +930,10 @@ class RootConfirmationValidationTest(unittest.TestCase):
             {"inference": {"type": "temporal_order"}},
             {"origin": {"type": "temporal_order"}},
             {"method": {"kind": "temporal_order"}},
+            {"source": {"type": "temporal_proximity"}},
+            {"source": [{"type": "temporal_proximity"}]},
+            {"origin": {"edges": [{"type": "temporal_order"}]}},
+            {"method": [{"details": {"kind": "temporal_adjacency"}}]},
         )
         payload = valid_confirmation_payload()
         payload["evidence_refs"] = ["record:decision"]
@@ -937,20 +951,30 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
                 )
 
-    def test_nested_non_temporal_origin_and_method_remain_eligible(self):
-        candidate_fact = {
-            **reference_envelope("record:decision"),
-            "content": "Implement only the explicitly listed methods.",
-            "origin": {"type": "recorded_edge"},
-            "method": {"kind": "semantic_analysis"},
-        }
-
-        result = validate_recursive_confirmation(
-            {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]},
-            request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+    def test_nested_non_temporal_provenance_forms_remain_eligible(self):
+        eligible_provenance = (
+            {"source": {"type": "recorded_artifact"}},
+            {"source": [{"type": "reconstructed_fact"}]},
+            {"origin": {"edges": [{"type": "confirmed_edge"}]}},
+            {"method": [{"details": {"kind": "semantic_analysis"}}]},
         )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for provenance in eligible_provenance:
+            with self.subTest(provenance=provenance):
+                candidate_fact = {
+                    **reference_envelope("record:decision"),
+                    "content": "Implement only the explicitly listed methods.",
+                    **provenance,
+                }
 
-        self.assertEqual(result.status, "confirmed")
+                result = validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(
+                        supporting_evidence=(candidate_fact,)
+                    ),
+                )
+
+                self.assertEqual(result.status, "confirmed")
 
     def test_excerpt_cannot_be_synthesized_across_candidate_fact_fragments(self):
         payload = valid_confirmation_payload()
@@ -1552,12 +1576,24 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             "content": "Implement only the explicitly listed methods.",
             "nested_analysis": {"evidence_status": {"availability": False}},
         }
+        temporal_source = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "source": [{"type": "temporal_proximity"}],
+        }
+        scalar_provider_failure = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "provider_failure": "timeout",
+        }
         for request in (
             sample_confirmation_request(opposing_evidence=(unresolved_opposition,)),
             sample_confirmation_request(supporting_evidence=(missing_artifact,)),
             sample_confirmation_request(supporting_evidence=(nested_provider_error,)),
             sample_confirmation_request(task_obligations=(provider_error_obligation,)),
             sample_confirmation_request(supporting_evidence=(aliased_blocker,)),
+            sample_confirmation_request(supporting_evidence=(temporal_source,)),
+            sample_confirmation_request(supporting_evidence=(scalar_provider_failure,)),
         ):
             with self.subTest(request=request.to_dict()):
                 transport = ScriptedTransport(

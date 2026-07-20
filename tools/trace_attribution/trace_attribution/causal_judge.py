@@ -517,21 +517,22 @@ _BLOCKING_STATUS_VALUES = {
     "provider_error",
     "provider_unavailable",
 }
-_PROVENANCE_FIELDS = {
-    "evidence_type",
-    "provenance_class",
-    "relation",
-    "inference_method",
-    "edge_origin",
-}
-_PROVENANCE_CONTAINER_KEYS = {
-    "edge_provenance",
+_PROVENANCE_KEYS = {
     "edge_metadata",
+    "evidence_type",
+    "edge_origin",
+    "edge_provenance",
     "evidence_metadata",
     "inference",
+    "inference_method",
     "inference_metadata",
     "lineage",
+    "method",
+    "origin",
     "provenance",
+    "provenance_class",
+    "relation",
+    "source",
 }
 _PROVENANCE_CONTEXT_FIELDS = {
     "evidence_type",
@@ -596,27 +597,18 @@ def _nonempty(value: Any) -> bool:
     return bool(value)
 
 
-def _is_provenance_field(key: str) -> bool:
+def _is_provenance_key(key: str) -> bool:
     return (
-        key in _PROVENANCE_FIELDS
-        or key in {"method", "origin", "source"}
-        or "provenance" in key
-        or key.startswith("inference_")
-        or key.endswith("_origin")
-        or key.endswith("_method")
-        or key.endswith("_source")
-    )
-
-
-def _is_provenance_container_key(key: str) -> bool:
-    return (
-        key in _PROVENANCE_CONTAINER_KEYS
-        or key in {"method", "origin"}
+        key in _PROVENANCE_KEYS
         or "provenance" in key
         or "inference" in key
         or "lineage" in key
         or "evidence_metadata" in key
         or "edge_metadata" in key
+        or key.startswith("inference_")
+        or key.endswith("_origin")
+        or key.endswith("_method")
+        or key.endswith("_source")
     )
 
 
@@ -707,7 +699,7 @@ def _is_semantic_metadata_key(key: str) -> bool:
             "truncated",
         }
         or key in _ENVELOPE_KEYS
-        or _is_provenance_field(key)
+        or _is_provenance_key(key)
         or _is_reference_key(key)
         or _is_reference_container_key(key)
         or key.endswith("_status")
@@ -754,7 +746,7 @@ class _FactTreeContext:
                 self.in_provider_context or _is_provider_context_key(key)
             ),
             in_provenance_context=(
-                self.in_provenance_context or _is_provenance_container_key(key)
+                self.in_provenance_context or _is_provenance_key(key)
             ),
             in_grounding_status_context=(
                 self.in_grounding_status_context
@@ -908,7 +900,7 @@ class _ConfirmationFactTreeValidator:
         errors: List[str] = []
         for raw_key, child in value.items():
             key = str(raw_key).strip().lower()
-            provenance_value = _is_provenance_field(key) or (
+            provenance_value = _is_provenance_key(key) or (
                 in_provenance_context and key in _PROVENANCE_CONTEXT_FIELDS
             )
             if not provenance_value or not isinstance(child, str):
@@ -1222,10 +1214,12 @@ class _ConfirmationFactTreeValidator:
                     errors.append("blocking contextual {0}={1}".format(key, status))
             if (
                 provider_context
-                and key_tokens.intersection({"error", "reason"})
+                and key_tokens.intersection(_CONTEXTUAL_FAILURE_STATES)
                 and _nonempty(child)
             ):
-                errors.append("blocking provider {0}".format(key))
+                errors.append("blocking declared provider/circuit failure {0}".format(key))
+            if provider_context and "reason" in key_tokens and _nonempty(child):
+                errors.append("blocking provider/circuit reason {0}".format(key))
             if isinstance(child, bool):
                 true_blockers = {
                     "error",
@@ -1272,8 +1266,6 @@ class _ConfirmationFactTreeValidator:
                 "unresolved_references",
                 "missing_artifact_ids",
                 "truncated_artifact_ids",
-                "provider_error",
-                "provider_unavailable",
                 "provider_circuit_reason",
                 "blocking_reasons",
                 "evidence_gaps",
@@ -1292,10 +1284,6 @@ class _ConfirmationFactTreeValidator:
                 errors.append("blocking {0}".format(key))
             elif key.endswith("_gaps") and isinstance(
                 child, (Mapping, list, tuple, set, str)
-            ):
-                errors.append("blocking {0}".format(key))
-            elif key.startswith("provider_") and any(
-                token in key for token in ("error", "unavailable", "circuit_reason")
             ):
                 errors.append("blocking {0}".format(key))
         return errors
