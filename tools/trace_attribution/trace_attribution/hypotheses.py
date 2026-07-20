@@ -11,6 +11,10 @@ from .causal_state import AttributionHypothesis, DefectState, FrontierItem, Hypo
 from .models import JsonDict
 
 
+FRONTIER_CHECKPOINT_SCHEMA = "trace_attribution.recursive_frontier"
+FRONTIER_CHECKPOINT_VERSION = 1
+
+
 def _normalized_evidence_reason(reason: str) -> str:
     return " ".join(str(reason).split()).casefold()
 
@@ -19,18 +23,28 @@ def _evidence_identity(item: HypothesisEvidence) -> Tuple[str, str]:
     return (str(item.ref).strip(), _normalized_evidence_reason(item.reason))
 
 
+def _canonical_evidence(item: HypothesisEvidence) -> HypothesisEvidence:
+    return HypothesisEvidence(
+        str(item.ref).strip(), " ".join(str(item.reason).split()), item.confidence
+    )
+
+
 def dedupe_evidence(items: Iterable[HypothesisEvidence]) -> Tuple[HypothesisEvidence, ...]:
     """Dedupe semantic evidence and retain the strongest finite confidence."""
     output: List[HypothesisEvidence] = []
     positions: Dict[Tuple[str, str], int] = {}
     for item in items:
-        key = _evidence_identity(item)
+        canonical = _canonical_evidence(item)
+        key = _evidence_identity(canonical)
         position = positions.get(key)
         if position is None:
             positions[key] = len(output)
-            output.append(item)
-        elif item.confidence > output[position].confidence:
-            output[position] = item
+            output.append(canonical)
+        elif canonical.confidence > output[position].confidence:
+            existing = output[position]
+            output[position] = HypothesisEvidence(
+                existing.ref, existing.reason, canonical.confidence
+            )
     return tuple(output)
 
 
@@ -112,17 +126,15 @@ class HypothesisLedger:
         hypothesis_id: str,
         question: str,
         *,
-        frontier: Optional["RecursiveFrontier"] = None,
+        frontier: "RecursiveFrontier",
     ) -> AttributionHypothesis:
         item = self.get(hypothesis_id)
         changes = {
             "unresolved_questions": _dedupe_strings([*item.unresolved_questions, question])
         }
-        if frontier is not None:
-            return self.update_with_frontier(frontier, hypothesis_id, **changes)
-        return self._replace_item(hypothesis_id, item.with_updates(**changes))
+        return self._update_with_frontier(frontier, hypothesis_id, **changes)
 
-    def update_with_frontier(
+    def _update_with_frontier(
         self,
         frontier: "RecursiveFrontier",
         hypothesis_id: str,
@@ -132,10 +144,10 @@ class HypothesisLedger:
         item = self.get(hypothesis_id)
         updated = item.with_updates(**changes)
         replacement_items = self._replacement_items(hypothesis_id, updated)
-        migration = frontier.plan_hypothesis_migration(item, updated)
+        migration = frontier._plan_hypothesis_migration(item, updated)
         previous_items = self._items
         try:
-            frontier.apply_hypothesis_migration(migration)
+            frontier._apply_hypothesis_migration(migration)
             self._items = replacement_items
         except Exception:
             self._items = previous_items
@@ -187,6 +199,8 @@ class HypothesisLedger:
     def _replace_item(
         self, previous_hypothesis_id: str, updated: AttributionHypothesis
     ) -> AttributionHypothesis:
+        if updated.semantic_hash != self.get(previous_hypothesis_id).semantic_hash:
+            raise ValueError("semantic hypothesis updates require a frontier")
         self._items = self._replacement_items(previous_hypothesis_id, updated)
         return updated
 
@@ -293,6 +307,8 @@ class RecursiveFrontier:
 
     def checkpoint(self) -> JsonDict:
         return {
+            "schema": FRONTIER_CHECKPOINT_SCHEMA,
+            "version": FRONTIER_CHECKPOINT_VERSION,
             "queued": self.snapshot(),
             "in_flight": [item.to_dict() for item in self.in_flight_items()],
             "completed": [
@@ -304,9 +320,18 @@ class RecursiveFrontier:
     @classmethod
     def from_checkpoint(cls, checkpoint: Mapping[str, object]) -> "RecursiveFrontier":
         """Restore completed work and requeue interrupted work by its stable heap key."""
-        queued = cls._load_checkpoint_items(checkpoint.get("queued"), "queued")
-        in_flight = cls._load_checkpoint_items(checkpoint.get("in_flight"), "in_flight")
-        completed = cls._load_completed_items(checkpoint.get("completed"))
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError("frontier checkpoint must be a mapping")
+        if checkpoint.get("schema") != FRONTIER_CHECKPOINT_SCHEMA:
+            raise ValueError("unsupported frontier checkpoint schema")
+        if checkpoint.get("version") != FRONTIER_CHECKPOINT_VERSION:
+            raise ValueError("unsupported frontier checkpoint version")
+        for section in ("queued", "in_flight", "completed"):
+            if section not in checkpoint:
+                raise ValueError("frontier checkpoint missing {0}".format(section))
+        queued = cls._load_checkpoint_items(checkpoint["queued"], "queued")
+        in_flight = cls._load_checkpoint_items(checkpoint["in_flight"], "in_flight")
+        completed = cls._load_completed_items(checkpoint["completed"])
         all_visits: Dict[str, str] = {}
         for state, items in (("queued", queued), ("in-flight", in_flight)):
             for item in items:
@@ -322,7 +347,7 @@ class RecursiveFrontier:
         )
         return frontier
 
-    def plan_hypothesis_migration(
+    def _plan_hypothesis_migration(
         self, previous: AttributionHypothesis, updated: AttributionHypothesis
     ) -> _FrontierMigration:
         queued = tuple(
@@ -340,7 +365,7 @@ class RecursiveFrontier:
         self._validate_lifecycle_state(queued, in_flight, completed)
         return _FrontierMigration(queued, in_flight, completed)
 
-    def apply_hypothesis_migration(self, migration: _FrontierMigration) -> None:
+    def _apply_hypothesis_migration(self, migration: _FrontierMigration) -> None:
         self._validate_lifecycle_state(
             migration.queued, migration.in_flight, migration.completed
         )
@@ -348,8 +373,6 @@ class RecursiveFrontier:
 
     @staticmethod
     def _load_checkpoint_items(value: object, state: str) -> Tuple[FrontierItem, ...]:
-        if value is None:
-            return ()
         if not isinstance(value, list):
             raise ValueError("frontier checkpoint {0} must be a list".format(state))
         items: List[FrontierItem] = []
@@ -361,8 +384,6 @@ class RecursiveFrontier:
 
     @staticmethod
     def _load_completed_items(value: object) -> Tuple[_CompletedFrontierItem, ...]:
-        if value is None:
-            return ()
         if not isinstance(value, list):
             raise ValueError("frontier checkpoint completed must be a list")
         items: List[_CompletedFrontierItem] = []

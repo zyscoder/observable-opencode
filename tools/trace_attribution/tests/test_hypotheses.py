@@ -67,6 +67,11 @@ class HypothesisLedgerTest(unittest.TestCase):
 
         self.assertEqual(len(updated.supporting_evidence), 1)
         self.assertEqual(len(updated.opposing_evidence), 1)
+        self.assertEqual(updated.supporting_evidence[0].ref, "record:decision")
+        self.assertEqual(updated.supporting_evidence[0].reason, "Plan declares completion")
+        self.assertEqual(updated.opposing_evidence[0].ref, "record:prompt")
+        self.assertEqual(updated.opposing_evidence[0].reason, "Prompt permits a complete search")
+        self.assertIn(updated.supporting_evidence[0].ref, {"record:decision", "record:prompt"})
         self.assertEqual(updated.supporting_evidence[0].confidence, 0.9)
         self.assertEqual(updated.opposing_evidence[0].confidence, 0.95)
         self.assertEqual(hypothesis_order_key(updated)[0], -0.9)
@@ -75,6 +80,7 @@ class HypothesisLedgerTest(unittest.TestCase):
 
     def test_unresolved_question_rekeys_semantic_identity_and_restores_snapshot(self):
         ledger = HypothesisLedger()
+        frontier = RecursiveFrontier()
         first = ledger.create("prompt omission is root", "record:prompt", sample_defect_state())
         second = ledger.create(
             "agent search closure is root", "record:decision", sample_defect_state()
@@ -84,7 +90,7 @@ class HypothesisLedgerTest(unittest.TestCase):
         )
 
         updated = ledger.add_unresolved_question(
-            second.hypothesis_id, "Were repository call sites searched?"
+            second.hypothesis_id, "Were repository call sites searched?", frontier=frontier
         )
         restored = HypothesisLedger.from_snapshot(ledger.snapshot())
 
@@ -95,6 +101,15 @@ class HypothesisLedgerTest(unittest.TestCase):
         )
         self.assertEqual(restored.snapshot(), ledger.snapshot())
 
+    def test_unresolved_question_requires_a_frontier_for_semantic_rekeying(self):
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root", "record:decision", sample_defect_state()
+        )
+
+        with self.assertRaises(TypeError):
+            ledger.add_unresolved_question(hypothesis.hypothesis_id, "Were call sites searched?")
+
     def test_explicit_frontier_transition_migrates_queued_item_identity(self):
         ledger = HypothesisLedger()
         frontier = RecursiveFrontier()
@@ -104,10 +119,10 @@ class HypothesisLedgerTest(unittest.TestCase):
         queued = item_for("record:decision", sample_defect_state(), hypothesis)
         frontier.push(queued)
 
-        updated = ledger.update_with_frontier(
-            frontier,
+        updated = ledger.add_unresolved_question(
             hypothesis.hypothesis_id,
-            unresolved_questions=["Were repository call sites searched?"],
+            "Were repository call sites searched?",
+            frontier=frontier,
         )
         popped = frontier.pop()
 
@@ -139,10 +154,10 @@ class HypothesisLedgerTest(unittest.TestCase):
         frontier.push(item)
         frontier.mark_completed(frontier.pop(), "evidence:v1")
 
-        updated = ledger.update_with_frontier(
-            frontier,
+        updated = ledger.add_unresolved_question(
             hypothesis.hypothesis_id,
-            unresolved_questions=["Were repository call sites searched?"],
+            "Were repository call sites searched?",
+            frontier=frontier,
         )
         migrated = item_for("record:decision", sample_defect_state(), updated)
         restored_ledger = HypothesisLedger.from_snapshot(ledger.snapshot())
@@ -160,7 +175,9 @@ class HypothesisLedgerTest(unittest.TestCase):
         stronger = ledger.create("B root", "record:b", sample_defect_state())
         weaker = ledger.add_support(weaker.hypothesis_id, "record:a", "partial support", 0.4)
         stronger = ledger.add_support(stronger.hypothesis_id, "record:b", "strong support", 0.8)
-        stronger = ledger.add_unresolved_question(stronger.hypothesis_id, "Check an artifact")
+        stronger = ledger.add_unresolved_question(
+            stronger.hypothesis_id, "Check an artifact", frontier=RecursiveFrontier()
+        )
 
         self.assertLess(hypothesis_order_key(stronger), hypothesis_order_key(weaker))
         self.assertEqual(ledger.best_active().hypothesis_id, stronger.hypothesis_id)
@@ -244,10 +261,10 @@ class RecursiveFrontierTest(unittest.TestCase):
         frontier.push(item)
         popped = frontier.pop()
 
-        updated = ledger.update_with_frontier(
-            frontier,
+        updated = ledger.add_unresolved_question(
             hypothesis.hypothesis_id,
-            unresolved_questions=["Were repository call sites searched?"],
+            "Were repository call sites searched?",
+            frontier=frontier,
         )
         migrated = frontier.in_flight_items()[0]
 
@@ -269,6 +286,36 @@ class RecursiveFrontierTest(unittest.TestCase):
 
         self.assertFalse(restored.in_flight_items())
         self.assertEqual(restored.pop(), item)
+
+    def test_checkpoint_requires_current_schema_and_all_lifecycle_sections(self):
+        frontier = RecursiveFrontier()
+        hypothesis = HypothesisLedger().create(
+            "agent search closure is root", "record:decision", sample_defect_state()
+        )
+        item = item_for("record:decision", sample_defect_state(), hypothesis)
+        frontier.push(item)
+        completed = frontier.pop()
+        frontier.mark_completed(completed, "evidence:v1")
+        checkpoint = frontier.checkpoint()
+
+        for section in ("queued", "in_flight", "completed"):
+            malformed = dict(checkpoint)
+            malformed.pop(section)
+            with self.subTest(section=section):
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    RecursiveFrontier.from_checkpoint(malformed)
+
+        malformed = dict(checkpoint)
+        malformed["completed"] = {}
+        with self.assertRaisesRegex(ValueError, "list"):
+            RecursiveFrontier.from_checkpoint(malformed)
+
+        unknown_version = dict(checkpoint)
+        unknown_version["version"] = checkpoint["version"] + 1
+        with self.assertRaisesRegex(ValueError, "version"):
+            RecursiveFrontier.from_checkpoint(unknown_version)
+
+        self.assertFalse(frontier.push(completed))
 
     def test_corrupt_checkpoint_and_reopen_rollback_preserve_completed_state(self):
         frontier = RecursiveFrontier()
