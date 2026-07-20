@@ -351,6 +351,14 @@ by the **deterministic plumbing suite**. That suite validates traversal, persist
 projection, role wiring, and evaluator safety; it is excluded from attribution-quality
 acceptance.
 
+`recursive-attribution-labels/v3` requires both `semantic_anchor_id` and
+`semantic_occurrence_id` for every scored root, condition, amplifier, and forbidden root.
+`node_ref` is optional navigation metadata. Acceptance recomputes both identities from the
+immutable source Trace and requires an exact binding. Occurrence identity is the scoring key;
+the content anchor is retained for cross-run grouping and diagnostics. Consequently, two
+same-anchor nodes in different causal neighborhoods remain two independently scored facts,
+while repeating the same occurrence is rejected.
+
 `tests.test_recursive_acceptance_review.DeterministicRuleSemanticSmokeTest` is a separate
 fixture-phrase rule smoke test. It randomizes refs, component aliases, and insertion order to
 exercise plumbing without the scripted ref table. Its keyword rules are fixture-specific and
@@ -385,12 +393,16 @@ evidence ref, and artifact against source facts. Artifact checks include canonic
 owner, path containment, byte range, and actual content. Directed causal paths may contain
 only attribution-eligible non-temporal hops.
 
-The exact comparison schema reports confirmed-root recall/precision separately from
+The `recursive-attribution-comparison/v4` schema reports occurrence-level confirmed-root
+recall/precision separately from
 introduction-candidate recall/precision, Top-1 (`null` for empty expected roots), explicit
 negative-control correctness, signed physical Judge request reduction, request ratio and
 signed request delta, mean causal-path length,
 factor precision, unknown rate, confirmation rejection, investigation yield, checkpoint
 reuse, and human/LLM disagreement. Multi-root recall is a fraction, not any-hit success.
+Top-1, role membership, forbidden-root checks, disagreements, and counts all compare causal
+occurrences. Separate `semantic_*` recall/precision fields expose content-level diagnostics
+but never substitute for occurrence-level acceptance quality.
 Recall/precision/rate metrics are bounded to `[0,1]`. Request reduction is signed, request
 ratio may exceed 1, and missing request measurements remain `null`.
 

@@ -10,12 +10,12 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v2",
+    "schema_version": "recursive-attribution-labels/v3",
     "case_id": "prompt-wrong-agent-faithful",
-    "roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:d4aa3e8863945526cd781660"}],
+    "roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:d4aa3e8863945526cd781660", "semantic_occurrence_id": "semantic_occurrence:v1:7d07672af6bd8117741e3693"}],
     "conditions": [],
     "amplifiers": [],
-    "forbidden_roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:0d41680f4c314f7e56e09e40"}],
+    "forbidden_roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:0d41680f4c314f7e56e09e40", "semantic_occurrence_id": "semantic_occurrence:v1:7780af2f99e1a0bab0a5219e"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

@@ -11,12 +11,12 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v2",
+    "schema_version": "recursive-attribution-labels/v3",
     "case_id": "timeout-amplifier",
-    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:a70611adf1582fa8f16e4502"}],
+    "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:a70611adf1582fa8f16e4502", "semantic_occurrence_id": "semantic_occurrence:v1:f2e233572d01ce08689ae40a"}],
     "conditions": [],
-    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v2:33da54951b6ccb2a76e677b3"}],
-    "forbidden_roots": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:699651f4d075be3b0a079a4b"}],
+    "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v2:33da54951b6ccb2a76e677b3", "semantic_occurrence_id": "semantic_occurrence:v1:824b8cb4d655dc1589dcd05d"}],
+    "forbidden_roots": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:699651f4d075be3b0a079a4b", "semantic_occurrence_id": "semantic_occurrence:v1:d590f010cfdf654912fbb5ff"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {

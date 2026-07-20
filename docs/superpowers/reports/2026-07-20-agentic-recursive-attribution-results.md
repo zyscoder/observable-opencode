@@ -139,14 +139,18 @@ The evaluator requires an immutable `--trace` source. Report-only acceptance is 
 - resolves candidate snapshots, judgments, hypotheses, confirmations, roots, factors, and
   compatibility projections against source facts;
 - validates every confirmed/factor path as directed, attribution-eligible, and non-temporal;
-- recomputes confirmation identities and rejects duplicate semantic identities or role reuse;
+- recomputes confirmation identities and rejects duplicate causal-occurrence identities or role reuse;
 - verifies artifacts by Trace membership, owner, contained path, canonical SHA-256, actual
   bytes, optional range/content, and envelope metadata;
 - rejects fabricated/unresolved confirmed facts, forbidden roots, disallowed unresolved
   outcomes, contradictory `no_defect`, and checkpoint reuse above logical calls.
 
-Metrics separate confirmed-root recall/precision from introduction-candidate recall/precision.
-Multi-root metrics are fractions. Empty expected roots use explicit
+The v3 human-label schema binds every scored role to both content semantics and causal
+occurrence; `node_ref` is optional navigation. The v4 comparison schema scores roots,
+factors, forbidden matches, Top-1, disagreements, and counts by occurrence identity. It also
+reports content-anchor recall/precision as diagnostics, never as a replacement quality gate.
+Thus two same-anchor roots in distinct neighborhoods contribute two denominator entries and
+finding one yields recall `0.5`. Multi-root metrics are fractions. Empty expected roots use explicit
 `negative_control_correct`; Top-1 is `null`. Recall/precision/rate metrics are bounded.
 Request performance separately reports signed `(legacy-current)/legacy`,
 `request_ratio=current/legacy`, and `request_delta=legacy-current`, so regressions remain
@@ -169,16 +173,16 @@ PYTHONPATH=tools/trace_attribution python3 -m trace_attribution.cli \
   --judge-timeout-sec 3600
 ```
 
-Evaluate only after producing a separately audited v2 label file:
+Evaluate only after producing a separately audited v3 dual-identity label file:
 
 ```bash
 PYTHONPATH=tools/trace_attribution python3 \
   tools/trace_attribution/scripts/evaluate_recursive_attribution.py \
   --trace /private/tmp/observable-opencode-multibench/runs/featurebench/traces/pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1/partial/latest.json \
   --report /private/tmp/observable-opencode-task9-real/pydantic/recursive.attribution.json \
-  --labels /private/tmp/observable-opencode-task9-real/pydantic/human-labels.v2.json \
+  --labels /private/tmp/observable-opencode-task9-real/pydantic/human-labels.v3.json \
   --legacy-report docs/superpowers/reports/2026-07-13-loop3-featurebench-pydantic-attribution-improved-v2.json \
-  --out /private/tmp/observable-opencode-task9-real/pydantic/comparison.v3.json
+  --out /private/tmp/observable-opencode-task9-real/pydantic/comparison.v4.json
 ```
 
 For semantic requirement/architecture/verification runs, substitute one exact inventory path
@@ -189,12 +193,13 @@ the parent task will execute authorized comparisons after review.
 ## Blocking Gates
 
 The default cannot switch until real Sphinx, Pydantic, requirement understanding, context
-compaction, and successful no-defect cases have audited v2 labels and pass source-backed
+compaction, and successful no-defect cases have audited v3 labels and pass source-backed
 evaluation; request reduction and cold/resumed checkpoint reuse must also be measured from
 real Provider runs. Scripted and rule-based deterministic suites can never satisfy these gates.
 
 ## Offline Verification
 
-Task 9 focused tests: 38 passed. Complete offline suite: 430 passed. Production modules
+Task 9 focused tests: 41 passed. Dedicated fixture/metrics tests: 12 passed. Complete offline
+suite: 433 passed. Production modules
 compile with an isolated Python bytecode cache. No model, network, Agent mutation, or Trace
 mutation was performed.

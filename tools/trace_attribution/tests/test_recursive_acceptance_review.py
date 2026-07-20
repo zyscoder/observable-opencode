@@ -18,6 +18,7 @@ from scripts.evaluate_recursive_attribution import (
     compare_report,
     load_fixture,
     main as evaluate_main,
+    validate_labels,
 )
 from trace_attribution.causal_state import (
     CausalStepJudgment,
@@ -212,6 +213,46 @@ class SemanticAnchorV2ReviewTest(unittest.TestCase):
             occurrences["record:decision-a"], occurrences["record:decision-b"]
         )
 
+    def test_semantic_and_occurrence_identities_are_stable_across_run_local_ids(self):
+        def graph(prompt_id, decision_id, root):
+            return TraceGraph.from_trace(
+                {
+                    "case_id": "cross-run-case",
+                    "records": [
+                        {
+                            "record_id": prompt_id,
+                            "component": "input-run-local",
+                            "event_type": "prompt.assembly",
+                            "data": {
+                                "text": "Apply the repository contract",
+                                "repository_root": root,
+                                "path": root + "/src/Foo.py",
+                            },
+                        },
+                        {
+                            "record_id": decision_id,
+                            "component": "planner-run-local",
+                            "event_type": "decision",
+                            "source_refs": ["record:" + prompt_id],
+                            "data": {"rationale": "apply contract"},
+                        },
+                    ],
+                    "dataflow_edges": [],
+                }
+            )
+
+        left = graph("prompt-1042", "decision-1043", "/tmp/run-1042/repo")
+        right = graph("prompt-9911", "decision-9912", "/private/tmp/run-9911/repo")
+
+        self.assertEqual(
+            semantic_anchor_index(left.case_id, left)["record:decision-1043"],
+            semantic_anchor_index(right.case_id, right)["record:decision-9912"],
+        )
+        self.assertEqual(
+            semantic_occurrence_index(left.case_id, left)["record:decision-1043"],
+            semantic_occurrence_index(right.case_id, right)["record:decision-9912"],
+        )
+
     def test_full_graph_collision_is_reported_even_for_unpublished_node(self):
         trace = {
             "case_id": "collision-case",
@@ -325,6 +366,13 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         with self.assertRaises(EvaluationSafetyError):
             self.compare(labels=label_mismatch)
 
+        occurrence_mismatch = copy.deepcopy(self.labels)
+        occurrence_mismatch["roots"][0]["semantic_occurrence_id"] = (
+            "semantic_occurrence:v1:" + "0" * 24
+        )
+        with self.assertRaises(EvaluationSafetyError):
+            self.compare(labels=occurrence_mismatch)
+
         ungrounded_candidate_edge = copy.deepcopy(self.report)
         candidate = next(
             item
@@ -356,6 +404,95 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         self.assertTrue(result["safety"]["passed"])
         self.assertEqual(len(report["metadata"]["semantic_anchor_collisions"]), 1)
         self.assertEqual(report["metadata"]["semantic_occurrence_collisions"], [])
+
+    def test_same_anchor_distinct_occurrence_roots_score_independently(self):
+        trace = json.loads((FIXTURE_ROOT / "sphinx_recursive_minimal.json").read_text())
+        trace.pop("human_labels")
+        trace.pop("scripted_analysis")
+        duplicate = copy.deepcopy(
+            next(item for item in trace["records"] if item["record_id"] == "decision")
+        )
+        duplicate.update(
+            {
+                "record_id": "decision-repeat",
+                "component": "planner-alias",
+                "source_refs": ["record:independent-prompt"],
+            }
+        )
+        trace["records"].extend(
+            [
+                {
+                    "record_id": "independent-prompt",
+                    "component": "input-alias",
+                    "event_type": "prompt.assembly",
+                    "data": {"text": "independent causal context"},
+                },
+                duplicate,
+            ]
+        )
+        graph = TraceGraph.from_trace(trace)
+        anchors = semantic_anchor_index(graph.case_id, graph)
+        occurrences = semantic_occurrence_index(graph.case_id, graph)
+        self.assertEqual(anchors["record:decision"], anchors["record:decision-repeat"])
+        self.assertNotEqual(
+            occurrences["record:decision"], occurrences["record:decision-repeat"]
+        )
+
+        report = annotate_report_semantic_anchors(
+            graph.case_id, graph.nodes, self.report, graph=graph
+        )
+        labels = copy.deepcopy(self.labels)
+        labels["schema_version"] = "recursive-attribution-labels/v3"
+        for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
+            for item in labels[role]:
+                item["semantic_occurrence_id"] = occurrences[item["node_ref"]]
+        labels["roots"] = [
+            {
+                "semantic_anchor_id": anchors["record:decision-repeat"],
+                "semantic_occurrence_id": occurrences["record:decision-repeat"],
+            },
+            labels["roots"][0],
+        ]
+
+        result = compare_report(report, labels, None, graph=graph)
+
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v4")
+        self.assertEqual(result["metrics"]["confirmed_root_recall"], 0.5)
+        self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
+        self.assertTrue(result["metrics"]["top1_match"])
+        self.assertEqual(result["metrics"]["semantic_confirmed_root_recall"], 1.0)
+        self.assertEqual(result["counts"]["expected_root_count"], 2)
+        self.assertEqual(result["counts"]["predicted_root_count"], 1)
+
+        top1_labels = copy.deepcopy(labels)
+        top1_labels["roots"] = [labels["roots"][0]]
+        top1 = compare_report(report, top1_labels, None, graph=graph)
+        self.assertFalse(top1["metrics"]["top1_match"])
+        self.assertEqual(top1["metrics"]["confirmed_root_recall"], 0.0)
+        self.assertEqual(top1["metrics"]["semantic_confirmed_root_recall"], 1.0)
+
+    def test_labels_reject_duplicate_occurrence_and_require_dual_identity(self):
+        labels = copy.deepcopy(self.labels)
+        labels["schema_version"] = "recursive-attribution-labels/v3"
+        occurrences = semantic_occurrence_index(self.graph.case_id, self.graph)
+        for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
+            for item in labels[role]:
+                item["semantic_occurrence_id"] = occurrences[item["node_ref"]]
+
+        missing_occurrence = copy.deepcopy(labels)
+        missing_occurrence["roots"][0].pop("semantic_occurrence_id")
+        with self.assertRaises(EvaluationSchemaError):
+            validate_labels(missing_occurrence)
+
+        duplicate_occurrence = copy.deepcopy(labels)
+        duplicate_occurrence["roots"].append(
+            {
+                "semantic_anchor_id": labels["roots"][0]["semantic_anchor_id"],
+                "semantic_occurrence_id": labels["roots"][0]["semantic_occurrence_id"],
+            }
+        )
+        with self.assertRaises(EvaluationSchemaError):
+            validate_labels(duplicate_occurrence)
 
     def test_outcome_state_machine_unresolved_policy_and_ratio_bounds_are_enforced(self):
         contradictory = copy.deepcopy(self.report)
@@ -431,6 +568,7 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             {
                 "node_ref": "record:observed",
                 "semantic_anchor_id": self.report["metadata"]["semantic_anchor_index"]["record:observed"],
+                "semantic_occurrence_id": self.report["metadata"]["semantic_occurrence_index"]["record:observed"],
             }
         )
         partial = self.compare(labels=partial_labels)

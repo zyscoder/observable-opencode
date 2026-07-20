@@ -22,10 +22,11 @@ from trace_attribution.models import TraceNode, stable_json
 
 
 JsonDict = Dict[str, Any]
-LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v2"
-COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v3"
+LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
+COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v4"
 REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
+SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
     {"temporal_proximity", "temporal_sequence", "previous_event", "next_event"}
 )
@@ -41,7 +42,12 @@ LABEL_KEYS = frozenset(
         "allowed_unresolved_outcomes",
     }
 )
-LABEL_ENTRY_KEYS = frozenset({"node_ref", "semantic_anchor_id"})
+LABEL_ENTRY_REQUIRED_KEYS = frozenset(
+    {"semantic_anchor_id", "semantic_occurrence_id"}
+)
+LABEL_ENTRY_ALLOWED_KEYS = frozenset(
+    {"node_ref", "semantic_anchor_id", "semantic_occurrence_id"}
+)
 FIXTURE_CONTROL_KEYS = frozenset({"human_labels", "scripted_analysis"})
 FIXTURE_ALLOWED_KEYS = frozenset(
     {
@@ -127,21 +133,38 @@ def validate_labels(value: Mapping[str, Any]) -> JsonDict:
         raise EvaluationSchemaError("labels case_id must be a non-empty string")
     for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
         entries = _list(labels[role], "labels.{0}".format(role))
-        anchors: Set[str] = set()
+        occurrences: Set[str] = set()
         refs: Set[str] = set()
         for index, raw in enumerate(entries):
             item = dict(_mapping(raw, "labels.{0}[{1}]".format(role, index)))
-            _exact_keys(item, LABEL_ENTRY_KEYS, "labels.{0}[{1}]".format(role, index))
-            node_ref = item["node_ref"]
+            missing = set(LABEL_ENTRY_REQUIRED_KEYS) - set(item)
+            extra = set(item) - set(LABEL_ENTRY_ALLOWED_KEYS)
+            if missing or extra:
+                raise EvaluationSchemaError(
+                    "labels.{0}[{1}] keys differ: missing={2}, extra={3}".format(
+                        role, index, sorted(missing), sorted(extra)
+                    )
+                )
+            node_ref = item.get("node_ref")
             anchor = item["semantic_anchor_id"]
-            if not isinstance(node_ref, str) or not node_ref.startswith("record:"):
+            occurrence = item["semantic_occurrence_id"]
+            if node_ref is not None and (
+                not isinstance(node_ref, str) or not node_ref.startswith("record:")
+            ):
                 raise EvaluationSchemaError("label node_ref must be a record ref")
             if not isinstance(anchor, str) or not anchor.startswith(SEMANTIC_ANCHOR_PREFIX):
                 raise EvaluationSchemaError("label semantic_anchor_id must be versioned")
-            if node_ref in refs or anchor in anchors:
+            if not isinstance(occurrence, str) or not occurrence.startswith(
+                SEMANTIC_OCCURRENCE_PREFIX
+            ):
+                raise EvaluationSchemaError(
+                    "label semantic_occurrence_id must be versioned"
+                )
+            if occurrence in occurrences or (node_ref is not None and node_ref in refs):
                 raise EvaluationSchemaError("duplicate label identity in {0}".format(role))
-            refs.add(node_ref)
-            anchors.add(anchor)
+            if node_ref is not None:
+                refs.add(node_ref)
+            occurrences.add(occurrence)
     outcomes = _list(labels["allowed_unresolved_outcomes"], "allowed_unresolved_outcomes")
     if any(item not in {"inconclusive", "partial_root_found"} for item in outcomes):
         raise EvaluationSchemaError(
@@ -205,8 +228,21 @@ def _anchors(items: Iterable[Mapping[str, Any]]) -> List[str]:
     return output
 
 
+def _occurrences(items: Iterable[Mapping[str, Any]]) -> List[str]:
+    output: List[str] = []
+    for item in items:
+        occurrence = item.get("semantic_occurrence_id")
+        if isinstance(occurrence, str) and occurrence:
+            output.append(occurrence)
+    return output
+
+
 def _label_anchors(labels: Mapping[str, Any], role: str) -> List[str]:
     return [str(item["semantic_anchor_id"]) for item in labels[role]]
+
+
+def _label_occurrences(labels: Mapping[str, Any], role: str) -> List[str]:
+    return [str(item["semantic_occurrence_id"]) for item in labels[role]]
 
 
 def _safe_rate(numerator: int, denominator: int, *, empty: float = 0.0) -> float:
@@ -744,7 +780,12 @@ def _trace_backed_safety_violations(
     report: Mapping[str, Any],
     labels: Mapping[str, Any],
     graph: TraceGraph,
-) -> Tuple[List[str], RecursiveAttributionReport, Dict[str, str]]:
+) -> Tuple[
+    List[str],
+    RecursiveAttributionReport,
+    Dict[str, str],
+    Dict[str, str],
+]:
     violations: List[str] = []
     try:
         parsed = RecursiveAttributionReport.from_dict(dict(report))
@@ -768,19 +809,40 @@ def _trace_backed_safety_violations(
     label_roles: Dict[str, str] = {}
     for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
         for label in labels[role]:
-            ref = str(label["node_ref"])
             anchor = str(label["semantic_anchor_id"])
-            violations.extend(_validate_ref(graph, ref))
+            occurrence = str(label["semantic_occurrence_id"])
+            explicit_ref = label.get("node_ref")
+            if explicit_ref is None:
+                matching_refs = [
+                    ref
+                    for ref in graph.nodes
+                    if anchors.get(ref) == anchor and occurrences.get(ref) == occurrence
+                ]
+                if len(matching_refs) != 1:
+                    violations.append(
+                        "label_identity_{0}:{1}:{2}".format(
+                            "unresolved" if not matching_refs else "ambiguous",
+                            role,
+                            occurrence,
+                        )
+                    )
+                    continue
+                ref = matching_refs[0]
+            else:
+                ref = str(explicit_ref)
+                violations.extend(_validate_ref(graph, ref))
             if anchors.get(ref) != anchor:
                 violations.append("label_anchor_mismatch:{0}:{1}".format(role, ref))
-            prior_role = label_roles.get(anchor)
+            if occurrences.get(ref) != occurrence:
+                violations.append("label_occurrence_mismatch:{0}:{1}".format(role, ref))
+            prior_role = label_roles.get(occurrence)
             if prior_role is not None and prior_role != role:
                 violations.append(
-                    "label_semantic_identity_role_conflict:{0}:{1}:{2}".format(
-                        anchor, prior_role, role
+                    "label_occurrence_identity_role_conflict:{0}:{1}:{2}".format(
+                        occurrence, prior_role, role
                     )
                 )
-            label_roles[anchor] = role
+            label_roles[occurrence] = role
     reported_index = metadata.get("semantic_anchor_index")
     if not isinstance(reported_index, Mapping) or dict(reported_index) != anchors:
         violations.append("semantic_anchor_index_mismatch")
@@ -908,16 +970,16 @@ def _trace_backed_safety_violations(
             if branch.get("node_ref") == ref:
                 violations.append("unresolved_branch_promoted_to_root:{0}".format(ref))
 
-    forbidden = set(_label_anchors(labels, "forbidden_roots"))
+    forbidden = set(_label_occurrences(labels, "forbidden_roots"))
     for root in roots:
-        if root.get("semantic_anchor_id") in forbidden:
+        if root.get("semantic_occurrence_id") in forbidden:
             violations.append("forbidden_root_confirmed:{0}".format(root.get("node_ref")))
 
     logical_calls = metadata_int(report, "logical_judge_call_count")
     reused_calls = metadata_int(report, "checkpoint_reused_judgment_count")
     if reused_calls > logical_calls:
         violations.append("checkpoint_reuse_exceeds_logical_calls")
-    return sorted(set(violations)), parsed, anchors
+    return sorted(set(violations)), parsed, anchors, occurrences
 
 
 def compare_report(
@@ -932,14 +994,14 @@ def compare_report(
     report = dict(_mapping(report, "report"))
     labels = validate_labels(labels)
     _validate_report_shape(report, labels)
-    violations, parsed, _ = _trace_backed_safety_violations(report, labels, graph)
+    violations, parsed, _, _ = _trace_backed_safety_violations(report, labels, graph)
     if violations:
         raise EvaluationSafetyError("; ".join(violations))
 
     confirmed = [*_items(report["confirmed_roots"]), *_items(report["co_roots"])]
-    predicted = _anchors(confirmed)
-    introduced = _anchors(_items(report.get("introduction_candidates")))
-    expected = _label_anchors(labels, "roots")
+    predicted = _occurrences(confirmed)
+    introduced = _occurrences(_items(report.get("introduction_candidates")))
+    expected = _label_occurrences(labels, "roots")
     predicted_set = set(predicted)
     introduced_set = set(introduced)
     expected_set = set(expected)
@@ -956,6 +1018,30 @@ def compare_report(
         len(introduced_set & expected_set), len(introduced_set), empty=1.0 if not expected else 0.0
     )
     top1_match = None if not expected else bool(predicted and predicted[0] in expected_set)
+
+    predicted_semantics = set(_anchors(confirmed))
+    introduced_semantics = set(_anchors(_items(report.get("introduction_candidates"))))
+    expected_semantics = set(_label_anchors(labels, "roots"))
+    semantic_root_recall = _safe_rate(
+        len(predicted_semantics & expected_semantics),
+        len(expected_semantics),
+        empty=1.0 if not predicted_semantics else 0.0,
+    )
+    semantic_root_precision = _safe_rate(
+        len(predicted_semantics & expected_semantics),
+        len(predicted_semantics),
+        empty=1.0 if not expected_semantics else 0.0,
+    )
+    semantic_introduction_recall = _safe_rate(
+        len(introduced_semantics & expected_semantics),
+        len(expected_semantics),
+        empty=1.0 if not introduced_semantics else 0.0,
+    )
+    semantic_introduction_precision = _safe_rate(
+        len(introduced_semantics & expected_semantics),
+        len(introduced_semantics),
+        empty=1.0 if not expected_semantics else 0.0,
+    )
     negative_control_correct = bool(
         not expected and not predicted and parsed.analysis_outcome == "no_defect"
     )
@@ -975,10 +1061,10 @@ def compare_report(
     ]
     mean_path_length = round(sum(path_lengths) / len(path_lengths), 6) if path_lengths else 0.0
 
-    predicted_conditions = set(_anchors(_items(report["contributing_conditions"])))
-    predicted_amplifiers = set(_anchors(_items(report["amplifying_factors"])))
-    expected_conditions = set(_label_anchors(labels, "conditions"))
-    expected_amplifiers = set(_label_anchors(labels, "amplifiers"))
+    predicted_conditions = set(_occurrences(_items(report["contributing_conditions"])))
+    predicted_amplifiers = set(_occurrences(_items(report["amplifying_factors"])))
+    expected_conditions = set(_label_occurrences(labels, "conditions"))
+    expected_amplifiers = set(_label_occurrences(labels, "amplifiers"))
     predicted_factors = {
         *(('condition', item) for item in predicted_conditions),
         *(('amplifier', item) for item in predicted_amplifiers),
@@ -1049,8 +1135,12 @@ def compare_report(
         "metrics": {
             "confirmed_root_recall": root_recall,
             "confirmed_root_precision": root_precision,
+            "semantic_confirmed_root_recall": semantic_root_recall,
+            "semantic_confirmed_root_precision": semantic_root_precision,
             "introduction_candidate_recall": introduction_recall,
             "introduction_candidate_precision": introduction_precision,
+            "semantic_introduction_candidate_recall": semantic_introduction_recall,
+            "semantic_introduction_candidate_precision": semantic_introduction_precision,
             "top1_match": top1_match,
             "negative_control_correct": negative_control_correct,
             "judge_request_reduction": request_reduction,

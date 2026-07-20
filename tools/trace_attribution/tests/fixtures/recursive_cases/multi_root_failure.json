@@ -10,11 +10,11 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v2",
+    "schema_version": "recursive-attribution-labels/v3",
     "case_id": "multi-root-failure",
     "roots": [
-      {"node_ref": "record:encryption_decision", "semantic_anchor_id": "semantic_anchor:v2:24b5cf0a8bb4372cd4b6d145"},
-      {"node_ref": "record:audit_decision", "semantic_anchor_id": "semantic_anchor:v2:3d44a85411b474802a62a7dc"}
+      {"node_ref": "record:encryption_decision", "semantic_anchor_id": "semantic_anchor:v2:24b5cf0a8bb4372cd4b6d145", "semantic_occurrence_id": "semantic_occurrence:v1:d9073324a39bf3af6b6e5410"},
+      {"node_ref": "record:audit_decision", "semantic_anchor_id": "semantic_anchor:v2:3d44a85411b474802a62a7dc", "semantic_occurrence_id": "semantic_occurrence:v1:45df94872ebec4c64ef40c58"}
     ],
     "conditions": [],
     "amplifiers": [],

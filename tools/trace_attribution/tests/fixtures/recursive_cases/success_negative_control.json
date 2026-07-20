@@ -10,15 +10,15 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v2",
+    "schema_version": "recursive-attribution-labels/v3",
     "case_id": "success-negative-control",
     "roots": [],
     "conditions": [],
     "amplifiers": [],
     "forbidden_roots": [
-      {"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:6911af0e33ca6889c53007ee"},
-      {"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:13785fac83fdfe99ffa60473"},
-      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:e1d8b159c44234872411e448"}
+      {"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:6911af0e33ca6889c53007ee", "semantic_occurrence_id": "semantic_occurrence:v1:9efb0081e773bb838a6bbce4"},
+      {"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:13785fac83fdfe99ffa60473", "semantic_occurrence_id": "semantic_occurrence:v1:306261d2ba18470ea1f565a3"},
+      {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:e1d8b159c44234872411e448", "semantic_occurrence_id": "semantic_occurrence:v1:ee0d060aeaaf08af34e9263c"}
     ],
     "allowed_unresolved_outcomes": []
   },

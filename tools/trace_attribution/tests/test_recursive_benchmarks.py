@@ -25,6 +25,7 @@ from trace_attribution.causal_state import (
     annotate_report_semantic_anchors,
     semantic_anchor_id,
     semantic_anchor_index,
+    semantic_occurrence_index,
 )
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
@@ -307,7 +308,7 @@ class RecursiveMetricTest(unittest.TestCase):
             graph=graph,
         )
 
-        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v3")
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v4")
         self.assertEqual(
             set(result),
             {
@@ -324,8 +325,12 @@ class RecursiveMetricTest(unittest.TestCase):
             {
                 "confirmed_root_recall",
                 "confirmed_root_precision",
+                "semantic_confirmed_root_recall",
+                "semantic_confirmed_root_precision",
                 "introduction_candidate_recall",
                 "introduction_candidate_precision",
+                "semantic_introduction_candidate_recall",
+                "semantic_introduction_candidate_precision",
                 "top1_match",
                 "negative_control_correct",
                 "judge_request_reduction",
@@ -486,16 +491,24 @@ class RecursiveFixtureTest(unittest.TestCase):
                 self.assertNotIn(label_text, stable_json(trace))
                 self.assertNotIn("expected_roots", stable_json(trace))
 
-    def test_fixture_labels_use_computed_versioned_semantic_anchors(self):
+    def test_fixture_labels_bind_computed_semantic_and_occurrence_identities(self):
         for name in FIXTURE_NAMES:
             trace, human_labels, _ = load_fixture(FIXTURE_ROOT / name)
             graph = TraceGraph.from_trace(trace)
             anchors = semantic_anchor_index(trace["case_id"], graph)
+            occurrences = semantic_occurrence_index(trace["case_id"], graph)
+            self.assertEqual(
+                human_labels["schema_version"], "recursive-attribution-labels/v3"
+            )
             for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
                 for item in human_labels[role]:
                     self.assertEqual(
                         item["semantic_anchor_id"],
                         anchors[item["node_ref"]],
+                    )
+                    self.assertEqual(
+                        item["semantic_occurrence_id"],
+                        occurrences[item["node_ref"]],
                     )
 
     def test_load_fixture_rejects_label_or_script_fields_nested_in_trace_facts(self):
@@ -514,7 +527,7 @@ class RecursiveFixtureTest(unittest.TestCase):
                             }
                         ],
                         "human_labels": {
-                            "schema_version": "recursive-attribution-labels/v2",
+                            "schema_version": "recursive-attribution-labels/v3",
                             "case_id": "leaky",
                             "roots": [],
                             "conditions": [],
@@ -606,6 +619,7 @@ class RecursiveFixtureTest(unittest.TestCase):
                 for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
                     for item in human_labels[role]:
                         self.assertNotIn(item["semantic_anchor_id"], request_text)
+                        self.assertNotIn(item["semantic_occurrence_id"], request_text)
                 if name == "success_negative_control.json":
                     self.assertEqual(report["analysis_outcome"], "no_defect")
                     self.assertEqual(report["confirmed_roots"], [])

@@ -10,12 +10,12 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v2",
+    "schema_version": "recursive-attribution-labels/v3",
     "case_id": "context-compaction-loss",
-    "roots": [{"node_ref": "record:compaction", "semantic_anchor_id": "semantic_anchor:v2:4c07ef89ce83b36118ef629c"}],
+    "roots": [{"node_ref": "record:compaction", "semantic_anchor_id": "semantic_anchor:v2:4c07ef89ce83b36118ef629c", "semantic_occurrence_id": "semantic_occurrence:v1:c3c3f6e7eef0a9a9293ca385"}],
     "conditions": [],
     "amplifiers": [],
-    "forbidden_roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:838d11eaa8c4c08ea6f76975"}],
+    "forbidden_roots": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:838d11eaa8c4c08ea6f76975", "semantic_occurrence_id": "semantic_occurrence:v1:7af0ecb597c4004f33fd2998"}],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]
   },
   "scripted_analysis": {
