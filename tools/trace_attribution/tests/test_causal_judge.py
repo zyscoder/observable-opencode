@@ -354,6 +354,24 @@ class RootConfirmationValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "grounded excerpt"):
             validate_recursive_confirmation(payload, request=sample_confirmation_request())
 
+    def test_confirmation_excerpt_cannot_come_from_nested_provenance_metadata(self):
+        payload = valid_confirmation_payload()
+        payload["excerpt"] = "Provenance-only explanation."
+        payload["evidence_refs"] = ["record:decision"]
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "content": "A different candidate-local semantic statement.",
+            "inference_metadata": {
+                "description": "Provenance-only explanation.",
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "grounded excerpt"):
+            validate_recursive_confirmation(
+                payload,
+                request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+            )
+
     def test_unresolved_candidate_cannot_be_confirmed(self):
         unresolved = sample_confirmation_request(
             candidate_reference=reference_envelope("record:decision", status="unresolved")
@@ -659,6 +677,24 @@ class RootConfirmationValidationTest(unittest.TestCase):
             valid_confirmation_payload(),
             request=sample_confirmation_request(candidate_reference=semantic_inferred),
         )
+        candidate_fact = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "edge_metadata": {
+                "provenance_class": "recorded",
+                "relation": "semantic_dependency",
+            },
+        }
+        validate_recursive_confirmation(
+            valid_confirmation_payload(),
+            request=sample_confirmation_request(supporting_evidence=(
+                candidate_fact,
+                {
+                    **reference_envelope("record:evidence"),
+                    "content": "The call site was present.",
+                },
+            )),
+        )
         invalid_envelopes = (
             reference_envelope("record:decision", provenance="fabricated"),
             reference_envelope("record:decision", provenance="Recorded"),
@@ -682,6 +718,155 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 validate_recursive_confirmation(
                     valid_confirmation_payload(),
                     request=sample_confirmation_request(candidate_reference=envelope),
+                )
+
+    def test_recursive_fact_tree_blocks_status_gap_provider_and_budget_states(self):
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        blocking_values = (
+            ("semantic status", {"status": "unknown"}, "unknown"),
+            ("missing evidence", {"missing_evidence": ["record:missing"]}, "missing_evidence"),
+            ("provider error", {"provider_error": "transport failed"}, "provider_error"),
+            ("budget exhausted", {"judge_budget_exhausted": True}, "budget_exhausted"),
+        )
+        for label, nested, error in blocking_values:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                "nested_analysis": nested,
+            }
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, error):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_recursive_blockers_apply_to_candidate_path_opposition_and_competition(self):
+        gap = {"nested_analysis": {"missing_evidence": ["record:missing"]}}
+        requests = (
+            sample_confirmation_request(
+                candidate_reference={**reference_envelope("record:decision"), **gap}
+            ),
+            sample_confirmation_request(
+                path_references=(
+                    reference_envelope("record:decision"),
+                    {**reference_envelope("record:change"), **gap},
+                )
+            ),
+            sample_confirmation_request(
+                opposing_evidence=(
+                    {**reference_envelope("record:opposition"), **gap},
+                )
+            ),
+            sample_confirmation_request(
+                competing_hypotheses=(
+                    {
+                        "hypothesis_id": "hyp_blocked",
+                        "status": "rejected",
+                        "candidate_reference": reference_envelope("record:alternative"),
+                        **gap,
+                    },
+                )
+            ),
+        )
+        for request in requests:
+            with self.subTest(request=request.to_dict()), self.assertRaisesRegex(
+                ValueError, "missing_evidence"
+            ):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(), request=request
+                )
+
+    def test_recursive_fact_tree_rejects_nested_fabricated_provenance_and_unresolved_envelope(self):
+        nested_values = (
+            (
+                {"edge": {"provenance_class": "fabricated"}},
+                "provenance_class",
+            ),
+            (
+                {
+                    "edge": {
+                        **reference_envelope("record:hidden", status="unresolved"),
+                        "content": "A hidden unresolved alternative.",
+                    }
+                },
+                "unresolved",
+            ),
+        )
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        for nested, error in nested_values:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                **nested,
+            }
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_temporal_order_and_nested_temporal_edge_are_confirmation_ineligible(self):
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = ["record:decision"]
+        temporal_values = (
+            {"evidence_type": "temporal_order"},
+            {
+                "edge": {
+                    **reference_envelope("record:edge"),
+                    "relation": "temporal_predecessor",
+                }
+            },
+        )
+        for temporal in temporal_values:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+                **temporal,
+            }
+            with self.subTest(temporal=temporal), self.assertRaisesRegex(
+                ValueError, "temporal"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(supporting_evidence=(candidate_fact,)),
+                )
+
+    def test_rejected_envelope_parent_cannot_hide_nested_unresolved_reference(self):
+        hypothesis = {
+            **reference_envelope("record:alternative"),
+            "status": "rejected",
+            "nested_evidence": {
+                "reference": reference_envelope(
+                    "record:hidden-alternative", status="unresolved"
+                )
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            validate_recursive_confirmation(
+                valid_confirmation_payload(),
+                request=sample_confirmation_request(competing_hypotheses=(hypothesis,)),
+            )
+
+    def test_rejected_hypothesis_cannot_hide_exact_bare_ref_or_refs(self):
+        for field, value in (
+            ("ref", "record:bare-alternative"),
+            ("refs", ["record:bare-evidence"]),
+        ):
+            hypothesis = {
+                "hypothesis_id": "hyp_bare",
+                "status": "rejected",
+                "candidate_reference": reference_envelope("record:alternative"),
+                field: value,
+            }
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "bare|unregistered|unresolved"
+            ):
+                validate_recursive_confirmation(
+                    valid_confirmation_payload(),
+                    request=sample_confirmation_request(competing_hypotheses=(hypothesis,)),
                 )
 
     def test_v3_counterfactual_all_status_combinations(self):
@@ -771,6 +956,15 @@ class CausalJudgePromptTest(unittest.TestCase):
             for phrase in required:
                 with self.subTest(phrase=phrase):
                     self.assertIn(phrase, prompt)
+        confirmation_prompt = prompts[1]
+        for phrase in (
+            "every nested mapping and list",
+            "provider_error",
+            "budget_exhausted",
+            "reference-bearing key",
+        ):
+            with self.subTest(confirmation_phrase=phrase):
+                self.assertIn(phrase, confirmation_prompt)
         self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v3")
 
 
@@ -990,9 +1184,15 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             "decisive": True,
             "content": "Implement only the explicitly listed methods.",
         }
+        nested_provider_error = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "nested_analysis": {"provider_error": "evidence provider failed"},
+        }
         for request in (
             sample_confirmation_request(opposing_evidence=(unresolved_opposition,)),
             sample_confirmation_request(supporting_evidence=(missing_artifact,)),
+            sample_confirmation_request(supporting_evidence=(nested_provider_error,)),
         ):
             with self.subTest(request=request.to_dict()):
                 transport = ScriptedTransport(

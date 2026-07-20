@@ -242,6 +242,8 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 "Cite only refs whose explicit reference envelope is resolved.",
                 "Unresolved opposing evidence, ambiguous path references, and missing or truncated decisive candidate evidence require unknown and can never confirm a root.",
                 "Walk nested artifact containers recursively. Artifact content is usable only through a resolved artifact reference envelope or a validated Task 2 hydration manifest; missing, truncated, unresolved, envelope-less, or contradictory artifacts require unknown.",
+                "Inspect every nested mapping and list without stopping at a valid parent envelope; every reference-bearing key must resolve through a complete offered envelope or validated hydration manifest.",
+                "Any nested unknown, unresolved, missing, truncated, provider_error, provider_unavailable, provider circuit, missing_evidence, unresolved reference, or true *_budget_exhausted state requires unknown.",
                 "Only provenance_class=recorded|reconstructed|inferred is valid. Inferred provenance requires auditable non-temporal inference metadata, and temporal-only evidence can never confirm a root.",
                 "Every competing hypothesis must have resolved reference envelopes; only explicitly rejected or superseded alternatives are closed, while active, supported, unresolved, or status-less alternatives require unknown.",
                 "candidate_introduction requires no viable defective predecessor.",
@@ -469,127 +471,13 @@ def causal_step_from_payload(
     return validate_causal_step_payload(value, request=request)
 
 
-def _validate_reference_envelope(
-    value: Any, *, field_name: str
-) -> Tuple[str, str]:
-    if not isinstance(value, Mapping):
-        raise ValueError("{0} must be an explicit reference envelope".format(field_name))
-    for key in ("resolved_ref", "resolution_status", "provenance_class"):
-        if key not in value or (
-            key != "resolved_ref" and not str(value.get(key) or "").strip()
-        ):
-            raise ValueError(
-                "{0} reference envelope requires {1}".format(field_name, key)
-            )
-    resolved_ref = str(value.get("resolved_ref") or "").strip()
-    status = str(value.get("resolution_status") or "").strip().lower()
-    provenance = str(value.get("provenance_class") or "").strip()
-    if provenance not in {"recorded", "reconstructed", "inferred"}:
-        raise ValueError(
-            "{0} provenance_class must be recorded, reconstructed, or inferred".format(
-                field_name
-            )
-        )
-    if (status == "resolved" and not resolved_ref) or (
-        status != "resolved" and resolved_ref
-    ):
-        raise ValueError("{0} has contradictory envelope fields".format(field_name))
-    inference = value.get("inference_metadata")
-    inference = inference if isinstance(inference, Mapping) else value
-    evidence_type = str(inference.get("evidence_type") or "").strip().lower()
-    inference_method = str(inference.get("inference_method") or "").strip().lower()
-    edge_origin = str(inference.get("edge_origin") or "").strip().lower()
-    relation = str(inference.get("relation") or "").strip().lower()
-    temporal_values = (evidence_type, inference_method, edge_origin, relation)
-    if evidence_type in {"temporal_inferred", "temporal_only", "temporal_advisory"} or any(
-        "temporal" in item for item in temporal_values[1:]
-    ):
-        raise ValueError(
-            "{0} temporal-only evidence is not confirmation-eligible".format(field_name)
-        )
-    if provenance == "inferred":
-        if not inference_method or not evidence_type:
-            raise ValueError(
-                "{0} inferred provenance requires auditable inference metadata".format(
-                    field_name
-                )
-            )
-        if "inferred" not in evidence_type:
-            raise ValueError("{0} has contradictory inferred provenance".format(field_name))
-    elif "inferred" in evidence_type:
-        raise ValueError(
-            "{0} has contradictory provenance and evidence_type".format(field_name)
-        )
-    return resolved_ref, status
-
-
-def _fact_is_candidate_local(value: Mapping[str, Any], candidate_ref: str) -> bool:
-    if str(value.get("resolved_ref") or "") == candidate_ref:
-        return True
-    owner = value.get("owner_reference")
-    return (
-        isinstance(owner, Mapping)
-        and str(owner.get("resolved_ref") or "") == candidate_ref
-        and str(owner.get("resolution_status") or "").lower() == "resolved"
-    )
-
-
-def _fact_gap(value: Mapping[str, Any]) -> str:
-    status = str(value.get("resolution_status") or "").strip().lower()
-    if status and status != "resolved":
-        return status
-    raw_artifact_status = value.get("artifact_status")
-    if isinstance(raw_artifact_status, Mapping):
-        if raw_artifact_status.get("available") is False or raw_artifact_status.get("missing"):
-            return "missing"
-        if raw_artifact_status.get("truncated"):
-            return "truncated"
-        if raw_artifact_status.get("resolved") is False:
-            return "unresolved"
-    else:
-        artifact_status = str(raw_artifact_status or "").strip().lower()
-        if artifact_status in {"missing", "truncated", "unresolved", "ambiguous"}:
-            return artifact_status
-    for key, label in (
-        ("missing", "missing"),
-        ("truncated", "truncated"),
-        ("trace_artifact_truncated", "truncated"),
-        ("prompt_excerpt_truncated", "truncated"),
-    ):
-        if value.get(key):
-            return label
-    hydration = value.get("artifact_hydration")
-    if isinstance(hydration, Mapping):
-        if hydration.get("missing_artifact_ids"):
-            return "missing"
-        if hydration.get("truncated_artifact_ids"):
-            return "truncated"
-    return ""
-
-
-_REFERENCE_METADATA_KEYS = {
-    "artifact_id",
-    "artifact_status",
-    "decisive",
-    "fact_kind",
-    "evidence_type",
-    "inference_metadata",
-    "inference_method",
-    "edge_origin",
-    "hash",
-    "missing",
-    "owner_reference",
-    "provenance_class",
+_ENVELOPE_KEYS = {
     "raw_ref",
-    "ref",
-    "reference_kind",
-    "relation",
     "resolved_ref",
     "resolution_status",
-    "trace_artifact_truncated",
-    "truncated",
-    "prompt_excerpt_truncated",
+    "provenance_class",
 }
+_ENVELOPE_SHAPE_KEYS = {"raw_ref", "resolved_ref", "resolution_status"}
 _TASK2_MANIFEST_KEYS = {
     "node_ref",
     "referenced_artifact_ids",
@@ -597,361 +485,663 @@ _TASK2_MANIFEST_KEYS = {
     "missing_artifact_ids",
     "truncated_artifact_ids",
 }
+_ALLOWED_PROVENANCE = {"recorded", "reconstructed", "inferred"}
+_ALLOWED_RESOLUTION = {
+    "resolved",
+    "unresolved",
+    "ambiguous",
+    "missing",
+    "truncated",
+    "unknown",
+}
+_BLOCKING_STATUS_VALUES = {
+    "unknown",
+    "unresolved",
+    "ambiguous",
+    "missing",
+    "truncated",
+    "provider_error",
+    "provider_unavailable",
+}
+_PROVENANCE_FIELDS = {
+    "evidence_type",
+    "provenance_class",
+    "relation",
+    "inference_method",
+    "edge_origin",
+}
+_SEMANTIC_TEXT_FIELDS = {
+    "actual",
+    "body",
+    "content",
+    "description",
+    "excerpt",
+    "expected",
+    "mechanism",
+    "rationale",
+    "reason",
+    "summary",
+    "text",
+    "title",
+}
 
 
-def _semantic_fragments(value: Any, *, skip_artifacts: bool = True) -> List[str]:
-    fragments: List[str] = []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Mapping):
-        if skip_artifacts and (
-            _looks_like_artifact(value) or _TASK2_MANIFEST_KEYS.issubset(value)
-        ):
-            return fragments
-        for key, child in value.items():
-            normalized = str(key).strip().lower()
-            if (
-                normalized in _REFERENCE_METADATA_KEYS
-                or normalized.endswith("_ref")
-                or normalized.endswith("_refs")
-                or normalized.endswith("_reference")
-                or normalized.endswith("_references")
-                or (skip_artifacts and "artifact" in normalized)
-            ):
-                continue
-            fragments.extend(_semantic_fragments(child, skip_artifacts=skip_artifacts))
-    elif isinstance(value, (list, tuple)):
-        for child in value:
-            fragments.extend(_semantic_fragments(child, skip_artifacts=skip_artifacts))
-    return fragments
-
-
-def _artifact_semantic_fragments(value: Mapping[str, Any]) -> List[str]:
-    fragments: List[str] = []
-    for key in ("content", "excerpt", "text", "body", "summary"):
-        if key in value:
-            fragments.extend(_semantic_fragments(value[key], skip_artifacts=False))
-    return fragments
-
-
-def _artifact_id(value: Any) -> str:
+def _normalized_artifact_id(value: Any) -> str:
     return str(value or "").strip().removeprefix("artifact:")
 
 
-def _string_id_set(value: Any, *, field_name: str) -> Set[str]:
-    if not isinstance(value, (list, tuple)) or any(
-        not isinstance(item, str) for item in value
-    ):
-        raise ValueError("{0} must be a list of artifact ids".format(field_name))
-    normalized = [_artifact_id(item) for item in value]
-    if any(not item for item in normalized) or len(normalized) != len(set(normalized)):
-        raise ValueError("{0} contains empty or duplicate artifact ids".format(field_name))
-    return set(normalized)
+def _nonempty(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple, set)):
+        return bool(value)
+    return bool(value)
 
 
-def _looks_like_artifact(value: Mapping[str, Any]) -> bool:
+def _is_provenance_field(key: str) -> bool:
     return (
-        "artifact_id" in value
-        or str(value.get("reference_kind") or "").strip().lower() == "artifact"
-        or "artifact_status" in value
+        key in _PROVENANCE_FIELDS
+        or key in {"method", "origin", "source"}
+        or "provenance" in key
+        or key.startswith("inference_")
+        or key.endswith("_origin")
+        or key.endswith("_method")
+        or key.endswith("_source")
     )
 
 
-def _validate_task2_hydration_manifest(
-    value: Mapping[str, Any],
-    *,
-    field_name: str,
-    candidate_ref: str,
-    candidate_local: bool,
-) -> List[str]:
-    missing_keys = _TASK2_MANIFEST_KEYS - set(value)
-    if missing_keys:
-        raise ValueError(
-            "{0} Task 2 hydration manifest is missing {1}".format(
-                field_name, ", ".join(sorted(missing_keys))
-            )
-        )
-    node_ref = str(value.get("node_ref") or "").strip()
-    if not node_ref or (candidate_local and node_ref != candidate_ref):
-        raise ValueError(
-            "{0} Task 2 hydration manifest has contradictory node_ref".format(field_name)
-        )
-    referenced = _string_id_set(
-        value.get("referenced_artifact_ids"),
-        field_name="{0}.referenced_artifact_ids".format(field_name),
-    )
-    missing = _string_id_set(
-        value.get("missing_artifact_ids"),
-        field_name="{0}.missing_artifact_ids".format(field_name),
-    )
-    truncated = _string_id_set(
-        value.get("truncated_artifact_ids"),
-        field_name="{0}.truncated_artifact_ids".format(field_name),
-    )
-    hydrated_value = value.get("hydrated_artifacts")
-    if not isinstance(hydrated_value, (list, tuple)) or any(
-        not isinstance(item, Mapping) for item in hydrated_value
-    ):
-        raise ValueError("{0}.hydrated_artifacts must be a list of objects".format(field_name))
-    hydrated: Set[str] = set()
-    fragments: List[str] = []
-    for index, artifact in enumerate(hydrated_value):
-        artifact_name = "{0}.hydrated_artifacts[{1}]".format(field_name, index)
-        artifact_id = _artifact_id(artifact.get("artifact_id"))
-        if not artifact_id or artifact_id in hydrated:
-            raise ValueError("{0} has an empty or duplicate artifact_id".format(artifact_name))
-        hydrated.add(artifact_id)
-        if artifact_id not in referenced:
-            raise ValueError("{0} is not listed in referenced_artifact_ids".format(artifact_name))
-        if any(
-            key in artifact
-            for key in ("resolved_ref", "resolution_status", "provenance_class")
-        ):
-            artifact_ref, artifact_resolution = _validate_reference_envelope(
-                artifact, field_name="{0} optional reference envelope".format(artifact_name)
-            )
-            if (
-                artifact_resolution != "resolved"
-                or _artifact_id(artifact_ref) != artifact_id
-            ):
-                raise ValueError(
-                    "{0} has contradictory artifact envelope fields".format(artifact_name)
-                )
-        gap = _fact_gap(artifact)
-        if gap:
-            raise ValueError("{0} artifact is {1}".format(artifact_name, gap))
-        if artifact_id in missing:
-            raise ValueError("{0} artifact is both hydrated and missing".format(artifact_name))
-        if bool(artifact.get("truncated")) != (artifact_id in truncated):
-            raise ValueError("{0} has contradictory truncation fields".format(artifact_name))
-        if artifact_id in truncated:
-            raise ValueError("{0} artifact is truncated".format(artifact_name))
-        if candidate_local:
-            fragments.extend(_artifact_semantic_fragments(artifact))
-        fragments.extend(
-            _validate_artifact_tree(
-                artifact,
-                field_name=artifact_name,
-                candidate_ref=candidate_ref,
-                candidate_local=candidate_local,
-                inspect_self=False,
-                trusted_manifest_item=True,
-            )
-        )
-    if not missing.issubset(referenced) or not truncated.issubset(referenced):
-        raise ValueError(
-            "{0} has artifact ids absent from referenced_artifact_ids".format(field_name)
-        )
-    if referenced != hydrated | missing:
-        raise ValueError("{0} does not account for every referenced artifact".format(field_name))
-    if missing:
-        raise ValueError("{0} contains missing artifacts".format(field_name))
-    return fragments
-
-
-def _validate_artifact_tree(
-    value: Any,
-    *,
-    field_name: str,
-    candidate_ref: str,
-    candidate_local: bool,
-    inspect_self: bool = False,
-    trusted_manifest_item: bool = False,
-) -> List[str]:
-    fragments: List[str] = []
-    if isinstance(value, (list, tuple)):
-        for index, child in enumerate(value):
-            fragments.extend(
-                _validate_artifact_tree(
-                    child,
-                    field_name="{0}[{1}]".format(field_name, index),
-                    candidate_ref=candidate_ref,
-                    candidate_local=candidate_local,
-                    inspect_self=inspect_self,
-                    trusted_manifest_item=trusted_manifest_item,
-                )
-            )
-        return fragments
-    if not isinstance(value, Mapping):
-        return fragments
-    if not trusted_manifest_item and (inspect_self or _looks_like_artifact(value)):
-        artifact_ref, artifact_status = _validate_reference_envelope(
-            value, field_name="{0} artifact reference envelope".format(field_name)
-        )
-        owner = value.get("owner_reference")
-        local = candidate_local or _fact_is_candidate_local(value, candidate_ref)
-        if owner is not None:
-            owner_ref, owner_status = _validate_reference_envelope(
-                owner, field_name="{0} artifact owner reference envelope".format(field_name)
-            )
-            if owner_status != "resolved":
-                raise ValueError("{0} artifact owner is unresolved".format(field_name))
-            if candidate_local and owner_ref != candidate_ref:
-                raise ValueError("{0} artifact has a contradictory owner".format(field_name))
-            local = local or owner_ref == candidate_ref
-        artifact_id = _artifact_id(value.get("artifact_id"))
-        if artifact_id and _artifact_id(artifact_ref) != artifact_id:
-            raise ValueError("{0} artifact id contradicts resolved_ref".format(field_name))
-        gap = _fact_gap(value)
-        if artifact_status != "resolved" or gap:
-            raise ValueError(
-                "{0} artifact is {1}: {2}".format(
-                    field_name, gap or artifact_status, artifact_ref
-                )
-            )
-        if local:
-            fragments.extend(_artifact_semantic_fragments(value))
-    for key, child in value.items():
-        normalized = str(key).strip().lower()
-        child_name = "{0}.{1}".format(field_name, key)
-        if normalized == "artifact_hydration":
-            if not isinstance(child, Mapping):
-                raise ValueError("{0} must be a Task 2 hydration manifest".format(child_name))
-            fragments.extend(
-                _validate_task2_hydration_manifest(
-                    child,
-                    field_name=child_name,
-                    candidate_ref=candidate_ref,
-                    candidate_local=candidate_local,
-                )
-            )
-            continue
-        artifact_container = "artifact" in normalized and normalized not in {
+def _is_reference_key(key: str) -> bool:
+    return (
+        key in {
+            "ref",
+            "refs",
+            "node_id",
+            "node_ids",
+            "edge_id",
+            "edge_ids",
             "artifact_id",
-            "artifact_status",
+            "artifact_ids",
             "referenced_artifact_ids",
             "missing_artifact_ids",
             "truncated_artifact_ids",
         }
-        fragments.extend(
-            _validate_artifact_tree(
-                child,
-                field_name=child_name,
-                candidate_ref=candidate_ref,
-                candidate_local=candidate_local,
-                inspect_self=artifact_container,
-            )
-        )
-    return fragments
+        or key.endswith("_ref")
+        or key.endswith("_refs")
+    ) and key not in {"raw_ref", "resolved_ref"}
 
 
-def _validate_competing_hypotheses(request: RootConfirmationRequest) -> None:
-    def validate_references(value: Any, field_name: str) -> None:
-        if isinstance(value, Mapping):
-            if any(
-                key in value
-                for key in ("resolved_ref", "resolution_status", "provenance_class")
-            ):
-                _, resolution = _validate_reference_envelope(value, field_name=field_name)
-                if resolution != "resolved":
-                    raise ValueError("{0} is unresolved".format(field_name))
-                return
-            for key, child in value.items():
-                normalized = str(key).strip().lower()
-                child_name = "{0}.{1}".format(field_name, key)
-                if normalized.endswith("_reference"):
-                    if not isinstance(child, Mapping):
-                        raise ValueError("{0} must be a reference envelope".format(child_name))
-                elif normalized.endswith("_references"):
-                    if not isinstance(child, (list, tuple)) or any(
-                        not isinstance(item, Mapping) for item in child
-                    ):
-                        raise ValueError("{0} must contain reference envelopes".format(child_name))
-                elif normalized.endswith("_ref") or normalized.endswith("_refs"):
-                    if normalized not in {"node_ref"}:
-                        raise ValueError("{0} is a bare reference".format(child_name))
-                validate_references(child, child_name)
-        elif isinstance(value, (list, tuple)):
-            for index, child in enumerate(value):
-                validate_references(child, "{0}[{1}]".format(field_name, index))
-
-    for index, hypothesis in enumerate(request.competing_hypotheses):
-        field_name = "competing hypothesis[{0}]".format(index)
-        status = str(hypothesis.get("status") or "").strip().lower()
-        if status not in {"rejected", "superseded"}:
-            raise ValueError(
-                "{0} must be explicitly rejected or superseded, not {1}".format(
-                    field_name, status or "missing status"
-                )
-            )
-        try:
-            validate_references(hypothesis, field_name)
-        except ValueError as exc:
-            raise ValueError("{0} has invalid references: {1}".format(field_name, exc)) from exc
-
-
-def _validate_confirmation_request(request: RootConfirmationRequest) -> str:
-    candidate_resolved, candidate_status = _validate_reference_envelope(
-        request.candidate_reference,
-        field_name="candidate reference envelope",
+def _is_reference_container_key(key: str) -> bool:
+    return (
+        key in {"reference", "references"}
+        or key.endswith("_reference")
+        or key.endswith("_references")
     )
-    if candidate_status != "resolved" or candidate_resolved != request.candidate_ref:
-        raise ValueError(
-            "unresolved candidate is not explicitly resolved by its candidate reference envelope"
+
+
+def _is_semantic_metadata_key(key: str) -> bool:
+    return (
+        key in {
+            "artifact_status",
+            "confidence",
+            "decisive",
+            "fact_kind",
+            "hash",
+            "inference_metadata",
+            "kind",
+            "label",
+            "missing",
+            "owner_reference",
+            "path",
+            "reference_kind",
+            "status",
+            "timestamp",
+            "truncated",
+        }
+        or key in _ENVELOPE_KEYS
+        or _is_provenance_field(key)
+        or _is_reference_key(key)
+        or _is_reference_container_key(key)
+        or key.endswith("_status")
+        or key.endswith("_budget_exhausted")
+        or key.startswith("missing_")
+        or key.startswith("unresolved_")
+        or key.startswith("truncated_")
+        or key.startswith("provider_")
+    )
+
+
+def _looks_like_artifact_fact(value: Mapping[str, Any], parent_key: str) -> bool:
+    if parent_key == "artifact_status":
+        return False
+    return (
+        "artifact_id" in value
+        or str(value.get("reference_kind") or "").strip().lower() == "artifact"
+        or parent_key in {"artifact", "artifacts", "hydrated_artifact", "hydrated_artifacts"}
+    )
+
+
+@dataclass(frozen=True)
+class _ConfirmationFactTreeResult:
+    grounded_refs: Set[str]
+    candidate_semantic_corpus: str
+
+
+class _ConfirmationFactTreeValidator:
+    """Validate every confirmation fact twice before exposing grounded semantics."""
+
+    def __init__(self, request: RootConfirmationRequest) -> None:
+        self.request = request
+        self.errors: List[str] = []
+        self.grounded_refs: Set[str] = set()
+        self.resolved_envelopes: Dict[int, str] = {}
+        self.validated_manifests: Set[int] = set()
+        self.hydrated_artifact_nodes: Set[int] = set()
+        self.hydrated_artifact_refs: Set[str] = set()
+        self.roots = (
+            ("candidate_reference", request.candidate_reference),
+            ("recursive_path_references", request.recursive_path_references),
+            ("supporting_evidence", request.supporting_evidence),
+            ("opposing_evidence", request.opposing_evidence),
+            ("competing hypothesis", request.competing_hypotheses),
         )
-    if len(request.recursive_path_references) != len(request.recursive_path):
-        raise ValueError("every navigation path ref requires a path reference envelope")
-    for index, (navigation_ref, reference) in enumerate(
-        zip(request.recursive_path, request.recursive_path_references)
-    ):
-        resolved_ref, status = _validate_reference_envelope(
-            reference,
-            field_name="path reference envelope[{0}]".format(index),
-        )
-        if status != "resolved" or resolved_ref != navigation_ref:
+
+    def validate(self) -> _ConfirmationFactTreeResult:
+        for path, value in self.roots:
+            self._pass_one(value, path=path, parent_key="")
+        self._validate_required_roots()
+        for path, value in self.roots:
+            self._pass_two(value, path=path, parent_key="", candidate_local=False)
+        self._validate_competing_hypotheses()
+        if self.errors:
+            unique_errors = list(dict.fromkeys(self.errors))
             raise ValueError(
-                "path reference envelope[{0}] is unresolved or ambiguous".format(index)
-            )
-    candidate_fragments: List[str] = []
-    for evidence_class, facts in (
-        ("supporting evidence", request.supporting_evidence),
-        ("opposing evidence", request.opposing_evidence),
-    ):
-        for index, fact in enumerate(facts):
-            resolved_ref, status = _validate_reference_envelope(
-                fact,
-                field_name="{0}[{1}]".format(evidence_class, index),
-            )
-            owner = fact.get("owner_reference")
-            if owner is not None:
-                _validate_reference_envelope(
-                    owner,
-                    field_name="{0}[{1}].owner_reference".format(evidence_class, index),
+                "confirmation fact tree is ineligible: {0}".format(
+                    "; ".join(unique_errors)
                 )
-            candidate_local = _fact_is_candidate_local(fact, request.candidate_ref)
-            gap = _fact_gap(fact)
-            if evidence_class == "opposing evidence" and status != "resolved":
-                raise ValueError("unresolved opposing evidence can invalidate root confirmation")
-            if (candidate_local or bool(fact.get("decisive"))) and gap:
-                raise ValueError(
-                    "decisive candidate evidence or artifact is {0}: {1}".format(
-                        gap, resolved_ref
+            )
+        fragments: List[str] = []
+        self._collect_candidate_semantics(
+            self.request.candidate_reference,
+            fragments=fragments,
+            parent_key="candidate_reference",
+            candidate_local=False,
+        )
+        self._collect_candidate_semantics(
+            self.request.supporting_evidence,
+            fragments=fragments,
+            parent_key="supporting_evidence",
+            candidate_local=False,
+        )
+        corpus = re.sub(r"\s+", " ", " ".join(fragments)).strip().lower()
+        return _ConfirmationFactTreeResult(set(self.grounded_refs), corpus)
+
+    def _error(self, path: str, message: str) -> None:
+        self.errors.append("{0}: {1}".format(path, message))
+
+    def _register_ref(self, value: Any) -> None:
+        ref = str(value or "").strip()
+        if not ref:
+            return
+        self.grounded_refs.add(ref)
+        if ref.startswith("artifact:"):
+            self.grounded_refs.add(ref.removeprefix("artifact:"))
+
+    def _envelope_errors(self, value: Mapping[str, Any]) -> List[str]:
+        errors: List[str] = []
+        missing = _ENVELOPE_KEYS - set(value)
+        if missing:
+            errors.append(
+                "reference envelope requires {0}".format(", ".join(sorted(missing)))
+            )
+            return errors
+        raw_ref = str(value.get("raw_ref") or "").strip()
+        resolved_ref = str(value.get("resolved_ref") or "").strip()
+        resolution = str(value.get("resolution_status") or "").strip().lower()
+        provenance = str(value.get("provenance_class") or "").strip()
+        if not raw_ref:
+            errors.append("reference envelope raw_ref must be non-empty")
+        if resolution not in _ALLOWED_RESOLUTION:
+            errors.append("reference envelope resolution_status is invalid")
+        if (resolution == "resolved") != bool(resolved_ref):
+            errors.append("reference envelope has contradictory raw_ref/resolved_ref fields")
+        if provenance not in _ALLOWED_PROVENANCE:
+            errors.append(
+                "provenance_class must be exactly recorded, reconstructed, or inferred"
+            )
+        errors.extend(self._inference_errors(value))
+        return errors
+
+    def _inference_errors(self, value: Mapping[str, Any]) -> List[str]:
+        provenance = str(value.get("provenance_class") or "").strip()
+        if provenance != "inferred":
+            return []
+        metadata = value.get("inference_metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else value
+        evidence_type = str(metadata.get("evidence_type") or "").strip().lower()
+        inference_method = str(metadata.get("inference_method") or "").strip().lower()
+        if not evidence_type or not inference_method:
+            return ["inferred provenance requires auditable inference metadata"]
+        if "inferred" not in evidence_type:
+            return ["inferred provenance contradicts evidence_type"]
+        return []
+
+    def _temporal_errors(self, value: Mapping[str, Any]) -> List[str]:
+        errors: List[str] = []
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower()
+            if not _is_provenance_field(key) or not isinstance(child, str):
+                continue
+            normalized = child.strip().lower()
+            if normalized.startswith("temporal_") or "temporal" in normalized:
+                errors.append("temporal provenance field {0} is confirmation-ineligible".format(key))
+        return errors
+
+    def _pass_one(self, value: Any, *, path: str, parent_key: str) -> None:
+        if isinstance(value, Mapping):
+            envelope_shaped = bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+            provenance_errors: List[str] = []
+            if "provenance_class" in value:
+                provenance = str(value.get("provenance_class") or "").strip()
+                if provenance not in _ALLOWED_PROVENANCE:
+                    provenance_errors.append(
+                        "provenance_class must be exactly recorded, reconstructed, or inferred",
                     )
+                provenance_errors.extend(self._inference_errors(value))
+            temporal_errors = self._temporal_errors(value)
+            for error in provenance_errors + temporal_errors:
+                self._error(path, error)
+            if envelope_shaped:
+                envelope_errors = self._envelope_errors(value)
+                for error in envelope_errors:
+                    self._error(path, error)
+                if (
+                    not envelope_errors
+                    and not provenance_errors
+                    and not temporal_errors
+                    and value.get("resolution_status") == "resolved"
+                ):
+                    resolved_ref = str(value.get("resolved_ref") or "").strip()
+                    self.resolved_envelopes[id(value)] = resolved_ref
+                    self._register_ref(value.get("raw_ref"))
+                    self._register_ref(resolved_ref)
+            if parent_key == "artifact_hydration":
+                self._register_hydration_manifest(value, path=path)
+            for raw_key, child in value.items():
+                key = str(raw_key).strip().lower()
+                self._pass_one(child, path="{0}.{1}".format(path, raw_key), parent_key=key)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                self._pass_one(
+                    child,
+                    path="{0}[{1}]".format(path, index),
+                    parent_key=parent_key,
                 )
-            if candidate_local and status == "resolved" and not gap:
-                candidate_fragments.extend(_semantic_fragments(fact))
-            candidate_fragments.extend(
-                _validate_artifact_tree(
-                    fact,
-                    field_name="{0}[{1}]".format(evidence_class, index),
-                    candidate_ref=request.candidate_ref,
+
+    def _artifact_id_list(self, value: Any, *, path: str) -> Optional[Set[str]]:
+        if not isinstance(value, (list, tuple)) or any(
+            not isinstance(item, str) for item in value
+        ):
+            self._error(path, "must be a list of artifact ids")
+            return None
+        normalized = [_normalized_artifact_id(item) for item in value]
+        if any(not item for item in normalized) or len(normalized) != len(set(normalized)):
+            self._error(path, "contains empty or duplicate artifact ids")
+            return None
+        return set(normalized)
+
+    def _register_hydration_manifest(self, value: Mapping[str, Any], *, path: str) -> None:
+        missing_keys = _TASK2_MANIFEST_KEYS - set(value)
+        if missing_keys:
+            self._error(
+                path,
+                "Task 2 hydration manifest is missing {0}".format(
+                    ", ".join(sorted(missing_keys))
+                ),
+            )
+            return
+        referenced = self._artifact_id_list(
+            value.get("referenced_artifact_ids"),
+            path="{0}.referenced_artifact_ids".format(path),
+        )
+        missing = self._artifact_id_list(
+            value.get("missing_artifact_ids"),
+            path="{0}.missing_artifact_ids".format(path),
+        )
+        truncated = self._artifact_id_list(
+            value.get("truncated_artifact_ids"),
+            path="{0}.truncated_artifact_ids".format(path),
+        )
+        hydrated_value = value.get("hydrated_artifacts")
+        if not isinstance(hydrated_value, (list, tuple)) or any(
+            not isinstance(item, Mapping) for item in hydrated_value
+        ):
+            self._error(path, "hydrated_artifacts must be a list of objects")
+            return
+        if referenced is None or missing is None or truncated is None:
+            return
+        hydrated: Set[str] = set()
+        valid_items: List[Tuple[Mapping[str, Any], str]] = []
+        for index, artifact in enumerate(hydrated_value):
+            item_path = "{0}.hydrated_artifacts[{1}]".format(path, index)
+            artifact_id = _normalized_artifact_id(artifact.get("artifact_id"))
+            if not artifact_id or artifact_id in hydrated:
+                self._error(item_path, "has an empty or duplicate artifact_id")
+                continue
+            hydrated.add(artifact_id)
+            if artifact_id not in referenced:
+                self._error(item_path, "is not listed in referenced_artifact_ids")
+                continue
+            if artifact.get("missing") is True:
+                self._error(item_path, "artifact is missing")
+                continue
+            if bool(artifact.get("truncated")) != (artifact_id in truncated):
+                self._error(item_path, "has contradictory truncation fields")
+                continue
+            if artifact_id in missing or artifact_id in truncated:
+                self._error(item_path, "artifact is missing or truncated")
+                continue
+            if _ENVELOPE_SHAPE_KEYS.intersection(artifact) and self._envelope_errors(
+                artifact
+            ):
+                continue
+            valid_items.append((artifact, artifact_id))
+        if not missing.issubset(referenced) or not truncated.issubset(referenced):
+            self._error(path, "contains artifact ids absent from referenced_artifact_ids")
+        if referenced != hydrated | missing:
+            self._error(path, "does not account for every referenced artifact")
+        if missing or truncated or len(valid_items) != len(hydrated_value):
+            return
+        self.validated_manifests.add(id(value))
+        for artifact, artifact_id in valid_items:
+            self.hydrated_artifact_nodes.add(id(artifact))
+            self.hydrated_artifact_refs.add(artifact_id)
+            self._register_ref(artifact_id)
+            self._register_ref("artifact:{0}".format(artifact_id))
+
+    def _validate_required_roots(self) -> None:
+        candidate = self.resolved_envelopes.get(id(self.request.candidate_reference))
+        if candidate != self.request.candidate_ref:
+            self._error(
+                "candidate_reference",
+                "unresolved candidate requires a complete resolved candidate reference envelope",
+            )
+        if len(self.request.recursive_path_references) != len(self.request.recursive_path):
+            self._error(
+                "recursive_path_references",
+                "every navigation path ref requires a path reference envelope",
+            )
+        for index, navigation_ref in enumerate(self.request.recursive_path):
+            if index >= len(self.request.recursive_path_references):
+                continue
+            resolved = self.resolved_envelopes.get(
+                id(self.request.recursive_path_references[index])
+            )
+            if resolved != navigation_ref:
+                self._error(
+                    "recursive_path_references[{0}]".format(index),
+                    "path reference envelope is unresolved or ambiguous",
+                )
+        for label, facts in (
+            ("supporting_evidence", self.request.supporting_evidence),
+            ("opposing_evidence", self.request.opposing_evidence),
+        ):
+            for index, fact in enumerate(facts):
+                if id(fact) not in self.resolved_envelopes:
+                    if (
+                        label == "opposing_evidence"
+                        and str(fact.get("resolution_status") or "").lower()
+                        != "resolved"
+                    ):
+                        self._error(
+                            "{0}[{1}]".format(label, index),
+                            "unresolved opposing evidence can invalidate root confirmation",
+                        )
+                    self._error(
+                        "{0}[{1}]".format(label, index),
+                        "fact requires a complete resolved reference envelope",
+                    )
+
+    def _blocking_errors(self, value: Mapping[str, Any]) -> List[str]:
+        errors: List[str] = []
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower()
+            if (
+                key == "status"
+                or key.endswith("_status")
+                or key.endswith("_state")
+                or key.endswith("_outcome")
+                or key.endswith("_resolution")
+                or key in {
+                    "availability",
+                    "outcome",
+                    "resolution",
+                    "result",
+                    "state",
+                }
+            ) and isinstance(child, str):
+                status = child.strip().lower()
+                if status in _BLOCKING_STATUS_VALUES:
+                    errors.append("blocking {0}={1}".format(key, status))
+            if not _nonempty(child):
+                continue
+            if key in {
+                "missing_evidence",
+                "unresolved_refs",
+                "unresolved_references",
+                "missing_artifact_ids",
+                "truncated_artifact_ids",
+                "provider_error",
+                "provider_unavailable",
+                "provider_circuit_reason",
+                "blocking_reasons",
+                "evidence_gaps",
+                "gaps",
+                "missing",
+                "truncated",
+                "unresolved",
+            }:
+                errors.append("blocking {0}".format(key))
+            elif (
+                key.startswith("missing_")
+                or key.startswith("unresolved_")
+                or key.startswith("truncated_")
+            ) and isinstance(child, (Mapping, list, tuple, set, str)):
+                errors.append("blocking {0}".format(key))
+            elif key.endswith("_gaps") and isinstance(
+                child, (Mapping, list, tuple, set, str)
+            ):
+                errors.append("blocking {0}".format(key))
+            elif key.startswith("provider_") and any(
+                token in key for token in ("error", "unavailable", "circuit_reason")
+            ):
+                errors.append("blocking {0}".format(key))
+            elif isinstance(child, bool) and child and (
+                key
+                in {
+                    "budget_exhausted",
+                    "missing",
+                    "provider_circuit_open",
+                    "truncated",
+                }
+                or key.endswith("_missing")
+                or key.endswith("_truncated")
+                or key.endswith("_budget_exhausted")
+            ):
+                errors.append("blocking {0}".format(key))
+        return errors
+
+    def _reference_is_grounded(self, value: Any) -> bool:
+        ref = str(value or "").strip()
+        if not ref:
+            return False
+        if ref in self.grounded_refs:
+            return True
+        artifact_id = _normalized_artifact_id(ref)
+        return artifact_id in self.hydrated_artifact_refs
+
+    def _validate_reference_value(self, value: Any, *, path: str) -> None:
+        if isinstance(value, str):
+            if not self._reference_is_grounded(value):
+                self._error(path, "bare or unregistered ref is unresolved: {0}".format(value))
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                child_path = "{0}[{1}]".format(path, index)
+                if isinstance(child, Mapping):
+                    if not _ENVELOPE_SHAPE_KEYS.intersection(child):
+                        self._error(child_path, "reference entry requires an envelope")
+                elif not self._reference_is_grounded(child):
+                    self._error(
+                        child_path,
+                        "bare or unregistered ref is unresolved: {0}".format(child),
+                    )
+            return
+        if isinstance(value, Mapping):
+            if not _ENVELOPE_SHAPE_KEYS.intersection(value):
+                self._error(path, "reference value requires an envelope")
+            return
+        self._error(path, "reference value must be a grounded ref or envelope")
+
+    def _pass_two(
+        self,
+        value: Any,
+        *,
+        path: str,
+        parent_key: str,
+        candidate_local: bool,
+    ) -> None:
+        if isinstance(value, Mapping):
+            envelope_shaped = bool(_ENVELOPE_SHAPE_KEYS.intersection(value))
+            current_local = candidate_local
+            if envelope_shaped:
+                for error in self._envelope_errors(value):
+                    self._error(path, error)
+                resolved = self.resolved_envelopes.get(id(value))
+                if resolved:
+                    current_local = resolved == self.request.candidate_ref
+            owner = value.get("owner_reference")
+            if isinstance(owner, Mapping):
+                owner_ref = self.resolved_envelopes.get(id(owner))
+                if owner_ref == self.request.candidate_ref:
+                    current_local = True
+            for error in self._temporal_errors(value):
+                self._error(path, error)
+            for error in self._blocking_errors(value):
+                self._error(path, error)
+            artifact_fact = _looks_like_artifact_fact(value, parent_key)
+            hydrated_item = id(value) in self.hydrated_artifact_nodes
+            if artifact_fact and not hydrated_item and not envelope_shaped:
+                self._error(path, "artifact reference envelope is required")
+            if artifact_fact and envelope_shaped:
+                artifact_id = _normalized_artifact_id(value.get("artifact_id"))
+                resolved = self.resolved_envelopes.get(id(value), "")
+                if artifact_id and _normalized_artifact_id(resolved) != artifact_id:
+                    self._error(path, "artifact_id contradicts resolved_ref")
+                if candidate_local and isinstance(owner, Mapping):
+                    owner_ref = self.resolved_envelopes.get(id(owner))
+                    if owner_ref and owner_ref != self.request.candidate_ref:
+                        self._error(path, "candidate artifact has a contradictory owner")
+            for raw_key, child in value.items():
+                key = str(raw_key).strip().lower()
+                child_path = "{0}.{1}".format(path, raw_key)
+                if _is_reference_key(key):
+                    self._validate_reference_value(child, path=child_path)
+                if _is_reference_container_key(key):
+                    if isinstance(child, Mapping):
+                        if not _ENVELOPE_SHAPE_KEYS.intersection(child):
+                            self._error(child_path, "reference container requires an envelope")
+                    elif isinstance(child, (list, tuple)):
+                        if any(
+                            not isinstance(item, Mapping)
+                            or not _ENVELOPE_SHAPE_KEYS.intersection(item)
+                            for item in child
+                        ):
+                            self._error(
+                                child_path,
+                                "reference collection requires complete envelopes",
+                            )
+                    else:
+                        self._error(child_path, "bare reference requires an envelope")
+                self._pass_two(
+                    child,
+                    path=child_path,
+                    parent_key=key,
+                    candidate_local=current_local,
+                )
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                self._pass_two(
+                    child,
+                    path="{0}[{1}]".format(path, index),
+                    parent_key=parent_key,
                     candidate_local=candidate_local,
                 )
-            )
-    _validate_competing_hypotheses(request)
-    return re.sub(r"\s+", " ", " ".join(candidate_fragments)).strip().lower()
 
+    def _validate_competing_hypotheses(self) -> None:
+        for index, hypothesis in enumerate(self.request.competing_hypotheses):
+            path = "competing hypothesis[{0}]".format(index)
+            status = str(hypothesis.get("status") or "").strip().lower()
+            if status not in {"rejected", "superseded"}:
+                self._error(
+                    path,
+                    "must be explicitly rejected or superseded, not {0}".format(
+                        status or "missing status"
+                    ),
+                )
 
-def _confirmation_reference_sets(request: RootConfirmationRequest) -> Tuple[Set[str], Set[str]]:
-    facts = (
-        request.candidate_reference,
-        request.recursive_path_references,
-        request.supporting_evidence,
-        request.opposing_evidence,
-        request.competing_hypotheses,
-    )
-    grounded, unresolved = _reference_sets(facts)
-    return grounded - unresolved, unresolved
+    def _collect_candidate_semantics(
+        self,
+        value: Any,
+        *,
+        fragments: List[str],
+        parent_key: str,
+        candidate_local: bool,
+    ) -> None:
+        if isinstance(value, Mapping):
+            current_local = candidate_local
+            resolved = self.resolved_envelopes.get(id(value))
+            if resolved is not None:
+                current_local = resolved == self.request.candidate_ref
+            owner = value.get("owner_reference")
+            if isinstance(owner, Mapping):
+                current_local = (
+                    self.resolved_envelopes.get(id(owner)) == self.request.candidate_ref
+                )
+            if id(value) in self.validated_manifests:
+                current_local = (
+                    str(value.get("node_ref") or "") == self.request.candidate_ref
+                )
+            for raw_key, child in value.items():
+                key = str(raw_key).strip().lower()
+                if _is_semantic_metadata_key(key):
+                    continue
+                if current_local and isinstance(child, str) and (
+                    key in _SEMANTIC_TEXT_FIELDS
+                    or key.endswith("_content")
+                    or key.endswith("_excerpt")
+                    or key.endswith("_summary")
+                    or key.endswith("_rationale")
+                ):
+                    fragments.append(child)
+                self._collect_candidate_semantics(
+                    child,
+                    fragments=fragments,
+                    parent_key=key,
+                    candidate_local=current_local,
+                )
+            return
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                self._collect_candidate_semantics(
+                    child,
+                    fragments=fragments,
+                    parent_key=parent_key,
+                    candidate_local=candidate_local,
+                )
 
 
 def validate_recursive_confirmation(
@@ -968,11 +1158,10 @@ def validate_recursive_confirmation(
     if not reason:
         raise ValueError("root confirmation reason must be non-empty")
     confidence = _number(value.get("confidence"), "confidence")
-    candidate_semantic_corpus = _validate_confirmation_request(request)
-    grounded, _ = _confirmation_reference_sets(request)
+    fact_tree = _ConfirmationFactTreeValidator(request).validate()
     evidence_refs = _validate_evidence_refs(
         value.get("evidence_refs", []),
-        grounded_refs=grounded,
+        grounded_refs=fact_tree.grounded_refs,
         field_name="root confirmation evidence_refs",
     )
     excerpt = str(value.get("excerpt") or "").strip()
@@ -1023,7 +1212,10 @@ def validate_recursive_confirmation(
             raise ValueError("confirmed root requires grounded evidence refs")
         if not excerpt:
             raise ValueError("confirmed root requires a grounded excerpt")
-        if re.sub(r"\s+", " ", excerpt).strip().lower() not in candidate_semantic_corpus:
+        if (
+            re.sub(r"\s+", " ", excerpt).strip().lower()
+            not in fact_tree.candidate_semantic_corpus
+        ):
             raise ValueError("confirmed root requires a grounded excerpt from candidate facts")
     return RootConfirmation(
         candidate_ref=request.candidate_ref,
