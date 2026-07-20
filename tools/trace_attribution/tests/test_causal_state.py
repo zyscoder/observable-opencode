@@ -78,7 +78,178 @@ def confirmation_for(root):
     return RootConfirmation.from_dict(dict(root.confirmation))
 
 
+def factor_bundle(*, role="contributing_condition"):
+    node_ref = "record:context"
+    target_ref = "record:decision"
+    path = (node_ref, target_ref)
+    confirmation = replace(
+        RootConfirmation.rejected(
+            node_ref,
+            "The candidate is a causal factor but not a necessary root.",
+            evidence_refs=[node_ref, target_ref],
+            factor_role=role,
+        ),
+        hypothesis_id="hyp:factor",
+        hypothesis_semantic_hash="semantic:factor",
+        defect_fingerprint=sample_defect_state().fingerprint,
+        recursive_path=path,
+        factor_mechanism={
+            "mechanism_type": (
+                "amplification" if role == "amplifying_factor" else "enabling_condition"
+            ),
+            "source_ref": node_ref,
+            "target_ref": target_ref,
+            "effect": "The candidate changes the downstream defect conditions.",
+        },
+    )
+    factor = CausalFactor(
+        node_ref=node_ref,
+        relation=role,
+        reason=confirmation.reason,
+        confidence=0.7,
+        evidence_refs=confirmation.evidence_refs,
+        recursive_path=path,
+        factor_label=role,
+        confirmation_status="rejected",
+        confirmation=confirmation.to_dict(),
+        mechanism=dict(confirmation.factor_mechanism),
+    )
+    rejected = RejectedCandidate(
+        node_ref=node_ref,
+        reason=confirmation.reason,
+        evidence_refs=confirmation.evidence_refs,
+        hypothesis_id=confirmation.hypothesis_id,
+        recursive_path=path,
+        confirmation_status="rejected",
+        confirmation=confirmation.to_dict(),
+    )
+    return confirmation, factor, rejected
+
+
+def reciprocal_root_pair(*, identical_legacy_projection):
+    defect = sample_defect_state()
+    first_ref = "record:decision"
+    second_ref = first_ref if identical_legacy_projection else "record:context"
+    path = ("record:decision", "record:change")
+
+    def make_root(node_ref, hypothesis_id, semantic_hash):
+        return modern_root(
+            ConfirmedRoot(
+                node_ref=node_ref,
+                defect_state=defect,
+                reason="The decision stopped discovery.",
+                counterfactual="Continuing discovery prevents the defect.",
+                confidence=0.9,
+                component="agent",
+                event_type="decision",
+                defect_type=defect.label,
+                causal_role="defect_introduction",
+                episode_id="episode:decision",
+            ),
+            hypothesis_id=hypothesis_id,
+            semantic_hash=semantic_hash,
+        )
+
+    first = make_root(first_ref, "hyp:first", "semantic:first")
+    second = make_root(second_ref, "hyp:second", "semantic:second")
+    first_confirmation = confirmation_for(first)
+    second_confirmation = confirmation_for(second)
+
+    def comparison(target):
+        return {
+            "hypothesis_id": target.hypothesis_id,
+            "hypothesis_semantic_hash": target.hypothesis_semantic_hash,
+            "candidate_ref": target.candidate_ref,
+            "defect_fingerprint": target.defect_fingerprint,
+            "confirmation_identity": target.confirmation_identity,
+            "recursive_path": list(target.recursive_path),
+            "requires_independent_confirmation": True,
+            "status": "co_root",
+            "reason": "The independently confirmed causes are jointly necessary.",
+            "evidence_refs": [target.candidate_ref],
+        }
+
+    first_confirmation = replace(
+        first_confirmation,
+        competitor_comparisons=(comparison(second_confirmation),),
+    )
+    second_confirmation = replace(
+        second_confirmation,
+        competitor_comparisons=(comparison(first_confirmation),),
+    )
+    first = replace(first, confirmation=first_confirmation.to_dict())
+    second = replace(second, confirmation=second_confirmation.to_dict())
+    return first, second, first_confirmation, second_confirmation
+
+
 class CausalStateTest(unittest.TestCase):
+    def test_legacy_projection_deduplicates_identical_visible_roots(self):
+        first, second, first_confirmation, second_confirmation = reciprocal_root_pair(
+            identical_legacy_projection=True
+        )
+        report = RecursiveAttributionReport(
+            case_id="legacy-dedup",
+            objective="Find roots.",
+            confirmations=[first_confirmation, second_confirmation],
+            confirmed_roots=[first],
+            co_roots=[second],
+        )
+
+        payload = report.to_dict()
+        self.assertEqual(len(payload["confirmed_roots"]), 1)
+        self.assertEqual(len(payload["co_roots"]), 1)
+        self.assertEqual(payload["root_causes"], [first.to_legacy_root_cause()])
+
+    def test_legacy_projection_preserves_distinct_objects_primary_first(self):
+        first, second, first_confirmation, second_confirmation = reciprocal_root_pair(
+            identical_legacy_projection=False
+        )
+        report = RecursiveAttributionReport(
+            case_id="legacy-order",
+            objective="Find roots.",
+            confirmations=[first_confirmation, second_confirmation],
+            confirmed_roots=[first],
+            co_roots=[second],
+        )
+
+        self.assertEqual(
+            report.to_dict()["root_causes"],
+            [first.to_legacy_root_cause(), second.to_legacy_root_cause()],
+        )
+
+    def test_factor_identity_cannot_also_be_a_rejected_candidate(self):
+        confirmation, factor, rejected = factor_bundle()
+
+        with self.assertRaisesRegex(
+            ValueError, "factor.*rejected|role conflict|inconsistent confirmation role"
+        ):
+            RecursiveAttributionReport(
+                case_id="factor-overlap",
+                objective="Find roots.",
+                confirmations=[confirmation],
+                contributing_conditions=[factor],
+                rejected_candidates=[rejected],
+            )
+
+    def test_factor_without_confirmed_root_remains_inconclusive(self):
+        for role in ("contributing_condition", "amplifying_factor"):
+            with self.subTest(role=role):
+                confirmation, factor, _ = factor_bundle(role=role)
+                report = RecursiveAttributionReport(
+                    case_id="factor-only",
+                    objective="Find roots.",
+                    confirmations=[confirmation],
+                    contributing_conditions=(
+                        [factor] if role == "contributing_condition" else []
+                    ),
+                    amplifying_factors=(
+                        [factor] if role == "amplifying_factor" else []
+                    ),
+                )
+
+                self.assertEqual(report.rejected_candidates, ())
+                self.assertEqual(report.analysis_outcome, "inconclusive")
+
     def _modern_report_bundle(self):
         root = modern_root(
             ConfirmedRoot(

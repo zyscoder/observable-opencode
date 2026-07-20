@@ -27,7 +27,12 @@ from trace_attribution.causal_state import (
     confirmation_identity_for,
 )
 from trace_attribution.claude import ClaudeJudgeClient
-from trace_attribution.errors import JudgeProviderError, JudgeProviderUnavailable
+from trace_attribution.errors import (
+    JudgeProviderError,
+    JudgeProviderUnavailable,
+    TransportCallError,
+    TransportCallResult,
+)
 from trace_attribution.models import NodeJudgment, TraceNode
 
 
@@ -262,12 +267,20 @@ class ScriptedTransport:
         self.calls = []
 
     def create_message_text(self, *, system, messages, max_tokens):
+        try:
+            return self.create_message_text_with_usage(
+                system=system, messages=messages, max_tokens=max_tokens
+            ).text
+        except TransportCallError as exc:
+            raise exc.error from exc
+
+    def create_message_text_with_usage(self, *, system, messages, max_tokens):
         self.request_count += 1
         self.calls.append({"system": system, "messages": messages, "max_tokens": max_tokens})
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
-            raise response
-        return response
+            raise TransportCallError(response, physical_requests=1)
+        return TransportCallResult(str(response), physical_requests=1)
 
 
 class CausalJudgeValidationTest(unittest.TestCase):
@@ -1727,6 +1740,68 @@ class ClaudeTransportAdapterTest(unittest.TestCase):
 
 
 class ClaudeCausalJudgeTest(unittest.TestCase):
+    def test_local_open_circuit_rejection_costs_zero_physical_requests(self):
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.model = "test-model"
+        transport.max_tokens = 2048
+        transport.repair_max_tokens = 512
+        transport.thinking_config = None
+        transport.provider_circuit_open = True
+        transport.provider_circuit_reason = "local circuit is open"
+        transport.request_count = 0
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=1
+        )
+
+        self.assertEqual(result.physical_requests, 0)
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertEqual(transport.request_count, 0)
+
+    def test_local_transport_preflight_failure_costs_zero_physical_requests(self):
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.model = "test-model"
+        transport.max_tokens = 2048
+        transport.repair_max_tokens = 512
+        transport.thinking_config = None
+        transport.provider_circuit_open = False
+        transport.request_count = 0
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=1
+        )
+
+        self.assertEqual(result.physical_requests, 0)
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertEqual(transport.request_count, 0)
+
+    def test_local_repair_rejection_does_not_add_a_physical_request(self):
+        class RepairCircuitTransport(ScriptedTransport):
+            def create_message_text_with_usage(self, *, system, messages, max_tokens):
+                if self.request_count == 1:
+                    raise TransportCallError(
+                        JudgeProviderUnavailable("repair circuit opened locally"),
+                        physical_requests=0,
+                    )
+                return super().create_message_text_with_usage(
+                    system=system, messages=messages, max_tokens=max_tokens
+                )
+
+        transport = RepairCircuitTransport([
+            json.dumps(valid_step_payload(predecessor_ref="record:fabricated"))
+        ])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=2
+        )
+
+        self.assertEqual(result.physical_requests, 1)
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertEqual(transport.request_count, 1)
+
     def test_cache_adapter_failure_after_transport_raises_typed_usage_error(self):
         class FailingCache(JudgmentCache):
             def put_payload(self, **kwargs):

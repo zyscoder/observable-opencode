@@ -13,7 +13,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 from .analyzer import JudgeClient
 from .cache import JudgmentCache, build_judge_cache_key
-from .errors import JudgeProviderError, JudgeProviderUnavailable, is_provider_request_error
+from .errors import (
+    JudgeProviderError,
+    JudgeProviderUnavailable,
+    TransportCallError,
+    TransportCallResult,
+    is_provider_request_error,
+)
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
 T = TypeVar("T")
@@ -536,32 +542,36 @@ class ClaudeJudgeClient(JudgeClient):
                 f"Original: {text[:200]} Repaired: {repaired[:200]}"
             ) from exc
 
-    def _create_message_text(self, *, system: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
+    def create_message_text_with_usage(
+        self, *, system: str, messages: List[Dict[str, str]], max_tokens: int
+    ) -> TransportCallResult:
         if getattr(self, "provider_circuit_open", False):
-            raise JudgeProviderUnavailable(
-                getattr(self, "provider_circuit_reason", "provider circuit is open")
+            raise TransportCallError(
+                JudgeProviderUnavailable(
+                    getattr(self, "provider_circuit_reason", "provider circuit is open")
+                ),
+                physical_requests=0,
             )
-        self.request_count += 1
         try:
-            if self.timeout_seconds is not None and self.timeout_seconds > 0:
-                result = run_worker_with_timeout(
-                    anthropic_request_worker,
-                    {
-                        "api_key": self.api_key,
-                        "base_url": self.base_url,
-                        "timeout_seconds": self.timeout_seconds,
-                        "model": self.model,
-                        "max_tokens": max_tokens,
-                        "temperature": 0,
-                        "thinking": self.thinking_config,
-                        "system": system,
-                        "messages": messages,
-                    },
-                    self.timeout_seconds,
-                )
-                text = str(result.get("text") or "")
+            timeout_seconds = self.timeout_seconds
+            if timeout_seconds is not None and timeout_seconds > 0:
+                worker_arguments = {
+                    "api_key": self.api_key,
+                    "base_url": self.base_url,
+                    "timeout_seconds": timeout_seconds,
+                    "model": self.model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                    "thinking": self.thinking_config,
+                    "system": system,
+                    "messages": messages,
+                }
+                direct_create = None
+                request = None
             else:
-                request: Dict[str, Any] = {
+                worker_arguments = None
+                direct_create = self.client.messages.create
+                request = {
                     "model": self.model,
                     "max_tokens": max_tokens,
                     "temperature": 0,
@@ -570,10 +580,27 @@ class ClaudeJudgeClient(JudgeClient):
                 }
                 if self.thinking_config is not None:
                     request["thinking"] = self.thinking_config
-                response = self.client.messages.create(**request)
+        except Exception as exc:
+            raise TransportCallError(exc, physical_requests=0) from exc
+
+        self.request_count += 1
+        try:
+            if worker_arguments is not None:
+                result = run_worker_with_timeout(
+                    anthropic_request_worker,
+                    worker_arguments,
+                    timeout_seconds,
+                )
+                text = str(result.get("text") or "")
+            else:
+                response = direct_create(**request)
                 text = response_text(response)
+            self.consecutive_provider_errors = 0
+            return TransportCallResult(text=text, physical_requests=1)
         except BaseException as exc:
             if not is_provider_request_error(exc):
+                if isinstance(exc, Exception):
+                    raise TransportCallError(exc, physical_requests=1) from exc
                 raise
             consecutive = getattr(self, "consecutive_provider_errors", 0) + 1
             self.consecutive_provider_errors = consecutive
@@ -584,10 +611,18 @@ class ClaudeJudgeClient(JudgeClient):
                 self.provider_circuit_reason = (
                     f"provider unavailable after {consecutive} consecutive request errors: {detail}"
                 )
-                raise JudgeProviderUnavailable(self.provider_circuit_reason) from exc
-            raise JudgeProviderError(detail) from exc
-        self.consecutive_provider_errors = 0
-        return text
+                error = JudgeProviderUnavailable(self.provider_circuit_reason)
+            else:
+                error = JudgeProviderError(detail)
+            raise TransportCallError(error, physical_requests=1) from exc
+
+    def _create_message_text(self, *, system: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
+        try:
+            return self.create_message_text_with_usage(
+                system=system, messages=messages, max_tokens=max_tokens
+            ).text
+        except TransportCallError as exc:
+            raise exc.error from exc
 
     def create_message_text(
         self, *, system: str, messages: List[Dict[str, str]], max_tokens: int

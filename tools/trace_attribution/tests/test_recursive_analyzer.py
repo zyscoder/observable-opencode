@@ -22,7 +22,11 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RootConfirmation,
 )
-from trace_attribution.errors import JudgeProviderUnavailable
+from trace_attribution.errors import (
+    JudgeProviderUnavailable,
+    TransportCallError,
+    TransportCallResult,
+)
 from trace_attribution.graph import TraceGraph
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
 
@@ -350,12 +354,20 @@ class ScriptedTransport:
         self.provider_circuit_reason = ""
 
     def create_message_text(self, *, system, messages, max_tokens):
+        try:
+            return self.create_message_text_with_usage(
+                system=system, messages=messages, max_tokens=max_tokens
+            ).text
+        except TransportCallError as exc:
+            raise exc.error from exc
+
+    def create_message_text_with_usage(self, *, system, messages, max_tokens):
         self.request_count += 1
         self.calls.append({"system": system, "messages": messages, "max_tokens": max_tokens})
         value = self.responses.pop(0)
         if isinstance(value, BaseException):
-            raise value
-        return value
+            raise TransportCallError(value, physical_requests=1)
+        return TransportCallResult(str(value), physical_requests=1)
 
 
 class UnboundedProviderJudge:
@@ -1305,10 +1317,7 @@ class RecursiveRootRankingTest(unittest.TestCase):
             [item.node_ref for item in report.contributing_conditions],
             ["record:context"],
         )
-        self.assertEqual(
-            [item.node_ref for item in report.rejected_candidates if item.confirmation_status == "rejected"],
-            ["record:context"],
-        )
+        self.assertEqual(report.rejected_candidates, ())
         requests = {item.candidate_ref: item for item in judge.confirmation_requests}
         decision_request = requests["record:decision"]
         self.assertTrue(decision_request.hypothesis_id)
@@ -1324,6 +1333,47 @@ class RecursiveRootRankingTest(unittest.TestCase):
             "The decision semantically explains the current defect.",
             json.dumps(decision_request.to_dict()),
         )
+
+    def test_unrelated_rejected_candidate_is_not_published_as_a_factor(self):
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+                "record:context": self._confirmation_step,
+            },
+            {
+                "record:context": RootConfirmation.rejected(
+                    "record:context", "The context did not introduce the defect."
+                ),
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision stopped repository discovery.",
+                    counterfactual="A complete search would prevent the omission.",
+                    confidence=0.91,
+                    evidence_refs=["record:decision"],
+                ),
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(
+            [item.node_ref for item in report.rejected_candidates],
+            ["record:context"],
+        )
+        self.assertEqual(report.contributing_conditions, ())
+        self.assertEqual(report.amplifying_factors, ())
 
     def test_successful_no_defect_does_not_invoke_confirmation(self):
         judge = ConfirmingScriptedJudge(

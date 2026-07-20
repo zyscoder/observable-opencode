@@ -1304,6 +1304,7 @@ class RecursiveAttributionReport:
             identity = confirmation.confirmation_identity
             if (
                 confirmation.status != "rejected"
+                or confirmation.factor_role not in {"unrelated", "unknown"}
                 or rejected.confirmation_status != "rejected"
                 or rejected.node_ref != confirmation.candidate_ref
                 or rejected.hypothesis_id != confirmation.hypothesis_id
@@ -1315,6 +1316,10 @@ class RecursiveAttributionReport:
             rejected_identities.add(identity)
 
         factor_identities = set().union(*factor_role_identities.values())
+        if factor_identities.intersection(rejected_identities):
+            raise ValueError(
+                "factor and rejected roles share a confirmation identity"
+            )
         if root_identities.intersection(factor_identities | rejected_identities):
             raise ValueError("confirmation role conflict between root and non-root roles")
         unresolved_hypothesis_ids = {
@@ -1377,6 +1382,7 @@ class RecursiveAttributionReport:
             or self.unresolved_hypotheses
             or orphan_confirmed
             or has_unknown_non_root_confirmation
+            or (factor_identities and not confirmed_root_refs)
             or _has_unresolved_judgment_state(self.step_judgments, self.causal_relations)
             or _has_blocking_metadata(self.metadata)
         )
@@ -1387,6 +1393,15 @@ class RecursiveAttributionReport:
         object.__setattr__(self, "analysis_outcome", outcome)
 
     def to_dict(self) -> JsonDict:
+        legacy_root_causes: List[JsonDict] = []
+        seen_legacy_roots: Set[str] = set()
+        for root in (*self.confirmed_roots, *self.co_roots):
+            projection = root.to_legacy_root_cause()
+            projection_key = stable_json(projection)
+            if projection_key in seen_legacy_roots:
+                continue
+            seen_legacy_roots.add(projection_key)
+            legacy_root_causes.append(projection)
         return {
             "schema_version": self.schema_version,
             "case_id": self.case_id,
@@ -1407,10 +1422,7 @@ class RecursiveAttributionReport:
             "amplifying_factors": [item.to_dict() for item in self.amplifying_factors],
             "rejected_candidates": [item.to_dict() for item in self.rejected_candidates],
             "unresolved_hypotheses": [item.to_dict() for item in self.unresolved_hypotheses],
-            "root_causes": [
-                item.to_legacy_root_cause()
-                for item in (*self.confirmed_roots, *self.co_roots)
-            ],
+            "root_causes": legacy_root_causes,
             "taint_paths": [list(path) for path in self.taint_paths],
             "visited_order": list(self.visited_order),
             "unresolved_refs": list(self.unresolved_refs),

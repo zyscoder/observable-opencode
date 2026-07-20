@@ -1929,22 +1929,6 @@ class AgenticRecursiveAnalyzer:
             hypothesis = state.ledger.get(hypothesis_id)
             if hypothesis.status in {"active", "supported"}:
                 state.ledger.reject(hypothesis_id, confirmation.reason)
-            state.rejected_candidates.append(
-                RejectedCandidate(
-                    confirmation.candidate_ref,
-                    confirmation.reason,
-                    confirmation.evidence_refs,
-                    hypothesis_id=hypothesis_id,
-                    recursive_path=confirmation.recursive_path,
-                    confirmation_status="rejected",
-                    confidence=confirmation.confidence,
-                    confirmation=confirmation.to_dict(),
-                    provenance={
-                        "confirmation_semantic_identity": queued.get("semantic_identity"),
-                        "defect_fingerprint": confirmation.defect_fingerprint,
-                    },
-                )
-            )
             if confirmation.factor_role in {
                 "contributing_condition",
                 "amplifying_factor",
@@ -1976,6 +1960,25 @@ class AgenticRecursiveAnalyzer:
                     state.amplifying_factors.append(factor)
                 else:
                     state.contributing_conditions.append(factor)
+            else:
+                state.rejected_candidates.append(
+                    RejectedCandidate(
+                        confirmation.candidate_ref,
+                        confirmation.reason,
+                        confirmation.evidence_refs,
+                        hypothesis_id=hypothesis_id,
+                        recursive_path=confirmation.recursive_path,
+                        confirmation_status="rejected",
+                        confidence=confirmation.confidence,
+                        confirmation=confirmation.to_dict(),
+                        provenance={
+                            "confirmation_semantic_identity": queued.get(
+                                "semantic_identity"
+                            ),
+                            "defect_fingerprint": confirmation.defect_fingerprint,
+                        },
+                    )
+                )
             pending_alternatives = [
                 item
                 for item in state.confirmation_queue

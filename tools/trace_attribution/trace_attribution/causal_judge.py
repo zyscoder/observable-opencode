@@ -22,7 +22,12 @@ from .causal_state import (
     confirmation_identity_for,
 )
 from .claude import ClaudeJudgeClient
-from .errors import JudgeProviderError, JudgeProviderUnavailable
+from .errors import (
+    JudgeProviderError,
+    JudgeProviderUnavailable,
+    TransportCallError,
+    TransportCallResult,
+)
 from .models import JsonDict, TraceNode, stable_json
 
 
@@ -2287,25 +2292,26 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
         if remaining_requests is not None:
             remaining_requests -= 1
         messages = [{"role": "user", "content": prompt}]
-        physical_requests = 1
+        physical_requests = 0
         try:
-            text = self.transport.create_message_text(
+            transport_result = self._call_transport(
                 system=system,
                 messages=messages,
                 max_tokens=max_tokens,
             )
-        except (JudgeProviderError, JudgeProviderUnavailable) as exc:
+            physical_requests += transport_result.physical_requests
+            text = transport_result.text
+        except TransportCallError as exc:
+            physical_requests += exc.physical_requests
+            error = exc.error
             return _RequestOutcome(
                 None,
-                "provider_error",
-                "{0}: {1}".format(type(exc).__name__, exc),
-                physical_requests,
-            )
-        except Exception as exc:
-            return _RequestOutcome(
-                None,
-                "adapter_error",
-                "{0}: {1}".format(type(exc).__name__, exc),
+                (
+                    "provider_error"
+                    if isinstance(error, (JudgeProviderError, JudgeProviderUnavailable))
+                    else "adapter_error"
+                ),
+                "{0}: {1}".format(type(error).__name__, error),
                 physical_requests,
             )
         try:
@@ -2324,9 +2330,8 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 )
             if remaining_requests is not None:
                 remaining_requests -= 1
-            physical_requests += 1
             try:
-                repaired = self.transport.create_message_text(
+                repair_result = self._call_transport(
                     system=REPAIR_SYSTEM_PROMPT,
                     messages=[
                         {
@@ -2346,21 +2351,29 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                         int(getattr(self.transport, "repair_max_tokens", 1024)), 1024
                     ),
                 )
-            except (JudgeProviderError, JudgeProviderUnavailable) as exc:
+                physical_requests += repair_result.physical_requests
+                repaired = repair_result.text
+            except TransportCallError as exc:
+                physical_requests += exc.physical_requests
+                error = exc.error
                 return _RequestOutcome(
                     None,
-                    "provider_error",
-                    "{0}; repair provider error: {1}: {2}".format(
-                        exact_error, type(exc).__name__, exc
+                    (
+                        "provider_error"
+                        if isinstance(
+                            error, (JudgeProviderError, JudgeProviderUnavailable)
+                        )
+                        else "adapter_error"
                     ),
-                    physical_requests,
-                )
-            except Exception as exc:
-                return _RequestOutcome(
-                    None,
-                    "adapter_error",
-                    "{0}; repair adapter error: {1}: {2}".format(
-                        exact_error, type(exc).__name__, exc
+                    "{0}; repair {1}: {2}: {3}".format(
+                        exact_error,
+                        "provider error"
+                        if isinstance(
+                            error, (JudgeProviderError, JudgeProviderUnavailable)
+                        )
+                        else "adapter error",
+                        type(error).__name__,
+                        error,
                     ),
                     physical_requests,
                 )
@@ -2392,6 +2405,30 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 physical_requests=physical_requests,
             ) from exc
         return _RequestOutcome(payload, physical_requests=physical_requests)
+
+    def _call_transport(
+        self, *, system: str, messages: List[JsonDict], max_tokens: int
+    ) -> TransportCallResult:
+        call = getattr(self.transport, "create_message_text_with_usage", None)
+        if not callable(call):
+            raise TransportCallError(
+                TypeError(
+                    "transport must implement create_message_text_with_usage"
+                ),
+                physical_requests=0,
+            )
+        try:
+            result = call(system=system, messages=messages, max_tokens=max_tokens)
+        except TransportCallError:
+            raise
+        except Exception as exc:
+            raise TransportCallError(exc, physical_requests=0) from exc
+        if not isinstance(result, TransportCallResult):
+            raise TransportCallError(
+                TypeError("transport must return TransportCallResult"),
+                physical_requests=0,
+            )
+        return result
 
 
 def _parse_single_json_object(text: str) -> JsonDict:
