@@ -19,8 +19,8 @@ class TraceGraph:
         case_id: str,
         nodes: Dict[str, TraceNode],
         aliases: Dict[str, str],
-        upstream: Dict[str, Set[str]],
-        downstream: Dict[str, Set[str]],
+        upstream: Dict[str, Dict[str, None]],
+        downstream: Dict[str, Dict[str, None]],
         raw_trace: JsonDict,
         artifact_hydration: JsonDict,
         artifact_index: Dict[str, JsonDict],
@@ -96,15 +96,15 @@ class TraceGraph:
                 aliases[alias] = ref
             aliases[ref] = ref
 
-        upstream: Dict[str, Set[str]] = defaultdict(set)
-        downstream: Dict[str, Set[str]] = defaultdict(set)
+        upstream: Dict[str, Dict[str, None]] = defaultdict(dict)
+        downstream: Dict[str, Dict[str, None]] = defaultdict(dict)
         edge_context_index: Dict[Tuple[str, str], List[JsonDict]] = defaultdict(list)
         for node in nodes.values():
             for source_ref in node.source_refs:
                 source = resolve_ref(source_ref, aliases)
                 if source and source != node.ref:
-                    upstream[node.ref].add(source)
-                    downstream[source].add(node.ref)
+                    upstream[node.ref][source] = None
+                    downstream[source][node.ref] = None
                     add_edge_context(
                         edge_context_index,
                         from_ref=source,
@@ -146,8 +146,8 @@ class TraceGraph:
                     edge_origin="trace.dataflow_edges",
                     edge_id=str(edge.get("edge_id") or ""),
                 )
-                upstream[target].add(source)
-                downstream[source].add(target)
+                upstream[target][source] = None
+                downstream[source][target] = None
 
         message_lineage = reconstruct_message_lineage(
             trace=trace,
@@ -174,8 +174,8 @@ class TraceGraph:
                     edge_origin="offline.message_lineage",
                     edge_id=str(edge.get("edge_id") or ""),
                 )
-                upstream[target].add(source)
-                downstream[source].add(target)
+                upstream[target][source] = None
+                downstream[source][target] = None
 
         progress_reconstruction = reconstruct_progress_episodes(
             nodes=nodes,
@@ -188,8 +188,8 @@ class TraceGraph:
             for source_ref in episode.source_refs:
                 source = resolve_ref(source_ref, aliases)
                 if source and source != episode.ref:
-                    upstream[episode.ref].add(source)
-                    downstream[source].add(episode.ref)
+                    upstream[episode.ref][source] = None
+                    downstream[source][episode.ref] = None
                     add_edge_context(
                         edge_context_index,
                         from_ref=source,
@@ -212,8 +212,8 @@ class TraceGraph:
             for episode_ref in episode_refs:
                 if episode_ref not in nodes or episode_ref == target_ref:
                     continue
-                upstream[target_ref].add(episode_ref)
-                downstream[episode_ref].add(target_ref)
+                upstream[target_ref][episode_ref] = None
+                downstream[episode_ref][target_ref] = None
                 add_edge_context(
                     edge_context_index,
                     from_ref=episode_ref,
@@ -294,6 +294,80 @@ class TraceGraph:
     def downstream_refs(self, ref: str) -> List[str]:
         resolved = self.resolve(ref) or ref
         return sorted(self._downstream.get(resolved, set()))
+
+    def bounded_upstream_refs(
+        self,
+        ref: str,
+        *,
+        limit: int,
+        relation_filter: Iterable[str] = (),
+        event_type: str = "",
+        exclude: Iterable[str] = (),
+    ) -> Tuple[List[str], bool]:
+        return self._bounded_adjacent_refs(
+            ref,
+            adjacency=self._upstream,
+            upstream=True,
+            limit=limit,
+            relation_filter=relation_filter,
+            event_type=event_type,
+            exclude=exclude,
+        )
+
+    def bounded_downstream_refs(
+        self,
+        ref: str,
+        *,
+        limit: int,
+        relation_filter: Iterable[str] = (),
+        event_type: str = "",
+        exclude: Iterable[str] = (),
+    ) -> Tuple[List[str], bool]:
+        return self._bounded_adjacent_refs(
+            ref,
+            adjacency=self._downstream,
+            upstream=False,
+            limit=limit,
+            relation_filter=relation_filter,
+            event_type=event_type,
+            exclude=exclude,
+        )
+
+    def _bounded_adjacent_refs(
+        self,
+        ref: str,
+        *,
+        adjacency: Dict[str, Dict[str, None]],
+        upstream: bool,
+        limit: int,
+        relation_filter: Iterable[str],
+        event_type: str,
+        exclude: Iterable[str],
+    ) -> Tuple[List[str], bool]:
+        """Return deterministic insertion-order adjacency with bounded eligible work."""
+        resolved = self.resolve(ref) or ref
+        maximum = max(0, int(limit))
+        relations = {str(item) for item in relation_filter if str(item)}
+        excluded = {str(item) for item in exclude}
+        eligible: List[str] = []
+        for adjacent in adjacency.get(resolved, {}):
+            if adjacent in excluded:
+                continue
+            node = self.nodes.get(adjacent)
+            if event_type and (node is None or node.event_type != event_type):
+                continue
+            if relations:
+                edges = (
+                    self.edge_context(adjacent, resolved)
+                    if upstream
+                    else self.edge_context(resolved, adjacent)
+                )
+                if not any(str(edge.get("relation") or "") in relations for edge in edges):
+                    continue
+            eligible.append(adjacent)
+            if len(eligible) > maximum:
+                return eligible[:maximum], True
+        return eligible, False
 
     def edge_context(self, from_ref: str, to_ref: str) -> List[JsonDict]:
         source = self.resolve(from_ref) or from_ref

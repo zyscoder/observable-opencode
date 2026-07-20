@@ -174,6 +174,27 @@ def _provider_circuit(judge: CausalJudge) -> JsonDict:
     }
 
 
+def _rejudge_success_terminal_state(
+    judgment: CausalStepJudgment,
+    *,
+    bounded_judge: bool,
+    offline_judge: bool,
+    physical_request_delta: Optional[int],
+) -> str:
+    missing = " ".join(judgment.missing_evidence).casefold()
+    if "judge_request_budget_exhausted" in missing:
+        return "budget_exhausted"
+    if "judge_validation_error" in missing:
+        return "validation_error"
+    if "judge_provider_error" in missing:
+        return "provider_error"
+    if offline_judge:
+        return "offline_success"
+    if bounded_judge and physical_request_delta == 0:
+        return "cache_hit"
+    return "success"
+
+
 @dataclass
 class RecursiveAnalysisState:
     """Mutable orchestration state containing immutable causal domain values."""
@@ -372,13 +393,13 @@ class RecursiveAnalysisState:
         context_hash = hashlib.sha256(
             stable_json(context_snapshot).encode("utf-8")
         ).hexdigest()
-        for index in self.pending_rejudge_journal.pop(item.visit_key, []):
+        for index in self.pending_rejudge_journal.get(item.visit_key, []):
             entry = self.investigation_journal[index]
             entry["context_after"] = context_snapshot
             entry["context_after_hash"] = context_hash
             entry["rejudge_linkage"] = {
                 **entry["rejudge_linkage"],
-                "status": "linked",
+                "status": "pending_judge",
                 "rejudge_visit_key": item.visit_key,
                 "context_after_hash": context_hash,
             }
@@ -499,19 +520,58 @@ class RecursiveAnalysisState:
             stable_json(judgment.to_dict()).encode("utf-8")
         ).hexdigest()
 
+    def complete_rejudge(
+        self,
+        item: FrontierItem,
+        *,
+        terminal_state: str,
+        judgment: Optional[CausalStepJudgment] = None,
+        detail: str = "",
+        physical_request_delta: Optional[int] = None,
+    ) -> None:
+        judgment_after = judgment.to_dict() if judgment is not None else None
+        judgment_hash = (
+            hashlib.sha256(stable_json(judgment_after).encode("utf-8")).hexdigest()
+            if judgment_after is not None
+            else ""
+        )
+        for index in self.pending_rejudge_journal.pop(item.visit_key, []):
+            entry = self.investigation_journal[index]
+            if entry.get("context_after") is None:
+                entry["context_after"] = entry["context_before"]
+                entry["context_after_hash"] = entry["context_before_hash"]
+            entry["judgment_after_investigation"] = judgment_after
+            entry["judgment_after_hash"] = judgment_hash
+            entry["rejudge_linkage"] = {
+                **entry["rejudge_linkage"],
+                "status": "completed",
+                "terminal_state": terminal_state,
+                "detail": str(detail or ""),
+                "physical_request_delta": physical_request_delta,
+                "rejudge_visit_key": item.visit_key,
+                "context_after_hash": entry["context_after_hash"],
+                "judgment_after_hash": judgment_hash,
+            }
+
     def finalize_pending_rejudges(self) -> None:
-        for indexes in self.pending_rejudge_journal.values():
+        pending = list(self.pending_rejudge_journal)
+        for visit_key in pending:
+            indexes = self.pending_rejudge_journal.pop(visit_key, [])
             for index in indexes:
                 entry = self.investigation_journal[index]
                 entry["context_after"] = entry["context_before"]
                 entry["context_after_hash"] = entry["context_before_hash"]
+                entry["judgment_after_investigation"] = None
+                entry["judgment_after_hash"] = ""
                 entry["rejudge_linkage"] = {
                     **entry["rejudge_linkage"],
-                    "status": "not_executed",
-                    "reason": "recursive traversal terminated before re-judgment",
+                    "status": "completed",
+                    "terminal_state": "traversal_terminated_before_rejudge",
+                    "detail": "recursive traversal terminated before re-judgment",
+                    "physical_request_delta": None,
                     "context_after_hash": entry["context_before_hash"],
+                    "judgment_after_hash": "",
                 }
-        self.pending_rejudge_journal.clear()
 
     def reserve_artifact_bytes(self, request: CausalStepRequest, limit: int) -> bool:
         new_payloads: Dict[str, bytes] = {}
@@ -533,6 +593,18 @@ class RecursiveAnalysisState:
         graph_position: Any,
         max_hypotheses: int,
     ) -> None:
+        hypothesis = self.ledger.get(item.hypothesis_id)
+        if hypothesis.status in {"rejected", "superseded"}:
+            self._mark_ref_unresolved(
+                item.node_ref,
+                item,
+                "inactive_hypothesis_result_discarded",
+                "A stale Judge result cannot update a rejected or superseded hypothesis.",
+            )
+            self.frontier.complete_if_in_flight(
+                item, "discarded:{0}".format(hypothesis.status)
+            )
+            return
         self.step_judgments.append(judgment)
         self.visited_order.append(item.node_ref)
         self.taint_paths.append(tuple(item.downstream_path))
@@ -547,7 +619,6 @@ class RecursiveAnalysisState:
             details = "; ".join(judgment.missing_evidence) or judgment.current_defect_reason
             self.mark_unresolved(item, "judge_unknown", details)
         elif is_present and judgment.candidate_introduction:
-            hypothesis = self.ledger.get(item.hypothesis_id)
             if hypothesis.candidate_root_ref != item.node_ref:
                 self.mark_unresolved(
                     item,
@@ -967,6 +1038,11 @@ class AgenticRecursiveAnalyzer:
             item = state.frontier.pop()
             state.processed_items += 1
             if item.depth > self.max_depth:
+                state.complete_rejudge(
+                    item,
+                    terminal_state="depth_limit",
+                    detail="Recursive depth exceeds the configured limit.",
+                )
                 state.complete_unresolved(
                     item,
                     "depth_limit",
@@ -975,6 +1051,14 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             if _provider_circuit(self.judge).get("open"):
+                state.complete_rejudge(
+                    item,
+                    terminal_state="provider_circuit_open",
+                    detail=str(
+                        _provider_circuit(self.judge).get("reason")
+                        or "Provider circuit is open."
+                    ),
+                )
                 state.complete_unresolved(
                     item,
                     "provider_circuit_open",
@@ -982,17 +1066,38 @@ class AgenticRecursiveAnalyzer:
                     exhausted_budget="provider_circuit",
                 )
                 continue
-            candidates = self.retriever.retrieve(
-                analysis_graph,
-                item.node_ref,
-                item.defect_state,
-                state.ledger.get(item.hypothesis_id),
-                allow_semantic_fallback=True,
-            )
+            try:
+                candidates = self.retriever.retrieve(
+                    analysis_graph,
+                    item.node_ref,
+                    item.defect_state,
+                    state.ledger.get(item.hypothesis_id),
+                    allow_semantic_fallback=True,
+                )
+            except Exception as exc:
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
+                state.complete_rejudge(
+                    item, terminal_state="retrieval_error", detail=detail
+                )
+                state.complete_unresolved(item, "retrieval_error", detail)
+                continue
             for candidate in candidates:
                 state._remember_candidate(candidate)
-            request = state.build_step_request(analysis_graph, item, candidates)
+            try:
+                request = state.build_step_request(analysis_graph, item, candidates)
+            except Exception as exc:
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
+                state.complete_rejudge(
+                    item, terminal_state="request_build_error", detail=detail
+                )
+                state.complete_unresolved(item, "request_build_error", detail)
+                continue
             if not state.reserve_artifact_bytes(request, self.max_artifact_bytes):
+                state.complete_rejudge(
+                    item,
+                    terminal_state="artifact_byte_limit",
+                    detail="Hydrated artifact content exceeds the analysis byte budget.",
+                )
                 state.complete_unresolved(
                     item,
                     "artifact_byte_limit",
@@ -1004,6 +1109,11 @@ class AgenticRecursiveAnalyzer:
             bounded_judge = isinstance(self.judge, BoundedJudgeCapability)
             offline_judge = isinstance(self.judge, OfflineJudgeCapability)
             if not bounded_judge and not offline_judge:
+                state.complete_rejudge(
+                    item,
+                    terminal_state="judge_budget_unenforceable",
+                    detail="Judge has no explicit bounded or offline capability.",
+                )
                 state.complete_unresolved(
                     item,
                     "judge_budget_unenforceable",
@@ -1022,10 +1132,21 @@ class AgenticRecursiveAnalyzer:
                     judgment = self.judge.judge_step_offline(request)
             except (JudgeProviderError, JudgeProviderUnavailable) as exc:
                 after = _judge_request_count(self.judge)
-                state.judge_requests += (
+                physical_delta = (
                     max(0, after - before)
                     if before is not None and after is not None
-                    else 0
+                    else None
+                )
+                state.judge_requests += physical_delta or 0
+                state.complete_rejudge(
+                    item,
+                    terminal_state=(
+                        "provider_unavailable"
+                        if isinstance(exc, JudgeProviderUnavailable)
+                        else "provider_error"
+                    ),
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(
                     item,
@@ -1040,10 +1161,17 @@ class AgenticRecursiveAnalyzer:
                 continue
             except Exception as exc:
                 after = _judge_request_count(self.judge)
-                state.judge_requests += (
+                physical_delta = (
                     max(0, after - before)
                     if before is not None and after is not None
-                    else 0
+                    else None
+                )
+                state.judge_requests += physical_delta or 0
+                state.complete_rejudge(
+                    item,
+                    terminal_state="judge_error",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_delta=physical_delta,
                 )
                 state.complete_unresolved(
                     item,
@@ -1052,10 +1180,34 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             after = _judge_request_count(self.judge)
-            state.judge_requests += (
+            physical_delta = (
                 max(0, after - before)
                 if before is not None and after is not None
-                else 0
+                else None
+            )
+            state.judge_requests += physical_delta or 0
+            if not isinstance(judgment, CausalStepJudgment):
+                detail = "Judge returned {0}, expected CausalStepJudgment.".format(
+                    type(judgment).__name__
+                )
+                state.complete_rejudge(
+                    item,
+                    terminal_state="validation_error",
+                    detail=detail,
+                    physical_request_delta=physical_delta,
+                )
+                state.complete_unresolved(item, "judge_validation_error", detail)
+                continue
+            state.complete_rejudge(
+                item,
+                terminal_state=_rejudge_success_terminal_state(
+                    judgment,
+                    bounded_judge=bounded_judge,
+                    offline_judge=offline_judge,
+                    physical_request_delta=physical_delta,
+                ),
+                judgment=judgment,
+                physical_request_delta=physical_delta,
             )
             if any(
                 "judge_request_budget_exhausted" in detail
@@ -1098,6 +1250,11 @@ class AgenticRecursiveAnalyzer:
         if state.frontier:
             while state.frontier:
                 item = state.frontier.pop()
+                state.complete_rejudge(
+                    item,
+                    terminal_state="frontier_item_limit",
+                    detail="The recursive frontier item budget is exhausted.",
+                )
                 state.complete_unresolved(
                     item,
                     "frontier_item_limit",
@@ -1302,22 +1459,31 @@ class AgenticRecursiveAnalyzer:
                 )
             elif directive.action == "reject_hypothesis":
                 hypothesis_id = str(arguments["hypothesis_id"])
-                if hypothesis_id == "active":
-                    hypothesis_id = item.hypothesis_id
+                if hypothesis_id != item.hypothesis_id:
+                    raise ValueError(
+                        "reject_hypothesis must target the exact active hypothesis"
+                    )
                 opposing = tuple(
                     str(ref) for ref in arguments.get("opposing_evidence_refs") or []
                 )
                 resolved = [state.graph.resolve(ref) for ref in opposing]
                 if opposing and any(ref is None for ref in resolved):
                     raise ValueError("opposing evidence contains unresolved refs")
-                for ref in resolved:
-                    state.ledger.add_opposition(
-                        hypothesis_id,
-                        str(ref),
-                        directive.reason,
-                        1.0,
-                    )
-                state.ledger.reject(hypothesis_id, directive.reason)
+                rejection_hash = hashlib.sha256(
+                    stable_json(
+                        {
+                            "directive": directive.to_dict(),
+                            "resolved_opposition": resolved,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                state.ledger.reject_with_frontier(
+                    hypothesis_id,
+                    directive.reason,
+                    opposing_refs=(str(ref) for ref in resolved),
+                    frontier=state.frontier,
+                    evidence_hash=rejection_hash,
+                )
             elif directive.action == "request_root_confirmation":
                 hypothesis_id = str(arguments["hypothesis_id"])
                 if hypothesis_id != item.hypothesis_id:
@@ -1384,15 +1550,9 @@ class AgenticRecursiveAnalyzer:
             },
         )
         if directive.action == "reject_hypothesis" and status == "applied":
-            state.frontier.mark_completed(
-                item,
-                hashlib.sha256(
-                    stable_json(
-                        {"directive": directive.to_dict(), "ledger_after": after}
-                    ).encode("utf-8")
-                ).hexdigest(),
-            )
             return "branch_rejected"
+        if directive.action == "reject_hypothesis" and status == "rejected":
+            return "rejected"
         return "control"
 
 

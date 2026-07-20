@@ -160,6 +160,37 @@ class HypothesisLedger:
             hypothesis_id, item.with_updates(status="rejected", resolution_reason=reason)
         )
 
+    def reject_with_frontier(
+        self,
+        hypothesis_id: str,
+        reason: str,
+        *,
+        opposing_refs: Iterable[str],
+        frontier: "RecursiveFrontier",
+        evidence_hash: str,
+    ) -> AttributionHypothesis:
+        """Atomically reject one hypothesis and terminate all of its live work."""
+        item = self.get(hypothesis_id)
+        if item.status not in {"active", "supported"}:
+            raise ValueError("only an active hypothesis can be rejected")
+        opposition = [
+            HypothesisEvidence(str(ref), reason, 1.0) for ref in opposing_refs
+        ]
+        updated = item.with_updates(
+            opposing_evidence=dedupe_evidence(
+                [*item.opposing_evidence, *opposition]
+            ),
+            status="rejected",
+            resolution_reason=reason,
+        )
+        replacement_items = self._replacement_items(hypothesis_id, updated)
+        migration = frontier._plan_hypothesis_termination(
+            hypothesis_id, evidence_hash=evidence_hash
+        )
+        frontier._apply_hypothesis_migration(migration)
+        self._items = replacement_items
+        return updated
+
     def supersede(
         self, hypothesis_id: str, successor_hypothesis_id: str, reason: str
     ) -> AttributionHypothesis:
@@ -272,6 +303,12 @@ class RecursiveFrontier:
         self._in_flight.pop(item.visit_key)
         self._completed[item.visit_key] = _CompletedFrontierItem(item, str(evidence_hash))
 
+    def complete_if_in_flight(self, item: FrontierItem, evidence_hash: str) -> bool:
+        if self._in_flight.get(item.visit_key) != item:
+            return False
+        self.mark_completed(item, evidence_hash)
+        return True
+
     def reopen(
         self,
         item: FrontierItem,
@@ -369,6 +406,34 @@ class RecursiveFrontier:
                 self._migrate_item(value.item, previous, updated), value.evidence_hash
             )
             for value in self._completed.values()
+        )
+        self._validate_lifecycle_state(queued, in_flight, completed)
+        return _FrontierMigration(queued, in_flight, completed)
+
+    def _plan_hypothesis_termination(
+        self, hypothesis_id: str, *, evidence_hash: str
+    ) -> _FrontierMigration:
+        queued = tuple(
+            item for _, item in self._heap if item.hypothesis_id != hypothesis_id
+        )
+        in_flight = tuple(
+            item
+            for item in self._in_flight.values()
+            if item.hypothesis_id != hypothesis_id
+        )
+        terminated = [
+            item for _, item in self._heap if item.hypothesis_id == hypothesis_id
+        ] + [
+            item
+            for item in self._in_flight.values()
+            if item.hypothesis_id == hypothesis_id
+        ]
+        completed = tuple(
+            [*self._completed.values()]
+            + [
+                _CompletedFrontierItem(item, str(evidence_hash))
+                for item in terminated
+            ]
         )
         self._validate_lifecycle_state(queued, in_flight, completed)
         return _FrontierMigration(queued, in_flight, completed)

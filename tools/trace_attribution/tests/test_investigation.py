@@ -7,8 +7,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from trace_attribution.causal_judge import OfflineJudgeCapability
-from trace_attribution.causal_state import CausalStepJudgment, PredecessorAssessment
+from trace_attribution.causal_judge import (
+    BoundedJudgeCapability,
+    OfflineJudgeCapability,
+)
+from trace_attribution.causal_state import (
+    CausalStepJudgment,
+    FrontierItem,
+    PredecessorAssessment,
+)
+from trace_attribution.errors import JudgeProviderUnavailable
 from trace_attribution.graph import TraceGraph
 from trace_attribution.investigation import (
     AttributionControlDirective,
@@ -16,7 +24,10 @@ from trace_attribution.investigation import (
     InvestigationDirective,
     InvestigationResult,
 )
-from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
+from trace_attribution.recursive_analyzer import (
+    AgenticRecursiveAnalyzer,
+    RecursiveAnalysisState,
+)
 
 
 def relation(ref: str, relation_name: str = "unknown") -> PredecessorAssessment:
@@ -214,6 +225,37 @@ class InvestigationValueTest(unittest.TestCase):
         tampered = {**result.to_dict(), "byte_count": 12}
         with self.assertRaisesRegex(ValueError, "evidence_hash"):
             InvestigationResult.from_dict(tampered)
+
+    def test_persisted_result_binds_complete_directive_and_request_identity(self):
+        directive = InvestigationDirective.create(
+            "inspect_node",
+            {"ref": "record:decision"},
+            requested_by_ref="record:decision",
+            reason="Inspect the grounded node.",
+        )
+        result = InvestigationResult.success(
+            directive,
+            requested_refs=["record:decision"],
+            resolved_refs=["record:decision"],
+            provenance=[{"ref": "record:decision", "provenance_class": "recorded"}],
+            payload={"node": {"ref": "record:decision"}},
+            byte_count=19,
+        )
+        persisted = result.to_dict()
+        self.assertTrue(persisted["result_identity_hash"].startswith("sha256:"))
+        for field, replacement in (
+            ("directive_id", "investigation:" + "0" * 24),
+            ("tool_name", "run_shell"),
+            ("requested_refs", ["record:secret"]),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    InvestigationResult.from_dict({**persisted, field: replacement})
+        with self.assertRaisesRegex(ValueError, "requested_refs"):
+            InvestigationResult.from_dict({**persisted, "requested_refs": [123]})
+        with self.assertRaisesRegex(ValueError, "resolved_refs"):
+            InvestigationResult.from_dict({**persisted, "resolved_refs": [None]})
+        self.assertEqual(InvestigationResult.from_dict(persisted), result)
 
     def test_argument_schemas_reject_nonces_and_bound_paths(self):
         with self.assertRaisesRegex(ValueError, "unexpected"):
@@ -523,6 +565,106 @@ class InvestigationToolTest(unittest.TestCase):
         self.assertEqual(case.payload["obligations"], manifest.payload["obligations"])
         self.assertEqual(case.evidence_hash, manifest.evidence_hash)
 
+    def test_context_lineage_matches_exact_structured_message_identity(self):
+        self.graph.message_lineage = {
+            "turns": [
+                {"message_id": "msg_10", "record_refs": ["record:source"]},
+                {"message_id": "msg_1", "record_refs": ["record:decision"]},
+            ],
+            "edges": [
+                {
+                    "from_message_id": "msg_1",
+                    "to_message_id": "msg_2",
+                    "from_ref": "record:source",
+                    "to_ref": "record:decision",
+                }
+            ],
+        }
+        result = CausalInvestigationTools(self.graph).execute(
+            InvestigationDirective.create(
+                "inspect_context_lineage",
+                {"message_id": "msg_1"},
+                requested_by_ref="record:decision",
+                reason="Resolve only the exact message identity and endpoints.",
+            )
+        )
+        self.assertEqual(result.status, "success")
+        paths = [item["path"] for item in result.payload["matches"]]
+        self.assertEqual(
+            paths,
+            ["message_lineage.turns[1]", "message_lineage.edges[0]"],
+        )
+        self.assertNotIn("msg_10", json.dumps(result.to_dict()["payload"]))
+
+    def test_bounded_adjacency_visits_at_most_limit_plus_one(self):
+        trace = trace_with_artifact()
+        trace["records"] = [
+            {
+                "record_id": "source_{0:03d}".format(index),
+                "component": "context",
+                "event_type": "context.snapshot",
+                "data": {"text": "source {0}".format(index)},
+            }
+            for index in range(200)
+        ] + [
+            {
+                "record_id": "target",
+                "component": "agent",
+                "event_type": "decision",
+                "source_refs": ["record:source_{0:03d}".format(index) for index in range(200)],
+                "data": {"failure_type": "bounded traversal"},
+            }
+        ]
+        trace["dataflow_edges"] = []
+        graph = TraceGraph.from_trace(trace)
+
+        class CountingAdjacency(dict):
+            visits = 0
+
+            def __iter__(self):
+                for ref in super().__iter__():
+                    self.visits += 1
+                    yield ref
+
+        adjacency = CountingAdjacency(
+            (ref, None) for ref in graph._upstream["record:target"]
+        )
+        graph._upstream["record:target"] = adjacency
+        refs, truncated = graph.bounded_upstream_refs("record:target", limit=1)
+        self.assertEqual(refs, ["record:source_000"])
+        self.assertTrue(truncated)
+        self.assertEqual(adjacency.visits, 2)
+
+    def test_expand_and_episode_never_use_full_adjacency_materialization(self):
+        tools = CausalInvestigationTools(self.graph)
+        with patch.object(
+            self.graph,
+            "upstream_refs",
+            side_effect=AssertionError("full upstream materialization forbidden"),
+        ), patch.object(
+            self.graph,
+            "downstream_refs",
+            side_effect=AssertionError("full downstream materialization forbidden"),
+        ):
+            expanded = tools.execute(
+                InvestigationDirective.create(
+                    "expand_upstream",
+                    {"ref": "record:decision", "limit": 1},
+                    requested_by_ref="record:decision",
+                    reason="Expand one bounded predecessor.",
+                )
+            )
+            episode = tools.execute(
+                InvestigationDirective.create(
+                    "inspect_episode",
+                    {"ref": "record:decision"},
+                    requested_by_ref="record:decision",
+                    reason="Inspect bounded episode adjacency.",
+                )
+            )
+        self.assertEqual(expanded.status, "success")
+        self.assertEqual(episode.status, "success")
+
     def test_unexpected_tool_failure_becomes_auditable_error(self):
         class BrokenTools(CausalInvestigationTools):
             def _inspect_node(self, directive):
@@ -759,23 +901,26 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.assertEqual(report.metadata["confirmation_queue"], ())
 
     def test_reject_hypothesis_control_requires_resolved_opposition(self):
-        judge = ScriptedInvestigatingJudge(
-            [
-                judgment(
-                    "record:decision",
-                    status="present",
-                    introduction=True,
-                    missing=(),
-                    suggested={
-                        "action": "reject_hypothesis",
-                        "arguments": {
-                            "hypothesis_id": "active",
-                            "opposing_evidence_refs": ["record:missing"],
-                        },
-                        "reason": "A missing ref allegedly contradicts the branch.",
+        def reject_with_missing_opposition(request):
+            return judgment(
+                "record:decision",
+                status="present",
+                introduction=True,
+                missing=(),
+                suggested={
+                    "action": "reject_hypothesis",
+                    "arguments": {
+                        "hypothesis_id": request.recursive_context[
+                            "active_hypothesis_id"
+                        ],
+                        "opposing_evidence_refs": ["record:missing"],
                     },
-                )
-            ]
+                    "reason": "A missing ref allegedly contradicts the branch.",
+                },
+            )
+
+        judge = ScriptedInvestigatingJudge(
+            [reject_with_missing_opposition]
         )
         report = AgenticRecursiveAnalyzer(judge=judge).analyze(
             self.graph,
@@ -815,6 +960,128 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.assertEqual(report.introduction_candidates, ())
         self.assertEqual(report.step_judgments, ())
         self.assertEqual(report.hypotheses[0].status, "rejected")
+
+    def test_reject_mismatched_hypothesis_changes_neither_branch(self):
+        state = RecursiveAnalysisState.create(
+            graph=self.graph,
+            start_refs=["record:source", "record:decision"],
+            objective="Find the defect.",
+            analysis_perspective="Compare independent branches.",
+            max_hypotheses=4,
+        )
+        item = state.frontier.pop()
+        other = next(
+            value
+            for value in state.ledger.snapshot()
+            if value["hypothesis_id"] != item.hypothesis_id
+        )
+        request = state.build_step_request(self.graph, item, ())
+        current_judgment = judgment(
+            item.node_ref,
+            status="present",
+            introduction=True,
+            missing=(),
+        )
+        result = AgenticRecursiveAnalyzer(
+            judge=ScriptedInvestigatingJudge([])
+        )._apply_control_directive(
+            state,
+            item,
+            current_judgment,
+            request,
+            {
+                "action": "reject_hypothesis",
+                "arguments": {
+                    "hypothesis_id": other["hypothesis_id"],
+                    "opposing_evidence_refs": ["record:source"],
+                },
+                "reason": "Attempt to reject a different branch.",
+            },
+        )
+        self.assertEqual(result, "rejected")
+        self.assertTrue(all(value["status"] == "active" for value in state.ledger.snapshot()))
+        self.assertEqual(len(state.frontier.in_flight_items()), 1)
+        state.apply_step(
+            item,
+            current_judgment,
+            graph_position=self.graph.position,
+            max_hypotheses=4,
+        )
+        self.assertEqual(
+            [candidate.ref for candidate in state.introduction_candidates],
+            [item.node_ref],
+        )
+
+    def test_active_rejection_atomically_terminates_all_hypothesis_work(self):
+        state = RecursiveAnalysisState.create(
+            graph=self.graph,
+            start_refs=["record:decision"],
+            objective="Find the defect.",
+            analysis_perspective="Inspect one branch.",
+            max_hypotheses=4,
+        )
+        item = state.frontier.pop()
+        hypothesis = state.ledger.get(item.hypothesis_id)
+        sibling = FrontierItem.create(
+            node_ref="record:source",
+            defect_state=item.defect_state,
+            downstream_path=["record:source", "record:decision"],
+            hypothesis_id=hypothesis.hypothesis_id,
+            hypothesis_semantic_hash=hypothesis.semantic_hash,
+            depth=1,
+            candidate_source="test",
+            priority=0.5,
+            graph_position=self.graph.position("record:source"),
+        )
+        self.assertTrue(state.frontier.push(sibling))
+        request = state.build_step_request(self.graph, item, ())
+        current_judgment = judgment(item.node_ref, status="present", missing=())
+        result = AgenticRecursiveAnalyzer(
+            judge=ScriptedInvestigatingJudge([])
+        )._apply_control_directive(
+            state,
+            item,
+            current_judgment,
+            request,
+            {
+                "action": "reject_hypothesis",
+                "arguments": {
+                    "hypothesis_id": item.hypothesis_id,
+                    "opposing_evidence_refs": ["record:source"],
+                },
+                "reason": "Grounded evidence rejects the active branch.",
+            },
+        )
+        self.assertEqual(result, "branch_rejected")
+        self.assertEqual(state.ledger.get(item.hypothesis_id).status, "rejected")
+        checkpoint = state.frontier.checkpoint()
+        self.assertEqual(checkpoint["queued"], [])
+        self.assertEqual(checkpoint["in_flight"], [])
+
+    def test_apply_step_refuses_rejected_hypothesis_defensively(self):
+        state = RecursiveAnalysisState.create(
+            graph=self.graph,
+            start_refs=["record:decision"],
+            objective="Find the defect.",
+            analysis_perspective="Inspect one branch.",
+            max_hypotheses=4,
+        )
+        item = state.frontier.pop()
+        state.ledger.reject(item.hypothesis_id, "Rejected before stale work returned.")
+        state.apply_step(
+            item,
+            judgment(
+                item.node_ref,
+                status="present",
+                introduction=True,
+                missing=(),
+            ),
+            graph_position=self.graph.position,
+            max_hypotheses=4,
+        )
+        self.assertEqual(state.step_judgments, [])
+        self.assertEqual(state.introduction_candidates, [])
+        self.assertEqual(state.frontier.in_flight_items(), [])
 
     def test_model_authored_verifier_rejection_is_never_applied(self):
         def forged(request):
@@ -896,12 +1163,163 @@ class AnalyzerInvestigationTest(unittest.TestCase):
             self.assertIn("result", entry)
             self.assertIn("context_after_hash", entry)
             self.assertIn("rejudge_linkage", entry)
-        self.assertEqual(
-            report.investigation_journal[0]["rejudge_linkage"]["status"], "linked"
-        )
+        first = report.investigation_journal[0]
+        self.assertEqual(first["rejudge_linkage"]["status"], "completed")
+        self.assertEqual(first["rejudge_linkage"]["terminal_state"], "offline_success")
+        self.assertEqual(first["judgment_after_investigation"]["current_node_ref"], "record:decision")
+        self.assertTrue(first["judgment_after_hash"])
         self.assertEqual(
             report.investigation_journal[1]["rejudge_linkage"]["status"], "not_scheduled"
         )
+
+    def test_rejudge_provider_failure_is_terminally_linked_to_investigation(self):
+        def provider_failure(_request):
+            raise JudgeProviderUnavailable("provider unavailable during rejudge")
+
+        report = AgenticRecursiveAnalyzer(
+            judge=ScriptedInvestigatingJudge(
+                [
+                    judgment(
+                        "record:decision",
+                        suggested={
+                            "tool": "inspect_node",
+                            "arguments": {"ref": "record:decision"},
+                            "reason": "Resolve the missing decision semantics.",
+                        },
+                    ),
+                    provider_failure,
+                ]
+            )
+        ).analyze(
+            self.graph,
+            start_refs=["record:decision"],
+            objective="Find the defect.",
+        )
+        entry = report.investigation_journal[0]
+        self.assertEqual(entry["rejudge_linkage"]["status"], "completed")
+        self.assertEqual(
+            entry["rejudge_linkage"]["terminal_state"],
+            "provider_unavailable",
+        )
+        self.assertIsNone(entry["judgment_after_investigation"])
+        self.assertIn("provider unavailable", entry["rejudge_linkage"]["detail"])
+
+    def test_rejudge_records_budget_validation_and_error_terminal_states(self):
+        cases = (
+            (
+                judgment(
+                    "record:decision",
+                    missing=("judge_request_budget_exhausted before request",),
+                ),
+                "budget_exhausted",
+            ),
+            (
+                judgment(
+                    "record:decision",
+                    missing=("judge_validation_error: invalid schema",),
+                ),
+                "validation_error",
+            ),
+            ({"not": "a causal step judgment"}, "validation_error"),
+            (RuntimeError("unexpected rejudge failure"), "judge_error"),
+        )
+        for terminal, expected in cases:
+            with self.subTest(expected=expected):
+                def second_response(_request, value=terminal):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+
+                report = AgenticRecursiveAnalyzer(
+                    judge=ScriptedInvestigatingJudge(
+                        [
+                            judgment(
+                                "record:decision",
+                                suggested={
+                                    "tool": "inspect_node",
+                                    "arguments": {"ref": "record:decision"},
+                                    "reason": "Resolve missing semantics.",
+                                },
+                            ),
+                            second_response,
+                        ]
+                    )
+                ).analyze(
+                    self.graph,
+                    start_refs=["record:decision"],
+                    objective="Find the defect.",
+                )
+                entry = report.investigation_journal[0]
+                self.assertEqual(
+                    entry["rejudge_linkage"]["terminal_state"], expected
+                )
+
+    def test_rejudge_zero_request_bounded_success_is_recorded_as_cache_hit(self):
+        class CachedBoundedJudge(BoundedJudgeCapability):
+            def __init__(self):
+                self.responses = [
+                    judgment(
+                        "record:decision",
+                        suggested={
+                            "tool": "inspect_node",
+                            "arguments": {"ref": "record:decision"},
+                            "reason": "Resolve missing semantics.",
+                        },
+                    ),
+                    judgment("record:decision", status="absent", missing=()),
+                ]
+                self.requests = []
+                self.transport = type("Transport", (), {"request_count": 0})()
+
+            def judge_step_bounded(self, request, *, max_physical_requests):
+                self.requests.append(request)
+                return self.responses.pop(0)
+
+        report = AgenticRecursiveAnalyzer(judge=CachedBoundedJudge()).analyze(
+            self.graph,
+            start_refs=["record:decision"],
+            objective="Find the defect.",
+        )
+        self.assertEqual(
+            report.investigation_journal[0]["rejudge_linkage"]["terminal_state"],
+            "cache_hit",
+        )
+
+    def test_rejudge_retrieval_error_updates_originating_journal(self):
+        class FailingOnReentryRetriever:
+            def __init__(self):
+                self.calls = 0
+
+            def retrieve(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("retrieval failed during rejudge")
+                return []
+
+        report = AgenticRecursiveAnalyzer(
+            judge=ScriptedInvestigatingJudge(
+                [
+                    judgment(
+                        "record:decision",
+                        suggested={
+                            "tool": "inspect_node",
+                            "arguments": {"ref": "record:decision"},
+                            "reason": "Resolve missing semantics.",
+                        },
+                    )
+                ]
+            ),
+            retriever=FailingOnReentryRetriever(),
+        ).analyze(
+            self.graph,
+            start_refs=["record:decision"],
+            objective="Find the defect.",
+        )
+        entry = report.investigation_journal[0]
+        self.assertEqual(
+            entry["rejudge_linkage"]["terminal_state"], "retrieval_error"
+        )
+        self.assertIn("retrieval failed", entry["rejudge_linkage"]["detail"])
 
     def test_record_hypothesis_reuses_existing_identity_at_budget_boundary(self):
         def record_existing(request):

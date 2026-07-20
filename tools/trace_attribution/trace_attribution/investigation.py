@@ -90,6 +90,7 @@ RESULT_KEYS = frozenset(
         "byte_count",
         "artifact_byte_count",
         "evidence_hash",
+        "result_identity_hash",
         "rejection_reason",
         "error",
     }
@@ -99,6 +100,7 @@ MAX_CAUSAL_PATH_LENGTH = 32
 MAX_CONTEXT_LINEAGE_MATCHES = 64
 MAX_CONTEXT_LINEAGE_SCANS = 4096
 MAX_EPISODE_REFS = 64
+INVESTIGATION_ID_PATTERN = re.compile(r"^investigation:[0-9a-f]{24}$")
 
 
 def _freeze(value: Any) -> Any:
@@ -126,6 +128,77 @@ def _strings(values: Iterable[Any]) -> Tuple[str, ...]:
             seen.add(item)
             output.append(item)
     return tuple(output)
+
+
+def _validated_ref_sequence(value: Any, *, label: str) -> Tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("{0} must be a list of refs".format(label))
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError("{0} entries must be non-empty strings".format(label))
+    canonical = _strings(value)
+    if tuple(value) != canonical:
+        raise ValueError("{0} must be canonical, unique refs".format(label))
+    return canonical
+
+
+def _structured_message_ids(value: Any) -> Tuple[str, ...]:
+    message_keys = {
+        "messageid",
+        "frommessageid",
+        "tomessageid",
+        "sourcemessageid",
+        "targetmessageid",
+        "parentmessageid",
+        "inputmessageid",
+        "outputmessageid",
+    }
+    output: List[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for raw_key, child in item.items():
+                key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
+                if key in message_keys and isinstance(child, str) and child.strip():
+                    output.append(child.strip())
+                elif key == "evidencerefs" and isinstance(child, (list, tuple)):
+                    output.extend(
+                        ref[len("message:") :]
+                        for ref in child
+                        if isinstance(ref, str)
+                        and ref.startswith("message:")
+                        and ref[len("message:") :]
+                    )
+                elif isinstance(child, (Mapping, list, tuple)):
+                    visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return _strings(output)
+
+
+def _structured_record_refs(value: Any, known_refs: Set[str]) -> Tuple[str, ...]:
+    output: List[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for raw_key, child in item.items():
+                key = re.sub(r"[^a-z0-9]", "", str(raw_key).casefold())
+                if key.endswith("ref") and isinstance(child, str) and child in known_refs:
+                    output.append(child)
+                elif key.endswith("refs") and isinstance(child, (list, tuple)):
+                    output.extend(
+                        ref for ref in child if isinstance(ref, str) and ref in known_refs
+                    )
+                elif isinstance(child, (Mapping, list, tuple)):
+                    visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return _strings(output)
 
 
 def _identity(prefix: str, value: Mapping[str, Any]) -> str:
@@ -459,6 +532,7 @@ class InvestigationResult:
     byte_count: int = 0
     artifact_byte_count: int = 0
     evidence_hash: str = ""
+    result_identity_hash: str = ""
     rejection_reason: str = ""
     error: str = ""
 
@@ -520,6 +594,7 @@ class InvestigationResult:
             error=semantic["error"],
         )
         object.__setattr__(result, "evidence_hash", _result_evidence_hash(result))
+        object.__setattr__(result, "result_identity_hash", _result_identity_hash(result))
         return result
 
     @classmethod
@@ -552,9 +627,11 @@ class InvestigationResult:
             byte_count=0,
             artifact_byte_count=0,
             evidence_hash="",
+            result_identity_hash="",
             rejection_reason="duplicate_directive_unchanged_evidence",
         )
         object.__setattr__(result, "evidence_hash", _result_evidence_hash(result))
+        object.__setattr__(result, "result_identity_hash", _result_identity_hash(result))
         return result
 
     def to_dict(self) -> JsonDict:
@@ -571,6 +648,7 @@ class InvestigationResult:
             "byte_count": self.byte_count,
             "artifact_byte_count": self.artifact_byte_count,
             "evidence_hash": self.evidence_hash,
+            "result_identity_hash": self.result_identity_hash,
             "rejection_reason": self.rejection_reason,
             "error": self.error,
         }
@@ -582,9 +660,23 @@ class InvestigationResult:
         )
         if value.get("directive_kind") != "evidence_investigation":
             raise ValueError("directive_kind must be evidence_investigation")
+        directive_id = value.get("directive_id")
+        if not isinstance(directive_id, str) or not INVESTIGATION_ID_PATTERN.fullmatch(
+            directive_id
+        ):
+            raise ValueError("persisted investigation result has invalid directive_id")
+        tool_name = value.get("tool_name")
+        if not isinstance(tool_name, str) or tool_name not in EVIDENCE_TOOLS:
+            raise ValueError("persisted investigation result has unsupported tool_name")
         for key in ("requested_refs", "resolved_refs", "provenance"):
             if not isinstance(value.get(key), list):
                 raise ValueError("persisted investigation result {0} must be a list".format(key))
+        requested_refs = _validated_ref_sequence(
+            value["requested_refs"], label="requested_refs"
+        )
+        resolved_refs = _validated_ref_sequence(
+            value["resolved_refs"], label="resolved_refs"
+        )
         if any(not isinstance(item, Mapping) for item in value["provenance"]):
             raise ValueError("persisted investigation result provenance entries must be objects")
         if not isinstance(value.get("payload"), Mapping):
@@ -599,31 +691,37 @@ class InvestigationResult:
             "tool_name",
             "status",
             "evidence_hash",
+            "result_identity_hash",
             "rejection_reason",
             "error",
         ):
             if not isinstance(value.get(key), str):
                 raise ValueError("persisted investigation result {0} must be a string".format(key))
         restored = cls(
-            directive_id=str(value.get("directive_id") or ""),
+            directive_id=directive_id,
             directive_kind=str(value.get("directive_kind") or "evidence_investigation"),
-            tool_name=str(value.get("tool_name") or ""),
+            tool_name=tool_name,
             status=str(value.get("status") or "error"),
-            requested_refs=_strings(value.get("requested_refs") or []),
-            resolved_refs=_strings(value.get("resolved_refs") or []),
+            requested_refs=requested_refs,
+            resolved_refs=resolved_refs,
             provenance=tuple(value["provenance"]),
             payload=value["payload"],
             truncated=value["truncated"],
             byte_count=value["byte_count"],
             artifact_byte_count=value["artifact_byte_count"],
             evidence_hash="",
+            result_identity_hash="",
             rejection_reason=str(value.get("rejection_reason") or ""),
             error=str(value.get("error") or ""),
         )
         expected = _result_evidence_hash(restored)
         if value.get("evidence_hash") != expected:
             raise ValueError("investigation result evidence_hash mismatch")
+        identity = _result_identity_hash(restored)
+        if value.get("result_identity_hash") != identity:
+            raise ValueError("investigation result identity mismatch")
         object.__setattr__(restored, "evidence_hash", expected)
+        object.__setattr__(restored, "result_identity_hash", identity)
         return restored
 
 
@@ -636,6 +734,28 @@ def _result_evidence_hash(result: InvestigationResult) -> str:
         "truncated": result.truncated,
         "byte_count": result.byte_count,
         "artifact_byte_count": result.artifact_byte_count,
+        "rejection_reason": result.rejection_reason,
+        "error": result.error,
+    }
+    return "sha256:{0}".format(
+        hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()
+    )
+
+
+def _result_identity_hash(result: InvestigationResult) -> str:
+    semantic = {
+        "directive_id": result.directive_id,
+        "directive_kind": result.directive_kind,
+        "tool_name": result.tool_name,
+        "status": result.status,
+        "requested_refs": list(result.requested_refs),
+        "resolved_refs": list(result.resolved_refs),
+        "provenance": [_thaw(item) for item in result.provenance],
+        "payload": _thaw(result.payload),
+        "truncated": result.truncated,
+        "byte_count": result.byte_count,
+        "artifact_byte_count": result.artifact_byte_count,
+        "evidence_hash": result.evidence_hash or _result_evidence_hash(result),
         "rejection_reason": result.rejection_reason,
         "error": result.error,
     }
@@ -742,8 +862,16 @@ class CausalInvestigationTools:
         raw_ref = _required_text(directive.arguments, "ref")
         resolved, _ = self._resolve_node(raw_ref)
         limit = _bounded_int(directive.arguments, "limit", default=24, minimum=1, maximum=96)
-        refs = self.graph.upstream_refs(resolved) if upstream else self.graph.downstream_refs(resolved)
         relation_filter = set(_strings(directive.arguments.get("relation_filter") or []))
+        refs, truncated = (
+            self.graph.bounded_upstream_refs(
+                resolved, limit=limit, relation_filter=relation_filter
+            )
+            if upstream
+            else self.graph.bounded_downstream_refs(
+                resolved, limit=limit, relation_filter=relation_filter
+            )
+        )
         rows: List[JsonDict] = []
         for ref in refs:
             edges = (
@@ -753,8 +881,6 @@ class CausalInvestigationTools:
             )
             if relation_filter:
                 edges = [edge for edge in edges if edge.get("relation") in relation_filter]
-                if not edges:
-                    continue
             rows.append(
                 {
                     "ref": ref,
@@ -762,10 +888,7 @@ class CausalInvestigationTools:
                     "edges": edges,
                 }
             )
-            if len(rows) > limit:
-                break
-        truncated = len(rows) > limit
-        selected = rows[:limit]
+        selected = rows
         provenance = [self._record_provenance(resolved)]
         for row in selected:
             provenance.append(self._record_provenance(str(row["ref"])))
@@ -893,19 +1016,23 @@ class CausalInvestigationTools:
         episode_refs = []
         if node.event_type == "progress.episode":
             episode_refs.append(resolved)
-        truncated = False
-        for ref in [*self.graph.upstream_refs(resolved), *self.graph.downstream_refs(resolved)]:
-            if not (
-                self.graph.nodes.get(ref)
-                and self.graph.nodes[ref].event_type == "progress.episode"
-            ):
-                continue
-            if ref not in episode_refs:
-                episode_refs.append(ref)
-            if len(episode_refs) > MAX_EPISODE_REFS:
-                truncated = True
-                break
-        episode_refs = episode_refs[:MAX_EPISODE_REFS]
+        remaining = MAX_EPISODE_REFS - len(episode_refs)
+        upstream_refs, truncated = self.graph.bounded_upstream_refs(
+            resolved,
+            limit=remaining,
+            event_type="progress.episode",
+            exclude=episode_refs,
+        )
+        episode_refs.extend(upstream_refs)
+        if not truncated:
+            remaining = MAX_EPISODE_REFS - len(episode_refs)
+            downstream_refs, truncated = self.graph.bounded_downstream_refs(
+                resolved,
+                limit=remaining,
+                event_type="progress.episode",
+                exclude=episode_refs,
+            )
+            episode_refs.extend(downstream_refs)
         payload = {
             "anchor": node.compact(),
             "episodes": [self.graph.nodes[ref].compact(max_chars=16_000) for ref in episode_refs],
@@ -926,7 +1053,7 @@ class CausalInvestigationTools:
         matches: List[JsonDict] = []
         scanned = 0
         truncated = False
-        for key in ("turns", "edges", "transforms"):
+        for key in ("turns", "snapshots", "edges", "transforms"):
             values = lineage.get(key) or []
             if not isinstance(values, (list, tuple)):
                 continue
@@ -935,7 +1062,10 @@ class CausalInvestigationTools:
                     truncated = True
                     break
                 scanned += 1
-                if isinstance(item, Mapping) and message_id in stable_json(item):
+                if (
+                    isinstance(item, Mapping)
+                    and message_id in _structured_message_ids(item)
+                ):
                     if len(matches) >= MAX_CONTEXT_LINEAGE_MATCHES:
                         truncated = True
                         break
@@ -949,11 +1079,11 @@ class CausalInvestigationTools:
                 break
         if not matches:
             raise ValueError("context message selector is unresolved")
+        known_refs = set(self.graph.nodes)
         refs = _strings(
             value
             for item in matches
-            for value in re.findall(r"record:[A-Za-z0-9_.:-]+", stable_json(item))
-            if value in self.graph.nodes
+            for value in _structured_record_refs(item["value"], known_refs)
         )
         payload = {"message_id": message_id, "matches": matches, "scanned_items": scanned}
         return InvestigationResult.success(
