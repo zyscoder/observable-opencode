@@ -630,6 +630,11 @@ def _semantic_state(value: str) -> str:
     return _SEMANTIC_TOKEN_ALIASES.get(normalized, normalized)
 
 
+def _is_temporal_provenance_value(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized.startswith("temporal_") or "temporal" in normalized
+
+
 def _is_provider_context_key(key: str) -> bool:
     tokens = _semantic_tokens(key)
     if tokens.intersection({"circuit", "judge", "provider", "transport"}):
@@ -905,8 +910,7 @@ class _ConfirmationFactTreeValidator:
             )
             if not provenance_value or not isinstance(child, str):
                 continue
-            normalized = child.strip().lower()
-            if normalized.startswith("temporal_") or "temporal" in normalized:
+            if _is_temporal_provenance_value(child):
                 errors.append("temporal provenance field {0} is confirmation-ineligible".format(key))
         return errors
 
@@ -918,6 +922,13 @@ class _ConfirmationFactTreeValidator:
         parent_key: str,
         context: _FactTreeContext,
     ) -> None:
+        if (
+            isinstance(value, str)
+            and context.in_provenance_context
+            and _is_temporal_provenance_value(value)
+        ):
+            self._error(path, "temporal provenance value is confirmation-ineligible")
+            return
         if isinstance(value, Mapping):
             artifact_status_shaped = parent_key == "artifact_status"
             envelope_shaped = (
@@ -1234,9 +1245,25 @@ class _ConfirmationFactTreeValidator:
                     errors.append("blocking {0}=true".format(key))
                 if (
                     not child
-                    and grounding_status_context
-                    and key_tokens.intersection(
-                        {"available", "complete", "grounded", "hydrated", "resolved"}
+                    and (
+                        (
+                            grounding_status_context
+                            and key_tokens.intersection(
+                                {
+                                    "available",
+                                    "complete",
+                                    "grounded",
+                                    "hydrated",
+                                    "resolved",
+                                }
+                            )
+                        )
+                        or (
+                            provider_context
+                            and key_tokens.intersection(
+                                {"available", "hydrated", "resolved"}
+                            )
+                        )
                     )
                 ):
                     errors.append("blocking {0}=false".format(key))
@@ -1329,6 +1356,13 @@ class _ConfirmationFactTreeValidator:
         candidate_local: bool,
         context: _FactTreeContext,
     ) -> None:
+        if (
+            isinstance(value, str)
+            and context.in_provenance_context
+            and _is_temporal_provenance_value(value)
+        ):
+            self._error(path, "temporal provenance value is confirmation-ineligible")
+            return
         if isinstance(value, Mapping):
             artifact_status_shaped = parent_key == "artifact_status"
             envelope_shaped = (

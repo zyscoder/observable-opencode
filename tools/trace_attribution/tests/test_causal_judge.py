@@ -912,7 +912,7 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 self.assertEqual(result.status, "confirmed")
 
     def test_structured_provenance_context_preserves_temporal_exclusion(self):
-        temporal_containers = (
+        temporal_containers = [
             {
                 "edge_provenance": {
                     "type": "temporal_order",
@@ -934,7 +934,21 @@ class RootConfirmationValidationTest(unittest.TestCase):
             {"source": [{"type": "temporal_proximity"}]},
             {"origin": {"edges": [{"type": "temporal_order"}]}},
             {"method": [{"details": {"kind": "temporal_adjacency"}}]},
-        )
+        ]
+        for field in ("source", "origin", "method"):
+            temporal_containers.extend(
+                (
+                    {field: "temporal_proximity"},
+                    {field: ["temporal_proximity"]},
+                    {field: [["temporal_proximity"]]},
+                    {
+                        field: [
+                            {"type": "recorded_edge"},
+                            ["semantic_analysis", {"kind": "temporal_proximity"}],
+                        ]
+                    },
+                )
+            )
         payload = valid_confirmation_payload()
         payload["evidence_refs"] = ["record:decision"]
         for structured_provenance in temporal_containers:
@@ -952,12 +966,26 @@ class RootConfirmationValidationTest(unittest.TestCase):
                 )
 
     def test_nested_non_temporal_provenance_forms_remain_eligible(self):
-        eligible_provenance = (
+        eligible_provenance = [
             {"source": {"type": "recorded_artifact"}},
             {"source": [{"type": "reconstructed_fact"}]},
             {"origin": {"edges": [{"type": "confirmed_edge"}]}},
             {"method": [{"details": {"kind": "semantic_analysis"}}]},
-        )
+        ]
+        for field in ("source", "origin", "method"):
+            eligible_provenance.extend(
+                (
+                    {field: "recorded_artifact"},
+                    {field: ["recorded_artifact"]},
+                    {field: [["recorded_artifact"]]},
+                    {
+                        field: [
+                            {"type": "recorded_edge"},
+                            ["semantic_analysis", {"kind": "confirmed_edge"}],
+                        ]
+                    },
+                )
+            )
         payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
         for provenance in eligible_provenance:
             with self.subTest(provenance=provenance):
@@ -971,6 +999,77 @@ class RootConfirmationValidationTest(unittest.TestCase):
                     payload,
                     request=sample_confirmation_request(
                         supporting_evidence=(candidate_fact,)
+                    ),
+                )
+
+                self.assertEqual(result.status, "confirmed")
+
+    def test_provider_false_health_flags_block_in_every_fact_tree_context(self):
+        provider_health_failures = (
+            ("candidate", {"provider_availability": False}),
+            ("candidate", {"provider_status": {"resolution": False}}),
+            ("obligation", {"provider_availability": False}),
+            ("obligation", {"provider_status": {"available": False}}),
+            ("obligation", {"provider": [{"health": {"hydration": False}}]}),
+            ("hypothesis", {"provider_resolution": False}),
+            ("hypothesis", {"provider_status": {"available": False}}),
+            ("hypothesis", {"provider": [[{"health": {"hydrated": False}}]]}),
+        )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for location, failure in provider_health_failures:
+            candidate_fact = {
+                **reference_envelope("record:decision"),
+                "content": "Implement only the explicitly listed methods.",
+            }
+            request_kwargs = {"supporting_evidence": (candidate_fact,)}
+            if location == "candidate":
+                candidate_fact.update(failure)
+            elif location == "obligation":
+                request_kwargs["task_obligations"] = (
+                    {"source": "task", "text": "Preserve the parser contract.", **failure},
+                )
+            else:
+                request_kwargs["competing_hypotheses"] = (
+                    {
+                        "hypothesis_id": "hyp_closed",
+                        "status": "rejected",
+                        "candidate_reference": reference_envelope("record:alternative"),
+                        **failure,
+                    },
+                )
+            with self.subTest(location=location, failure=failure), self.assertRaisesRegex(
+                ValueError, "blocking"
+            ):
+                validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(**request_kwargs),
+                )
+
+    def test_non_provider_domain_false_flags_remain_eligible(self):
+        domain_facts = (
+            {"tool_request": {"status": "failed", "available": False}},
+            {"tool_status": {"resolution": False}},
+            {"execution_result": {"hydration": False}},
+        )
+        payload = {**valid_confirmation_payload(), "evidence_refs": ["record:decision"]}
+        for domain_fact in domain_facts:
+            with self.subTest(domain_fact=domain_fact):
+                result = validate_recursive_confirmation(
+                    payload,
+                    request=sample_confirmation_request(
+                        supporting_evidence=(
+                            {
+                                **reference_envelope("record:decision"),
+                                "content": "Implement only the explicitly listed methods.",
+                            },
+                        ),
+                        task_obligations=(
+                            {
+                                "source": "task",
+                                "text": "Preserve the parser contract.",
+                                **domain_fact,
+                            },
+                        ),
                     ),
                 )
 
@@ -1581,10 +1680,48 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             "content": "Implement only the explicitly listed methods.",
             "source": [{"type": "temporal_proximity"}],
         }
+        temporal_scalar_shapes = (
+            "temporal_proximity",
+            ["temporal_proximity"],
+            [["temporal_proximity"]],
+            [
+                {"type": "recorded_edge"},
+                ["semantic_analysis", {"kind": "temporal_proximity"}],
+            ],
+        )
+        temporal_scalar_requests = tuple(
+            sample_confirmation_request(
+                supporting_evidence=(
+                    {
+                        **reference_envelope("record:decision"),
+                        "content": "Implement only the explicitly listed methods.",
+                        field: shape,
+                    },
+                )
+            )
+            for field in ("source", "origin", "method")
+            for shape in temporal_scalar_shapes
+        )
+        false_provider_candidate = {
+            **reference_envelope("record:decision"),
+            "content": "Implement only the explicitly listed methods.",
+            "provider_availability": False,
+        }
         scalar_provider_failure = {
             **reference_envelope("record:decision"),
             "content": "Implement only the explicitly listed methods.",
             "provider_failure": "timeout",
+        }
+        false_provider_obligation = {
+            "source": "task",
+            "text": "Preserve the parser contract.",
+            "provider_status": {"available": False},
+        }
+        false_provider_hypothesis = {
+            "hypothesis_id": "hyp_closed",
+            "status": "rejected",
+            "candidate_reference": reference_envelope("record:alternative"),
+            "provider": [{"health": {"hydration": False}}],
         }
         for request in (
             sample_confirmation_request(opposing_evidence=(unresolved_opposition,)),
@@ -1593,7 +1730,13 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             sample_confirmation_request(task_obligations=(provider_error_obligation,)),
             sample_confirmation_request(supporting_evidence=(aliased_blocker,)),
             sample_confirmation_request(supporting_evidence=(temporal_source,)),
+            *temporal_scalar_requests,
             sample_confirmation_request(supporting_evidence=(scalar_provider_failure,)),
+            sample_confirmation_request(supporting_evidence=(false_provider_candidate,)),
+            sample_confirmation_request(task_obligations=(false_provider_obligation,)),
+            sample_confirmation_request(
+                competing_hypotheses=(false_provider_hypothesis,)
+            ),
         ):
             with self.subTest(request=request.to_dict()):
                 transport = ScriptedTransport(
