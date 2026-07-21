@@ -341,11 +341,16 @@ class CausalJudgeValidationTest(unittest.TestCase):
         }
         for relation in valid_relations:
             with self.subTest(relation=relation):
+                payload = valid_step_payload(
+                    relation=relation,
+                    recurse=relation in {"same_defect_propagation", "defect_transformation"},
+                )
+                if relation not in {"same_defect_propagation", "defect_transformation"}:
+                    payload["missing_evidence"] = [
+                        "No recursive predecessor or introduction verdict is available."
+                    ]
                 validate_causal_step_payload(
-                    valid_step_payload(
-                        relation=relation,
-                        recurse=relation in {"same_defect_propagation", "defect_transformation"},
-                    ),
+                    payload,
                     request=sample_step_request(),
                 )
         with self.assertRaisesRegex(ValueError, "causal relation"):
@@ -360,7 +365,7 @@ class CausalJudgeValidationTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "recurse=true"):
             validate_causal_step_payload(
-                valid_step_payload(relation="contributing_condition", recurse=True),
+                valid_step_payload(relation="outcome_evidence", recurse=True),
                 request=sample_step_request(),
             )
 
@@ -377,6 +382,77 @@ class CausalJudgeValidationTest(unittest.TestCase):
                     payload = valid_step_payload(relation=relation)
                     mutation(payload)
                     validate_causal_step_payload(payload, request=sample_step_request())
+
+    def test_material_contributing_condition_can_recurse_with_an_upstream_defect(self):
+        payload = valid_step_payload(
+            relation="contributing_condition",
+            recurse=True,
+        )
+        payload["predecessors"][0]["upstream_defect"] = {
+            "label": "incorrect_cancellation_assumption",
+            "mechanism": "the authored plan assumes task cancellation preserves cleanup",
+            "transformation_reason": "the assumption shaped the downstream implementation",
+        }
+
+        result = validate_causal_step_payload(payload, request=sample_step_request())
+
+        predecessor = result.predecessors[0]
+        self.assertTrue(predecessor.recurse)
+        self.assertEqual(
+            predecessor.upstream_defect.label,
+            "incorrect_cancellation_assumption",
+        )
+
+        payload["predecessors"][0]["upstream_defect"] = None
+        with self.assertRaisesRegex(ValueError, "upstream_defect"):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
+    def test_input_provenance_envelope_cannot_recurse_from_motivation_alone(self):
+        base = sample_step_request()
+        prompt = TraceNode(
+            ref="record:prompt",
+            record_id="prompt",
+            component="prompt",
+            event_type="prompt.assembly",
+            data={"text": "Every started task must complete cleanup."},
+        )
+        candidate = CausalCandidate(
+            ref=prompt.ref,
+            node=prompt,
+            source="attribution_edge",
+            evidence_refs=(prompt.ref,),
+        )
+        request = CausalStepRequest(
+            recursive_context={
+                **base.recursive_context,
+                "candidate_predecessors": [
+                    {
+                        "ref": prompt.ref,
+                        "reference": reference_envelope(prompt.ref),
+                        "edge_evidence_references": [reference_envelope(prompt.ref)],
+                        "node": prompt.compact(),
+                    }
+                ],
+            },
+            current_node=base.current_node,
+            defect_state=base.defect_state,
+            candidates=(candidate,),
+        )
+        payload = valid_step_payload(predecessor_ref=prompt.ref)
+        payload["predecessors"][0]["evidence_refs"] = [prompt.ref]
+        payload["predecessors"][0]["reason"] = (
+            "The requirement prompted the decision and fed the defective assumption into the model."
+        )
+
+        with self.assertRaisesRegex(ValueError, "provenance envelope"):
+            validate_causal_step_payload(payload, request=request)
+
+        payload["predecessors"][0]["reason"] = (
+            "The prompt itself contains the same defect: it incorrectly requires cancellation "
+            "without preserving cleanup."
+        )
+        result = validate_causal_step_payload(payload, request=request)
+        self.assertTrue(result.predecessors[0].recurse)
 
     def test_introduction_requires_no_viable_defective_predecessor(self):
         payload = valid_step_payload()
@@ -428,12 +504,207 @@ class CausalJudgeValidationTest(unittest.TestCase):
 
         self.assertTrue(result.candidate_introduction)
 
-    def test_validator_requires_an_assessment_for_every_offered_candidate(self):
+    def test_root_confirmation_control_requires_an_introduction_verdict(self):
+        base = sample_step_request()
+        request = CausalStepRequest(
+            recursive_context={
+                **base.recursive_context,
+                "active_hypothesis_id": "hyp:active",
+            },
+            current_node=base.current_node,
+            defect_state=base.defect_state,
+            candidates=base.candidates,
+        )
+        payload = valid_step_payload()
+        payload["suggested_investigation"] = {
+            "action": "request_root_confirmation",
+            "arguments": {
+                "hypothesis_id": "hyp:active",
+                "candidate_ref": base.current_node.ref,
+                "defect_fingerprint": base.defect_state.fingerprint,
+            },
+            "reason": "Confirm the current node even though it was not judged as an introduction.",
+        }
+
+        with self.assertRaisesRegex(ValueError, "requires candidate_introduction=true"):
+            validate_causal_step_payload(payload, request=request)
+
+    def test_introduction_requires_assessing_every_offered_predecessor(self):
+        base = sample_step_request()
+        request = CausalStepRequest(
+            recursive_context={
+                **base.recursive_context,
+                "active_hypothesis_id": "hyp:active",
+            },
+            current_node=base.current_node,
+            defect_state=base.defect_state,
+            candidates=base.candidates,
+        )
         payload = valid_step_payload()
         payload["predecessors"] = []
+        payload["candidate_introduction"] = True
+        payload["suggested_investigation"] = {
+            "action": "request_root_confirmation",
+            "arguments": {
+                "hypothesis_id": "hyp:active",
+                "candidate_ref": base.current_node.ref,
+                "defect_fingerprint": base.defect_state.fingerprint,
+            },
+            "reason": "Confirm only after every offered predecessor is ruled out.",
+        }
 
-        with self.assertRaisesRegex(ValueError, "every offered candidate"):
+        with self.assertRaisesRegex(ValueError, "every offered predecessor"):
+            validate_causal_step_payload(payload, request=request)
+
+    def test_validator_accepts_sparse_ranked_predecessors_and_records_unselected_candidates(self):
+        payload = valid_step_payload()
+        payload["predecessors"] = []
+        payload["current_defect_status"] = "absent"
+        payload["current_defect_reason"] = "The current node does not contain the active defect."
+
+        result = validate_causal_step_payload(payload, request=sample_step_request())
+
+        self.assertEqual(result.predecessors, ())
+        self.assertEqual(result.unselected_predecessor_refs, ("record:decision",))
+
+    def test_present_defect_cannot_end_without_recursion_introduction_or_missing_evidence(self):
+        payload = valid_step_payload(
+            relation="contributing_condition",
+            recurse=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot terminate silently"):
             validate_causal_step_payload(payload, request=sample_step_request())
+
+        payload["missing_evidence"] = ["The omitted predecessor still needs assessment."]
+        result = validate_causal_step_payload(payload, request=sample_step_request())
+        self.assertEqual(result.current_defect_status, "present")
+
+    def test_validator_rejects_present_status_that_explicitly_denies_a_current_node_defect(self):
+        payload = valid_step_payload()
+        payload["current_defect_status"] = "present"
+        payload["current_defect_reason"] = (
+            "The current node itself is not defective; the defect belongs to an earlier decision."
+        )
+
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
+        payload["current_defect_reason"] = (
+            "The decision itself does not carry the defect; it only triggered verification."
+        )
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
+    def test_validator_rejects_absent_status_when_reason_admits_a_defective_assumption(self):
+        payload = valid_step_payload(relation="unrelated", recurse=False)
+        payload["current_defect_status"] = "absent"
+        payload["current_defect_reason"] = (
+            "The reasoning block assumes awaiting cancellation guarantees cleanup, but that "
+            "assumption is insufficient and does not account for process-level SIGINT timing."
+        )
+        payload["missing_evidence"] = []
+
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
+    def test_navigation_aggregate_cannot_request_root_confirmation(self):
+        base = sample_step_request()
+        current = TraceNode(
+            ref="progress_episode:latest",
+            record_id="latest",
+            component="progress",
+            event_type="progress.episode",
+            data={"offline_only": True, "semantic_role": "aggregate"},
+        )
+        request = CausalStepRequest(
+            recursive_context={
+                "active_hypothesis_id": "hyp:active",
+                "current_ref": current.ref,
+                "candidate_predecessors": [],
+            },
+            current_node=current,
+            defect_state=base.defect_state,
+            candidates=(),
+        )
+        payload = {
+            "current_node_ref": current.ref,
+            "current_defect_status": "present",
+            "current_defect_reason": "The aggregate appears to introduce the defect.",
+            "predecessors": [],
+            "candidate_introduction": True,
+            "missing_evidence": [],
+            "suggested_investigation": {
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "hypothesis_id": "hyp:active",
+                    "candidate_ref": current.ref,
+                    "defect_fingerprint": base.defect_state.fingerprint,
+                },
+                "reason": "Confirm the aggregate.",
+            },
+            "confidence": 0.9,
+        }
+
+        with self.assertRaisesRegex(ValueError, "not eligible"):
+            validate_causal_step_payload(payload, request=request)
+
+        payload["candidate_introduction"] = False
+        payload["current_defect_status"] = "absent"
+        payload["current_defect_reason"] = (
+            "The navigation aggregate is not itself defective, so stop traversal."
+        )
+        payload["suggested_investigation"] = None
+        with self.assertRaisesRegex(ValueError, "cannot close"):
+            validate_causal_step_payload(payload, request=request)
+
+    def test_navigation_contributing_condition_must_open_a_recursive_hypothesis(self):
+        base = sample_step_request()
+        current = TraceNode(
+            ref="progress_episode:latest",
+            record_id="latest",
+            component="progress",
+            event_type="progress.episode",
+            data={"offline_only": True, "semantic_role": "aggregate"},
+        )
+        request = CausalStepRequest(
+            recursive_context={
+                **base.recursive_context,
+                "current_ref": current.ref,
+            },
+            current_node=current,
+            defect_state=base.defect_state,
+            candidates=base.candidates,
+        )
+        payload = valid_step_payload(
+            relation="contributing_condition",
+            recurse=False,
+        )
+        payload["current_node_ref"] = current.ref
+
+        with self.assertRaisesRegex(ValueError, "navigation contributing_condition"):
+            validate_causal_step_payload(payload, request=request)
+
+        payload["current_defect_status"] = "absent"
+        payload["current_defect_reason"] = (
+            "The aggregate itself is not defective, but it routes to a material authored assumption."
+        )
+        payload["predecessors"][0]["recurse"] = True
+        payload["predecessors"][0]["upstream_defect"] = {
+            "label": "incorrect_authored_assumption",
+            "mechanism": "the decision shaped the downstream defect",
+            "transformation_reason": "navigation exposes the upstream semantic cause",
+        }
+        routed = validate_causal_step_payload(payload, request=request)
+        self.assertEqual(routed.current_defect_status, "absent")
+        self.assertTrue(routed.predecessors[0].recurse)
+
+        payload["current_defect_status"] = "unknown"
+        payload["predecessors"] = []
+        payload["missing_evidence"] = ["The candidate decision has not been assessed."]
+        payload["confidence"] = 0.0
+        with self.assertRaisesRegex(ValueError, "every offered predecessor"):
+            validate_causal_step_payload(payload, request=request)
 
     def test_request_snapshots_mutable_recursive_context(self):
         source = {"current_ref": "record:change", "candidate_predecessors": []}
@@ -1727,7 +1998,6 @@ class CausalJudgePromptTest(unittest.TestCase):
             "outcome_evidence",
             "unrelated",
             "unknown",
-            "exactly one assessment for every offered candidate",
             "reference envelope",
             "recurse=true",
             "direct evidence",
@@ -1742,6 +2012,8 @@ class CausalJudgePromptTest(unittest.TestCase):
                     self.assertIn(phrase, prompt)
         confirmation_prompt = prompts[1]
         step_prompt = prompts[0]
+        self.assertIn("sparse ranked assessments", step_prompt)
+        self.assertIn("current node itself is never a predecessor", step_prompt)
         self.assertIn("earliest trace-visible introduction", step_prompt)
         self.assertIn("unknown external sender", step_prompt)
         self.assertIn("root_confirmation_action_schema", step_prompt)
@@ -2034,6 +2306,30 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             self.assertEqual(transport.calls[1]["max_tokens"], transport.max_tokens)
             self.assertEqual(transport.request_count, 2)
             self.assertEqual(cache.stats()["writes"], 1)
+
+    def test_focused_repair_names_the_exact_predecessor_boundary_and_valid_endings(self):
+        invalid = valid_step_payload(predecessor_ref="record:change")
+        transport = ScriptedTransport([json.dumps(invalid), json.dumps(valid_step_payload())])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        judge.judge_step(sample_step_request())
+
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        constraints = repair_payload["repair_constraints"]
+        self.assertEqual(constraints["current_node_ref"], "record:change")
+        self.assertEqual(constraints["offered_predecessor_refs"], ["record:decision"])
+        self.assertIn(
+            "must never appear in predecessors",
+            constraints["current_node_is_not_a_predecessor"],
+        )
+        self.assertEqual(
+            constraints["valid_present_defect_endings"],
+            [
+                "recurse through one or two offered grounded predecessors",
+                "declare candidate_introduction after assessing every offered predecessor and request root confirmation",
+                "return concrete blocking missing_evidence",
+            ],
+        )
 
     def test_full_retry_recovers_after_two_responses_omit_required_confidence(self):
         invalid = valid_step_payload()

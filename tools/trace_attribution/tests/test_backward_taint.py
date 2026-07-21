@@ -944,6 +944,51 @@ class TraceGraphTest(unittest.TestCase):
         self.assertIn("billing-core", hydrated[0]["content"])
         self.assertEqual(graph.artifact_hydration["loaded"], 1)
 
+    def test_partial_latest_uses_manifest_declared_trace_root_for_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "artifacts" / "sha256" / "decision.txt"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text("Complete cancellation rationale.", encoding="utf-8")
+            partial = root / "partial" / "latest.json"
+            partial.parent.mkdir()
+            partial.write_text(
+                json.dumps(
+                    {
+                        "manifest": {
+                            "case_id": "partial-artifact-case",
+                            "files": {"partial_latest": "partial/latest.json"},
+                        },
+                        "artifacts": [
+                            {
+                                "artifact_id": "decision-rationale",
+                                "path": "artifacts/sha256/decision.txt",
+                                "kind": "text",
+                            }
+                        ],
+                        "records": [
+                            {
+                                "record_id": "decision",
+                                "component": "processor",
+                                "event_type": "decision",
+                                "artifact_refs": ["decision-rationale"],
+                                "data": {"rationale": {"artifact_id": "decision-rationale"}},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            graph = TraceGraph.from_file(partial)
+            node = graph.hydrate_node("record:decision")
+
+        self.assertEqual(graph.artifact_hydration["artifact_root"], str(root.resolve()))
+        self.assertEqual(
+            node.data["hydrated_artifacts"][0]["content"],
+            "Complete cancellation rationale.",
+        )
+
     def test_response_claim_upstream_prioritizes_current_revision_direct_support(self):
         trace = {
             "case_id": "revision-order-case",
@@ -1529,6 +1574,7 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         self.assertIn("record:reason_after", predecessors)
         self.assertIn("record:search_after", predecessors)
         self.assertIn("record:reason_latest", predecessors)
+        self.assertIn("record:delivery", predecessors)
         self.assertIn(delivery_episode.ref, predecessors)
         self.assertNotIn(episodes[-2].ref, predecessors)
 

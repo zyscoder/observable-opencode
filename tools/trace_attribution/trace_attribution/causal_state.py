@@ -906,12 +906,18 @@ class CausalStepJudgment:
     candidate_introduction: bool = False
     missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
     suggested_investigation: Optional[JsonDict] = None
+    unselected_predecessor_refs: Tuple[str, ...] = field(default_factory=tuple)
     confidence: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "predecessors", tuple(self.predecessors))
         object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
+        object.__setattr__(
+            self,
+            "unselected_predecessor_refs",
+            _frozen_strings(self.unselected_predecessor_refs),
+        )
         if self.suggested_investigation is not None:
             object.__setattr__(
                 self, "suggested_investigation", FrozenMapping(_thaw(self.suggested_investigation))
@@ -928,6 +934,7 @@ class CausalStepJudgment:
             "suggested_investigation": _thaw(self.suggested_investigation)
             if self.suggested_investigation
             else None,
+            "unselected_predecessor_refs": list(self.unselected_predecessor_refs),
             "confidence": self.confidence,
         }
 
@@ -946,6 +953,9 @@ class CausalStepJudgment:
             suggested_investigation=_json_dict(value.get("suggested_investigation"))
             if isinstance(value.get("suggested_investigation"), dict)
             else None,
+            unselected_predecessor_refs=_string_list(
+                value.get("unselected_predecessor_refs")
+            ),
             confidence=_confidence(value.get("confidence", 0.0)),
         )
 

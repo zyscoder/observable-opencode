@@ -20,7 +20,11 @@ from .causal_judge import (
     bind_root_confirmation,
     preflight_root_confirmation_request,
 )
-from .causal_retrieval import SemanticPredecessorRetriever
+from .causal_retrieval import (
+    SemanticPredecessorRetriever,
+    is_navigation_node,
+    root_candidate_eligible,
+)
 from .causal_state import (
     AttributionHypothesis,
     CausalCandidate,
@@ -37,6 +41,16 @@ from .causal_state import (
 )
 from .checkpoint import CheckpointBundle, CheckpointState
 from .errors import JudgeProviderError, JudgeProviderUnavailable
+from .evidence_capsule import (
+    CandidateEvidenceCapsule,
+    build_candidate_evidence_capsules,
+    candidate_compression_metrics,
+)
+from .global_judge import (
+    GlobalCandidateJudgeRequest,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+)
 from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
 from .investigation import (
@@ -45,11 +59,15 @@ from .investigation import (
     InvestigationDirective,
     InvestigationResult,
 )
-from .judgment_context import build_recursive_judgment_context
+from .judgment_context import build_recursive_judgment_context, task_obligations
 from .models import JsonDict, TraceNode, stable_json
 
 
-RECURSIVE_RELATIONS = frozenset({"same_defect_propagation", "defect_transformation"})
+RECURSIVE_RELATIONS = frozenset(
+    {"same_defect_propagation", "defect_transformation", "contributing_condition"}
+)
+CAUSAL_STEP_CANDIDATE_LIMIT = 8
+NAVIGATION_ROUTE_CANDIDATE_LIMIT = 2
 EVALUATION_START_EVENTS = frozenset(
     {"case.failed", "case.observed_defect", "case.quality_gap", "case.missing_semantic"}
 )
@@ -79,6 +97,16 @@ PROVIDER_ACCOUNTING_KEYS = {
     "investigation_rounds",
     "artifact_bytes",
 }
+NON_CAUSAL_CONFIRMATION_RELATIONS = frozenset(
+    {
+        "temporal_proximity",
+        "temporal_sequence",
+        "previous_progress_episode",
+        "progress_episode_member",
+        "progress_episode_projects_to_target",
+        "semantic_navigation_route",
+    }
+)
 
 
 def _require_exact_checkpoint_keys(
@@ -136,6 +164,25 @@ def _first_semantic_value(data: Mapping[str, Any], keys: Sequence[str], fallback
 
 def _seed_defect_state(node: TraceNode, objective: str) -> DefectState:
     data = node.data
+    if node.event_type == "response.claim":
+        claim = _first_semantic_value(
+            data,
+            ("text", "claim", "summary", "description"),
+            "The final response contains an ungrounded claim candidate.",
+        )
+        return DefectState.create(
+            label="unsupported_response_claim",
+            expected=(
+                objective
+                or "The final response claim is fully grounded, temporally valid, and not contradicted."
+            ),
+            actual=claim,
+            mechanism=(
+                "The claim may be unsupported, contradicted, incomplete, or fully valid; "
+                "defect presence is unconfirmed until evidence comparison."
+            ),
+            scope="response_quality",
+        )
     label = _first_semantic_value(
         data,
         ("failure_type", "gap_kind", "dimension", "issue_kind", "defect_type"),
@@ -167,6 +214,148 @@ def _seed_defect_state(node: TraceNode, objective: str) -> DefectState:
             node.component or node.event_type or "task_quality",
         ),
     )
+
+
+def _global_evidence_search_text(node: TraceNode) -> str:
+    data = node.data
+    payload: JsonDict = {
+        "event_type": node.event_type,
+        "title": node.title,
+        "status": node.status,
+    }
+    for key in (
+        "tool_name",
+        "status",
+        "title",
+        "command",
+        "description",
+        "fact_kind",
+        "semantic_role",
+        "verification_status",
+        "verification_result",
+        "structured_claim",
+    ):
+        value = data.get(key)
+        if value not in (None, "", [], {}):
+            payload[key] = value
+    for key in ("args", "input"):
+        value = data.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        selected = {
+            nested_key: value[nested_key]
+            for nested_key in ("command", "description", "path")
+            if nested_key in value
+        }
+        if selected:
+            payload[key] = selected
+    for key in ("metadata", "output", "data"):
+        value = data.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        selected = {
+            nested_key: value[nested_key]
+            for nested_key in (
+                "preview",
+                "exit",
+                "exit_code",
+                "status",
+                "description",
+            )
+            if nested_key in value
+        }
+        if selected:
+            preview = selected.get("preview")
+            if isinstance(preview, str) and len(preview) > 1600:
+                selected["preview"] = preview[:1600]
+            payload[key] = selected
+    return stable_json(payload).casefold()
+
+
+def _grounded_downstream_path(
+    graph: TraceGraph,
+    start_ref: str,
+    target_refs: Sequence[str],
+    *,
+    max_hops: int = 48,
+) -> Tuple[str, ...]:
+    start = graph.resolve(start_ref) or start_ref
+    targets = {
+        graph.resolve(ref) or str(ref)
+        for ref in target_refs
+        if str(ref)
+    }
+    if start not in graph.nodes or not targets:
+        return ()
+    if start in targets:
+        return (start,)
+    queue: List[Tuple[str, Tuple[str, ...]]] = [(start, (start,))]
+    visited = {start}
+    cursor = 0
+    while cursor < len(queue):
+        current, path = queue[cursor]
+        cursor += 1
+        if len(path) - 1 >= max_hops:
+            continue
+        downstream = sorted(
+            set(graph.downstream_refs(current)),
+            key=lambda ref: (graph.position(ref), ref),
+        )
+        for next_ref in downstream:
+            if next_ref in visited:
+                continue
+            edges = graph.edge_context(current, next_ref)
+            if not any(
+                bool(edge.get("eligible_for_attribution", True))
+                and str(edge.get("relation") or "")
+                not in NON_CAUSAL_CONFIRMATION_RELATIONS
+                for edge in edges
+            ):
+                continue
+            next_path = (*path, next_ref)
+            if next_ref in targets:
+                return next_path
+            visited.add(next_ref)
+            queue.append((next_ref, next_path))
+    return ()
+
+
+def _global_evidence_score(node: TraceNode) -> float:
+    if node.event_type == "verification":
+        return 1.0
+    if node.event_type not in {
+        "tool.result",
+        "tool.error",
+        "evidence.fact",
+        "evidence.semantic_fact",
+        "claim.support_assessment",
+    }:
+        return 0.0
+    text = _global_evidence_search_text(node)
+    verification_terms = (
+        "pytest",
+        "unittest",
+        "mocha",
+        "jest",
+        "vitest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "run focused",
+        " tests pass",
+        " test pass",
+        " passing",
+        " failed",
+        "verification_status",
+        "verification_result",
+    )
+    if not any(term in text for term in verification_terms):
+        return 0.0
+    if node.event_type in {"evidence.fact", "evidence.semantic_fact"}:
+        return 0.85
+    if node.event_type == "claim.support_assessment":
+        return 0.82
+    return 0.8
 
 
 def _clone_graph(graph: TraceGraph) -> TraceGraph:
@@ -587,7 +776,44 @@ class RecursiveAnalysisState:
                         "The evaluation assertion has no concrete outcome evidence.",
                     )
                     continue
+                progress_predecessors = [
+                    ref
+                    for ref in predecessors
+                    if graph.nodes.get(ref)
+                    and graph.nodes[ref].event_type == "progress.episode"
+                ]
+                traversal_predecessors = set(predecessors)
+                if progress_predecessors:
+                    traversal_predecessors = {
+                        max(progress_predecessors, key=graph.position)
+                    }
                 for predecessor_ref in predecessors:
+                    state.causal_relations.append(
+                        PredecessorAssessment(
+                            ref=predecessor_ref,
+                            relation="outcome_evidence",
+                            reason="The evaluation assertion cites this record as observed outcome evidence.",
+                            confidence=1.0,
+                            recurse=False,
+                            evidence_refs=(start_ref, predecessor_ref),
+                        )
+                    )
+                    candidate = state._candidate_for_ref(
+                        predecessor_ref,
+                        source="outcome_evidence",
+                        edge={
+                            "from_ref": predecessor_ref,
+                            "to_ref": start_ref,
+                            "relation": "outcome_evidence",
+                            "evidence_type": "recorded_evaluation",
+                            "eligible_for_attribution": True,
+                        },
+                        evidence_refs=(start_ref, predecessor_ref),
+                    )
+                    if candidate is not None:
+                        state._remember_candidate(candidate)
+                    if predecessor_ref not in traversal_predecessors:
+                        continue
                     if len(state.ledger.snapshot()) >= max_hypotheses:
                         state._increment_budget("hypotheses")
                         state._mark_seed_unresolved(
@@ -616,30 +842,6 @@ class RecursiveAnalysisState:
                     )
                     state.frontier.push(item)
                     state._merge_visit_evidence(item.visit_key, [start_ref])
-                    state.causal_relations.append(
-                        PredecessorAssessment(
-                            ref=predecessor_ref,
-                            relation="outcome_evidence",
-                            reason="The evaluation assertion cites this record as observed outcome evidence.",
-                            confidence=1.0,
-                            recurse=False,
-                            evidence_refs=(start_ref, predecessor_ref),
-                        )
-                    )
-                    candidate = state._candidate_for_ref(
-                        predecessor_ref,
-                        source="outcome_evidence",
-                        edge={
-                            "from_ref": predecessor_ref,
-                            "to_ref": start_ref,
-                            "relation": "outcome_evidence",
-                            "evidence_type": "recorded_evaluation",
-                            "eligible_for_attribution": True,
-                        },
-                        evidence_refs=(start_ref, predecessor_ref),
-                    )
-                    if candidate is not None:
-                        state._remember_candidate(candidate)
                 continue
             if len(state.ledger.snapshot()) >= max_hypotheses:
                 state._increment_budget("hypotheses")
@@ -910,6 +1112,7 @@ class RecursiveAnalysisState:
         graph: TraceGraph,
         item: FrontierItem,
         candidates: Sequence[CausalCandidate],
+        retrieved_candidates: Optional[Sequence[CausalCandidate]] = None,
     ) -> CausalStepRequest:
         hypothesis = self.ledger.get(item.hypothesis_id)
         chain = self.transformation_chains.get(item.defect_state.fingerprint, (item.defect_state,))
@@ -934,6 +1137,21 @@ class RecursiveAnalysisState:
         context["active_hypothesis_id"] = hypothesis.hypothesis_id
         context["active_visit_key"] = item.visit_key
         context["checked_evidence_refs"] = sorted(self.visit_evidence.get(item.visit_key, set()))
+        retrieved = tuple(retrieved_candidates or candidates)
+        offered_refs = {candidate.ref for candidate in candidates}
+        context["candidate_pagination"] = {
+            "retrieved_count": len(retrieved),
+            "offered_count": len(candidates),
+            "offered_candidate_refs": [candidate.ref for candidate in candidates],
+            "omitted_candidate_refs": [
+                candidate.ref
+                for candidate in retrieved
+                if candidate.ref not in offered_refs
+            ],
+            "has_more": len(retrieved) > len(candidates),
+            "page_size": CAUSAL_STEP_CANDIDATE_LIMIT,
+            "selection_method": "structural_provenance_ranked_shortlist_v1",
+        }
         investigated = self.investigation_evidence.get(item.visit_key, [])
         if investigated:
             context["investigation_evidence"] = copy.deepcopy(investigated)
@@ -1163,6 +1381,8 @@ class RecursiveAnalysisState:
             stable_json(judgment.to_dict()).encode("utf-8")
         ).hexdigest()
         is_present = judgment.current_defect_status == "present"
+        current_node = self.graph.nodes.get(item.node_ref)
+        is_navigation = bool(current_node and is_navigation_node(current_node))
         if is_present:
             self.present_hypothesis_ids.add(item.hypothesis_id)
 
@@ -1170,7 +1390,14 @@ class RecursiveAnalysisState:
             details = "; ".join(judgment.missing_evidence) or judgment.current_defect_reason
             self.mark_unresolved(item, "judge_unknown", details)
         elif is_present and judgment.candidate_introduction:
-            if hypothesis.candidate_root_ref != item.node_ref:
+            node = self.graph.nodes.get(item.node_ref)
+            if node is not None and not root_candidate_eligible(node):
+                self.mark_unresolved(
+                    item,
+                    "root_candidate_ineligible",
+                    "Navigation, outcome, lifecycle-start, and context-packaging aggregates cannot introduce a reportable defect root.",
+                )
+            elif hypothesis.candidate_root_ref != item.node_ref:
                 self.mark_unresolved(
                     item,
                     "introduction_hypothesis_mismatch",
@@ -1215,7 +1442,7 @@ class RecursiveAnalysisState:
                 and assessment.relation == "unknown"
             ):
                 self.causal_relations.append(assessment)
-            if assessment.relation == "contributing_condition":
+            if assessment.relation == "contributing_condition" and not assessment.recurse:
                 continue
             if assessment.relation in {"unrelated", "unknown"}:
                 if assessment.relation == "unrelated":
@@ -1253,7 +1480,7 @@ class RecursiveAnalysisState:
                     or "The recursive predecessor has no grounded supporting evidence.",
                 )
                 continue
-            if judgment.current_defect_status != "present":
+            if judgment.current_defect_status != "present" and not is_navigation:
                 self._mark_ref_unresolved(
                     assessment.ref,
                     item,
@@ -1263,7 +1490,10 @@ class RecursiveAnalysisState:
                 continue
 
             upstream_defect = item.defect_state
-            if assessment.relation == "defect_transformation":
+            if assessment.relation in {
+                "defect_transformation",
+                "contributing_condition",
+            }:
                 if assessment.upstream_defect is None:
                     self._mark_ref_unresolved(
                         assessment.ref,
@@ -1342,6 +1572,129 @@ class RecursiveAnalysisState:
 
         self.frontier.mark_completed(item, evidence_hash)
 
+    def route_navigation_candidates(
+        self,
+        item: FrontierItem,
+        candidates: Sequence[CausalCandidate],
+        *,
+        graph_position: Any,
+        max_hypotheses: int,
+    ) -> int:
+        selected = [
+            candidate
+            for candidate in candidates
+            if candidate.ref in self.graph.nodes
+            and root_candidate_eligible(candidate.node)
+        ][:NAVIGATION_ROUTE_CANDIDATE_LIMIT]
+        if not selected:
+            self.complete_unresolved(
+                item,
+                "navigation_candidates_missing",
+                "The progress aggregate has no concrete semantic candidate to route backward.",
+            )
+            return 0
+
+        successors: List[AttributionHypothesis] = []
+        for candidate in selected:
+            if len(self.ledger.snapshot()) >= max_hypotheses:
+                self._increment_budget("hypotheses")
+                self._mark_ref_unresolved(
+                    candidate.ref,
+                    item,
+                    "hypothesis_limit",
+                    "The navigation route hypothesis budget is exhausted.",
+                )
+                continue
+            upstream_defect = item.defect_state.transformed(
+                label="navigation_candidate_semantic_cause",
+                expected=(
+                    "The recorded semantics at {0} are consistent with avoiding the downstream defect {1}."
+                ).format(candidate.ref, item.defect_state.label),
+                actual=(
+                    "The recorded semantics at {0} are a high-relevance candidate that may contain an "
+                    "upstream assumption or action leading to {1}; defect presence remains unconfirmed."
+                ).format(candidate.ref, item.defect_state.label),
+                mechanism=(
+                    "Offline semantic retrieval selected this concrete node for independent LLM defect "
+                    "judgment; ranking is navigation evidence, not a causal verdict."
+                ),
+                scope="navigation_candidate_validation",
+                transformation_reason=(
+                    "The progress aggregate is offline routing state, so causal judgment moves to its "
+                    "highest-relevance concrete predecessor."
+                ),
+            )
+            self._remember_defect(upstream_defect)
+            downstream_chain = self.transformation_chains.get(
+                item.defect_state.fingerprint, (item.defect_state,)
+            )
+            self.transformation_chains[upstream_defect.fingerprint] = (
+                upstream_defect,
+                *downstream_chain,
+            )
+            claim = (
+                "Independently judge whether {0} introduces an upstream semantic cause of {1}; "
+                "offline ranking score {2:.3f} is retrieval-only."
+            ).format(candidate.ref, item.defect_state.label, candidate.score)
+            hypothesis = self.ledger.create(claim, candidate.ref, upstream_defect)
+            hypothesis = self.ledger.add_support(
+                hypothesis.hypothesis_id,
+                candidate.ref,
+                "Selected as a bounded progress-navigation candidate; causality is unconfirmed.",
+                candidate.score,
+            )
+            evidence_refs = tuple(
+                dict.fromkeys(
+                    [
+                        *candidate.evidence_refs,
+                        candidate.ref,
+                        *item.checked_evidence_refs,
+                    ]
+                )
+            )
+            self.graph.add_offline_navigation_edge(
+                candidate.ref,
+                item.node_ref,
+                evidence_refs=evidence_refs,
+                confidence=candidate.score,
+            )
+            predecessor = FrontierItem.create(
+                node_ref=candidate.ref,
+                defect_state=upstream_defect,
+                downstream_path=[candidate.ref, *item.downstream_path],
+                hypothesis_id=hypothesis.hypothesis_id,
+                hypothesis_semantic_hash=hypothesis.semantic_hash,
+                depth=item.depth + 1,
+                candidate_source="navigation_semantic_hypothesis",
+                priority=max(candidate.score, 0.0),
+                checked_evidence_refs=list(evidence_refs),
+                graph_position=graph_position(candidate.ref),
+            )
+            self._merge_visit_evidence(predecessor.visit_key, evidence_refs)
+            self.frontier.push(predecessor)
+            successors.append(hypothesis)
+
+        if not successors:
+            self.complete_unresolved(
+                item,
+                "navigation_hypothesis_limit",
+                "No navigation candidate could be queued within the hypothesis budget.",
+                exhausted_budget="hypotheses",
+            )
+            return 0
+        parent = self.ledger.get(item.hypothesis_id)
+        if parent.status in {"active", "supported"}:
+            self.ledger.supersede(
+                parent.hypothesis_id,
+                successors[0].hypothesis_id,
+                "Offline progress navigation moved causal judgment to concrete predecessors.",
+            )
+        route_hash = hashlib.sha256(
+            stable_json([candidate.ref for candidate in selected]).encode("utf-8")
+        ).hexdigest()
+        self.frontier.mark_completed(item, "navigation:{0}".format(route_hash))
+        return len(successors)
+
     def mark_unresolved(
         self,
         item: FrontierItem,
@@ -1408,8 +1761,29 @@ class RecursiveAnalysisState:
             if len(refs) > 1
         }
         provider = _provider_circuit(judge)
+        global_passes = [
+            item
+            for item in self.investigation_journal
+            if isinstance(item, Mapping)
+            and item.get("kind") == "global_candidate_pass"
+        ]
+        completed_global_passes = [
+            item for item in global_passes if item.get("status") == "completed"
+        ]
+        expansion_reasons = []
+        for item in completed_global_passes:
+            judgment = item.get("judgment")
+            if not isinstance(judgment, Mapping):
+                continue
+            for request in judgment.get("expansion_requests") or ():
+                if isinstance(request, Mapping):
+                    expansion_reasons.append(dict(request))
         metadata = {
-            "analysis": "agentic_recursive_semantic_taint",
+            "analysis": (
+                "retrieval_global_recursive_fusion"
+                if global_passes
+                else "agentic_recursive_semantic_taint"
+            ),
             "behavior_impact": "none_offline_analysis_only",
             "seed_count": self.seed_count,
             "processed_frontier_items": self.processed_items,
@@ -1434,6 +1808,23 @@ class RecursiveAnalysisState:
             "confirmation_queue": list(self.confirmation_queue),
             "confirmation_journal": list(self.confirmation_journal),
             "logical_confirmation_call_count": self.logical_confirmation_calls,
+            "fusion_mode": "retrieval-global" if global_passes else "off",
+            "global_candidate_pass_count": len(completed_global_passes),
+            "global_candidate_judgments": [
+                copy.deepcopy(item.get("judgment"))
+                for item in completed_global_passes
+                if isinstance(item.get("judgment"), Mapping)
+            ],
+            "candidate_compression": [
+                copy.deepcopy(item.get("candidate_compression"))
+                for item in completed_global_passes
+                if isinstance(item.get("candidate_compression"), Mapping)
+            ],
+            "recursive_expansion_reasons": expansion_reasons,
+            "global_judge_physical_request_count": sum(
+                int(item.get("physical_request_delta") or 0)
+                for item in completed_global_passes
+            ),
         }
         return RecursiveAttributionReport(
             case_id=self.graph.case_id,
@@ -1543,6 +1934,7 @@ class AgenticRecursiveAnalyzer:
         checkpoint: Optional[CheckpointBundle] = None,
         checkpoint_config: Optional[Mapping[str, Any]] = None,
         stop_requested: Optional[Callable[[], bool]] = None,
+        fusion_mode: str = "off",
     ) -> None:
         self.judge = judge
         self.retriever = retriever or SemanticPredecessorRetriever()
@@ -1553,6 +1945,9 @@ class AgenticRecursiveAnalyzer:
         self.max_investigation_rounds = max(0, int(max_investigation_rounds))
         self.max_artifact_bytes = max(0, int(max_artifact_bytes))
         self.max_judge_requests = max(0, int(max_judge_requests))
+        if fusion_mode not in {"off", "retrieval-global"}:
+            raise ValueError("unsupported fusion_mode: {0}".format(fusion_mode))
+        self.fusion_mode = fusion_mode
         if checkpoint is not None and checkpoint_config is None:
             raise ValueError("checkpoint_config is required with checkpoint")
         self.checkpoint = checkpoint
@@ -1625,6 +2020,541 @@ class AgenticRecursiveAnalyzer:
     def _replay_action(state: RecursiveAnalysisState, semantic_key: str) -> Optional[JsonDict]:
         value = state.replay_actions.get(semantic_key)
         return dict(value) if isinstance(value, Mapping) else None
+
+    def _run_global_candidate_prepass(
+        self, state: RecursiveAnalysisState, graph: TraceGraph
+    ) -> None:
+        if self.fusion_mode != "retrieval-global":
+            return
+        if any(
+            item.get("kind") == "global_candidate_pass"
+            for item in state.investigation_journal
+            if isinstance(item, Mapping)
+        ):
+            return
+        if not isinstance(self.judge, GlobalJudgeCapability):
+            state.investigation_journal.append(
+                {
+                    "kind": "global_candidate_pass",
+                    "status": "fallback_recursive",
+                    "reason": "judge_missing_global_capability",
+                    "behavior_impact": "none_offline_analysis_only",
+                }
+            )
+            return
+
+        queued_items = [
+            FrontierItem.from_dict(item) for item in state.frontier.snapshot()
+        ]
+        for item in queued_items:
+            hypothesis = state.ledger.get(item.hypothesis_id)
+            if hypothesis.status not in {"active", "supported"}:
+                continue
+            try:
+                candidates, paths = self._global_candidate_pool(
+                    state, graph, item
+                )
+                capsules = build_candidate_evidence_capsules(
+                    graph=graph,
+                    candidates=candidates,
+                    defect_state=item.defect_state,
+                    downstream_paths=paths,
+                    start_refs=(item.downstream_path[-1],),
+                )
+            except Exception as exc:
+                state.investigation_journal.append(
+                    {
+                        "kind": "global_candidate_pass",
+                        "status": "fallback_recursive",
+                        "seed_ref": item.node_ref,
+                        "reason": "capsule_build_error: {0}: {1}".format(
+                            type(exc).__name__, exc
+                        ),
+                        "behavior_impact": "none_offline_analysis_only",
+                    }
+                )
+                continue
+            if not capsules:
+                state.investigation_journal.append(
+                    {
+                        "kind": "global_candidate_pass",
+                        "status": "fallback_recursive",
+                        "seed_ref": item.node_ref,
+                        "reason": "candidate_evidence_capsules_empty",
+                        "behavior_impact": "none_offline_analysis_only",
+                    }
+                )
+                continue
+            for candidate in candidates:
+                state._remember_candidate(candidate)
+            metrics = candidate_compression_metrics(graph, capsules)
+            request = GlobalCandidateJudgeRequest(
+                case_id=graph.case_id,
+                objective=state.objective,
+                analysis_perspective=state.analysis_perspective,
+                start_refs=(item.downstream_path[-1],),
+                capsules=capsules,
+                trace_health={
+                    "missing_artifact_count": sum(
+                        len(capsule.missing_evidence_refs) for capsule in capsules
+                    ),
+                    "candidate_compression": metrics,
+                },
+            )
+            remaining = max(0, self.max_judge_requests - state.judge_requests)
+            state.logical_judge_calls += 1
+            self._checkpoint_state(
+                state, "global:before:{0}".format(item.visit_key)
+            )
+            try:
+                result = self.judge.judge_candidates_bounded(
+                    request, max_physical_requests=remaining
+                )
+                if not isinstance(result, BoundedJudgeCallResult):
+                    raise TypeError(
+                        "global Judge must return BoundedJudgeCallResult"
+                    )
+                judgment = result.value
+                if not isinstance(judgment, GlobalCandidateJudgment):
+                    raise TypeError(
+                        "global Judge returned an unsupported judgment"
+                    )
+                state.judge_requests += result.physical_requests
+            except BoundedJudgeCallError as exc:
+                state.judge_requests += exc.physical_requests
+                state.investigation_journal.append(
+                    {
+                        "kind": "global_candidate_pass",
+                        "status": "fallback_recursive",
+                        "seed_ref": item.node_ref,
+                        "reason": "global_judge_error: {0}".format(exc),
+                        "physical_request_delta": exc.physical_requests,
+                        "candidate_compression": metrics,
+                        "behavior_impact": "none_offline_analysis_only",
+                    }
+                )
+                continue
+            except Exception as exc:
+                state.investigation_journal.append(
+                    {
+                        "kind": "global_candidate_pass",
+                        "status": "fallback_recursive",
+                        "seed_ref": item.node_ref,
+                        "reason": "global_judge_error: {0}: {1}".format(
+                            type(exc).__name__, exc
+                        ),
+                        "physical_request_delta": 0,
+                        "candidate_compression": metrics,
+                        "behavior_impact": "none_offline_analysis_only",
+                    }
+                )
+                continue
+            event = {
+                "kind": "global_candidate_pass",
+                "status": "completed",
+                "seed_ref": item.node_ref,
+                "hypothesis_id": item.hypothesis_id,
+                "defect_fingerprint": item.defect_state.fingerprint,
+                "physical_request_delta": result.physical_requests,
+                "candidate_compression": metrics,
+                "candidate_evidence_capsules": [
+                    capsule.to_dict() for capsule in capsules
+                ],
+                "judgment": judgment.to_dict(),
+                "behavior_impact": "none_offline_analysis_only",
+            }
+            state.investigation_journal.append(event)
+            self._apply_global_candidate_judgment(
+                state=state,
+                item=item,
+                candidates=candidates,
+                capsules=capsules,
+                judgment=judgment,
+            )
+            self._checkpoint_state(
+                state, "global:after:{0}".format(item.visit_key)
+            )
+
+    def _global_candidate_pool(
+        self,
+        state: RecursiveAnalysisState,
+        graph: TraceGraph,
+        item: FrontierItem,
+    ) -> Tuple[List[CausalCandidate], Dict[str, Tuple[str, ...]]]:
+        retrieved = self.retriever.retrieve(
+            graph,
+            item.node_ref,
+            item.defect_state,
+            state.ledger.get(item.hypothesis_id),
+            limit=24,
+            allow_semantic_fallback=True,
+        )
+        decisive_evidence = self._global_decisive_evidence_candidates(
+            graph, item
+        )
+        related_existing = []
+        active_path = set(item.downstream_path)
+        for candidate in state.causal_candidates:
+            target = str(candidate.edge.get("to_ref") or "")
+            if candidate.ref in active_path or target in active_path:
+                related_existing.append(candidate)
+        authored_siblings = self._global_authored_decision_siblings(
+            graph,
+            [*related_existing, *retrieved],
+        )
+        ordered = [
+            *related_existing,
+            *retrieved,
+            *authored_siblings,
+            *decisive_evidence,
+        ]
+        selected: Dict[str, CausalCandidate] = {}
+        refs: List[str] = []
+        for candidate in ordered:
+            resolved = graph.resolve(candidate.ref) or candidate.ref
+            if resolved not in graph.nodes:
+                continue
+            existing = selected.get(resolved)
+            if existing is None:
+                refs.append(resolved)
+                selected[resolved] = candidate
+            elif candidate.score > existing.score:
+                selected[resolved] = candidate
+        paths: Dict[str, Tuple[str, ...]] = {}
+        for ref in refs:
+            candidate = selected[ref]
+            target = graph.resolve(str(candidate.edge.get("to_ref") or ""))
+            grounded_path = _grounded_downstream_path(
+                graph,
+                ref,
+                item.downstream_path,
+            )
+            if grounded_path:
+                joined_at = grounded_path[-1]
+                offset = item.downstream_path.index(joined_at)
+                paths[ref] = (
+                    *grounded_path,
+                    *item.downstream_path[offset + 1 :],
+                )
+            elif target and target in item.downstream_path:
+                offset = item.downstream_path.index(target)
+                paths[ref] = (ref, *item.downstream_path[offset:])
+            elif ref == item.node_ref:
+                paths[ref] = item.downstream_path
+            else:
+                paths[ref] = (ref, *item.downstream_path)
+        return [selected[ref] for ref in refs], paths
+
+    def _global_authored_decision_siblings(
+        self,
+        graph: TraceGraph,
+        candidates: Sequence[CausalCandidate],
+        *,
+        limit: int = 8,
+    ) -> List[CausalCandidate]:
+        seeds = [
+            candidate.node
+            for candidate in candidates
+            if candidate.node.event_type == "decision"
+        ]
+        selected_refs = {graph.resolve(item.ref) or item.ref for item in candidates}
+        ranked: List[Tuple[int, int, CausalCandidate]] = []
+        for node in graph.nodes.values():
+            if (
+                node.ref in selected_refs
+                or node.event_type != "decision"
+                or not root_candidate_eligible(node)
+            ):
+                continue
+            node_sources = {
+                graph.resolve(ref) or ref for ref in node.source_refs if str(ref)
+            }
+            if len(node_sources) < 2:
+                continue
+            best: Optional[Tuple[int, int, TraceNode, Tuple[str, ...]]] = None
+            for seed in seeds:
+                seed_sources = {
+                    graph.resolve(ref) or ref for ref in seed.source_refs if str(ref)
+                }
+                shared = tuple(sorted(node_sources & seed_sources))
+                distance = abs(graph.position(node.ref) - graph.position(seed.ref))
+                if len(shared) < 2 or distance > 12:
+                    continue
+                rank = (len(shared), -distance)
+                if best is None or rank > (best[0], -best[1]):
+                    best = (len(shared), distance, seed, shared)
+            if best is None:
+                continue
+            overlap, distance, seed, shared = best
+            score = min(0.86, 0.68 + overlap * 0.03)
+            ranked.append(
+                (
+                    -overlap,
+                    distance,
+                    CausalCandidate(
+                        ref=node.ref,
+                        node=node,
+                        source="global_authored_decision_sibling",
+                        edge={
+                            "from_ref": node.ref,
+                            "to_ref": seed.ref,
+                            "relation": "shared_generation_provenance_candidate",
+                            "evidence_type": "recorded_provenance_overlap",
+                            "evidence_refs": list(shared),
+                            "confidence": score,
+                            "eligible_for_attribution": False,
+                            "retrieval_candidate": True,
+                            "inference_method": "bounded_same_turn_authored_sibling_v1",
+                            "edge_origin": "offline.global_candidate_retrieval",
+                        },
+                        score=score,
+                        evidence_refs=shared,
+                    ),
+                )
+            )
+        ranked.sort(key=lambda item: (item[0], item[1], item[2].ref))
+        return [candidate for _, _, candidate in ranked[:limit]]
+
+    def _global_decisive_evidence_candidates(
+        self, graph: TraceGraph, item: FrontierItem
+    ) -> List[CausalCandidate]:
+        seed_ref = item.downstream_path[-1]
+        boundary = graph.position(seed_ref)
+        seed_node = graph.nodes.get(graph.resolve(seed_ref) or seed_ref)
+        include_post_boundary_evidence = bool(
+            seed_node and seed_node.event_type in EVALUATION_START_EVENTS
+        )
+        selected: List[Tuple[int, CausalCandidate]] = []
+        for node in graph.nodes.values():
+            position = graph.position(node.ref)
+            if (
+                position >= boundary and not include_post_boundary_evidence
+            ) or node.event_type == "progress.episode":
+                continue
+            score = _global_evidence_score(node)
+            if score <= 0.0:
+                continue
+            selected.append(
+                (
+                    position,
+                    CausalCandidate(
+                        ref=node.ref,
+                        node=node,
+                        source="global_decisive_evidence",
+                        edge={
+                            "from_ref": node.ref,
+                            "to_ref": item.downstream_path[-1],
+                            "relation": "global_evidence_candidate",
+                            "evidence_type": "recorded_evidence_retrieval",
+                            "evidence_refs": [node.ref],
+                            "confidence": score,
+                            "eligible_for_attribution": False,
+                            "retrieval_candidate": True,
+                            "inference_method": "bounded_verification_counterevidence_retrieval_v1",
+                            "edge_origin": "offline.global_candidate_retrieval",
+                            "temporal_relation": (
+                                "after_derived_evaluation_node"
+                                if position >= boundary
+                                else "at_or_before_evaluation_node"
+                            ),
+                        },
+                        score=score,
+                        evidence_refs=(node.ref,),
+                    ),
+                )
+            )
+        selected.sort(key=lambda item: (-item[0], item[1].ref))
+        return [candidate for _, candidate in selected[:8]]
+
+    def _apply_global_candidate_judgment(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        item: FrontierItem,
+        candidates: Sequence[CausalCandidate],
+        capsules: Sequence[CandidateEvidenceCapsule],
+        judgment: GlobalCandidateJudgment,
+    ) -> None:
+        if judgment.outcome == "no_defect":
+            hypothesis = state.ledger.get(item.hypothesis_id)
+            if hypothesis.status in {"active", "supported"}:
+                state.ledger.reject_with_frontier(
+                    item.hypothesis_id,
+                    judgment.reason,
+                    opposing_refs=judgment.decisive_evidence_refs,
+                    frontier=state.frontier,
+                    evidence_hash=hashlib.sha256(
+                        stable_json(judgment.to_dict()).encode("utf-8")
+                    ).hexdigest(),
+                )
+            return
+
+        candidate_by_ref = {
+            state.graph.resolve(candidate.ref) or candidate.ref: candidate
+            for candidate in candidates
+        }
+        capsule_by_ref = {capsule.candidate_ref: capsule for capsule in capsules}
+        assessments = {
+            assessment.candidate_ref: assessment
+            for assessment in judgment.assessments
+        }
+        created_hypotheses: Set[str] = set()
+
+        if judgment.outcome == "candidate_roots":
+            for selected_ref in judgment.selected_candidate_refs:
+                node = state.graph.nodes.get(selected_ref)
+                candidate = candidate_by_ref.get(selected_ref)
+                capsule = capsule_by_ref.get(selected_ref)
+                if (
+                    node is None
+                    or candidate is None
+                    or capsule is None
+                    or not root_candidate_eligible(node)
+                ):
+                    continue
+                assessment = assessments[selected_ref]
+                hypothesis = state.ledger.create(
+                    "Global comparison selected {0} as a candidate root for {1}.".format(
+                        selected_ref, item.defect_state.label
+                    ),
+                    selected_ref,
+                    item.defect_state,
+                )
+                created_hypotheses.add(hypothesis.hypothesis_id)
+                support_refs = _dedupe_strings(
+                    [
+                        selected_ref,
+                        *assessment.evidence_refs,
+                        *judgment.decisive_evidence_refs,
+                    ]
+                )
+                for evidence_ref in support_refs:
+                    if state.graph.resolve(evidence_ref):
+                        state.ledger.add_support(
+                            hypothesis.hypothesis_id,
+                            evidence_ref,
+                            assessment.reason,
+                            max(assessment.confidence, 0.01),
+                        )
+                hypothesis = state.ledger.get(hypothesis.hypothesis_id)
+                binding_key = (
+                    selected_ref,
+                    item.defect_state.fingerprint,
+                    hypothesis.semantic_hash,
+                )
+                if binding_key not in state.introduction_binding_keys:
+                    state.introduction_binding_keys.add(binding_key)
+                    state.introduction_bindings.append(
+                        {
+                            "candidate_ref": selected_ref,
+                            "defect_state_id": item.defect_state.defect_state_id,
+                            "defect_fingerprint": item.defect_state.fingerprint,
+                            "hypothesis_id": hypothesis.hypothesis_id,
+                            "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                            "origin": "global_candidate_judgment",
+                        }
+                    )
+                    state.introduction_candidates.append(candidate)
+                    state._remember_candidate(candidate)
+                state.introduction_hypothesis_ids.add(hypothesis.hypothesis_id)
+                queue_key = (
+                    hypothesis.hypothesis_id,
+                    selected_ref,
+                    item.defect_state.fingerprint,
+                )
+                if queue_key not in state.confirmation_queue_keys:
+                    state.confirmation_queue_keys.add(queue_key)
+                    state.confirmation_queue.append(
+                        {
+                            "hypothesis_id": hypothesis.hypothesis_id,
+                            "candidate_ref": selected_ref,
+                            "defect_fingerprint": item.defect_state.fingerprint,
+                            "requested_by_ref": item.node_ref,
+                            "recursive_path": list(capsule.downstream_path),
+                            "checked_evidence_refs": list(support_refs),
+                            "task_obligations": task_obligations(
+                                state.graph, state.objective
+                            ),
+                            "analysis_perspective": state.analysis_perspective,
+                            "semantic_identity": hashlib.sha256(
+                                stable_json(queue_key).encode("utf-8")
+                            ).hexdigest(),
+                            "status": "queued",
+                            "origin": "global_candidate_judgment",
+                        }
+                    )
+
+        if judgment.outcome == "needs_expansion":
+            for request in judgment.expansion_requests:
+                anchor = state.graph.resolve(str(request.get("anchor_ref") or ""))
+                if not anchor or anchor not in state.graph.nodes:
+                    continue
+                owner = next(
+                    (
+                        capsule
+                        for capsule in capsules
+                        if anchor == capsule.candidate_ref
+                        or any(
+                            str(member.get("ref") or "") == anchor
+                            for member in capsule.action_group.get("members") or ()
+                            if isinstance(member, Mapping)
+                        )
+                    ),
+                    None,
+                )
+                path = (
+                    owner.downstream_path
+                    if owner is not None and anchor == owner.candidate_ref
+                    else (
+                        (anchor, *owner.downstream_path)
+                        if owner is not None
+                        else (anchor, *item.downstream_path)
+                    )
+                )
+                hypothesis = state.ledger.create(
+                    "Global comparison requested {0} expansion at {1}.".format(
+                        str(request.get("context_kind") or "context"), anchor
+                    ),
+                    anchor,
+                    item.defect_state,
+                )
+                created_hypotheses.add(hypothesis.hypothesis_id)
+                state.ledger.add_support(
+                    hypothesis.hypothesis_id,
+                    anchor,
+                    str(request.get("reason") or judgment.reason),
+                    max(judgment.confidence, 0.01),
+                )
+                hypothesis = state.ledger.get(hypothesis.hypothesis_id)
+                state.frontier.push(
+                    FrontierItem.create(
+                        node_ref=anchor,
+                        defect_state=item.defect_state,
+                        downstream_path=path,
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        hypothesis_semantic_hash=hypothesis.semantic_hash,
+                        depth=item.depth + 1,
+                        candidate_source="global_requested_expansion",
+                        priority=1.0,
+                        checked_evidence_refs=judgment.decisive_evidence_refs,
+                        graph_position=state.graph.position(anchor),
+                    )
+                )
+
+        original = state.ledger.get(item.hypothesis_id)
+        if created_hypotheses and item.hypothesis_id not in created_hypotheses and original.status in {
+            "active",
+            "supported",
+        }:
+            state.ledger.reject_with_frontier(
+                item.hypothesis_id,
+                "Global comparison superseded the seed with selected candidates.",
+                opposing_refs=(),
+                frontier=state.frontier,
+                evidence_hash=hashlib.sha256(
+                    stable_json(judgment.to_dict()).encode("utf-8")
+                ).hexdigest(),
+            )
 
     def analyze(
         self,
@@ -1718,6 +2648,7 @@ class AgenticRecursiveAnalyzer:
                 analysis_graph, max_artifact_bytes=self.max_artifact_bytes
             )
         )
+        self._run_global_candidate_prepass(state, analysis_graph)
         if not requested_starts:
             state._mark_seed_unresolved(
                 "analysis:start",
@@ -1768,13 +2699,14 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             try:
-                candidates = self.retriever.retrieve(
+                retrieved_candidates = self.retriever.retrieve(
                     analysis_graph,
                     item.node_ref,
                     item.defect_state,
                     state.ledger.get(item.hypothesis_id),
                     allow_semantic_fallback=True,
                 )
+                candidates = retrieved_candidates[:CAUSAL_STEP_CANDIDATE_LIMIT]
             except Exception as exc:
                 detail = "{0}: {1}".format(type(exc).__name__, exc)
                 state.complete_rejudge(
@@ -1784,8 +2716,23 @@ class AgenticRecursiveAnalyzer:
                 continue
             for candidate in candidates:
                 state._remember_candidate(candidate)
+            current_node = analysis_graph.nodes.get(item.node_ref)
+            if current_node is not None and is_navigation_node(current_node):
+                state.route_navigation_candidates(
+                    item,
+                    candidates,
+                    graph_position=analysis_graph.position,
+                    max_hypotheses=self.max_hypotheses,
+                )
+                self._checkpoint_state(state, "analysis:navigation_routed")
+                continue
             try:
-                request = state.build_step_request(analysis_graph, item, candidates)
+                request = state.build_step_request(
+                    analysis_graph,
+                    item,
+                    candidates,
+                    retrieved_candidates=retrieved_candidates,
+                )
             except Exception as exc:
                 detail = "{0}: {1}".format(type(exc).__name__, exc)
                 state.complete_rejudge(
@@ -2628,7 +3575,7 @@ class AgenticRecursiveAnalyzer:
             if not any(
                 bool(edge.get("eligible_for_attribution", True))
                 and str(edge.get("relation") or "")
-                not in {"temporal_proximity", "temporal_sequence"}
+                not in NON_CAUSAL_CONFIRMATION_RELATIONS
                 for edge in edges
             ):
                 raise ValueError(
@@ -2673,10 +3620,32 @@ class AgenticRecursiveAnalyzer:
         for value in state.ledger.snapshot():
             if value.get("hypothesis_id") == hypothesis_id:
                 continue
+            competitor_hypothesis_id = str(value.get("hypothesis_id") or "")
+            competitor_fingerprint = str(
+                value.get("active_defect_fingerprint") or ""
+            )
+            competitor_semantic_hash = str(value.get("semantic_hash") or "")
+            competitor_binding = next(
+                (
+                    item
+                    for item in state.introduction_bindings
+                    if str(item.get("hypothesis_id") or "")
+                    == competitor_hypothesis_id
+                    and str(item.get("defect_fingerprint") or "")
+                    == competitor_fingerprint
+                    and str(item.get("hypothesis_semantic_hash") or "")
+                    == competitor_semantic_hash
+                ),
+                None,
+            )
+            if competitor_binding is None:
+                continue
             competitor_ref = str(value.get("candidate_root_ref") or "")
             resolved = state.graph.resolve(competitor_ref)
             if not resolved:
                 raise ValueError("competing hypothesis candidate is unresolved")
+            if str(competitor_binding.get("candidate_ref") or "") != resolved:
+                continue
             if resolved in path[1:]:
                 continue
             support = value.get("supporting_evidence") or []
@@ -2706,12 +3675,9 @@ class AgenticRecursiveAnalyzer:
                     )
                 return output
 
-            competitor_fingerprint = str(value.get("active_defect_fingerprint") or "")
             competitor_defect = state.defect_states.get(competitor_fingerprint)
             if competitor_defect is None:
                 raise ValueError("competing hypothesis defect is unresolved")
-            competitor_hypothesis_id = str(value.get("hypothesis_id") or "")
-            competitor_semantic_hash = str(value.get("semantic_hash") or "")
             queued_competitor = next(
                 (
                     item
@@ -2723,6 +3689,13 @@ class AgenticRecursiveAnalyzer:
                 ),
                 None,
             )
+            competitor_node = state.graph.nodes.get(resolved)
+            if (
+                queued_competitor is None
+                or competitor_node is None
+                or not root_candidate_eligible(competitor_node)
+            ):
+                continue
             competitor_path = tuple(
                 str(item)
                 for item in (
@@ -2991,6 +3964,8 @@ class AgenticRecursiveAnalyzer:
         suggestion = judgment.suggested_investigation
         if not isinstance(suggestion, Mapping):
             return "not_handled"
+        if suggestion.get("kind") == "judge_retry" and not suggestion.get("action"):
+            return "not_handled_internal_diagnostic"
         if suggestion.get("action"):
             return self._apply_control_directive(
                 state, item, judgment, request, suggestion

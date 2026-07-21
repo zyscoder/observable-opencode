@@ -39,6 +39,17 @@ from .checkpoint import (
     publish_output_transaction,
 )
 from .graph import TraceGraph
+from .evidence_capsule import (
+    CandidateEvidenceCapsule,
+    build_candidate_evidence_capsules,
+    candidate_compression_metrics,
+)
+from .global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgeRequest,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+)
 from .investigation import (
     AttributionControlDirective,
     CausalInvestigationTools,
@@ -58,6 +69,7 @@ __all__ = [
     "BoundedJudgeCallResult",
     "BoundedJudgeCallError",
     "CausalCandidate",
+    "CandidateEvidenceCapsule",
     "CausalFactor",
     "CausalInvestigationTools",
     "CausalStepJudgment",
@@ -68,6 +80,10 @@ __all__ = [
     "ConfirmedRoot",
     "DefectState",
     "FrontierItem",
+    "GlobalCandidateAssessment",
+    "GlobalCandidateJudgeRequest",
+    "GlobalCandidateJudgment",
+    "GlobalJudgeCapability",
     "HypothesisEvidence",
     "InvestigationDirective",
     "InvestigationResult",
@@ -91,5 +107,7 @@ __all__ = [
     "semantic_visit_key",
     "confirmation_identity_for",
     "build_checkpoint_config",
+    "build_candidate_evidence_capsules",
+    "candidate_compression_metrics",
     "publish_output_transaction",
 ]

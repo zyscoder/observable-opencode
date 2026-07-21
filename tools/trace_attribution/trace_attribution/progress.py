@@ -29,6 +29,7 @@ MUTATION_ACTIONS = {"apply_patch", "edit", "multiedit", "write"}
 READ_ACTIONS = {"cat", "find", "glob", "grep", "ls", "read", "search"}
 VERIFICATION_ACTIONS = {"build", "lint", "test", "typecheck", "verify"}
 DELEGATION_DECISION_TYPES = {"subagent_call", "task_delegation"}
+PROGRESS_DELIVERY_HISTORY_LIMIT = 8
 
 
 def reconstruct_progress_episodes(
@@ -284,14 +285,56 @@ def progress_navigation_window(nodes: Dict[str, TraceNode], current_ref: str) ->
         cursor = previous
 
     chronological_refs = list(reversed(episode_refs))
-    candidate_member_refs = dedupe_progress_refs(
+    previous_delivery_candidate_refs = (
+        [
+            str(ref)
+            for ref in (
+                nodes[previous_delivery_ref].data.get("candidate_member_refs")
+                or nodes[previous_delivery_ref].data.get("member_refs")
+                or []
+            )
+        ]
+        if previous_delivery_ref
+        else []
+    )
+    delivery_history_refs: List[str] = []
+    history_cursor_ref = previous_delivery_ref
+    while history_cursor_ref and len(delivery_history_refs) < PROGRESS_DELIVERY_HISTORY_LIMIT:
+        history_cursor = nodes.get(history_cursor_ref)
+        if not history_cursor or history_cursor.event_type != "progress.episode":
+            break
+        if progress_episode_has_delivery(history_cursor):
+            delivery_history_refs.append(history_cursor.ref)
+        history_cursor_ref = str(history_cursor.data.get("previous_episode_ref") or "")
+    delivery_history_refs.reverse()
+    delivery_history_candidate_refs = dedupe_progress_refs(
         str(ref)
-        for episode_ref in chronological_refs
+        for episode_ref in delivery_history_refs
         for ref in (
             nodes[episode_ref].data.get("candidate_member_refs")
             or nodes[episode_ref].data.get("member_refs")
             or []
         )
+    )
+    candidate_member_refs = dedupe_progress_refs(
+        [
+            *previous_delivery_candidate_refs,
+            *(
+                str(ref)
+                for episode_ref in chronological_refs
+                for ref in (
+                    nodes[episode_ref].data.get("candidate_member_refs")
+                    or nodes[episode_ref].data.get("member_refs")
+                    or []
+                )
+            ),
+        ]
+    )
+    retrieval_candidate_member_refs = dedupe_progress_refs(
+        [
+            *delivery_history_candidate_refs,
+            *candidate_member_refs,
+        ]
     )
     member_refs = dedupe_progress_refs(
         str(ref)
@@ -303,10 +346,16 @@ def progress_navigation_window(nodes: Dict[str, TraceNode], current_ref: str) ->
         "member_episode_refs": chronological_refs,
         "member_refs": member_refs,
         "candidate_member_refs": candidate_member_refs,
+        "retrieval_candidate_member_refs": retrieval_candidate_member_refs,
         "previous_delivery_episode_ref": previous_delivery_ref,
-        "navigation_method": "delivery_bounded_no_delivery_window_v1",
+        "previous_delivery_candidate_member_refs": previous_delivery_candidate_refs,
+        "delivery_history_episode_refs": delivery_history_refs,
+        "delivery_history_candidate_member_refs": delivery_history_candidate_refs,
+        "delivery_history_limit": PROGRESS_DELIVERY_HISTORY_LIMIT,
+        "navigation_method": "bounded_delivery_history_progress_window_v3",
         "episode_count": len(chronological_refs),
         "candidate_count": len(candidate_member_refs),
+        "retrieval_candidate_count": len(retrieval_candidate_member_refs),
         "no_delivery_episode_count": sum(
             bool(nodes[ref].data.get("no_delivery_progress")) for ref in chronological_refs
         ),

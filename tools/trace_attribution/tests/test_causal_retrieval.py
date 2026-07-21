@@ -288,6 +288,201 @@ def trace_with_artifact_evidence():
 
 
 class CausalRetrievalTest(unittest.TestCase):
+    def test_retriever_bounds_provenance_envelopes_and_keeps_the_semantic_match(self):
+        records = []
+        edges = []
+        for index, event_type in enumerate(
+            (
+                "prompt.assembly",
+                "message.input",
+                "context.transform",
+                "llm.call",
+                "task.loop",
+            )
+        ):
+            record_id = "wrapper_{0}".format(index)
+            records.append(
+                {
+                    "record_id": record_id,
+                    "component": "context",
+                    "event_type": event_type,
+                    "data": {
+                        "text": (
+                            "Process SIGINT can interrupt already-started async cleanup."
+                            if index == 3
+                            else "Generic transport envelope {0}.".format(index)
+                        )
+                    },
+                }
+            )
+            edges.append(
+                {
+                    "from": {"type": "record", "id": record_id},
+                    "to": {"type": "record", "id": "decision"},
+                    "relation": "record_source",
+                    "evidence_type": "confirmed",
+                    "confidence": 1.0,
+                    "eligible_for_attribution": True,
+                }
+            )
+        records.append(
+            {
+                "record_id": "decision",
+                "component": "processor",
+                "event_type": "decision",
+                "data": {"rationale": "Choose a cancellation implementation."},
+            }
+        )
+        graph = TraceGraph.from_trace(
+            {"case_id": "bounded-provenance", "records": records, "dataflow_edges": edges}
+        )
+        defect_state = DefectState.create(
+            label="started_async_cleanup_interrupted_by_process_sigint",
+            expected="Already-started async cleanup completes after process SIGINT.",
+            actual="Process SIGINT interrupts already-started async cleanup.",
+            mechanism="The cancellation assumption ignores signal timing.",
+            scope="task_cancellation",
+        )
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:decision",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+        )
+
+        wrapper_refs = [item.ref for item in candidates if item.node.event_type in {
+            "prompt.assembly", "message.input", "context.transform", "llm.call", "task.loop"
+        }]
+        self.assertLessEqual(len(wrapper_refs), 2)
+        self.assertIn("record:wrapper_3", wrapper_refs)
+
+    def test_analysis_navigation_edge_is_auditable_and_non_temporal(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "navigation-edge",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "A candidate assumption."},
+                    },
+                    {
+                        "record_id": "progress",
+                        "component": "progress",
+                        "event_type": "progress.episode",
+                        "data": {"offline_only": True},
+                    },
+                ],
+            }
+        )
+
+        graph.add_offline_navigation_edge(
+            "record:decision",
+            "record:progress",
+            evidence_refs=["record:decision"],
+            confidence=0.9,
+        )
+
+        edge = graph.edge_context("record:decision", "record:progress")[0]
+        self.assertEqual(edge["relation"], "semantic_navigation_route")
+        self.assertEqual(edge["evidence_type"], "semantic_inferred")
+        self.assertTrue(edge["eligible_for_attribution"])
+        self.assertEqual(graph.upstream_refs("record:progress"), ["record:decision"])
+
+    def test_progress_shortlist_recovers_older_semantically_relevant_delivery(self):
+        records = []
+        for index in range(1, 8):
+            relevant = index == 1
+            records.extend(
+                [
+                    {
+                        "record_id": "reason_{0}".format(index),
+                        "component": "processor",
+                        "event_type": "decision",
+                        "timestamp": "2026-07-21T10:00:{0:02d}.000Z".format(index * 2),
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": (
+                                "Assume process SIGINT cancellation preserves already-started async cleanup."
+                                if relevant
+                                else "Perform unrelated import cleanup edit {0}.".format(index)
+                            ),
+                            "metadata": {
+                                "sessionID": "ses_progress",
+                                "messageID": "msg_{0}".format(index),
+                            },
+                        },
+                    },
+                    {
+                        "record_id": "edit_{0}".format(index),
+                        "component": "processor",
+                        "event_type": "decision",
+                        "timestamp": "2026-07-21T10:00:{0:02d}.500Z".format(index * 2),
+                        "data": {
+                            "decision_type": "llm_tool_call",
+                            "chosen_action": "edit",
+                            "rationale": "Apply edit {0}.".format(index),
+                            "metadata": {
+                                "sessionID": "ses_progress",
+                                "messageID": "msg_{0}".format(index),
+                            },
+                        },
+                    },
+                ]
+            )
+        records.append(
+            {
+                "record_id": "final_reason",
+                "component": "processor",
+                "event_type": "decision",
+                "timestamp": "2026-07-21T10:00:30.000Z",
+                "data": {
+                    "decision_type": "reasoning_block",
+                    "rationale": "All tests pass after import cleanup.",
+                    "metadata": {
+                        "sessionID": "ses_progress",
+                        "messageID": "msg_8",
+                    },
+                },
+            }
+        )
+        graph = TraceGraph.from_trace(
+            {"case_id": "progress-semantic-history", "records": records}
+        )
+        latest = max(
+            (node for node in graph.nodes.values() if node.event_type == "progress.episode"),
+            key=lambda node: int(node.data.get("chronology_index") or 0),
+        )
+        defect_state = DefectState.create(
+            label="process_sigint_cleanup_interrupted",
+            expected="Already-started async cleanup completes after process SIGINT cancellation.",
+            actual="Process SIGINT interrupts already-started async cleanup.",
+            mechanism="The cancellation assumption is incorrect.",
+            scope="task_cancellation",
+        )
+        hypothesis = AttributionHypothesis.create(
+            claim="An earlier cancellation decision introduced the cleanup defect.",
+            candidate_root_ref=latest.ref,
+            defect_state=defect_state,
+        )
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref=latest.ref,
+            defect_state=defect_state,
+            hypothesis=hypothesis,
+            limit=8,
+        )
+
+        by_ref = {item.ref: item for item in candidates}
+        self.assertIn("record:reason_1", by_ref)
+        self.assertEqual(by_ref["record:reason_1"].source, "progress_window")
+        self.assertLessEqual(len(candidates), 8)
+        self.assertTrue(all(item.source == "progress_window" for item in candidates))
+
     def test_grounding_candidates_are_not_promoted_to_causal_predecessors(self):
         graph = TraceGraph.from_trace(
             {

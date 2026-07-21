@@ -95,7 +95,7 @@ function numberValue(input: unknown, key: string) {
 function isVerificationCommand(command: string | undefined) {
   return Boolean(
     command &&
-      /(?:^|[;&|]\s*)(?:python\d*(?:\.\d+)?\s+-m\s+pytest|uv\s+run\s+(?:[^\s;&|]\/)?pytest|(?:[^\s;&|]*\/)?pytest|bun\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|go\s+test|cargo\s+test|node\s+[^;&|]*test|(?:[^\s;&|]*\/)?(?:jest|vitest|mocha)|xcodebuild\b)/i.test(
+      /(?:^|[;&|]\s*)(?:python\d*(?:\.\d+)?\s+-m\s+pytest|uv\s+run\s+(?:[^\s;&|]\/)?pytest|(?:[^\s;&|]*\/)?pytest|bun\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|go\s+test|cargo\s+test|node\s+[^;&|]*test|(?:(?:npx|bunx|pnpm\s+exec|yarn\s+exec)\s+)?(?:[^\s;&|]*\/)?(?:jest|vitest|mocha)\b|xcodebuild\b)/i.test(
         command,
       ),
   )

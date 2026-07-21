@@ -22,16 +22,27 @@ from .causal_state import (
     confirmation_identity_for,
 )
 from .claude import ClaudeJudgeClient
+from .causal_retrieval import is_navigation_node, root_candidate_eligible
 from .errors import (
     JudgeProviderError,
     JudgeProviderUnavailable,
     TransportCallError,
     TransportCallResult,
 )
+from .global_judge import (
+    GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgeRequest,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+    build_global_candidate_prompt,
+    global_candidate_judgment_from_payload,
+    validate_global_candidate_payload,
+)
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v5"
+CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v8"
 ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v6"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
@@ -39,10 +50,13 @@ RELATION_DEFINITIONS = (
     "same_defect_propagation: the predecessor already contains the same active defect.",
     "defect_transformation: a different predecessor defect transforms into the active defect through an explicit mechanism.",
     "introduction_candidate: the defective node has no viable defective predecessor.",
-    "contributing_condition: the predecessor changes likelihood or exposure but does not carry the defect.",
+    "contributing_condition: the predecessor changes likelihood or exposure but does not carry the active defect; set recurse=true only for a material authored assumption or condition that warrants its own explicit upstream_defect hypothesis.",
     "outcome_evidence: the predecessor records or exposes the defect outcome without causing it.",
     "unrelated: no grounded causal relationship is established.",
     "unknown: grounded evidence is insufficient to classify the relationship.",
+)
+INPUT_PROVENANCE_EVENT_TYPES = frozenset(
+    {"prompt.assembly", "message.input", "context.transform", "llm.call", "task.loop"}
 )
 
 CAUSAL_STEP_SYSTEM_PROMPT = """You judge one backward step in an offline causal trace.
@@ -53,6 +67,11 @@ Return exactly one JSON object with no markdown."""
 ROOT_CONFIRMATION_SYSTEM_PROMPT = """You independently try to falsify a proposed recursive root candidate.
 Use only the supplied grounded candidate facts, path, obligations, and competing hypotheses.
 Do not assume any component type is or is not causal. Return exactly one JSON object with no markdown."""
+
+GLOBAL_CANDIDATE_SYSTEM_PROMPT = """You globally compare a bounded set of causal candidates.
+Use only supplied evidence closures, compare every candidate, and preserve no-defect as a valid outcome.
+Retrieval rank is navigation evidence only. Ask for expansion when decisive facts are absent.
+Return exactly one JSON object with no markdown."""
 
 REPAIR_SYSTEM_PROMPT = """Repair one invalid causal-attribution JSON response.
 Correct the exact supplied parse, schema, or grounding error using only the supplied request facts.
@@ -276,15 +295,24 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "Every field shown in required_json_schema is mandatory; return the complete object, not a partial object or patch.",
                 "The top-level confidence must be an unquoted JSON number between 0 and 1.",
                 *RELATION_DEFINITIONS,
-                "Return exactly one assessment for every offered candidate, with no duplicates or omissions.",
+                "Return sparse ranked assessments only for offered candidates that plausibly propagate, transform, condition, expose, or materially challenge the active defect; omit low-value candidates instead of emitting unrelated filler.",
+                "Order predecessor assessments from strongest to weakest causal relevance and never duplicate a ref. Omitted offered candidates are recorded deterministically as unselected, not treated as model judgments.",
+                "The current node itself is never a predecessor. Emit a predecessor object only for an exact ref listed in request.candidates; downstream_path refs are navigation context, not offered predecessors.",
+                "Sparse omission is allowed only while candidate_introduction=false. Before setting candidate_introduction=true, assess every offered predecessor so the no-viable-defective-predecessor conclusion is auditable.",
                 "A reference is grounded only by an explicit reference envelope containing resolved_ref, resolution_status=resolved, and provenance_class; bare refs never ground evidence.",
                 "Use same_defect_propagation only when the predecessor already carries the active defect.",
+                "Prompt, message, context-transform, LLM-call, and task-loop nodes are input provenance envelopes. Being prompted, consumed, transformed, or produced establishes dataflow only. Recurse through such a node only when grounded content shows that the node itself already contains an incorrect, ambiguous, contradictory, or omitted semantic that carries the defect.",
                 "Use defect_transformation only when a different upstream defect transforms into the active defect through an explicit mechanism.",
                 "Set recurse=true for same_defect_propagation and defect_transformation, and require current_defect_status=present plus at least one grounded direct evidence ref.",
-                "Set recurse=false for introduction_candidate, contributing_condition, outcome_evidence, unrelated, and unknown.",
+                "Set recurse=false for introduction_candidate, outcome_evidence, unrelated, unknown, and non-material contributing conditions.",
+                "For a material contributing_condition such as an authored assumption, plan, or test-oracle decision whose correction could prevent the downstream defect, set recurse=true, cite grounded direct evidence, and provide an upstream_defect with label, mechanism, and transformation_reason. This creates a separate backward hypothesis; do not use it for incidental background context.",
                 "introduction_candidate is reserved for the current-node candidate_introduction verdict and must never be assigned as an offered predecessor relation; recurse to a suspected predecessor introduction using same_defect_propagation or defect_transformation, then judge that node directly.",
                 "A transformation must provide label, mechanism, and transformation_reason for the upstream defect.",
                 "Set candidate_introduction=true only when the current node is defective and no viable defective predecessor remains.",
+                "A present defect cannot terminate silently: either select a grounded recursive predecessor, set candidate_introduction=true after assessing every offered predecessor, or provide concrete blocking missing_evidence.",
+                "Navigation aggregates, offline-only reconstruction nodes, observed outcomes, context packaging, and lifecycle-start nodes are not eligible introduction roots; keep candidate_introduction=false and recurse through eligible concrete predecessors.",
+                "A navigation aggregate is a routing projection, not a defective component. Set current_defect_status=absent when the aggregate itself is clean, but still select at most two strongest recursive predecessors that route the active downstream defect. Absent without a recursive route cannot close the branch; return unknown with concrete missing evidence when no grounded route is available.",
+                "Within a navigation aggregate, contributing_condition always denotes a material route and therefore requires recurse=true plus an explicit upstream_defect. Use outcome_evidence or unrelated for non-recursive candidates. Before returning unknown, assess every offered predecessor and state concrete missing evidence.",
                 "A root candidate is the earliest trace-visible introduction of the active defect, not necessarily its ultimate real-world origin.",
                 "When a boundary event such as process.signal directly records the active defect and no offered predecessor carries it, set candidate_introduction=true; an unknown external sender is outside the trace-visible attribution scope, so mention that scope limit in the reason but do not list it as blocking missing_evidence or move the root to an unrelated earlier node.",
                 "When candidate_introduction=true with no blocking missing_evidence, suggested_investigation must request the request_root_confirmation action using the exact active_hypothesis_id, current node ref, and active defect fingerprint from the supplied recursive context.",
@@ -353,7 +381,6 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 "Any component may be confirmed when the grounded semantics support it.",
                 "This is perspective-neutral factual confirmation; presentation perspective is applied only after the confirmed set is fixed.",
                 *RELATION_DEFINITIONS,
-                "The causal-step response must contain exactly one assessment for every offered candidate.",
                 "A reference is grounded only by an explicit reference envelope containing resolved_ref, resolution_status=resolved, and provenance_class; candidate_ref and recursive path strings are navigation only.",
                 "same_defect_propagation and defect_transformation require current_defect_status=present, recurse=true, and at least one grounded direct evidence ref; every other relation requires recurse=false.",
                 "A confirmed excerpt must occur only in a fully resolved candidate-local fact or hydrated artifact that is not missing or truncated.",
@@ -496,6 +523,32 @@ def validate_causal_step_payload(
     reason = str(value.get("current_defect_reason") or "").strip()
     if not reason:
         raise ValueError("current_defect_reason must be non-empty")
+    normalized_reason = " ".join(reason.casefold().split())
+    if status == "present" and (
+        re.search(
+            r"\b(?:current node|this node|candidate|node)\b.{0,32}\b(?:is|was) not (?:itself )?(?:defective|a defect|the defect)\b",
+            normalized_reason,
+        )
+        or re.search(
+            r"\b(?:current node|this node|candidate|node)\b.{0,24}\bdoes not (?:contain|introduce|carry) (?:the |a )?defect\b",
+            normalized_reason,
+        )
+        or re.search(
+            r"\b(?:decision|tool call|claim|episode|result)(?: node)? itself\b.{0,24}\bdoes not (?:contain|introduce|carry) (?:the |a )?defect\b",
+            normalized_reason,
+        )
+    ):
+        raise ValueError(
+            "current_defect_status=present contradicts current_defect_reason"
+        )
+    if status == "absent" and re.search(
+        r"\b(?:reasoning block|decision|plan|assumption)\b.{0,160}"
+        r"\b(?:insufficient|incorrect|wrong|defective|does not account for|fails? to account for|omits?)\b",
+        normalized_reason,
+    ):
+        raise ValueError(
+            "current_defect_status=absent contradicts current_defect_reason"
+        )
     predecessors = value.get("predecessors")
     if not isinstance(predecessors, list):
         raise ValueError("predecessors must be a list")
@@ -526,11 +579,37 @@ def validate_causal_step_payload(
         if not isinstance(raw.get("recurse"), bool):
             raise ValueError("predecessor recurse must be boolean")
         recurse = raw["recurse"]
-        if recurse and relation not in {"same_defect_propagation", "defect_transformation"}:
-            raise ValueError("recurse=true is allowed only for propagation or transformation")
+        candidate_node = next(
+            (candidate.node for candidate in request.candidates if candidate.ref == ref),
+            None,
+        )
+        if (
+            recurse
+            and candidate_node is not None
+            and candidate_node.event_type in INPUT_PROVENANCE_EVENT_TYPES
+            and not reason_identifies_candidate_local_defect(predecessor_reason)
+        ):
+            raise ValueError(
+                "an input provenance envelope can recurse only when its own content contains the defect"
+            )
+        if recurse and relation not in {
+            "same_defect_propagation",
+            "defect_transformation",
+            "contributing_condition",
+        }:
+            raise ValueError(
+                "recurse=true is allowed only for propagation, transformation, or a material contributing condition"
+            )
         carries_defect = relation in {"same_defect_propagation", "defect_transformation"}
-        if carries_defect and status != "present":
-            raise ValueError("propagation and transformation require current_defect_status=present")
+        recursively_influences = relation == "contributing_condition" and recurse
+        if (
+            (carries_defect or recursively_influences)
+            and status != "present"
+            and not is_navigation_node(request.current_node)
+        ):
+            raise ValueError(
+                "recursive propagation, transformation, and material contribution require current_defect_status=present"
+            )
         if carries_defect and not recurse:
             raise ValueError("propagation and transformation require recurse=true")
         evidence_refs = _validate_evidence_refs(
@@ -538,13 +617,17 @@ def validate_causal_step_payload(
             grounded_refs=grounded_refs,
             field_name="predecessor evidence_refs",
         )
-        if carries_defect and not evidence_refs:
-            raise ValueError("propagation and transformation require grounded direct evidence")
+        if (carries_defect or recursively_influences) and not evidence_refs:
+            raise ValueError(
+                "recursive propagation, transformation, and material contribution require grounded direct evidence"
+            )
         upstream_defect = None
         raw_upstream = raw.get("upstream_defect")
-        if relation == "defect_transformation":
+        if relation == "defect_transformation" or recursively_influences:
             if not isinstance(raw_upstream, dict):
-                raise ValueError("defect_transformation requires an upstream_defect object")
+                raise ValueError(
+                    "defect_transformation and recursive contributing_condition require an upstream_defect object"
+                )
             label = str(raw_upstream.get("label") or "").strip()
             mechanism = str(raw_upstream.get("mechanism") or "").strip()
             transformation_reason = str(raw_upstream.get("transformation_reason") or "").strip()
@@ -564,7 +647,9 @@ def validate_causal_step_payload(
                 transformation_reason=transformation_reason,
             )
         elif raw_upstream not in (None, {}):
-            raise ValueError("upstream_defect is valid only for defect_transformation")
+            raise ValueError(
+                "upstream_defect is valid only for defect_transformation or a recursive contributing_condition"
+            )
         predecessor_confidence = _number(
             raw.get("confidence"), "predecessor confidence"
         )
@@ -588,28 +673,78 @@ def validate_causal_step_payload(
                 ),
             )
         )
-    if seen != offered:
-        raise ValueError(
-            "predecessors must assess every offered candidate; missing: {0}".format(
-                ", ".join(sorted(offered - seen))
-            )
-        )
+    unselected = tuple(sorted(offered - seen))
+    if sum(bool(item.recurse) for item in assessments) > 2:
+        raise ValueError("a causal step may select at most two recursive predecessors")
     if not isinstance(value.get("candidate_introduction"), bool):
         raise ValueError("candidate_introduction must be boolean")
     introduction = value["candidate_introduction"]
     if introduction and status != "present":
         raise ValueError("candidate introduction requires current_defect_status=present")
+    if introduction and not root_candidate_eligible(request.current_node):
+        raise ValueError("the current navigation or outcome node is not eligible as a root candidate")
     if introduction and any(
         item.relation in {"same_defect_propagation", "defect_transformation"}
+        or (item.relation == "contributing_condition" and item.recurse)
         for item in assessments
     ):
         raise ValueError("candidate introduction requires no viable defective predecessor")
-    if status != "present" and any(item.recurse for item in assessments):
+    if introduction and unselected:
+        raise ValueError(
+            "candidate introduction requires assessing every offered predecessor"
+        )
+    if (
+        status != "present"
+        and any(item.recurse for item in assessments)
+        and not is_navigation_node(request.current_node)
+    ):
         raise ValueError("a non-present current defect cannot recurse")
     investigation = value.get("suggested_investigation")
     if investigation is not None and not isinstance(investigation, dict):
         raise ValueError("suggested_investigation must be an object or null")
     missing_evidence = _strings(value.get("missing_evidence", []), "missing_evidence")
+    if is_navigation_node(request.current_node):
+        recursive_predecessors = [item for item in assessments if item.recurse]
+        if any(
+            item.relation == "contributing_condition" and not item.recurse
+            for item in assessments
+        ):
+            raise ValueError(
+                "navigation contributing_condition requires recurse=true and an upstream_defect"
+            )
+        if len(recursive_predecessors) > 2:
+            raise ValueError(
+                "a navigation aggregate may select at most two recursive predecessors"
+            )
+        if status in {"present", "absent"} and not recursive_predecessors and not missing_evidence:
+            raise ValueError(
+                "a navigation aggregate cannot close the active branch without a recursive predecessor or concrete missing_evidence"
+            )
+        if status == "unknown" and unselected:
+            raise ValueError(
+                "an unknown navigation judgment requires assessing every offered predecessor"
+            )
+        if status == "unknown" and not missing_evidence:
+            raise ValueError(
+                "an unknown navigation judgment requires concrete missing_evidence"
+            )
+    if (
+        status == "present"
+        and not introduction
+        and not any(item.recurse for item in assessments)
+        and not missing_evidence
+    ):
+        raise ValueError(
+            "a present defect cannot terminate silently without recursion, introduction, or missing_evidence"
+        )
+    if (
+        isinstance(investigation, dict)
+        and investigation.get("action") == "request_root_confirmation"
+        and not introduction
+    ):
+        raise ValueError(
+            "request_root_confirmation requires candidate_introduction=true"
+        )
     active_hypothesis_id = str(request.recursive_context.get("active_hypothesis_id") or "")
     if introduction and not missing_evidence and active_hypothesis_id:
         if not isinstance(investigation, dict) or investigation.get("action") != "request_root_confirmation":
@@ -642,6 +777,7 @@ def validate_causal_step_payload(
         candidate_introduction=introduction,
         missing_evidence=missing_evidence,
         suggested_investigation=dict(investigation) if investigation is not None else None,
+        unselected_predecessor_refs=unselected,
         confidence=confidence,
     )
 
@@ -650,6 +786,29 @@ def causal_step_from_payload(
     value: Dict[str, Any], *, request: CausalStepRequest
 ) -> CausalStepJudgment:
     return validate_causal_step_payload(value, request=request)
+
+
+def reason_identifies_candidate_local_defect(reason: str) -> bool:
+    normalized = " ".join(reason.lower().split())
+    explicit_phrases = (
+        "itself contains",
+        "itself carries",
+        "already contains",
+        "already carries",
+        "contains the same defect",
+        "carries the same defect",
+    )
+    if any(phrase in normalized for phrase in explicit_phrases):
+        return True
+    subject = r"(?:prompt|requirement|message|context|llm call|task loop)"
+    defect = r"(?:incorrect|ambiguous|contradictory|defective|incomplete)"
+    return bool(
+        re.search(rf"\b{subject}\b.{{0,24}}\b(?:itself\s+)?(?:is|was)\s+{defect}\b", normalized)
+        or re.search(
+            rf"\b{subject}\b.{{0,24}}\b(?:omits|omitted|contradicts|misstates|misstated)\b",
+            normalized,
+        )
+    )
 
 
 _ENVELOPE_KEYS = {
@@ -2207,10 +2366,114 @@ class _RequestOutcome:
     physical_requests: int = 0
 
 
-class ClaudeCausalJudge(BoundedJudgeCapability):
+def _repair_constraints(
+    *, stage: str, node_ref: str, request_context: JsonDict
+) -> JsonDict:
+    if stage == "global_candidate_judgment":
+        offered = request_context.get("offered_candidate_refs")
+        grounded = request_context.get("grounded_refs")
+        return {
+            "offered_candidate_refs": list(offered) if isinstance(offered, list) else [],
+            "grounded_refs": list(grounded) if isinstance(grounded, list) else [],
+            "valid_outcomes": [
+                "candidate_roots",
+                "no_defect",
+                "needs_expansion",
+                "inconclusive",
+            ],
+        }
+    if stage != "recursive_causal_step":
+        return {"expected_node_ref": node_ref}
+    candidates = request_context.get("candidates")
+    offered_refs = [
+        str(item.get("ref") or "")
+        for item in candidates
+        if isinstance(item, Mapping) and item.get("ref")
+    ] if isinstance(candidates, list) else []
+    return {
+        "current_node_ref": node_ref,
+        "offered_predecessor_refs": offered_refs,
+        "current_node_is_not_a_predecessor": (
+            "The current_node_ref must never appear in predecessors unless it is "
+            "separately listed in offered_predecessor_refs."
+        ),
+        "valid_present_defect_endings": [
+            "recurse through one or two offered grounded predecessors",
+            (
+                "declare candidate_introduction after assessing every offered predecessor "
+                "and request root confirmation"
+            ),
+            "return concrete blocking missing_evidence",
+        ],
+    }
+
+
+class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
     def __init__(self, *, transport: ClaudeJudgeClient, cache: JudgmentCache):
         self.transport = transport
         self.cache = cache
+
+    def judge_candidates_bounded(
+        self,
+        request: GlobalCandidateJudgeRequest,
+        *,
+        max_physical_requests: Optional[int],
+    ) -> BoundedJudgeCallResult:
+        prompt = build_global_candidate_prompt(request)
+        outcome = self._request_validated(
+            stage="global_candidate_judgment",
+            schema_version=GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+            system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+            prompt=prompt,
+            node_ref="global:{0}".format(request.case_id),
+            request_context=request.to_dict(),
+            validator=lambda value: validate_global_candidate_payload(
+                value, request=request
+            ),
+            max_tokens=int(getattr(self.transport, "max_tokens", 4096)),
+            max_physical_requests=max_physical_requests,
+        )
+        if outcome.payload is not None:
+            try:
+                judgment = global_candidate_judgment_from_payload(
+                    outcome.payload, request=request
+                )
+            except Exception as exc:
+                raise BoundedJudgeCallError(
+                    "post-validation global adapter failed: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    physical_requests=outcome.physical_requests,
+                ) from exc
+            return BoundedJudgeCallResult(judgment, outcome.physical_requests)
+        detail = "global_judge_{0}: {1}".format(
+            outcome.error_kind or "error", outcome.error_detail
+        )
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome="inconclusive",
+                reason="The global candidate Judge could not produce a validated result: {0}".format(
+                    detail
+                ),
+                assessments=tuple(
+                    GlobalCandidateAssessment(
+                        candidate_ref=capsule.candidate_ref,
+                        defect_status="unknown",
+                        causal_role="unknown",
+                        reason="Global candidate judgment is unavailable.",
+                        evidence_refs=(),
+                        confidence=0.0,
+                    )
+                    for capsule in request.capsules
+                ),
+                selected_candidate_refs=(),
+                expansion_requests=(),
+                decisive_evidence_refs=(),
+                missing_evidence=(detail,),
+                confidence=0.0,
+            ),
+            outcome.physical_requests,
+        )
 
     def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:
         return self.judge_step_bounded(request, max_physical_requests=None).value
@@ -2409,6 +2672,11 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                                     "schema_version": schema_version,
                                     "original_prompt": prompt,
                                     "canonical_request_context": request_context,
+                                    "repair_constraints": _repair_constraints(
+                                        stage=stage,
+                                        node_ref=node_ref,
+                                        request_context=request_context,
+                                    ),
                                 }
                             ),
                         }
@@ -2478,6 +2746,11 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                                             exact_error,
                                             repair_error_detail,
                                         ],
+                                        "repair_constraints": _repair_constraints(
+                                            stage=stage,
+                                            node_ref=node_ref,
+                                            request_context=request_context,
+                                        ),
                                         "invalid_outputs": [
                                             text[:16000],
                                             repaired[:16000],

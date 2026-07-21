@@ -19,6 +19,11 @@ describe("tool semantic observability", () => {
       "repository_change",
     )
     expect(classifyShellOperation("python3 scripts/generate.py")).toBe("general_execution")
+    expect(
+      classifyShellOperation(
+        'npx mocha test/unit/adapters/http.js --timeout 10000 --grep "decompression|content-encoding" 2>&1 | head -60',
+      ),
+    ).toBe("verification")
   })
 
   test("does not treat a pipeline's trailing command exit code as the pytest result", () => {
@@ -27,6 +32,14 @@ describe("tool semantic observability", () => {
     expect(inferVerificationStatus(command, 0, "2 failed, 10 passed in 0.20s", undefined)).toBe("failed")
     expect(inferVerificationStatus(command, 0, "12 passed in 0.20s", undefined)).toBe("passed")
     expect(inferVerificationStatus(command, 0, "collected tests/test_api.py", undefined)).toBe("unknown")
+    expect(
+      inferVerificationStatus(
+        'npx mocha test/unit/adapters/http.js --grep "decompression|content-encoding" 2>&1 | head -60',
+        0,
+        "AxiosError decompression suite",
+        undefined,
+      ),
+    ).toBe("unknown")
   })
 
   test("detects an actual repository mutation without changing repository state", () => {

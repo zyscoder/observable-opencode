@@ -1713,12 +1713,11 @@ function parseVerificationFailures(input: { stdout?: unknown; stderr?: unknown }
     return bHasColumn - aHasColumn || a.index - b.index
   })
   const location = locations[0]
-  if (location) {
-    const target = failures[0] ?? {}
+  if (location && failures.length) {
+    const target = failures[0]
     target.file = location[1]
     target.line = optionalNumber(location[2])
     target.column = optionalNumber(location[3])
-    if (!failures.length) failures.push(target)
   }
 
   return failures
@@ -2497,11 +2496,12 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
   const normalized = protectedText.text
     .replace(/\r\n/g, "\n")
     .split(/\n+|(?:^|\n)\s*(?:[-*]|\d+\.)\s+/)
-    .flatMap((part) => part.match(/[^。！？.!?；;]+[。！？.!?]?/g) ?? [part])
+    .flatMap(splitClaimSentences)
     .map((part) => restoreClaimSegments(part.trim(), protectedText.segments))
     .filter(Boolean)
+  const completeClaims = mergeClaimContinuationFragments(normalized)
   const seen = new Set<string>()
-  return normalized
+  return completeClaims
     .map((claim) => claim.replace(/\s+/g, " ").trim())
     .flatMap((claim): ResponseClaimCandidate[] => {
       if (isBrokenClaimFragment(claim)) return []
@@ -2521,6 +2521,52 @@ function splitResponseClaims(input: unknown): ResponseClaimCandidate[] {
       return [candidate]
     })
     .slice(0, 50)
+}
+
+function splitClaimSentences(input: string) {
+  const output: string[] = []
+  let start = 0
+  const stack: string[] = []
+  const closing = new Map([
+    [")", "("],
+    ["）", "（"],
+    ["]", "["],
+    ["］", "［"],
+    ["}", "{"],
+    ["｝", "｛"],
+  ])
+  const opening = new Set(closing.values())
+  for (let index = 0; index < input.length; index++) {
+    const value = input[index]
+    if (opening.has(value)) {
+      stack.push(value)
+      continue
+    }
+    const expected = closing.get(value)
+    if (expected) {
+      if (stack.at(-1) === expected) stack.pop()
+      continue
+    }
+    if (stack.length || !/[。！？.!?；;]/.test(value)) continue
+    output.push(input.slice(start, index + 1))
+    start = index + 1
+  }
+  if (start < input.length) output.push(input.slice(start))
+  return output.length ? output : [input]
+}
+
+function mergeClaimContinuationFragments(input: string[]) {
+  const output: string[] = []
+  for (const value of input) {
+    const fragment = value.trim()
+    if (!fragment) continue
+    if (output.length && /^[,，、:：)）\]］}｝]/.test(fragment)) {
+      output[output.length - 1] = `${output[output.length - 1]}${fragment}`
+      continue
+    }
+    output.push(fragment)
+  }
+  return output
 }
 
 function stripResponseClaimScaffolding(input: string) {

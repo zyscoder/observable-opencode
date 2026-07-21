@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from .causal_state import AttributionHypothesis, CausalCandidate, DefectState
 from .episodes import CausalEpisodeIndex
@@ -20,6 +20,27 @@ SIBLING_REFERENCE_KEYS = (
     "artifact_refs",
 )
 SEMANTIC_FALLBACK_LIMIT = 5
+PROVENANCE_ENVELOPE_LIMIT = 2
+PROVENANCE_ENVELOPE_EVENT_TYPES = frozenset(
+    {
+        "prompt.assembly",
+        "message.input",
+        "context.transform",
+        "context.pack",
+        "llm.call",
+        "task.loop",
+    }
+)
+ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
+    {
+        "case.failed",
+        "case.observed_defect",
+        "case.quality_gap",
+        "case.missing_semantic",
+        "context.pack",
+        "run.start",
+    }
+)
 
 
 class SemanticPredecessorRetriever:
@@ -40,19 +61,36 @@ class SemanticPredecessorRetriever:
             return []
         if graph.nodes[resolved].event_type == "process.signal":
             return merge_ranked_candidates([self._direct_candidates(graph, resolved)], limit=limit)
-        layers = [
-            self._direct_candidates(graph, resolved),
-            self._episode_candidates(graph, resolved),
-            self._sibling_candidates(graph, resolved),
-        ]
-        if allow_semantic_fallback:
+        if graph.nodes[resolved].event_type == "progress.episode":
+            layers = [
+                self._episode_candidates(graph, resolved, defect_state, hypothesis),
+            ]
+        else:
+            terms = semantic_terms(defect_state, hypothesis)
+            layers = [
+                bound_provenance_envelopes(
+                    self._direct_candidates(graph, resolved), terms
+                ),
+                self._episode_candidates(graph, resolved, defect_state, hypothesis),
+                bound_provenance_envelopes(
+                    self._sibling_candidates(graph, resolved), terms
+                ),
+            ]
+        if allow_semantic_fallback and graph.nodes[resolved].event_type != "progress.episode":
             layers.append(self._semantic_candidates(graph, resolved, defect_state, hypothesis))
         if is_interrupted_case_failure(graph, graph.nodes[resolved]):
             layers = [
                 [candidate for candidate in layer if not is_stale_completion_diagnostic(candidate.node)]
                 for layer in layers
             ]
-        return merge_ranked_candidates(layers, limit=limit)
+        merged = merge_ranked_candidates(layers, limit=limit)
+        if graph.nodes[resolved].event_type == "progress.episode":
+            return merged
+        return bound_provenance_envelopes(
+            merged,
+            semantic_terms(defect_state, hypothesis),
+            limit=limit,
+        )
 
     def _direct_candidates(self, graph: TraceGraph, node_ref: str) -> List[CausalCandidate]:
         candidates: List[CausalCandidate] = []
@@ -75,14 +113,30 @@ class SemanticPredecessorRetriever:
             )
         return candidates
 
-    def _episode_candidates(self, graph: TraceGraph, node_ref: str) -> List[CausalCandidate]:
+    def _episode_candidates(
+        self,
+        graph: TraceGraph,
+        node_ref: str,
+        defect_state: DefectState,
+        hypothesis: AttributionHypothesis,
+    ) -> List[CausalCandidate]:
         current = graph.nodes[node_ref]
         refs: List[str] = []
         source = "episode_candidate"
+        terms: List[str] = []
         if current.event_type == "progress.episode":
             window = progress_navigation_window(graph.nodes, node_ref)
-            refs = [str(item) for item in window.get("member_refs") or []]
+            refs = [
+                str(item)
+                for item in (
+                    window.get("retrieval_candidate_member_refs")
+                    or window.get("candidate_member_refs")
+                    or window.get("member_refs")
+                    or []
+                )
+            ]
             source = "progress_window"
+            terms = semantic_terms(defect_state, hypothesis)
         else:
             episode = CausalEpisodeIndex.from_graph(graph).episode_for(node_ref)
             refs = [
@@ -97,6 +151,7 @@ class SemanticPredecessorRetriever:
             node = graph.nodes.get(ref)
             if not node or ref == node_ref or is_navigation_node(node):
                 continue
+            score = progress_candidate_score(node, terms) if source == "progress_window" else 0.7
             candidates.append(
                 CausalCandidate(
                     ref=ref,
@@ -108,15 +163,15 @@ class SemanticPredecessorRetriever:
                         "relation": "progress_window_candidate" if source == "progress_window" else "episode_member",
                         "evidence_type": "offline_reconstruction",
                         "evidence_refs": [ref],
-                        "confidence": 0.7,
+                        "confidence": score,
                         "eligible_for_attribution": False,
                         "retrieval_candidate": True,
-                        "inference_method": "delivery_bounded_progress_window"
+                        "inference_method": "bounded_delivery_history_semantic_ranking_v1"
                         if source == "progress_window"
                         else "causal_episode_membership",
                         "edge_origin": "offline.progress_retrieval",
                     },
-                    score=0.7,
+                    score=score,
                     evidence_refs=(ref,),
                 )
             )
@@ -224,6 +279,43 @@ def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limi
     return [item[2] for item in selected[:limit]]
 
 
+def bound_provenance_envelopes(
+    candidates: Sequence[CausalCandidate],
+    terms: Sequence[str],
+    *,
+    limit: Optional[int] = None,
+) -> List[CausalCandidate]:
+    ranked_envelopes: List[Tuple[float, int, CausalCandidate]] = []
+    concrete: List[Tuple[int, CausalCandidate]] = []
+    for index, candidate in enumerate(candidates):
+        if candidate.node.event_type not in PROVENANCE_ENVELOPE_EVENT_TYPES:
+            concrete.append((index, candidate))
+            continue
+        semantic_score = progress_candidate_score(candidate.node, terms)
+        ranked_envelopes.append(
+            (
+                semantic_score,
+                index,
+                CausalCandidate(
+                    ref=candidate.ref,
+                    node=candidate.node,
+                    source=candidate.source,
+                    edge=candidate.edge,
+                    score=semantic_score,
+                    evidence_refs=candidate.evidence_refs,
+                ),
+            )
+        )
+    selected_envelopes = sorted(
+        ranked_envelopes,
+        key=lambda item: (-item[0], item[1], item[2].ref),
+    )[:PROVENANCE_ENVELOPE_LIMIT]
+    retained = concrete + [(index, candidate) for _, index, candidate in selected_envelopes]
+    retained.sort(key=lambda item: item[0])
+    output = [candidate for _, candidate in retained]
+    return output if limit is None else output[:limit]
+
+
 def edge_evidence_refs(edge: Mapping[str, Any]) -> Tuple[str, ...]:
     refs = edge.get("evidence_refs")
     if isinstance(refs, (list, tuple)):
@@ -272,6 +364,31 @@ def semantic_terms(defect_state: DefectState, hypothesis: AttributionHypothesis)
     return re.findall(r"[A-Za-z0-9_]{3,}", source)
 
 
+def progress_candidate_score(node: TraceNode, terms: Sequence[str]) -> float:
+    query_terms = {term.lower() for term in terms}
+    node_terms = {
+        token.lower()
+        for token in re.findall(
+            r"[A-Za-z0-9_]{3,}",
+            " ".join((node.title, node.status, flatten_text(node.data))),
+        )
+    }
+    overlap = len(query_terms & node_terms) / max(1, len(query_terms))
+    decision_type = str(node.data.get("decision_type") or "").strip().lower()
+    role_bonus = 0.03 if decision_type == "reasoning_block" else 0.0
+    return min(0.99, 0.55 + overlap + role_bonus)
+
+
+def flatten_text(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return " ".join(flatten_text(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return " ".join(flatten_text(child) for child in value)
+    if value in (None, ""):
+        return ""
+    return str(value)
+
+
 def identity_value(node: TraceNode, *keys: str) -> str:
     normalized = {key.lower() for key in keys}
     stack = [node.data]
@@ -294,6 +411,13 @@ def is_navigation_node(node: TraceNode) -> bool:
         "navigation",
         "progress_episode",
     }
+
+
+def root_candidate_eligible(node: TraceNode) -> bool:
+    return (
+        not is_navigation_node(node)
+        and node.event_type not in ROOT_INELIGIBLE_EVENT_TYPES
+    )
 
 
 def is_interrupted_case_failure(graph: TraceGraph, node: TraceNode) -> bool:

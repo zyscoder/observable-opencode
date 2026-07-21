@@ -1830,6 +1830,50 @@ describe("case trace", () => {
     expect(trace.metrics.trace_health.broken_claim_fragments).toBe(0)
   })
 
+  test("keeps parenthetical abbreviations inside one complete response claim", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-parenthetical-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "parenthetical-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const text =
+      "When _cstack handled a non-Model right operand (i.e., a pre-computed separability matrix from a nested compound model), it used the wrong shape. The fix preserves the nested matrix."
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ text: ${JSON.stringify(text)} })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "parenthetical-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "parenthetical-claim-case", "trace.json"), "utf8"),
+    ) as any
+    const claims = trace.records
+      .filter((record: any) => record.event_type === "response.claim")
+      .map((record: any) => record.data.text)
+
+    expect(claims).toEqual([
+      "When _cstack handled a non-Model right operand (i.e., a pre-computed separability matrix from a nested compound model), it used the wrong shape.",
+      "The fix preserves the nested matrix.",
+    ])
+  })
+
   test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-discount-values-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -6176,6 +6220,59 @@ describe("case trace", () => {
     })
     expect(verificationFact.data.structured_claim.value).toBe("failed")
     expect(verificationFact.data.quality_flags).toContain("failure_output_masked_by_exit_code")
+  })
+
+  test("does not infer verification failure from a source location in passing pytest output", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-passing-location-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "passing-location-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const stdout = [
+      "astropy/modeling/separable.py:211: DeprecationWarning: pending cleanup",
+      "...........",
+      "11 passed, 1 warning in 0.08s",
+    ].join("\n")
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.verification({ command: "python -m pytest astropy/modeling/tests/test_separable.py -q", exit_code: 0, stdout: ${JSON.stringify(stdout)}, stderr: "" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "passing-location-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(dir, "passing-location-case", "legacy-trace.json"), "utf8"),
+    ) as any
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "passing-location-case", "trace.json"), "utf8"),
+    ) as any
+    const verification = trace.records.find((record: any) => record.event_type === "verification")
+
+    expect(legacy.verification_records[0].status).toBe("passed")
+    expect(legacy.verification_records[0].parsed_failures).toEqual([])
+    expect(legacy.verification_records[0].quality_flags).not.toContain("failure_output_masked_by_exit_code")
+    expect(verification.status).toBe("passed")
+    expect(verification.data.final_test_result).toMatchObject({
+      status: "passed",
+      exit_code: 0,
+      parsed_failure_count: 0,
+    })
   })
 
   test("tracks repository revisions and supersedes pre-change verification results", async () => {

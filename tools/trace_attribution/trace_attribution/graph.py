@@ -58,7 +58,11 @@ class TraceGraph:
     def from_file(cls, trace_file: Path) -> "TraceGraph":
         path = Path(trace_file)
         with path.open("r", encoding="utf-8") as handle:
-            return cls.from_trace(json.load(handle), artifact_root=path.parent)
+            trace = json.load(handle)
+        return cls.from_trace(
+            trace,
+            artifact_root=artifact_root_for_trace_path(path, trace),
+        )
 
     @classmethod
     def from_trace(cls, trace: JsonDict, artifact_root: Optional[Path] = None) -> "TraceGraph":
@@ -407,6 +411,33 @@ class TraceGraph:
         target = self.resolve(to_ref) or to_ref
         return [dict(item) for item in self._edge_context_index.get((source, target), [])]
 
+    def add_offline_navigation_edge(
+        self,
+        from_ref: str,
+        to_ref: str,
+        *,
+        evidence_refs: Iterable[str],
+        confidence: float,
+    ) -> None:
+        source = self.resolve(from_ref) or from_ref
+        target = self.resolve(to_ref) or to_ref
+        if source not in self.nodes or target not in self.nodes or source == target:
+            raise ValueError("offline navigation edge endpoints must resolve to distinct nodes")
+        self._upstream[target][source] = None
+        self._downstream[source][target] = None
+        add_edge_context(
+            self._edge_context_index,
+            from_ref=source,
+            to_ref=target,
+            relation="semantic_navigation_route",
+            evidence_type="semantic_inferred",
+            evidence_refs=[str(ref) for ref in evidence_refs],
+            confidence=normalized_confidence(confidence),
+            eligible_for_attribution=True,
+            inference_method="bounded_delivery_history_semantic_ranking_v1",
+            edge_origin="offline.navigation_routing",
+        )
+
     def semantic_predecessor_edges(self, ref: str) -> List[JsonDict]:
         """Return attribution-eligible incoming edges without changing the trace graph."""
         resolved = self.resolve(ref) or ref
@@ -725,6 +756,25 @@ class TraceGraph:
             return dedupe(starts)
         case_records = [ref for ref, node in self.nodes.items() if node.event_type in ("case.completed", "case.failed")]
         return case_records[-1:] if case_records else list(self.nodes.keys())[-1:]
+
+
+def artifact_root_for_trace_path(trace_path: Path, trace: JsonDict) -> Path:
+    path = Path(trace_path).resolve()
+    manifest = trace.get("manifest") if isinstance(trace.get("manifest"), dict) else {}
+    files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    for value in files.values():
+        declared = Path(str(value or ""))
+        if not declared.parts or declared.is_absolute() or ".." in declared.parts:
+            continue
+        if len(declared.parts) > len(path.parts):
+            continue
+        if tuple(path.parts[-len(declared.parts):]) != declared.parts:
+            continue
+        root = path
+        for _ in declared.parts:
+            root = root.parent
+        return root
+    return path.parent
 
 
 def hydrate_record_artifacts(

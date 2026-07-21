@@ -13,6 +13,8 @@ def build_recursive_trace_improvement_report(
     """Derive recursive-attribution observability gaps without model calls."""
     blocking_gaps: List[JsonDict] = []
     recommendations: List[JsonDict] = []
+    analysis_gaps: List[JsonDict] = []
+    attribution_recommendations: List[JsonDict] = []
 
     def add_recursive_gap(
         gap_type: str,
@@ -43,6 +45,39 @@ def build_recursive_trace_improvement_report(
                     ", ".join(missing_fields), node_ref or "the recursive analysis"
                 ),
                 "unblocks": [gap_type],
+            }
+        )
+
+    def add_analysis_gap(
+        gap_type: str,
+        *,
+        node_ref: str,
+        why: str,
+        required_analysis: Iterable[str],
+        related_refs: Iterable[str],
+    ) -> None:
+        analysis_gaps.append(
+            {
+                "gap_type": gap_type,
+                "node_ref": node_ref,
+                "component": "attribution",
+                "event_type": "recursive_analysis",
+                "why_it_blocks_root_cause_analysis": why,
+                "required_analysis_fields": list(required_analysis),
+                "related_refs": list(dict.fromkeys(str(ref) for ref in related_refs if ref)),
+                "confidence": 1.0,
+                "behavior_impact": "none_offline_analysis_only",
+            }
+        )
+        attribution_recommendations.append(
+            {
+                "component": "attribution",
+                "priority": "high",
+                "change": "Complete {0} for {1} in the offline attribution pass.".format(
+                    ", ".join(required_analysis), node_ref or "the recursive analysis"
+                ),
+                "unblocks": [gap_type],
+                "must_not_be_recorded_as_agent_trace_semantics": True,
             }
         )
 
@@ -106,11 +141,11 @@ def build_recursive_trace_improvement_report(
         if item.status in {"active", "supported", "unresolved"}
     ]
     if unresolved:
-        add_recursive_gap(
+        add_analysis_gap(
             "competing_hypotheses_unresolved",
             node_ref=unresolved[0].candidate_root_ref,
             why="One or more grounded competing explanations remain unresolved.",
-            missing_fields=("independent_comparison", "falsification_result"),
+            required_analysis=("independent_comparison", "falsification_result"),
             related_refs=(item.candidate_root_ref for item in unresolved),
         )
 
@@ -172,22 +207,29 @@ def build_recursive_trace_improvement_report(
 
     blocking_gaps = dedupe_gaps(blocking_gaps)
     recommendations = dedupe_recommendations(recommendations)
+    analysis_gaps = dedupe_gaps(analysis_gaps)
+    attribution_recommendations = dedupe_recommendations(attribution_recommendations)
+    total_blocking = len(blocking_gaps) + len(analysis_gaps)
     return {
         "summary": {
-            "blocking_gap_count": len(blocking_gaps),
+            "blocking_gap_count": total_blocking,
+            "trace_gap_count": len(blocking_gaps),
+            "analysis_gap_count": len(analysis_gaps),
             "advisory_gap_count": 0,
-            "recommended_change_count": len(recommendations),
+            "recommended_change_count": len(recommendations) + len(attribution_recommendations),
             "analysis_confidence": (
                 "blocked"
-                if blocking_gaps and not confirmed_refs
+                if total_blocking and not confirmed_refs
                 else "partial"
-                if blocking_gaps
+                if total_blocking
                 else "high"
             ),
         },
         "blocking_gaps": blocking_gaps,
+        "analysis_gaps": analysis_gaps,
         "advisory_gaps": [],
         "recommended_trace_changes": recommendations,
+        "recommended_attribution_changes": attribution_recommendations,
     }
 
 

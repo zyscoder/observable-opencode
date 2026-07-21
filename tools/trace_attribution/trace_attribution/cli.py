@@ -18,7 +18,7 @@ from .checkpoint import (
     publish_output_transaction,
 )
 from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
-from .graph import TraceGraph
+from .graph import TraceGraph, artifact_root_for_trace_path
 from .models import stable_json
 from .quality_review import inject_quality_gap_records
 from .recursive_analyzer import AgenticRecursiveAnalyzer
@@ -61,6 +61,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=("legacy", "recursive-agentic"),
         default="legacy",
         help="Attribution engine; legacy remains the compatibility default.",
+    )
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("off", "retrieval-global"),
+        default="retrieval-global",
+        help="Recursive engine candidate strategy; retrieval-global compares evidence capsules before bounded recursive expansion.",
     )
     parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
     parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
@@ -175,6 +181,7 @@ def main() -> int:
                 "thinking": transport.thinking_config,
                 "max_tokens": transport.max_tokens,
                 "provider_error_threshold": transport.provider_error_threshold,
+                "fusion_mode": args.fusion_mode,
             }
         )
         checkpoint_config = build_checkpoint_config(
@@ -213,6 +220,7 @@ def main() -> int:
                 checkpoint=checkpoint,
                 checkpoint_config=checkpoint_config,
                 stop_requested=shutdown.stop_requested,
+                fusion_mode=args.fusion_mode,
             ).analyze(
                 graph,
                 start_refs=starts,
@@ -313,7 +321,10 @@ def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGra
     if review_path:
         review = json.loads(review_path.read_text(encoding="utf-8"))
         trace = inject_quality_gap_records(trace, review)
-    return TraceGraph.from_trace(trace, artifact_root=trace_path.parent)
+    return TraceGraph.from_trace(
+        trace,
+        artifact_root=artifact_root_for_trace_path(trace_path, trace),
+    )
 
 
 if __name__ == "__main__":
