@@ -131,6 +131,7 @@ function splitLineClaimSpans(
 
   for (let index = start; index < end; index++) {
     const value = input[index]!
+    if (protectedOffsets.has(index)) continue
     if (opening.has(value)) {
       stack.push(value)
       continue
@@ -140,7 +141,7 @@ function splitLineClaimSpans(
       if (stack.at(-1) === expected) stack.pop()
       continue
     }
-    if (stack.length || protectedOffsets.has(index) || !/[。！？.!?；;]/.test(value)) continue
+    if (stack.length || !/[。！？.!?；;]/.test(value)) continue
     pushTrimmedSpan(input, spanStart, index + 1, output)
     spanStart = index + 1
   }
