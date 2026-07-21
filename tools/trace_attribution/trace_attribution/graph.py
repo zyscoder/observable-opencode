@@ -654,6 +654,16 @@ class TraceGraph:
         return [self.hydrate_node(item) for item in refs[:limit]]
 
     def default_start_refs(self) -> List[str]:
+        failed_cases = [ref for ref, node in self.nodes.items() if node.event_type == "case.failed"]
+        manifest = self.raw_trace.get("manifest") if isinstance(self.raw_trace.get("manifest"), dict) else {}
+        interrupted = manifest.get("shutdown_disposition") == "interrupted_before_case_completion"
+        if not interrupted:
+            interrupted = any(
+                self.nodes[ref].data.get("shutdown_disposition") == "interrupted_before_case_completion"
+                for ref in failed_cases
+            )
+        if failed_cases and interrupted:
+            return failed_cases[-1:]
         offline_defect_starts = [
             ref
             for ref, node in self.nodes.items()
@@ -661,7 +671,6 @@ class TraceGraph:
         ]
         if offline_defect_starts:
             return dedupe(offline_defect_starts)
-        failed_cases = [ref for ref, node in self.nodes.items() if node.event_type == "case.failed"]
         if failed_cases:
             return failed_cases[-1:]
         final_claims = [

@@ -4,6 +4,7 @@ export const TRACE_VERSION = "6.0" as const
 
 export const FORMAL_RECORD_TYPES = [
   "run.start",
+  "process.signal",
   "case.completed",
   "case.failed",
   "case.observed_defect",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Set
 
 from .causal_state import RecursiveAttributionReport
@@ -83,6 +84,21 @@ def build_recursive_trace_improvement_report(
                 ),
                 related_refs=(relation.ref,),
             )
+
+    for branch in report.metadata.get("unresolved_branches") or ():
+        if not isinstance(branch, Mapping) or branch.get("reason") != "process_signal_node_missing":
+            continue
+        node_ref = str(branch.get("node_ref") or "")
+        add_recursive_gap(
+            "process_signal_node_missing",
+            node_ref=node_ref,
+            why=(
+                "The case was interrupted by a recorded process signal, but the trace has no distinct "
+                "signal occurrence that can be traversed and independently confirmed."
+            ),
+            missing_fields=("process_signal_node", "signal_observation_source", "signal_to_failure_edge"),
+            related_refs=(node_ref,),
+        )
 
     unresolved = [
         item

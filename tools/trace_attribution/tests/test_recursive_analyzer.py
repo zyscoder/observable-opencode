@@ -418,6 +418,14 @@ def single_node_trace(*, content: str = "", hydrated_artifacts=None) -> dict:
 
 
 def valid_single_node_payload() -> dict:
+    state = RecursiveAnalysisState.create(
+        graph=TraceGraph.from_trace(single_node_trace()),
+        start_refs=["record:only"],
+        objective="Find the defect.",
+        analysis_perspective="Find the best-supported causal explanation.",
+    )
+    hypothesis = state.ledger.snapshot()[0]
+    defect_fingerprint = next(iter(state.defect_states))
     return {
         "current_node_ref": "record:only",
         "current_defect_status": "present",
@@ -425,7 +433,15 @@ def valid_single_node_payload() -> dict:
         "predecessors": [],
         "candidate_introduction": True,
         "missing_evidence": [],
-        "suggested_investigation": None,
+        "suggested_investigation": {
+            "action": "request_root_confirmation",
+            "arguments": {
+                "hypothesis_id": hypothesis["hypothesis_id"],
+                "candidate_ref": "record:only",
+                "defect_fingerprint": defect_fingerprint,
+            },
+            "reason": "Independently confirm the introduction candidate.",
+        },
         "confidence": 0.9,
     }
 
@@ -661,6 +677,84 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(report.defect_states[0].label, "missing_namespace_contract")
         self.assertEqual(report.metadata["seed_count"], 1)
 
+    def test_interrupted_case_failure_seeds_only_the_recorded_process_signal(self):
+        trace = {
+            "case_id": "recorded-signal-boundary",
+            "manifest": {"shutdown_disposition": "interrupted_before_case_completion"},
+            "records": [
+                {"record_id": "run", "component": "run", "event_type": "run.start"},
+                {
+                    "record_id": "signal",
+                    "component": "runtime",
+                    "event_type": "process.signal",
+                    "data": {"signal": "SIGTERM"},
+                },
+                {
+                    "record_id": "failed",
+                    "component": "run",
+                    "event_type": "case.failed",
+                    "source_refs": ["record:run", "record:signal"],
+                    "data": {
+                        "shutdown_signal": "SIGTERM",
+                        "shutdown_disposition": "interrupted_before_case_completion",
+                    },
+                },
+            ],
+        }
+        judge = ScriptedCausalJudge(
+            {"record:signal": step("record:signal", introduction=True)}
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:failed"],
+            objective="Find why the case was interrupted.",
+        )
+
+        self.assertEqual([item.current_node.ref for item in judge.requests], ["record:signal"])
+        self.assertEqual([item.ref for item in report.introduction_candidates], ["record:signal"])
+        self.assertNotIn("record:failed", report.visited_order)
+
+    def test_legacy_interrupted_failure_without_signal_node_reports_trace_gap(self):
+        trace = {
+            "case_id": "legacy-signal-boundary",
+            "manifest": {"shutdown_disposition": "interrupted_before_case_completion"},
+            "records": [
+                {"record_id": "run", "component": "run", "event_type": "run.start"},
+                {
+                    "record_id": "failed",
+                    "component": "run",
+                    "event_type": "case.failed",
+                    "source_refs": ["record:run"],
+                    "data": {
+                        "shutdown_signal": "SIGINT",
+                        "shutdown_disposition": "interrupted_before_case_completion",
+                    },
+                },
+            ],
+        }
+        judge = ScriptedCausalJudge({})
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:failed"],
+            objective="Find why the case was interrupted.",
+        )
+
+        self.assertEqual(judge.requests, [])
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertIn(
+            "process_signal_node_missing",
+            [item["reason"] for item in report.metadata["unresolved_branches"]],
+        )
+        self.assertIn(
+            "process_signal_node_missing",
+            [
+                item["gap_type"]
+                for item in report.metadata["trace_improvement_report"]["blocking_gaps"]
+            ],
+        )
+
     def test_same_defect_propagation_preserves_defect_fingerprint(self):
         judge = ScriptedCausalJudge(
             {
@@ -759,6 +853,30 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(report.analysis_outcome, "no_defect")
         self.assertEqual(report.unresolved_refs, ())
         self.assertEqual(report.introduction_candidates, ())
+
+    def test_unknown_predecessor_does_not_block_an_absent_current_defect(self):
+        judge = ScriptedCausalJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    status="absent",
+                    predecessors=(relation("record:decision", "unknown"),),
+                )
+            }
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Check whether this branch contains the defect.",
+        )
+
+        self.assertEqual(report.analysis_outcome, "no_defect")
+        self.assertEqual(report.unresolved_refs, ())
+        self.assertNotIn(
+            "predecessor_unknown",
+            [item["reason"] for item in report.metadata["unresolved_branches"]],
+        )
 
     def test_changed_defect_fingerprints_visit_the_same_predecessor_separately(self):
         transformed = DefectState.create(
@@ -1012,7 +1130,7 @@ class RecursiveBudgetTest(unittest.TestCase):
         self.assertEqual(report.metadata["artifact_bytes"], 6)
         self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
 
-    def test_one_physical_request_budget_allows_valid_claude_judgment(self):
+    def test_one_physical_request_budget_allows_judgment_but_not_confirmation(self):
         transport = ScriptedTransport([json.dumps(valid_single_node_payload())])
         judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
 
@@ -1024,8 +1142,10 @@ class RecursiveBudgetTest(unittest.TestCase):
 
         self.assertEqual(transport.request_count, 1)
         self.assertEqual(report.metadata["judge_request_count"], 1)
-        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
+        self.assertEqual(report.metadata["logical_judge_call_count"], 2)
         self.assertEqual([item.ref for item in report.introduction_candidates], ["record:only"])
+        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
 
     def test_cache_hit_costs_zero_physical_requests_with_zero_remaining_budget(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1049,8 +1169,9 @@ class RecursiveBudgetTest(unittest.TestCase):
 
         self.assertEqual(transport.request_count, 1)
         self.assertEqual(report.metadata["judge_request_count"], 0)
-        self.assertEqual(report.metadata["logical_judge_call_count"], 1)
-        self.assertNotIn("judge_requests", report.metadata["exhausted_budgets"])
+        self.assertEqual(report.metadata["logical_judge_call_count"], 2)
+        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertEqual(report.metadata["exhausted_budgets"]["judge_requests"], 1)
 
     def test_repair_is_blocked_at_exact_physical_request_boundary(self):
         transport = ScriptedTransport(["not-json"])
@@ -1320,6 +1441,12 @@ class RecursiveRootRankingTest(unittest.TestCase):
         self.assertEqual(report.rejected_candidates, ())
         requests = {item.candidate_ref: item for item in judge.confirmation_requests}
         decision_request = requests["record:decision"]
+        competitor_refs = {
+            item["candidate_reference"]["resolved_ref"]
+            for item in decision_request.competing_hypotheses
+        }
+        self.assertIn("record:context", competitor_refs)
+        self.assertNotIn("record:change", competitor_refs)
         self.assertTrue(decision_request.hypothesis_id)
         self.assertEqual(
             decision_request.defect_state.fingerprint,

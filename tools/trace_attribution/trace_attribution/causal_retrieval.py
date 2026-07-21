@@ -15,11 +15,11 @@ from .progress import progress_navigation_window
 
 SIBLING_REFERENCE_KEYS = (
     "candidate_context_refs",
-    "grounding_candidate_refs",
     "selected_context_refs",
     "verification_refs",
     "artifact_refs",
 )
+SEMANTIC_FALLBACK_LIMIT = 5
 
 
 class SemanticPredecessorRetriever:
@@ -38,6 +38,8 @@ class SemanticPredecessorRetriever:
         resolved = graph.resolve(node_ref) or node_ref
         if resolved not in graph.nodes:
             return []
+        if graph.nodes[resolved].event_type == "process.signal":
+            return merge_ranked_candidates([self._direct_candidates(graph, resolved)], limit=limit)
         layers = [
             self._direct_candidates(graph, resolved),
             self._episode_candidates(graph, resolved),
@@ -45,6 +47,11 @@ class SemanticPredecessorRetriever:
         ]
         if allow_semantic_fallback:
             layers.append(self._semantic_candidates(graph, resolved, defect_state, hypothesis))
+        if is_interrupted_case_failure(graph, graph.nodes[resolved]):
+            layers = [
+                [candidate for candidate in layer if not is_stale_completion_diagnostic(candidate.node)]
+                for layer in layers
+            ]
         return merge_ranked_candidates(layers, limit=limit)
 
     def _direct_candidates(self, graph: TraceGraph, node_ref: str) -> List[CausalCandidate]:
@@ -165,7 +172,11 @@ class SemanticPredecessorRetriever:
     ) -> List[CausalCandidate]:
         terms = semantic_terms(defect_state, hypothesis)
         candidates: List[CausalCandidate] = []
-        for match in graph.semantic_search(terms, before_ref=node_ref, limit=24):
+        for match in graph.semantic_search(
+            terms,
+            before_ref=node_ref,
+            limit=SEMANTIC_FALLBACK_LIMIT,
+        ):
             ref = str(match["ref"])
             node = graph.nodes.get(ref)
             if not node:
@@ -283,3 +294,25 @@ def is_navigation_node(node: TraceNode) -> bool:
         "navigation",
         "progress_episode",
     }
+
+
+def is_interrupted_case_failure(graph: TraceGraph, node: TraceNode) -> bool:
+    if node.event_type != "case.failed":
+        return False
+    if node.data.get("shutdown_disposition") == "interrupted_before_case_completion":
+        return True
+    manifest = graph.raw_trace.get("manifest")
+    return (
+        isinstance(manifest, Mapping)
+        and manifest.get("shutdown_disposition") == "interrupted_before_case_completion"
+    )
+
+
+def is_stale_completion_diagnostic(node: TraceNode) -> bool:
+    if node.event_type == "case.missing_semantic":
+        return node.data.get("semantic_name") == "final_test_result"
+    if node.event_type != "case.observed_defect":
+        return False
+    return node.data.get("defect_type") == "missing_verification_after_change" or node.data.get(
+        "failure_type"
+    ) == "final_test_result_missing"

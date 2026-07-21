@@ -2,14 +2,15 @@
 
 ## Scope And Decision
 
-This report freezes locally available legacy evidence and records the Task 9 offline
-acceptance-harness result. The frozen code baseline is
+This report freezes locally available legacy evidence, records the original Task 9 offline
+acceptance-harness result, and appends the Fusion C real-Provider validation performed on
+2026-07-20. The original frozen code baseline is
 `44b72341e516ac9af24a29c336e59ddcb659139d` (`2026-07-21T05:23:06+08:00`).
 
 The CLI default remains `legacy`. Deterministic fixture results are regression evidence, not
-real-LLM attribution-quality acceptance. No network or model call was made in Task 9 or this
-review fix. The parent task must run the authorized real comparisons before any default can
-change.
+real-LLM attribution-quality acceptance. The historical Task 9 section made no network or
+model call. The later Fusion C validation used the authorized Anthropic-compatible DeepSeek
+Provider, but it is behavioral validation rather than an audited benchmark-quality gate.
 
 ## Frozen Legacy Evidence
 
@@ -190,6 +191,43 @@ above and write to `/private/tmp/observable-opencode-task9-real/semantic/`. The 
 real Sphinx and successful no-defect inputs remain pending. No model result is claimed here;
 the parent task will execute authorized comparisons after review.
 
+## Fusion C Real-Provider Validation
+
+Fusion C combines deterministic graph reconstruction and bounded retrieval with LLM-driven
+recursive semantic judgment, multi-hypothesis backtracking, and independent root
+confirmation. Four real Provider runs exercise both positive and negative paths:
+
+| Case | Outcome | Visited | Physical/logical requests | Result |
+| --- | --- | ---: | ---: | --- |
+| New interrupted trace with explicit `process.signal` | `root_found` | 1 | 2/2 | `record:process_signal_bcea91f9` independently confirmed at 0.90 |
+| Legacy interrupted Pydantic trace | `inconclusive` | 0 | 0/0 | `process_signal_node_missing`; no fabricated root |
+| Successful case negative control | `no_defect` | 1 | 1/1 | no root and no unresolved branch |
+| Architecture-boundary negative control | `no_defect` | 1 | 1/1 | no root and no unresolved branch |
+
+The new signal trace is at
+`/private/var/folders/sp/z3z2zy2110v1bnxszvqjkfqh0000gn/T/opencode-case-trace-interrupted-diagnostics-rhNmKH/interrupted-diagnostics-case/trace.json`;
+its report is
+`/private/tmp/observable-opencode-task9-real/signal-node-v10-20260720/recursive.attribution.json`.
+The analyzer starts from `case.failed`, traverses only the recorded `process.signal`, and then
+independently confirms that signal as the earliest trace-visible defect introduction. The
+unknown external sender remains an explicit scope boundary rather than invented missing
+evidence.
+
+The legacy Pydantic report is
+`/private/tmp/observable-opencode-task9-real/pydantic-current-v6-20260720/recursive.attribution.json`.
+Because that old trace records interrupted shutdown but has no distinct signal occurrence,
+the analyzer performs no LLM call, returns `inconclusive`, and recommends adding
+`process_signal_node`, `signal_observation_source`, and `signal_to_failure_edge`. This replaces
+the earlier unsafe behavior that could confirm `case.failed` as its own cause.
+
+The successful and architecture reports are respectively
+`/private/tmp/observable-opencode-task9-real/success-final-20260720/recursive.attribution.json`
+and
+`/private/tmp/observable-opencode-task9-real/architecture-final-v2-20260720/recursive.attribution.json`.
+Both return clean `no_defect` results. Candidate roots now require an exact, independently
+validated `request_root_confirmation` action; exhausted confirmation budget is exposed as
+`unknown`, never silently promoted to a confirmed root.
+
 ## Blocking Gates
 
 The default cannot switch until real Sphinx, Pydantic, requirement understanding, context
@@ -197,9 +235,22 @@ compaction, and successful no-defect cases have audited v3 labels and pass sourc
 evaluation; request reduction and cold/resumed checkpoint reuse must also be measured from
 real Provider runs. Scripted and rule-based deterministic suites can never satisfy these gates.
 
-## Offline Verification
+## Historical Offline Verification
 
-Task 9 focused tests: 41 passed. Dedicated fixture/metrics tests: 12 passed. Complete offline
-suite: 433 passed. Production modules
-compile with an isolated Python bytecode cache. No model, network, Agent mutation, or Trace
-mutation was performed.
+Task 9 focused tests: 41 passed. Dedicated fixture/metrics tests: 12 passed. The historical
+complete offline suite had 433 passing tests. Production modules compiled with an isolated
+Python bytecode cache. No model, network, Agent mutation, or Trace mutation was performed in
+that historical run.
+
+## Fusion C Verification
+
+- Python attribution suite: 447 passed.
+- Bun case-trace suite: 131 passed with repository-pinned Bun 1.3.13.
+- `git diff --check`: clean.
+- Real Provider positive signal path: confirmed root with no unresolved state.
+- Real Provider negative controls: both `no_defect` with no root and no unresolved state.
+- Legacy interrupted trace: explicit instrumentation gap, zero model requests, no false root.
+
+Trace collection remains a passive sidecar: the new signal fact records handler-observed
+lifecycle data and declares `recording_mode=passive_posthoc` and `agent_feedback=none`; none
+of the attribution output is fed back into the Agent.

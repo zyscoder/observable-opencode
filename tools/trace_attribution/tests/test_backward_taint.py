@@ -1036,6 +1036,40 @@ class TraceGraphTest(unittest.TestCase):
             ["record:claim_architecture", "record:claim_verification"],
         )
 
+    def test_interrupted_trace_prefers_case_failure_over_stale_completion_diagnostics(self):
+        trace = {
+            "case_id": "interrupted-case",
+            "manifest": {"shutdown_disposition": "interrupted_before_case_completion"},
+            "records": [
+                {
+                    "record_id": "missing_semantic_final_test_result",
+                    "component": "trace",
+                    "event_type": "case.missing_semantic",
+                    "data": {"semantic_name": "final_test_result"},
+                },
+                {
+                    "record_id": "observed_defect_missing_verification_after_change",
+                    "component": "trace",
+                    "event_type": "case.observed_defect",
+                    "data": {"failure_type": "final_test_result_missing"},
+                },
+                {
+                    "record_id": "case_failed",
+                    "component": "run",
+                    "event_type": "case.failed",
+                    "status": "cancelled",
+                    "data": {
+                        "shutdown_signal": "SIGINT",
+                        "shutdown_disposition": "interrupted_before_case_completion",
+                    },
+                },
+            ],
+        }
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertEqual(graph.default_start_refs(), ["record:case_failed"])
+
     def test_quality_review_gaps_become_default_start_refs(self):
         trace = sample_trace()
         review = {

@@ -288,6 +288,48 @@ def trace_with_artifact_evidence():
 
 
 class CausalRetrievalTest(unittest.TestCase):
+    def test_grounding_candidates_are_not_promoted_to_causal_predecessors(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "candidate-grounding-is-not-dataflow",
+                "records": [
+                    {
+                        "record_id": "considered",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "data": {"text": "A considered but unconsumed candidate."},
+                    },
+                    {
+                        "record_id": "selected",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "data": {"text": "The selected direct support."},
+                    },
+                    {
+                        "record_id": "claim",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "source_refs": ["record:selected"],
+                        "data": {
+                            "text": "The selected support justifies this claim.",
+                            "grounding_candidate_refs": ["record:considered"],
+                        },
+                    },
+                ],
+            }
+        )
+        defect_state = sample_defect_state()
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:claim",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+        )
+
+        self.assertEqual([item.ref for item in candidates], ["record:selected"])
+
     def test_retriever_prefers_confirmed_edges_without_dropping_inferred_candidates(self):
         graph = TraceGraph.from_trace(trace_with_confirmed_and_inferred_predecessors())
         defect_state = sample_defect_state()
@@ -404,6 +446,147 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertIn("record:sibling", [item["ref"] for item in matches])
         self.assertEqual(graph.incoming_edge_context("record:decision"), before_edges)
         self.assertNotIn("record:sibling", graph.upstream_refs("record:decision"))
+
+    def test_semantic_fallback_has_a_bounded_exploration_quota(self):
+        records = [
+            {
+                "record_id": f"candidate_{index}",
+                "component": "processor",
+                "event_type": "decision",
+                "data": {
+                    "rationale": "Recover the missing parser namespace compatibility contract."
+                },
+            }
+            for index in range(20)
+        ]
+        records.append(
+            {
+                "record_id": "current",
+                "component": "result",
+                "event_type": "response.claim",
+                "data": {"text": "The parser namespace contract remains incomplete."},
+            }
+        )
+        graph = TraceGraph.from_trace(
+            {"case_id": "bounded-semantic-fallback", "records": records}
+        )
+        defect_state = sample_defect_state()
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:current",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=24,
+            allow_semantic_fallback=True,
+        )
+
+        self.assertEqual(len(candidates), 5)
+        self.assertTrue(all(item.source == "semantic_fallback" for item in candidates))
+
+    def test_interrupted_failure_excludes_stale_completion_diagnostics_from_candidates(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "interrupted-candidate-filter",
+                "manifest": {"shutdown_disposition": "interrupted_before_case_completion"},
+                "records": [
+                    {
+                        "record_id": "signal",
+                        "component": "runtime",
+                        "event_type": "process.signal",
+                        "data": {"signal": "SIGTERM"},
+                    },
+                    {
+                        "record_id": "missing_semantic_final_test_result",
+                        "component": "trace",
+                        "event_type": "case.missing_semantic",
+                        "data": {
+                            "semantic_name": "final_test_result",
+                            "reason": "No test-like verification command was recorded after repository changes.",
+                        },
+                    },
+                    {
+                        "record_id": "observed_defect_missing_verification_after_change",
+                        "component": "trace",
+                        "event_type": "case.observed_defect",
+                        "data": {"failure_type": "final_test_result_missing"},
+                    },
+                    {
+                        "record_id": "failed",
+                        "component": "run",
+                        "event_type": "case.failed",
+                        "source_refs": ["record:signal"],
+                        "data": {
+                            "shutdown_signal": "SIGTERM",
+                            "shutdown_disposition": "interrupted_before_case_completion",
+                        },
+                    },
+                ],
+            }
+        )
+        defect_state = DefectState.create(
+            label="interrupted_missing_verification",
+            expected="The changed repository is verified before completion.",
+            actual="SIGTERM interrupted the case before final verification.",
+            mechanism="The process signal interrupted the case and final verification is missing.",
+            scope="process_lifecycle",
+        )
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:failed",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+            allow_semantic_fallback=True,
+        )
+
+        refs = [item.ref for item in candidates]
+        self.assertIn("record:signal", refs)
+        self.assertNotIn("record:missing_semantic_final_test_result", refs)
+        self.assertNotIn("record:observed_defect_missing_verification_after_change", refs)
+
+    def test_process_signal_boundary_does_not_use_global_semantic_fallback(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "signal-boundary",
+                "records": [
+                    {
+                        "record_id": "unrelated_prior",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "Consider how SIGTERM interruption affects completion."},
+                    },
+                    {
+                        "record_id": "signal",
+                        "component": "runtime",
+                        "event_type": "process.signal",
+                        "data": {
+                            "signal": "SIGTERM",
+                            "shutdown_disposition": "interrupted_before_case_completion",
+                        },
+                    },
+                ],
+            }
+        )
+        defect_state = DefectState.create(
+            label="process_interruption",
+            expected="The process completes normally.",
+            actual="SIGTERM interrupted completion.",
+            mechanism="The process received SIGTERM.",
+            scope="process_lifecycle",
+        )
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:signal",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+            allow_semantic_fallback=True,
+        )
+
+        self.assertEqual(candidates, [])
 
     def test_recursive_context_carries_state_evidence_and_hydration_without_prejudging_candidates(self):
         graph = TraceGraph.from_trace(trace_with_confirmed_and_inferred_predecessors())

@@ -6944,6 +6944,69 @@ describe("case trace", () => {
     assertJournalReplaysCanonicalTrace(journal, trace)
   })
 
+  test("removes completion diagnostics when a signal interrupts the case before completion", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-interrupted-diagnostics-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "interrupted-diagnostics-trace.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ input: { prompt: "change then verify" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.change({ files: ["src/changed.mjs"], intent: "change awaiting verification", diff: "- 1\\n+ 2" })`,
+        `await Bun.sleep(25)`,
+        `CaseTrace.finish({ status: "cancelled", result: { reason: "SIGTERM", signal: "SIGTERM", trace_html_flush: "process_signal" } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "interrupted-diagnostics-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "interrupted-diagnostics-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const journal = await readCausalIRJournal(caseDir)
+    const diagnosticIDs = ["missing_semantic_final_test_result", "observed_defect_missing_verification_after_change"]
+    const failed = trace.records.find((record: any) => record.event_type === "case.failed")
+    const signal = trace.records.find((record: any) => record.event_type === "process.signal")
+
+    expect(trace.manifest.shutdown_disposition).toBe("interrupted_before_case_completion")
+    expect(failed).toBeTruthy()
+    expect(signal).toBeTruthy()
+    expect(signal.data).toMatchObject({
+      signal: "SIGTERM",
+      shutdown_disposition: "interrupted_before_case_completion",
+      sender_identity_available: false,
+    })
+    expect(failed.source_refs).toContain(`node:${signal.record_id}`)
+    expect(
+      trace.edges.some(
+        (edge: any) =>
+          edge.from?.ref_id === signal.record_id &&
+          edge.to?.ref_id === failed.record_id &&
+          edge.normalized_relation === "failed_before" &&
+          edge.eligible_for_attribution === true,
+      ),
+    ).toBe(true)
+    expect(journal.some((entry: any) => diagnosticIDs.includes(entry.entity_id))).toBe(true)
+    expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
+    expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
+    assertJournalReplaysCanonicalTrace(journal, trace)
+  })
+
   test("records passive verification-attempt semantics for handwritten assertion scripts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-handwritten-verification-attempt-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

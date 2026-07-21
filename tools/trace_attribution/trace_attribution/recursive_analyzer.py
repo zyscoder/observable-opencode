@@ -51,7 +51,7 @@ from .models import JsonDict, TraceNode, stable_json
 
 RECURSIVE_RELATIONS = frozenset({"same_defect_propagation", "defect_transformation"})
 EVALUATION_START_EVENTS = frozenset(
-    {"case.observed_defect", "case.quality_gap", "case.missing_semantic"}
+    {"case.failed", "case.observed_defect", "case.quality_gap", "case.missing_semantic"}
 )
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
@@ -554,6 +554,32 @@ class RecursiveAnalysisState:
             state.seed_count += 1
             if node.event_type in EVALUATION_START_EVENTS:
                 predecessors = graph.upstream_refs(start_ref)
+                manifest = (
+                    graph.raw_trace.get("manifest")
+                    if isinstance(graph.raw_trace.get("manifest"), Mapping)
+                    else {}
+                )
+                interrupted_failure = node.event_type == "case.failed" and (
+                    node.data.get("shutdown_disposition")
+                    == "interrupted_before_case_completion"
+                    or manifest.get("shutdown_disposition")
+                    == "interrupted_before_case_completion"
+                )
+                if interrupted_failure:
+                    signal_predecessors = [
+                        ref
+                        for ref in predecessors
+                        if graph.nodes.get(ref)
+                        and graph.nodes[ref].event_type == "process.signal"
+                    ]
+                    if not signal_predecessors:
+                        state._mark_seed_unresolved(
+                            start_ref,
+                            "process_signal_node_missing",
+                            "The interrupted case records a shutdown signal but has no distinct process.signal causal node.",
+                        )
+                        continue
+                    predecessors = signal_predecessors
                 if not predecessors:
                     state._mark_seed_unresolved(
                         start_ref,
@@ -1184,7 +1210,11 @@ class RecursiveAnalysisState:
 
         declared_recursive = False
         for assessment in judgment.predecessors:
-            self.causal_relations.append(assessment)
+            if not (
+                judgment.current_defect_status == "absent"
+                and assessment.relation == "unknown"
+            ):
+                self.causal_relations.append(assessment)
             if assessment.relation == "contributing_condition":
                 continue
             if assessment.relation in {"unrelated", "unknown"}:
@@ -1195,7 +1225,7 @@ class RecursiveAnalysisState:
                         assessment.reason,
                         assessment.confidence,
                     )
-                else:
+                elif is_present:
                     self._mark_ref_unresolved(
                         assessment.ref,
                         item,
@@ -2647,6 +2677,8 @@ class AgenticRecursiveAnalyzer:
             resolved = state.graph.resolve(competitor_ref)
             if not resolved:
                 raise ValueError("competing hypothesis candidate is unresolved")
+            if resolved in path[1:]:
+                continue
             support = value.get("supporting_evidence") or []
             opposition = value.get("opposing_evidence") or []
 

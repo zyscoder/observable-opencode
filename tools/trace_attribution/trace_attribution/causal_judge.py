@@ -31,8 +31,8 @@ from .errors import (
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v1"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v4"
+CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v5"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v6"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (
@@ -56,6 +56,8 @@ Do not assume any component type is or is not causal. Return exactly one JSON ob
 
 REPAIR_SYSTEM_PROMPT = """Repair one invalid causal-attribution JSON response.
 Correct the exact supplied parse, schema, or grounding error using only the supplied request facts.
+Return a full replacement object, not a patch. Every field shown in required_json_schema is mandatory.
+The top-level confidence must be an unquoted JSON number between 0 and 1.
 Return exactly one JSON object with no markdown and do not invent references."""
 
 
@@ -271,6 +273,8 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
             "rules": [
                 TEMPORAL_CAUSALITY_RULE,
                 "Judge semantics and evidence, not component labels; any component can be causal.",
+                "Every field shown in required_json_schema is mandatory; return the complete object, not a partial object or patch.",
+                "The top-level confidence must be an unquoted JSON number between 0 and 1.",
                 *RELATION_DEFINITIONS,
                 "Return exactly one assessment for every offered candidate, with no duplicates or omissions.",
                 "A reference is grounded only by an explicit reference envelope containing resolved_ref, resolution_status=resolved, and provenance_class; bare refs never ground evidence.",
@@ -278,8 +282,12 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "Use defect_transformation only when a different upstream defect transforms into the active defect through an explicit mechanism.",
                 "Set recurse=true for same_defect_propagation and defect_transformation, and require current_defect_status=present plus at least one grounded direct evidence ref.",
                 "Set recurse=false for introduction_candidate, contributing_condition, outcome_evidence, unrelated, and unknown.",
+                "introduction_candidate is reserved for the current-node candidate_introduction verdict and must never be assigned as an offered predecessor relation; recurse to a suspected predecessor introduction using same_defect_propagation or defect_transformation, then judge that node directly.",
                 "A transformation must provide label, mechanism, and transformation_reason for the upstream defect.",
                 "Set candidate_introduction=true only when the current node is defective and no viable defective predecessor remains.",
+                "A root candidate is the earliest trace-visible introduction of the active defect, not necessarily its ultimate real-world origin.",
+                "When a boundary event such as process.signal directly records the active defect and no offered predecessor carries it, set candidate_introduction=true; an unknown external sender is outside the trace-visible attribution scope, so mention that scope limit in the reason but do not list it as blocking missing_evidence or move the root to an unrelated earlier node.",
+                "When candidate_introduction=true with no blocking missing_evidence, suggested_investigation must request the request_root_confirmation action using the exact active_hypothesis_id, current node ref, and active defect fingerprint from the supplied recursive context.",
                 "Cite only resolved refs supplied in the grounded request context.",
                 "Artifact content is usable only through a resolved artifact reference envelope or a validated Task 2 hydration manifest; missing, truncated, unresolved, envelope-less, or contradictory artifacts require unknown.",
                 "Only recorded, reconstructed, or auditable non-temporal inferred provenance is eligible; temporal-only evidence is never confirmation evidence.",
@@ -298,9 +306,9 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "predecessors": [
                     {
                         "ref": "offered candidate ref",
-                        "relation": "same_defect_propagation|defect_transformation|introduction_candidate|contributing_condition|outcome_evidence|unrelated|unknown",
+                        "relation": "same_defect_propagation|defect_transformation|contributing_condition|outcome_evidence|unrelated|unknown",
                         "reason": "direct causal explanation",
-                        "confidence": 0.0,
+                        "confidence": 0.8,
                         "recurse": False,
                         "upstream_defect": None,
                         "evidence_refs": [],
@@ -310,7 +318,16 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "candidate_introduction": False,
                 "missing_evidence": [],
                 "suggested_investigation": "null | {tool, arguments, reason} | {action, arguments, reason}",
-                "confidence": 0.0,
+                "confidence": 0.8,
+            },
+            "root_confirmation_action_schema": {
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "hypothesis_id": request.recursive_context.get("active_hypothesis_id", "exact active hypothesis id"),
+                    "candidate_ref": request.current_node.ref,
+                    "defect_fingerprint": request.defect_state.fingerprint,
+                },
+                "reason": "why this trace-visible introduction needs independent confirmation",
             },
         }
     )
@@ -331,6 +348,8 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
             "rules": [
                 TEMPORAL_CAUSALITY_RULE,
                 "Try to falsify the candidate independently; no first-pass verdict is supplied.",
+                "Every field shown in required_json_schema is mandatory; return the complete object, not a partial object or patch.",
+                "The top-level confidence must be an unquoted JSON number between 0 and 1.",
                 "Any component may be confirmed when the grounded semantics support it.",
                 "This is perspective-neutral factual confirmation; presentation perspective is applied only after the confirmed set is fixed.",
                 *RELATION_DEFINITIONS,
@@ -346,10 +365,12 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                 "Only provenance_class=recorded|reconstructed|inferred is valid. Inferred provenance requires auditable non-temporal inference metadata, and temporal-only evidence can never confirm a root.",
                 "Every competing hypothesis must have resolved reference envelopes. Independently compare active, supported, and unresolved alternatives; a grounded open alternative does not by itself decide the result.",
                 "candidate_introduction requires no viable defective predecessor.",
+                "Confirm the earliest trace-visible introduction, not an unobserved ultimate real-world origin; an unknown external sender does not by itself invalidate a grounded process.signal root.",
                 "Use unknown when evidence is missing, unresolved, ambiguous, truncated, or insufficient.",
                 "The counterfactual object must use intervention_ref=candidate_ref and intervention_kind=replace_with_semantically_correct_behavior.",
                 "confirmed requires predicted_defect_status=absent and causal_effect=prevents_defect; unknown requires unknown and unknown; rejected allows present with does_not_prevent_defect or unknown with unknown.",
                 "confirmed requires factor_role=necessary_cause; rejected may classify a grounded contributing_condition, amplifying_factor, unrelated alternative, or unknown; unknown requires factor_role=unknown.",
+                "factor_mechanism must be null for necessary_cause, unrelated, and unknown; use causal_factor_mechanism_schema only for contributing_condition or amplifying_factor.",
             ],
             "required_json_schema": {
                 "candidate_ref": request.candidate_ref,
@@ -363,7 +384,7 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                     "predicted_defect_status": "absent|present|unknown",
                     "causal_effect": "prevents_defect|does_not_prevent_defect|unknown",
                 },
-                "confidence": 0.0,
+                "confidence": 0.8,
                 "evidence_refs": [],
                 "competitor_comparisons": [
                     {
@@ -379,12 +400,13 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
                         "evidence_refs": [],
                     }
                 ],
-                "factor_mechanism": {
+                "factor_mechanism": None,
+            },
+            "causal_factor_mechanism_schema": {
                     "mechanism_type": "enabling_condition|amplification",
                     "source_ref": request.candidate_ref,
                     "target_ref": "grounded recursive path ref",
                     "effect": "non-empty causal mechanism",
-                },
             },
         }
     )
@@ -493,7 +515,11 @@ def validate_causal_step_payload(
         seen.add(ref)
         relation = str(raw.get("relation") or "").strip().lower()
         if relation not in CAUSAL_RELATIONS:
-            raise ValueError("relation must be one of the exact seven causal relation values")
+            raise ValueError("relation must be one of the allowed causal relation values")
+        if relation == "introduction_candidate":
+            raise ValueError(
+                "predecessor introduction_candidate is invalid; it is a current-node verdict"
+            )
         predecessor_reason = str(raw.get("reason") or "").strip()
         if not predecessor_reason:
             raise ValueError("predecessor reason must be non-empty")
@@ -539,12 +565,21 @@ def validate_causal_step_payload(
             )
         elif raw_upstream not in (None, {}):
             raise ValueError("upstream_defect is valid only for defect_transformation")
+        predecessor_confidence = _number(
+            raw.get("confidence"), "predecessor confidence"
+        )
+        if relation != "unknown" and predecessor_confidence <= 0.0:
+            raise ValueError(
+                "predecessors[{0}].confidence for {1} with relation={2} must be greater than 0".format(
+                    index, ref, relation
+                )
+            )
         assessments.append(
             PredecessorAssessment(
                 ref=ref,
                 relation=relation,
                 reason=predecessor_reason,
-                confidence=_number(raw.get("confidence"), "predecessor confidence"),
+                confidence=predecessor_confidence,
                 recurse=recurse,
                 upstream_defect=upstream_defect,
                 evidence_refs=evidence_refs,
@@ -574,15 +609,40 @@ def validate_causal_step_payload(
     investigation = value.get("suggested_investigation")
     if investigation is not None and not isinstance(investigation, dict):
         raise ValueError("suggested_investigation must be an object or null")
+    missing_evidence = _strings(value.get("missing_evidence", []), "missing_evidence")
+    active_hypothesis_id = str(request.recursive_context.get("active_hypothesis_id") or "")
+    if introduction and not missing_evidence and active_hypothesis_id:
+        if not isinstance(investigation, dict) or investigation.get("action") != "request_root_confirmation":
+            raise ValueError(
+                "candidate introduction requires request_root_confirmation"
+            )
+        arguments = investigation.get("arguments")
+        expected_arguments = {
+            "hypothesis_id": active_hypothesis_id,
+            "candidate_ref": request.current_node.ref,
+            "defect_fingerprint": request.defect_state.fingerprint,
+        }
+        if not isinstance(arguments, dict) or set(arguments) != set(expected_arguments):
+            raise ValueError(
+                "request_root_confirmation arguments require exact keys: "
+                "hypothesis_id, candidate_ref, defect_fingerprint"
+            )
+        if arguments != expected_arguments:
+            raise ValueError(
+                "request_root_confirmation arguments must match the active hypothesis, current node, and defect fingerprint"
+            )
+    confidence = _number(value.get("confidence"), "confidence")
+    if status != "unknown" and confidence <= 0.0:
+        raise ValueError("non-unknown status requires positive confidence")
     return CausalStepJudgment(
         current_node_ref=request.current_node.ref,
         current_defect_status=status,
         current_defect_reason=reason,
         predecessors=tuple(assessments),
         candidate_introduction=introduction,
-        missing_evidence=_strings(value.get("missing_evidence", []), "missing_evidence"),
+        missing_evidence=missing_evidence,
         suggested_investigation=dict(investigation) if investigation is not None else None,
-        confidence=_number(value.get("confidence"), "confidence"),
+        confidence=confidence,
     )
 
 
@@ -1877,7 +1937,9 @@ def _validate_factor_mechanism(
 ) -> JsonDict:
     if role not in {"contributing_condition", "amplifying_factor"}:
         if value not in (None, {}, FrozenMapping()):
-            raise ValueError("factor_mechanism is allowed only for a causal factor")
+            raise ValueError(
+                "factor_mechanism must be null or empty when factor_role={0}".format(role)
+            )
         return {}
     if not evidence_refs:
         raise ValueError("factor role requires grounded factor evidence")
@@ -1922,6 +1984,10 @@ def validate_recursive_confirmation(
     if not reason:
         raise ValueError("root confirmation reason must be non-empty")
     confidence = _number(value.get("confidence"), "confidence")
+    if status != "unknown" and confidence <= 0.0:
+        raise ValueError(
+            "non-unknown confirmation requires positive confidence"
+        )
     fact_tree = _ConfirmationFactTreeValidator(request).validate()
     evidence_refs = _validate_evidence_refs(
         value.get("evidence_refs", []),
@@ -2347,9 +2413,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                             ),
                         }
                     ],
-                    max_tokens=min(
-                        int(getattr(self.transport, "repair_max_tokens", 1024)), 1024
-                    ),
+                    max_tokens=max_tokens,
                 )
                 physical_requests += repair_result.physical_requests
                 repaired = repair_result.text
@@ -2381,14 +2445,99 @@ class ClaudeCausalJudge(BoundedJudgeCapability):
                 payload = _parse_single_json_object(repaired)
                 validator(payload)
             except Exception as repair_error:
-                return _RequestOutcome(
-                    None,
-                    "validation_error",
-                    "{0}; focused repair invalid: {1}: {2}".format(
-                        exact_error, type(repair_error).__name__, repair_error
-                    ),
-                    physical_requests,
+                repair_error_detail = "{0}: {1}".format(
+                    type(repair_error).__name__, repair_error
                 )
+                if remaining_requests == 0:
+                    return _RequestOutcome(
+                        None,
+                        "request_budget_exhausted",
+                        (
+                            "{0}; focused repair invalid: {1}; "
+                            "judge_request_budget_exhausted before full retry"
+                        ).format(exact_error, repair_error_detail),
+                        physical_requests,
+                    )
+                if remaining_requests is not None:
+                    remaining_requests -= 1
+                try:
+                    retry_result = self._call_transport(
+                        system=system,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": stable_json(
+                                    {
+                                        "retry_instruction": "Return a complete replacement JSON object.",
+                                        "mandatory_output_contract": {
+                                            "all_required_fields_must_be_present": True,
+                                            "confidence": "required unquoted JSON number between 0 and 1",
+                                            "response_shape": "one complete JSON object, not a patch",
+                                        },
+                                        "validation_errors": [
+                                            exact_error,
+                                            repair_error_detail,
+                                        ],
+                                        "invalid_outputs": [
+                                            text[:16000],
+                                            repaired[:16000],
+                                        ],
+                                        "schema_version": schema_version,
+                                        "original_prompt": prompt,
+                                        "canonical_request_context": request_context,
+                                    }
+                                ),
+                            }
+                        ],
+                        max_tokens=max_tokens,
+                    )
+                    physical_requests += retry_result.physical_requests
+                    retried = retry_result.text
+                except TransportCallError as exc:
+                    physical_requests += exc.physical_requests
+                    error = exc.error
+                    return _RequestOutcome(
+                        None,
+                        (
+                            "provider_error"
+                            if isinstance(
+                                error,
+                                (JudgeProviderError, JudgeProviderUnavailable),
+                            )
+                            else "adapter_error"
+                        ),
+                        "{0}; focused repair invalid: {1}; full retry {2}: {3}: {4}".format(
+                            exact_error,
+                            repair_error_detail,
+                            "provider error"
+                            if isinstance(
+                                error,
+                                (JudgeProviderError, JudgeProviderUnavailable),
+                            )
+                            else "adapter error",
+                            type(error).__name__,
+                            error,
+                        ),
+                        physical_requests,
+                    )
+                try:
+                    payload = _parse_single_json_object(retried)
+                    validator(payload)
+                except Exception as retry_error:
+                    return _RequestOutcome(
+                        None,
+                        "validation_error",
+                        (
+                            "{0}; focused repair invalid: {1}; "
+                            "full retry invalid: {2}: {3}"
+                        ).format(
+                            exact_error,
+                            repair_error_detail,
+                            type(retry_error).__name__,
+                            retry_error,
+                        ),
+                        physical_requests,
+                    )
         try:
             self.cache.put_payload(
                 key=cache_key,

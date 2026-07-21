@@ -9,6 +9,7 @@ from pathlib import Path
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
+    CAUSAL_STEP_SYSTEM_PROMPT,
     ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
     BoundedJudgeCallResult,
     BoundedJudgeCallError,
@@ -284,6 +285,25 @@ class ScriptedTransport:
 
 
 class CausalJudgeValidationTest(unittest.TestCase):
+    def test_zero_confidence_cannot_assert_defect_presence_or_absence(self):
+        payload = valid_step_payload(relation="unrelated", recurse=False)
+        payload["current_defect_status"] = "absent"
+        payload["current_defect_reason"] = "The current node does not contain the tracked defect."
+        payload["confidence"] = 0.0
+
+        with self.assertRaisesRegex(ValueError, "non-unknown status requires positive confidence"):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
+    def test_zero_confidence_cannot_assert_a_known_predecessor_relation(self):
+        payload = valid_step_payload()
+        payload["predecessors"][0]["confidence"] = 0.0
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"predecessors\[0\]\.confidence.*record:decision.*same_defect_propagation.*greater than 0",
+        ):
+            validate_causal_step_payload(payload, request=sample_step_request())
+
     def test_validator_accepts_grounded_defect_transformation(self):
         result = validate_causal_step_payload(
             valid_step_payload(relation="defect_transformation"),
@@ -314,7 +334,6 @@ class CausalJudgeValidationTest(unittest.TestCase):
         valid_relations = {
             "same_defect_propagation",
             "defect_transformation",
-            "introduction_candidate",
             "contributing_condition",
             "outcome_evidence",
             "unrelated",
@@ -332,6 +351,11 @@ class CausalJudgeValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "causal relation"):
             validate_causal_step_payload(
                 valid_step_payload(relation="motivated_by"),
+                request=sample_step_request(),
+            )
+        with self.assertRaisesRegex(ValueError, "current-node verdict"):
+            validate_causal_step_payload(
+                valid_step_payload(relation="introduction_candidate", recurse=False),
                 request=sample_step_request(),
             )
         with self.assertRaisesRegex(ValueError, "recurse=true"):
@@ -361,6 +385,49 @@ class CausalJudgeValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "viable defective predecessor"):
             validate_causal_step_payload(payload, request=sample_step_request())
 
+    def test_introduction_requires_exact_root_confirmation_control_arguments(self):
+        base = sample_step_request()
+        request = CausalStepRequest(
+            recursive_context={
+                "active_hypothesis_id": "hyp:active",
+                "current_ref": base.current_node.ref,
+                "candidate_predecessors": [],
+            },
+            current_node=base.current_node,
+            defect_state=base.defect_state,
+            candidates=(),
+        )
+        payload = {
+            "current_node_ref": base.current_node.ref,
+            "current_defect_status": "present",
+            "current_defect_reason": "The current boundary node introduces the defect.",
+            "predecessors": [],
+            "candidate_introduction": True,
+            "missing_evidence": [],
+            "suggested_investigation": {
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "active_hypothesis_id": "hyp:active",
+                    "candidate_root_ref": base.current_node.ref,
+                    "active_defect_fingerprint": base.defect_state.fingerprint,
+                },
+                "reason": "Confirm the trace-visible root.",
+            },
+            "confidence": 0.9,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exact keys"):
+            validate_causal_step_payload(payload, request=request)
+
+        payload["suggested_investigation"]["arguments"] = {
+            "hypothesis_id": "hyp:active",
+            "candidate_ref": base.current_node.ref,
+            "defect_fingerprint": base.defect_state.fingerprint,
+        }
+        result = validate_causal_step_payload(payload, request=request)
+
+        self.assertTrue(result.candidate_introduction)
+
     def test_validator_requires_an_assessment_for_every_offered_candidate(self):
         payload = valid_step_payload()
         payload["predecessors"] = []
@@ -382,6 +449,17 @@ class CausalJudgeValidationTest(unittest.TestCase):
 
 
 class RootConfirmationValidationTest(unittest.TestCase):
+    def test_zero_confidence_cannot_confirm_or_reject_a_root(self):
+        payload = valid_confirmation_payload()
+        payload["confidence"] = 0.0
+
+        with self.assertRaisesRegex(
+            ValueError, "non-unknown confirmation requires positive confidence"
+        ):
+            validate_recursive_confirmation(
+                payload, request=sample_confirmation_request()
+            )
+
     def test_binding_rejects_foreign_hypothesis_semantic_hash(self):
         request = sample_confirmation_request()
         confirmation = validate_recursive_confirmation(
@@ -1640,6 +1718,8 @@ class CausalJudgePromptTest(unittest.TestCase):
         )
         required = (
             "Temporal order or proximity alone is never causal.",
+            "Every field shown in required_json_schema is mandatory",
+            "top-level confidence must be an unquoted JSON number",
             "same_defect_propagation",
             "defect_transformation",
             "introduction_candidate",
@@ -1661,6 +1741,12 @@ class CausalJudgePromptTest(unittest.TestCase):
                 with self.subTest(phrase=phrase):
                     self.assertIn(phrase, prompt)
         confirmation_prompt = prompts[1]
+        step_prompt = prompts[0]
+        self.assertIn("earliest trace-visible introduction", step_prompt)
+        self.assertIn("unknown external sender", step_prompt)
+        self.assertIn("root_confirmation_action_schema", step_prompt)
+        self.assertIn("earliest trace-visible introduction", confirmation_prompt)
+        self.assertIn("causal_factor_mechanism_schema", confirmation_prompt)
         for phrase in (
             "every nested mapping and list",
             "provider_error",
@@ -1669,7 +1755,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v4")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v6")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):
@@ -1945,12 +2031,54 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             self.assertEqual(result, cached)
             self.assertIn("candidate predecessor", repair_prompt)
             self.assertIn("record:fabricated", repair_prompt)
+            self.assertEqual(transport.calls[1]["max_tokens"], transport.max_tokens)
             self.assertEqual(transport.request_count, 2)
             self.assertEqual(cache.stats()["writes"], 1)
 
+    def test_full_retry_recovers_after_two_responses_omit_required_confidence(self):
+        invalid = valid_step_payload()
+        invalid.pop("confidence")
+        transport = ScriptedTransport(
+            [json.dumps(invalid), json.dumps(invalid), json.dumps(valid_step_payload())]
+        )
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=3
+        )
+
+        self.assertEqual(result.value.current_defect_status, "present")
+        self.assertEqual(result.physical_requests, 3)
+        self.assertEqual(transport.request_count, 3)
+        retry_payload = json.loads(transport.calls[2]["messages"][0]["content"])
+        self.assertEqual(retry_payload["retry_instruction"], "Return a complete replacement JSON object.")
+        self.assertIn("confidence must be numeric", retry_payload["validation_errors"][0])
+        self.assertIn("confidence must be numeric", retry_payload["validation_errors"][1])
+        self.assertEqual(transport.calls[2]["system"], CAUSAL_STEP_SYSTEM_PROMPT)
+
+    def test_bounded_step_blocks_full_retry_after_two_physical_requests(self):
+        invalid = valid_step_payload()
+        invalid.pop("confidence")
+        transport = ScriptedTransport([json.dumps(invalid), json.dumps(invalid)])
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.judge_step_bounded(
+            sample_step_request(), max_physical_requests=2
+        )
+
+        self.assertEqual(result.value.current_defect_status, "unknown")
+        self.assertEqual(result.physical_requests, 2)
+        self.assertEqual(transport.request_count, 2)
+        self.assertTrue(
+            any(
+                "judge_request_budget_exhausted before full retry" in item
+                for item in result.value.missing_evidence
+            )
+        )
+
     def test_invalid_repair_returns_auditable_unknown_and_is_not_cached(self):
         invalid = json.dumps(valid_step_payload(predecessor_ref="record:fabricated"))
-        transport = ScriptedTransport([invalid, invalid, invalid, invalid])
+        transport = ScriptedTransport([invalid, invalid, invalid, invalid, invalid, invalid])
         with tempfile.TemporaryDirectory() as tempdir:
             cache = JudgmentCache(Path(tempdir) / "cache.jsonl")
             judge = ClaudeCausalJudge(transport=transport, cache=cache)
@@ -1962,7 +2090,7 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             self.assertFalse(first.candidate_introduction)
             self.assertTrue(any("validation" in item for item in first.missing_evidence))
             self.assertEqual(second.current_defect_status, "unknown")
-            self.assertEqual(transport.request_count, 4)
+            self.assertEqual(transport.request_count, 6)
             self.assertEqual(cache.stats()["writes"], 0)
 
     def test_provider_errors_return_unknown_while_transport_opens_its_circuit(self):
@@ -2135,7 +2263,7 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             with self.subTest(response=type(response).__name__):
                 responses = [response]
                 if not isinstance(response, BaseException):
-                    responses.append(response)
+                    responses.extend([response, response])
                 judge = ClaudeCausalJudge(
                     transport=ScriptedTransport(responses), cache=JudgmentCache()
                 )

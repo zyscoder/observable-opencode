@@ -254,6 +254,8 @@ def _has_unresolved_judgment_state(
     for judgment in latest_steps.values():
         if judgment.current_defect_status == "unknown" or judgment.missing_evidence:
             return True
+        if judgment.current_defect_status == "absent":
+            continue
         for assessment in judgment.predecessors:
             latest_nested_assessments[(judgment.current_node_ref, assessment.ref)] = assessment
     if any(_assessment_is_unresolved(item) for item in latest_nested_assessments.values()):

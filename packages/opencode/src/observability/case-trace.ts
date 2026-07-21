@@ -733,6 +733,7 @@ export type TraceHealthMetrics = {
 
 export type CausalNodeKind =
   | "run.start"
+  | "process.signal"
   | "case.completed"
   | "case.failed"
   | "case.observed_defect"
@@ -8383,7 +8384,10 @@ class ActiveCaseTrace {
     const manifest = this.manifest(status, caseStatus)
     const records = this.provenanceRecords().filter((record) => !this.isCaseDiagnosticKind(record.event_type))
     const traceHealth = this.traceHealth(records)
-    this.syncCaseDiagnosticNodes(traceHealth)
+    this.syncCaseDiagnosticNodes(
+      traceHealth,
+      manifest.shutdown_disposition !== "interrupted_before_case_completion",
+    )
     const causalIR = synchronize ? this.causalIR.synchronize() : this.causalIR.snapshot()
     const streamSummary = this.streamSummary()
     const provenance = this.projectCausalIRSnapshot(causalIR, manifest, {
@@ -8515,10 +8519,10 @@ class ActiveCaseTrace {
     }
   }
 
-  private syncCaseDiagnosticNodes(traceHealth: TraceHealthMetrics) {
+  private syncCaseDiagnosticNodes(traceHealth: TraceHealthMetrics, completionDiagnosticsEligible: boolean) {
     const current = this.causalNodes.filter((node) => this.isCaseDiagnosticKind(node.kind))
     const currentByID = new Map(current.map((node) => [node.node_id, node]))
-    const desired = this.caseDiagnosticNodes(traceHealth, currentByID)
+    const desired = this.caseDiagnosticNodes(traceHealth, currentByID, completionDiagnosticsEligible)
     const desiredIDs = new Set(desired.map((node) => node.node_id))
 
     for (const node of desired) {
@@ -8537,7 +8541,11 @@ class ActiveCaseTrace {
     }
   }
 
-  private caseDiagnosticNodes(traceHealth: TraceHealthMetrics, currentByID: Map<string, CausalNode>): CausalNode[] {
+  private caseDiagnosticNodes(
+    traceHealth: TraceHealthMetrics,
+    currentByID: Map<string, CausalNode>,
+    completionDiagnosticsEligible: boolean,
+  ): CausalNode[] {
     const nodes: CausalNode[] = []
     const timestamp = nowIso()
     const timeMs = Date.now() - this.startedAt
@@ -8550,7 +8558,7 @@ class ActiveCaseTrace {
       })
     }
     const missingVerification = traceHealth.issues.find((issue) => issue.kind === "missing_verification_after_change")
-    if (missingVerification) {
+    if (missingVerification && completionDiagnosticsEligible) {
       const missingID = "missing_semantic_final_test_result"
       const sourceRefs = dedupeStrings(missingVerification.refs ?? [])
       diagnosticNode({
@@ -8695,7 +8703,32 @@ class ActiveCaseTrace {
       )
       .at(-1)
     const failedOpenRecordRefs = this.finalizedOpenRecordRefsForCase(caseStatus)
-    const sourceRefs = finalSegment ? [`response_segment:${finalSegment.segment_id}`] : failedOpenRecordRefs
+    const signalNode =
+      shutdown.signal && shutdown.disposition === "interrupted_before_case_completion"
+        ? this.node({
+            node_id: `process_signal_${hash(`${this.runID}:${shutdown.signal}`).slice(0, 8)}`,
+            kind: "process.signal",
+            component: "runtime",
+            title: `process received ${shutdown.signal}`,
+            status: "cancelled",
+            data: {
+              signal: shutdown.signal,
+              shutdown_disposition: shutdown.disposition,
+              server_shutdown_reason: shutdownReason,
+              observation_source:
+                stringField(recordFromUnknown(this.result) ?? {}, ["trace_html_flush"]) === "process_signal"
+                  ? "process_signal_handler"
+                  : "finish_result",
+              sender_identity_available: false,
+              recording_mode: "passive_posthoc",
+              agent_feedback: "none",
+            },
+          })
+        : undefined
+    const sourceRefs = dedupeStrings([
+      ...(finalSegment ? [`response_segment:${finalSegment.segment_id}`] : failedOpenRecordRefs),
+      ...(signalNode ? [`node:${signalNode.node_id}`] : []),
+    ])
     const node = this.node({
       node_id: `case_${caseStatus === "success" ? "completed" : "failed"}_${hash(this.runID).slice(0, 8)}`,
       kind: caseStatus === "success" ? "case.completed" : "case.failed",
@@ -8719,6 +8752,18 @@ class ActiveCaseTrace {
       },
       source_refs: sourceRefs,
     })
+    if (signalNode) {
+      this.causalEdge({
+        from: { type: "node", id: signalNode.node_id },
+        to: { type: "node", id: node.node_id },
+        relation: "failed_before",
+        label: "External process signal interrupted the case before completion",
+        metadata: {
+          causal_role: "external_interruption",
+          sender_identity_available: false,
+        },
+      })
+    }
     if (caseStatus !== "success") {
       for (const ref of failedOpenRecordRefs) {
         const source = this.traceRefFromSourceRef(ref)
