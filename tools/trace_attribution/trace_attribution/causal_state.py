@@ -2035,6 +2035,7 @@ class RecursiveAttributionReport:
             return False
 
         root_owner_counts = {identity: 0 for identity in root_identities}
+        report_seed_refs = {seed.start_ref for seed in self.seed_results}
         for seed in self.seed_results:
             expected_seed_binding = seed_binding_identity_for(
                 seed.start_ref, seed.defect_fingerprint
@@ -2084,7 +2085,12 @@ class RecursiveAttributionReport:
                 }
                 != set(seed.confirmed_root_refs)
                 or any(
-                    seed.start_ref not in root.observed_defect_refs
+                    {
+                        ref
+                        for ref in root.observed_defect_refs
+                        if ref in report_seed_refs
+                    }
+                    != {seed.start_ref}
                     or root.recursive_path[-1] != seed.start_ref
                     or not defect_lineage_reaches_seed(
                         root.defect_state.fingerprint, seed
@@ -2093,7 +2099,8 @@ class RecursiveAttributionReport:
                 )
             ):
                 raise ValueError(
-                    "confirmed_root seed is not bound to top-level confirmed roots"
+                    "confirmed_root seed is not bound to top-level confirmed roots or "
+                    "observed_defect_refs owning seed projection"
                 )
             for identity in confirmed_seed_roots:
                 root_owner_counts[identity] += 1

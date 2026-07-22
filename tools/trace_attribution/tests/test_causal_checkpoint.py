@@ -28,6 +28,7 @@ from trace_attribution.causal_state import (
     FrontierItem,
     RecursiveAttributionReport,
     RootConfirmation,
+    seed_binding_identity_for,
 )
 from trace_attribution.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -497,8 +498,41 @@ class CausalCheckpointTest(unittest.TestCase):
             / "frontier-v1-pre-seed-binding.json"
         )
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-        hypothesis = AttributionHypothesis.from_dict(fixture["hypothesis"])
-        legacy_item = fixture["frontier"]["queued"][0]
+        legacy_item = copy.deepcopy(fixture["frontier"]["queued"][0])
+        defect_state = DefectState.from_dict(legacy_item["defect_state"])
+        hypothesis = AttributionHypothesis.create(
+            fixture["hypothesis"]["claim"],
+            fixture["hypothesis"]["candidate_root_ref"],
+            defect_state,
+            seed_binding_identity=seed_binding_identity_for(
+                "record:seed_one", defect_state.fingerprint
+            ),
+        )
+        legacy_item["hypothesis_id"] = hypothesis.hypothesis_id
+        legacy_item["hypothesis_semantic_hash"] = hypothesis.semantic_hash
+        legacy_item["item_id"] = "frontier:{0}".format(
+            hashlib.sha256(
+                stable_json(
+                    {
+                        "node_ref": legacy_item["node_ref"],
+                        "defect_fingerprint": defect_state.fingerprint,
+                        "downstream_path": legacy_item["downstream_path"],
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                        "depth": legacy_item["depth"],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+        )
+        legacy_item["visit_key"] = hashlib.sha256(
+            stable_json(
+                {
+                    "node_ref": legacy_item["node_ref"],
+                    "defect_fingerprint": defect_state.fingerprint,
+                    "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
         item = FrontierItem.from_legacy_dict(
             legacy_item,
             seed_binding_identity=hypothesis.seed_binding_identity,
@@ -524,7 +558,7 @@ class CausalCheckpointTest(unittest.TestCase):
             ],
         }
         graph = TraceGraph.from_trace(trace)
-        ledger = HypothesisLedger.from_snapshot([fixture["hypothesis"]])
+        ledger = HypothesisLedger.from_snapshot([hypothesis.to_dict()])
         frontier = RecursiveFrontier()
         frontier.push(item)
         state = RecursiveAnalysisState(
@@ -537,6 +571,8 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         state.defect_states[item.defect_state.fingerprint] = item.defect_state
         state.transformation_chains[item.defect_state.fingerprint] = (item.defect_state,)
+        seed = state._ensure_seed("record:seed_one", item.defect_state)
+        state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, seed)
         state.visit_evidence[new_visit_key] = {"record:shared_anchor"}
         context = {
             "active_visit_key": new_visit_key,
@@ -619,7 +655,10 @@ class CausalCheckpointTest(unittest.TestCase):
         ]
         legacy_frontier = {
             "schema": "recursive-analysis-frontier/v1",
-            "frontier": copy.deepcopy(fixture["frontier"]),
+            "frontier": {
+                **copy.deepcopy(fixture["frontier"]),
+                "queued": [copy.deepcopy(legacy_item)],
+            },
             "visit_evidence": {old_visit_key: ["record:shared_anchor"]},
         }
 

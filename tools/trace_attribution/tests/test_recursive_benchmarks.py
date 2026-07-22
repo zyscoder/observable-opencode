@@ -654,6 +654,37 @@ class RecursiveMetricTest(unittest.TestCase):
         ):
             compare_report(report, labels, None, graph=graph)
 
+    def test_evaluator_rejects_other_report_seed_in_published_root_provenance(self):
+        report, labels, _, graph = self.fixture()
+        root = report["confirmed_roots"][0]
+        owner_seed_ref = root["observed_defect_refs"][0]
+        other_seed_ref = next(
+            ref
+            for ref in report["visited_order"]
+            if ref != owner_seed_ref
+        )
+        other_seed = copy.deepcopy(report["seed_results"][0])
+        other_seed.update(
+            {
+                "start_ref": other_seed_ref,
+                "outcome": "no_defect",
+                "confirmed_root_refs": [],
+                "confirmation_identities": [],
+                "missing_evidence": [],
+                "blocking_reasons": [],
+            }
+        )
+        report["start_refs"].append(other_seed_ref)
+        report["seed_results"].append(other_seed)
+        root["observed_defect_refs"].extend(
+            ["record:distinguishable-provenance", other_seed_ref]
+        )
+
+        with self.assertRaisesRegex(
+            EvaluationSafetyError, "observed_defect_refs.*owning seed"
+        ):
+            compare_report(report, labels, None, graph=graph)
+
     def test_missing_current_request_measurement_does_not_invent_reduction(self):
         report, labels, _, graph = self.fixture()
         for key in (

@@ -1490,11 +1490,30 @@ class RecursiveAnalysisState:
             str(key): str(value)
             for key, value in dict(action_payload["hypothesis_seed_keys"]).items()
         }
+        restored_hypotheses = state.ledger.hypotheses_by_id()
         if any(
-            key not in state.seed_ledger
-            for key in state.hypothesis_seed_keys.values()
+            hypothesis_id not in restored_hypotheses
+            for hypothesis_id in state.hypothesis_seed_keys
         ):
-            raise ValueError("checkpoint hypothesis references an unknown attribution seed")
+            raise ValueError(
+                "checkpoint hypothesis_seed_keys contains an unknown restored hypothesis"
+            )
+        if any(
+            seed_key not in state.seed_ledger
+            or restored_hypotheses[hypothesis_id].seed_binding_identity != seed_key
+            for hypothesis_id, seed_key in state.hypothesis_seed_keys.items()
+        ):
+            raise ValueError(
+                "checkpoint hypothesis_seed_keys must match restored hypothesis seed bindings"
+            )
+        frontier_hypothesis_ids = {
+            FrontierItem.from_dict(item).hypothesis_id
+            for item in state.frontier.snapshot()
+        }
+        if not frontier_hypothesis_ids.issubset(state.hypothesis_seed_keys):
+            raise ValueError(
+                "checkpoint hypothesis_seed_keys is missing frontier hypothesis routing"
+            )
         if state.seed_count != len(state.seed_ledger):
             raise ValueError("checkpoint seed_count contradicts seed ledger")
         state.provider_state = _validate_provider_state(

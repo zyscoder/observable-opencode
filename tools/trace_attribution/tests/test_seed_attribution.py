@@ -15,6 +15,7 @@ from trace_attribution.causal_judge import (
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
+    FrontierItem,
     FrozenMapping,
     PredecessorAssessment,
     RecursiveAttributionReport,
@@ -662,6 +663,35 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
                     CrashAfterFirstCompletedConfirmation(root),
                     config,
                 )
+            checkpoint = CheckpointBundle(root).restore(expected_config=config)
+            restored_state = RecursiveAnalysisState.from_checkpoint(
+                graph=graph, checkpoint=checkpoint
+            )
+            restored_items = [
+                FrontierItem.from_dict(item)
+                for item in restored_state.frontier.snapshot()
+            ]
+            for item in restored_items:
+                hypothesis = restored_state.ledger.get(item.hypothesis_id)
+                self.assertEqual(
+                    restored_state.hypothesis_seed_keys[item.hypothesis_id],
+                    hypothesis.seed_binding_identity,
+                )
+                self.assertEqual(
+                    restored_state._seed_builder_for_item(item).key,
+                    hypothesis.seed_binding_identity,
+                )
+            queued_hypotheses = [
+                str(item["hypothesis_id"])
+                for item in restored_state.confirmation_queue
+            ]
+            self.assertTrue(restored_items or queued_hypotheses)
+            for hypothesis_id in queued_hypotheses:
+                hypothesis = restored_state.ledger.get(hypothesis_id)
+                self.assertEqual(
+                    restored_state.hypothesis_seed_keys[hypothesis_id],
+                    hypothesis.seed_binding_identity,
+                )
             resumed_judge = TwoHopSharedRootJudge()
             resumed = analyze(resumed_judge, CheckpointBundle(root), config)
 
@@ -859,6 +889,33 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_published_root_rejects_another_report_seed_in_observed_refs(self):
+        report = run_fixture("multi_seed_claims.json")
+        root = report.confirmed_roots[0]
+        other_seed = next(
+            item
+            for item in report.seed_results
+            if item.start_ref not in root.observed_defect_refs
+        )
+        mixed_root = replace(
+            root,
+            observed_defect_refs=(
+                *root.observed_defect_refs,
+                "record:distinguishable-provenance",
+                other_seed.start_ref,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "observed_defect_refs.*owning seed"):
+            replace(report, confirmed_roots=(mixed_root,))
+
+        payload = report.to_dict()
+        payload["confirmed_roots"][0]["observed_defect_refs"] = list(
+            mixed_root.observed_defect_refs
+        )
+        with self.assertRaisesRegex(ValueError, "observed_defect_refs.*owning seed"):
+            RecursiveAttributionReport.from_dict(payload)
+
     def test_published_root_requires_exactly_one_confirmed_seed_owner(self):
         report = run_fixture("multi_seed_claims.json")
         owning = next(
@@ -1372,6 +1429,112 @@ class SeedAttributionCheckpointTests(unittest.TestCase):
             [item.to_dict() for item in restored.seed_results()],
             [item.to_dict() for item in state.seed_results()],
         )
+
+    def test_checkpoint_rejects_noncanonical_hypothesis_seed_key_routing(self):
+        trace = {
+            "case_id": "hypothesis-seed-key-routing",
+            "records": [
+                {
+                    "record_id": "seed",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "A seed with pending frontier work."},
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState(
+            graph=graph,
+            start_refs=("record:seed",),
+            objective="Keep every frontier hypothesis bound to its seed.",
+            analysis_perspective="",
+        )
+        owner = state._ensure_seed("record:seed", defect("owner"))
+        other = state._ensure_seed("record:seed", defect("other"))
+        hypothesis = state.ledger.create(
+            "The pending item belongs to the owner seed.",
+            "record:seed",
+            owner.defect_state,
+            seed_binding_identity=owner.key,
+        )
+        state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, owner)
+        state.frontier.push(
+            FrontierItem.create(
+                node_ref="record:seed",
+                defect_state=owner.defect_state,
+                downstream_path=["record:seed"],
+                hypothesis_id=hypothesis.hypothesis_id,
+                hypothesis_semantic_hash=hypothesis.semantic_hash,
+                seed_binding_identity=owner.key,
+                candidate_source="checkpoint-test",
+            )
+        )
+        config = build_checkpoint_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            objective=state.objective,
+            analysis_perspective="",
+            start_refs=state.start_refs,
+            budgets={
+                "max_frontier_items": 96,
+                "max_depth": 20,
+                "max_hypotheses": 24,
+                "max_investigation_rounds": 12,
+                "max_artifact_bytes": 1_048_576,
+                "max_judge_requests": 128,
+            },
+            model_identity="offline:test",
+            cache_identity="cache:test",
+            runtime_identity={
+                "judge_timeout_sec": 3600.0,
+                "judge_max_tokens": 4096,
+                "thinking_mode": "disabled",
+                "base_url": "offline://test",
+                "provider_error_threshold": 3,
+            },
+        )
+        state.provider_state = _provider_state_payload(
+            MultiSeedJudge(), state, cache_identity="cache:test"
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="hypothesis-seed-key-routing",
+                frontier_payload=state.frontier_checkpoint_payload(),
+                hypothesis_payload=state.hypothesis_checkpoint_payload(),
+                action_payload=state.action_checkpoint_payload(),
+            )
+            checkpoint = bundle.restore(expected_config=config)
+            restored = RecursiveAnalysisState.from_checkpoint(
+                graph=graph, checkpoint=checkpoint
+            )
+            restored_item = FrontierItem.from_dict(restored.frontier.snapshot()[0])
+            self.assertEqual(
+                restored._seed_builder_for_item(restored_item).key, owner.key
+            )
+
+        mutations = {
+            "extra": lambda mapping: mapping.update({"hyp:extra": owner.key}),
+            "missing_frontier": lambda mapping: mapping.pop(hypothesis.hypothesis_id),
+            "cross_seed": lambda mapping: mapping.update(
+                {hypothesis.hypothesis_id: other.key}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                actions = json.loads(json.dumps(checkpoint.actions))
+                snapshot = next(
+                    item
+                    for item in reversed(actions)
+                    if item["operation"] == "state_snapshot"
+                )
+                mutate(snapshot["payload"]["hypothesis_seed_keys"])
+                with self.assertRaisesRegex(ValueError, "hypothesis_seed_keys"):
+                    RecursiveAnalysisState.from_checkpoint(
+                        graph=graph,
+                        checkpoint=replace(checkpoint, actions=tuple(actions)),
+                    )
 
 
 if __name__ == "__main__":
