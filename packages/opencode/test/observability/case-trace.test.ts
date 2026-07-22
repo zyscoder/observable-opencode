@@ -1979,10 +1979,11 @@ describe("case trace", () => {
         `const publicSnapshot = (caseID: string) => {`,
         `  const caseDir = path.join(${JSON.stringify(dir)}, caseID)`,
         `  const events = read(path.join(caseDir, "events.jsonl")) ?? ""`,
-        `  const summaryRecord = events.trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line)).findLast((event) => event.type === "trace.finish")`,
+        `  const eventLines = events.trim().split("\\n").filter(Boolean)`,
+        `  const summaryRecord = eventLines.findLast((line) => JSON.parse(line).type === "trace.finish")`,
         `  const persisted = ["manifest.json", "trace.json", "partial/latest.json", "legacy-trace.json"].map((file) => [file, read(path.join(caseDir, file))])`,
         `  const artifactDir = path.join(caseDir, "artifacts")`,
-        `  const artifactFiles = fs.existsSync(artifactDir) ? fs.readdirSync(artifactDir, { recursive: true }).filter((file) => fs.statSync(path.join(artifactDir, file.toString())).isFile()).map((file) => [file.toString(), read(path.join(artifactDir, file.toString()))]) : []`,
+        `  const artifactFiles = fs.existsSync(artifactDir) ? fs.readdirSync(artifactDir, { recursive: true }).filter((file) => fs.statSync(path.join(artifactDir, file.toString())).isFile()).map((file) => [file.toString(), read(path.join(artifactDir, file.toString()))]).sort((left, right) => left[0].localeCompare(right[0])) : []`,
         `  const artifactRefs = Array.from(new Set((persisted.map((item) => item[1]).join("\\n") + events).match(/artifact_[a-z0-9_]+/g) ?? [])).sort()`,
         `  return { manifest: persisted[0][1], trace: persisted[1][1], partial: persisted[2][1], summary: persisted[3][1], summaryRecord, artifactRefs, artifactFiles, records: read(path.join(caseDir, "records.jsonl")), events }`,
         `}`,
@@ -2007,9 +2008,12 @@ describe("case trace", () => {
         `CaseTrace.configure({ caseID: "response-source-exception" })`,
         `CaseTrace.responseOutput({ text: responseText })`,
         `const trace = CaseTrace.get() as any`,
+        `CaseTrace.finish({ status: "success" })`,
         `const exceptionBefore = publicSnapshot("response-source-exception")`,
+        `trace.finished = false`,
+        `trace.responseSourceBySegmentID.set("forced-segment", responseText)`,
         `trace.emitFinalResponseClaims = () => { throw new Error("forced claim emission failure") }`,
-        `try { CaseTrace.finish({ status: "success" }) } catch {}`,
+        `try { trace.finish({ status: "success" }) } catch {}`,
         `const exceptionAfter = publicSnapshot("response-source-exception")`,
         `results.push({ kind: "exception", count: sourceCount(trace), finished: trace.finished })`,
         `trace.finished = true`,
@@ -2051,8 +2055,12 @@ describe("case trace", () => {
     expect(lifecycle.repeatAfter.summaryRecord).toEqual(lifecycle.repeatBefore.summaryRecord)
     expect(lifecycle.repeatAfter.artifactRefs).toEqual(lifecycle.repeatBefore.artifactRefs)
     expect(lifecycle.repeatAfter.artifactFiles).toEqual(lifecycle.repeatBefore.artifactFiles)
-    expect(lifecycle.exceptionBefore.partial).toBeDefined()
+    for (const field of ["manifest", "trace", "partial", "summary", "summaryRecord", "records", "events"]) {
+      expect(lifecycle.exceptionBefore[field]).toEqual(expect.any(String))
+      expect(lifecycle.exceptionBefore[field].length).toBeGreaterThan(0)
+    }
     expect(lifecycle.exceptionBefore.artifactRefs.length).toBeGreaterThan(0)
+    expect(lifecycle.exceptionBefore.artifactFiles.length).toBeGreaterThan(0)
     expect(lifecycle.exceptionAfter.manifest).toBe(lifecycle.exceptionBefore.manifest)
     expect(lifecycle.exceptionAfter.trace).toBe(lifecycle.exceptionBefore.trace)
     expect(lifecycle.exceptionAfter.partial).toBe(lifecycle.exceptionBefore.partial)

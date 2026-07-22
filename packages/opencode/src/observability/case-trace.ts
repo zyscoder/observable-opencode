@@ -21,11 +21,8 @@ import {
   type CausalNodeLike,
 } from "./causal-ir"
 import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
-import {
-  atomizeResponseClaims,
-  isBrokenClaimFragment,
-  isNonFactualResponseClaim,
-} from "./claim-atomization"
+import { atomizeResponseClaims } from "./claim-atomization"
+import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
 import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"

@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import * as claimAtomization from "../../src/observability/claim-atomization"
 import { atomizeResponseClaims } from "../../src/observability/claim-atomization"
+import { isBrokenClaimFragment } from "../../src/observability/claim-atomization-core"
 import { atomizeResponseClaimsWithLexerForTest } from "../../src/observability/claim-atomization.test-support"
 
 describe("claim atomization", () => {
+  test("keeps the production module export surface limited to the atomizer", () => {
+    expect(Object.keys(claimAtomization).sort()).toEqual(["atomizeResponseClaims"])
+  })
+
   test("keeps a parenthetical cstack statement as one auditable claim", () => {
     const response =
       "When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix), it now returns the matrix directly."
@@ -259,43 +265,124 @@ describe("claim atomization", () => {
     expect(Buffer.from(response).subarray(start, end).toString()).toBe(tableFact!.raw_text)
   })
 
-  test("uses marked table cells for escaped pipes, inline-code pipes, and Unicode", () => {
-    const response = [
+  test("uses marked cells for escaped pipes and fails closed for conflicting inline-code pipes", () => {
+    const lines = [
       "| Field | Value |",
       "| --- | --- |",
       "| Owner | billing\\|platform |",
+      "| Escaped expression | `left\\|right` |",
       "| Expression | `left|right` |",
+      "| Hidden | before | `left|right` |",
       "| 状态😀 | 所有 11 个测试通过。 |",
-    ].join("\n")
+    ]
+    const response = lines.join("\n")
+    const factRowIndexes = [2, 3, 6]
+    const factRows = factRowIndexes.map((index) => lines[index]!)
+    const factRowByteRanges = factRowIndexes.map((index) => {
+      const before = lines.slice(0, index).join("\n")
+      const start = Buffer.byteLength(before) + (index ? 1 : 0)
+      return [start, start + Buffer.byteLength(lines[index]!)] as [number, number]
+    })
     const first = atomizeResponseClaims(response)
     const second = atomizeResponseClaims(response)
 
     expect(first.map((claim) => claim.text)).toEqual([
       "Owner: billing|platform",
-      "Expression: left|right",
+      "Escaped expression: left|right",
       "状态😀: 所有 11 个测试通过。",
     ])
     expect(first.map((claim) => claim.table_cells)).toEqual([
       ["Owner", "billing|platform"],
-      ["Expression", "left|right"],
+      ["Escaped expression", "left|right"],
       ["状态😀", "所有 11 个测试通过。"],
     ])
     expect(first.map((claim) => claim.canonical_text)).toEqual(first.map((claim) => claim.text))
     expect(first.map((claim) => claim.claim_group_id)).toEqual(second.map((claim) => claim.claim_group_id))
     expect(first.map((claim) => claim.key)).toEqual(second.map((claim) => claim.key))
-    expect(first.map((claim) => claim.source_byte_range)).toEqual(
-      ["| Owner | billing\\|platform |", "| Expression | `left|right` |", "| 状态😀 | 所有 11 个测试通过。 |"].map(
-        (row) => [
-          Buffer.byteLength(response.slice(0, response.indexOf(row))),
-          Buffer.byteLength(response.slice(0, response.indexOf(row) + row.length)),
-        ],
-      ),
-    )
-    expect(first.map((claim) => claim.raw_text)).toEqual([
-      "| Owner | billing\\|platform |",
-      "| Expression | `left|right` |",
-      "| 状态😀 | 所有 11 个测试通过。 |",
+    expect(first.map((claim) => claim.source_byte_range)).toEqual(factRowByteRanges)
+    expect(first.map((claim) => claim.raw_text)).toEqual(factRows)
+    expect(first.some((claim) => claim.raw_text.includes("Expression"))).toBe(false)
+    expect(first.some((claim) => claim.raw_text.includes("Hidden"))).toBe(false)
+  })
+
+  test("maps nested list children monotonically across indentation and duplicate text", () => {
+    const lines = [
+      "- Parent item passes 10 tests.",
+      "  continuation passes 11 tests.",
+      "  - Nested item passes 12 tests.",
+      "    continuation passes 13 tests.",
+      "  - Nested item passes 12 tests.",
+      "- Parent item passes 10 tests.",
+      "  - Nested item passes 14 tests.",
+    ]
+    const response = lines.join("\n")
+    const claims = atomizeResponseClaims(response)
+    const secondParentStart = Buffer.byteLength(`${lines.slice(0, 5).join("\n")}\n`)
+
+    expect(claims.map((claim) => claim.text)).toEqual([
+      "Parent item passes 10 tests.",
+      "continuation passes 11 tests.",
+      "Nested item passes 12 tests.",
+      "continuation passes 13 tests.",
+      "Nested item passes 12 tests.",
+      "Parent item passes 10 tests.",
+      "Nested item passes 14 tests.",
     ])
+    expect(claims.slice(0, 5).every((claim) => claim.source_byte_range[1] <= secondParentStart)).toBe(true)
+    expect(claims.slice(5).every((claim) => claim.source_byte_range[0] >= secondParentStart)).toBe(true)
+    expect(claims[2]!.source_byte_range).not.toEqual(claims[4]!.source_byte_range)
+  })
+
+  test("maps CRLF nested list continuations and repeated child text within the parent range", () => {
+    const lines = [
+      "- Parent passes 10 tests.",
+      "  - Child passes 12 tests.",
+      "    continuation passes 13 tests.",
+      "  - Child passes 12 tests.",
+    ]
+    const response = lines.join("\r\n")
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual([
+      "Parent passes 10 tests.",
+      "Child passes 12 tests.",
+      "continuation passes 13 tests.",
+      "Child passes 12 tests.",
+    ])
+    expect(
+      claims.every(
+        (claim) => claim.source_byte_range[0] >= 0 && claim.source_byte_range[1] <= Buffer.byteLength(response),
+      ),
+    ).toBe(true)
+    expect(claims[1]!.source_byte_range).not.toEqual(claims[3]!.source_byte_range)
+  })
+
+  test("backs the scan window out of a split CRLF for top-level, list, and table blocks", () => {
+    const atBoundary = (prefix: string, suffix = "") => {
+      const fill = 7_999 - prefix.length - suffix.length
+      expect(fill).toBeGreaterThanOrEqual(0)
+      return `${prefix}${"x".repeat(fill)}${suffix}\r\nAfter 99 tests pass.`
+    }
+    const tablePrefix = ["| Field | Value |", "| --- | --- |", "| Tests | All 11 tests pass. |", "| Padding | "].join(
+      "\r\n",
+    )
+    const cases = [
+      { name: "top-level", response: atBoundary("All 11 tests pass. "), expected: "All 11 tests pass." },
+      { name: "list", response: atBoundary("- All 11 tests pass.\r\n- Padding "), expected: "All 11 tests pass." },
+      { name: "table", response: atBoundary(tablePrefix, " |"), expected: "Tests: All 11 tests pass." },
+    ]
+
+    for (const item of cases) {
+      const claims = atomizeResponseClaims(item.response)
+      expect(
+        claims.map((claim) => claim.text),
+        item.name,
+      ).toContain(item.expected)
+      expect(
+        claims.every((claim) => !claim.text.includes("After 99 tests pass.")),
+        item.name,
+      ).toBe(true)
+    }
   })
 
   test("keeps list items independent across nested and consecutive lists", () => {
@@ -422,6 +509,7 @@ describe("claim atomization", () => {
     expect(first).toEqual(second)
     expect(first.map((claim) => claim.text)).toEqual(["[unserializable response]"])
     expect(first.map((claim) => claim.raw_text)).toEqual(["[unserializable response]"])
+    expect(() => isBrokenClaimFragment(hostile)).not.toThrow()
   })
 
   test("fails closed when the Markdown lexer throws", () => {

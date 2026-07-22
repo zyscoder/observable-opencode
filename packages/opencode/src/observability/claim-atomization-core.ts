@@ -87,6 +87,14 @@ function createClaimSourceView(input: unknown, limit: number): ClaimSourceView {
   ) {
     scanEnd--
   }
+  if (
+    scanEnd > 0 &&
+    scanEnd < originalText.length &&
+    originalText[scanEnd - 1] === "\r" &&
+    originalText[scanEnd] === "\n"
+  ) {
+    scanEnd--
+  }
   return { originalText, scanEnd }
 }
 
@@ -118,10 +126,13 @@ function stringPreview(input: unknown, limit = 400) {
   if (typeof input === "string") return input.slice(0, limit)
   if (input === undefined || input === null) return ""
   try {
-    return JSON.stringify(input).slice(0, limit)
-  } catch {
+    const serialized = JSON.stringify(input)
+    if (typeof serialized === "string") return serialized.slice(0, limit)
+  } catch {}
+  try {
     return String(input).slice(0, limit)
-  }
+  } catch {}
+  return "[unserializable response]".slice(0, limit)
 }
 
 function tokenizeClaimSource(source: ClaimSourceView, lexer: MarkdownBlockLexer): ClaimToken[] {
@@ -291,9 +302,88 @@ function tokenizeListParagraphRange(source: ClaimSourceView, start: number, end:
 
 function mapNestedRawRange(source: ClaimSourceView, raw: unknown, cursor: number, end: number) {
   if (typeof raw !== "string" || !raw) return undefined
-  for (let start = cursor; start < end; start++) {
-    const range = mapMarkedRawToSource(raw, source, start, end)
-    if (range) return { start: range[0], end: range[1] }
+  const rawLines = normalizedPhysicalLines(raw)
+  let lineStart = cursor
+  while (lineStart < end) {
+    const range = mapNestedRawLinesAt(source, rawLines, lineStart, end)
+    if (range) return range
+    const line = sourcePhysicalLine(source.originalText, lineStart, end)
+    if (line.stop <= lineStart) break
+    lineStart = line.stop
+  }
+  return undefined
+}
+
+type NormalizedPhysicalLine = {
+  text: string
+  hasNewline: boolean
+}
+
+function normalizedPhysicalLines(raw: string): NormalizedPhysicalLine[] {
+  const lines: NormalizedPhysicalLine[] = []
+  let start = 0
+  while (start < raw.length) {
+    const newline = raw.indexOf("\n", start)
+    if (newline === -1) {
+      lines.push({ text: raw.slice(start), hasNewline: false })
+      break
+    }
+    lines.push({ text: raw.slice(start, newline), hasNewline: true })
+    start = newline + 1
+  }
+  return lines
+}
+
+function sourcePhysicalLine(input: string, start: number, limit: number) {
+  const newline = input.indexOf("\n", start)
+  const hasNewline = newline !== -1 && newline < limit
+  const stop = hasNewline ? newline + 1 : limit
+  const end = hasNewline && input[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : limit
+  return { start, end, stop, hasNewline }
+}
+
+function mapNestedRawLinesAt(
+  source: ClaimSourceView,
+  rawLines: NormalizedPhysicalLine[],
+  sourceStart: number,
+  limit: number,
+) {
+  let lineStart = sourceStart
+  let rangeStart: number | undefined
+  let rangeEnd = sourceStart
+
+  for (const rawLine of rawLines) {
+    if (lineStart >= limit) return undefined
+    const sourceLine = sourcePhysicalLine(source.originalText, lineStart, limit)
+    const contentStart = nestedLineContentStart(source.originalText, sourceLine.start, sourceLine.end, rawLine.text)
+    if (contentStart === undefined) return undefined
+    if (rangeStart === undefined) rangeStart = contentStart
+    if (rawLine.hasNewline) {
+      if (!sourceLine.hasNewline) return undefined
+      rangeEnd = sourceLine.stop
+      lineStart = sourceLine.stop
+    } else {
+      rangeEnd = sourceLine.end
+    }
+  }
+
+  return rangeStart === undefined ? undefined : { start: rangeStart, end: rangeEnd }
+}
+
+function nestedLineContentStart(input: string, start: number, end: number, rawLine: string) {
+  const candidates = [start]
+  let indentEnd = start
+  while (indentEnd < end && /[ \t]/.test(input[indentEnd]!)) {
+    indentEnd++
+    candidates.push(indentEnd)
+  }
+
+  const marker = input.slice(indentEnd, end).match(/^(?:[-+*]|\d+[.)])[ \t]+/)
+  if (marker) candidates.push(indentEnd + marker[0].length)
+
+  for (const candidate of candidates) {
+    if (candidate + rawLine.length !== end) continue
+    if (input.slice(candidate, end) === rawLine) return candidate
   }
   return undefined
 }
@@ -348,36 +438,50 @@ function tokenizeMarkdownTable(
 
 function markedTableRowCells(row: MarkdownTableCell[], expectedCount: number, rawLine: string) {
   if (!Array.isArray(row) || row.some((cell) => !cell || typeof cell.text !== "string")) return undefined
-  const cells: string[] = []
-  let pending = ""
   const structured = row.map((cell) => cell.text)
-  const last = structured.at(-1)
-  if (last) structured[structured.length - 1] = completeTruncatedCodeCell(last, rawLine)
+  if (
+    structured.length !== expectedCount ||
+    structured.some((cell) => unclosedBacktickRun(cell)) ||
+    hasUnescapedPipeInCodeSpan(rawLine)
+  )
+    return undefined
+  return structured.map(normalizeMarkedTableCell)
+}
 
-  for (const cell of structured) {
-    pending = pending ? `${pending}|${cell}` : cell
-    if (hasUnclosedBacktickRun(pending)) continue
-    cells.push(normalizeMarkedTableCell(pending))
-    pending = ""
+function hasUnescapedPipeInCodeSpan(input: string) {
+  for (let index = 0; index < input.length; index++) {
+    if (input[index] !== "`" || isBackslashEscaped(input, index)) continue
+    const delimiterLength = backtickRunLengthInText(input, index)
+    const close = matchingBacktickRunInText(input, index + delimiterLength, delimiterLength)
+    if (close === -1) continue
+    for (let content = index + delimiterLength; content < close; content++) {
+      if (input[content] === "|" && !isBackslashEscaped(input, content)) return true
+    }
+    index = close + delimiterLength - 1
   }
-  if (pending) cells.push(normalizeMarkedTableCell(pending))
-  if (cells.length !== expectedCount) return undefined
-  return cells
+  return false
 }
 
-function completeTruncatedCodeCell(input: string, rawLine: string) {
-  const unclosed = unclosedBacktickRun(input)
-  if (!unclosed) return input
-  const rawStart = rawLine.indexOf(input)
-  if (rawStart === -1) return input
-  const delimiter = "`".repeat(unclosed.length)
-  const close = rawLine.indexOf(delimiter, rawStart + input.length)
-  if (close === -1) return input
-  return `${input.slice(0, unclosed.start)}${rawLine.slice(rawStart + unclosed.start, close + unclosed.length)}`
+function backtickRunLengthInText(input: string, start: number) {
+  let end = start
+  while (input[end] === "`") end++
+  return end - start
 }
 
-function hasUnclosedBacktickRun(input: string) {
-  return Boolean(unclosedBacktickRun(input))
+function matchingBacktickRunInText(input: string, start: number, length: number) {
+  for (let index = start; index < input.length; index++) {
+    if (input[index] !== "`" || isBackslashEscaped(input, index)) continue
+    const candidateLength = backtickRunLengthInText(input, index)
+    if (candidateLength === length) return index
+    index += candidateLength - 1
+  }
+  return -1
+}
+
+function isBackslashEscaped(input: string, index: number) {
+  let slashCount = 0
+  while (index > 0 && input[--index] === "\\") slashCount++
+  return slashCount % 2 === 1
 }
 
 function unclosedBacktickRun(input: string) {
