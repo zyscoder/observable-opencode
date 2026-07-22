@@ -80,6 +80,24 @@ function assertFinalCancelledPartialMatchesTrace(partial: any, trace: any) {
   })
 }
 
+function expectResponseClaimAtomizationClosure(value: any) {
+  expect(value).toEqual(
+    expect.objectContaining({
+      claim_group_id: expect.any(String),
+      claim_count: expect.any(Number),
+      source_byte_range: [expect.any(Number), expect.any(Number)],
+      atomization_status: expect.any(String),
+      atomization_reason: expect.any(String),
+    }),
+  )
+  expect(value.claim_group_id.length).toBeGreaterThan(0)
+  expect(value.claim_count).toBeGreaterThan(0)
+  expect(value.source_byte_range[0]).toBeGreaterThanOrEqual(0)
+  expect(value.source_byte_range[1]).toBeGreaterThanOrEqual(value.source_byte_range[0])
+  expect(["atomic", "group_required", "invalid_fragment"]).toContain(value.atomization_status)
+  expect(value.atomization_reason.length).toBeGreaterThan(0)
+}
+
 function changeIdFromTrace(trace: any) {
   const record = trace.records.find((item: any) => item.event_type === "change")
   return record?.data?.change_id ?? record?.record_id
@@ -1904,6 +1922,12 @@ describe("case trace", () => {
     const claimOrderEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "claim_group_precedes")
 
     expect(claims).toHaveLength(2)
+    for (const claim of claims) {
+      const node = responseClaimNodes.find((item: any) => item.node_id === claim.record_id)
+      expectResponseClaimAtomizationClosure(claim.data)
+      expectResponseClaimAtomizationClosure(node.data)
+      expectResponseClaimAtomizationClosure(node.metadata)
+    }
     expect(firstClaim!.data.next_claim_ref).toBe(secondRecordRef)
     expect(secondClaim!.data.previous_claim_ref).toBe(firstRecordRef)
     expect(firstClaimNode.data).toMatchObject({
@@ -1947,6 +1971,7 @@ describe("case trace", () => {
       from: { type: "response_claim", id: firstClaim!.record_id },
       to: { type: "response_claim", id: secondClaim!.record_id },
       eligible_for_attribution: false,
+      label: "Adjacent claim/group order within a response segment",
       metadata: {
         causal_semantics: "claim_group_order_only",
         eligible_for_attribution: false,
@@ -1972,6 +1997,66 @@ describe("case trace", () => {
     expect(firstNextClaimKey).toEqual(expect.any(String))
     expect(firstNextClaimKey).toBe(secondClaimKey)
     expect(secondPreviousClaimKey).toBe(firstClaimKey)
+  })
+
+  test("normalizes legacy runtime response claims into complete atomization facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-legacy-response-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "legacy-response-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const text = "Legacy 😀 claim. ".repeat(600)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ segment_id: "legacy_segment", response_role: "intermediate_summary", text: ${JSON.stringify(text)} })`,
+        `CaseTrace.get()?.responseClaim({ claim_id: "legacy_claim", response_segment_id: "legacy_segment", text: ${JSON.stringify(text)}, claim_index: 1, metadata: { response_node_id: "responsenode_legacy_segment" } } as any)`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "legacy-response-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "legacy-response-claim-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const claim = trace.records.find((record: any) => record.event_type === "response.claim")
+    const node = trace.nodes.find((item: any) => item.node_id === claim.record_id)
+
+    expectResponseClaimAtomizationClosure(claim.data)
+    expectResponseClaimAtomizationClosure(node.data)
+    expectResponseClaimAtomizationClosure(node.metadata)
+    expect(claim.data).toMatchObject({
+      claim_group_id: `claim_group_${createHash("sha256")
+        .update(["legacy_response_claim", "legacy_segment", "legacy_claim", text].join("\0"))
+        .digest("hex")
+        .slice(0, 16)}`,
+      claim_count: 1,
+      source_byte_range: [0, Buffer.byteLength(text)],
+      atomization_status: "group_required",
+      atomization_reason: "legacy_response_claim_missing_atomization_facts",
+    })
+    expect(node.data).toMatchObject(claim.data)
+    expect(node.metadata).toMatchObject({
+      claim_group_id: claim.data.claim_group_id,
+      claim_count: 1,
+      source_byte_range: [0, Buffer.byteLength(text)],
+      atomization_status: "group_required",
+      atomization_reason: "legacy_response_claim_missing_atomization_facts",
+    })
+    assertJournalReplaysCanonicalTrace(await readCausalIRJournal(caseDir), trace)
   })
 
   test("does not connect explicit claims across response segments", async () => {

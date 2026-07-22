@@ -627,16 +627,16 @@ export type TraceResponseClaimRecord = {
   table_cells?: string[]
   table_subject?: string
   table_values?: string[]
-  claim_group_id?: string
+  claim_group_id: string
   claim_index: number
-  claim_count?: number
-  source_byte_range?: [number, number]
+  claim_count: number
+  source_byte_range: [number, number]
   previous_claim_key?: string
   next_claim_key?: string
   previous_claim_ref?: string
   next_claim_ref?: string
-  atomization_status?: "atomic" | "group_required" | "invalid_fragment" | string
-  atomization_reason?: string
+  atomization_status: "atomic" | "group_required" | "invalid_fragment"
+  atomization_reason: string
   direct_evidence_refs: string[]
   direct_support_refs?: string[]
   candidate_context_refs?: string[]
@@ -1109,15 +1109,10 @@ type ResponseClaimInput = Omit<
   | "table_cells"
   | "table_subject"
   | "table_values"
-  | "claim_group_id"
-  | "claim_count"
-  | "source_byte_range"
   | "previous_claim_key"
   | "next_claim_key"
   | "previous_claim_ref"
   | "next_claim_ref"
-  | "atomization_status"
-  | "atomization_reason"
   | "direct_evidence_refs"
   | "context_refs"
   | "execution_refs"
@@ -1140,15 +1135,10 @@ type ResponseClaimInput = Omit<
   table_cells?: string[]
   table_subject?: string
   table_values?: string[]
-  claim_group_id?: string
-  claim_count?: number
-  source_byte_range?: [number, number]
   previous_claim_key?: string
   next_claim_key?: string
   previous_claim_ref?: string
   next_claim_ref?: string
-  atomization_status?: TraceResponseClaimRecord["atomization_status"]
-  atomization_reason?: string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
@@ -2529,6 +2519,42 @@ function responseClaimQualityFlags(classifiedRefs: ReturnType<typeof classifySou
     else flags.push("unsupported_response_claim")
   }
   return flags
+}
+
+function hasCompleteResponseClaimAtomizationFacts(input: ResponseClaimInput) {
+  return (
+    typeof input.claim_group_id === "string" &&
+    input.claim_group_id.length > 0 &&
+    Number.isInteger(input.claim_count) &&
+    input.claim_count > 0 &&
+    Array.isArray(input.source_byte_range) &&
+    input.source_byte_range.length === 2 &&
+    Number.isFinite(input.source_byte_range[0]) &&
+    Number.isFinite(input.source_byte_range[1]) &&
+    input.source_byte_range[0] >= 0 &&
+    input.source_byte_range[1] >= input.source_byte_range[0] &&
+    ["atomic", "group_required", "invalid_fragment"].includes(input.atomization_status) &&
+    typeof input.atomization_reason === "string" &&
+    input.atomization_reason.length > 0
+  )
+}
+
+function normalizeLegacyResponseClaimAtomizationFacts(input: ResponseClaimInput): ResponseClaimInput {
+  if (hasCompleteResponseClaimAtomizationFacts(input)) return input
+  const originalText = input.raw_text ?? input.text
+  const sourceText = typeof originalText === "string" ? originalText : fieldSummaryText(originalText)
+  return {
+    ...input,
+    claim_group_id: `claim_group_${hash(
+      ["legacy_response_claim", input.response_segment_id ?? "", input.claim_id ?? input.claim_key ?? input.claim_index, sourceText].join(
+        "\0",
+      ),
+    )}`,
+    claim_count: 1,
+    source_byte_range: [0, Buffer.byteLength(sourceText)],
+    atomization_status: "group_required",
+    atomization_reason: "legacy_response_claim_missing_atomization_facts",
+  }
 }
 
 function responseClaimKind(input: unknown): TraceResponseClaimRecord["claim_kind"] {
@@ -6580,7 +6606,8 @@ class ActiveCaseTrace {
     return dedupeStrings(evidenceRefs)
   }
 
-  responseClaim(input: ResponseClaimInput) {
+  responseClaim(legacyInput: ResponseClaimInput) {
+    const input = normalizeLegacyResponseClaimAtomizationFacts(legacyInput)
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
     const generationProvenanceRefs = dedupeStrings([
@@ -7315,7 +7342,7 @@ class ActiveCaseTrace {
           to: { type: "response_claim", id: `responseclaim_${next.claim_id}`, label: "response.claim" },
           relation: "claim_group_precedes",
           eligible_for_attribution: false,
-          label: "Claim order within a response claim group",
+          label: "Adjacent claim/group order within a response segment",
           metadata: {
             causal_semantics: "claim_group_order_only",
             eligible_for_attribution: false,

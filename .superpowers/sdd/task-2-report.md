@@ -63,3 +63,35 @@ Completed.
 ### Commit
 
 `fix(trace): close claim group projection review gaps`
+
+## Final Interface Closure
+
+### RED
+
+- A JavaScript/`as any` `responseClaim()` input omitting all five atomization facts wrote an incomplete `response.claim` record, node data payload, and node metadata payload.
+- The initial legacy normalization used a summarized source string. A Unicode legacy input larger than 8 KB exposed a truncated `source_byte_range` and a group hash derived from the truncated text.
+- The `claim_group_precedes` label still described ordering as being within one claim group even though the edge correctly joins adjacent claims from the same response segment regardless of group.
+
+### GREEN
+
+- `TraceResponseClaimRecord` and `ResponseClaimInput` now require `claim_group_id`, `claim_count`, `source_byte_range`, `atomization_status`, and `atomization_reason`; status is exactly `atomic | group_required | invalid_fragment`.
+- `normalizeLegacyResponseClaimAtomizationFacts()` is an isolated runtime boundary. Valid atomized inputs bypass it unchanged; incomplete or invalid dynamic inputs receive a deterministic group ID, count `1`, the original string's UTF-8 byte range, `group_required`, and `legacy_response_claim_missing_atomization_facts`.
+- The normal atomized path now verifies the five facts for every response-claim record, Causal IR node data payload, and node metadata payload. The legacy runtime regression verifies the same closure and journal replay for a long Unicode source.
+- `claim_group_precedes` now labels the fact as `Adjacent claim/group order within a response segment`; relation, eligibility, and metadata semantics are unchanged.
+
+### Verification
+
+- Focused CaseTrace RED/GREEN tests: parenthetical normal closure and legacy runtime normalization, 2 pass.
+- Full CaseTrace suite: 138 pass, 0 fail.
+- Full Causal IR suite: 54 pass, 0 fail.
+- Claim atomizer suite: 39 pass, 0 fail.
+- `bun run typecheck`: passed.
+- `git diff --check`: passed.
+
+### Commit
+
+`fix(trace): close Task 2 response claim interface`
+
+### Concerns
+
+- The compatibility boundary intentionally treats malformed dynamic values like missing values so persistence cannot produce a partial atomization closure. Statically typed callers must provide all five facts and retain their normal atomized values unchanged.
