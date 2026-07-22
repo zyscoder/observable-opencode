@@ -312,18 +312,24 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
 
 
 class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
-    def __init__(self, *, global_outcome, script=None, confirmations=None):
+    def __init__(
+        self,
+        *,
+        global_outcome,
+        script=None,
+        confirmations=None,
+        selected_candidate_refs=None,
+    ):
         super().__init__(script or {}, confirmations or {})
         self.global_outcome = global_outcome
         self.global_requests = []
+        self.selected_candidate_refs = tuple(selected_candidate_refs or ())
 
     def judge_candidates_bounded(self, request, *, max_physical_requests):
         self.global_requests.append(request)
-        selected = (
-            ("record:decision",)
-            if self.global_outcome == "candidate_roots"
-            else ()
-        )
+        selected = self.selected_candidate_refs if self.global_outcome == "candidate_roots" else ()
+        if self.global_outcome == "candidate_roots" and not selected:
+            selected = ("record:decision",)
         if self.global_outcome == "needs_expansion":
             selected = ()
         assessments = []
@@ -2581,6 +2587,98 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             }
 
         self.assertEqual(run(0.01), run(0.99))
+
+    def test_retrieval_rank_data_does_not_change_global_or_competitor_confirmation_facts(self):
+        class RankAdjustedRetriever(SemanticPredecessorRetriever):
+            def __init__(self, score, edge_confidence):
+                self.score = score
+                self.edge_confidence = edge_confidence
+
+            def retrieve(self, *args, **kwargs):
+                return [
+                    replace(
+                        candidate,
+                        score=self.score,
+                        edge={**candidate.edge, "confidence": self.edge_confidence},
+                    )
+                    for candidate in super().retrieve(*args, **kwargs)
+                ]
+
+        trace = observed_trace()
+        trace["records"].insert(
+            2,
+            {
+                "record_id": "rival_decision",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "A competing decision omitted the same search."},
+            },
+        )
+        trace["dataflow_edges"].insert(
+            1,
+            {
+                "from": {"type": "record", "id": "rival_decision"},
+                "to": {"type": "record", "id": "change"},
+                "relation": "decision_guided_change",
+                "evidence_type": "confirmed",
+                "confidence": 0.73,
+                "eligible_for_attribution": True,
+            },
+        )
+
+        def normalized_facts(value):
+            return json.loads(json.dumps(value, sort_keys=True))
+
+        def run(score, edge_confidence):
+            judge = FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                selected_candidate_refs=("record:decision", "record:rival_decision"),
+                confirmations={
+                    ref: RootConfirmation.confirmed(
+                        ref,
+                        excerpt="The decision omitted required search coverage.",
+                        reason="The decision is a necessary local root.",
+                        counterfactual="Searching all call sites prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=[ref],
+                    )
+                    for ref in ("record:decision", "record:rival_decision")
+                },
+            )
+            AgenticRecursiveAnalyzer(
+                judge=judge,
+                retriever=RankAdjustedRetriever(score, edge_confidence),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find every trace-visible root.",
+            )
+            confirmation_facts = [
+                request.factual_dict() for request in judge.confirmation_requests
+            ]
+            self.assertTrue(
+                any(item["competing_hypotheses"] for item in confirmation_facts)
+            )
+            return normalized_facts(
+                {
+                    "global": [request.to_dict() for request in judge.global_requests],
+                    "independent_confirmation": confirmation_facts,
+                }
+            )
+
+        baseline = run(0.01, 0.02)
+        reranked = run(0.99, 0.98)
+
+        self.assertEqual(baseline, reranked)
+        candidate = baseline["global"][0]["candidate_evidence_capsules"][0]["candidate"]
+        self.assertNotIn("confidence", candidate["retrieval_edge"])
+        self.assertTrue(
+            any(
+                edge.get("confidence") == 0.98
+                for edge in baseline["global"][0]["candidate_evidence_capsules"][0]["incoming_edges"]
+            )
+        )
 
     def test_grounded_downstream_path_uses_recorded_non_temporal_edges(self):
         graph = TraceGraph.from_trace(

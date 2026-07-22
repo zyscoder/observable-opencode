@@ -22,7 +22,9 @@ from scripts.evaluate_recursive_attribution import (
 )
 from trace_attribution.causal_state import (
     CausalStepJudgment,
+    DefectState,
     PredecessorAssessment,
+    RecursiveAttributionReport,
     RootConfirmation,
     annotate_report_semantic_anchors,
     confirmation_identity_for,
@@ -328,6 +330,25 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         seed["confirmed_root_refs"] = ["record:invented"]
         seed["confirmation_identities"] = ["confirmation:invented"]
 
+        with self.assertRaises((EvaluationSchemaError, EvaluationSafetyError)):
+            self.compare(report)
+
+    def test_evaluator_rejects_same_start_ref_seed_with_fresh_defect_identity(self):
+        report = copy.deepcopy(self.report)
+        seed = report["seed_results"][0]
+        fresh_defect = DefectState.create(
+            label="fresh_but_internally_valid_defect",
+            expected="A distinct defect state is retained.",
+            actual="The prior root is incorrectly reused.",
+            mechanism="Adversarial seed identity substitution.",
+            scope="same_start_ref_regression",
+        )
+        seed["defect_state"] = fresh_defect.to_dict()
+        seed["defect_fingerprint"] = fresh_defect.fingerprint
+        report["defect_states"].append(fresh_defect.to_dict())
+
+        with self.assertRaises(ValueError):
+            RecursiveAttributionReport.from_dict(report)
         with self.assertRaises((EvaluationSchemaError, EvaluationSafetyError)):
             self.compare(report)
 

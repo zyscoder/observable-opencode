@@ -2111,6 +2111,36 @@ class RecursiveAttributionReport:
                 *confirmed_roots,
                 *items("co_roots", ConfirmedRoot.from_dict),
             ]
+            defect_states_by_id: Dict[str, DefectState] = {}
+            for defect_state in (
+                *defect_states,
+                *(item.defect_state for item in seed_results),
+                *(item.defect_state for item in published_roots),
+            ):
+                existing = defect_states_by_id.setdefault(
+                    defect_state.defect_state_id, defect_state
+                )
+                if existing != defect_state:
+                    raise ValueError("conflicting report defect_state identity")
+
+            def root_defect_is_bound_to_seed(
+                root: ConfirmedRoot, seed: SeedAttributionResult
+            ) -> bool:
+                current = root.defect_state
+                visited_ids: Set[str] = set()
+                while current.defect_state_id not in visited_ids:
+                    if current.fingerprint == seed.defect_fingerprint:
+                        return True
+                    visited_ids.add(current.defect_state_id)
+                    parent_id = current.derived_from_defect_state_id
+                    if not parent_id:
+                        return False
+                    parent = defect_states_by_id.get(parent_id)
+                    if parent is None:
+                        return False
+                    current = parent
+                return False
+
             for seed in seed_results:
                 if seed.outcome != "confirmed_root":
                     if seed.confirmed_root_refs:
@@ -2137,6 +2167,9 @@ class RecursiveAttributionReport:
                         and confirmation
                         == RootConfirmation.from_dict(_thaw(confirmation_payload))
                         and confirmation.status == "confirmed"
+                        and confirmation.defect_fingerprint
+                        == root.defect_state.fingerprint
+                        and root_defect_is_bound_to_seed(root, seed)
                         and seed.start_ref in root.observed_defect_refs
                     ):
                         bound_refs.add(root.node_ref)

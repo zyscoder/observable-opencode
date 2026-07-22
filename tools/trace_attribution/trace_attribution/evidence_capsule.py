@@ -152,7 +152,11 @@ def build_candidate_evidence_capsules(
             "artifact:{0}".format(item)
             for item in artifact_hydration.get("missing_artifact_ids") or []
         ]
-        retrieval_edge = graph.sanitize_edge_evidence(candidate.edge)
+        retrieval_edge = {
+            key: value
+            for key, value in graph.sanitize_edge_evidence(candidate.edge).items()
+            if key not in {"confidence", "score", "retrieval_score"}
+        }
         evidence_refs = _dedupe_strings(
             graph.filter_evidence_refs(
                 [
