@@ -3995,6 +3995,48 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 label="final attribution report",
             )
 
+    def test_publication_audit_rejects_capsule_drift_from_active_graph(self):
+        trace = observed_trace()
+        decision = next(
+            item for item in trace["records"] if item["record_id"] == "decision"
+        )
+        decision["data"]["repository_revision"] = "git:active"
+        report = AgenticRecursiveAnalyzer(
+            judge=FusionScriptedJudge(global_outcome="no_defect"),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Determine whether the observed defect is supported.",
+        )
+
+        for label, mutate in (
+            (
+                "event type",
+                lambda record: record.update({"event_type": "tool.result"}),
+            ),
+            (
+                "revision",
+                lambda record: record["data"].update(
+                    {"repository_revision": "git:stale"}
+                ),
+            ),
+        ):
+            with self.subTest(case=label):
+                active_trace = copy.deepcopy(trace)
+                active_decision = next(
+                    item
+                    for item in active_trace["records"]
+                    if item["record_id"] == "decision"
+                )
+                mutate(active_decision)
+                with self.assertRaisesRegex(ValueError, "active graph"):
+                    _assert_report_grounded_evidence(
+                        TraceGraph.from_trace(active_trace),
+                        report,
+                        label="final attribution report",
+                    )
+
     def test_confirmation_queue_never_accepts_more_than_three_candidates_per_seed(self):
         refs = ("record:alpha", "record:bravo", "record:charlie", "record:delta")
         graph = TraceGraph.from_trace(
@@ -4038,6 +4080,53 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             [item["candidate_ref"] for item in state.confirmation_queue],
             ["record:alpha", "record:bravo", "record:charlie"],
         )
+
+    def test_evidence_only_nodes_fail_direct_live_and_restored_queue_guards(self):
+        event_types = (
+            "tool.error",
+            "tool.result",
+            "verification",
+            "evidence.fact",
+            "evidence.semantic_fact",
+            "claim.support_assessment",
+        )
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "evidence-only-confirmation-queue",
+                "records": [
+                    {
+                        "record_id": "candidate_{0}".format(index),
+                        "component": "evidence",
+                        "event_type": event_type,
+                        "data": {"summary": "Observed evidence only."},
+                    }
+                    for index, event_type in enumerate(event_types)
+                ],
+                "dataflow_edges": [],
+            }
+        )
+
+        for index, event_type in enumerate(event_types):
+            ref = "record:candidate_{0}".format(index)
+            with self.subTest(event_type=event_type):
+                self.assertFalse(root_candidate_eligible(graph.nodes[ref]))
+                state = RecursiveAnalysisState(
+                    graph=graph,
+                    start_refs=("record:defect",),
+                    objective="Keep evidence out of root confirmation.",
+                    analysis_perspective="task quality",
+                )
+                entry = {
+                    "hypothesis_id": "hyp:{0}".format(index),
+                    "candidate_ref": ref,
+                    "defect_fingerprint": "defect-fingerprint",
+                    "seed_binding_identity": "seed-binding",
+                    "status": "queued",
+                }
+                self.assertFalse(state.enqueue_confirmation(entry))
+                state.confirmation_queue = [entry]
+                with self.assertRaisesRegex(ValueError, "ineligible"):
+                    state.validate_confirmation_queue_bound()
 
     def test_conflicting_raw_provenance_never_publishes_global_root(self):
         trace = observed_trace()
@@ -4163,7 +4252,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(report.analysis_outcome, "inconclusive")
         self.assertEqual(seed.outcome, "evidence_gap")
         self.assertEqual(seed.confirmed_root_refs, ())
-        self.assertEqual(seed.confirmation_identities, ())
+        self.assertEqual(len(seed.confirmation_identities), 1)
         self.assertEqual(report.confirmed_roots, ())
         self.assertEqual(report.co_roots, ())
         self.assertEqual([item.status for item in report.confirmations], ["confirmed"])
@@ -4208,7 +4297,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(report.analysis_outcome, "inconclusive")
         self.assertEqual(seed.outcome, "evidence_gap")
         self.assertEqual(seed.confirmed_root_refs, ())
-        self.assertEqual(seed.confirmation_identities, ())
+        self.assertEqual(len(seed.confirmation_identities), 1)
         self.assertEqual(report.confirmed_roots, ())
         self.assertEqual(report.co_roots, ())
         self.assertEqual([item.status for item in report.confirmations], ["confirmed"])

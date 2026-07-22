@@ -3277,10 +3277,10 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         )
 
         self.assertEqual(report.case_id, "unit-case")
-        self.assertEqual([candidate.node_ref for candidate in report.root_causes], ["record:evidence_old"])
+        self.assertEqual(report.root_causes, [])
         self.assertEqual(report.node_judgments["record:change_bad"].defect_type, "wrong_change")
-        self.assertEqual(report.taint_paths[0], ["record:claim_bad", "record:change_bad", "record:evidence_old"])
-        self.assertEqual(report.metadata["analysis_outcome"], "root_found")
+        self.assertEqual(report.taint_paths, [])
+        self.assertEqual(report.metadata["analysis_outcome"], "inconclusive")
         self.assertEqual(report.metadata["termination_reason"], "queue_exhausted")
 
     def test_nondefective_start_reports_no_defect(self):

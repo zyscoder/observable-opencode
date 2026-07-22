@@ -34,13 +34,23 @@ PROVENANCE_ENVELOPE_EVENT_TYPES = frozenset(
         "task.loop",
     }
 )
-ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
+EVIDENCE_ONLY_EVENT_TYPES = frozenset(
+    {
+        "claim.support_assessment",
+        "evidence.fact",
+        "evidence.semantic_fact",
+        "external.evaluation_fact",
+        "tool.error",
+        "tool.result",
+        "verification",
+    }
+)
+ROOT_INELIGIBLE_EVENT_TYPES = EVIDENCE_ONLY_EVENT_TYPES | frozenset(
     {
         "case.failed",
         "case.observed_defect",
         "case.quality_gap",
         "case.missing_semantic",
-        "external.evaluation_fact",
         "context.pack",
         "run.start",
     }
@@ -597,6 +607,10 @@ def root_candidate_eligible(node: TraceNode) -> bool:
         not is_navigation_node(node)
         and node.event_type not in ROOT_INELIGIBLE_EVENT_TYPES
     )
+
+
+def is_evidence_only_node(node: TraceNode) -> bool:
+    return node.event_type in EVIDENCE_ONLY_EVENT_TYPES
 
 
 def is_interrupted_case_failure(graph: TraceGraph, node: TraceNode) -> bool:

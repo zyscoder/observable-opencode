@@ -23,6 +23,7 @@ from .causal_judge import (
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
     canonical_candidate_route,
+    is_evidence_only_node,
     is_navigation_node,
     root_candidate_eligible,
 )
@@ -41,6 +42,7 @@ from .causal_state import (
     SeedAttributionResult,
     confirmation_identity_for,
     seed_binding_identity_for,
+    validate_confirmation_ownership,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
 from .confirmation_path import is_confirmation_causal_edge
@@ -57,6 +59,7 @@ from .global_judge import (
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
     active_focus_text_sha256,
+    global_candidate_request_from_validation_envelope,
     validate_active_focus_binding,
     validate_global_candidate_payload,
 )
@@ -449,6 +452,11 @@ def _grounded_downstream_path(
 def _assert_report_grounded_evidence(
     graph: TraceGraph, report: RecursiveAttributionReport, *, label: str
 ) -> None:
+    validate_confirmation_ownership(
+        report.confirmations,
+        report.seed_results,
+        label=label,
+    )
     refs: List[str] = []
     identity_refs: List[str] = []
     for seed in report.seed_results:
@@ -458,6 +466,11 @@ def _assert_report_grounded_evidence(
         identity_refs.extend(seed.confirmed_root_refs)
         refs.extend(seed.decisive_evidence_refs)
         judgment = seed.global_judgment
+        if judgment:
+            global_candidate_request_from_validation_envelope(
+                seed.to_dict()["global_judgment"].get("validation_envelope"),
+                graph=graph,
+            )
         refs.extend(judgment.get("decisive_evidence_refs") or ())
         identity_refs.extend(judgment.get("selected_candidate_refs") or ())
         for assessment in judgment.get("assessments") or ():
@@ -468,6 +481,13 @@ def _assert_report_grounded_evidence(
             refs.extend(assessment.get("evidence_refs") or ())
             refs.extend(assessment.get("causal_path_refs") or ())
     for confirmation in report.confirmations:
+        candidate = graph.nodes.get(confirmation.candidate_ref)
+        if candidate is not None and not root_candidate_eligible(candidate):
+            raise ValueError(
+                "{0} confirmation candidate is not authored-root eligible".format(
+                    label
+                )
+            )
         identity_refs.append(confirmation.candidate_ref)
         identity_refs.extend(confirmation.recursive_path)
         refs.extend(confirmation.evidence_refs)
@@ -1026,13 +1046,8 @@ class SeedAttributionBuilder:
             outcome = "no_defect"
         else:
             outcome = "inconclusive"
-        confirmation_identities = self.confirmation_identities
         confirmed_root_refs = self.confirmed_root_refs
         if outcome != "confirmed_root":
-            confirmation_identities = (
-                self.confirmation_identities
-                - self.confirmed_root_confirmation_identities
-            )
             confirmed_root_refs = set()
         return SeedAttributionResult(
             start_ref=self.start_ref,
@@ -1041,7 +1056,7 @@ class SeedAttributionBuilder:
             outcome=outcome,
             candidate_refs=tuple(self.candidate_refs),
             selected_candidate_refs=tuple(self.selected_candidate_refs),
-            confirmation_identities=tuple(confirmation_identities),
+            confirmation_identities=tuple(self.confirmation_identities),
             confirmed_root_refs=tuple(confirmed_root_refs),
             decisive_evidence_refs=tuple(self.decisive_evidence_refs),
             missing_evidence=tuple(self.missing_evidence),
@@ -1190,6 +1205,11 @@ class RecursiveAnalysisState:
             candidate_ref = str(item.get("candidate_ref") or "")
             if not seed_binding_identity or not candidate_ref:
                 raise ValueError("restored confirmation queue identity is incomplete")
+            candidate = self.graph.nodes.get(candidate_ref)
+            if candidate is None or not root_candidate_eligible(candidate):
+                raise ValueError(
+                    "restored confirmation queue contains an ineligible root candidate"
+                )
             candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
             candidates.add(candidate_ref)
             if len(candidates) > MAX_ROOT_CONFIRMATION_CANDIDATES:
@@ -1709,6 +1729,17 @@ class RecursiveAnalysisState:
                 if confirmation.status == "confirmed"
                 and confirmation.seed_binding_identity == builder.key
             )
+        validate_confirmation_ownership(
+            state.confirmations,
+            state.seed_results(),
+            label="restored recursive state",
+        )
+        for builder in state.seed_ledger.values():
+            judgment = builder.global_judgment
+            if judgment:
+                global_candidate_request_from_validation_envelope(
+                    judgment.get("validation_envelope"), graph=graph
+                )
         if len(state.seed_ledger) != len(action_payload["seed_ledger"]):
             raise ValueError("checkpoint contains duplicate per-seed attribution identity")
         state.hypothesis_seed_keys = {
@@ -2081,11 +2112,12 @@ class RecursiveAnalysisState:
         elif is_present and judgment.candidate_introduction:
             node = self.graph.nodes.get(item.node_ref)
             if node is not None and not root_candidate_eligible(node):
-                self.mark_unresolved(
-                    item,
-                    "root_candidate_ineligible",
-                    "Navigation, outcome, lifecycle-start, and context-packaging aggregates cannot introduce a reportable defect root.",
-                )
+                if not is_evidence_only_node(node):
+                    self.mark_unresolved(
+                        item,
+                        "root_candidate_ineligible",
+                        "Navigation, outcome, lifecycle-start, and context-packaging aggregates cannot introduce a reportable defect root.",
+                    )
             elif hypothesis.candidate_root_ref != item.node_ref:
                 self.mark_unresolved(
                     item,

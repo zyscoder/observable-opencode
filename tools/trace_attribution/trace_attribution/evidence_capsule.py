@@ -13,20 +13,9 @@ from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v1"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v2"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
-GLOBAL_EVIDENCE_ONLY_EVENT_TYPES = frozenset(
-    {
-        "claim.support_assessment",
-        "evidence.fact",
-        "evidence.semantic_fact",
-        "tool.result",
-        "verification",
-    }
-)
-
-
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}
@@ -109,6 +98,24 @@ class CandidateEvidenceCapsule:
             raise TypeError("candidate evidence capsule candidate must be an object")
         if type(self.candidate.get("root_candidate_eligible")) is not bool:
             raise ValueError("candidate root_candidate_eligible must be an exact boolean")
+        if type(self.candidate.get("evidence_eligible")) is not bool:
+            raise ValueError("candidate evidence_eligible must be an exact boolean")
+        graph_facts = self.candidate.get("active_graph_facts")
+        if not isinstance(graph_facts, Mapping):
+            raise ValueError("candidate active_graph_facts must be an object")
+        if graph_facts.get("canonical_ref") != self.candidate_ref:
+            raise ValueError("candidate identity mismatches active graph canonical identity")
+        if type(graph_facts.get("evidence_eligible")) is not bool or type(
+            graph_facts.get("root_candidate_eligible")
+        ) is not bool:
+            raise ValueError("candidate active graph eligibility must be exact booleans")
+        if (
+            graph_facts.get("evidence_eligible")
+            != self.candidate.get("evidence_eligible")
+            or graph_facts.get("root_candidate_eligible")
+            != self.candidate.get("root_candidate_eligible")
+        ):
+            raise ValueError("candidate active graph eligibility facts contradict candidate")
         self._validate_identity_mapping(self.candidate, label="candidate")
         node = self.candidate.get("node")
         if not isinstance(node, Mapping):
@@ -116,8 +123,12 @@ class CandidateEvidenceCapsule:
         self._validate_identity_mapping(node, label="embedded candidate node")
         if not self.downstream_path or self.downstream_path[0] != self.candidate_ref:
             raise ValueError("candidate identity must match downstream path start")
+        if len(self.downstream_path_references) != len(self.downstream_path):
+            raise ValueError(
+                "candidate downstream path references must cover every path position"
+            )
         for path_ref, reference in zip(
-            self.downstream_path[:1], self.downstream_path_references[:1]
+            self.downstream_path, self.downstream_path_references
         ):
             if not isinstance(reference, Mapping):
                 raise TypeError("candidate downstream path reference must be an object")
@@ -125,9 +136,14 @@ class CandidateEvidenceCapsule:
                 raise ValueError("candidate downstream path reference must be resolved")
             resolved_ref = str(reference.get("resolved_ref") or "")
             canonical_ref = str(reference.get("canonical_ref") or resolved_ref)
-            if resolved_ref != path_ref or canonical_ref != path_ref:
+            raw_ref = str(reference.get("raw_ref") or "")
+            if (
+                raw_ref != path_ref
+                or resolved_ref != path_ref
+                or canonical_ref != path_ref
+            ):
                 raise ValueError(
-                    "candidate identity must match every resolved downstream path reference"
+                    "candidate identity downstream path reference must match its exact path position"
                 )
             reference_node = reference.get("node")
             if isinstance(reference_node, Mapping):
@@ -301,33 +317,32 @@ def build_candidate_evidence_capsules(
             evidence_references.append(reference)
             if reference.get("resolution_status") != "resolved":
                 missing.append(evidence_ref)
-        capsules.append(
-            CandidateEvidenceCapsule(
-                candidate_ref=ref,
-                defect_state=defect_state,
-                candidate={
-                    "ref": ref,
-                    "source": candidate.source,
-                    "retrieval_is_not_causal_verdict": True,
-                    "root_candidate_eligible": (
-                        root_candidate_eligible(node)
-                        and node.event_type not in GLOBAL_EVIDENCE_ONLY_EVENT_TYPES
-                    ),
-                    "retrieval_edge": retrieval_edge,
-                    "node": node.compact(max_chars=3200),
-                },
-                downstream_path=path,
-                downstream_path_references=tuple(_reference(graph, item) for item in path),
-                causal_path_edges=causal_path_edges,
-                start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
-                action_group=_action_group(graph, node),
-                incoming_edges=incoming_edges,
-                outgoing_edges=outgoing_edges,
-                evidence_references=tuple(evidence_references),
-                artifact_hydration=artifact_hydration,
-                missing_evidence_refs=tuple(missing),
-            )
+        capsule = CandidateEvidenceCapsule(
+            candidate_ref=ref,
+            defect_state=defect_state,
+            candidate={
+                "ref": ref,
+                "source": candidate.source,
+                "retrieval_is_not_causal_verdict": True,
+                "evidence_eligible": graph.evidence_eligible(ref),
+                "root_candidate_eligible": root_candidate_eligible(node),
+                "active_graph_facts": _active_candidate_graph_facts(graph, node),
+                "retrieval_edge": retrieval_edge,
+                "node": node.compact(max_chars=3200),
+            },
+            downstream_path=path,
+            downstream_path_references=tuple(_reference(graph, item) for item in path),
+            causal_path_edges=causal_path_edges,
+            start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
+            action_group=_action_group(graph, node),
+            incoming_edges=incoming_edges,
+            outgoing_edges=outgoing_edges,
+            evidence_references=tuple(evidence_references),
+            artifact_hydration=artifact_hydration,
+            missing_evidence_refs=tuple(missing),
         )
+        validate_candidate_evidence_capsule_against_graph(graph, capsule)
+        capsules.append(capsule)
     return tuple(capsules)
 
 
@@ -361,6 +376,7 @@ def _reference(graph: TraceGraph, raw_ref: str) -> JsonDict:
         return {
             "raw_ref": str(raw_ref),
             "resolved_ref": resolved,
+            "canonical_ref": resolved,
             "resolution_status": "resolved",
             "provenance_class": "recorded_or_reconstructed_trace_fact",
             "node": graph.hydrate_node(resolved).compact(max_chars=1800),
@@ -378,6 +394,76 @@ def _reference(graph: TraceGraph, raw_ref: str) -> JsonDict:
         "resolution_status": "unresolved",
         "provenance_class": "unresolved_reference",
     }
+
+
+def _active_candidate_graph_facts(
+    graph: TraceGraph, node: TraceNode
+) -> JsonDict:
+    manifest = (
+        graph.raw_trace.get("manifest")
+        if isinstance(graph.raw_trace.get("manifest"), Mapping)
+        else {}
+    )
+    return {
+        "canonical_ref": node.ref,
+        "component": node.component,
+        "event_type": node.event_type,
+        "event_kind": str(
+            node.data.get("event_kind") or node.data.get("kind") or ""
+        ),
+        "subject_revision": str(
+            node.data.get("subject_revision")
+            or manifest.get("subject_revision")
+            or ""
+        ),
+        "repository_revision": str(
+            node.data.get("repository_revision") or ""
+        ),
+        "revision_before": str(node.data.get("revision_before") or ""),
+        "revision_after": str(node.data.get("revision_after") or ""),
+        "revision_status": str(node.data.get("revision_status") or ""),
+        "offline_only": node.data.get("offline_only"),
+        "semantic_role": str(node.data.get("semantic_role") or ""),
+        "navigation_role": str(node.data.get("navigation_role") or ""),
+        "evidence_eligible": graph.evidence_eligible(node.ref),
+        "root_candidate_eligible": root_candidate_eligible(node),
+    }
+
+
+def validate_candidate_evidence_capsule_against_graph(
+    graph: TraceGraph, capsule: CandidateEvidenceCapsule
+) -> None:
+    """Bind persisted candidate and path facts to the active graph."""
+    capsule.validate()
+    resolved = graph.resolve(capsule.candidate_ref)
+    if resolved != capsule.candidate_ref or resolved not in graph.nodes:
+        raise ValueError("candidate evidence capsule does not match active graph identity")
+    node = graph.hydrate_node(resolved)
+    expected_facts = _active_candidate_graph_facts(graph, node)
+    if _thaw(capsule.candidate.get("active_graph_facts")) != expected_facts:
+        raise ValueError("candidate evidence capsule facts do not match active graph")
+    if capsule.candidate.get("evidence_eligible") is not True:
+        raise ValueError("candidate evidence capsule is ineligible in active graph")
+    if _thaw(capsule.candidate.get("node")) != node.compact(max_chars=3200):
+        raise ValueError("candidate evidence capsule node does not match active graph")
+    for path_ref, reference in zip(
+        capsule.downstream_path, capsule.downstream_path_references
+    ):
+        if not graph.evidence_eligible(path_ref):
+            raise ValueError(
+                "candidate downstream path reference is ineligible in active graph"
+            )
+        if _thaw(reference) != _reference(graph, path_ref):
+            raise ValueError(
+                "candidate downstream path reference does not match active graph"
+            )
+
+
+def validate_candidate_evidence_capsules_against_graph(
+    graph: TraceGraph, capsules: Sequence[CandidateEvidenceCapsule]
+) -> None:
+    for capsule in capsules:
+        validate_candidate_evidence_capsule_against_graph(graph, capsule)
 
 
 def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict]:
@@ -446,4 +532,6 @@ __all__ = [
     "CandidateEvidenceCapsule",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
+    "validate_candidate_evidence_capsule_against_graph",
+    "validate_candidate_evidence_capsules_against_graph",
 ]

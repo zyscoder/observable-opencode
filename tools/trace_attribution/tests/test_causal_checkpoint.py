@@ -2233,6 +2233,61 @@ class CausalCheckpointTest(unittest.TestCase):
             self.assertEqual(resumed_judge.confirmation_calls, 0)
             self.assertEqual(resumed.to_dict(), first.to_dict())
 
+    def test_partial_and_completed_restore_reject_orphan_unknown_confirmation(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "ownership.checkpoint"
+            config = sample_config()
+            AgenticRecursiveAnalyzer(
+                judge=UnknownConfirmationJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            partial_actions = json.loads(json.dumps(restored.actions))
+            snapshot = next(
+                item
+                for item in reversed(partial_actions)
+                if item["operation"] == "state_snapshot"
+                and item["payload"]["confirmations"]
+            )
+            snapshot["payload"]["seed_ledger"][0][
+                "confirmation_identities"
+            ] = []
+            with self.assertRaisesRegex(ValueError, "confirmation ownership"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(sample_trace()),
+                    checkpoint=replace(restored, actions=tuple(partial_actions)),
+                )
+
+            completed_actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["payload"]["report"]["seed_results"][0][
+                "confirmation_identities"
+            ] = []
+            with self.assertRaisesRegex(ValueError, "confirmation ownership"):
+                AgenticRecursiveAnalyzer(
+                    judge=UnknownConfirmationJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(completed_actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(sample_trace()),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
     def test_signal_arriving_during_confirmation_writes_partial_resume_marker(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"

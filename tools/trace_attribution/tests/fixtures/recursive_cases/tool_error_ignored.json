@@ -13,7 +13,7 @@
     "schema_version": "recursive-attribution-labels/v3",
     "case_id": "tool-error-ignored",
     "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:025ca2348d79ad1cce954446", "semantic_occurrence_id": "semantic_occurrence:v1:8ef3f709a65ee352acdae1c3"}],
-    "conditions": [{"node_ref": "record:tool_error", "semantic_anchor_id": "semantic_anchor:v2:612784486562d5055bd0e5ce", "semantic_occurrence_id": "semantic_occurrence:v1:819b4ca54f697616f96e2bc9"}],
+    "conditions": [],
     "amplifiers": [],
     "forbidden_roots": [],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]

@@ -237,6 +237,72 @@ def multi_root_payload(
     }
 
 
+def evidence_only_request(event_type: str) -> GlobalCandidateJudgeRequest:
+    ref = "record:evidence_only"
+    trace = {
+        "case_id": "evidence-only-global-judge-case",
+        "records": [
+            {
+                "record_id": "evidence_only",
+                "component": "evidence",
+                "event_type": event_type,
+                "data": {"summary": "Observed evidence only."},
+            },
+            {
+                "record_id": "defect",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": [ref],
+                "data": {"actual": "The active defect is present."},
+            },
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": "evidence_only"},
+                "to": {"type": "record", "id": "defect"},
+                "relation": "outcome_evidence",
+                "evidence_type": "confirmed",
+                "confidence": 1.0,
+                "eligible_for_attribution": True,
+            }
+        ],
+    }
+    graph = TraceGraph.from_trace(trace)
+    defect = DefectState.create(
+        label="active_defect",
+        expected="The active defect is absent.",
+        actual="The active defect is present.",
+        mechanism="Evidence observed the defect.",
+        scope="task_quality",
+    )
+    capsules = build_candidate_evidence_capsules(
+        graph=graph,
+        candidates=[
+            CausalCandidate(
+                ref=ref,
+                node=graph.nodes[ref],
+                source="global_evidence",
+                score=1.0,
+                evidence_refs=(ref,),
+            )
+        ],
+        defect_state=defect,
+        downstream_paths={ref: (ref, "record:defect")},
+        start_refs=("record:defect",),
+    )
+    return GlobalCandidateJudgeRequest(
+        case_id=trace["case_id"],
+        objective="Keep evidence-only nodes out of root confirmation.",
+        analysis_perspective="task quality",
+        seed_ref="record:defect",
+        active_defect=defect,
+        active_focus_text=defect.actual,
+        active_focus_text_hash=active_focus_text_sha256(defect.actual),
+        start_refs=("record:defect",),
+        capsules=capsules,
+    )
+
+
 def assessment(
     ref: str,
     *,
@@ -315,6 +381,28 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
 
 
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
+    def test_evidence_only_nodes_cannot_enter_global_root_selection(self):
+        for event_type in (
+            "tool.error",
+            "tool.result",
+            "verification",
+            "evidence.fact",
+            "evidence.semantic_fact",
+            "claim.support_assessment",
+        ):
+            with self.subTest(event_type=event_type):
+                request = evidence_only_request(event_type)
+                self.assertEqual(request.open_authored_root_candidate_refs, ())
+                restored = global_candidate_request_from_validation_envelope(
+                    request.validation_envelope()
+                )
+                self.assertEqual(restored.open_authored_root_candidate_refs, ())
+                with self.assertRaisesRegex(ValueError, "ineligible"):
+                    validate_global_candidate_payload(
+                        multi_root_payload(request, ["record:evidence_only"]),
+                        request=request,
+                    )
+
     def test_live_capsule_rejects_non_boolean_candidate_eligibility(self):
         request = sample_request()
 
@@ -592,6 +680,11 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                         "record:verification",
                         "record:defect",
                     ),
+                    downstream_path_references=(
+                        request.capsules[0].downstream_path_references[0],
+                        request.capsules[1].downstream_path_references[0],
+                        request.capsules[0].downstream_path_references[-1],
+                    ),
                 ),
                 request.capsules[1],
             ),
@@ -810,6 +903,17 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         capsule = replace(
             request.capsules[0],
             downstream_path=("record:decision", "record:action", "record:defect"),
+            downstream_path_references=(
+                request.capsules[0].downstream_path_references[0],
+                {
+                    "raw_ref": "record:action",
+                    "resolved_ref": "record:action",
+                    "canonical_ref": "record:action",
+                    "resolution_status": "resolved",
+                    "node": {"ref": "record:action"},
+                },
+                request.capsules[0].downstream_path_references[-1],
+            ),
             causal_path_edges=(
                 {
                     "from_ref": "record:decision",

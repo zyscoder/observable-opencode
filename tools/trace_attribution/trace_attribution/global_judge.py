@@ -15,7 +15,11 @@ from .causal_state import (
     FrozenMapping,
 )
 from .confirmation_path import is_confirmation_causal_edge
-from .evidence_capsule import CandidateEvidenceCapsule
+from .evidence_capsule import (
+    CandidateEvidenceCapsule,
+    validate_candidate_evidence_capsules_against_graph,
+)
+from .graph import TraceGraph
 from .models import JsonDict, stable_json
 
 
@@ -271,6 +275,8 @@ class GlobalCandidateJudgeRequest:
 
 def global_candidate_request_from_validation_envelope(
     value: Any,
+    *,
+    graph: Optional[TraceGraph] = None,
 ) -> GlobalCandidateJudgeRequest:
     if not isinstance(value, Mapping):
         raise TypeError("global candidate validation envelope must be an object")
@@ -307,7 +313,7 @@ def global_candidate_request_from_validation_envelope(
         raise TypeError("validation envelope start_refs must be a string array")
     if not isinstance(capsules, list):
         raise TypeError("validation envelope capsules must be an array")
-    return GlobalCandidateJudgeRequest(
+    request = GlobalCandidateJudgeRequest(
         case_id=str(value.get("case_id") or ""),
         objective=str(value.get("objective") or ""),
         analysis_perspective=str(value.get("analysis_perspective") or ""),
@@ -321,6 +327,11 @@ def global_candidate_request_from_validation_envelope(
         ),
         trace_health=trace_health,
     )
+    if graph is not None:
+        validate_candidate_evidence_capsules_against_graph(
+            graph, request.capsules
+        )
+    return request
 
 
 @dataclass(frozen=True)

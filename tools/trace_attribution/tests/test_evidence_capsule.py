@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from trace_attribution.causal_state import CausalCandidate, DefectState
+from trace_attribution import evidence_capsule
 from trace_attribution.evidence_capsule import (
     CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
@@ -16,7 +17,11 @@ from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 
 
-def sample_graph() -> TraceGraph:
+def sample_graph(
+    *,
+    decision_event_type: str = "decision",
+    decision_revision: str = "git:abc123",
+) -> TraceGraph:
     return TraceGraph.from_trace(
         {
             "case_id": "evidence-capsule-case",
@@ -37,11 +42,12 @@ def sample_graph() -> TraceGraph:
                 {
                     "record_id": "decision",
                     "component": "processor",
-                    "event_type": "decision",
+                    "event_type": decision_event_type,
                     "source_refs": ["record:prompt"],
                     "artifact_refs": ["artifact:decision-rationale"],
                     "data": {
                         "decision_id": "dec_1",
+                        "repository_revision": decision_revision,
                         "rationale": "Direct parent cancellation is sufficient to model process SIGINT.",
                         "metadata": {"callID": "call_1"},
                     },
@@ -162,6 +168,40 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 payload["candidate"]["root_candidate_eligible"] = malformed
                 with self.assertRaisesRegex(ValueError, "root_candidate_eligible"):
                     CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_capsule_restore_validates_every_downstream_path_reference(self):
+        original = self._decision_capsule().to_dict()
+
+        for field in ("raw_ref", "resolved_ref", "canonical_ref"):
+            with self.subTest(field=field):
+                payload = copy.deepcopy(original)
+                payload["downstream_path_references"][1][field] = "record:prompt"
+                with self.assertRaisesRegex(ValueError, "downstream path reference"):
+                    CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_restored_capsule_must_match_active_graph_facts_and_revision(self):
+        capsule = self._decision_capsule()
+
+        for label, active_graph in (
+            ("event type", sample_graph(decision_event_type="tool.result")),
+            ("revision", sample_graph(decision_revision="git:stale")),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ValueError, "active graph"):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        active_graph, capsule
+                    )
+
+        for field in ("root_candidate_eligible", "evidence_eligible"):
+            with self.subTest(fabricated=field):
+                payload = capsule.to_dict()
+                payload["candidate"][field] = False
+                payload["candidate"]["active_graph_facts"][field] = False
+                fabricated = CandidateEvidenceCapsule.from_dict(payload)
+                with self.assertRaisesRegex(ValueError, "active graph"):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        sample_graph(), fabricated
+                    )
 
     def test_duplicate_routes_preserve_recorded_provenance_independent_of_score(self):
         graph = sample_graph()

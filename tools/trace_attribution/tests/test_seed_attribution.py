@@ -22,6 +22,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     annotate_report_semantic_anchors,
+    seed_binding_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
 )
@@ -1075,6 +1076,59 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_every_top_level_confirmation_status_requires_exact_seed_ownership(self):
+        seed = seed_result("record:seed", "evidence_gap")
+        for status in ("confirmed", "rejected", "unknown"):
+            with self.subTest(status=status):
+                if status == "confirmed":
+                    raw = RootConfirmation.confirmed(
+                        "record:root",
+                        excerpt="The candidate contains the defect.",
+                        reason="The candidate remains a possible root.",
+                        counterfactual="Correcting it prevents the defect.",
+                        confidence=0.9,
+                    )
+                elif status == "rejected":
+                    raw = RootConfirmation.rejected(
+                        "record:root", "The candidate is not a necessary root."
+                    )
+                else:
+                    raw = RootConfirmation.unknown(
+                        "record:root", "The confirmation evidence is incomplete."
+                    )
+                confirmation = replace(
+                    raw,
+                    hypothesis_id="hyp:{0}".format(status),
+                    hypothesis_semantic_hash="semantic:{0}".format(status),
+                    defect_fingerprint=seed.defect_fingerprint,
+                    recursive_path=("record:root", seed.start_ref),
+                    seed_binding_identity=seed_binding_identity_for(
+                        seed.start_ref, seed.defect_fingerprint
+                    ),
+                )
+                owned_seed = replace(
+                    seed,
+                    confirmation_identities=(confirmation.confirmation_identity,),
+                )
+                report = RecursiveAttributionReport(
+                    case_id="confirmation-ownership-{0}".format(status),
+                    objective="Require exact confirmation ownership.",
+                    start_refs=(seed.start_ref,),
+                    seed_results=(owned_seed,),
+                    defect_states=(seed.defect_state,),
+                    confirmations=(confirmation,),
+                    unresolved_refs=(confirmation.candidate_ref,),
+                )
+                orphaned_seed = replace(owned_seed, confirmation_identities=())
+
+                with self.assertRaisesRegex(ValueError, "confirmation ownership"):
+                    replace(report, seed_results=(orphaned_seed,))
+
+                payload = report.to_dict()
+                payload["seed_results"][0]["confirmation_identities"] = []
+                with self.assertRaisesRegex(ValueError, "confirmation ownership"):
+                    RecursiveAttributionReport.from_dict(payload)
+
     def test_same_start_ref_sibling_with_matching_lineage_is_rejected(self):
         report = run_fixture("multi_seed_claims.json")
         for sibling_outcome in ("no_defect", "evidence_gap"):
@@ -1597,7 +1651,7 @@ class SeedAttributionModelTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, "evidence_gap")
         self.assertEqual(result.confirmed_root_refs, ())
-        self.assertEqual(result.confirmation_identities, ())
+        self.assertEqual(len(result.confirmation_identities), 1)
 
     def test_seed_outcome_payload_contract_is_rejected_everywhere(self):
         state = defect("payload-contract")

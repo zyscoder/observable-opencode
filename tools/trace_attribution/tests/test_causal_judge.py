@@ -285,6 +285,56 @@ class ScriptedTransport:
 
 
 class CausalJudgeValidationTest(unittest.TestCase):
+    def test_evidence_only_nodes_cannot_be_recursive_introduction_candidates(self):
+        base = sample_step_request()
+        for event_type in (
+            "tool.error",
+            "tool.result",
+            "verification",
+            "evidence.fact",
+            "evidence.semantic_fact",
+            "claim.support_assessment",
+        ):
+            with self.subTest(event_type=event_type):
+                current = TraceNode(
+                    ref="record:evidence_only",
+                    record_id="evidence_only",
+                    component="evidence",
+                    event_type=event_type,
+                    data={"summary": "Observed evidence only."},
+                )
+                request = CausalStepRequest(
+                    recursive_context={
+                        "active_hypothesis_id": "hyp:active",
+                        "current_ref": current.ref,
+                        "candidate_predecessors": [],
+                    },
+                    current_node=current,
+                    defect_state=base.defect_state,
+                    candidates=(),
+                )
+                payload = {
+                    "current_node_ref": current.ref,
+                    "current_defect_status": "present",
+                    "current_defect_reason": "The evidence node appears defective.",
+                    "predecessors": [],
+                    "candidate_introduction": True,
+                    "missing_evidence": [],
+                    "suggested_investigation": {
+                        "action": "request_root_confirmation",
+                        "arguments": {
+                            "hypothesis_id": "hyp:active",
+                            "candidate_ref": current.ref,
+                            "defect_fingerprint": base.defect_state.fingerprint,
+                        },
+                        "reason": "Attempt to confirm evidence as a root.",
+                    },
+                    "confidence": 0.9,
+                }
+
+                with self.assertRaisesRegex(ValueError, "not eligible"):
+                    validate_causal_step_payload(payload, request=request)
+
     def test_zero_confidence_cannot_assert_defect_presence_or_absence(self):
         payload = valid_step_payload(relation="unrelated", recurse=False)
         payload["current_defect_status"] = "absent"

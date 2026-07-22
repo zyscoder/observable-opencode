@@ -55,10 +55,10 @@ PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v2"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v2+validation-envelope/v1"
+    "global-candidate-judgment/v2+validation-envelope/v2"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v1"
+    "global-candidate-validation-envelope/v2"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -1958,6 +1958,69 @@ def _validate_persisted_global_judgment(
         ) from exc
 
 
+def validate_confirmation_ownership(
+    confirmations: Iterable[RootConfirmation],
+    seed_results: Iterable[SeedAttributionResult],
+    *,
+    label: str,
+) -> None:
+    """Require an exact two-way link between confirmations and seed entries."""
+    confirmation_list = tuple(confirmations)
+    seeds = tuple(seed_results)
+    confirmations_by_identity: Dict[str, List[RootConfirmation]] = {}
+    for confirmation in confirmation_list:
+        confirmations_by_identity.setdefault(
+            confirmation.confirmation_identity, []
+        ).append(confirmation)
+    seeds_by_binding: Dict[str, List[SeedAttributionResult]] = {}
+    for seed in seeds:
+        seeds_by_binding.setdefault(
+            seed_binding_identity_for(seed.start_ref, seed.defect_fingerprint), []
+        ).append(seed)
+        if len(seed.confirmation_identities) != len(
+            set(seed.confirmation_identities)
+        ):
+            raise ValueError(
+                "{0} confirmation ownership contains duplicates; each published root "
+                "must belong to exactly one confirmed_root seed".format(label)
+            )
+        for identity in seed.confirmation_identities:
+            matches = confirmations_by_identity.get(identity, [])
+            if (
+                len(matches) != 1
+                or matches[0].seed_binding_identity
+                != seed_binding_identity_for(
+                    seed.start_ref, seed.defect_fingerprint
+                )
+                or not matches[0].recursive_path
+                or matches[0].recursive_path[-1] != seed.start_ref
+            ):
+                raise ValueError(
+                    "{0} confirmation ownership is not bidirectional: confirmation "
+                    "identities must individually bind to their seed; each published "
+                    "root must belong to exactly one confirmed_root seed".format(label)
+                )
+    for identity, matches in confirmations_by_identity.items():
+        if len(matches) != 1:
+            raise ValueError(
+                "{0} confirmation ownership is not unique; each published root must "
+                "belong to exactly one confirmed_root seed".format(label)
+            )
+        confirmation = matches[0]
+        owners = seeds_by_binding.get(confirmation.seed_binding_identity, [])
+        if (
+            len(owners) != 1
+            or identity not in owners[0].confirmation_identities
+            or not confirmation.recursive_path
+            or confirmation.recursive_path[-1] != owners[0].start_ref
+        ):
+            raise ValueError(
+                "{0} confirmation ownership is not bidirectional: confirmation identities "
+                "must individually bind to their seed; each published root must belong "
+                "to exactly one confirmed_root seed".format(label)
+            )
+
+
 def validate_seed_outcome_payload(
     *,
     outcome: str,
@@ -2405,6 +2468,12 @@ class RecursiveAttributionReport:
                     "orphan confirmed confirmation requires explicit unresolved state"
                 )
 
+        validate_confirmation_ownership(
+            self.confirmations,
+            self.seed_results,
+            label="report",
+        )
+
         metadata = _thaw(self.metadata)
         summary = {}
         for node_ref in sorted(node_statuses):
@@ -2533,6 +2602,9 @@ class RecursiveAttributionReport:
         metadata = _json_dict(value.get("metadata"))
         unresolved_refs = _string_list(value.get("unresolved_refs"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
+            migrated_confirmations = items(
+                "confirmations", RootConfirmation.from_dict
+            )
             migrated_states = [
                 DefectState.create(
                     label="legacy_seed_attribution_unresolved",
@@ -2565,6 +2637,10 @@ class RecursiveAttributionReport:
                         "unpublished_confirmed_roots": [
                             root.to_dict() for root in (*confirmed_roots, *co_roots)
                         ],
+                        "unpublished_confirmations": [
+                            confirmation.to_dict()
+                            for confirmation in migrated_confirmations
+                        ],
                     }
                 }
             )
@@ -2590,6 +2666,7 @@ class RecursiveAttributionReport:
             )
             confirmed_roots = []
             co_roots = []
+            value = {**value, "confirmations": []}
         return cls(
             case_id=str(value.get("case_id") or ""),
             objective=str(value.get("objective") or ""),
@@ -2638,6 +2715,7 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "SeedAttributionResult",
+    "validate_confirmation_ownership",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
     "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",
     "annotate_report_semantic_anchors",
