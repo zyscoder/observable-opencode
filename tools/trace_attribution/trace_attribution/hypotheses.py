@@ -532,6 +532,7 @@ class RecursiveFrontier:
             downstream_path=list(item.downstream_path),
             hypothesis_id=updated.hypothesis_id,
             hypothesis_semantic_hash=updated.semantic_hash,
+            seed_binding_identity=item.seed_binding_identity,
             depth=item.depth,
             candidate_source=item.candidate_source,
             priority=item.priority,

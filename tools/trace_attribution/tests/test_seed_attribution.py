@@ -169,6 +169,82 @@ class TransformingRootJudge(OfflineJudgeCapability):
         )
 
 
+class TwoHopSharedRootJudge(OfflineJudgeCapability):
+    def __init__(self) -> None:
+        self.step_requests = []
+        self.confirmation_requests = []
+
+    def judge_step_offline(self, request):
+        self.step_requests.append(request)
+        ref = request.current_node.ref
+        if ref in {"record:seed_one", "record:seed_two"}:
+            return CausalStepJudgment(
+                current_node_ref=ref,
+                current_defect_status="present",
+                current_defect_reason="The observed claim propagates the shared unsupported decision.",
+                predecessors=(
+                    PredecessorAssessment(
+                        ref="record:shared_middle",
+                        relation="same_defect_propagation",
+                        reason="The shared intermediate decision propagated the same unsupported claim.",
+                        confidence=0.9,
+                        recurse=True,
+                        evidence_refs=("record:shared_middle", ref),
+                    ),
+                ),
+                candidate_introduction=False,
+                confidence=0.9,
+            )
+        if ref == "record:shared_middle":
+            return CausalStepJudgment(
+                current_node_ref=ref,
+                current_defect_status="present",
+                current_defect_reason="The shared intermediate decision propagates the root defect.",
+                predecessors=(
+                    PredecessorAssessment(
+                        ref="record:shared_root",
+                        relation="same_defect_propagation",
+                        reason="The shared root decision introduced the unsupported claim.",
+                        confidence=0.9,
+                        recurse=True,
+                        evidence_refs=("record:shared_root", ref),
+                    ),
+                ),
+                candidate_introduction=False,
+                confidence=0.9,
+            )
+        if ref == "record:shared_root":
+            return CausalStepJudgment(
+                current_node_ref=ref,
+                current_defect_status="present",
+                current_defect_reason="The shared root decision introduced the unsupported claim.",
+                predecessors=(),
+                candidate_introduction=True,
+                suggested_investigation={
+                    "action": "request_root_confirmation",
+                    "arguments": {
+                        "hypothesis_id": request.recursive_context["active_hypothesis_id"],
+                        "candidate_ref": ref,
+                        "defect_fingerprint": request.defect_state.fingerprint,
+                    },
+                    "reason": "Independently confirm the shared root for this seed.",
+                },
+                confidence=0.9,
+            )
+        raise AssertionError("unexpected node: {0}".format(ref))
+
+    def confirm_candidate_offline(self, request):
+        self.confirmation_requests.append(request)
+        return RootConfirmation.confirmed(
+            request.candidate_ref,
+            excerpt="The root decision introduced an unsupported claim.",
+            reason="The shared root independently introduced this seed's defect.",
+            counterfactual="Grounding the root decision prevents this unsupported claim.",
+            confidence=0.95,
+            evidence_refs=(request.candidate_ref,),
+        )
+
+
 class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
     def __init__(self) -> None:
         self.global_requests = []
@@ -314,6 +390,56 @@ def shared_root_trace():
     }
 
 
+def two_hop_shared_root_trace():
+    return {
+        "case_id": "two-hop-shared-root-seeds",
+        "records": [
+            {
+                "record_id": "shared_root",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "The root decision introduced an unsupported claim."},
+            },
+            {
+                "record_id": "shared_middle",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "The middle decision propagated the unsupported claim."},
+            },
+            *(
+                {
+                    "record_id": seed,
+                    "component": "assistant",
+                    "event_type": "response.claim",
+                    "data": {"text": "The same unsupported claim."},
+                }
+                for seed in ("seed_one", "seed_two")
+            ),
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": "shared_root"},
+                "to": {"type": "record", "id": "shared_middle"},
+                "relation": "decision_guided_claim",
+                "evidence_type": "confirmed",
+                "confidence": 0.9,
+                "eligible_for_attribution": True,
+            },
+            *(
+                {
+                    "from": {"type": "record", "id": "shared_middle"},
+                    "to": {"type": "record", "id": seed},
+                    "relation": "decision_guided_claim",
+                    "evidence_type": "confirmed",
+                    "confidence": 0.9,
+                    "eligible_for_attribution": True,
+                }
+                for seed in ("seed_one", "seed_two")
+            ),
+        ],
+    }
+
+
 def shared_root_checkpoint_config(trace, objective, start_refs):
     return build_checkpoint_config(
         trace=trace,
@@ -418,6 +544,76 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
         self.assertIn(
             "judge_error",
             by_ref["record:claim_fragment"].blocking_reasons,
+        )
+
+    def test_two_hop_shared_root_preserves_seed_visits_and_resume_confirmations(self):
+        trace = two_hop_shared_root_trace()
+        graph = TraceGraph.from_trace(trace)
+        start_refs = ("record:seed_one", "record:seed_two")
+        objective = "Confirm each identical claim through the shared causal path."
+
+        def analyze(judge, checkpoint=None, checkpoint_config=None):
+            return AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=checkpoint,
+                checkpoint_config=checkpoint_config,
+            ).analyze(
+                graph,
+                start_refs=start_refs,
+                objective=objective,
+                analysis_perspective="",
+            )
+
+        uninterrupted_judge = TwoHopSharedRootJudge()
+        uninterrupted = analyze(uninterrupted_judge)
+        root_steps = [
+            request
+            for request in uninterrupted_judge.step_requests
+            if request.current_node.ref == "record:shared_root"
+        ]
+
+        self.assertEqual(
+            {item.defect_fingerprint for item in uninterrupted.seed_results},
+            {uninterrupted.seed_results[0].defect_fingerprint},
+        )
+        self.assertEqual(len(root_steps), 2)
+        self.assertEqual(len(uninterrupted.confirmations), 2)
+        self.assertEqual(len(uninterrupted_judge.confirmation_requests), 2)
+        self.assertEqual(
+            len(
+                {
+                    request.seed_binding_identity
+                    for request in uninterrupted_judge.confirmation_requests
+                }
+            ),
+            2,
+        )
+        self.assertEqual(
+            {item.outcome for item in uninterrupted.seed_results},
+            {"confirmed_root"},
+        )
+
+        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "two-hop-shared-root.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                analyze(
+                    TwoHopSharedRootJudge(),
+                    CrashAfterFirstCompletedConfirmation(root),
+                    config,
+                )
+            resumed_judge = TwoHopSharedRootJudge()
+            resumed = analyze(resumed_judge, CheckpointBundle(root), config)
+
+        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+        self.assertEqual(len(resumed_judge.confirmation_requests), 1)
+        self.assertEqual(
+            [
+                request.current_node.ref
+                for request in resumed_judge.step_requests
+                if request.current_node.ref == "record:shared_root"
+            ],
+            [],
         )
 
     def test_shared_root_same_fingerprint_keeps_seed_confirmations_independent_after_resume(self):

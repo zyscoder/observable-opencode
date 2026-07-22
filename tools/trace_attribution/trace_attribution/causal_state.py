@@ -829,12 +829,18 @@ class DefectState:
         return state
 
 
-def semantic_visit_key(node_ref: str, defect_state: DefectState, hypothesis_semantic_hash: str) -> str:
+def semantic_visit_key(
+    node_ref: str,
+    defect_state: DefectState,
+    hypothesis_semantic_hash: str,
+    seed_binding_identity: str = "",
+) -> str:
     return _hash(
         {
             "node_ref": node_ref,
             "defect_fingerprint": defect_state.fingerprint,
             "hypothesis_semantic_hash": hypothesis_semantic_hash,
+            "seed_binding_identity": seed_binding_identity,
         }
     )
 
@@ -992,6 +998,7 @@ class FrontierItem:
     downstream_path: Tuple[str, ...]
     hypothesis_id: str
     hypothesis_semantic_hash: str
+    seed_binding_identity: str = ""
     depth: int = 0
     candidate_source: str = ""
     priority: float = 0.0
@@ -1014,6 +1021,7 @@ class FrontierItem:
         downstream_path: List[str],
         hypothesis_id: str,
         hypothesis_semantic_hash: str,
+        seed_binding_identity: str = "",
         depth: int = 0,
         candidate_source: str = "",
         priority: float = 0.0,
@@ -1030,6 +1038,7 @@ class FrontierItem:
                     "downstream_path": downstream_path,
                     "hypothesis_id": hypothesis_id,
                     "hypothesis_semantic_hash": hypothesis_semantic_hash,
+                    "seed_binding_identity": seed_binding_identity,
                     "depth": depth,
                 }
             )[:20]
@@ -1041,6 +1050,7 @@ class FrontierItem:
             downstream_path=tuple(downstream_path),
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis_semantic_hash,
+            seed_binding_identity=seed_binding_identity,
             depth=depth,
             candidate_source=candidate_source,
             priority=priority,
@@ -1052,7 +1062,12 @@ class FrontierItem:
 
     @property
     def visit_key(self) -> str:
-        return semantic_visit_key(self.node_ref, self.defect_state, self.hypothesis_semantic_hash)
+        return semantic_visit_key(
+            self.node_ref,
+            self.defect_state,
+            self.hypothesis_semantic_hash,
+            self.seed_binding_identity,
+        )
 
     @property
     def heap_key(self) -> tuple:
@@ -1066,6 +1081,7 @@ class FrontierItem:
             "downstream_path": list(self.downstream_path),
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
+            "seed_binding_identity": self.seed_binding_identity,
             "depth": self.depth,
             "candidate_source": self.candidate_source,
             "priority": self.priority,
@@ -1084,6 +1100,7 @@ class FrontierItem:
             downstream_path=_string_list(value.get("downstream_path")),
             hypothesis_id=str(value.get("hypothesis_id") or ""),
             hypothesis_semantic_hash=str(value.get("hypothesis_semantic_hash") or ""),
+            seed_binding_identity=str(value.get("seed_binding_identity") or ""),
             depth=int(value.get("depth") or 0),
             candidate_source=str(value.get("candidate_source") or ""),
             priority=_priority(value.get("priority", 0.0)),
