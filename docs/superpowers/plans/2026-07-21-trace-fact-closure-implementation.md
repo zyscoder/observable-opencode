@@ -31,6 +31,8 @@
 - Consumes: 任意 final response 值，通过现有 `stringPreview(input, 8000)` 等价规则转成文本。
 - Produces: `atomizeResponseClaims(input: unknown): AtomizedResponseClaim[]`。
 - Produces: `AtomizedResponseClaim`，包含 `text`、`raw_text`、`canonical_text`、`claim_format`、`claim_group_id`、`claim_index`、`claim_count`、`source_byte_range`、`previous_claim_key`、`next_claim_key`、`atomization_status`、`atomization_reason`。
+- Internal: `tokenizeClaimSource(source: string): ClaimToken[]`，token 类型限定为 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和 `HARD_BREAK`。
+- Internal: `segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[]`，只在 token 状态机中维护括号与活动 span。
 
 - [ ] **Step 1: 写 `_cstack`、括号、代码片段和 UTF-8 字节范围的失败测试**
 
@@ -101,10 +103,9 @@ export type AtomizedResponseClaim = {
 }
 
 export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
-  const source = stripResponseClaimScaffolding(normalizeResponseText(input))
-  const spans = splitClaimSpans(source)
-    .map((span) => mergeContinuationIntoPrevious(span))
-    .filter((span): span is ClaimSpan => Boolean(span))
+  const source = normalizeResponseText(input)
+  const tokens = tokenizeClaimSource(source)
+  const spans = segmentClaimTokens(source, tokens)
   const candidates = spans.flatMap(toFactualCandidate).slice(0, 50)
   const claimCount = candidates.length
   return candidates.map((candidate, index) => ({
@@ -117,7 +118,20 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
 }
 ```
 
-将现有 `stripResponseClaimScaffolding`、table fact、非事实过滤、protected segment 和 broken fragment 规则移入该模块。`splitClaimSpans` 必须在原始字符串上扫描括号栈和 markdown fence，返回字符起止位置；`source_byte_range` 使用 `Buffer.byteLength(source.slice(0, charOffset))` 计算。遇到以延续标点开头的 span 时必须与前一个 span 合并；没有前一个 span 时标记 `invalid_fragment` 并过滤。`claim_group_id` 使用完整合并语义声明的稳定 hash，格式为 `claim_group_<hash前12位>`；现有 `claim_index` 与新增 `claim_count` 表示该 response segment 中的顺序和总数，相邻 ref 也只表达 response 内顺序，不表示因果关系。
+`tokenizeClaimSource()` 必须在原始响应上保留位置并生成：普通文本 `TEXT`、不参与
+括号/标点扫描的 `PROTECTED_TEXT`、可在括号未闭合时延续的 `SOFT_BREAK`，以及
+heading、fence、空段落、list、table、blockquote 对应的 `HARD_BREAK`。状态机遇到
+`HARD_BREAK` 必须终止或丢弃不完整 span 并清空括号栈；普通换行只有在括号未闭合
+时才延续。不得通过删除 Markdown 行后再扫描。table fact、非事实过滤、continuation
+合并和 broken fragment 判断必须发生在 span 形成之后。`source_byte_range` 使用
+`Buffer.byteLength(source.slice(0, charOffset))` 计算，且从原始响应按范围反切片后
+必须包含 claim 原始文本。`claim_group_id` 使用完整合并语义声明的稳定 hash，格式为
+`claim_group_<hash前12位>`；现有 `claim_index` 与新增 `claim_count` 表示该 response
+segment 中的顺序和总数，相邻 ref 只表达 response 内顺序，不表示因果关系。
+
+除原有定向用例外，必须增加结构边界矩阵：普通括号跨行、inline code 未闭合括号、
+heading、fence、空段落、list、table、blockquote、嵌套/连续 list。任何 hard barrier
+前后的文本不得组成同一 claim，现有 CaseTrace 133 个测试必须全部通过。
 
 - [ ] **Step 4: 运行原子化测试**
 

@@ -104,6 +104,13 @@ Agent / Harness 原始执行
 右括号等开始的片段作为独立 claim。无法可靠切分时，以完整 claim group 作为
 评估 seed，不生成伪原子事实。
 
+原子化内部采用基于原始响应的单遍 Token + State Machine，不允许先删除 Markdown
+再计算 span。词法层只生成 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和带来源类型的
+`HARD_BREAK`。普通物理换行仅在括号未闭合时延续 claim；heading、fence、空段落、
+list、table 和 blockquote 边界必须清空括号与活动 span。`PROTECTED_TEXT` 的内容
+进入 claim 原文，但其内部括号和标点不参与外层状态迁移。所有 byte range 始终
+指向原始响应。
+
 ### 5.2 Artifact Bundle
 
 归因所需 artifact 必须随 Trace 包一起可解析。每项 artifact 记录：
