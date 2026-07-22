@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .causal_state import GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
+from .causal_state import GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION
 from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
@@ -212,7 +212,7 @@ def build_checkpoint_config(
         "cache_identity": str(cache_identity),
         "runtime_identity": _validated_runtime(runtime_identity),
         "evidence_eligibility_policy": EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
-        "global_judgment_contract": GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
+        "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
     }
     return {**semantic, "config_fingerprint": _sha256(semantic)}
 
@@ -245,7 +245,7 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
         raise CheckpointCompatibilityError(
             "unsupported graph evidence eligibility policy"
         )
-    if config["global_judgment_contract"] != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
+    if config["global_judgment_contract"] != GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION:
         raise CheckpointCompatibilityError(
             "unsupported global judgment contract"
         )

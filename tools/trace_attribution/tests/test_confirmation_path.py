@@ -95,6 +95,32 @@ class ConfirmationPathPolicyTest(unittest.TestCase):
             )
         )
 
+    def test_requires_exact_boolean_true_eligibility(self):
+        for value in (False, "false", "true", 0, 1, None, [], {}):
+            with self.subTest(value=value):
+                self.assertFalse(
+                    is_confirmation_causal_edge(
+                        {
+                            "relation": "produced",
+                            "eligible_for_attribution": value,
+                        },
+                        default_eligible=True,
+                    )
+                )
+
+        self.assertTrue(
+            is_confirmation_causal_edge(
+                {"relation": "produced"},
+                default_eligible=True,
+            )
+        )
+        self.assertFalse(
+            is_confirmation_causal_edge(
+                {"relation": "produced"},
+                default_eligible=False,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 from .causal_state import (
     GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
+    GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
     DefectState,
     FrozenMapping,
 )
@@ -246,6 +247,78 @@ class GlobalCandidateJudgeRequest:
             "grounded_refs": list(self.grounded_refs),
             "candidate_evidence_capsules": [item.to_dict() for item in self.capsules],
         }
+
+    def validation_envelope(self) -> JsonDict:
+        self.validate()
+        return {
+            "schema_version": GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
+            "case_id": self.case_id,
+            "objective": self.objective,
+            "analysis_perspective": self.analysis_perspective,
+            "seed_ref": self.seed_ref,
+            "active_defect": self.active_defect.to_dict(),
+            "active_focus_text": self.active_focus_text,
+            "active_focus_text_hash": self.active_focus_text_hash,
+            "start_refs": list(self.start_refs),
+            "trace_health": _thaw(self.trace_health),
+            "candidate_evidence_capsules": [
+                item.to_dict() for item in self.capsules
+            ],
+        }
+
+
+def global_candidate_request_from_validation_envelope(
+    value: Any,
+) -> GlobalCandidateJudgeRequest:
+    if not isinstance(value, Mapping):
+        raise TypeError("global candidate validation envelope must be an object")
+    required = {
+        "schema_version",
+        "case_id",
+        "objective",
+        "analysis_perspective",
+        "seed_ref",
+        "active_defect",
+        "active_focus_text",
+        "active_focus_text_hash",
+        "start_refs",
+        "trace_health",
+        "candidate_evidence_capsules",
+    }
+    if (
+        set(value) != required
+        or value.get("schema_version")
+        != GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION
+    ):
+        raise ValueError("global candidate validation envelope schema mismatch")
+    active_defect = value.get("active_defect")
+    trace_health = value.get("trace_health")
+    start_refs = value.get("start_refs")
+    capsules = value.get("candidate_evidence_capsules")
+    if not isinstance(active_defect, Mapping):
+        raise TypeError("validation envelope active_defect must be an object")
+    if not isinstance(trace_health, Mapping):
+        raise TypeError("validation envelope trace_health must be an object")
+    if not isinstance(start_refs, list) or any(
+        not isinstance(item, str) for item in start_refs
+    ):
+        raise TypeError("validation envelope start_refs must be a string array")
+    if not isinstance(capsules, list):
+        raise TypeError("validation envelope capsules must be an array")
+    return GlobalCandidateJudgeRequest(
+        case_id=str(value.get("case_id") or ""),
+        objective=str(value.get("objective") or ""),
+        analysis_perspective=str(value.get("analysis_perspective") or ""),
+        seed_ref=str(value.get("seed_ref") or ""),
+        active_defect=DefectState.from_dict(dict(active_defect)),
+        active_focus_text=str(value.get("active_focus_text") or ""),
+        active_focus_text_hash=str(value.get("active_focus_text_hash") or ""),
+        start_refs=tuple(start_refs),
+        capsules=tuple(
+            CandidateEvidenceCapsule.from_dict(item) for item in capsules
+        ),
+        trace_health=trace_health,
+    )
 
 
 @dataclass(frozen=True)

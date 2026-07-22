@@ -78,7 +78,7 @@ def is_confirmation_causal_edge(
 ) -> bool:
     relation = str(edge.get("relation") or "").strip().lower()
     return (
-        bool(edge.get("eligible_for_attribution", default_eligible))
+        edge.get("eligible_for_attribution", default_eligible) is True
         and not is_temporal_only_edge(edge)
         and relation not in NON_CAUSAL_CONFIRMATION_RELATIONS
         and relation in CONFIRMATION_CAUSAL_RELATIONS

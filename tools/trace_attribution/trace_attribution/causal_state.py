@@ -54,6 +54,12 @@ MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v3"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v2"
+GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
+    "global-candidate-judgment/v2+validation-envelope/v1"
+)
+GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
+    "global-candidate-validation-envelope/v1"
+)
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_SCHEMA_VERSION = "semantic-occurrence/v1"
@@ -1851,21 +1857,27 @@ class SeedAttributionResult:
     def from_dict(cls, value: JsonDict) -> "SeedAttributionResult":
         defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
         global_judgment = _json_dict(value.get("global_judgment"))
+        candidate_refs = _string_list(value.get("candidate_refs"))
+        selected_candidate_refs = _string_list(value.get("selected_candidate_refs"))
+        decisive_evidence_refs = _string_list(value.get("decisive_evidence_refs"))
         _validate_persisted_global_judgment(
             global_judgment,
             start_ref=str(value.get("start_ref") or ""),
             defect_state=defect_state,
+            candidate_refs=candidate_refs,
+            selected_candidate_refs=selected_candidate_refs,
+            decisive_evidence_refs=decisive_evidence_refs,
         )
         return cls(
             start_ref=str(value.get("start_ref") or ""),
             defect_fingerprint=str(value.get("defect_fingerprint") or ""),
             defect_state=defect_state,
             outcome=str(value.get("outcome") or "inconclusive"),
-            candidate_refs=_string_list(value.get("candidate_refs")),
-            selected_candidate_refs=_string_list(value.get("selected_candidate_refs")),
+            candidate_refs=candidate_refs,
+            selected_candidate_refs=selected_candidate_refs,
             confirmation_identities=_string_list(value.get("confirmation_identities")),
             confirmed_root_refs=_string_list(value.get("confirmed_root_refs")),
-            decisive_evidence_refs=_string_list(value.get("decisive_evidence_refs")),
+            decisive_evidence_refs=decisive_evidence_refs,
             missing_evidence=_seed_json_string_list(
                 value.get("missing_evidence"), "missing_evidence"
             ),
@@ -1886,6 +1898,9 @@ def _validate_persisted_global_judgment(
     *,
     start_ref: str,
     defect_state: DefectState,
+    candidate_refs: Iterable[str],
+    selected_candidate_refs: Iterable[str],
+    decisive_evidence_refs: Iterable[str],
 ) -> None:
     if not value:
         return
@@ -1904,39 +1919,43 @@ def _validate_persisted_global_judgment(
         "missing_evidence",
         "confidence",
         "active_focus_binding",
+        "validation_envelope",
     }
     if set(value) != required:
         raise ValueError("persisted global judgment v2 schema is incomplete")
-    binding = value.get("active_focus_binding")
-    normalized_actual = defect_state.actual.replace("\r\n", "\n").replace("\r", "\n")
-    expected_binding = {
-        "seed_ref": start_ref,
-        "defect_fingerprint": defect_state.fingerprint,
-        "active_focus_text_hash": hashlib.sha256(
-            normalized_actual.encode("utf-8")
-        ).hexdigest(),
-    }
-    if not isinstance(binding, Mapping) or dict(binding) != expected_binding:
-        raise ValueError("persisted global judgment v2 active focus binding is invalid")
-    assessments = value.get("assessments")
-    required_assessment = {
-        "candidate_ref",
-        "defect_status",
-        "input_defect_status",
-        "output_defect_status",
-        "causal_path_refs",
-        "counterfactual",
-        "compared_candidate_refs",
-        "causal_role",
-        "reason",
-        "evidence_refs",
-        "confidence",
-    }
-    if not isinstance(assessments, list) or any(
-        not isinstance(item, Mapping) or set(item) != required_assessment
-        for item in assessments
-    ):
-        raise ValueError("persisted global judgment v2 assessments are incomplete")
+    from .global_judge import (
+        global_candidate_request_from_validation_envelope,
+        validate_global_candidate_payload,
+    )
+
+    try:
+        request = global_candidate_request_from_validation_envelope(
+            value.get("validation_envelope")
+        )
+        if request.seed_ref != start_ref or request.active_defect != defect_state:
+            raise ValueError("validation envelope drifts from persisted seed facts")
+        judgment = validate_global_candidate_payload(
+            {
+                key: copy.deepcopy(item)
+                for key, item in value.items()
+                if key not in {"schema_version", "validation_envelope"}
+            },
+            request=request,
+        )
+        if not set(request.offered_candidate_refs).issubset(set(candidate_refs)):
+            raise ValueError("validation envelope candidates drift from seed candidates")
+        if set(judgment.selected_candidate_refs) != set(selected_candidate_refs):
+            raise ValueError("selected roots drift from persisted seed selection")
+        if not set(judgment.decisive_evidence_refs).issubset(
+            set(decisive_evidence_refs)
+        ):
+            raise ValueError("decisive refs drift from persisted seed evidence")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "persisted global judgment v2 semantic validation failed: {0}".format(
+                exc
+            )
+        ) from exc
 
 
 def validate_seed_outcome_payload(

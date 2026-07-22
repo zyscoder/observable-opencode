@@ -117,6 +117,67 @@ class CandidateEvidenceCapsule:
             "missing_evidence_refs": list(self.missing_evidence_refs),
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":
+        if not isinstance(value, Mapping):
+            raise TypeError("candidate evidence capsule must be an object")
+        required = {
+            "schema_version",
+            "candidate_ref",
+            "defect_state",
+            "candidate",
+            "downstream_path",
+            "downstream_path_references",
+            "causal_path_edges",
+            "start_refs",
+            "action_group",
+            "incoming_edges",
+            "outgoing_edges",
+            "evidence_references",
+            "artifact_hydration",
+            "missing_evidence_refs",
+        }
+        if set(value) != required or value.get("schema_version") != CAPSULE_SCHEMA_VERSION:
+            raise ValueError("candidate evidence capsule schema mismatch")
+
+        def mapping(name: str) -> Mapping[str, Any]:
+            item = value.get(name)
+            if not isinstance(item, Mapping):
+                raise TypeError("candidate evidence capsule {0} must be an object".format(name))
+            return item
+
+        def mappings(name: str) -> Tuple[Mapping[str, Any], ...]:
+            items = value.get(name)
+            if not isinstance(items, list) or any(
+                not isinstance(item, Mapping) for item in items
+            ):
+                raise TypeError("candidate evidence capsule {0} must be an object array".format(name))
+            return tuple(items)
+
+        def strings(name: str) -> Tuple[str, ...]:
+            items = value.get(name)
+            if not isinstance(items, list) or any(
+                not isinstance(item, str) or not item for item in items
+            ):
+                raise TypeError("candidate evidence capsule {0} must be a string array".format(name))
+            return tuple(items)
+
+        return cls(
+            candidate_ref=str(value.get("candidate_ref") or ""),
+            defect_state=DefectState.from_dict(dict(mapping("defect_state"))),
+            candidate=mapping("candidate"),
+            downstream_path=strings("downstream_path"),
+            downstream_path_references=mappings("downstream_path_references"),
+            causal_path_edges=mappings("causal_path_edges"),
+            start_refs=strings("start_refs"),
+            action_group=mapping("action_group"),
+            incoming_edges=mappings("incoming_edges"),
+            outgoing_edges=mappings("outgoing_edges"),
+            evidence_references=mappings("evidence_references"),
+            artifact_hydration=mapping("artifact_hydration"),
+            missing_evidence_refs=strings("missing_evidence_refs"),
+        )
+
 
 def build_candidate_evidence_capsules(
     *,

@@ -23,6 +23,7 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
+    confirmation_identity_for,
 )
 from trace_attribution.errors import (
     JudgeProviderUnavailable,
@@ -44,6 +45,7 @@ from trace_attribution.global_judge import (
 from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
+    _assert_report_grounded_evidence,
     _grounded_downstream_path,
 )
 
@@ -213,6 +215,34 @@ def step(
         suggested_investigation=suggested,
         confidence=0.9 if status != "unknown" else 0.0,
     )
+
+
+def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
+    confirmation = report_payload["confirmations"][0]
+    confirmation["candidate_ref"] = ghost_ref
+    recursive_path = [
+        ghost_ref,
+        *confirmation["recursive_path"][1:],
+    ]
+    seed_ref = report_payload["seed_results"][0]["start_ref"]
+    if recursive_path[-1] != seed_ref:
+        recursive_path.append(seed_ref)
+    confirmation["recursive_path"] = recursive_path
+    confirmation["confirmation_identity"] = confirmation_identity_for(
+        hypothesis_id=confirmation["hypothesis_id"],
+        hypothesis_semantic_hash=confirmation["hypothesis_semantic_hash"],
+        candidate_ref=ghost_ref,
+        defect_fingerprint=confirmation["defect_fingerprint"],
+        recursive_path=confirmation["recursive_path"],
+        seed_binding_identity=confirmation["seed_binding_identity"],
+    )
+    root = report_payload["confirmed_roots"][0]
+    root["node_ref"] = ghost_ref
+    root["recursive_path"] = list(confirmation["recursive_path"])
+    root["confirmation"] = copy.deepcopy(confirmation)
+    seed = report_payload["seed_results"][0]
+    seed["confirmed_root_refs"] = [ghost_ref]
+    seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
 
 
 class ScriptedCausalJudge(OfflineJudgeCapability):
@@ -2178,6 +2208,83 @@ class RecursiveRootRankingTest(unittest.TestCase):
             report.confirmations[0].reason,
         )
 
+    def test_queued_confirmation_rejects_conflicting_raw_provenance(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0].update(
+            {
+                "evidence_type": "confirmed",
+                "metadata": {"evidence_type": "temporal_advisory"},
+            }
+        )
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="The decision omitted required search coverage.",
+                    reason="The decision is a necessary local root.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertIn(
+            "queued confirmation path lacks a grounded non-temporal edge",
+            report.confirmations[0].reason,
+        )
+
+    def test_queued_confirmation_rejects_malformed_explicit_eligibility(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0]["eligible_for_attribution"] = "false"
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="The decision omitted required search coverage.",
+                    reason="The decision is a necessary local root.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual(report.confirmed_roots, ())
+
     def test_rejected_candidate_backtracks_to_independently_confirmed_alternative(self):
         def first_step(request):
             return step(
@@ -3394,6 +3501,51 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     (),
                 )
 
+    def test_grounded_downstream_path_rejects_conflicting_raw_provenance(self):
+        conflicts = (
+            ("relation", "produced", "temporal_adjacency"),
+            ("evidence_type", "confirmed", "temporal_only"),
+            ("edge_origin", "trace.dataflow_edges", "offline.temporal_reconstruction"),
+            ("inference_method", "trace_dataflow_edge", "same_session_temporal_order"),
+        )
+        for field, recorded, temporal in conflicts:
+            with self.subTest(field=field):
+                graph = TraceGraph.from_trace(
+                    {
+                        "case_id": "conflicting-provenance-grounded-path",
+                        "records": [
+                            {
+                                "record_id": ref,
+                                "component": "processor",
+                                "event_type": "decision",
+                            }
+                            for ref in ("decision", "defect")
+                        ],
+                        "dataflow_edges": [
+                            {
+                                "from": {"type": "record", "id": "decision"},
+                                "to": {"type": "record", "id": "defect"},
+                                "relation": "produced",
+                                "evidence_type": "confirmed",
+                                "edge_origin": "trace.dataflow_edges",
+                                "inference_method": "trace_dataflow_edge",
+                                "eligible_for_attribution": True,
+                                field: recorded,
+                                "metadata": {field: temporal},
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    _grounded_downstream_path(
+                        graph,
+                        "record:decision",
+                        ("record:defect",),
+                    ),
+                    (),
+                )
+
     def test_response_claim_seed_is_an_unconfirmed_claim_quality_candidate(self):
         graph = TraceGraph.from_trace(
             {
@@ -3662,6 +3814,150 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             report.seed_results[0].global_judgment["schema_version"],
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
         )
+
+    def test_persisted_global_matrix_round_trips_only_with_full_semantics(self):
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The global candidate remains necessary under independent review.",
+                    counterfactual="Searching the complete contract prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+        payload = report.to_dict()
+
+        self.assertEqual(
+            RecursiveAttributionReport.from_dict(copy.deepcopy(payload)).to_dict(),
+            payload,
+        )
+
+        invalid_payloads = []
+        missing_candidate = copy.deepcopy(payload)
+        judgment = missing_candidate["seed_results"][0]["global_judgment"]
+        selected = set(judgment["selected_candidate_refs"])
+        removable = next(
+            item
+            for item in judgment["assessments"]
+            if item["candidate_ref"] not in selected
+        )
+        judgment["assessments"].remove(removable)
+        invalid_payloads.append(("missing candidate", missing_candidate))
+
+        incomplete_comparison = copy.deepcopy(payload)
+        incomplete_comparison["seed_results"][0]["global_judgment"][
+            "assessments"
+        ][0]["compared_candidate_refs"] = []
+        invalid_payloads.append(("competitor coverage", incomplete_comparison))
+
+        invalid_status = copy.deepcopy(payload)
+        invalid_status["seed_results"][0]["global_judgment"]["assessments"][0][
+            "output_defect_status"
+        ] = "malformed"
+        invalid_payloads.append(("invalid status", invalid_status))
+
+        contradictory_counterfactual = copy.deepcopy(payload)
+        judgment = contradictory_counterfactual["seed_results"][0][
+            "global_judgment"
+        ]
+        selected_ref = judgment["selected_candidate_refs"][0]
+        next(
+            item
+            for item in judgment["assessments"]
+            if item["candidate_ref"] == selected_ref
+        )["counterfactual"]["causal_effect"] = "does_not_prevent_defect"
+        invalid_payloads.append(
+            ("contradictory counterfactual", contradictory_counterfactual)
+        )
+
+        for label, invalid in invalid_payloads:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(
+                    ValueError, "persisted global judgment.*semantic"
+                ):
+                    RecursiveAttributionReport.from_dict(invalid)
+
+    def test_publication_audit_rejects_unresolved_root_identity_with_real_evidence(self):
+        graph = TraceGraph.from_trace(observed_trace())
+        report = AgenticRecursiveAnalyzer(
+            judge=FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="Implement only the methods found in the first search.",
+                        reason="The decision remains necessary under independent review.",
+                        counterfactual="Searching the complete contract prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    )
+                },
+            ),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            graph,
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+        forged = report.to_dict()
+        forge_published_root_identity(forged, "record:ghost")
+        forged_report = RecursiveAttributionReport.from_dict(forged)
+
+        with self.assertRaisesRegex(
+            ValueError, "publication identity.*record:ghost"
+        ):
+            _assert_report_grounded_evidence(
+                TraceGraph.from_trace(observed_trace()),
+                forged_report,
+                label="final attribution report",
+            )
+
+    def test_conflicting_raw_provenance_never_publishes_global_root(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0].update(
+            {
+                "relation": "decision_guided_change",
+                "metadata": {"relation": "temporal_adjacency"},
+            }
+        )
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The decision remains necessary under independent review.",
+                    counterfactual="Searching the complete contract prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        self.assertTrue(judge.global_requests)
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual(report.confirmed_roots, ())
 
     def test_unresolved_global_evidence_never_reaches_persisted_root_judgment(self):
         trace = observed_trace()

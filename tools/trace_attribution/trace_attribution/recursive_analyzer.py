@@ -449,21 +449,43 @@ def _assert_report_grounded_evidence(
     graph: TraceGraph, report: RecursiveAttributionReport, *, label: str
 ) -> None:
     refs: List[str] = []
+    identity_refs: List[str] = []
     for seed in report.seed_results:
+        if seed.confirmed_root_refs or seed.confirmation_identities:
+            identity_refs.append(seed.start_ref)
+        identity_refs.extend(seed.selected_candidate_refs)
+        identity_refs.extend(seed.confirmed_root_refs)
         refs.extend(seed.decisive_evidence_refs)
         judgment = seed.global_judgment
         refs.extend(judgment.get("decisive_evidence_refs") or ())
+        identity_refs.extend(judgment.get("selected_candidate_refs") or ())
         for assessment in judgment.get("assessments") or ():
             if not isinstance(assessment, Mapping):
                 continue
+            identity_refs.append(str(assessment.get("candidate_ref") or ""))
+            identity_refs.extend(assessment.get("causal_path_refs") or ())
             refs.extend(assessment.get("evidence_refs") or ())
             refs.extend(assessment.get("causal_path_refs") or ())
     for confirmation in report.confirmations:
+        identity_refs.append(confirmation.candidate_ref)
+        identity_refs.extend(confirmation.recursive_path)
         refs.extend(confirmation.evidence_refs)
+        for competitor in confirmation.competitor_comparisons:
+            if not isinstance(competitor, Mapping):
+                continue
+            identity_refs.append(str(competitor.get("candidate_ref") or ""))
+            identity_refs.extend(competitor.get("recursive_path") or ())
     for root in (*report.confirmed_roots, *report.co_roots):
+        identity_refs.append(root.node_ref)
+        identity_refs.extend(root.recursive_path)
+        identity_refs.extend(root.observed_defect_refs)
+        identity_refs.extend(root.episode_member_refs)
         refs.extend(root.evidence_refs)
     graph.assert_resolved_evidence_references(
         _dedupe_strings(refs), label=label
+    )
+    graph.assert_resolved_node_references(
+        _dedupe_strings(identity_refs), label=label
     )
 
 
@@ -854,6 +876,7 @@ class SeedAttributionBuilder:
         self,
         judgment: GlobalCandidateJudgment,
         candidate_refs: Iterable[str],
+        request: GlobalCandidateJudgeRequest,
     ) -> None:
         self.candidate_refs.update(str(ref) for ref in candidate_refs if ref)
         self.selected_candidate_refs.update(judgment.selected_candidate_refs)
@@ -861,6 +884,9 @@ class SeedAttributionBuilder:
         self.global_judgment = copy.deepcopy(judgment.to_dict())
         self.global_judgment["schema_version"] = (
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION
+        )
+        self.global_judgment["validation_envelope"] = (
+            request.validation_envelope()
         )
         self.expansion_history.extend(
             copy.deepcopy(dict(item)) for item in judgment.expansion_requests
@@ -2800,6 +2826,7 @@ class AgenticRecursiveAnalyzer:
                 candidates=candidates,
                 capsules=capsules,
                 judgment=judgment,
+                request=request,
             )
             self._checkpoint_state(
                 state, "global:after:{0}".format(item.visit_key)
@@ -3005,12 +3032,14 @@ class AgenticRecursiveAnalyzer:
         candidates: Sequence[CausalCandidate],
         capsules: Sequence[CandidateEvidenceCapsule],
         judgment: GlobalCandidateJudgment,
+        request: GlobalCandidateJudgeRequest,
     ) -> None:
         seed_builder = state._seed_builder_for_item(item)
         if seed_builder is not None:
             seed_builder.record_global_judgment(
                 judgment,
                 (candidate.ref for candidate in candidates),
+                request,
             )
         if judgment.outcome == "no_defect":
             hypothesis = state.ledger.get(item.hypothesis_id)

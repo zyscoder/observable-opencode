@@ -31,6 +31,12 @@ RANKING_CONFIDENCE_INFERENCE_METHODS = frozenset(
         "token_overlap_retrieval",
     }
 )
+RECORDED_PROVENANCE_KEYS = (
+    "relation",
+    "evidence_type",
+    "edge_origin",
+    "inference_method",
+)
 
 
 @dataclass(frozen=True)
@@ -244,6 +250,18 @@ class TraceGraph:
                     ),
                     source_container="trace.dataflow_edges",
                     edge_id=str(edge.get("edge_id") or ""),
+                    recorded_provenance={
+                        "top_level": {
+                            key: edge[key]
+                            for key in RECORDED_PROVENANCE_KEYS
+                            if key in edge
+                        },
+                        "metadata": {
+                            key: metadata[key]
+                            for key in RECORDED_PROVENANCE_KEYS
+                            if key in metadata
+                        },
+                    },
                 )
                 upstream[target][source] = None
                 downstream[source][target] = None
@@ -471,6 +489,20 @@ class TraceGraph:
                 continue
             raise ValueError(
                 "{0} contains unresolved grounded evidence: {1}".format(label, ref)
+            )
+
+    def assert_resolved_node_references(
+        self, refs: Iterable[Any], *, label: str
+    ) -> None:
+        for value in refs:
+            ref = str(value or "")
+            resolved = self.resolve(ref)
+            if resolved in self.nodes and self.evidence_eligible(resolved):
+                continue
+            raise ValueError(
+                "{0} contains unresolved or revision-ineligible publication identity: {1}".format(
+                    label, ref
+                )
             )
 
     def analysis_start_eligible(self, ref: str) -> bool:
@@ -1367,6 +1399,7 @@ def add_edge_context(
     edge_origin: str,
     source_container: str = "",
     edge_id: str = "",
+    recorded_provenance: Optional[Mapping[str, Any]] = None,
 ) -> None:
     edge = {
         "from_ref": from_ref,
@@ -1383,6 +1416,11 @@ def add_edge_context(
         edge["source_container"] = source_container
     if edge_id:
         edge["edge_id"] = edge_id
+    if recorded_provenance:
+        edge["recorded_provenance"] = {
+            str(key): dict(value) if isinstance(value, Mapping) else value
+            for key, value in recorded_provenance.items()
+        }
     bucket = index[(from_ref, to_ref)]
     signature = stable_edge_signature(edge)
     if any(stable_edge_signature(item) == signature for item in bucket):
@@ -1400,6 +1438,7 @@ def stable_edge_signature(edge: JsonDict) -> tuple:
         str(edge.get("inference_method") or ""),
         str(edge.get("edge_origin") or ""),
         str(edge.get("source_container") or ""),
+        stable_json(edge.get("recorded_provenance") or {}),
     )
 
 
@@ -1419,17 +1458,42 @@ def normalized_confidence(value: Any) -> float:
     return max(0.0, min(1.0, confidence))
 
 
-def is_temporal_only_edge(edge: JsonDict) -> bool:
+def is_temporal_only_edge(edge: Mapping[str, Any]) -> bool:
     """Identify advisory time adjacency even when a producer marked it eligible."""
-    evidence_type = str(edge.get("evidence_type") or "").strip().lower()
-    relation = str(edge.get("relation") or "").strip().lower()
-    origin = str(edge.get("edge_origin") or "").strip().lower()
-    method = str(edge.get("inference_method") or "").strip().lower()
-    if evidence_type in {"temporal_inferred", "temporal_only", "temporal_advisory"}:
-        return True
-    if relation in {"temporal_availability", "available_to_next_request", "temporal_adjacency"}:
-        return True
-    return "temporal" in origin or "temporal" in method
+    provenance = edge.get("recorded_provenance")
+    containers = [edge]
+    metadata = edge.get("metadata")
+    if isinstance(metadata, Mapping):
+        containers.append(metadata)
+    if isinstance(provenance, Mapping):
+        containers.extend(
+            value
+            for value in (
+                provenance.get("top_level"),
+                provenance.get("metadata"),
+            )
+            if isinstance(value, Mapping)
+        )
+    for container in containers:
+        evidence_type = str(container.get("evidence_type") or "").strip().lower()
+        relation = str(container.get("relation") or "").strip().lower()
+        origin = str(container.get("edge_origin") or "").strip().lower()
+        method = str(container.get("inference_method") or "").strip().lower()
+        if evidence_type in {
+            "temporal_inferred",
+            "temporal_only",
+            "temporal_advisory",
+        }:
+            return True
+        if relation in {
+            "temporal_availability",
+            "available_to_next_request",
+            "temporal_adjacency",
+        }:
+            return True
+        if "temporal" in origin or "temporal" in method:
+            return True
+    return False
 
 
 def dedupe(items: Iterable[str]) -> List[str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import json
 import tempfile
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -483,6 +484,78 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 payload(outcome="candidate_roots", request=request),
                 request=request,
             )
+
+    def test_conflicting_raw_provenance_is_preserved_and_blocks_global_path(self):
+        conflicts = (
+            ("relation", "produced", "temporal_adjacency"),
+            ("evidence_type", "confirmed", "temporal_only"),
+            ("edge_origin", "trace.dataflow_edges", "offline.temporal_reconstruction"),
+            ("inference_method", "trace_dataflow_edge", "same_session_temporal_order"),
+        )
+        for field, recorded, temporal in conflicts:
+            for top_level, metadata in ((recorded, temporal), (temporal, recorded)):
+                with self.subTest(
+                    field=field,
+                    top_level=top_level,
+                    metadata=metadata,
+                ):
+                    request = sample_request(
+                        decision_edge_fields={
+                            field: top_level,
+                            "metadata": {field: metadata},
+                        },
+                        include_decision_source_ref=False,
+                    )
+                    path_edge = request.capsules[0].causal_path_edges[0]
+                    provenance = path_edge.get("recorded_provenance")
+                    self.assertIsInstance(provenance, Mapping)
+                    if not isinstance(provenance, Mapping):
+                        continue
+                    self.assertEqual(
+                        provenance["top_level"][field],
+                        top_level,
+                    )
+                    self.assertEqual(
+                        provenance["metadata"][field],
+                        metadata,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "causal_path_refs.*eligible.*hop"
+                    ):
+                        validate_global_candidate_payload(
+                            payload(outcome="candidate_roots", request=request),
+                            request=request,
+                        )
+
+    def test_global_path_requires_exact_boolean_true_eligibility(self):
+        request = sample_request()
+        for value in (False, "false", "true", 0, 1, None, [], {}):
+            with self.subTest(value=value):
+                capsule = replace(
+                    request.capsules[0],
+                    causal_path_edges=(
+                        {
+                            "from_ref": "record:decision",
+                            "to_ref": "record:defect",
+                            "relation": "produced",
+                            "eligible_for_attribution": value,
+                        },
+                    ),
+                    incoming_edges=(),
+                    outgoing_edges=(),
+                )
+                rejected_request = replace(
+                    request,
+                    capsules=(capsule, request.capsules[1]),
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "causal_path_refs.*eligible.*hop"
+                ):
+                    validate_global_candidate_payload(
+                        payload(outcome="candidate_roots", request=rejected_request),
+                        request=rejected_request,
+                    )
 
     def test_unresolved_raw_edge_evidence_is_missing_not_grounded(self):
         request = sample_request(

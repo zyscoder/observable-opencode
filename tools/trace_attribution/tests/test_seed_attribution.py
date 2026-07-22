@@ -32,6 +32,7 @@ from trace_attribution.checkpoint import (
 from trace_attribution.graph import TraceGraph
 from trace_attribution.global_judge import (
     GlobalCandidateAssessment,
+    GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     active_focus_text_sha256,
 )
@@ -1669,6 +1670,17 @@ class SeedAttributionModelTests(unittest.TestCase):
 
     def test_seed_result_is_deeply_immutable_and_round_trips_defaults(self):
         state = defect("immutable")
+        request = GlobalCandidateJudgeRequest(
+            case_id="immutable-seed-result",
+            objective="Exercise immutable seed persistence.",
+            analysis_perspective="",
+            seed_ref="record:seed",
+            active_defect=state,
+            active_focus_text=state.actual,
+            active_focus_text_hash=active_focus_text_sha256(state.actual),
+            start_refs=("record:seed",),
+            capsules=(),
+        )
         result = SeedAttributionResult(
             start_ref="record:seed",
             defect_fingerprint=state.fingerprint,
@@ -1691,6 +1703,7 @@ class SeedAttributionModelTests(unittest.TestCase):
                     "defect_fingerprint": state.fingerprint,
                     "active_focus_text_hash": active_focus_text_sha256(state.actual),
                 },
+                "validation_envelope": request.validation_envelope(),
             },
             expansion_history=[{"anchor_ref": "record:a", "refs": ["record:b"]}],
         )
