@@ -110,14 +110,27 @@ class GlobalCandidateJudgeRequest:
             raise TypeError("global candidate request active_defect must be DefectState")
         if not normalize_active_focus_text(focus_text):
             raise ValueError("global candidate request requires active_focus_text")
-        expected_hash = active_focus_text_sha256(focus_text)
-        if self.active_focus_text_hash != expected_hash:
-            raise ValueError("global candidate request active_focus_text_hash mismatch")
         object.__setattr__(self, "seed_ref", seed_ref)
         object.__setattr__(self, "active_focus_text", focus_text)
         object.__setattr__(self, "start_refs", tuple(str(item) for item in self.start_refs))
         object.__setattr__(self, "capsules", tuple(self.capsules))
         object.__setattr__(self, "trace_health", _freeze(self.trace_health))
+        self.validate()
+
+    def validate(self) -> None:
+        if not str(self.seed_ref).strip():
+            raise ValueError("global candidate request requires seed_ref")
+        if not isinstance(self.active_defect, DefectState):
+            raise TypeError("global candidate request active_defect must be DefectState")
+        if not normalize_active_focus_text(self.active_focus_text):
+            raise ValueError("global candidate request requires active_focus_text")
+        expected_hash = active_focus_text_sha256(self.active_focus_text)
+        if self.active_focus_text_hash != expected_hash:
+            raise ValueError("global candidate request active_focus_text_hash mismatch")
+        if normalize_active_focus_text(self.active_focus_text) != normalize_active_focus_text(
+            self.active_defect.actual
+        ):
+            raise ValueError("global candidate request active_focus_text must match active_defect.actual")
         refs = [item.candidate_ref for item in self.capsules]
         if len(refs) != len(set(refs)):
             raise ValueError("global candidate request contains duplicate candidate refs")
@@ -186,6 +199,7 @@ class GlobalCandidateJudgeRequest:
         return tuple(output)
 
     def to_dict(self) -> JsonDict:
+        self.validate()
         return {
             "case_id": self.case_id,
             "objective": self.objective,
@@ -331,6 +345,7 @@ class GlobalJudgeCapability:
 
 
 def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
+    request.validate()
     return stable_json(
         {
             "request": request.to_dict(),
@@ -405,6 +420,7 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
 def validate_global_candidate_payload(
     value: Any, *, request: GlobalCandidateJudgeRequest
 ) -> GlobalCandidateJudgment:
+    request.validate()
     if not isinstance(value, Mapping):
         raise TypeError("global candidate judgment must be an object")
     required = {
@@ -464,6 +480,21 @@ def validate_global_candidate_payload(
             or item.causal_path_refs[-1] != request.seed_ref
         ):
             raise ValueError("causal_path_refs must connect candidate to active seed")
+        if item.causal_path_refs and not _has_eligible_causal_path_hops(
+            capsule, item.causal_path_refs
+        ):
+            raise ValueError(
+                "causal_path_refs must use an eligible correctly directed capsule hop"
+            )
+        if (
+            item.causal_role
+            in {"root_candidate", "contributing_condition", "amplifying_factor"}
+            and item.output_defect_status == "present"
+            and not item.causal_path_refs
+        ):
+            raise ValueError(
+                "present causal candidate requires causal_path_refs to the active seed"
+            )
         expected_compared = set(request.open_authored_root_candidate_refs)
         if set(item.compared_candidate_refs) != expected_compared:
             raise ValueError(
@@ -647,6 +678,26 @@ def _immutable_strings(value: Any, field_name: str) -> Tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise TypeError("{0} must be an array".format(field_name))
     return _strings(list(value), field_name)
+
+
+def _has_eligible_causal_path_hops(
+    capsule: CandidateEvidenceCapsule, path_refs: Tuple[str, ...]
+) -> bool:
+    edges = (
+        *capsule.causal_path_edges,
+        *capsule.outgoing_edges,
+        *capsule.incoming_edges,
+    )
+    return all(
+        any(
+            str(edge.get("from_ref") or "") == source_ref
+            and str(edge.get("to_ref") or "") == target_ref
+            and edge.get("eligible_for_attribution") is True
+            for edge in edges
+            if isinstance(edge, Mapping)
+        )
+        for source_ref, target_ref in zip(path_refs, path_refs[1:])
+    )
 
 
 def _active_focus_binding(value: Any) -> Mapping[str, Any]:

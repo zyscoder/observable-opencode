@@ -5,6 +5,7 @@ import json
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import ClaudeCausalJudge
@@ -207,6 +208,47 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active_focus_text_hash"):
             replace(request, active_focus_text_hash="0" * 64)
 
+    def test_rejects_self_consistent_neighboring_active_focus_text(self):
+        request = sample_request()
+        neighboring_text = "All focused tests passed."
+
+        with self.assertRaisesRegex(ValueError, "active_focus_text must match"):
+            replace(
+                request,
+                active_focus_text=neighboring_text,
+                active_focus_text_hash=active_focus_text_sha256(neighboring_text),
+            )
+
+    def test_rejects_self_consistent_neighboring_focus_before_cache_or_replay(self):
+        request = sample_request()
+        neighboring_text = "All focused tests passed."
+        object.__setattr__(request, "active_focus_text", neighboring_text)
+        object.__setattr__(
+            request,
+            "active_focus_text_hash",
+            active_focus_text_sha256(neighboring_text),
+        )
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def create_message_text_with_usage(self, *, system, messages, max_tokens):
+                raise AssertionError("invalid focus must not reach the provider or cache")
+
+        cache = JudgmentCache()
+        with self.assertRaisesRegex(ValueError, "active_focus_text must match"):
+            ClaudeCausalJudge(transport=Transport(), cache=cache).judge_candidates_bounded(
+                request, max_physical_requests=0
+            )
+        with self.assertRaisesRegex(ValueError, "active_focus_text must match"):
+            global_candidate_judgment_from_payload(
+                payload(outcome="candidate_roots"), request=request
+            )
+        self.assertEqual(cache.stats()["hits"], 0)
+
     def test_rejects_judgment_that_answers_neighboring_claim(self):
         request = sample_request()
         value = payload(outcome="candidate_roots", request=request)
@@ -258,6 +300,42 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(ValueError, "causal_path_refs"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_disconnected_but_individually_grounded_causal_path_hops(self):
+        request = sample_request()
+        request = replace(
+            request,
+            capsules=(
+                replace(
+                    request.capsules[0],
+                    downstream_path=(
+                        "record:decision",
+                        "record:verification",
+                        "record:defect",
+                    ),
+                ),
+                request.capsules[1],
+            ),
+        )
+        value = payload(outcome="candidate_roots", request=request)
+
+        with self.assertRaisesRegex(ValueError, "causal_path_refs.*eligible.*hop"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_unselected_present_causal_candidate_without_path(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][1].update(
+            {
+                "defect_status": "present",
+                "output_defect_status": "present",
+                "causal_role": "contributing_condition",
+                "causal_path_refs": [],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "causal candidate.*causal_path_refs"):
             validate_global_candidate_payload(value, request=request)
 
     def test_rejects_root_whose_input_already_has_active_defect(self):
@@ -533,11 +611,26 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 return TransportCallResult("{}", physical_requests=1)
 
         request = sample_request()
-        result = ClaudeCausalJudge(
-            transport=Transport(), cache=JudgmentCache()
-        ).judge_candidates_bounded(request, max_physical_requests=1)
+        payloads = []
+        validator = validate_global_candidate_payload
+
+        def record_validation(value, *, request):
+            payloads.append(value)
+            return validator(value, request=request)
+
+        with patch(
+            "trace_attribution.causal_judge.validate_global_candidate_payload",
+            side_effect=record_validation,
+        ):
+            result = ClaudeCausalJudge(
+                transport=Transport(), cache=JudgmentCache()
+            ).judge_candidates_bounded(request, max_physical_requests=1)
 
         self.assertEqual(result.value.outcome, "inconclusive")
+        self.assertIn(
+            "inconclusive",
+            [item.get("outcome") for item in payloads if isinstance(item, dict)],
+        )
         self.assertEqual(
             validate_global_candidate_payload(
                 result.value.to_dict(), request=request

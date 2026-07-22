@@ -61,6 +61,7 @@ class CandidateEvidenceCapsule:
     candidate: Mapping[str, Any]
     downstream_path: Tuple[str, ...] = field(default_factory=tuple)
     downstream_path_references: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
+    causal_path_edges: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     start_refs: Tuple[str, ...] = field(default_factory=tuple)
     action_group: Mapping[str, Any] = field(default_factory=FrozenMapping)
     incoming_edges: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
@@ -76,6 +77,9 @@ class CandidateEvidenceCapsule:
             self,
             "downstream_path_references",
             tuple(_freeze(item) for item in self.downstream_path_references),
+        )
+        object.__setattr__(
+            self, "causal_path_edges", tuple(_freeze(item) for item in self.causal_path_edges)
         )
         object.__setattr__(self, "start_refs", _dedupe_strings(self.start_refs))
         object.__setattr__(self, "action_group", _freeze(self.action_group))
@@ -103,6 +107,7 @@ class CandidateEvidenceCapsule:
             "candidate": _thaw(self.candidate),
             "downstream_path": list(self.downstream_path),
             "downstream_path_references": _thaw(self.downstream_path_references),
+            "causal_path_edges": _thaw(self.causal_path_edges),
             "start_refs": list(self.start_refs),
             "action_group": _thaw(self.action_group),
             "incoming_edges": _thaw(self.incoming_edges),
@@ -188,6 +193,7 @@ def build_candidate_evidence_capsules(
                 },
                 downstream_path=path,
                 downstream_path_references=tuple(_reference(graph, item) for item in path),
+                causal_path_edges=tuple(_causal_path_edges(graph, path)),
                 start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
                 action_group=_action_group(graph, node),
                 incoming_edges=tuple(
@@ -262,6 +268,20 @@ def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict
         if len(output) >= limit:
             break
     return output[:limit]
+
+
+def _causal_path_edges(graph: TraceGraph, path: Tuple[str, ...]) -> List[JsonDict]:
+    output: List[JsonDict] = []
+    seen = set()
+    for source_ref, target_ref in zip(path, path[1:]):
+        for edge in graph.edge_context(source_ref, target_ref):
+            sanitized = graph.sanitize_judge_edge_evidence(edge)
+            signature = stable_json(sanitized)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            output.append(sanitized)
+    return output
 
 
 def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:

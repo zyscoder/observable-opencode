@@ -31,7 +31,6 @@ from .errors import (
 )
 from .global_judge import (
     GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-    GlobalCandidateAssessment,
     GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
@@ -2474,44 +2473,47 @@ class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
         detail = "global_judge_{0}: {1}".format(
             outcome.error_kind or "error", outcome.error_detail
         )
-        return BoundedJudgeCallResult(
-            GlobalCandidateJudgment(
-                outcome="inconclusive",
-                reason="The global candidate Judge could not produce a validated result: {0}".format(
-                    detail
-                ),
-                assessments=tuple(
-                    GlobalCandidateAssessment(
-                        candidate_ref=capsule.candidate_ref,
-                        defect_status="unknown",
-                        input_defect_status="unknown",
-                        output_defect_status="unknown",
-                        causal_path_refs=(),
-                        counterfactual={
-                            "intervention_ref": capsule.candidate_ref,
-                            "intervention_kind": "replace_with_semantically_correct_behavior",
-                            "predicted_defect_status": "present",
-                            "causal_effect": "does_not_prevent_defect",
-                        },
-                        compared_candidate_refs=request.open_authored_root_candidate_refs,
-                        causal_role="unknown",
-                        reason="Global candidate judgment is unavailable.",
-                        evidence_refs=(),
-                        confidence=0.0,
-                    )
-                    for capsule in request.capsules
-                ),
-                selected_candidate_refs=(),
-                expansion_requests=(),
-                decisive_evidence_refs=(),
-                missing_evidence=(detail,),
-                confidence=0.0,
-                active_focus_binding={
-                    "seed_ref": request.seed_ref,
-                    "defect_fingerprint": request.active_defect.fingerprint,
-                    "active_focus_text_hash": request.active_focus_text_hash,
-                },
+        fallback_payload = {
+            "outcome": "inconclusive",
+            "reason": "The global candidate Judge could not produce a validated result: {0}".format(
+                detail
             ),
+            "assessments": [
+                {
+                    "candidate_ref": capsule.candidate_ref,
+                    "defect_status": "unknown",
+                    "input_defect_status": "unknown",
+                    "output_defect_status": "unknown",
+                    "causal_path_refs": [],
+                    "counterfactual": {
+                        "intervention_ref": capsule.candidate_ref,
+                        "intervention_kind": "replace_with_semantically_correct_behavior",
+                        "predicted_defect_status": "present",
+                        "causal_effect": "does_not_prevent_defect",
+                    },
+                    "compared_candidate_refs": list(
+                        request.open_authored_root_candidate_refs
+                    ),
+                    "causal_role": "unknown",
+                    "reason": "Global candidate judgment is unavailable.",
+                    "evidence_refs": [],
+                    "confidence": 0.0,
+                }
+                for capsule in request.capsules
+            ],
+            "selected_candidate_refs": [],
+            "expansion_requests": [],
+            "decisive_evidence_refs": [],
+            "missing_evidence": [detail],
+            "confidence": 0.0,
+            "active_focus_binding": {
+                "seed_ref": request.seed_ref,
+                "defect_fingerprint": request.active_defect.fingerprint,
+                "active_focus_text_hash": request.active_focus_text_hash,
+            },
+        }
+        return BoundedJudgeCallResult(
+            validate_global_candidate_payload(fallback_payload, request=request),
             outcome.physical_requests,
         )
 
