@@ -53,6 +53,7 @@ def report_seed(
     start_ref="record:observed",
     defect_state=None,
     root_refs=(),
+    confirmation_identities=(),
 ):
     defect_state = defect_state or sample_defect_state()
     return SeedAttributionResult(
@@ -61,6 +62,7 @@ def report_seed(
         defect_state=defect_state,
         outcome=outcome,
         confirmed_root_refs=root_refs,
+        confirmation_identities=confirmation_identities,
         missing_evidence=("seed-local evidence is incomplete",)
         if outcome == "evidence_gap"
         else (),
@@ -793,12 +795,13 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="case-1",
             objective="Find the defect origin.",
-            start_refs=["record:observed"],
+            start_refs=["record:observed", "record:prompt"],
             seed_results=[
                 report_seed(
                     "confirmed_root",
                     defect_state=defect_state,
                     root_refs=(root.node_ref,),
+                    confirmation_identities=(confirmation.confirmation_identity,),
                 ),
                 report_seed(
                     "evidence_gap",
@@ -867,16 +870,19 @@ class CausalStateTest(unittest.TestCase):
             reason="The decision stopped discovery.",
             counterfactual="Searching call sites would reveal the contract.",
             confidence=0.9,
+            observed_defect_refs=["record:observed"],
         )
         partial = RecursiveAttributionReport(
             case_id="partial",
             objective="Find the root.",
+            start_refs=["record:observed", "record:prompt"],
             analysis_outcome="inconclusive",
             seed_results=[
                 report_seed(
                     "confirmed_root",
                     defect_state=root.defect_state,
                     root_refs=(root.node_ref,),
+                    confirmation_identities=(confirmation_for(root).confirmation_identity,),
                 ),
                 report_seed("evidence_gap", start_ref="record:prompt"),
             ],

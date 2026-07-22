@@ -11,6 +11,7 @@ from trace_attribution.causal_judge import OfflineJudgeCapability
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
+    FrozenMapping,
     RecursiveAttributionReport,
     RootConfirmation,
     SeedAttributionResult,
@@ -186,6 +187,10 @@ class SeedAttributionModelTests(unittest.TestCase):
             result.outcome = "no_defect"
         with self.assertRaises(TypeError):
             result.global_judgment["nested"] = ()
+        with self.assertRaises((AttributeError, TypeError)):
+            result.global_judgment._entries = ()
+        with self.assertRaises((AttributeError, TypeError)):
+            result.expansion_history[0]._entries = ()
         self.assertIsInstance(result.global_judgment["nested"], tuple)
         self.assertIsInstance(result.global_judgment["nested"][0], Mapping)
         self.assertEqual(result.candidate_refs, ("record:a", "record:z"))
@@ -210,6 +215,38 @@ class SeedAttributionModelTests(unittest.TestCase):
                 "expansion_history",
             },
         )
+
+    def test_frozen_mapping_rejects_own_storage_reassignment(self):
+        value = FrozenMapping({"nested": {"refs": ["record:one"]}})
+
+        with self.assertRaises((AttributeError, TypeError)):
+            value._entries = ()
+        with self.assertRaises((AttributeError, TypeError)):
+            value["nested"]._entries = ()
+
+        self.assertEqual(value, {"nested": {"refs": ["record:one"]}})
+
+    def test_confirmed_seed_cannot_fabricate_root_without_top_level_confirmation(self):
+        result = seed_result("record:seed", "confirmed_root")
+        payload = RecursiveAttributionReport(
+            case_id="forged-seed",
+            objective="Reject fabricated local roots.",
+            start_refs=["record:seed"],
+            seed_results=[result],
+        ).to_dict()
+
+        with self.assertRaisesRegex(ValueError, "confirmed_root"):
+            RecursiveAttributionReport.from_dict(payload)
+
+        outside_start_refs = json.loads(json.dumps(payload))
+        outside_start_refs["start_refs"] = []
+        with self.assertRaisesRegex(ValueError, "start_ref"):
+            RecursiveAttributionReport.from_dict(outside_start_refs)
+
+        non_confirmed = json.loads(json.dumps(payload))
+        non_confirmed["seed_results"][0]["outcome"] = "no_defect"
+        with self.assertRaisesRegex(ValueError, "non-confirmed"):
+            RecursiveAttributionReport.from_dict(non_confirmed)
 
     def test_report_v3_round_trip_is_complete_and_v2_migration_is_conservative(self):
         report = run_fixture("multi_seed_claims.json")

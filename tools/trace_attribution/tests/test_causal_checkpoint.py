@@ -14,6 +14,11 @@ from trace_attribution.causal_judge import (
     BoundedJudgeCapability,
     OfflineJudgeCapability,
 )
+from trace_attribution.global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+)
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     RecursiveAttributionReport,
@@ -49,6 +54,70 @@ def sample_trace() -> dict:
                 "data": {"content": "A complete answer."},
                 "source_refs": [],
             }
+        ],
+    }
+
+
+def multi_seed_global_trace() -> dict:
+    return {
+        "case_id": "global-resume-case",
+        "records": [
+            {
+                "record_id": "decision_one",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "First candidate decision."},
+            },
+            {
+                "record_id": "change_one",
+                "component": "processor",
+                "event_type": "change",
+                "source_refs": ["record:decision_one"],
+                "data": {"summary": "First change."},
+            },
+            {
+                "record_id": "defect_one",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": ["record:change_one"],
+                "data": {"actual": "First observation is refuted."},
+            },
+            {
+                "record_id": "decision_two",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "Second candidate decision."},
+            },
+            {
+                "record_id": "change_two",
+                "component": "processor",
+                "event_type": "change",
+                "source_refs": ["record:decision_two"],
+                "data": {"summary": "Second change."},
+            },
+            {
+                "record_id": "defect_two",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": ["record:change_two"],
+                "data": {"actual": "Second observation is refuted."},
+            },
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": source},
+                "to": {"type": "record", "id": target},
+                "relation": relation,
+                "evidence_type": "confirmed",
+                "confidence": 0.9,
+                "eligible_for_attribution": True,
+            }
+            for source, target, relation in (
+                ("decision_one", "change_one", "decision_guided_change"),
+                ("change_one", "defect_one", "change_observed_by_evaluation"),
+                ("decision_two", "change_two", "decision_guided_change"),
+                ("change_two", "defect_two", "change_observed_by_evaluation"),
+            )
         ],
     }
 
@@ -121,6 +190,42 @@ class CountingOfflineJudge(OfflineJudgeCapability):
     def confirm_candidate_offline(self, request):
         self.confirmation_calls += 1
         raise AssertionError("no root confirmation is expected")
+
+
+class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapability):
+    def __init__(self, *, interrupt_on_call=0):
+        super().__init__()
+        self.interrupt_on_call = interrupt_on_call
+        self.global_calls = []
+
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.global_calls.append(request.start_refs)
+        if len(self.global_calls) == self.interrupt_on_call:
+            raise KeyboardInterrupt("interrupt during the second global seed pass")
+        assessments = tuple(
+            GlobalCandidateAssessment(
+                candidate_ref=capsule.candidate_ref,
+                defect_status="absent",
+                causal_role="exculpatory_evidence",
+                reason="The scripted evidence refutes this observed defect.",
+                evidence_refs=(capsule.candidate_ref,),
+                confidence=1.0,
+            )
+            for capsule in request.capsules
+        )
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome="no_defect",
+                reason="The complete scripted candidate set refutes the defect.",
+                assessments=assessments,
+                selected_candidate_refs=(),
+                expansion_requests=(),
+                decisive_evidence_refs=(request.capsules[0].candidate_ref,),
+                missing_evidence=(),
+                confidence=1.0,
+            ),
+            0,
+        )
 
 
 class InterruptingOfflineJudge(CountingOfflineJudge):
@@ -1425,6 +1530,54 @@ class CausalCheckpointTest(unittest.TestCase):
                 analysis_perspective="Improve repository reasoning.",
             )
             self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+
+    def test_resumed_global_prepass_retries_only_interrupted_second_seed(self):
+        trace = multi_seed_global_trace()
+        start_refs = ["record:defect_one", "record:defect_two"]
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=start_refs,
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "global.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingGlobalNoDefectJudge(interrupt_on_call=2),
+                    fusion_mode="retrieval-global",
+                    checkpoint=CheckpointBundle(root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=start_refs,
+                    objective="Determine whether either observation is supported.",
+                    analysis_perspective="",
+                )
+
+            resumed_judge = InterruptingGlobalNoDefectJudge()
+            resumed = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                fusion_mode="retrieval-global",
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=start_refs,
+                objective="Determine whether either observation is supported.",
+                analysis_perspective="",
+            )
+            uninterrupted = AgenticRecursiveAnalyzer(
+                judge=InterruptingGlobalNoDefectJudge(),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=start_refs,
+                objective="Determine whether either observation is supported.",
+                analysis_perspective="",
+            )
+
+        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+        self.assertEqual(resumed_judge.global_calls, [("record:defect_two",)])
 
     def test_tail_repair_audit_is_persisted_in_report_metadata(self):
         with tempfile.TemporaryDirectory() as tempdir:

@@ -160,10 +160,20 @@ _URL_PORT_PATTERN = re.compile(r"(?P<host>\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0
 class FrozenMapping(Mapping[str, Any]):
     """Immutable JSON mapping backed by recursively frozen key/value entries."""
 
-    __slots__ = ("_entries",)
+    __slots__ = ("_entries", "_sealed")
 
     def __init__(self, value: Optional[Mapping[str, Any]] = None) -> None:
-        self._entries = tuple((str(key), _freeze(item)) for key, item in (value or {}).items())
+        object.__setattr__(
+            self,
+            "_entries",
+            tuple((str(key), _freeze(item)) for key, item in (value or {}).items()),
+        )
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("FrozenMapping is immutable")
+        object.__setattr__(self, name, value)
 
     def __iter__(self) -> Iterator[str]:
         return (key for key, _ in self._entries)
@@ -2078,6 +2088,66 @@ class RecursiveAttributionReport:
         start_refs = _string_list(value.get("start_refs"))
         defect_states = items("defect_states", DefectState.from_dict)
         seed_results = items("seed_results", SeedAttributionResult.from_dict)
+        raw_start_refs = _frozen_strings(value.get("start_refs"))
+        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            unknown_seed_refs = sorted(
+                {
+                    item.start_ref
+                    for item in seed_results
+                    if item.start_ref not in raw_start_refs
+                }
+            )
+            if unknown_seed_refs:
+                raise ValueError(
+                    "per-seed start_ref is absent from report start_refs: {0}".format(
+                        ", ".join(unknown_seed_refs)
+                    )
+                )
+            confirmation_by_identity = {
+                item.confirmation_identity: item
+                for item in items("confirmations", RootConfirmation.from_dict)
+            }
+            published_roots = [
+                *confirmed_roots,
+                *items("co_roots", ConfirmedRoot.from_dict),
+            ]
+            for seed in seed_results:
+                if seed.outcome != "confirmed_root":
+                    if seed.confirmed_root_refs:
+                        raise ValueError(
+                            "non-confirmed seed cannot retain confirmed_root_refs"
+                        )
+                    continue
+                if not seed.confirmed_root_refs or not seed.confirmation_identities:
+                    raise ValueError(
+                        "confirmed_root seed requires root refs and confirmation identities"
+                    )
+                bound_refs: Set[str] = set()
+                bound_identities: Set[str] = set()
+                for root in published_roots:
+                    confirmation_payload = root.confirmation
+                    identity = str(
+                        confirmation_payload.get("confirmation_identity") or ""
+                    )
+                    confirmation = confirmation_by_identity.get(identity)
+                    if (
+                        root.node_ref in seed.confirmed_root_refs
+                        and identity in seed.confirmation_identities
+                        and confirmation is not None
+                        and confirmation
+                        == RootConfirmation.from_dict(_thaw(confirmation_payload))
+                        and confirmation.status == "confirmed"
+                        and seed.start_ref in root.observed_defect_refs
+                    ):
+                        bound_refs.add(root.node_ref)
+                        bound_identities.add(identity)
+                if (
+                    bound_refs != set(seed.confirmed_root_refs)
+                    or not bound_identities
+                ):
+                    raise ValueError(
+                        "confirmed_root seed is not bound to top-level confirmed roots"
+                    )
         metadata = _json_dict(value.get("metadata"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
             migrated_states = [

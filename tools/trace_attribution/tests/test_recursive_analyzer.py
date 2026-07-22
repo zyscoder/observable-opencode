@@ -29,7 +29,10 @@ from trace_attribution.errors import (
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
-from trace_attribution.causal_retrieval import root_candidate_eligible
+from trace_attribution.causal_retrieval import (
+    SemanticPredecessorRetriever,
+    root_candidate_eligible,
+)
 from trace_attribution.global_judge import (
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
@@ -2538,6 +2541,47 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
 
 class RetrievalGlobalFusionTest(unittest.TestCase):
+    def test_retrieval_score_does_not_change_confirmation_facts_on_real_fusion_path(self):
+        class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
+            def __init__(self, score):
+                self.score = score
+
+            def retrieve(self, *args, **kwargs):
+                return [
+                    replace(candidate, score=self.score)
+                    for candidate in super().retrieve(*args, **kwargs)
+                ]
+
+        def run(score):
+            judge = FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="The decision omitted required search coverage.",
+                        reason="The decision is the necessary local root.",
+                        counterfactual="Searching all call sites prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    )
+                },
+            )
+            AgenticRecursiveAnalyzer(
+                judge=judge,
+                retriever=ScoreAdjustedRetriever(score),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(observed_trace()),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+            return {
+                "global_confirmation_facts": judge.global_requests[0].to_dict(),
+                "independent_confirmation_facts": judge.confirmation_requests[0].factual_dict(),
+            }
+
+        self.assertEqual(run(0.01), run(0.99))
+
     def test_grounded_downstream_path_uses_recorded_non_temporal_edges(self):
         graph = TraceGraph.from_trace(
             {

@@ -2388,12 +2388,6 @@ class AgenticRecursiveAnalyzer:
     ) -> None:
         if self.fusion_mode != "retrieval-global":
             return
-        if any(
-            item.get("kind") == "global_candidate_pass"
-            for item in state.investigation_journal
-            if isinstance(item, Mapping)
-        ):
-            return
         if not isinstance(self.judge, GlobalJudgeCapability):
             state.investigation_journal.append(
                 {
@@ -2405,10 +2399,24 @@ class AgenticRecursiveAnalyzer:
             )
             return
 
+        completed_seed_visits = {
+            (
+                str(event.get("hypothesis_id") or ""),
+                str(event.get("defect_fingerprint") or ""),
+            )
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_pass"
+            and event.get("status") == "completed"
+        }
+
         queued_items = [
             FrontierItem.from_dict(item) for item in state.frontier.snapshot()
         ]
         for item in queued_items:
+            seed_visit = (item.hypothesis_id, item.defect_state.fingerprint)
+            if seed_visit in completed_seed_visits:
+                continue
             node = graph.nodes.get(item.node_ref)
             if node is None or not graph.analysis_start_eligible(item.node_ref):
                 continue
@@ -2467,7 +2475,6 @@ class AgenticRecursiveAnalyzer:
                 },
             )
             remaining = max(0, self.max_judge_requests - state.judge_requests)
-            state.logical_judge_calls += 1
             self._checkpoint_state(
                 state, "global:before:{0}".format(item.visit_key)
             )
@@ -2484,6 +2491,7 @@ class AgenticRecursiveAnalyzer:
                     raise TypeError(
                         "global Judge returned an unsupported judgment"
                     )
+                state.logical_judge_calls += 1
                 state.judge_requests += result.physical_requests
             except BoundedJudgeCallError as exc:
                 state.judge_requests += exc.physical_requests
@@ -2520,6 +2528,7 @@ class AgenticRecursiveAnalyzer:
                 "seed_ref": item.node_ref,
                 "hypothesis_id": item.hypothesis_id,
                 "defect_fingerprint": item.defect_state.fingerprint,
+                "visit_key": item.visit_key,
                 "physical_request_delta": result.physical_requests,
                 "candidate_compression": metrics,
                 "candidate_evidence_capsules": [

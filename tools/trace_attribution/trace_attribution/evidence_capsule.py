@@ -175,7 +175,6 @@ def build_candidate_evidence_capsules(
                 candidate={
                     "ref": ref,
                     "source": candidate.source,
-                    "retrieval_score": candidate.score,
                     "retrieval_is_not_causal_verdict": True,
                     "root_candidate_eligible": (
                         root_candidate_eligible(node)

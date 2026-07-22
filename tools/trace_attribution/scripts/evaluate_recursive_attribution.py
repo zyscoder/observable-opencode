@@ -325,6 +325,7 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
     ):
         _list(report.get(key), "report.{0}".format(key))
     seed_identities: Set[Tuple[str, str]] = set()
+    report_start_refs = {item for item in _list(report.get("start_refs"), "report.start_refs") if isinstance(item, str)}
     for index, raw in enumerate(report["seed_results"]):
         item = _mapping(raw, "report.seed_results[{0}]".format(index))
         _exact_keys(
@@ -336,6 +337,10 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         fingerprint = item.get("defect_fingerprint")
         if not isinstance(start_ref, str) or not start_ref:
             raise EvaluationSchemaError("seed result start_ref must be non-empty")
+        if start_ref not in report_start_refs:
+            raise EvaluationSchemaError(
+                "seed result start_ref must belong to report.start_refs"
+            )
         if not isinstance(fingerprint, str) or not fingerprint:
             raise EvaluationSchemaError(
                 "seed result defect_fingerprint must be non-empty"

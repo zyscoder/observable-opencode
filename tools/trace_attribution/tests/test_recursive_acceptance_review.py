@@ -321,6 +321,16 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         with self.assertRaises(EvaluationSafetyError):
             self.compare(report)
 
+    def test_evaluator_rejects_forged_confirmed_seed_binding(self):
+        report = copy.deepcopy(self.report)
+        seed = report["seed_results"][0]
+        seed["outcome"] = "confirmed_root"
+        seed["confirmed_root_refs"] = ["record:invented"]
+        seed["confirmation_identities"] = ["confirmation:invented"]
+
+        with self.assertRaises((EvaluationSchemaError, EvaluationSafetyError)):
+            self.compare(report)
+
     def test_ambiguous_source_trace_duplicate_record_is_rejected(self):
         trace = json.loads((FIXTURE_ROOT / "sphinx_recursive_minimal.json").read_text())
         trace.pop("human_labels")
