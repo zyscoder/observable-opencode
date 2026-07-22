@@ -9011,4 +9011,85 @@ describe("case trace", () => {
     expect(record.data.business_payload.type).toBe("object")
     expect(record.data.business_payload.artifact_id).toBeTruthy()
   })
+
+  test("closes the exact Astropy producer claim and artifact bundle facts", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-task5-astropy-closure-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "astropy-closure.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const response =
+      "All 11 tests pass. The fix was a one-character change in `astropy/modeling/separable.py:245`: `= 1` → `= right`. When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix from a nested compound model), it was filling the block with all 1s instead of the actual matrix values, causing nested compound models to appear non-separable."
+    const artifactPayload = `task-5-artifact-closure:${"verifiable semantic evidence ".repeat(100)}`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ subjectRevision: "git:task5-current-producer" })`,
+        `CaseTrace.responseOutput({ response_role: "final_answer", text: ${JSON.stringify(response)} })`,
+        `CaseTrace.event({ component: "context", event_type: "context.before_compaction", data: { payload: ${JSON.stringify(artifactPayload)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "task5-astropy-closure",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "512",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDir = path.join(dir, "task5-astropy-closure")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const claimTexts = claims.map((record: any) => record.data.text)
+
+    expect(trace.manifest.subject_revision).toBe("git:task5-current-producer")
+    expect(trace.manifest.subject_revision_provenance).toMatchObject({
+      method: "case_trace_config",
+      source: "CaseTraceConfig.subjectRevision",
+      bound_at: "case_start",
+      case_id: trace.manifest.case_id,
+      run_id: trace.manifest.run_id,
+    })
+    expect(claimTexts).toEqual([
+      "All 11 tests pass.",
+      "The fix was a one-character change in `astropy/modeling/separable.py:245`: `= 1` → `= right`.",
+      "When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix from a nested compound model), it was filling the block with all 1s instead of the actual matrix values, causing nested compound models to appear non-separable.",
+    ])
+    expect(claimTexts.some((text: string) => /^[,，;；)）\]］}｝]/.test(text))).toBe(false)
+    for (const claim of claims) {
+      expectResponseClaimAtomizationClosure(claim.data)
+      const [start, end] = claim.data.source_byte_range
+      expect(Buffer.from(response).subarray(start, end).toString()).toContain(claim.data.text)
+    }
+
+    const artifact = trace.artifacts.find((item: any) => item.label === "context.context.before_compaction.data")
+    expect(artifact.availability).toBe("bundled")
+    expect(typeof artifact.path).toBe("string")
+    expect(typeof artifact.content_hash).toBe("string")
+    expect(typeof artifact.byte_length).toBe("number")
+    expect(Array.isArray(artifact.semantic_slices)).toBe(true)
+    expect(path.isAbsolute(artifact.path)).toBe(false)
+    expect(artifact.path.split(path.sep)).not.toContain("..")
+    const artifactBytes = await fs.readFile(path.join(caseDir, artifact.path))
+    expect(artifact.byte_length).toBe(artifactBytes.byteLength)
+    expect(artifact.content_hash).toBe(createHash("sha256").update(artifactBytes).digest("hex").slice(0, 16))
+    expect(artifact.semantic_slices.length).toBeGreaterThan(0)
+    for (const slice of artifact.semantic_slices) {
+      const [start, end] = slice.byte_range
+      const bytes = artifactBytes.subarray(start, end)
+      expect(bytes.toString()).toBe(slice.content)
+      expect(slice.hash).toBe(createHash("sha256").update(bytes).digest("hex").slice(0, 16))
+      expect(slice.truncated).toBe(true)
+    }
+  })
 })

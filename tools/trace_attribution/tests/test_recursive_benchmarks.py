@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import tempfile
@@ -27,9 +28,10 @@ from trace_attribution.causal_state import (
     semantic_anchor_index,
     semantic_occurrence_index,
 )
+from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
-from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
+from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "recursive_cases"
@@ -215,6 +217,167 @@ def run_fixture(path: Path):
         trace["case_id"], graph.nodes, report.to_dict(), graph=graph
     )
     return annotated, human_labels, judge
+
+
+def task5_broken_claim_fragments(trace: dict) -> list[str]:
+    return [
+        text
+        for record in trace.get("records") or []
+        if record.get("event_type") == "response.claim"
+        for text in [record.get("data", {}).get("text")]
+        if isinstance(text, str) and text.lstrip().startswith((",", "，", ";", "；", ")", "）"))
+    ]
+
+
+class TraceFactClosureBenchmarkTest(unittest.TestCase):
+    def test_legacy_archive_fixture_fails_closed_without_rewriting_historical_gaps(self):
+        trace = {
+            "manifest": {"case_id": "legacy-astropy", "run_id": "legacy-run"},
+            "artifacts": [
+                {
+                    "artifact_id": "legacy_missing_artifact",
+                    "kind": "text",
+                    "path": "artifacts/sha256/legacy.txt",
+                    "availability": "bundled",
+                    "hash": "0123456789abcdef",
+                    "content_hash": "0123456789abcdef",
+                    "byte_length": 128,
+                }
+            ],
+            "records": [
+                {
+                    "record_id": "legacy_claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "text": ", a pre-computed separability matrix from a nested compound model), it used the wrong values.",
+                        "artifact_id": "legacy_missing_artifact",
+                    },
+                }
+            ],
+            "dataflow_edges": [],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            graph = TraceGraph.from_trace(trace, artifact_root=Path(directory))
+            for ref in graph.nodes:
+                graph.hydrate_node(ref)
+
+        self.assertEqual(len(task5_broken_claim_fragments(trace)), 1)
+        self.assertNotIn("subject_revision", trace["manifest"])
+        self.assertEqual(
+            {
+                key: graph.artifact_hydration[key]
+                for key in ("loaded", "missing", "truncated", "slice_fallbacks", "hash_mismatches")
+            },
+            {"loaded": 0, "missing": 1, "truncated": 0, "slice_fallbacks": 0, "hash_mismatches": 0},
+        )
+        self.assertEqual(
+            [
+                ref
+                for ref in graph.default_start_refs()
+                if graph.nodes[ref].event_type == "external.evaluation_fact"
+            ],
+            [],
+        )
+        self.assertEqual(graph.nodes["record:legacy_claim"].data["text"], trace["records"][0]["data"]["text"])
+
+    def test_current_terminalbench_fixture_is_a_revision_matched_failed_seed(self):
+        slice_content = "SIGINT leaves async workers running."
+        full_content = slice_content + " Detailed shutdown diagnostics follow."
+        trace = {
+            "manifest": {
+                "case_id": "current-terminalbench",
+                "run_id": "current-terminalbench-run",
+                "subject_revision": "git:task5-terminalbench",
+                "subject_revision_provenance": {
+                    "method": "case_trace_config",
+                    "source": "CaseTraceConfig.subjectRevision",
+                    "bound_at": "case_start",
+                    "case_id": "current-terminalbench",
+                    "run_id": "current-terminalbench-run",
+                },
+            },
+            "artifacts": [
+                {
+                    "artifact_id": "terminalbench_output",
+                    "kind": "text",
+                    "path": "artifacts/sha256/terminalbench.txt",
+                    "availability": "bundled",
+                    "hash": hashlib.sha256(full_content.encode("utf-8")).hexdigest()[:16],
+                    "content_hash": hashlib.sha256(full_content.encode("utf-8")).hexdigest()[:16],
+                    "byte_length": len(full_content.encode("utf-8")),
+                    "semantic_slices": [
+                        {
+                            "byte_range": [0, len(slice_content.encode("utf-8"))],
+                            "content": slice_content,
+                            "hash": hashlib.sha256(slice_content.encode("utf-8")).hexdigest()[:16],
+                            "truncated": True,
+                        }
+                    ],
+                }
+            ],
+            "records": [
+                {
+                    "record_id": "terminalbench_result",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {"artifact_id": "terminalbench_output"},
+                }
+            ],
+            "dataflow_edges": [],
+        }
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                {
+                    "source": "terminalbench",
+                    "scope": "cancel_async_tasks_after_sigint",
+                    "subject_revision": "git:task5-terminalbench",
+                    "assertion": "All async tasks are cancelled after SIGINT.",
+                    "observation": "The external evaluator found async workers still running.",
+                    "status": "failed",
+                    "observed_at": "2026-07-21T12:00:00Z",
+                    "evidence_refs": ["record:terminalbench_result"],
+                    "provenance": {"method": "terminalbench_grader", "version": "1.0"},
+                }
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            graph = TraceGraph.from_trace(trace, artifact_root=Path(directory))
+            for ref in graph.nodes:
+                graph.hydrate_node(ref)
+            starts = graph.default_start_refs()
+            state = RecursiveAnalysisState.create(
+                graph=graph,
+                start_refs=starts,
+                objective="Find why async task cancellation failed.",
+                analysis_perspective="Use only reconstructed formal facts.",
+            )
+
+        self.assertEqual(len(task5_broken_claim_fragments(trace)), 0)
+        self.assertEqual(
+            {
+                key: graph.artifact_hydration[key]
+                for key in ("loaded", "missing", "truncated", "slice_fallbacks", "hash_mismatches")
+            },
+            {"loaded": 1, "missing": 0, "truncated": 1, "slice_fallbacks": 1, "hash_mismatches": 0},
+        )
+        hydrated = graph.nodes["record:terminalbench_result"].data["hydrated_artifacts"][0]
+        self.assertEqual(hydrated["source"], "embedded_semantic_slice")
+        self.assertTrue(hydrated["truncated"])
+        self.assertEqual(hydrated["hash_status"], "verified")
+        self.assertEqual(len(starts), 1)
+        external = graph.nodes[starts[0]]
+        self.assertEqual(external.event_type, "external.evaluation_fact")
+        self.assertEqual(external.status, "failed")
+        self.assertEqual(external.data["revision_status"], "matched")
+        self.assertEqual(external.data["revision_provenance_status"], "valid")
+        self.assertTrue(external.data["eligible_for_decisive_judgment"])
+        self.assertFalse(external.data["root_candidate_eligible"])
+        self.assertEqual(state.seed_count, 1)
+        self.assertEqual(next(iter(state.defect_states.values())).label, "external_evaluation_failed")
 
 
 class SemanticAnchorTest(unittest.TestCase):
