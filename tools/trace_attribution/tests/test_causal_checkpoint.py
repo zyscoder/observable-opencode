@@ -53,6 +53,26 @@ def sample_trace() -> dict:
     }
 
 
+def trace_with_audit_only_external() -> dict:
+    trace = sample_trace()
+    trace["records"].append(
+        {
+            "record_id": "forged_external",
+            "component": "evaluation",
+            "event_type": "external.evaluation_fact",
+            "status": "failed",
+            "data": {
+                "status": "failed",
+                "revision_status": "matched",
+                "revision_provenance_status": "valid",
+                "eligible_for_decisive_judgment": True,
+                "observation": "FORGED_AUDIT_ONLY_PAYLOAD",
+            },
+        }
+    )
+    return trace
+
+
 def sample_config(**changes: object) -> dict:
     values = {
         "trace": sample_trace(),
@@ -342,7 +362,204 @@ class InterruptingTools:
         raise AssertionError("an interrupted investigation must not be repeated")
 
 
+class InjectedRestoreCheckpoint:
+    def __init__(self, state, root: Path) -> None:
+        self.state = state
+        self.output_commit_path = root / "output-commit.json"
+
+    def initialize(self, config) -> None:
+        return None
+
+    def restore(self, *, expected_config=None):
+        return self.state
+
+
 class CausalCheckpointTest(unittest.TestCase):
+    def test_checkpoint_config_fingerprints_graph_evidence_eligibility_policy(self):
+        config = sample_config()
+
+        self.assertEqual(
+            config["evidence_eligibility_policy"],
+            "graph-external-evidence-eligibility/v1",
+        )
+        semantic = {
+            key: value for key, value in config.items() if key != "config_fingerprint"
+        }
+        self.assertEqual(config["config_fingerprint"], _sha256(semantic))
+
+    def test_restore_rejects_checkpoint_from_before_evidence_eligibility_policy(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            manifest["config"].pop("evidence_eligibility_policy", None)
+            manifest["config"]["schema_version"] = "recursive-attribution-checkpoint/v2"
+            semantic = {
+                key: value
+                for key, value in manifest["config"].items()
+                if key != "config_fingerprint"
+            }
+            manifest["config"]["config_fingerprint"] = _sha256(semantic)
+            unsigned = {
+                key: value for key, value in manifest.items() if key != "manifest_hash"
+            }
+            manifest["manifest_hash"] = _sha256(unsigned)
+            bundle.manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(root).restore(expected_config=sample_config())
+
+    def test_restore_rejects_older_evidence_eligibility_policy_identity(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            manifest["config"]["evidence_eligibility_policy"] = (
+                "graph-external-evidence-eligibility/v0"
+            )
+            semantic = {
+                key: value
+                for key, value in manifest["config"].items()
+                if key != "config_fingerprint"
+            }
+            manifest["config"]["config_fingerprint"] = _sha256(semantic)
+            unsigned = {
+                key: value for key, value in manifest.items() if key != "manifest_hash"
+            }
+            manifest["manifest_hash"] = _sha256(unsigned)
+            bundle.manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(root).restore(expected_config=sample_config())
+
+    def test_recursive_restore_rejects_audit_only_refs_across_all_state_surfaces(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            trace = trace_with_audit_only_external()
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config(trace=trace)
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+                stop_requested=lambda: True,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            for surface in (
+                "hypothesis",
+                "visit",
+                "investigation",
+                "judgment",
+            ):
+                with self.subTest(surface=surface):
+                    frontier_records = json.loads(json.dumps(restored.frontier_records))
+                    hypothesis_records = json.loads(json.dumps(restored.hypothesis_records))
+                    actions = json.loads(json.dumps(restored.actions))
+                    action_snapshot = next(
+                        item
+                        for item in reversed(actions)
+                        if item["operation"] == "state_snapshot"
+                    )
+                    if surface == "hypothesis":
+                        hypothesis_records[-1]["payload"]["hypotheses"][0][
+                            "supporting_evidence"
+                        ].append(
+                            {
+                                "ref": "record:forged_external",
+                                "reason": "Restored audit-only evidence.",
+                                "confidence": 1.0,
+                            }
+                        )
+                    elif surface == "visit":
+                        frontier_records[-1]["payload"]["visit_evidence"][
+                            "restored-visit"
+                        ] = ["record:forged_external"]
+                    elif surface == "investigation":
+                        action_snapshot["payload"]["investigation_evidence"] = {
+                            "restored-visit": [
+                                {"resolved_refs": ["record:forged_external"]}
+                            ]
+                        }
+                    else:
+                        action_snapshot["payload"]["step_judgments"].append(
+                            CausalStepJudgment(
+                                current_node_ref="record:only",
+                                current_defect_status="unknown",
+                                current_defect_reason="Restored judgment.",
+                                predecessors=(),
+                                missing_evidence=("record:forged_external",),
+                                confidence=0.0,
+                            ).to_dict()
+                        )
+
+                    with self.assertRaisesRegex(ValueError, "evidence eligibility"):
+                        RecursiveAnalysisState.from_checkpoint(
+                            graph=TraceGraph.from_trace(trace),
+                            checkpoint=replace(
+                                restored,
+                                frontier_records=tuple(frontier_records),
+                                hypothesis_records=tuple(hypothesis_records),
+                                actions=tuple(actions),
+                            ),
+                        )
+
+    def test_completed_and_pending_reports_reject_restored_audit_only_refs(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            trace = trace_with_audit_only_external()
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config(trace=trace)
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            for report_state in ("completed", "pending"):
+                with self.subTest(report_state=report_state):
+                    actions = json.loads(json.dumps(restored.actions))
+                    report_action = next(
+                        item
+                        for item in reversed(actions)
+                        if item["operation"] == "analysis_ready"
+                    )
+                    if report_state == "completed":
+                        report_action["operation"] = "analysis_completed"
+                    report_action["payload"]["report"]["metadata"][
+                        "restored_evidence_refs"
+                    ] = ["record:forged_external"]
+                    injected = InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(actions)), root
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "evidence eligibility"):
+                        AgenticRecursiveAnalyzer(
+                            judge=CountingOfflineJudge(),
+                            checkpoint=injected,
+                            checkpoint_config=config,
+                        ).analyze(
+                            TraceGraph.from_trace(trace),
+                            start_refs=["record:only"],
+                            objective="Find the defect.",
+                            analysis_perspective="Improve repository reasoning.",
+                        )
+
     def test_snapshot_commit_has_one_run_id_and_global_transaction_sequence(self):
         with tempfile.TemporaryDirectory() as tempdir:
             bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")

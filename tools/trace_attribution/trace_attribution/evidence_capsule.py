@@ -152,12 +152,15 @@ def build_candidate_evidence_capsules(
             "artifact:{0}".format(item)
             for item in artifact_hydration.get("missing_artifact_ids") or []
         ]
+        retrieval_edge = graph.sanitize_edge_evidence(candidate.edge)
         evidence_refs = _dedupe_strings(
-            [
-                *candidate.evidence_refs,
-                *(candidate.edge.get("evidence_refs") or ()),
-                *node.source_refs,
-            ]
+            graph.filter_evidence_refs(
+                [
+                    *candidate.evidence_refs,
+                    *(retrieval_edge.get("evidence_refs") or ()),
+                    *node.source_refs,
+                ]
+            )
         )
         evidence_references = []
         for evidence_ref in evidence_refs:
@@ -178,7 +181,7 @@ def build_candidate_evidence_capsules(
                         root_candidate_eligible(node)
                         and node.event_type not in GLOBAL_EVIDENCE_ONLY_EVENT_TYPES
                     ),
-                    "retrieval_edge": dict(candidate.edge),
+                    "retrieval_edge": retrieval_edge,
                     "node": node.compact(max_chars=3200),
                 },
                 downstream_path=path,

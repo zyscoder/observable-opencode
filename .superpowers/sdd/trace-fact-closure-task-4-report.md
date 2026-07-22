@@ -438,3 +438,104 @@ resulting SHA.
   exactly from the strict payload and formal manifest provenance are
   intentionally retained as audit-only. No dependencies, Agent behavior, LLM
   calls, or TypeScript surfaces changed.
+
+## Fourth Review Fix Wave
+
+### RED
+
+- Edge-carried evidence refs in temporal context and global evidence capsules:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_temporal_context_filters_ineligible_resolved_evidence_refs_only tools.trace_attribution.tests.test_evidence_capsule.CandidateEvidenceCapsuleTest.test_capsule_filters_audit_only_external_refs_but_preserves_other_ref_classes -v
+  Ran 2 tests - FAILED (failures=2)
+  ```
+
+  Both failures showed that an eligible edge could carry an audit-only
+  external node ref into Judge-visible structures. The matched passed external
+  ref, normal record ref, artifact ref, and unresolved raw ref were present as
+  expected.
+
+- Checkpoint policy identity and restored state/report validation:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_checkpoint_config_fingerprints_graph_evidence_eligibility_policy tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_restore_rejects_checkpoint_from_before_evidence_eligibility_policy tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_restore_rejects_older_evidence_eligibility_policy_identity tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_recursive_restore_rejects_audit_only_refs_across_all_state_surfaces tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_completed_and_pending_reports_reject_restored_audit_only_refs -v
+  Ran 5 tests - FAILED (failures=6, errors=3)
+  ```
+
+  The failures proved that pre-policy state resumed and that hypothesis,
+  visit, investigation, judgment, and pending report refs were trusted. Two
+  errors proved the policy field was absent; the completed-report fixture was
+  then corrected to model the durable action directly.
+
+- Completed and pending report validation was also proven independently by
+  temporarily reverting only the new return-path guards:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_completed_and_pending_reports_reject_restored_audit_only_refs -v
+  Ran 1 test - FAILED (failures=2)
+  ```
+
+- The final request-assembly review found visit and investigation evidence was
+  added after the context builder's sanitizer:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_step_request_resanitizes_visit_and_investigation_evidence -v
+  Ran 1 test - FAILED (failures=1)
+  ```
+
+### Implementation
+
+- Added `TraceGraph.filter_evidence_refs()` as the central policy boundary.
+  Any ref that resolves to a trace node must pass `evidence_eligible()`;
+  unresolved artifact/raw refs remain unchanged. Edge context, incoming edge
+  context, and temporal adjacency all sanitize refs before returning them.
+- Defensively reapplied the policy in evidence capsule and judgment context
+  construction, including retrieval edges, candidate refs, hypothesis
+  evidence, downstream judgment evidence, source refs, and temporal evidence.
+  Audit-only external payloads are therefore never hydrated through those
+  refs. Matched passed external evidence remains available as counterevidence.
+- Added the deterministic
+  `graph-external-evidence-eligibility/v1` policy identity to the strict
+  checkpoint config schema and config fingerprint, and bumped the checkpoint
+  schema to `recursive-attribution-checkpoint/v3`. Pre-policy and older-policy
+  manifests fail compatibility validation before resume.
+- Added recursive restored-value validation for frontier/visit, hypothesis,
+  action/investigation/judgment state and for pending/completed reports before
+  materialization or return. This closes every current checkpoint surface
+  containing node refs rather than filtering only causal candidates.
+- Reapplied the judgment-context sanitizer after live visit and investigation
+  evidence is attached to each step request, before hashing and Judge delivery.
+
+### GREEN
+
+- New boundary, policy, restore, and current-resume regressions:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_temporal_context_filters_ineligible_resolved_evidence_refs_only tools.trace_attribution.tests.test_evidence_capsule.CandidateEvidenceCapsuleTest.test_capsule_filters_audit_only_external_refs_but_preserves_other_ref_classes tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_checkpoint_config_fingerprints_graph_evidence_eligibility_policy tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_restore_rejects_checkpoint_from_before_evidence_eligibility_policy tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_restore_rejects_older_evidence_eligibility_policy_identity tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_recursive_restore_rejects_audit_only_refs_across_all_state_surfaces tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_completed_and_pending_reports_reject_restored_audit_only_refs tools.trace_attribution.tests.test_causal_checkpoint.CausalCheckpointTest.test_completed_recursive_run_restores_exact_report_without_repeating_calls -v
+  Ran 8 tests - OK
+  ```
+
+- Focused graph/evidence capsule/judgment/checkpoint/recursive suites:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools/trace_attribution/tests/test_evaluation_facts.py tools/trace_attribution/tests/test_causal_retrieval.py tools/trace_attribution/tests/test_evidence_capsule.py tools/trace_attribution/tests/test_causal_judge.py tools/trace_attribution/tests/test_global_judge.py tools/trace_attribution/tests/test_causal_checkpoint.py tools/trace_attribution/tests/test_recursive_analyzer.py tools/trace_attribution/tests/test_recursive_acceptance_review.py -v
+  Ran 277 tests - OK
+  ```
+
+- Full Python trace-attribution suite:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest discover -s tools/trace_attribution/tests -p 'test_*.py'
+  Ran 546 tests - OK
+  ```
+
+- Python compileall and `git diff --check` passed after the final report update.
+- No TypeScript files changed, so Bun tests and TypeScript typecheck were not
+  applicable.
+
+### Concerns
+
+- None. The policy change is passive and confined to offline Python
+  attribution. Strict external status/revision semantics, exact checkpoint
+  schemas, unresolved evidence preservation, and dependency count are
+  unchanged.

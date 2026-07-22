@@ -8,6 +8,7 @@ from trace_attribution.causal_retrieval import (
     SemanticPredecessorRetriever,
     root_candidate_eligible,
 )
+from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.judgment_context import build_recursive_judgment_context
 
@@ -678,6 +679,108 @@ class CausalRetrievalTest(unittest.TestCase):
         temporal_refs = {item["from_ref"] for item in context["temporal_adjacency"]}
         self.assertNotIn("record:forged_external", temporal_refs)
         self.assertIn("record:temporal_true", temporal_refs)
+
+    def test_temporal_context_filters_ineligible_resolved_evidence_refs_only(self):
+        trace = trace_with_temporal_variants()
+        trace["manifest"] = {
+            "case_id": "temporal-variants-case",
+            "run_id": "temporal-variants-run",
+            "subject_revision": "git:abc123",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": "temporal-variants-case",
+                "run_id": "temporal-variants-run",
+            },
+        }
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                {
+                    "source": "terminalbench",
+                    "scope": "namespace_contract",
+                    "subject_revision": "git:abc123",
+                    "assertion": "The namespace contract remains compatible.",
+                    "observation": "The namespace contract passed.",
+                    "status": "passed",
+                    "observed_at": "2026-07-21T12:00:00Z",
+                    "evidence_refs": ["record:temporal_true"],
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                }
+            ],
+        )
+        passed_ref = "record:{0}".format(trace["records"][-1]["record_id"])
+        trace["records"].append(
+            {
+                **external_fact_record(
+                    "forged_external",
+                    status="failed",
+                    revision_status="matched",
+                    decisive=True,
+                ),
+                "data": {
+                    **external_fact_record(
+                        "forged_external",
+                        status="failed",
+                        revision_status="matched",
+                        decisive=True,
+                    )["data"],
+                    "observation": "FORGED_AUDIT_ONLY_PAYLOAD",
+                },
+            }
+        )
+        expected_refs = [
+            passed_ref,
+            "record:temporal_true",
+            "artifact:raw-proof",
+            "raw:unresolved-proof",
+        ]
+        trace["dataflow_edges"][0]["evidence_refs"] = [
+            "record:forged_external",
+            *expected_refs,
+        ]
+        graph = TraceGraph.from_trace(trace)
+        defect_state = sample_defect_state()
+        hypothesis = sample_hypothesis(defect_state).with_updates(
+            supporting_evidence=(
+                HypothesisEvidence(
+                    "record:forged_external",
+                    "Audit-only support must be removed.",
+                    1.0,
+                ),
+                HypothesisEvidence(
+                    passed_ref,
+                    "Matched passed counterevidence remains available.",
+                    1.0,
+                ),
+            )
+        )
+
+        context = build_recursive_judgment_context(
+            graph=graph,
+            node_ref="record:decision",
+            defect_state=defect_state,
+            hypothesis=hypothesis,
+            candidates=[],
+            downstream_path=["record:decision"],
+        )
+
+        temporal = next(
+            item
+            for item in context["temporal_adjacency"]
+            if item["from_ref"] == "record:temporal_true"
+        )
+        self.assertEqual(temporal["evidence_refs"], expected_refs)
+        self.assertEqual(
+            [item["ref"] for item in context["hypothesis"]["supporting_evidence"]],
+            [passed_ref],
+        )
+        self.assertNotIn("record:forged_external", json.dumps(context))
+        self.assertNotIn("FORGED_AUDIT_ONLY_PAYLOAD", json.dumps(context))
 
     def test_sibling_retrieval_accepts_every_concrete_recorded_node_type(self):
         graph = TraceGraph.from_trace(trace_with_all_concrete_siblings())

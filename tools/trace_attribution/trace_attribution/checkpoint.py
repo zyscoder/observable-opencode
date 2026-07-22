@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
 
-CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v2"
+CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v3"
 OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v1"
 CHECKPOINT_CONFIG_KEYS = frozenset(
     {
@@ -29,6 +30,7 @@ CHECKPOINT_CONFIG_KEYS = frozenset(
         "model_identity",
         "cache_identity",
         "runtime_identity",
+        "evidence_eligibility_policy",
         "config_fingerprint",
     }
 )
@@ -207,14 +209,17 @@ def build_checkpoint_config(
         "model_identity": str(model_identity),
         "cache_identity": str(cache_identity),
         "runtime_identity": _validated_runtime(runtime_identity),
+        "evidence_eligibility_policy": EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
     }
     return {**semantic, "config_fingerprint": _sha256(semantic)}
 
 
 def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
-    config = _exact_mapping(value, CHECKPOINT_CONFIG_KEYS, "checkpoint config")
-    if config["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+    if not isinstance(value, Mapping):
+        raise CheckpointCorruptionError("checkpoint config must be an object")
+    if value.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise CheckpointCompatibilityError("unsupported checkpoint schema version")
+    config = _exact_mapping(value, CHECKPOINT_CONFIG_KEYS, "checkpoint config")
     start_refs = config["start_refs"]
     if not isinstance(start_refs, list) or any(not isinstance(item, str) for item in start_refs):
         raise CheckpointCompatibilityError("start_refs must be a list of strings")
@@ -227,10 +232,15 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
         "analysis_perspective",
         "model_identity",
         "cache_identity",
+        "evidence_eligibility_policy",
         "config_fingerprint",
     ):
         if not isinstance(config[key], str):
             raise CheckpointCompatibilityError("{0} must be a string".format(key))
+    if config["evidence_eligibility_policy"] != EVIDENCE_ELIGIBILITY_POLICY_IDENTITY:
+        raise CheckpointCompatibilityError(
+            "unsupported graph evidence eligibility policy"
+        )
     semantic = {key: config[key] for key in config if key != "config_fingerprint"}
     if config["config_fingerprint"] != _sha256(semantic):
         raise CheckpointCorruptionError("checkpoint config fingerprint does not match contents")

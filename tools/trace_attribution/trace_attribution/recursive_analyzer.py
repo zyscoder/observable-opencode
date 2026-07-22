@@ -59,7 +59,11 @@ from .investigation import (
     InvestigationDirective,
     InvestigationResult,
 )
-from .judgment_context import build_recursive_judgment_context, task_obligations
+from .judgment_context import (
+    build_recursive_judgment_context,
+    sanitize_judge_evidence_payload,
+    task_obligations,
+)
 from .models import JsonDict, TraceNode, stable_json
 
 
@@ -1038,6 +1042,18 @@ class RecursiveAnalysisState:
             raise ValueError("unsupported recursive hypothesis state schema")
         if action_payload["schema"] != ACTION_STATE_SCHEMA:
             raise ValueError("unsupported recursive action state schema")
+        graph.assert_evidence_eligible_references(
+            frontier_payload,
+            label="restored recursive frontier state",
+        )
+        graph.assert_evidence_eligible_references(
+            hypothesis_payload,
+            label="restored recursive hypothesis state",
+        )
+        graph.assert_evidence_eligible_references(
+            action_payload,
+            label="restored recursive action state",
+        )
 
         state = cls(
             graph=graph,
@@ -1224,6 +1240,7 @@ class RecursiveAnalysisState:
         investigated = self.investigation_evidence.get(item.visit_key, [])
         if investigated:
             context["investigation_evidence"] = copy.deepcopy(investigated)
+        context = sanitize_judge_evidence_payload(graph, context)
         context["evidence_hash"] = hashlib.sha256(
             stable_json(context).encode("utf-8")
         ).hexdigest()
@@ -2661,6 +2678,10 @@ class AgenticRecursiveAnalyzer:
             )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
+                analysis_graph.assert_evidence_eligible_references(
+                    final_report,
+                    label="restored completed report",
+                )
                 report = RecursiveAttributionReport.from_dict(final_report)
                 if restored_checkpoint.tail_repair_count:
                     metadata = dict(report.metadata)
@@ -2683,6 +2704,10 @@ class AgenticRecursiveAnalyzer:
             if pending_report is not None and (
                 not pending_interrupted or self.checkpoint.output_commit_path.exists()
             ):
+                analysis_graph.assert_evidence_eligible_references(
+                    pending_report,
+                    label="restored pending report",
+                )
                 report = RecursiveAttributionReport.from_dict(pending_report)
                 if restored_checkpoint.tail_repair_count:
                     metadata = dict(report.metadata)

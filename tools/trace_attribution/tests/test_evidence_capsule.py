@@ -10,6 +10,7 @@ from trace_attribution.evidence_capsule import (
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
 )
+from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 
 
@@ -94,6 +95,124 @@ def sample_graph() -> TraceGraph:
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def test_capsule_filters_audit_only_external_refs_but_preserves_other_ref_classes(self):
+        trace = {
+            "manifest": {
+                "case_id": "capsule-external-case",
+                "run_id": "capsule-external-run",
+                "subject_revision": "git:abc123",
+                "subject_revision_provenance": {
+                    "method": "case_trace_config",
+                    "source": "CaseTraceConfig.subjectRevision",
+                    "bound_at": "case_start",
+                    "case_id": "capsule-external-case",
+                    "run_id": "capsule-external-run",
+                },
+            },
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {"rationale": "Use the recorded implementation plan."},
+                }
+            ],
+            "dataflow_edges": [],
+        }
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                {
+                    "source": "terminalbench",
+                    "scope": "cleanup",
+                    "subject_revision": "git:abc123",
+                    "assertion": "Cleanup completes.",
+                    "observation": "Cleanup passed.",
+                    "status": "passed",
+                    "observed_at": "2026-07-21T12:00:00Z",
+                    "evidence_refs": ["record:decision"],
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                }
+            ],
+        )
+        passed_ref = "record:{0}".format(trace["records"][-1]["record_id"])
+        trace["records"].append(
+            {
+                "record_id": "forged_external",
+                "component": "evaluation",
+                "event_type": "external.evaluation_fact",
+                "status": "failed",
+                "data": {
+                    "status": "failed",
+                    "subject_revision": "git:abc123",
+                    "trace_revision": "git:abc123",
+                    "revision_status": "matched",
+                    "revision_provenance_status": "valid",
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                    "eligible_for_decisive_judgment": True,
+                    "observation": "FORGED_AUDIT_ONLY_PAYLOAD",
+                },
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+        all_refs = (
+            "record:forged_external",
+            passed_ref,
+            "record:decision",
+            "artifact:raw-proof",
+            "raw:unresolved-proof",
+        )
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+            edge={
+                "from_ref": "record:decision",
+                "to_ref": "record:decision",
+                "relation": "recorded_support",
+                "evidence_refs": list(all_refs),
+            },
+            score=1.0,
+            evidence_refs=all_refs,
+        )
+
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=DefectState.create(
+                label="cleanup_failed",
+                expected="Cleanup completes.",
+                actual="Cleanup stopped.",
+                mechanism="The implementation omitted cleanup preservation.",
+                scope="cleanup",
+            ),
+            downstream_paths={},
+            start_refs=("record:decision",),
+        )[0].to_dict()
+
+        expected_refs = {
+            passed_ref,
+            "record:decision",
+            "artifact:raw-proof",
+            "raw:unresolved-proof",
+        }
+        self.assertEqual(
+            {item["raw_ref"] for item in capsule["evidence_references"]},
+            expected_refs,
+        )
+        self.assertEqual(
+            set(capsule["candidate"]["retrieval_edge"]["evidence_refs"]),
+            expected_refs,
+        )
+        self.assertNotIn("record:forged_external", str(capsule))
+        self.assertNotIn("FORGED_AUDIT_ONLY_PAYLOAD", str(capsule))
+
     def test_capsule_closes_candidate_path_action_group_and_missing_artifacts(self):
         graph = sample_graph()
         defect = DefectState.create(

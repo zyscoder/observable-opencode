@@ -13,6 +13,17 @@ from .progress import progress_navigation_window
 
 JUDGMENT_CONTEXT_VERSION = "1.0"
 EPISODE_MEMBER_LIMIT = 16
+EVIDENCE_REF_LIST_FIELDS = frozenset(
+    {
+        "checked_evidence_refs",
+        "decisive_evidence_refs",
+        "evidence_refs",
+        "missing_evidence",
+        "opposing_evidence_refs",
+        "resolved_refs",
+        "source_refs",
+    }
+)
 
 
 def build_causal_judgment_context(
@@ -66,7 +77,7 @@ def build_causal_judgment_context(
             if not context["active_defect"].get(key)
         ],
     }
-    return context
+    return sanitize_judge_evidence_payload(graph, context)
 
 
 def build_recursive_judgment_context(
@@ -158,7 +169,38 @@ def build_recursive_judgment_context(
         "truncated_artifact_count": len(truncated_artifacts),
         "legacy_context_manifest": legacy_context["context_manifest"],
     }
-    return context
+    return sanitize_judge_evidence_payload(graph, context)
+
+
+def sanitize_judge_evidence_payload(
+    graph: TraceGraph,
+    value: Any,
+    *,
+    field_name: str = "",
+) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): sanitize_judge_evidence_payload(
+                graph,
+                child,
+                field_name=str(key),
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        if field_name in EVIDENCE_REF_LIST_FIELDS:
+            return graph.filter_evidence_refs(value)
+        if field_name in {"supporting_evidence", "opposing_evidence"}:
+            return [
+                sanitize_judge_evidence_payload(graph, child)
+                for child in value
+                if not isinstance(child, Mapping)
+                or graph.filter_evidence_refs([child.get("ref")])
+            ]
+        return [
+            sanitize_judge_evidence_payload(graph, child) for child in value
+        ]
+    return value
 
 
 def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[DefectState]:
@@ -170,10 +212,13 @@ def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[De
 
 def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -> JsonDict:
     hydrated = graph.hydrate_node(candidate.ref)
-    edge = dict(candidate.edge)
+    edge = graph.sanitize_edge_evidence(candidate.edge)
+    candidate_evidence_refs = graph.filter_evidence_refs(candidate.evidence_refs)
     edge_evidence_references = [
         ground_reference(graph, ref, edge_provenance_class(edge))
-        for ref in dedupe_raw_refs(list(edge.get("evidence_refs") or []) + list(candidate.evidence_refs))
+        for ref in dedupe_raw_refs(
+            list(edge.get("evidence_refs") or []) + candidate_evidence_refs
+        )
     ]
     return {
         "ref": candidate.ref,
@@ -185,7 +230,7 @@ def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -
             "from": ground_reference(graph, edge.get("from_ref") or candidate.ref, edge_provenance_class(edge)),
             "to": ground_reference(graph, edge.get("to_ref"), edge_provenance_class(edge)),
         },
-        "evidence_refs": list(candidate.evidence_refs),
+        "evidence_refs": candidate_evidence_refs,
         "edge_evidence_references": edge_evidence_references,
         "artifact_hydration": graph.artifact_hydration_manifest(candidate.ref),
         "node": hydrated.compact(),
@@ -294,6 +339,8 @@ def grounded_hypothesis_evidence(graph: TraceGraph, hypothesis: AttributionHypot
         ("opposing", hypothesis.opposing_evidence),
     ):
         for evidence in evidence_items:
+            if not graph.filter_evidence_refs([evidence.ref]):
+                continue
             output.append(
                 {
                     **ground_reference(graph, evidence.ref, "recorded"),
@@ -399,7 +446,10 @@ def collect_identity_values(value: Any) -> Dict[str, str]:
 
 def temporal_adjacency_context(graph: TraceGraph, node_ref: str) -> List[JsonDict]:
     """Expose temporal-only facts to the Judge without promoting them to graph predecessors."""
-    return graph.temporal_adjacency_edges(node_ref)
+    return [
+        graph.sanitize_edge_evidence(edge)
+        for edge in graph.temporal_adjacency_edges(node_ref)
+    ]
 
 
 def build_active_defect_fingerprint(*, graph: TraceGraph, path: List[str], objective: str) -> JsonDict:

@@ -6,13 +6,16 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .artifact_reader import VerifiedArtifactReader
 from .evaluation_facts import reconstruct_external_evaluation_record
 from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
+
+
+EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v1"
 
 
 @dataclass(frozen=True)
@@ -380,6 +383,47 @@ class TraceGraph:
         resolved = self.resolve(ref) or ref
         return resolved in self._evidence_eligible_refs
 
+    def filter_evidence_refs(self, refs: Iterable[Any]) -> List[str]:
+        """Keep unresolved refs and refs to nodes allowed by the evidence policy."""
+        output: List[str] = []
+        for value in refs:
+            ref = str(value or "")
+            if not ref:
+                continue
+            resolved = self.resolve(ref)
+            if resolved in self.nodes and not self.evidence_eligible(resolved):
+                continue
+            output.append(ref)
+        return output
+
+    def sanitize_edge_evidence(self, edge: Mapping[str, Any]) -> JsonDict:
+        output = dict(edge)
+        if "evidence_refs" in output:
+            refs = output.get("evidence_refs")
+            output["evidence_refs"] = self.filter_evidence_refs(
+                refs if isinstance(refs, (list, tuple)) else string_list(refs)
+            )
+        return output
+
+    def assert_evidence_eligible_references(
+        self, value: Any, *, label: str
+    ) -> None:
+        if isinstance(value, Mapping):
+            for child in value.values():
+                self.assert_evidence_eligible_references(child, label=label)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for child in value:
+                self.assert_evidence_eligible_references(child, label=label)
+            return
+        if not isinstance(value, str):
+            return
+        resolved = self.resolve(value)
+        if resolved in self.nodes and not self.evidence_eligible(resolved):
+            raise ValueError(
+                "{0} violates graph evidence eligibility: {1}".format(label, value)
+            )
+
     def analysis_start_eligible(self, ref: str) -> bool:
         resolved = self.resolve(ref) or ref
         return resolved in self._analysis_start_eligible_refs
@@ -522,7 +566,10 @@ class TraceGraph:
     def edge_context(self, from_ref: str, to_ref: str) -> List[JsonDict]:
         source = self.resolve(from_ref) or from_ref
         target = self.resolve(to_ref) or to_ref
-        return [dict(item) for item in self._edge_context_index.get((source, target), [])]
+        return [
+            self.sanitize_edge_evidence(item)
+            for item in self._edge_context_index.get((source, target), [])
+        ]
 
     def temporal_adjacency_edges(self, ref: str) -> List[JsonDict]:
         """Return advisory temporal edges whose endpoints are valid evidence."""
@@ -562,8 +609,10 @@ class TraceGraph:
                         or metadata.get("evidence_type")
                         or "temporal_only"
                     ),
-                    "evidence_refs": string_list(
-                        edge.get("evidence_refs") or metadata.get("evidence_refs")
+                    "evidence_refs": self.filter_evidence_refs(
+                        string_list(
+                            edge.get("evidence_refs") or metadata.get("evidence_refs")
+                        )
                     ),
                     "confidence": edge.get(
                         "confidence", metadata.get("confidence", 0.0)
@@ -596,7 +645,7 @@ class TraceGraph:
             ):
                 continue
             output.append(
-                {
+                self.sanitize_edge_evidence({
                     **dict(edge),
                     "from_ref": source,
                     "to_ref": target,
@@ -604,7 +653,7 @@ class TraceGraph:
                         "eligible_for_attribution"
                     ),
                     "direct_predecessor_eligible": False,
-                }
+                })
             )
         output.sort(
             key=lambda item: (
@@ -771,7 +820,7 @@ class TraceGraph:
         for (source, edge_target), edges in self._edge_context_index.items():
             if edge_target != target or (allowed is not None and source not in allowed):
                 continue
-            output.extend(dict(item) for item in edges)
+            output.extend(self.sanitize_edge_evidence(item) for item in edges)
         output.sort(
             key=lambda item: (
                 self.position(str(item.get("from_ref") or "")),
