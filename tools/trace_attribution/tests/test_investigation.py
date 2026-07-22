@@ -390,6 +390,115 @@ class InvestigationToolTest(unittest.TestCase):
         self.assertEqual(self.graph.raw_trace, before)
         self.assertEqual(self.graph._hydrated_refs, set())
 
+    def test_audit_only_external_fact_cannot_enter_judge_investigation_input(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "audit-only-investigation",
+                "records": [
+                    {
+                        "record_id": "stale_external",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                        "status": "failed",
+                        "data": {
+                            "status": "failed",
+                            "subject_revision": "git:stale",
+                            "trace_revision": "git:current",
+                            "revision_status": "mismatched",
+                            "revision_provenance_status": "valid",
+                            "provenance": {
+                                "method": "benchmark_grader",
+                                "version": "1.0",
+                            },
+                            "eligible_for_decisive_judgment": False,
+                            "offline_only": True,
+                        },
+                    },
+                    {
+                        "record_id": "normal_decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"text": "Inspect the cleanup contract."},
+                    },
+                    {
+                        "record_id": "current",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {"text": "The cleanup contract failed."},
+                    },
+                ],
+            }
+        )
+
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_node",
+                {"ref": "record:stale_external"},
+                requested_by_ref="record:stale_external",
+                reason="Inspect the stale external fact.",
+            )
+        )
+
+        self.assertIn("record:stale_external", graph.nodes)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("ineligible", result.rejection_reason)
+
+    def test_semantic_investigation_excludes_audit_only_external_fact(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "audit-only-semantic-investigation",
+                "records": [
+                    {
+                        "record_id": "stale_external",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                        "status": "failed",
+                        "data": {
+                            "status": "failed",
+                            "subject_revision": "git:stale",
+                            "trace_revision": "git:current",
+                            "revision_status": "mismatched",
+                            "revision_provenance_status": "valid",
+                            "provenance": {
+                                "method": "benchmark_grader",
+                                "version": "1.0",
+                            },
+                            "eligible_for_decisive_judgment": False,
+                            "offline_only": True,
+                            "assertion": "Inspect the cleanup contract.",
+                        },
+                    },
+                    {
+                        "record_id": "normal_decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"text": "Inspect the cleanup contract."},
+                    },
+                    {
+                        "record_id": "current",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {"text": "The cleanup contract failed."},
+                    },
+                ],
+            }
+        )
+        search = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "search_semantic_nodes",
+                {
+                    "query": "cleanup contract",
+                    "before_ref": "record:current",
+                },
+                requested_by_ref="record:current",
+                reason="Find relevant cleanup evidence.",
+            )
+        )
+        self.assertEqual(
+            [item["ref"] for item in search.payload["matches"]],
+            ["record:normal_decision"],
+        )
+
     def test_artifact_range_uses_grounded_resolver_budget_and_dedup(self):
         tools = CausalInvestigationTools(self.graph, max_artifact_bytes=8)
         directive = InvestigationDirective.create(

@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from .episodes import CausalEpisodeIndex
 from .errors import JudgeProviderUnavailable
 from .causal_retrieval import root_candidate_eligible
-from .graph import TraceGraph, eligible_for_decisive_judgment
+from .graph import TraceGraph, eligible_as_analysis_seed
 from .judgment_context import build_causal_judgment_context
 from .models import (
     AttributionReport,
@@ -51,7 +51,7 @@ class BackwardTaintAnalyzer:
         starts = [
             ref
             for ref in starts
-            if eligible_for_decisive_judgment(graph.nodes[ref])
+            if eligible_as_analysis_seed(graph.nodes[ref])
         ]
         episode_index = CausalEpisodeIndex.from_graph(graph)
         branches = [
@@ -187,6 +187,9 @@ class BackwardTaintAnalyzer:
         while queue and len(visited_order) < self.max_nodes:
             ref, path, depth = queue.popleft()
             if ref in visited or ref not in graph.nodes:
+                continue
+            if not eligible_as_analysis_seed(graph.nodes[ref]):
+                unresolved_refs.append(ref)
                 continue
             visited.add(ref)
             visited_order.append(ref)

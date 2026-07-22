@@ -22,7 +22,7 @@ from .evaluation_facts import inject_external_evaluation_facts
 from .graph import (
     TraceGraph,
     artifact_root_for_trace_path,
-    eligible_for_decisive_judgment,
+    eligible_as_analysis_seed,
 )
 from .models import stable_json
 from .quality_review import inject_quality_gap_records
@@ -293,7 +293,7 @@ def analysis_start_refs(
     resolved = tuple(graph.resolve(ref) or ref for ref in requested)
     for requested_ref, resolved_ref in zip(requested, resolved):
         node = graph.nodes.get(resolved_ref)
-        if node is None or eligible_for_decisive_judgment(node):
+        if node is None or eligible_as_analysis_seed(node):
             continue
         raise ValueError(
             "--start-ref {0} resolves to an external evaluation fact that is ineligible for decisive judgment".format(

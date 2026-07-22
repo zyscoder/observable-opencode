@@ -27,7 +27,9 @@ from trace_attribution.errors import (
     TransportCallError,
     TransportCallResult,
 )
+from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
+from trace_attribution.causal_retrieval import root_candidate_eligible
 from trace_attribution.global_judge import (
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
@@ -123,6 +125,46 @@ def observed_trace(*, branching: bool = False, artifact_content: str = "") -> di
             }
         )
     return {"case_id": "recursive-case", "records": records, "dataflow_edges": edges}
+
+
+def revision_bound_trace() -> dict:
+    return {
+        "manifest": {
+            "case_id": "external-recursive-case",
+            "run_id": "external-recursive-run",
+            "subject_revision": "git:abc123",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": "external-recursive-case",
+                "run_id": "external-recursive-run",
+            },
+        },
+        "records": [
+            {
+                "record_id": "tool_result",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {"text": "cleanup evaluation evidence"},
+            }
+        ],
+        "dataflow_edges": [],
+    }
+
+
+def external_payload(*, scope: str, status: str, subject_revision: str, evidence_refs):
+    return {
+        "source": "terminalbench",
+        "scope": scope,
+        "subject_revision": subject_revision,
+        "assertion": "Cleanup completes after SIGINT.",
+        "observation": "Cleanup evaluation result for {0}.".format(scope),
+        "status": status,
+        "observed_at": "2026-07-21T12:00:00Z",
+        "evidence_refs": list(evidence_refs),
+        "provenance": {"method": "benchmark_grader", "version": "1.0"},
+    }
 
 
 def relation(
@@ -830,7 +872,14 @@ class RecursiveTraversalTest(unittest.TestCase):
                 "observation": "Cleanup was interrupted.",
                 "scope": "process_sigint_behavior",
                 "status": "failed",
+                "subject_revision": "git:abc123",
+                "trace_revision": "git:abc123",
                 "revision_status": "matched",
+                "revision_provenance_status": "valid",
+                "provenance": {
+                    "method": "benchmark_grader",
+                    "version": "1.0",
+                },
                 "eligible_for_decisive_judgment": True,
             },
         }
@@ -890,6 +939,120 @@ class RecursiveTraversalTest(unittest.TestCase):
                         for item in report.metadata["unresolved_branches"]
                     ],
                 )
+
+    def test_mismatched_external_source_cited_by_matched_failure_never_reaches_frontier_or_judge(self):
+        trace = inject_external_evaluation_facts(
+            revision_bound_trace(),
+            [
+                external_payload(
+                    scope="stale_cleanup",
+                    status="failed",
+                    subject_revision="git:stale",
+                    evidence_refs=["record:tool_result"],
+                )
+            ],
+        )
+        source = trace["records"][-1]
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                external_payload(
+                    scope="current_cleanup",
+                    status="failed",
+                    subject_revision="git:abc123",
+                    evidence_refs=[
+                        "external_evaluation:{0}".format(source["record_id"])
+                    ],
+                )
+            ],
+        )
+        target = trace["records"][-1]
+        source_ref = "record:{0}".format(source["record_id"])
+        target_ref = "record:{0}".format(target["record_id"])
+        graph = TraceGraph.from_trace(trace)
+
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=[target_ref],
+            objective="Find the cleanup failure cause.",
+            analysis_perspective="Find the cause.",
+        )
+        judge = ScriptedCausalJudge({source_ref: step(source_ref, introduction=True)})
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            graph,
+            start_refs=[target_ref],
+            objective="Find the cleanup failure cause.",
+        )
+
+        self.assertNotIn(
+            source_ref,
+            [item["node_ref"] for item in state.frontier.snapshot()],
+        )
+        self.assertNotIn(
+            source_ref,
+            [candidate.ref for candidate in state.causal_candidates],
+        )
+        self.assertNotIn(
+            source_ref,
+            [request.current_node.ref for request in judge.requests],
+        )
+        self.assertNotIn(source_ref, report.visited_order)
+
+    def test_matched_passed_external_fact_is_counterevidence_but_never_seed_frontier_or_root(self):
+        trace = inject_external_evaluation_facts(
+            revision_bound_trace(),
+            [
+                external_payload(
+                    scope="passing_cleanup",
+                    status="passed",
+                    subject_revision="git:abc123",
+                    evidence_refs=["record:tool_result"],
+                )
+            ],
+        )
+        passed = trace["records"][-1]
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                external_payload(
+                    scope="failing_cleanup",
+                    status="failed",
+                    subject_revision="git:abc123",
+                    evidence_refs=[
+                        "external_evaluation:{0}".format(passed["record_id"])
+                    ],
+                )
+            ],
+        )
+        failed = trace["records"][-1]
+        passed_ref = "record:{0}".format(passed["record_id"])
+        failed_ref = "record:{0}".format(failed["record_id"])
+        graph = TraceGraph.from_trace(trace)
+
+        passed_seed = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=[passed_ref],
+            objective="Find the cleanup failure cause.",
+            analysis_perspective="Find the cause.",
+        )
+        failed_seed = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=[failed_ref],
+            objective="Find the cleanup failure cause.",
+            analysis_perspective="Find the cause.",
+        )
+
+        self.assertEqual(passed_seed.seed_count, 0)
+        self.assertEqual(passed_seed.frontier.snapshot(), [])
+        self.assertIn(
+            passed_ref,
+            [candidate.ref for candidate in failed_seed.causal_candidates],
+        )
+        self.assertNotIn(
+            passed_ref,
+            [item["node_ref"] for item in failed_seed.frontier.snapshot()],
+        )
+        self.assertFalse(root_candidate_eligible(graph.nodes[passed_ref]))
 
     def test_evaluation_seed_prefers_progress_navigation_over_parallel_outcome_surfaces(self):
         trace = {

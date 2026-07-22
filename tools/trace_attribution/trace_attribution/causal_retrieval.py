@@ -8,7 +8,11 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from .causal_state import AttributionHypothesis, CausalCandidate, DefectState
 from .episodes import CausalEpisodeIndex
-from .graph import TraceGraph, is_temporal_only_edge
+from .graph import (
+    TraceGraph,
+    eligible_as_attribution_evidence,
+    is_temporal_only_edge,
+)
 from .models import TraceNode
 from .progress import progress_navigation_window
 
@@ -61,7 +65,16 @@ class SemanticPredecessorRetriever:
         if resolved not in graph.nodes:
             return []
         if graph.nodes[resolved].event_type == "process.signal":
-            return merge_ranked_candidates([self._direct_candidates(graph, resolved)], limit=limit)
+            return merge_ranked_candidates(
+                [
+                    [
+                        candidate
+                        for candidate in self._direct_candidates(graph, resolved)
+                        if eligible_as_attribution_evidence(candidate.node)
+                    ]
+                ],
+                limit=limit,
+            )
         if graph.nodes[resolved].event_type == "progress.episode":
             layers = [
                 self._episode_candidates(graph, resolved, defect_state, hypothesis),
@@ -79,6 +92,14 @@ class SemanticPredecessorRetriever:
             ]
         if allow_semantic_fallback and graph.nodes[resolved].event_type != "progress.episode":
             layers.append(self._semantic_candidates(graph, resolved, defect_state, hypothesis))
+        layers = [
+            [
+                candidate
+                for candidate in layer
+                if eligible_as_attribution_evidence(candidate.node)
+            ]
+            for layer in layers
+        ]
         if is_interrupted_case_failure(graph, graph.nodes[resolved]):
             layers = [
                 [candidate for candidate in layer if not is_stale_completion_diagnostic(candidate.node)]
@@ -407,7 +428,10 @@ def identity_value(node: TraceNode, *keys: str) -> str:
 
 def is_navigation_node(node: TraceNode) -> bool:
     role = str(node.data.get("semantic_role") or node.data.get("navigation_role") or "").strip().lower()
-    return node.event_type == "progress.episode" or bool(node.data.get("offline_only")) or role in {
+    return node.event_type == "progress.episode" or (
+        bool(node.data.get("offline_only"))
+        and node.event_type != "external.evaluation_fact"
+    ) or role in {
         "aggregate",
         "navigation",
         "progress_episode",

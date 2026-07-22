@@ -266,6 +266,48 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
             fact["data"]["unresolved_evidence_refs"], ["record:not_present"]
         )
 
+    def test_matched_fact_cannot_make_mismatched_external_source_edge_eligible(self):
+        mismatched = inject_external_evaluation_facts(
+            base_trace(),
+            [
+                evaluation_payload(
+                    scope="stale_cleanup_result",
+                    subject_revision="git:stale",
+                )
+            ],
+        )
+        source = mismatched["records"][-1]
+
+        enriched = inject_external_evaluation_facts(
+            mismatched,
+            [
+                evaluation_payload(
+                    scope="current_cleanup_result",
+                    evidence_refs=[
+                        "external_evaluation:{0}".format(source["record_id"])
+                    ],
+                )
+            ],
+        )
+        target = enriched["records"][-1]
+        edge = next(
+            item
+            for item in enriched["dataflow_edges"]
+            if item["from"]["id"] == source["record_id"]
+            and item["to"]["id"] == target["record_id"]
+        )
+
+        self.assertEqual(source["data"]["revision_status"], "mismatched")
+        self.assertEqual(target["data"]["revision_status"], "matched")
+        self.assertIs(edge["eligible_for_attribution"], False)
+        self.assertEqual(target["data"]["unresolved_evidence_refs"], [])
+        graph = TraceGraph.from_trace(enriched)
+        self.assertIn("record:{0}".format(source["record_id"]), graph.nodes)
+        self.assertNotIn(
+            "record:{0}".format(source["record_id"]),
+            graph.upstream_refs("record:{0}".format(target["record_id"])),
+        )
+
     def test_ambiguous_evidence_alias_stays_unresolved_without_an_edge(self):
         trace = base_trace()
         trace["records"].append(

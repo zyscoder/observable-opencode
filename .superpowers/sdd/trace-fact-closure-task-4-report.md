@@ -277,3 +277,89 @@ resulting SHA.
   formal case-start provenance to become decisive.
 - Evaluation facts and derived eligibility remain offline-only and are not
   added to Agent prompts, context, or execution. No dependencies were added.
+
+## Second Review Fix Wave
+
+### RED
+
+- Five focused smuggling-path regressions:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_evaluation_facts.ExternalEvaluationFactsTest.test_matched_fact_cannot_make_mismatched_external_source_edge_eligible tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_semantic_search_and_fallback_exclude_audit_only_external_facts tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_malformed_eligible_edge_from_audit_only_external_source_is_filtered tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_mismatched_external_source_cited_by_matched_failure_never_reaches_frontier_or_judge tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_matched_passed_external_fact_is_counterevidence_but_never_seed_frontier_or_root -v
+  Ran 5 tests - FAILED (failures=5)
+  ```
+
+  The failures proved that a matched target upgraded a mismatched external
+  source edge, semantic search returned mismatched and unknown facts, a
+  malformed eligible edge entered graph adjacency, and mismatched and passed
+  external facts entered recursive frontier work.
+
+- Judge-directed investigation bypasses:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_investigation.InvestigationToolTest.test_audit_only_external_fact_cannot_enter_judge_investigation_input tools.trace_attribution.tests.test_investigation.InvestigationToolTest.test_semantic_investigation_excludes_audit_only_external_fact -v
+  Ran 2 tests - FAILED (failures=2)
+  ```
+
+  Direct node inspection returned the audit-only fact, and the independent
+  semantic investigation path ranked it as a Judge input.
+
+### Implementation
+
+- Added canonical `eligible_as_attribution_evidence` and
+  `eligible_as_analysis_seed` predicates. Matched `passed` and `failed` facts
+  with valid revision and grader provenance can participate as evidence; only
+  matched failed facts with explicit decisive eligibility can seed analysis.
+- Made generated and loaded graph edges validate both endpoints. Raw facts and
+  raw ineligible edges remain in the trace for audit, while audit-only external
+  endpoints are excluded from adjacency and semantic predecessor traversal.
+- Filtered graph semantic search, layered retrieval, global candidate pools,
+  checkpoint candidate restoration, legacy traversal, recursive seed/frontier
+  creation, global expansion, and final Judge request construction.
+- Kept matched passed facts available as counterevidence candidates while
+  preventing them from becoming initial seeds, recursive frontier nodes, or
+  roots.
+- Applied the same evidence predicate to direct and semantic investigation
+  tools so an audit-only fact cannot be reintroduced into a Judge request by
+  reference.
+
+### GREEN
+
+- Focused smuggling-path regressions:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_evaluation_facts.ExternalEvaluationFactsTest.test_matched_fact_cannot_make_mismatched_external_source_edge_eligible tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_semantic_search_and_fallback_exclude_audit_only_external_facts tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_malformed_eligible_edge_from_audit_only_external_source_is_filtered tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_mismatched_external_source_cited_by_matched_failure_never_reaches_frontier_or_judge tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_matched_passed_external_fact_is_counterevidence_but_never_seed_frontier_or_root -v
+  Ran 5 tests - OK
+  ```
+
+- Focused investigation regressions:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_investigation.InvestigationToolTest.test_audit_only_external_fact_cannot_enter_judge_investigation_input tools.trace_attribution.tests.test_investigation.InvestigationToolTest.test_semantic_investigation_excludes_audit_only_external_fact -v
+  Ran 2 tests - OK
+  ```
+
+- Focused evaluation, graph/retrieval, recursive CLI/analyzer, and legacy
+  suites:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools/trace_attribution/tests/test_evaluation_facts.py tools/trace_attribution/tests/test_causal_retrieval.py tools/trace_attribution/tests/test_recursive_analyzer.py tools/trace_attribution/tests/test_recursive_cli.py tools/trace_attribution/tests/test_backward_taint.py
+  Ran 241 tests - OK
+  ```
+
+- Full Python trace-attribution suite:
+
+  ```text
+  PYTHONPYCACHEPREFIX=/tmp/observable-opencode-task4-wave2-final-pycache PYTHONPATH=tools/trace_attribution python3 -m unittest discover -s tools/trace_attribution/tests -p 'test_*.py'
+  Ran 531 tests - OK
+  ```
+
+- No TypeScript files changed, so changed Bun suites and TypeScript typecheck
+  were not applicable.
+- Python compileall and `git diff --check` passed after the final report update.
+
+### Concerns
+
+- None. The change is confined to offline Python attribution and preserves all
+  audit-only nodes and unresolved evidence references without exposing them to
+  Agent execution or adding dependencies or LLM calls.

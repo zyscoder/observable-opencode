@@ -30,6 +30,36 @@ def sample_hypothesis(defect_state):
     )
 
 
+def external_fact_record(
+    record_id: str,
+    *,
+    status: str,
+    revision_status: str,
+    decisive: bool = False,
+):
+    return {
+        "record_id": record_id,
+        "component": "evaluation",
+        "event_type": "external.evaluation_fact",
+        "status": status,
+        "data": {
+            "assertion": "The namespace contract remains compatible.",
+            "observation": "The namespace contract evaluation completed.",
+            "scope": "namespace_contract",
+            "status": status,
+            "subject_revision": "git:abc123",
+            "trace_revision": (
+                "git:abc123" if revision_status == "matched" else "git:different"
+            ),
+            "revision_status": revision_status,
+            "revision_provenance_status": "valid",
+            "provenance": {"method": "benchmark_grader", "version": "1.0"},
+            "eligible_for_decisive_judgment": decisive,
+            "offline_only": True,
+        },
+    }
+
+
 def trace_with_confirmed_and_inferred_predecessors():
     return {
         "case_id": "causal-retrieval-case",
@@ -660,6 +690,96 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertIn("record:sibling", [item["ref"] for item in matches])
         self.assertEqual(graph.incoming_edge_context("record:decision"), before_edges)
         self.assertNotIn("record:sibling", graph.upstream_refs("record:decision"))
+
+    def test_semantic_search_and_fallback_exclude_audit_only_external_facts(self):
+        records = [
+            external_fact_record(
+                "mismatched_external",
+                status="failed",
+                revision_status="mismatched",
+            ),
+            external_fact_record(
+                "unknown_external",
+                status="unknown",
+                revision_status="matched",
+            ),
+            {
+                "record_id": "normal_decision",
+                "component": "processor",
+                "event_type": "decision",
+                "data": {
+                    "rationale": "Recover the missing namespace compatibility contract."
+                },
+            },
+            {
+                "record_id": "current",
+                "component": "result",
+                "event_type": "response.claim",
+                "data": {"text": "The namespace compatibility contract is missing."},
+            },
+        ]
+        graph = TraceGraph.from_trace(
+            {"case_id": "external-semantic-filter", "records": records}
+        )
+        defect_state = sample_defect_state()
+
+        matches = graph.semantic_search(
+            ["namespace", "contract"], before_ref="record:current", limit=8
+        )
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:current",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            limit=8,
+            allow_semantic_fallback=True,
+        )
+
+        self.assertEqual([item["ref"] for item in matches], ["record:normal_decision"])
+        self.assertEqual([item.ref for item in candidates], ["record:normal_decision"])
+        self.assertEqual(candidates[0].source, "semantic_fallback")
+
+    def test_malformed_eligible_edge_from_audit_only_external_source_is_filtered(self):
+        trace = {
+            "case_id": "malformed-external-edge",
+            "records": [
+                external_fact_record(
+                    "mismatched_external",
+                    status="failed",
+                    revision_status="mismatched",
+                ),
+                {
+                    "record_id": "current",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "The namespace contract failed."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "external_evaluation", "id": "mismatched_external"},
+                    "to": {"type": "record", "id": "current"},
+                    "relation": "external_evaluation_observed",
+                    "evidence_type": "external_grader",
+                    "eligible_for_attribution": True,
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        defect_state = sample_defect_state()
+
+        candidates = SemanticPredecessorRetriever().retrieve(
+            graph=graph,
+            node_ref="record:current",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            allow_semantic_fallback=True,
+        )
+
+        self.assertEqual(graph.upstream_refs("record:current"), [])
+        self.assertNotIn(
+            "record:mismatched_external", {item.ref for item in candidates}
+        )
 
     def test_semantic_fallback_has_a_bounded_exploration_quota(self):
         records = [

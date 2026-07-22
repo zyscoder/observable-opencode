@@ -6,7 +6,7 @@ import math
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .graph import record_aliases
+from .graph import eligible_as_attribution_evidence, record_aliases
 from .models import JsonDict, stable_json
 
 
@@ -45,6 +45,11 @@ def inject_external_evaluation_facts(
 
     trace_revision, revision_provenance_status = _trace_execution_revision(enriched)
     aliases = _record_alias_index(records)
+    records_by_ref = {
+        "record:{0}".format(item["record_id"]): item
+        for item in records
+        if isinstance(item, dict) and item.get("record_id")
+    }
     existing_edges: Dict[str, JsonDict] = {}
     for edge in edges:
         if not isinstance(edge, dict) or not edge.get("edge_id"):
@@ -110,6 +115,7 @@ def inject_external_evaluation_facts(
         )
         if existing is None:
             records.append(record)
+            records_by_ref["record:{0}".format(record_id)] = record
             for alias in record_aliases(record):
                 aliases.setdefault(alias, set()).add(
                     "record:{0}".format(record_id)
@@ -137,7 +143,11 @@ def inject_external_evaluation_facts(
                 "relation": "external_evaluation_observed",
                 "evidence_type": "external_grader",
                 "evidence_refs": [evidence_ref],
-                "eligible_for_attribution": revision_status == "matched",
+                "eligible_for_attribution": bool(
+                    records_by_ref.get(resolved)
+                    and eligible_as_attribution_evidence(records_by_ref[resolved])
+                    and eligible_as_attribution_evidence(record)
+                ),
                 "metadata": {
                     "revision_status": revision_status,
                     "revision_provenance_status": revision_provenance_status,

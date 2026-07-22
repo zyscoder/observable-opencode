@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from .graph import TraceGraph, is_temporal_only_edge
+from .graph import (
+    TraceGraph,
+    eligible_as_attribution_evidence,
+    is_temporal_only_edge,
+)
 from .models import JsonDict, stable_json
 
 
@@ -835,6 +839,12 @@ class CausalInvestigationTools:
         resolved = self.graph.resolve(raw_ref)
         if not resolved or resolved not in self.graph.nodes:
             raise ValueError("unresolved trace node ref: {0}".format(raw_ref))
+        if not eligible_as_attribution_evidence(self.graph.nodes[resolved]):
+            raise ValueError(
+                "trace node is ineligible for attribution evidence: {0}".format(
+                    raw_ref
+                )
+            )
         return resolved, self.graph.nodes[resolved]
 
     def _inspect_node(self, directive: InvestigationDirective) -> InvestigationResult:
@@ -1234,7 +1244,11 @@ class CausalInvestigationTools:
                 scan_truncated = True
                 break
             scanned += 1
-            if node.event_type == "progress.episode" or self.graph.position(node.ref) >= before_position:
+            if (
+                node.event_type == "progress.episode"
+                or self.graph.position(node.ref) >= before_position
+                or not eligible_as_attribution_evidence(node)
+            ):
                 continue
             tokens = set(
                 re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower())
