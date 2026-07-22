@@ -1676,20 +1676,34 @@ class SeedAttributionModelTests(unittest.TestCase):
             outcome="evidence_gap",
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
-            global_judgment={"nested": [{"status": "unknown"}]},
+            global_judgment={
+                "schema_version": "global-candidate-judgment/v2",
+                "outcome": "inconclusive",
+                "reason": "No global candidates were available.",
+                "assessments": [],
+                "selected_candidate_refs": [],
+                "expansion_requests": [],
+                "decisive_evidence_refs": [],
+                "missing_evidence": [],
+                "confidence": 0.0,
+                "active_focus_binding": {
+                    "seed_ref": "record:seed",
+                    "defect_fingerprint": state.fingerprint,
+                    "active_focus_text_hash": active_focus_text_sha256(state.actual),
+                },
+            },
             expansion_history=[{"anchor_ref": "record:a", "refs": ["record:b"]}],
         )
 
         with self.assertRaises(FrozenInstanceError):
             result.outcome = "no_defect"
         with self.assertRaises(TypeError):
-            result.global_judgment["nested"] = ()
+            result.global_judgment["active_focus_binding"]["seed_ref"] = "record:other"
         with self.assertRaises((AttributeError, TypeError)):
             result.global_judgment._entries = ()
         with self.assertRaises((AttributeError, TypeError)):
             result.expansion_history[0]._entries = ()
-        self.assertIsInstance(result.global_judgment["nested"], tuple)
-        self.assertIsInstance(result.global_judgment["nested"][0], Mapping)
+        self.assertIsInstance(result.global_judgment["active_focus_binding"], Mapping)
         self.assertEqual(result.candidate_refs, ("record:a", "record:z"))
 
         payload = result.to_dict()

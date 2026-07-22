@@ -53,6 +53,7 @@ BLOCKING_METADATA_KEYS = frozenset(
 MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v3"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v2"
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_SCHEMA_VERSION = "semantic-occurrence/v1"
@@ -1849,6 +1850,12 @@ class SeedAttributionResult:
     @classmethod
     def from_dict(cls, value: JsonDict) -> "SeedAttributionResult":
         defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
+        global_judgment = _json_dict(value.get("global_judgment"))
+        _validate_persisted_global_judgment(
+            global_judgment,
+            start_ref=str(value.get("start_ref") or ""),
+            defect_state=defect_state,
+        )
         return cls(
             start_ref=str(value.get("start_ref") or ""),
             defect_fingerprint=str(value.get("defect_fingerprint") or ""),
@@ -1865,13 +1872,71 @@ class SeedAttributionResult:
             blocking_reasons=_seed_json_string_list(
                 value.get("blocking_reasons"), "blocking_reasons"
             ),
-            global_judgment=_json_dict(value.get("global_judgment")),
+            global_judgment=global_judgment,
             expansion_history=tuple(
                 item
                 for item in value.get("expansion_history", [])
                 if isinstance(item, dict)
             ),
         )
+
+
+def _validate_persisted_global_judgment(
+    value: JsonDict,
+    *,
+    start_ref: str,
+    defect_state: DefectState,
+) -> None:
+    if not value:
+        return
+    if value.get("schema_version") != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
+        raise ValueError(
+            "persisted global judgment requires v2 migration or rejudgment"
+        )
+    required = {
+        "schema_version",
+        "outcome",
+        "reason",
+        "assessments",
+        "selected_candidate_refs",
+        "expansion_requests",
+        "decisive_evidence_refs",
+        "missing_evidence",
+        "confidence",
+        "active_focus_binding",
+    }
+    if set(value) != required:
+        raise ValueError("persisted global judgment v2 schema is incomplete")
+    binding = value.get("active_focus_binding")
+    normalized_actual = defect_state.actual.replace("\r\n", "\n").replace("\r", "\n")
+    expected_binding = {
+        "seed_ref": start_ref,
+        "defect_fingerprint": defect_state.fingerprint,
+        "active_focus_text_hash": hashlib.sha256(
+            normalized_actual.encode("utf-8")
+        ).hexdigest(),
+    }
+    if not isinstance(binding, Mapping) or dict(binding) != expected_binding:
+        raise ValueError("persisted global judgment v2 active focus binding is invalid")
+    assessments = value.get("assessments")
+    required_assessment = {
+        "candidate_ref",
+        "defect_status",
+        "input_defect_status",
+        "output_defect_status",
+        "causal_path_refs",
+        "counterfactual",
+        "compared_candidate_refs",
+        "causal_role",
+        "reason",
+        "evidence_refs",
+        "confidence",
+    }
+    if not isinstance(assessments, list) or any(
+        not isinstance(item, Mapping) or set(item) != required_assessment
+        for item in assessments
+    ):
+        raise ValueError("persisted global judgment v2 assessments are incomplete")
 
 
 def validate_seed_outcome_payload(

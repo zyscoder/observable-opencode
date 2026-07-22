@@ -237,7 +237,12 @@ class TraceGraph:
                         or metadata.get("inference_method")
                         or "trace_dataflow_edge"
                     ),
-                    edge_origin="trace.dataflow_edges",
+                    edge_origin=str(
+                        edge.get("edge_origin")
+                        or metadata.get("edge_origin")
+                        or "trace.dataflow_edges"
+                    ),
+                    source_container="trace.dataflow_edges",
                     edge_id=str(edge.get("edge_id") or ""),
                 )
                 upstream[target][source] = None
@@ -451,6 +456,21 @@ class TraceGraph:
         if resolved in self.nodes and not self.evidence_eligible(resolved):
             raise ValueError(
                 "{0} violates graph evidence eligibility: {1}".format(label, value)
+            )
+
+    def assert_resolved_evidence_references(
+        self, refs: Iterable[Any], *, label: str
+    ) -> None:
+        for value in refs:
+            ref = str(value or "")
+            resolved = self.resolve(ref)
+            if resolved in self.nodes and self.evidence_eligible(resolved):
+                continue
+            artifact = self.artifact_reference_status(ref)
+            if artifact is not None and artifact.get("resolution_status") == "resolved":
+                continue
+            raise ValueError(
+                "{0} contains unresolved grounded evidence: {1}".format(label, ref)
             )
 
     def analysis_start_eligible(self, ref: str) -> bool:
@@ -1345,6 +1365,7 @@ def add_edge_context(
     eligible_for_attribution: bool,
     inference_method: str,
     edge_origin: str,
+    source_container: str = "",
     edge_id: str = "",
 ) -> None:
     edge = {
@@ -1358,6 +1379,8 @@ def add_edge_context(
         "inference_method": inference_method,
         "edge_origin": edge_origin,
     }
+    if source_container:
+        edge["source_container"] = source_container
     if edge_id:
         edge["edge_id"] = edge_id
     bucket = index[(from_ref, to_ref)]
@@ -1376,6 +1399,7 @@ def stable_edge_signature(edge: JsonDict) -> tuple:
         tuple(str(item) for item in edge.get("evidence_refs") or []),
         str(edge.get("inference_method") or ""),
         str(edge.get("edge_origin") or ""),
+        str(edge.get("source_container") or ""),
     )
 
 

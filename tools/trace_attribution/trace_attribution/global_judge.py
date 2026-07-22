@@ -8,13 +8,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
-from .causal_state import DefectState, FrozenMapping
+from .causal_state import (
+    GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
+    DefectState,
+    FrozenMapping,
+)
 from .confirmation_path import is_confirmation_causal_edge
 from .evidence_capsule import CandidateEvidenceCapsule
 from .models import JsonDict, stable_json
 
 
-GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = "global-candidate-judgment/v2"
+GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
 GLOBAL_OUTCOMES = frozenset(
     {"candidate_roots", "no_defect", "needs_expansion", "inconclusive"}
 )
@@ -164,7 +168,10 @@ class GlobalCandidateJudgeRequest:
             refs.append(capsule.candidate_ref)
             refs.extend(value.get("downstream_path") or [])
             for reference in value.get("downstream_path_references") or []:
-                if isinstance(reference, Mapping):
+                if (
+                    isinstance(reference, Mapping)
+                    and reference.get("resolution_status") == "resolved"
+                ):
                     refs.extend(
                         str(reference.get(key) or "")
                         for key in ("raw_ref", "resolved_ref")
@@ -176,19 +183,34 @@ class GlobalCandidateJudgeRequest:
                     str(reference.get(key) or "")
                     for key in ("raw_ref", "resolved_ref", "canonical_ref")
                 )
+            resolved_evidence_refs = {
+                str(reference.get(key) or "")
+                for reference in value.get("evidence_references") or []
+                if isinstance(reference, Mapping)
+                and reference.get("resolution_status") == "resolved"
+                for key in ("raw_ref", "resolved_ref", "canonical_ref")
+            }
             action_group = value.get("action_group")
             if isinstance(action_group, Mapping):
                 for member in action_group.get("members") or []:
                     if isinstance(member, Mapping):
                         refs.append(str(member.get("ref") or ""))
-            for edge_key in ("incoming_edges", "outgoing_edges"):
+            for edge_key in (
+                "causal_path_edges",
+                "incoming_edges",
+                "outgoing_edges",
+            ):
                 for edge in value.get(edge_key) or []:
                     if not isinstance(edge, Mapping):
                         continue
                     refs.extend(
                         str(edge.get(key) or "") for key in ("from_ref", "to_ref")
                     )
-                    refs.extend(str(item) for item in edge.get("evidence_refs") or [])
+                    refs.extend(
+                        str(item)
+                        for item in edge.get("evidence_refs") or []
+                        if str(item) in resolved_evidence_refs
+                    )
         output = []
         seen = set()
         for ref in refs:

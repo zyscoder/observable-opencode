@@ -36,6 +36,7 @@ from trace_attribution.causal_retrieval import (
     root_candidate_eligible,
 )
 from trace_attribution.global_judge import (
+    GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
@@ -2139,6 +2140,44 @@ class RecursiveRootRankingTest(unittest.TestCase):
             report.confirmations[0].reason,
         )
 
+    def test_queued_confirmation_rejects_raw_temporal_origin_path(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0]["edge_origin"] = "offline.temporal_reconstruction"
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="The decision omitted required search coverage.",
+                    reason="The decision is a necessary local root.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertIn(
+            "queued confirmation path lacks a grounded non-temporal edge",
+            report.confirmations[0].reason,
+        )
+
     def test_rejected_candidate_backtracks_to_independently_confirmed_alternative(self):
         def first_step(request):
             return step(
@@ -3319,6 +3358,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             {"evidence_type": "temporal_inferred"},
             {"evidence_type": "temporal_only"},
             {"evidence_type": "temporal_advisory"},
+            {"edge_origin": "offline.temporal_reconstruction"},
             {"inference_method": "same_session_temporal_order"},
         ):
             with self.subTest(metadata=metadata):
@@ -3618,6 +3658,62 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             ("record:decision",),
         )
         self.assertNotIn("score", json.dumps(report.seed_results[0].to_dict()))
+        self.assertEqual(
+            report.seed_results[0].global_judgment["schema_version"],
+            GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+        )
+
+    def test_unresolved_global_evidence_never_reaches_persisted_root_judgment(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0]["evidence_refs"] = ["record:ghost"]
+
+        class GhostEvidenceGlobalJudge(FusionScriptedJudge):
+            def judge_candidates_bounded(self, request, *, max_physical_requests):
+                result = super().judge_candidates_bounded(
+                    request, max_physical_requests=max_physical_requests
+                )
+                judgment = result.value
+                assessments = tuple(
+                    replace(item, evidence_refs=("record:ghost",))
+                    if item.candidate_ref == "record:decision"
+                    else item
+                    for item in judgment.assessments
+                )
+                return BoundedJudgeCallResult(
+                    replace(
+                        judgment,
+                        assessments=assessments,
+                        decisive_evidence_refs=("record:ghost",),
+                    ),
+                    result.physical_requests,
+                )
+
+        judge = GhostEvidenceGlobalJudge(global_outcome="candidate_roots")
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        self.assertIn(
+            "record:ghost",
+            judge.global_requests[0].capsules[0].missing_evidence_refs,
+        )
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertNotIn(
+            "record:ghost",
+            json.dumps(report.seed_results[0].to_dict()["global_judgment"]),
+        )
+        self.assertTrue(
+            any(
+                "decisive evidence must use grounded refs" in item.get("reason", "")
+                for item in report.investigation_journal
+                if item.get("kind") == "global_candidate_pass"
+            )
+        )
 
     def test_global_inconclusive_then_recursive_confirmation_stays_conservative(self):
         judge = FusionScriptedJudge(

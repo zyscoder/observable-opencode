@@ -17,9 +17,11 @@ from trace_attribution.causal_judge import (
     OfflineJudgeCapability,
 )
 from trace_attribution.global_judge import (
+    GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
+    active_focus_text_sha256,
 )
 from trace_attribution.causal_state import (
     AttributionHypothesis,
@@ -995,6 +997,135 @@ class CausalCheckpointTest(unittest.TestCase):
             report_action["payload"]["report"].pop("schema_version")
 
             with self.assertRaisesRegex(ValueError, "schema_version"):
+                AgenticRecursiveAnalyzer(
+                    judge=CountingOfflineJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+    def test_checkpoint_report_restoration_rejects_pre_v2_global_judgment(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            trace = sample_trace()
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config(trace=trace)
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["payload"]["report"]["seed_results"][0][
+                "global_judgment"
+            ] = {
+                "outcome": "candidate_roots",
+                "assessments": [{"candidate_ref": "record:only"}],
+            }
+
+            with self.assertRaisesRegex(ValueError, "global judgment.*v2"):
+                AgenticRecursiveAnalyzer(
+                    judge=CountingOfflineJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+    def test_checkpoint_identity_includes_global_judgment_contract(self):
+        config = sample_config()
+
+        self.assertEqual(
+            config["global_judgment_contract"],
+            GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+        )
+
+    def test_completed_report_rejects_v2_global_judgment_with_unresolved_evidence(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            trace = sample_trace()
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config(trace=trace)
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["operation"] = "analysis_completed"
+            seed = report_action["payload"]["report"]["seed_results"][0]
+            defect = seed["defect_state"]
+            seed["decisive_evidence_refs"] = ["record:ghost"]
+            seed["global_judgment"] = {
+                "schema_version": GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+                "outcome": "candidate_roots",
+                "reason": "A stale candidate judgment cited missing evidence.",
+                "assessments": [
+                    {
+                        "candidate_ref": "record:only",
+                        "defect_status": "present",
+                        "input_defect_status": "absent",
+                        "output_defect_status": "present",
+                        "causal_path_refs": ["record:only"],
+                        "counterfactual": {
+                            "intervention_ref": "record:only",
+                            "intervention_kind": "replace_with_semantically_correct_behavior",
+                            "predicted_defect_status": "absent",
+                            "causal_effect": "prevents_defect",
+                        },
+                        "compared_candidate_refs": ["record:only"],
+                        "causal_role": "root_candidate",
+                        "reason": "The missing evidence was treated as proof.",
+                        "evidence_refs": ["record:ghost"],
+                        "confidence": 0.9,
+                    }
+                ],
+                "selected_candidate_refs": ["record:only"],
+                "expansion_requests": [],
+                "decisive_evidence_refs": ["record:ghost"],
+                "missing_evidence": [],
+                "confidence": 0.9,
+                "active_focus_binding": {
+                    "seed_ref": seed["start_ref"],
+                    "defect_fingerprint": defect["fingerprint"],
+                    "active_focus_text_hash": active_focus_text_sha256(
+                        defect["actual"]
+                    ),
+                },
+            }
+
+            with self.assertRaisesRegex(ValueError, "grounded evidence.*record:ghost"):
                 AgenticRecursiveAnalyzer(
                     judge=CountingOfflineJudge(),
                     checkpoint=InjectedRestoreCheckpoint(

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .causal_state import GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
 from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
@@ -31,6 +32,7 @@ CHECKPOINT_CONFIG_KEYS = frozenset(
         "cache_identity",
         "runtime_identity",
         "evidence_eligibility_policy",
+        "global_judgment_contract",
         "config_fingerprint",
     }
 )
@@ -210,6 +212,7 @@ def build_checkpoint_config(
         "cache_identity": str(cache_identity),
         "runtime_identity": _validated_runtime(runtime_identity),
         "evidence_eligibility_policy": EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
+        "global_judgment_contract": GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
     }
     return {**semantic, "config_fingerprint": _sha256(semantic)}
 
@@ -233,6 +236,7 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
         "model_identity",
         "cache_identity",
         "evidence_eligibility_policy",
+        "global_judgment_contract",
         "config_fingerprint",
     ):
         if not isinstance(config[key], str):
@@ -240,6 +244,10 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
     if config["evidence_eligibility_policy"] != EVIDENCE_ELIGIBILITY_POLICY_IDENTITY:
         raise CheckpointCompatibilityError(
             "unsupported graph evidence eligibility policy"
+        )
+    if config["global_judgment_contract"] != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
+        raise CheckpointCompatibilityError(
+            "unsupported global judgment contract"
         )
     semantic = {key: config[key] for key in config if key != "config_fingerprint"}
     if config["config_fingerprint"] != _sha256(semantic):

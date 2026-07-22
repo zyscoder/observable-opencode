@@ -51,6 +51,7 @@ from .evidence_capsule import (
     candidate_compression_metrics,
 )
 from .global_judge import (
+    GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
@@ -442,6 +443,28 @@ def _grounded_downstream_path(
             visited.add(next_ref)
             queue.append((next_ref, next_path))
     return ()
+
+
+def _assert_report_grounded_evidence(
+    graph: TraceGraph, report: RecursiveAttributionReport, *, label: str
+) -> None:
+    refs: List[str] = []
+    for seed in report.seed_results:
+        refs.extend(seed.decisive_evidence_refs)
+        judgment = seed.global_judgment
+        refs.extend(judgment.get("decisive_evidence_refs") or ())
+        for assessment in judgment.get("assessments") or ():
+            if not isinstance(assessment, Mapping):
+                continue
+            refs.extend(assessment.get("evidence_refs") or ())
+            refs.extend(assessment.get("causal_path_refs") or ())
+    for confirmation in report.confirmations:
+        refs.extend(confirmation.evidence_refs)
+    for root in (*report.confirmed_roots, *report.co_roots):
+        refs.extend(root.evidence_refs)
+    graph.assert_resolved_evidence_references(
+        _dedupe_strings(refs), label=label
+    )
 
 
 def _global_evidence_score(node: TraceNode) -> float:
@@ -836,6 +859,9 @@ class SeedAttributionBuilder:
         self.selected_candidate_refs.update(judgment.selected_candidate_refs)
         self.decisive_evidence_refs.update(judgment.decisive_evidence_refs)
         self.global_judgment = copy.deepcopy(judgment.to_dict())
+        self.global_judgment["schema_version"] = (
+            GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION
+        )
         self.expansion_history.extend(
             copy.deepcopy(dict(item)) for item in judgment.expansion_requests
         )
@@ -3209,6 +3235,11 @@ class AgenticRecursiveAnalyzer:
                     label="restored completed report",
                 )
                 report = RecursiveAttributionReport.from_dict(final_report)
+                _assert_report_grounded_evidence(
+                    analysis_graph,
+                    report,
+                    label="restored completed report",
+                )
                 if restored_checkpoint.tail_repair_count:
                     metadata = dict(report.metadata)
                     metadata["checkpoint_audit"] = {
@@ -3235,6 +3266,11 @@ class AgenticRecursiveAnalyzer:
                     label="restored pending report",
                 )
                 report = RecursiveAttributionReport.from_dict(pending_report)
+                _assert_report_grounded_evidence(
+                    analysis_graph,
+                    report,
+                    label="restored pending report",
+                )
                 if restored_checkpoint.tail_repair_count:
                     metadata = dict(report.metadata)
                     metadata["checkpoint_audit"] = {
@@ -3823,6 +3859,11 @@ class AgenticRecursiveAnalyzer:
             metadata["termination_reason"] = "signal_interrupted"
             metadata["checkpoint_resume_available"] = self.checkpoint is not None
         report = replace(report, metadata=metadata)
+        _assert_report_grounded_evidence(
+            analysis_graph,
+            report,
+            label="final attribution report",
+        )
         self._checkpoint_state(state, "analysis:final_state")
         self._checkpoint_action(
             "analysis_ready",

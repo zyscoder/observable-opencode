@@ -161,12 +161,23 @@ def build_candidate_evidence_capsules(
             for item in artifact_hydration.get("missing_artifact_ids") or []
         ]
         retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
+        causal_path_edges = tuple(_causal_path_edges(graph, path))
+        incoming_edges = tuple(
+            graph.sanitize_judge_edge_evidence(edge)
+            for edge in graph.incoming_edge_context(ref)[:16]
+        )
+        outgoing_edges = tuple(_outgoing_edges(graph, ref, limit=16))
         evidence_refs = _dedupe_strings(
             graph.filter_evidence_refs(
                 [
                     *candidate.evidence_refs,
                     *(retrieval_edge.get("evidence_refs") or ()),
                     *node.source_refs,
+                    *(
+                        evidence_ref
+                        for edge in (*causal_path_edges, *incoming_edges, *outgoing_edges)
+                        for evidence_ref in edge.get("evidence_refs") or ()
+                    ),
                 ]
             )
         )
@@ -193,14 +204,11 @@ def build_candidate_evidence_capsules(
                 },
                 downstream_path=path,
                 downstream_path_references=tuple(_reference(graph, item) for item in path),
-                causal_path_edges=tuple(_causal_path_edges(graph, path)),
+                causal_path_edges=causal_path_edges,
                 start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
                 action_group=_action_group(graph, node),
-                incoming_edges=tuple(
-                    graph.sanitize_judge_edge_evidence(edge)
-                    for edge in graph.incoming_edge_context(ref)[:16]
-                ),
-                outgoing_edges=tuple(_outgoing_edges(graph, ref, limit=16)),
+                incoming_edges=incoming_edges,
+                outgoing_edges=outgoing_edges,
                 evidence_references=tuple(evidence_references),
                 artifact_hydration=artifact_hydration,
                 missing_evidence_refs=tuple(missing),

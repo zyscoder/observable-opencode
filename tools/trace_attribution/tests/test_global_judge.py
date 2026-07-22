@@ -24,7 +24,11 @@ from trace_attribution.graph import TraceGraph
 from trace_attribution.errors import TransportCallResult
 
 
-def sample_request() -> GlobalCandidateJudgeRequest:
+def sample_request(
+    *,
+    decision_edge_fields: dict | None = None,
+    include_decision_source_ref: bool = True,
+) -> GlobalCandidateJudgeRequest:
     trace = {
         "case_id": "global-judge-case",
         "records": [
@@ -70,6 +74,9 @@ def sample_request() -> GlobalCandidateJudgeRequest:
             },
         ],
     }
+    if not include_decision_source_ref:
+        trace["records"][2]["source_refs"].remove("record:decision")
+    trace["dataflow_edges"][1].update(decision_edge_fields or {})
     graph = TraceGraph.from_trace(trace)
     defect = DefectState.create(
         label="sigint_cleanup_interrupted",
@@ -460,6 +467,35 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                         payload(outcome="candidate_roots", request=rejected_request),
                         request=rejected_request,
                     )
+
+    def test_raw_trace_temporal_origin_survives_ingestion_and_blocks_global_path(self):
+        request = sample_request(
+            decision_edge_fields={"edge_origin": "offline.temporal_reconstruction"},
+            include_decision_source_ref=False,
+        )
+        path_edge = request.capsules[0].causal_path_edges[0]
+
+        self.assertEqual(
+            path_edge["edge_origin"], "offline.temporal_reconstruction"
+        )
+        with self.assertRaisesRegex(ValueError, "causal_path_refs.*eligible.*hop"):
+            validate_global_candidate_payload(
+                payload(outcome="candidate_roots", request=request),
+                request=request,
+            )
+
+    def test_unresolved_raw_edge_evidence_is_missing_not_grounded(self):
+        request = sample_request(
+            decision_edge_fields={"evidence_refs": ["record:ghost"]}
+        )
+
+        self.assertIn("record:ghost", request.capsules[0].missing_evidence_refs)
+        self.assertNotIn("record:ghost", request.grounded_refs)
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["evidence_refs"] = ["record:ghost"]
+        value["decisive_evidence_refs"] = ["record:ghost"]
+        with self.assertRaisesRegex(ValueError, "grounded refs"):
+            validate_global_candidate_payload(value, request=request)
 
     def test_rejects_empty_missing_and_unknown_confirmation_relations(self):
         request = sample_request()
