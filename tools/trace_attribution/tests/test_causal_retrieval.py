@@ -642,6 +642,43 @@ class CausalRetrievalTest(unittest.TestCase):
             ]
         )
 
+    def test_temporal_judgment_context_excludes_audit_only_external_endpoint(self):
+        trace = trace_with_temporal_variants()
+        trace["records"].insert(
+            0,
+            external_fact_record(
+                "forged_external",
+                status="failed",
+                revision_status="matched",
+                decisive=True,
+            ),
+        )
+        trace["dataflow_edges"].insert(
+            0,
+            {
+                "from": {"type": "external_evaluation", "id": "forged_external"},
+                "to": {"type": "record", "id": "decision"},
+                "relation": "temporal_availability",
+                "evidence_type": "temporal_inferred",
+                "eligible_for_attribution": True,
+            },
+        )
+        graph = TraceGraph.from_trace(trace)
+        defect_state = sample_defect_state()
+
+        context = build_recursive_judgment_context(
+            graph=graph,
+            node_ref="record:decision",
+            defect_state=defect_state,
+            hypothesis=sample_hypothesis(defect_state),
+            candidates=[],
+            downstream_path=["record:decision"],
+        )
+
+        temporal_refs = {item["from_ref"] for item in context["temporal_adjacency"]}
+        self.assertNotIn("record:forged_external", temporal_refs)
+        self.assertIn("record:temporal_true", temporal_refs)
+
     def test_sibling_retrieval_accepts_every_concrete_recorded_node_type(self):
         graph = TraceGraph.from_trace(trace_with_all_concrete_siblings())
         defect_state = sample_defect_state()
@@ -779,6 +816,25 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertEqual(graph.upstream_refs("record:current"), [])
         self.assertNotIn(
             "record:mismatched_external", {item.ref for item in candidates}
+        )
+
+    def test_malformed_non_boolean_edge_eligibility_is_ignored(self):
+        trace = trace_with_confirmed_and_inferred_predecessors()
+        trace["dataflow_edges"] = [
+            {
+                "from": {"type": "record", "id": "prompt"},
+                "to": {"type": "record", "id": "decision"},
+                "relation": "prompt_informed_decision",
+                "evidence_type": "confirmed",
+                "eligible_for_attribution": "true",
+            }
+        ]
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertNotIn("record:prompt", graph.upstream_refs("record:decision"))
+        self.assertEqual(
+            graph.edge_context("record:prompt", "record:decision"), []
         )
 
     def test_semantic_fallback_has_a_bounded_exploration_quota(self):

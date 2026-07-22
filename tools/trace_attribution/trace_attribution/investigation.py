@@ -11,7 +11,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .graph import (
     TraceGraph,
-    eligible_as_attribution_evidence,
     is_temporal_only_edge,
 )
 from .models import JsonDict, stable_json
@@ -791,6 +790,11 @@ class CausalInvestigationTools:
         )
 
     def execute(self, directive: InvestigationDirective) -> InvestigationResult:
+        requester = self.graph.resolve(directive.requested_by_ref)
+        if requester in self.graph.nodes and not self.graph.evidence_eligible(requester):
+            return InvestigationResult.rejected(
+                directive, "investigation requester is ineligible attribution evidence"
+            )
         execution_key = _identity(
             "tool-call",
             {"tool_name": directive.tool_name, "arguments": _thaw(directive.arguments)},
@@ -814,6 +818,7 @@ class CausalInvestigationTools:
         try:
             validate_evidence_arguments(directive.tool_name, directive.arguments)
             result = getattr(self, "_{0}".format(directive.tool_name))(directive)
+            self._assert_result_evidence_eligible(result)
         except (KeyError, OSError, UnicodeError, ValueError) as exc:
             result = InvestigationResult.rejected(
                 directive, "{0}: {1}".format(type(exc).__name__, exc)
@@ -824,6 +829,21 @@ class CausalInvestigationTools:
             )
         self._results[execution_key] = result
         return result
+
+    def _assert_result_evidence_eligible(
+        self, result: InvestigationResult
+    ) -> None:
+        ineligible = [
+            ref
+            for ref in result.resolved_refs
+            if ref in self.graph.nodes and not self.graph.evidence_eligible(ref)
+        ]
+        if ineligible:
+            raise ValueError(
+                "investigation result contains ineligible attribution evidence: {0}".format(
+                    ", ".join(ineligible)
+                )
+            )
 
     @staticmethod
     def _record_provenance(ref: str) -> JsonDict:
@@ -839,7 +859,7 @@ class CausalInvestigationTools:
         resolved = self.graph.resolve(raw_ref)
         if not resolved or resolved not in self.graph.nodes:
             raise ValueError("unresolved trace node ref: {0}".format(raw_ref))
-        if not eligible_as_attribution_evidence(self.graph.nodes[resolved]):
+        if not self.graph.evidence_eligible(resolved):
             raise ValueError(
                 "trace node is ineligible for attribution evidence: {0}".format(
                     raw_ref
@@ -1193,6 +1213,15 @@ class CausalInvestigationTools:
                         ", ".join(ref for ref, item in zip(path, resolved) if not item)
                     )
                 )
+            ineligible = [
+                ref for ref in resolved if not self.graph.evidence_eligible(ref)
+            ]
+            if ineligible:
+                raise ValueError(
+                    "causal path contains ineligible attribution evidence: {0}".format(
+                        ", ".join(ineligible)
+                    )
+                )
             edges: List[JsonDict] = []
             if valid:
                 resolved_refs.extend(resolved)
@@ -1201,7 +1230,8 @@ class CausalInvestigationTools:
                     hop_edges = [
                         edge
                         for edge in self.graph.edge_context(source, target)
-                        if edge.get("eligible_for_attribution") is not False
+                        if self.graph.edge_endpoints_eligible(source, target)
+                        and edge.get("eligible_for_attribution") is True
                         and not is_temporal_only_edge(edge)
                     ]
                     if not hop_edges:
@@ -1247,7 +1277,7 @@ class CausalInvestigationTools:
             if (
                 node.event_type == "progress.episode"
                 or self.graph.position(node.ref) >= before_position
-                or not eligible_as_attribution_evidence(node)
+                or not self.graph.evidence_eligible(node.ref)
             ):
                 continue
             tokens = set(

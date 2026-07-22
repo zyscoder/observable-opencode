@@ -6,7 +6,6 @@ import math
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .graph import eligible_as_attribution_evidence, record_aliases
 from .models import JsonDict, stable_json
 
 
@@ -30,11 +29,26 @@ STRING_FIELDS = (
     "observed_at",
 )
 EVALUATION_STATUSES = frozenset({"passed", "failed", "unknown"})
+DERIVED_DATA_FIELDS = frozenset(
+    {
+        "evaluation_id",
+        "trace_revision",
+        "revision_status",
+        "revision_provenance_status",
+        "eligible_for_decisive_judgment",
+        "unresolved_evidence_refs",
+        "root_candidate_eligible",
+        "offline_only",
+        "behavior_impact",
+    }
+)
 
 
 def inject_external_evaluation_facts(
     trace: JsonDict, payloads: Iterable[JsonDict]
 ) -> JsonDict:
+    from .graph import record_aliases
+
     enriched = copy.deepcopy(trace)
     records = enriched.setdefault("records", [])
     edges = enriched.setdefault("dataflow_edges", [])
@@ -43,7 +57,6 @@ def inject_external_evaluation_facts(
     if not isinstance(edges, list):
         raise ValueError("trace dataflow_edges must be a list")
 
-    trace_revision, revision_provenance_status = _trace_execution_revision(enriched)
     aliases = _record_alias_index(records)
     records_by_ref = {
         "record:{0}".format(item["record_id"]): item
@@ -61,50 +74,14 @@ def inject_external_evaluation_facts(
         existing_edges[edge_id] = edge
     for index, candidate in enumerate(payloads):
         payload = _validated_payload(candidate, index)
-        record_id = "external_evaluation_{0}".format(
-            hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()[:16]
+        record, resolved_evidence = _build_external_evaluation_record(
+            enriched, payload, aliases
         )
-        revision_status = revision_provenance_status
-        if trace_revision is not None:
-            revision_status = (
-                "matched"
-                if payload["subject_revision"] == trace_revision
-                else "mismatched"
-            )
-        resolved_evidence: List[tuple[str, str]] = []
-        unresolved_evidence: List[str] = []
-        for evidence_ref in payload["evidence_refs"]:
-            resolved = _resolve_unique_ref(evidence_ref, aliases)
-            if resolved:
-                resolved_evidence.append((evidence_ref, resolved))
-            else:
-                unresolved_evidence.append(evidence_ref)
-
-        data = copy.deepcopy(payload)
-        data.update(
-            {
-                "evaluation_id": record_id,
-                "trace_revision": trace_revision,
-                "revision_status": revision_status,
-                "revision_provenance_status": revision_provenance_status,
-                "eligible_for_decisive_judgment": (
-                    revision_status == "matched" and payload["status"] == "failed"
-                ),
-                "unresolved_evidence_refs": unresolved_evidence,
-                "root_candidate_eligible": False,
-                "offline_only": True,
-                "behavior_impact": "none",
-            }
-        )
-        record = {
-            "record_id": record_id,
-            "event_type": "external.evaluation_fact",
-            "component": "evaluation",
-            "status": payload["status"],
-            "timestamp": payload["observed_at"],
-            "title": payload["assertion"],
-            "data": data,
-        }
+        record_id = str(record["record_id"])
+        data = record["data"]
+        revision_status = str(data["revision_status"])
+        trace_revision = data["trace_revision"]
+        revision_provenance_status = str(data["revision_provenance_status"])
         existing = next(
             (
                 item
@@ -145,8 +122,10 @@ def inject_external_evaluation_facts(
                 "evidence_refs": [evidence_ref],
                 "eligible_for_attribution": bool(
                     records_by_ref.get(resolved)
-                    and eligible_as_attribution_evidence(records_by_ref[resolved])
-                    and eligible_as_attribution_evidence(record)
+                    and _record_evidence_eligible(
+                        enriched, records_by_ref[resolved], records
+                    )
+                    and _record_evidence_eligible(enriched, record, records)
                 ),
                 "metadata": {
                     "revision_status": revision_status,
@@ -167,6 +146,110 @@ def inject_external_evaluation_facts(
             edges.append(edge)
             existing_edges[edge_id] = edge
     return enriched
+
+
+def reconstruct_external_evaluation_record(
+    trace: JsonDict,
+    record: Any,
+    records: Optional[Iterable[Any]] = None,
+) -> Optional[JsonDict]:
+    """Rebuild an external fact from trusted manifest data and its strict payload."""
+    if not isinstance(record, dict) or record.get("event_type") != "external.evaluation_fact":
+        return None
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return None
+    if set(data) != set(REQUIRED_FIELDS) | DERIVED_DATA_FIELDS:
+        return None
+    try:
+        payload = _validated_payload(
+            {field: data[field] for field in REQUIRED_FIELDS}, 0
+        )
+    except (KeyError, ValueError):
+        return None
+    record_id = str(record.get("record_id") or "")
+    source_records = list(
+        records if records is not None else trace.get("records") or []
+    )
+    aliases = _record_alias_index(
+        item
+        for item in source_records
+        if not (
+            isinstance(item, dict)
+            and str(item.get("record_id") or "") == record_id
+        )
+    )
+    expected, _ = _build_external_evaluation_record(trace, payload, aliases)
+    return expected if record == expected else None
+
+
+def _build_external_evaluation_record(
+    trace: JsonDict,
+    payload: JsonDict,
+    aliases: Dict[str, Set[str]],
+) -> Tuple[JsonDict, List[Tuple[str, str]]]:
+    record_id = "external_evaluation_{0}".format(
+        hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()[:16]
+    )
+    trace_revision, revision_provenance_status = _trace_execution_revision(trace)
+    revision_status = revision_provenance_status
+    if trace_revision is not None:
+        revision_status = (
+            "matched"
+            if payload["subject_revision"] == trace_revision
+            else "mismatched"
+        )
+    resolved_evidence: List[Tuple[str, str]] = []
+    unresolved_evidence: List[str] = []
+    for evidence_ref in payload["evidence_refs"]:
+        resolved = _resolve_unique_ref(evidence_ref, aliases)
+        if resolved:
+            resolved_evidence.append((evidence_ref, resolved))
+        else:
+            unresolved_evidence.append(evidence_ref)
+    data = copy.deepcopy(payload)
+    data.update(
+        {
+            "evaluation_id": record_id,
+            "trace_revision": trace_revision,
+            "revision_status": revision_status,
+            "revision_provenance_status": revision_provenance_status,
+            "eligible_for_decisive_judgment": (
+                revision_status == "matched" and payload["status"] == "failed"
+            ),
+            "unresolved_evidence_refs": unresolved_evidence,
+            "root_candidate_eligible": False,
+            "offline_only": True,
+            "behavior_impact": "none",
+        }
+    )
+    return (
+        {
+            "record_id": record_id,
+            "event_type": "external.evaluation_fact",
+            "component": "evaluation",
+            "status": payload["status"],
+            "timestamp": payload["observed_at"],
+            "title": payload["assertion"],
+            "data": data,
+        },
+        resolved_evidence,
+    )
+
+
+def _record_evidence_eligible(
+    trace: JsonDict, record: JsonDict, records: Iterable[Any]
+) -> bool:
+    if record.get("event_type") != "external.evaluation_fact":
+        return True
+    reconstructed = reconstruct_external_evaluation_record(trace, record, records)
+    data = reconstructed["data"] if reconstructed else {}
+    return bool(
+        reconstructed
+        and data.get("status") in {"failed", "passed"}
+        and data.get("revision_status") == "matched"
+        and data.get("revision_provenance_status") == "valid"
+    )
 
 
 def _validated_payload(payload: Any, index: int) -> JsonDict:
@@ -305,6 +388,8 @@ def _trace_execution_revision(trace: JsonDict) -> Tuple[Optional[str], str]:
 
 
 def _record_alias_index(records: Iterable[Any]) -> Dict[str, Set[str]]:
+    from .graph import record_aliases
+
     aliases: Dict[str, Set[str]] = {}
     for record in records:
         if not isinstance(record, dict) or not record.get("record_id"):

@@ -860,32 +860,26 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(report.metadata["seed_count"], 1)
 
     def test_external_evaluation_seed_preserves_expected_actual_scope_and_status(self):
-        trace = observed_trace()
-        trace["records"][-1] = {
-            "record_id": "external_evaluation",
-            "component": "evaluation",
-            "event_type": "external.evaluation_fact",
-            "status": "failed",
-            "source_refs": ["record:change"],
-            "data": {
-                "assertion": "Cleanup completes after SIGINT.",
-                "observation": "Cleanup was interrupted.",
-                "scope": "process_sigint_behavior",
-                "status": "failed",
-                "subject_revision": "git:abc123",
-                "trace_revision": "git:abc123",
-                "revision_status": "matched",
-                "revision_provenance_status": "valid",
-                "provenance": {
-                    "method": "benchmark_grader",
-                    "version": "1.0",
-                },
-                "eligible_for_decisive_judgment": True,
-            },
-        }
+        trace = revision_bound_trace()
+        trace["records"][0] = observed_trace()["records"][2]
+        trace = inject_external_evaluation_facts(
+            trace,
+            [
+                {
+                    **external_payload(
+                        scope="process_sigint_behavior",
+                        status="failed",
+                        subject_revision="git:abc123",
+                        evidence_refs=["record:change"],
+                    ),
+                    "observation": "Cleanup was interrupted.",
+                }
+            ],
+        )
+        external_ref = "record:{0}".format(trace["records"][-1]["record_id"])
         state = RecursiveAnalysisState.create(
             graph=TraceGraph.from_trace(trace),
-            start_refs=["record:external_evaluation"],
+            start_refs=[external_ref],
             objective="Generic objective text must not replace benchmark semantics.",
             analysis_perspective="Find the cause.",
         )
@@ -895,6 +889,39 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(defect.actual, "Cleanup was interrupted.")
         self.assertEqual(defect.scope, "process_sigint_behavior")
         self.assertEqual(defect.label, "external_evaluation_failed")
+
+    def test_forged_external_fact_never_enters_recursive_frontier(self):
+        trace = observed_trace()
+        trace["records"][-1] = {
+            "record_id": "forged_external",
+            "component": "evaluation",
+            "event_type": "external.evaluation_fact",
+            "status": "failed",
+            "source_refs": ["record:change"],
+            "data": {
+                "status": "failed",
+                "subject_revision": "git:forged",
+                "trace_revision": "git:forged",
+                "revision_status": "matched",
+                "revision_provenance_status": "valid",
+                "provenance": {
+                    "method": "benchmark_grader",
+                    "version": "1.0",
+                },
+                "eligible_for_decisive_judgment": True,
+            },
+        }
+        graph = TraceGraph.from_trace(trace)
+
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:forged_external"],
+            objective="Find the cause.",
+            analysis_perspective="Find the cause.",
+        )
+
+        self.assertEqual(state.seed_count, 0)
+        self.assertEqual(state.frontier.snapshot(), [])
 
     def test_ineligible_external_evaluation_start_never_reaches_recursive_judge(self):
         for status, revision_status in (
@@ -1044,6 +1071,8 @@ class RecursiveTraversalTest(unittest.TestCase):
 
         self.assertEqual(passed_seed.seed_count, 0)
         self.assertEqual(passed_seed.frontier.snapshot(), [])
+        self.assertTrue(graph.evidence_eligible(passed_ref))
+        self.assertFalse(graph.analysis_start_eligible(passed_ref))
         self.assertIn(
             passed_ref,
             [candidate.ref for candidate in failed_seed.causal_candidates],

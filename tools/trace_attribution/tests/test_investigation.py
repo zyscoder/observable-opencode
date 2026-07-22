@@ -499,6 +499,54 @@ class InvestigationToolTest(unittest.TestCase):
             ["record:normal_decision"],
         )
 
+    def test_context_lineage_investigation_rejects_audit_only_external_reference(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "audit-only-context-lineage",
+                "records": [
+                    {
+                        "record_id": "forged_external",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                        "status": "failed",
+                        "data": {
+                            "status": "failed",
+                            "subject_revision": "git:forged",
+                            "trace_revision": "git:forged",
+                            "revision_status": "matched",
+                            "revision_provenance_status": "valid",
+                            "provenance": {
+                                "method": "benchmark_grader",
+                                "version": "1.0",
+                            },
+                            "eligible_for_decisive_judgment": True,
+                        },
+                    },
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"text": "Inspect context lineage."},
+                    },
+                ],
+            }
+        )
+        graph.message_lineage["turns"] = [
+            {"message_id": "msg_external", "source_ref": "record:forged_external"}
+        ]
+
+        result = CausalInvestigationTools(graph).execute(
+            InvestigationDirective.create(
+                "inspect_context_lineage",
+                {"message_id": "msg_external"},
+                requested_by_ref="record:decision",
+                reason="Reject the audit-only lineage reference.",
+            )
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("ineligible", result.rejection_reason)
+
     def test_artifact_range_uses_grounded_resolver_budget_and_dedup(self):
         tools = CausalInvestigationTools(self.graph, max_artifact_bytes=8)
         directive = InvestigationDirective.create(
@@ -751,6 +799,90 @@ class InvestigationToolTest(unittest.TestCase):
             )
         )
         self.assertEqual(temporal.status, "rejected")
+
+    def test_compare_paths_rejects_every_path_containing_audit_only_external_fact(self):
+        trace = trace_with_artifact()
+        trace["records"].insert(
+            1,
+            {
+                "record_id": "forged_external",
+                "component": "evaluation",
+                "event_type": "external.evaluation_fact",
+                "status": "failed",
+                "data": {
+                    "status": "failed",
+                    "subject_revision": "git:forged",
+                    "trace_revision": "git:forged",
+                    "revision_status": "matched",
+                    "revision_provenance_status": "valid",
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                    "eligible_for_decisive_judgment": True,
+                },
+            },
+        )
+        trace["dataflow_edges"].extend(
+            [
+                {
+                    "from": {"type": "record", "id": "source"},
+                    "to": {"type": "external_evaluation", "id": "forged_external"},
+                    "relation": "external_evaluation_observed",
+                    "evidence_type": "external_grader",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "external_evaluation", "id": "forged_external"},
+                    "to": {"type": "record", "id": "decision"},
+                    "relation": "external_evaluation_observed",
+                    "evidence_type": "external_grader",
+                    "eligible_for_attribution": True,
+                },
+            ]
+        )
+        tools = CausalInvestigationTools(
+            TraceGraph.from_trace(trace, artifact_root=Path(self.temp.name))
+        )
+
+        one_node = tools.execute(
+            InvestigationDirective.create(
+                "compare_causal_paths",
+                {"paths": [["record:forged_external"]]},
+                requested_by_ref="record:decision",
+                reason="Reject an audit-only singleton path.",
+            )
+        )
+        multi_node = tools.execute(
+            InvestigationDirective.create(
+                "compare_causal_paths",
+                {
+                    "paths": [
+                        [
+                            "record:source",
+                            "record:forged_external",
+                            "record:decision",
+                        ]
+                    ]
+                },
+                requested_by_ref="record:decision",
+                reason="Reject an audit-only multi-node path.",
+            )
+        )
+        normal = tools.execute(
+            InvestigationDirective.create(
+                "compare_causal_paths",
+                {"paths": [["record:source", "record:decision"]]},
+                requested_by_ref="record:decision",
+                reason="Keep normal recorded paths available.",
+            )
+        )
+
+        self.assertEqual(one_node.status, "rejected")
+        self.assertIn("ineligible", one_node.rejection_reason)
+        self.assertEqual(multi_node.status, "rejected")
+        self.assertIn("ineligible", multi_node.rejection_reason)
+        self.assertEqual(normal.status, "success")
 
     def test_unresolved_context_and_obligation_selectors_are_explicit(self):
         tools = CausalInvestigationTools(self.graph)

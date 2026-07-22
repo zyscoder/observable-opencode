@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .artifact_reader import VerifiedArtifactReader
+from .evaluation_facts import reconstruct_external_evaluation_record
 from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
@@ -40,6 +41,8 @@ class TraceGraph:
         artifact_records: Dict[str, JsonDict],
         message_lineage: JsonDict,
         edge_context_index: Dict[Tuple[str, str], List[JsonDict]],
+        evidence_eligible_refs: Set[str],
+        analysis_start_eligible_refs: Set[str],
     ):
         self.case_id = case_id
         self.nodes = nodes
@@ -57,6 +60,10 @@ class TraceGraph:
         self.message_lineage = message_lineage
         self._edge_context_index = edge_context_index
         self._positions = {ref: index for index, ref in enumerate(nodes)}
+        self._evidence_eligible_refs = frozenset(evidence_eligible_refs)
+        self._analysis_start_eligible_refs = frozenset(
+            analysis_start_eligible_refs
+        )
 
     @classmethod
     def from_file(cls, trace_file: Path) -> "TraceGraph":
@@ -125,6 +132,33 @@ class TraceGraph:
                 aliases[alias] = ref
             aliases[ref] = ref
 
+        evidence_eligible_refs: Set[str] = set()
+        analysis_start_eligible_refs: Set[str] = set()
+        for ref, node in nodes.items():
+            if node.event_type != "external.evaluation_fact":
+                evidence_eligible_refs.add(ref)
+                analysis_start_eligible_refs.add(ref)
+                continue
+            reconstructed = reconstruct_external_evaluation_record(
+                trace, artifact_records.get(ref), records
+            )
+            if not reconstructed:
+                continue
+            data = reconstructed["data"]
+            status = data.get("status")
+            revision_matched = (
+                data.get("revision_status") == "matched"
+                and data.get("revision_provenance_status") == "valid"
+            )
+            if revision_matched and status in {"failed", "passed"}:
+                evidence_eligible_refs.add(ref)
+            if (
+                revision_matched
+                and status == "failed"
+                and data.get("eligible_for_decisive_judgment") is True
+            ):
+                analysis_start_eligible_refs.add(ref)
+
         upstream: Dict[str, Dict[str, None]] = defaultdict(dict)
         downstream: Dict[str, Dict[str, None]] = defaultdict(dict)
         edge_context_index: Dict[Tuple[str, str], List[JsonDict]] = defaultdict(list)
@@ -134,7 +168,9 @@ class TraceGraph:
                 if (
                     source
                     and source != node.ref
-                    and attribution_edge_endpoints_eligible(nodes, source, node.ref)
+                    and _edge_endpoints_eligible(
+                        nodes, evidence_eligible_refs, source, node.ref
+                    )
                 ):
                     upstream[node.ref][source] = None
                     downstream[source][node.ref] = None
@@ -155,7 +191,7 @@ class TraceGraph:
             if not isinstance(edge, dict):
                 continue
             metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
-            if edge.get("eligible_for_attribution") is False or metadata.get("eligible_for_attribution") is False:
+            if not recorded_edge_eligible(edge):
                 continue
             source = resolve_edge_endpoint(edge.get("from"), aliases)
             target = resolve_edge_endpoint(edge.get("to"), aliases)
@@ -163,7 +199,9 @@ class TraceGraph:
                 source
                 and target
                 and source != target
-                and attribution_edge_endpoints_eligible(nodes, source, target)
+                and _edge_endpoints_eligible(
+                    nodes, evidence_eligible_refs, source, target
+                )
             ):
                 add_edge_context(
                     edge_context_index,
@@ -203,7 +241,9 @@ class TraceGraph:
                 source in nodes
                 and target in nodes
                 and source != target
-                and attribution_edge_endpoints_eligible(nodes, source, target)
+                and _edge_endpoints_eligible(
+                    nodes, evidence_eligible_refs, source, target
+                )
             ):
                 add_edge_context(
                     edge_context_index,
@@ -229,12 +269,16 @@ class TraceGraph:
             nodes[episode.ref] = episode
             aliases[episode.ref] = episode.ref
             aliases[f"record:{episode.record_id}"] = episode.ref
+            evidence_eligible_refs.add(episode.ref)
+            analysis_start_eligible_refs.add(episode.ref)
             for source_ref in episode.source_refs:
                 source = resolve_ref(source_ref, aliases)
                 if (
                     source
                     and source != episode.ref
-                    and attribution_edge_endpoints_eligible(nodes, source, episode.ref)
+                    and _edge_endpoints_eligible(
+                        nodes, evidence_eligible_refs, source, episode.ref
+                    )
                 ):
                     upstream[episode.ref][source] = None
                     downstream[source][episode.ref] = None
@@ -261,8 +305,8 @@ class TraceGraph:
                 if (
                     episode_ref not in nodes
                     or episode_ref == target_ref
-                    or not attribution_edge_endpoints_eligible(
-                        nodes, episode_ref, target_ref
+                    or not _edge_endpoints_eligible(
+                        nodes, evidence_eligible_refs, episode_ref, target_ref
                     )
                 ):
                     continue
@@ -302,6 +346,8 @@ class TraceGraph:
             artifact_records=artifact_records,
             message_lineage=message_lineage,
             edge_context_index=edge_context_index,
+            evidence_eligible_refs=evidence_eligible_refs,
+            analysis_start_eligible_refs=analysis_start_eligible_refs,
         )
 
     def hydrate_node(self, ref: str) -> TraceNode:
@@ -330,6 +376,21 @@ class TraceGraph:
     def resolve(self, ref: str) -> Optional[str]:
         return resolve_ref(ref, self.aliases)
 
+    def evidence_eligible(self, ref: str) -> bool:
+        resolved = self.resolve(ref) or ref
+        return resolved in self._evidence_eligible_refs
+
+    def analysis_start_eligible(self, ref: str) -> bool:
+        resolved = self.resolve(ref) or ref
+        return resolved in self._analysis_start_eligible_refs
+
+    def edge_endpoints_eligible(self, source_ref: str, target_ref: str) -> bool:
+        source = self.resolve(source_ref) or source_ref
+        target = self.resolve(target_ref) or target_ref
+        return _edge_endpoints_eligible(
+            self.nodes, self._evidence_eligible_refs, source, target
+        )
+
     def upstream_refs(self, ref: str) -> List[str]:
         resolved = self.resolve(ref) or ref
         ordered: List[str] = []
@@ -342,9 +403,7 @@ class TraceGraph:
                     source
                     and source != resolved
                     and source not in seen
-                    and attribution_edge_endpoints_eligible(
-                        self.nodes, source, resolved
-                    )
+                    and self.edge_endpoints_eligible(source, resolved)
                 ):
                     ordered.append(source)
                     seen.add(source)
@@ -435,7 +494,7 @@ class TraceGraph:
             source, target = (
                 (adjacent, resolved) if upstream else (resolved, adjacent)
             )
-            if not attribution_edge_endpoints_eligible(self.nodes, source, target):
+            if not self.edge_endpoints_eligible(source, target):
                 continue
             if event_type and (node is None or node.event_type != event_type):
                 continue
@@ -465,6 +524,96 @@ class TraceGraph:
         target = self.resolve(to_ref) or to_ref
         return [dict(item) for item in self._edge_context_index.get((source, target), [])]
 
+    def temporal_adjacency_edges(self, ref: str) -> List[JsonDict]:
+        """Return advisory temporal edges whose endpoints are valid evidence."""
+        target_ref = self.resolve(ref) or ref
+        output: List[JsonDict] = []
+        for edge in self.raw_trace.get("dataflow_edges") or []:
+            if not isinstance(edge, dict) or not edge_eligibility_well_formed(edge):
+                continue
+            metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+            normalized = {
+                "evidence_type": edge.get("evidence_type") or metadata.get("evidence_type"),
+                "relation": edge.get("relation") or metadata.get("relation"),
+                "edge_origin": edge.get("edge_origin") or metadata.get("edge_origin"),
+                "inference_method": edge.get("inference_method") or metadata.get("inference_method"),
+            }
+            if not is_temporal_only_edge(normalized):
+                continue
+            source = resolve_edge_endpoint(edge.get("from"), self.aliases)
+            target = resolve_edge_endpoint(edge.get("to"), self.aliases)
+            if (
+                target != target_ref
+                or not source
+                or not self.edge_endpoints_eligible(source, target)
+            ):
+                continue
+            output.append(
+                {
+                    "from_ref": source,
+                    "to_ref": target,
+                    "relation": str(
+                        edge.get("relation")
+                        or metadata.get("relation")
+                        or "temporal_availability"
+                    ),
+                    "evidence_type": str(
+                        edge.get("evidence_type")
+                        or metadata.get("evidence_type")
+                        or "temporal_only"
+                    ),
+                    "evidence_refs": string_list(
+                        edge.get("evidence_refs") or metadata.get("evidence_refs")
+                    ),
+                    "confidence": edge.get(
+                        "confidence", metadata.get("confidence", 0.0)
+                    ),
+                    "recorded_eligible_for_attribution": declared_edge_eligibility(
+                        edge
+                    ),
+                    "direct_predecessor_eligible": False,
+                    "inference_method": str(
+                        edge.get("inference_method")
+                        or metadata.get("inference_method")
+                        or "temporal_adjacency"
+                    ),
+                    "edge_origin": str(
+                        edge.get("edge_origin")
+                        or metadata.get("edge_origin")
+                        or "trace.dataflow_edges"
+                    ),
+                }
+            )
+        for edge in self.message_lineage.get("edges") or []:
+            if not isinstance(edge, dict) or not is_temporal_only_edge(edge):
+                continue
+            source = self.resolve(str(edge.get("from_ref") or "")) or ""
+            target = self.resolve(str(edge.get("to_ref") or "")) or ""
+            if (
+                target != target_ref
+                or not source
+                or not self.edge_endpoints_eligible(source, target)
+            ):
+                continue
+            output.append(
+                {
+                    **dict(edge),
+                    "from_ref": source,
+                    "to_ref": target,
+                    "recorded_eligible_for_attribution": edge.get(
+                        "eligible_for_attribution"
+                    ),
+                    "direct_predecessor_eligible": False,
+                }
+            )
+        output.sort(
+            key=lambda item: (
+                self.position(str(item["from_ref"])),
+                str(item.get("relation") or ""),
+            )
+        )
+        return output
+
     def add_offline_navigation_edge(
         self,
         from_ref: str,
@@ -477,7 +626,7 @@ class TraceGraph:
         target = self.resolve(to_ref) or to_ref
         if source not in self.nodes or target not in self.nodes or source == target:
             raise ValueError("offline navigation edge endpoints must resolve to distinct nodes")
-        if not attribution_edge_endpoints_eligible(self.nodes, source, target):
+        if not self.edge_endpoints_eligible(source, target):
             return
         self._upstream[target][source] = None
         self._downstream[source][target] = None
@@ -499,9 +648,7 @@ class TraceGraph:
         resolved = self.resolve(ref) or ref
         output: List[JsonDict] = []
         for upstream_ref in self.upstream_refs(resolved):
-            if not attribution_edge_endpoints_eligible(
-                self.nodes, upstream_ref, resolved
-            ):
+            if not self.edge_endpoints_eligible(upstream_ref, resolved):
                 continue
             for edge in self.edge_context(upstream_ref, resolved):
                 if is_temporal_only_edge(edge) or not edge.get("eligible_for_attribution"):
@@ -533,7 +680,7 @@ class TraceGraph:
             if (
                 node.event_type == "progress.episode"
                 or self.position(node.ref) >= before_position
-                or not eligible_as_attribution_evidence(node)
+                or not self.evidence_eligible(node.ref)
             ):
                 continue
             tokens = set(re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower()))
@@ -750,7 +897,7 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type == "external.evaluation_fact"
-            and eligible_as_analysis_seed(node)
+            and self.analysis_start_eligible(ref)
         ]
         if external_evaluation_starts:
             return dedupe(external_evaluation_starts)
@@ -851,78 +998,45 @@ def artifact_root_for_trace_path(trace_path: Path, trace: JsonDict) -> Path:
     return path.parent
 
 
-def eligible_as_attribution_evidence(node: Any) -> bool:
-    event_type = (
-        str(node.get("event_type") or "")
-        if isinstance(node, dict)
-        else str(node.event_type or "")
-    )
-    if event_type != "external.evaluation_fact":
-        return True
-    data = (
-        node.get("data")
-        if isinstance(node, dict) and isinstance(node.get("data"), dict)
-        else node.data
-        if isinstance(node, TraceNode)
-        else {}
-    )
-    status = (
-        str(node.get("status") or "")
-        if isinstance(node, dict)
-        else str(node.status or "")
-    )
-    provenance = data.get("provenance")
-    subject_revision = data.get("subject_revision")
-    trace_revision = data.get("trace_revision")
-    return (
-        status in {"failed", "passed"}
-        and data.get("status") == status
-        and data.get("revision_status") == "matched"
-        and data.get("revision_provenance_status") == "valid"
-        and isinstance(subject_revision, str)
-        and bool(subject_revision.strip())
-        and subject_revision == trace_revision
-        and isinstance(provenance, dict)
-        and isinstance(provenance.get("method"), str)
-        and bool(provenance["method"].strip())
-        and isinstance(provenance.get("version"), str)
-        and bool(provenance["version"].strip())
-    )
-
-
-def eligible_as_analysis_seed(node: Any) -> bool:
-    event_type = (
-        str(node.get("event_type") or "")
-        if isinstance(node, dict)
-        else str(node.event_type or "")
-    )
-    if event_type != "external.evaluation_fact":
-        return True
-    data = (
-        node.get("data")
-        if isinstance(node, dict) and isinstance(node.get("data"), dict)
-        else node.data
-        if isinstance(node, TraceNode)
-        else {}
-    )
-    return (
-        eligible_as_attribution_evidence(node)
-        and data.get("status") == "failed"
-        and data.get("eligible_for_decisive_judgment") is True
-    )
-
-
-def attribution_edge_endpoints_eligible(
-    nodes: Dict[str, TraceNode], source_ref: str, target_ref: str
+def _edge_endpoints_eligible(
+    nodes: Dict[str, TraceNode],
+    evidence_eligible_refs: Iterable[str],
+    source_ref: str,
+    target_ref: str,
 ) -> bool:
-    source = nodes.get(source_ref)
-    target = nodes.get(target_ref)
+    eligible = evidence_eligible_refs
     return bool(
-        source
-        and target
-        and eligible_as_attribution_evidence(source)
-        and eligible_as_attribution_evidence(target)
+        source_ref in nodes
+        and target_ref in nodes
+        and source_ref in eligible
+        and target_ref in eligible
     )
+
+
+def recorded_edge_eligible(edge: JsonDict) -> bool:
+    return edge_eligibility_well_formed(edge) and declared_edge_eligibility(edge) is not False
+
+
+def edge_eligibility_well_formed(edge: JsonDict) -> bool:
+    metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+    declarations = []
+    for container in (edge, metadata):
+        if "eligible_for_attribution" not in container:
+            continue
+        value = container["eligible_for_attribution"]
+        if type(value) is not bool:
+            return False
+        declarations.append(value)
+    return len(set(declarations)) <= 1
+
+
+def declared_edge_eligibility(edge: JsonDict) -> Optional[bool]:
+    metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+    if "eligible_for_attribution" in edge:
+        return edge["eligible_for_attribution"]
+    if "eligible_for_attribution" in metadata:
+        return metadata["eligible_for_attribution"]
+    return None
 
 
 def hydrate_record_artifacts(

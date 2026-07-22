@@ -10,7 +10,6 @@ from .causal_state import AttributionHypothesis, CausalCandidate, DefectState
 from .episodes import CausalEpisodeIndex
 from .graph import (
     TraceGraph,
-    eligible_as_attribution_evidence,
     is_temporal_only_edge,
 )
 from .models import TraceNode
@@ -70,7 +69,7 @@ class SemanticPredecessorRetriever:
                     [
                         candidate
                         for candidate in self._direct_candidates(graph, resolved)
-                        if eligible_as_attribution_evidence(candidate.node)
+                        if graph.evidence_eligible(candidate.ref)
                     ]
                 ],
                 limit=limit,
@@ -96,7 +95,7 @@ class SemanticPredecessorRetriever:
             [
                 candidate
                 for candidate in layer
-                if eligible_as_attribution_evidence(candidate.node)
+                if graph.evidence_eligible(candidate.ref)
             ]
             for layer in layers
         ]

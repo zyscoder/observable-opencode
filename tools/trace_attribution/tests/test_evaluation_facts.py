@@ -75,7 +75,49 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
         self.assertEqual(node.event_type, "external.evaluation_fact")
         self.assertEqual(node.data["revision_status"], "matched")
         self.assertTrue(node.data["eligible_for_decisive_judgment"])
+        self.assertTrue(graph.evidence_eligible(node.ref))
+        self.assertTrue(graph.analysis_start_eligible(node.ref))
         self.assertFalse(root_candidate_eligible(node))
+
+    def test_graph_rejects_forged_preexisting_external_fact_without_formal_proof(self):
+        trace = base_trace(revision=None)
+        trace["records"].append(
+            {
+                "record_id": "forged_external",
+                "component": "evaluation",
+                "event_type": "external.evaluation_fact",
+                "status": "failed",
+                "data": {
+                    "status": "failed",
+                    "subject_revision": "git:forged",
+                    "trace_revision": "git:forged",
+                    "revision_status": "matched",
+                    "revision_provenance_status": "valid",
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                    "eligible_for_decisive_judgment": True,
+                },
+            }
+        )
+        trace["dataflow_edges"].append(
+            {
+                "from": {"type": "record", "id": "tool_result"},
+                "to": {"type": "external_evaluation", "id": "forged_external"},
+                "relation": "external_evaluation_observed",
+                "evidence_type": "external_grader",
+                "eligible_for_attribution": True,
+            }
+        )
+
+        graph = TraceGraph.from_trace(trace)
+
+        self.assertIn("record:forged_external", graph.nodes)
+        self.assertFalse(graph.evidence_eligible("record:forged_external"))
+        self.assertFalse(graph.analysis_start_eligible("record:forged_external"))
+        self.assertNotIn("record:forged_external", graph.default_start_refs())
+        self.assertEqual(graph.upstream_refs("record:forged_external"), [])
 
     def test_mismatched_revision_is_retained_but_not_decisive_or_a_default_start(self):
         enriched = inject_external_evaluation_facts(
@@ -146,6 +188,24 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
                 fact = enriched["records"][-1]["data"]
                 self.assertEqual(fact["revision_status"], "unprovenanced")
                 self.assertIs(fact["eligible_for_decisive_judgment"], False)
+                graph = TraceGraph.from_trace(enriched)
+                fact_ref = "record:{0}".format(enriched["records"][-1]["record_id"])
+                self.assertFalse(graph.evidence_eligible(fact_ref))
+                self.assertFalse(graph.analysis_start_eligible(fact_ref))
+
+    def test_graph_rejects_preexisting_external_fact_with_derived_field_contradiction(self):
+        enriched = inject_external_evaluation_facts(
+            base_trace(), [evaluation_payload()]
+        )
+        fact = enriched["records"][-1]
+        fact["data"]["offline_only"] = False
+        fact_ref = "record:{0}".format(fact["record_id"])
+
+        graph = TraceGraph.from_trace(enriched)
+
+        self.assertFalse(graph.evidence_eligible(fact_ref))
+        self.assertFalse(graph.analysis_start_eligible(fact_ref))
+        self.assertNotIn(fact_ref, graph.default_start_refs())
 
     def test_passed_and_unknown_facts_are_not_decisive_or_default_starts(self):
         for status in ("passed", "unknown"):

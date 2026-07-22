@@ -363,3 +363,78 @@ resulting SHA.
 - None. The change is confined to offline Python attribution and preserves all
   audit-only nodes and unresolved evidence references without exposing them to
   Agent execution or adding dependencies or LLM calls.
+
+## Third Review Fix Wave
+
+### RED
+
+- Graph revalidation, temporal context, investigation paths, recursive
+  frontier, and preserved imported/counterevidence behavior:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools.trace_attribution.tests.test_evaluation_facts.ExternalEvaluationFactsTest.test_injects_revision_matched_external_failure_as_start_seed tools.trace_attribution.tests.test_evaluation_facts.ExternalEvaluationFactsTest.test_graph_rejects_forged_preexisting_external_fact_without_formal_proof tools.trace_attribution.tests.test_causal_retrieval.CausalRetrievalTest.test_temporal_judgment_context_excludes_audit_only_external_endpoint tools.trace_attribution.tests.test_investigation.InvestigationToolTest.test_compare_paths_rejects_every_path_containing_audit_only_external_fact tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_forged_external_fact_never_enters_recursive_frontier tools.trace_attribution.tests.test_recursive_analyzer.RecursiveTraversalTest.test_matched_passed_external_fact_is_counterevidence_but_never_seed_frontier_or_root -v
+  Ran 6 tests - FAILED (failures=3, errors=3)
+  ```
+
+  The errors proved that `TraceGraph` did not own evidence/start eligibility.
+  The failures proved that a forged pre-existing fact entered recursive state,
+  raw temporal adjacency exposed it to Judge context, and a one-node causal
+  path accepted it without checking any edge.
+
+### Implementation
+
+- Added one strict `reconstruct_external_evaluation_record()` path shared by
+  ingestion and graph construction. It revalidates the exact nine-field
+  payload, formal revision provenance and case/run binding, stable record ID,
+  record envelope, resolved/unresolved evidence derivation, and every derived
+  field. Any mismatch leaves the raw record present but audit-only.
+- Moved contextual truth to `TraceGraph.evidence_eligible()`,
+  `TraceGraph.analysis_start_eligible()`, and
+  `TraceGraph.edge_endpoints_eligible()`. Migrated legacy, CLI, retrieval,
+  recursive, and investigation consumers away from standalone node trust.
+- Added `TraceGraph.temporal_adjacency_edges()` so judgment context no longer
+  scans raw edges without canonical endpoint validation. Normal non-external
+  temporal edges remain advisory for true, false, and omitted eligibility.
+- Rejected malformed non-boolean or contradictory pre-existing edge
+  eligibility declarations before adjacency construction.
+- Made all investigation results reject resolved audit-only external refs and
+  made `compare_causal_paths` validate every node before validating hops, so
+  both one-node and multi-node paths fail closed.
+- Preserved matched failed facts as evidence/seeds, matched passed facts as
+  counterevidence only, and all external facts as root-ineligible.
+
+### GREEN
+
+- Focused evaluation, graph/retrieval, judgment-context, investigation,
+  recursive analyzer, and recursive CLI suites:
+
+  ```text
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest tools/trace_attribution/tests/test_evaluation_facts.py tools/trace_attribution/tests/test_causal_retrieval.py tools/trace_attribution/tests/test_investigation.py tools/trace_attribution/tests/test_recursive_analyzer.py tools/trace_attribution/tests/test_recursive_cli.py
+  Ran 173 tests in 0.407s
+  OK
+  ```
+
+- Full Python trace-attribution suite:
+
+  ```text
+  PYTHONPYCACHEPREFIX=/tmp/observable-opencode-task4-wave3-pycache PYTHONPATH=tools/trace_attribution python3 -m unittest discover -s tools/trace_attribution/tests -p 'test_*.py'
+  Ran 538 tests in 2.348s
+  OK
+  ```
+
+- Python compileall:
+
+  ```text
+  PYTHONPYCACHEPREFIX=/tmp/observable-opencode-task4-wave3-compile python3 -m compileall -q tools/trace_attribution/trace_attribution tools/trace_attribution/tests
+  exit 0
+  ```
+
+- `git diff --check` passed. No TypeScript files changed, so Bun tests and
+  TypeScript typecheck were not applicable.
+
+### Concerns
+
+- None. Legacy or handcrafted external records that cannot be reconstructed
+  exactly from the strict payload and formal manifest provenance are
+  intentionally retained as audit-only. No dependencies, Agent behavior, LLM
+  calls, or TypeScript surfaces changed.

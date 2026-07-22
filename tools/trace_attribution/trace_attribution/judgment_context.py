@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .causal_state import AttributionHypothesis, CausalCandidate, CausalStepJudgment, DefectState
 from .episodes import CausalEpisodeIndex
-from .graph import TraceGraph, is_temporal_only_edge
+from .graph import TraceGraph
 from .models import JsonDict, NodeJudgment, TraceNode, stable_json
 from .progress import progress_navigation_window
 
@@ -399,82 +399,7 @@ def collect_identity_values(value: Any) -> Dict[str, str]:
 
 def temporal_adjacency_context(graph: TraceGraph, node_ref: str) -> List[JsonDict]:
     """Expose temporal-only facts to the Judge without promoting them to graph predecessors."""
-    output: List[JsonDict] = []
-    for edge in graph.raw_trace.get("dataflow_edges") or []:
-        if not isinstance(edge, Mapping):
-            continue
-        metadata = edge.get("metadata") if isinstance(edge.get("metadata"), Mapping) else {}
-        normalized_edge = {
-            "evidence_type": edge.get("evidence_type") or metadata.get("evidence_type"),
-            "relation": edge.get("relation") or metadata.get("relation"),
-            "edge_origin": edge.get("edge_origin") or metadata.get("edge_origin"),
-            "inference_method": edge.get("inference_method") or metadata.get("inference_method"),
-        }
-        if not is_temporal_only_edge(normalized_edge):
-            continue
-        target = raw_edge_ref(graph, edge.get("to"))
-        if target != node_ref:
-            continue
-        source = raw_edge_ref(graph, edge.get("from"))
-        if not source:
-            continue
-        output.append(
-            {
-                "from_ref": source,
-                "to_ref": target,
-                "relation": str(edge.get("relation") or metadata.get("relation") or "temporal_availability"),
-                "evidence_type": str(edge.get("evidence_type") or metadata.get("evidence_type") or "temporal_only"),
-                "evidence_refs": list(edge.get("evidence_refs") or metadata.get("evidence_refs") or []),
-                "confidence": edge.get("confidence", metadata.get("confidence", 0.0)),
-                "recorded_eligible_for_attribution": raw_edge_eligibility(edge, metadata),
-                "direct_predecessor_eligible": False,
-                "inference_method": str(
-                    edge.get("inference_method") or metadata.get("inference_method") or "temporal_adjacency"
-                ),
-                "edge_origin": str(edge.get("edge_origin") or metadata.get("edge_origin") or "trace.dataflow_edges"),
-            }
-        )
-    for edge in graph.message_lineage.get("edges") or []:
-        if not isinstance(edge, Mapping) or not is_temporal_only_edge(dict(edge)):
-            continue
-        target = graph.resolve(str(edge.get("to_ref") or "")) or str(edge.get("to_ref") or "")
-        if target != node_ref:
-            continue
-        source = graph.resolve(str(edge.get("from_ref") or "")) or str(edge.get("from_ref") or "")
-        if source:
-            output.append(
-                {
-                    **dict(edge),
-                    "from_ref": source,
-                    "to_ref": target,
-                    "recorded_eligible_for_attribution": edge.get("eligible_for_attribution"),
-                    "direct_predecessor_eligible": False,
-                }
-            )
-    output.sort(key=lambda item: (graph.position(str(item["from_ref"])), str(item.get("relation") or "")))
-    return output
-
-
-def raw_edge_eligibility(edge: Mapping[str, Any], metadata: Mapping[str, Any]) -> Optional[bool]:
-    if "eligible_for_attribution" in edge:
-        return bool(edge.get("eligible_for_attribution"))
-    if "eligible_for_attribution" in metadata:
-        return bool(metadata.get("eligible_for_attribution"))
-    return None
-
-
-def raw_edge_ref(graph: TraceGraph, value: Any) -> str:
-    if isinstance(value, Mapping):
-        ref_type = str(value.get("type") or "")
-        ref_id = str(value.get("id") or "")
-        candidates = ["{0}:{1}".format(ref_type, ref_id), "record:{0}".format(ref_id)]
-    else:
-        candidates = [str(value or "")]
-    for candidate in candidates:
-        resolved = graph.resolve(candidate)
-        if resolved:
-            return resolved
-    return ""
+    return graph.temporal_adjacency_edges(node_ref)
 
 
 def build_active_defect_fingerprint(*, graph: TraceGraph, path: List[str], objective: str) -> JsonDict:

@@ -51,12 +51,7 @@ from .global_judge import (
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
 )
-from .graph import (
-    TraceGraph,
-    attribution_edge_endpoints_eligible,
-    eligible_as_analysis_seed,
-    eligible_as_attribution_evidence,
-)
+from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
 from .investigation import (
     AttributionControlDirective,
@@ -342,9 +337,7 @@ def _grounded_downstream_path(
                 and str(edge.get("relation") or "")
                 not in NON_CAUSAL_CONFIRMATION_RELATIONS
                 for edge in edges
-            ) or not attribution_edge_endpoints_eligible(
-                graph.nodes, current, next_ref
-            ):
+            ) or not graph.edge_endpoints_eligible(current, next_ref):
                 continue
             next_path = (*path, next_ref)
             if next_ref in targets:
@@ -774,7 +767,7 @@ class RecursiveAnalysisState:
             if node is None:
                 state._mark_seed_unresolved(start_ref, "start_ref_unresolved", "The start reference is absent.")
                 continue
-            if not eligible_as_analysis_seed(node):
+            if not graph.analysis_start_eligible(start_ref):
                 state._mark_seed_unresolved(
                     start_ref,
                     "start_ref_ineligible",
@@ -789,7 +782,7 @@ class RecursiveAnalysisState:
                     ref
                     for ref in graph.upstream_refs(start_ref)
                     if graph.nodes.get(ref)
-                    and eligible_as_attribution_evidence(graph.nodes[ref])
+                    and graph.evidence_eligible(ref)
                 ]
                 manifest = (
                     graph.raw_trace.get("manifest")
@@ -862,7 +855,7 @@ class RecursiveAnalysisState:
                         state._remember_candidate(candidate)
                     if predecessor_ref not in traversal_predecessors:
                         continue
-                    if not eligible_as_analysis_seed(graph.nodes[predecessor_ref]):
+                    if not graph.analysis_start_eligible(predecessor_ref):
                         continue
                     if len(state.ledger.snapshot()) >= max_hypotheses:
                         state._increment_budget("hypotheses")
@@ -1075,7 +1068,7 @@ class RecursiveAnalysisState:
                 for item in action_payload["causal_candidates"]
             )
             if graph.nodes.get(candidate.ref)
-            and eligible_as_attribution_evidence(graph.nodes[candidate.ref])
+            and graph.evidence_eligible(candidate.ref)
         ]
         state.causal_relations = [PredecessorAssessment.from_dict(item) for item in action_payload["causal_relations"]]
         state.step_judgments = [CausalStepJudgment.from_dict(item) for item in action_payload["step_judgments"]]
@@ -1183,12 +1176,12 @@ class RecursiveAnalysisState:
         candidates = tuple(
             candidate
             for candidate in candidates
-            if eligible_as_attribution_evidence(candidate.node)
+            if graph.evidence_eligible(candidate.ref)
         )
         retrieved_candidates = tuple(
             candidate
             for candidate in (retrieved_candidates or candidates)
-            if eligible_as_attribution_evidence(candidate.node)
+            if graph.evidence_eligible(candidate.ref)
         )
         hypothesis = self.ledger.get(item.hypothesis_id)
         chain = self.transformation_chains.get(item.defect_state.fingerprint, (item.defect_state,))
@@ -1547,7 +1540,7 @@ class RecursiveAnalysisState:
                     "The recursive predecessor is not present in the trace graph.",
                 )
                 continue
-            if not eligible_as_analysis_seed(self.graph.nodes[assessment.ref]):
+            if not self.graph.analysis_start_eligible(assessment.ref):
                 self._mark_ref_unresolved(
                     assessment.ref,
                     item,
@@ -1944,7 +1937,7 @@ class RecursiveAnalysisState:
         evidence_refs: Tuple[str, ...],
     ) -> Optional[CausalCandidate]:
         node = self.graph.nodes.get(ref)
-        if node is None or not eligible_as_attribution_evidence(node):
+        if node is None or not self.graph.evidence_eligible(ref):
             return None
         return CausalCandidate(
             ref=ref,
@@ -2132,7 +2125,7 @@ class AgenticRecursiveAnalyzer:
         ]
         for item in queued_items:
             node = graph.nodes.get(item.node_ref)
-            if node is None or not eligible_as_analysis_seed(node):
+            if node is None or not graph.analysis_start_eligible(item.node_ref):
                 continue
             hypothesis = state.ledger.get(item.hypothesis_id)
             if hypothesis.status not in {"active", "supported"}:
@@ -2301,7 +2294,7 @@ class AgenticRecursiveAnalyzer:
             resolved = graph.resolve(candidate.ref) or candidate.ref
             if (
                 resolved not in graph.nodes
-                or not eligible_as_attribution_evidence(graph.nodes[resolved])
+                or not graph.evidence_eligible(resolved)
             ):
                 continue
             existing = selected.get(resolved)
@@ -2419,7 +2412,7 @@ class AgenticRecursiveAnalyzer:
             position = graph.position(node.ref)
             if (
                 position >= boundary and not include_post_boundary_evidence
-            ) or node.event_type == "progress.episode" or not eligible_as_attribution_evidence(node):
+            ) or node.event_type == "progress.episode" or not graph.evidence_eligible(node.ref):
                 continue
             score = _global_evidence_score(node)
             if score <= 0.0:
@@ -2579,7 +2572,7 @@ class AgenticRecursiveAnalyzer:
                 anchor = state.graph.resolve(str(request.get("anchor_ref") or ""))
                 if not anchor or anchor not in state.graph.nodes:
                     continue
-                if not eligible_as_analysis_seed(state.graph.nodes[anchor]):
+                if not state.graph.analysis_start_eligible(anchor):
                     continue
                 owner = next(
                     (
@@ -2762,7 +2755,7 @@ class AgenticRecursiveAnalyzer:
             item = state.frontier.pop()
             state.processed_items += 1
             current_node = analysis_graph.nodes.get(item.node_ref)
-            if current_node is None or not eligible_as_analysis_seed(current_node):
+            if current_node is None or not analysis_graph.analysis_start_eligible(item.node_ref):
                 state.complete_unresolved(
                     item,
                     "frontier_node_ineligible",
@@ -2809,7 +2802,7 @@ class AgenticRecursiveAnalyzer:
                 retrieved_candidates = [
                     candidate
                     for candidate in retrieved_candidates
-                    if eligible_as_attribution_evidence(candidate.node)
+                    if analysis_graph.evidence_eligible(candidate.ref)
                 ]
                 candidates = retrieved_candidates[:CAUSAL_STEP_CANDIDATE_LIMIT]
             except Exception as exc:
