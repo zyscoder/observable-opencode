@@ -2100,6 +2100,45 @@ class RecursiveRootRankingTest(unittest.TestCase):
         )
         self.assertEqual(judge.confirmation_requests.__len__(), 1)
 
+    def test_queued_confirmation_rejects_temporal_metadata_path(self):
+        trace = observed_trace()
+        trace["dataflow_edges"][0]["evidence_type"] = "temporal_advisory"
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="The decision omitted required search coverage.",
+                    reason="The decision is a necessary local root.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertIn(
+            "queued confirmation path lacks a grounded non-temporal edge",
+            report.confirmations[0].reason,
+        )
+
     def test_rejected_candidate_backtracks_to_independently_confirmed_alternative(self):
         def first_step(request):
             return step(
@@ -2928,6 +2967,14 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "edge_origin": "offline.semantic_retrieval",
                     },
                     {
+                        "from": {"type": "record", "id": "route_a"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "used_as_context",
+                        "evidence_type": "recorded_dataflow",
+                        "confidence": 0.0,
+                        "eligible_for_attribution": True,
+                    },
+                    {
                         "from": {"type": "record", "id": "route_b"},
                         "to": {"type": "record", "id": "change"},
                         "relation": "higher_scored_distinct_route",
@@ -3005,7 +3052,11 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         )
         self.assertNotIn("confidence", route_a["candidate"]["retrieval_edge"])
         self.assertTrue(
-            all("confidence" not in edge for edge in route_a["outgoing_edges"])
+            all(
+                "confidence" not in edge
+                for edge in route_a["outgoing_edges"]
+                if edge["relation"] in {"ranking_route_a", "ranking_route_b"}
+            )
         )
         route_b = next(
             item
@@ -3192,8 +3243,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         for relation in (
             "semantic_navigation_route",
             "temporal_sequence",
+            "temporal_availability",
+            "available_to_next_request",
+            "temporal_adjacency",
             "fallback_sequence",
             "previous_progress_episode",
+            "",
+            "unregistered_causal_guess",
         ):
             with self.subTest(relation=relation):
                 graph = TraceGraph.from_trace(
@@ -3257,6 +3313,46 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             ),
             (),
         )
+
+    def test_grounded_downstream_path_rejects_temporal_edge_metadata(self):
+        for metadata in (
+            {"evidence_type": "temporal_inferred"},
+            {"evidence_type": "temporal_only"},
+            {"evidence_type": "temporal_advisory"},
+            {"inference_method": "same_session_temporal_order"},
+        ):
+            with self.subTest(metadata=metadata):
+                graph = TraceGraph.from_trace(
+                    {
+                        "case_id": "temporal-metadata-grounded-path",
+                        "records": [
+                            {
+                                "record_id": ref,
+                                "component": "processor",
+                                "event_type": "decision",
+                            }
+                            for ref in ("decision", "defect")
+                        ],
+                        "dataflow_edges": [
+                            {
+                                "from": {"type": "record", "id": "decision"},
+                                "to": {"type": "record", "id": "defect"},
+                                "relation": "produced",
+                                "eligible_for_attribution": True,
+                                **metadata,
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    _grounded_downstream_path(
+                        graph,
+                        "record:decision",
+                        ("record:defect",),
+                    ),
+                    (),
+                )
 
     def test_response_claim_seed_is_an_unconfirmed_claim_quality_candidate(self):
         graph = TraceGraph.from_trace(
