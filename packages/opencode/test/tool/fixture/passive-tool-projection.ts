@@ -208,7 +208,8 @@ const result = await Effect.runPromise(
                 scenario,
                 constructorName: error instanceof Error ? error.constructor.name : typeof error,
                 name: error instanceof Error ? error.name : undefined,
-                type: error instanceof Error ? error.name : typeof error,
+                isPassiveToolError: error instanceof PassiveToolError,
+                hasPassiveToolErrorPrototype: Object.getPrototypeOf(error) === PassiveToolError.prototype,
                 message: error instanceof Error ? error.message : String(error),
               })
               return {

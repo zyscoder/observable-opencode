@@ -27,8 +27,9 @@ The observed public result is byte-for-byte structurally equal across modes:
 - exact decoded success, error, and pre-aborted inputs;
 - exact success tool output and metadata;
 - original thrown error identity captured before `SessionProcessor.failToolCall`:
-  constructor/name/type/message `PassiveToolError` / `PassiveToolError` /
-  `PassiveToolError` / `passive benchmark failure`;
+  constructor/name/`instanceof PassiveToolError`/exact prototype/message
+  `PassiveToolError` / `PassiveToolError` / `true` / `true` /
+  `passive benchmark failure`;
 - metadata callback count 3 and permission callback count 3;
 - exact production-generated three-message Agent-visible projection containing
   three tool calls and three corresponding tool results, without synthesized or
@@ -44,17 +45,19 @@ metrics. No Agent, attribution Judge, LLM, API, or network call was used.
 
 Artifact outcomes are `loaded / missing / slice fallback / hash mismatch`.
 
-| Frozen case | Broken fragments | Artifact outcomes | Artifact files | External seeds | Revision | IR nodes/edges | Graph nodes/edges |
-| --- | ---: | --- | ---: | ---: | --- | ---: | ---: |
-| Axios | 0 | `0 / 170 / 0 / 0` | 0 | 0 | absent | `507 / 1334` | `522 / 1277` |
-| Astropy | 1 | `0 / 184 / 0 / 0` | 0 | 0 | absent | `518 / 1318` | `533 / 1257` |
-| TerminalBench | 0 | `0 / 110 / 0 / 0` | 0 | 0 | absent | `258 / 566` | `267 / 535` |
+| Frozen case | Broken fragments | Artifact outcomes | Indexed / record refs / unique refs | Artifact files | External seeds | Revision | IR nodes/edges | Graph nodes/edges |
+| --- | ---: | --- | --- | ---: | ---: | --- | ---: | ---: |
+| Axios | 0 | `0 / 170 / 0 / 0` | `234 / 208 / 170` | 0 | 0 | absent | `507 / 1334` | `522 / 1277` |
+| Astropy | 1 | `0 / 184 / 0 / 0` | `258 / 232 / 184` | 0 | 0 | absent | `518 / 1318` | `533 / 1257` |
+| TerminalBench | 0 | `0 / 110 / 0 / 0` | `129 / 124 / 110` | 0 | 0 | absent | `258 / 566` | `267 / 535` |
 
-The frozen bundles index 234, 258, and 129 artifacts respectively, but their
-artifact directories contain zero files. Their old manifests also contain no
-verified semantic slices, so current hydration honestly reports every unique
-referenced artifact as missing. Zero hash mismatches means no bytes were
-available to compare; it is not evidence of artifact integrity.
+The characterizer emits the table's `indexed_artifacts`, `record_references`,
+and `unique_referenced_artifacts` fields. The frozen bundles index 234, 258,
+and 129 artifacts respectively, but their artifact directories contain zero
+files. Their old manifests also contain no verified semantic slices, so current
+hydration honestly reports every unique referenced artifact as missing. Zero
+hash mismatches means no bytes were available to compare; it is not evidence of
+artifact integrity.
 
 Astropy record `responseclaim_claim_515_882c4186` still begins with a comma.
 The historical bytes were not rewritten.
@@ -172,3 +175,19 @@ historical portability limitation remains unchanged.
   completed successfully; the four-file Bun gate passed `241/241`, the Python
   suite passed `555 tests`, and typecheck, isolated-pycache compileall, and
   `git diff --check` exited `0`.
+
+## Fix Wave 3 (2026-07-22)
+
+- The passive child now captures direct `instanceof PassiveToolError` and exact
+  `PassiveToolError.prototype` identity before creating the `tool-error` event
+  consumed by `SessionProcessor.failToolCall`; it no longer infers type from
+  `error.name`. The exact oracle deep-compares those booleans across disabled,
+  enabled, and invalid-root tracing modes.
+- The no-LLM characterizer now emits `record_references` and
+  `unique_referenced_artifacts`. The published three-archive command reports
+  Axios `208 / 170`, Astropy `232 / 184`, and TerminalBench `124 / 110`, exactly
+  matching the table above. The hermetic archive fixture fixes the expected
+  duplicate-reference values at `4 / 2`.
+- GREEN: focused passive Bun `4/4`; focused characterizer class `6/6`; required
+  four-file Bun regression `241/241`; full Python suite `555/555`; typecheck,
+  isolated-pycache compileall, and `git diff --check` all exited `0`.

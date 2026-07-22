@@ -41,6 +41,8 @@ def characterize_archive(path: Path) -> JsonDict:
             "artifact_hydration": {
                 key: graph.artifact_hydration[key] for key in HYDRATION_KEYS
             },
+            "record_references": graph.artifact_hydration["referenced"],
+            "unique_referenced_artifacts": graph.artifact_hydration["unique_referenced"],
             "graph_nodes": len(graph.nodes),
             "graph_edges": sum(len(graph.downstream_refs(ref)) for ref in graph.nodes),
         }
@@ -61,6 +63,8 @@ def characterize_archive(path: Path) -> JsonDict:
         "broken_claim_fragments": len(broken_claim_fragments(trace)),
         "artifact_hydration": first["artifact_hydration"],
         "indexed_artifacts": len(trace.get("artifacts") or []),
+        "record_references": first["record_references"],
+        "unique_referenced_artifacts": first["unique_referenced_artifacts"],
         "artifact_files": sum(1 for item in artifact_root.rglob("*") if item.is_file())
         if artifact_root.exists()
         else 0,

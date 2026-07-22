@@ -45,14 +45,16 @@ describe("tool semantic observability", () => {
           scenario: "error",
           constructorName: "PassiveToolError",
           name: "PassiveToolError",
-          type: "PassiveToolError",
+          isPassiveToolError: true,
+          hasPassiveToolErrorPrototype: true,
           message: "passive benchmark failure",
         },
         {
           scenario: "pre-aborted",
           constructorName: "DOMException",
           name: "AbortError",
-          type: "AbortError",
+          isPassiveToolError: false,
+          hasPassiveToolErrorPrototype: false,
           message: "Passive tool pre-aborted",
         },
       ])

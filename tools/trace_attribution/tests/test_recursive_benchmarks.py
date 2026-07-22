@@ -236,13 +236,29 @@ class TraceFactClosureBenchmarkTest(unittest.TestCase):
             "manifest": {"case_id": "characterizer-fixture", "run_id": "run"},
             "nodes": [],
             "edges": [],
-            "artifacts": [],
+            "artifacts": [
+                {"artifact_id": "artifact-alpha"},
+                {"artifact_id": "artifact-beta"},
+            ],
             "records": [
                 {
                     "record_id": "claim",
                     "component": "result",
                     "event_type": "response.claim",
-                    "data": {"text": ", broken historical fragment"},
+                    "artifact_refs": ["artifact:artifact-alpha", "artifact:artifact-beta"],
+                    "data": {
+                        "text": ", broken historical fragment",
+                        "artifact_id": "artifact-alpha",
+                    },
+                },
+                {
+                    "record_id": "related",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {
+                        "payload_ref": "artifact:artifact-beta",
+                        "nested": {"raw_artifact_ref": "artifact:artifact-alpha"},
+                    },
                 }
             ],
             "dataflow_edges": [],
@@ -261,6 +277,8 @@ class TraceFactClosureBenchmarkTest(unittest.TestCase):
         self.assertEqual(first["sha256"], hashlib.sha256(source_bytes).hexdigest())
         self.assertEqual(first["byte_length"], len(source_bytes))
         self.assertEqual(first["broken_claim_fragments"], 1)
+        self.assertEqual(first["record_references"], 4)
+        self.assertEqual(first["unique_referenced_artifacts"], 2)
         self.assertEqual(first["artifact_files"], 0)
         self.assertIsNone(first["subject_revision"])
 

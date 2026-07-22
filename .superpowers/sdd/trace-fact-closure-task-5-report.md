@@ -72,9 +72,10 @@ three scenarios. The test fixes and asserts:
   `payload="fixed-input"`;
 - success output: title `passive success`, output `stable tool output`, and
   metadata `{scenario: "success", truncated: false}`;
-- original thrown error constructor/name/type/message, captured before it is
-  passed to `SessionProcessor.failToolCall`: `PassiveToolError`,
-  `PassiveToolError`, `PassiveToolError`, `passive benchmark failure`;
+- original thrown error constructor/name/`instanceof PassiveToolError`/exact
+  prototype/message, captured before it is passed to
+  `SessionProcessor.failToolCall`: `PassiveToolError`, `PassiveToolError`,
+  `true`, `true`, `passive benchmark failure`;
 - callback counts: metadata 3, permission 3;
 - the exact production-generated three-message Agent-visible projection with
   three tool calls and three tool results, not synthesized callback/result/error
@@ -96,6 +97,10 @@ Graph counts include current deterministic offline reconstruction.
 | TerminalBench `cancel-async-tasks` | 0 | `0 / 110 / 0 / 0` | 0 | 0 | absent | `258 / 566` | `267 / 535` |
 
 Additional artifact facts:
+
+These columns are the characterizer's `indexed_artifacts`,
+`record_references`, `unique_referenced_artifacts`, and
+`artifact_hydration.truncated` fields.
 
 | Case | Indexed artifacts | Record references | Unique referenced artifacts | Truncated loads |
 | --- | ---: | ---: | ---: | ---: |
@@ -244,3 +249,20 @@ boundaries and adds a deterministic offline characterization utility.
   before emitting metrics. The four-file Bun gate passed `241/241`, the full
   Python suite passed `555 tests`, and typecheck, isolated-pycache compileall,
   and `git diff --check` exited `0`.
+
+## Fix Wave 3 Evidence (2026-07-22)
+
+- The passive fixture records `error instanceof PassiveToolError` and
+  `Object.getPrototypeOf(error) === PassiveToolError.prototype` immediately
+  after squashing the original cause and before it creates the `tool-error`
+  event for `SessionProcessor.failToolCall`. It does not derive a type label
+  from `error.name`; the exact expected booleans are deep-compared across all
+  three tracing modes.
+- The characterizer JSON now emits `record_references` and
+  `unique_referenced_artifacts`. Its published archive output is Axios
+  `208 / 170`, Astropy `232 / 184`, and TerminalBench `124 / 110`, matching the
+  additional-artifact table exactly; the hermetic fixture asserts `4 / 2` for
+  repeated references to two artifacts.
+- GREEN: focused passive Bun `4/4`; focused characterizer class `6/6`; required
+  four-file Bun regression `241/241`; full Python suite `555/555`; typecheck,
+  isolated-pycache compileall, and `git diff --check` all exited `0`.
