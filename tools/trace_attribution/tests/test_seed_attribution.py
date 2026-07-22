@@ -246,6 +246,25 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
         )
 
 
+class DivergentSharedRootFusionJudge(SharedRootFusionJudge):
+    def confirm_candidate_offline(self, request):
+        self.confirmation_requests.append(request)
+        if request.recursive_path[-1] == "record:seed_two":
+            return RootConfirmation.unknown(
+                request.candidate_ref,
+                "The second seed lacks independent confirmation evidence.",
+                evidence_refs=(request.candidate_ref,),
+            )
+        return RootConfirmation.confirmed(
+            request.candidate_ref,
+            excerpt="The shared root decision omitted required evidence.",
+            reason="The shared decision independently caused the first seed's defect.",
+            counterfactual="A grounded decision prevents the unsupported claim.",
+            confidence=0.95,
+            evidence_refs=(request.candidate_ref,),
+        )
+
+
 class CrashAfterFirstCompletedConfirmation(CheckpointBundle):
     def __init__(self, root: Path) -> None:
         super().__init__(root)
@@ -467,6 +486,58 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
                     config,
                 )
             resumed_judge = SharedRootFusionJudge()
+            resumed = analyze(resumed_judge, CheckpointBundle(root), config)
+
+        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+        self.assertEqual(len(resumed_judge.confirmation_requests), 1)
+
+    def test_same_fingerprint_different_seed_unknown_does_not_erase_confirmed_seed_after_resume(self):
+        trace = shared_root_trace()
+        graph = TraceGraph.from_trace(trace)
+        start_refs = ("record:seed_one", "record:seed_two")
+        objective = "Confirm each identical claim independently."
+
+        def analyze(judge, checkpoint=None, checkpoint_config=None):
+            return AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=checkpoint,
+                checkpoint_config=checkpoint_config,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                graph,
+                start_refs=start_refs,
+                objective=objective,
+                analysis_perspective="",
+            )
+
+        uninterrupted_judge = DivergentSharedRootFusionJudge()
+        uninterrupted = analyze(uninterrupted_judge)
+        by_ref = {item.start_ref: item for item in uninterrupted.seed_results}
+
+        self.assertEqual(by_ref["record:seed_one"].outcome, "confirmed_root")
+        self.assertEqual(by_ref["record:seed_two"].outcome, "evidence_gap")
+        self.assertEqual(uninterrupted.analysis_outcome, "partial")
+        self.assertEqual(
+            [item.node_ref for item in uninterrupted.confirmed_roots],
+            ["record:shared_root"],
+        )
+        self.assertTrue(
+            all(
+                request.competing_hypotheses == ()
+                for request in uninterrupted_judge.confirmation_requests
+            )
+        )
+
+        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "divergent-shared-root.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                analyze(
+                    DivergentSharedRootFusionJudge(),
+                    CrashAfterFirstCompletedConfirmation(root),
+                    config,
+                )
+            resumed_judge = DivergentSharedRootFusionJudge()
             resumed = analyze(resumed_judge, CheckpointBundle(root), config)
 
         self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())

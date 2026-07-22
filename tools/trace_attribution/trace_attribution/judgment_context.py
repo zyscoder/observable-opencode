@@ -179,6 +179,11 @@ def sanitize_judge_evidence_payload(
     field_name: str = "",
 ) -> Any:
     if isinstance(value, Mapping):
+        value = (
+            graph.sanitize_judge_edge_evidence(value)
+            if "from_ref" in value and "to_ref" in value
+            else value
+        )
         return {
             str(key): sanitize_judge_evidence_payload(
                 graph,
@@ -212,18 +217,7 @@ def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[De
 
 def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -> JsonDict:
     hydrated = graph.hydrate_node(candidate.ref)
-    edge = {
-        key: value
-        for key, value in graph.sanitize_edge_evidence(candidate.edge).items()
-        if key not in {"score", "retrieval_score"}
-        and not (
-            key == "confidence"
-            and (
-                bool(candidate.edge.get("retrieval_candidate"))
-                or not bool(candidate.edge.get("eligible_for_attribution"))
-            )
-        )
-    }
+    edge = graph.sanitize_judge_edge_evidence(candidate.edge)
     candidate_evidence_refs = graph.filter_evidence_refs(candidate.evidence_refs)
     edge_evidence_references = [
         ground_reference(graph, ref, edge_provenance_class(edge))
@@ -457,7 +451,7 @@ def collect_identity_values(value: Any) -> Dict[str, str]:
 def temporal_adjacency_context(graph: TraceGraph, node_ref: str) -> List[JsonDict]:
     """Expose temporal-only facts to the Judge without promoting them to graph predecessors."""
     return [
-        graph.sanitize_edge_evidence(edge)
+        graph.sanitize_judge_edge_evidence(edge)
         for edge in graph.temporal_adjacency_edges(node_ref)
     ]
 

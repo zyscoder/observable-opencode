@@ -2835,18 +2835,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(confirmed_high, inferred_high)
 
     def test_provenance_envelope_limit_keeps_all_routes_for_selected_resolved_refs(self):
-        def without_navigation_scores(value):
-            if isinstance(value, dict):
-                return {
-                    key: without_navigation_scores(item)
-                    for key, item in value.items()
-                    if key not in {"confidence", "score", "retrieval_score"}
-                }
-            if isinstance(value, list):
-                return [without_navigation_scores(item) for item in value]
-            return value
-
-        def run(*, authentic_confidence, synthetic_confidence):
+        def run(*, first_route_confidence, second_route_confidence):
             trace = {
                 "case_id": "provenance-envelope-resolved-ref-limit",
                 "records": [
@@ -2887,18 +2876,24 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     {
                         "from": {"type": "record", "id": "route_a"},
                         "to": {"type": "record", "id": "change"},
-                        "relation": "authentic_route",
-                        "evidence_type": "confirmed",
-                        "confidence": authentic_confidence,
+                        "relation": "ranking_route_a",
+                        "evidence_type": "semantic_inferred",
+                        "confidence": first_route_confidence,
                         "eligible_for_attribution": True,
+                        "retrieval_candidate": True,
+                        "inference_method": "bounded_delivery_history_semantic_ranking_v1",
+                        "edge_origin": "offline.progress_retrieval",
                     },
                     {
                         "from": {"type": "record", "id": "route_a"},
                         "to": {"type": "record", "id": "change"},
-                        "relation": "synthetic_route",
+                        "relation": "ranking_route_b",
                         "evidence_type": "semantic_inferred",
-                        "confidence": synthetic_confidence,
+                        "confidence": second_route_confidence,
                         "eligible_for_attribution": True,
+                        "retrieval_candidate": True,
+                        "inference_method": "token_overlap_retrieval",
+                        "edge_origin": "offline.semantic_retrieval",
                     },
                     {
                         "from": {"type": "record", "id": "route_b"},
@@ -2940,9 +2935,10 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 start_refs=["record:observed_defect"],
                 objective="Find the trace-visible root.",
             )
-            capsules = judge.global_requests[0].to_dict()["candidate_evidence_capsules"]
+            global_request = judge.global_requests[0].to_dict()
+            capsules = global_request["candidate_evidence_capsules"]
             return {
-                "normalized_global_capsules": without_navigation_scores(capsules),
+                "global_request": global_request,
                 "capsule_refs": [item["candidate_ref"] for item in capsules],
                 "hypotheses": [item.to_dict() for item in report.hypotheses],
                 "confirmation_facts": [
@@ -2950,25 +2946,42 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 ],
             }
 
-        authentic_high = run(authentic_confidence=0.99, synthetic_confidence=0.01)
-        synthetic_high = run(authentic_confidence=0.01, synthetic_confidence=0.99)
+        first_route_high = run(
+            first_route_confidence=0.99,
+            second_route_confidence=0.01,
+        )
+        second_route_high = run(
+            first_route_confidence=0.01,
+            second_route_confidence=0.99,
+        )
 
-        self.assertEqual(authentic_high, synthetic_high)
-        self.assertEqual(len(authentic_high["confirmation_facts"]), 1)
+        self.assertEqual(first_route_high, second_route_high)
+        self.assertEqual(len(first_route_high["confirmation_facts"]), 1)
         self.assertLess(
-            authentic_high["capsule_refs"].index("record:route_b"),
-            authentic_high["capsule_refs"].index("record:route_a"),
+            first_route_high["capsule_refs"].index("record:route_b"),
+            first_route_high["capsule_refs"].index("record:route_a"),
         )
         route_a = next(
             item
-            for item in authentic_high["normalized_global_capsules"]
+            for item in first_route_high["global_request"]["candidate_evidence_capsules"]
             if item["candidate_ref"] == "record:route_a"
         )
-        self.assertEqual(route_a["candidate"]["source"], "confirmed_edge")
+        self.assertEqual(route_a["candidate"]["source"], "attribution_edge")
         self.assertEqual(
             route_a["candidate"]["retrieval_edge"]["relation"],
-            "authentic_route",
+            "ranking_route_a",
         )
+        self.assertNotIn("confidence", route_a["candidate"]["retrieval_edge"])
+        self.assertTrue(
+            all("confidence" not in edge for edge in route_a["outgoing_edges"])
+        )
+        route_b = next(
+            item
+            for item in first_route_high["global_request"]["candidate_evidence_capsules"]
+            if item["candidate_ref"] == "record:route_b"
+        )
+        self.assertEqual(route_b["candidate"]["retrieval_edge"]["confidence"], 0.8)
+        self.assertEqual(route_b["outgoing_edges"][0]["confidence"], 0.8)
 
     def test_retrieval_score_does_not_change_confirmation_facts_on_real_fusion_path(self):
         class ScoreAdjustedRetriever(SemanticPredecessorRetriever):

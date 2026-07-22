@@ -3902,6 +3902,8 @@ class AgenticRecursiveAnalyzer:
         )
         for index, (left_identity, left) in enumerate(confirmed_items):
             for right_identity, right in confirmed_items[index + 1 :]:
+                if left.seed_binding_identity != right.seed_binding_identity:
+                    continue
                 left_to_right = comparison_to(left, right_identity)
                 right_to_left = comparison_to(right, left_identity)
                 if (
@@ -3929,6 +3931,17 @@ class AgenticRecursiveAnalyzer:
                     comparison.get("requires_independent_confirmation")
                 )
                 target = confirmations.get(target_identity)
+                comparison_seed = str(
+                    comparison.get("seed_binding_identity") or ""
+                )
+                if target is not None:
+                    if target.seed_binding_identity != source.seed_binding_identity:
+                        continue
+                elif (
+                    comparison_seed
+                    and comparison_seed != source.seed_binding_identity
+                ):
+                    continue
                 if not requires_confirmation:
                     if status == "co_root":
                         block(source_identity, "co_root_lacks_independent_confirmation")
@@ -4083,6 +4096,8 @@ class AgenticRecursiveAnalyzer:
             competitor_seed_binding_identity = str(
                 value.get("seed_binding_identity") or ""
             )
+            if competitor_seed_binding_identity != seed_binding_identity:
+                continue
             competitor_binding = next(
                 (
                     item

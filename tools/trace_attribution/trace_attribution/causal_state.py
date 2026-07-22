@@ -2009,6 +2009,8 @@ class RecursiveAttributionReport:
             left = confirmation_by_identity[left_identity]
             for right_identity in ordered_root_identities[index + 1 :]:
                 right = confirmation_by_identity[right_identity]
+                if left.seed_binding_identity != right.seed_binding_identity:
+                    continue
 
                 def reciprocal(
                     source: RootConfirmation, target_identity: str

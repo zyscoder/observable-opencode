@@ -16,6 +16,21 @@ from .reconstruction import reconstruct_message_lineage
 
 
 EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v1"
+RANKING_CONFIDENCE_EDGE_ORIGINS = frozenset(
+    {
+        "offline.global_candidate_retrieval",
+        "offline.navigation_routing",
+        "offline.progress_retrieval",
+        "offline.semantic_retrieval",
+        "offline.sibling_retrieval",
+    }
+)
+RANKING_CONFIDENCE_INFERENCE_METHODS = frozenset(
+    {
+        "bounded_delivery_history_semantic_ranking_v1",
+        "token_overlap_retrieval",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -403,6 +418,20 @@ class TraceGraph:
             output["evidence_refs"] = self.filter_evidence_refs(
                 refs if isinstance(refs, (list, tuple)) else string_list(refs)
             )
+        return output
+
+    def sanitize_judge_edge_evidence(self, edge: Mapping[str, Any]) -> JsonDict:
+        output = self.sanitize_edge_evidence(edge)
+        output.pop("score", None)
+        output.pop("retrieval_score", None)
+        if (
+            bool(edge.get("retrieval_candidate"))
+            or str(edge.get("edge_origin") or "")
+            in RANKING_CONFIDENCE_EDGE_ORIGINS
+            or str(edge.get("inference_method") or "")
+            in RANKING_CONFIDENCE_INFERENCE_METHODS
+        ):
+            output.pop("confidence", None)
         return output
 
     def assert_evidence_eligible_references(

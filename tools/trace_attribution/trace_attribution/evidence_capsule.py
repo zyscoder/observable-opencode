@@ -155,18 +155,7 @@ def build_candidate_evidence_capsules(
             "artifact:{0}".format(item)
             for item in artifact_hydration.get("missing_artifact_ids") or []
         ]
-        retrieval_edge = {
-            key: value
-            for key, value in graph.sanitize_edge_evidence(candidate.edge).items()
-            if key not in {"score", "retrieval_score"}
-            and not (
-                key == "confidence"
-                and (
-                    bool(candidate.edge.get("retrieval_candidate"))
-                    or not bool(candidate.edge.get("eligible_for_attribution"))
-                )
-            )
-        }
+        retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
         evidence_refs = _dedupe_strings(
             graph.filter_evidence_refs(
                 [
@@ -201,7 +190,10 @@ def build_candidate_evidence_capsules(
                 downstream_path_references=tuple(_reference(graph, item) for item in path),
                 start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
                 action_group=_action_group(graph, node),
-                incoming_edges=tuple(graph.incoming_edge_context(ref)[:16]),
+                incoming_edges=tuple(
+                    graph.sanitize_judge_edge_evidence(edge)
+                    for edge in graph.incoming_edge_context(ref)[:16]
+                ),
                 outgoing_edges=tuple(_outgoing_edges(graph, ref, limit=16)),
                 evidence_references=tuple(evidence_references),
                 artifact_hydration=artifact_hydration,
@@ -263,7 +255,10 @@ def _reference(graph: TraceGraph, raw_ref: str) -> JsonDict:
 def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict]:
     output: List[JsonDict] = []
     for downstream in graph.downstream_refs(ref):
-        output.extend(graph.edge_context(ref, downstream))
+        output.extend(
+            graph.sanitize_judge_edge_evidence(edge)
+            for edge in graph.edge_context(ref, downstream)
+        )
         if len(output) >= limit:
             break
     return output[:limit]
