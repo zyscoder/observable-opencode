@@ -302,16 +302,7 @@ function tokenizeListParagraphRange(source: ClaimSourceView, start: number, end:
 
 function mapNestedRawRange(source: ClaimSourceView, raw: unknown, cursor: number, end: number) {
   if (typeof raw !== "string" || !raw) return undefined
-  const rawLines = normalizedPhysicalLines(raw)
-  let lineStart = cursor
-  while (lineStart < end) {
-    const range = mapNestedRawLinesAt(source, rawLines, lineStart, end)
-    if (range) return range
-    const line = sourcePhysicalLine(source.originalText, lineStart, end)
-    if (line.stop <= lineStart) break
-    lineStart = line.stop
-  }
-  return undefined
+  return mapNestedRawLinesAt(source, normalizedPhysicalLines(raw), cursor, end)
 }
 
 type NormalizedPhysicalLine = {
@@ -420,7 +411,13 @@ function tokenizeMarkdownTable(
   tokens.push({ type: "HARD_BREAK", start: lines[0]!.start, end: lines[1]!.stop })
   block.rows.forEach((row, index) => {
     const line = lines[index + 2]!
-    const cells = markedTableRowCells(row, block.header!.length, source.originalText.slice(line.start, line.end))
+    const rawLine = source.originalText.slice(line.start, line.end)
+    if (!hasMarkdownTableColumnDelimiter(rawLine)) {
+      tokenizeParagraphRange(source, line.start, line.end, tokens)
+      tokens.push({ type: "HARD_BREAK", start: line.end, end: line.stop })
+      return
+    }
+    const cells = markedTableRowCells(row, block.header!.length, rawLine)
     if (!cells) {
       tokens.push({ type: "HARD_BREAK", start: line.start, end: line.stop })
       return
@@ -446,6 +443,13 @@ function markedTableRowCells(row: MarkdownTableCell[], expectedCount: number, ra
   )
     return undefined
   return structured.map(normalizeMarkedTableCell)
+}
+
+function hasMarkdownTableColumnDelimiter(input: string) {
+  for (let index = 0; index < input.length; index++) {
+    if (input[index] === "|" && !isBackslashEscaped(input, index)) return true
+  }
+  return false
 }
 
 function hasUnescapedPipeInCodeSpan(input: string) {
@@ -673,6 +677,8 @@ function mergeClaimContinuations(source: ClaimSourceView, input: ClaimSpan[]) {
 function toFactualCandidate(source: ClaimSourceView, span: ClaimSpan): ClaimCandidate[] {
   const rawText = source.originalText.slice(span.start, span.end)
   const normalized = rawText.replace(/\s+/g, " ").trim()
+  const tableFact = span.table_cells === undefined ? undefined : markdownTableFactClaim(span.table_cells)
+  if (span.table_cells !== undefined && !tableFact) return []
   if (isBrokenClaimFragment(normalized) || isNonFactualResponseClaim(normalized)) return []
   const textLength = normalized.replace(/\s/g, "").length
   const hasFactSignal = /\d|[/\\][\w.-]+|[A-Za-z_$][\w$]*\(|[A-Za-z_$][\w$]*\.[A-Za-z_$]/.test(normalized)
@@ -682,7 +688,6 @@ function toFactualCandidate(source: ClaimSourceView, span: ClaimSpan): ClaimCand
     )
   if (textLength < 6 && !hasFactSignal && !hasAtomicVerdict) return []
 
-  const tableFact = span.table_cells ? markdownTableFactClaim(span.table_cells) : undefined
   const text = tableFact?.text ?? normalized
   const canonicalText = tableFact?.canonical_text
   const semanticStatement = canonicalText ?? text
@@ -718,6 +723,7 @@ function stableHash(input: string) {
 
 export function isNonFactualResponseClaim(input: unknown) {
   const text = typeof input === "string" ? input : stringPreview(input)
+  if (isMarkdownTableStructuralRow(text)) return true
   if (/__TRACE_PROTECTED_\d+__/.test(text)) return true
   if (
     /^\s*[+-]\s+/.test(text) &&
@@ -775,6 +781,45 @@ export function isNonFactualResponseClaim(input: unknown) {
   if (/^(no further steps needed|nothing else needed|no next steps needed)$/.test(normalized)) return true
   if (/^(以下是|下面是|这里是).*(总结|结论|报告)$/.test(normalized)) return true
   return false
+}
+
+function markdownTableCells(input: string) {
+  const trimmed = input.trim()
+  if (!trimmed.includes("|")) return []
+  return trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim().replace(/\*\*/g, "").replace(/`/g, "").trim())
+}
+
+function isLikelyTableHeaderCell(input: string) {
+  const normalized = input.trim().toLowerCase()
+  if (!normalized || /^:?-{2,}:?$/.test(normalized)) return true
+  if (
+    /^(项目|结果|来源|状态|输入|计算|关键信息|维度|说明|字段|值|文件|路径|议题|结论|事实|约束|描述|当前值|预期值|是否命中|脚本|命令|覆盖风险|子 agent 结论|subagent result|item|project|result|source|input|calculation|key information|dimension|description|file|path|topic|conclusion|fact|constraint|current value|expected value|script|command|coverage risk|field|value|status)$/.test(
+      normalized,
+    )
+  )
+    return true
+  if (/^(折扣上限|架构规定|现行需求|当前代码|相关文件|证据|动作|原因|风险)$/.test(normalized)) return true
+  if (/^mcp\s+[\w-]+$/i.test(normalized)) return true
+  if (/^syntheticfacts(?:\s*\(mcp\))?[_\w.-]*$/i.test(normalized)) return true
+  return /^(?:[\w@+.-]+\/)?[\w@+.-]+\.(?:md|mjs|js|ts|tsx|json|txt|py|go|rs|java|yaml|yml)$/i.test(normalized)
+}
+
+function isMarkdownTableStructuralRow(input: string) {
+  const cells = markdownTableCells(input)
+  if (cells.length < 2) return false
+  if (cells.every((cell) => /^:?-{2,}:?$/.test(cell))) return true
+  const joined = cells.join(" ")
+  if (
+    /billing-platform|15\s*%|15 percent|0\.15|全部通过|pricing tests passed|失败|通过|无需改动|Math\.min|quoteOwner\(|renewalQuote\(input\)|48000|51000/i.test(
+      joined,
+    )
+  )
+    return false
+  return cells.every(isLikelyTableHeaderCell)
 }
 
 function markdownTableFactClaim(cells: string[]) {

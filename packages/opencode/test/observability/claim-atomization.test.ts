@@ -37,6 +37,49 @@ describe("claim atomization", () => {
     }
   })
 
+  test("keeps markdown table scaffolding non-factual for ordinary strings", () => {
+    const scaffolds = ["| Field | Value |", "| --- | --- |", "| 项目 | 结果 |", "| 输入 | 计算 | 结果 |"]
+
+    for (const scaffold of scaffolds) {
+      expect(() => isNonFactualResponseClaim(scaffold)).not.toThrow()
+      expect(isNonFactualResponseClaim(scaffold), scaffold).toBe(true)
+    }
+  })
+
+  test("drops structured table rows when table facts cannot be constructed", () => {
+    const atomizeTableRow = (row: string, cells: string[]) =>
+      atomizeResponseClaimsWithLexerForTest(`| Field | Value |\n| --- | --- |\n${row}`, (source) => [
+        {
+          type: "table",
+          raw: source,
+          header: [{ text: "Field" }, { text: "Value" }],
+          rows: [cells.map((text) => ({ text }))],
+        },
+      ])
+
+    expect(atomizeTableRow("|  | All 11 tests pass. |", ["", "All 11 tests pass."])).toEqual([])
+    expect(atomizeTableRow("| Tests | --- |", ["Tests", "---"])).toEqual([])
+  })
+
+  test("fails closed when a nested lexer item first mismatches the current source line", () => {
+    const response = "- Decoy entry.\n- All 11 tests pass."
+    const claims = atomizeResponseClaimsWithLexerForTest(response, (source) => [
+      {
+        type: "list",
+        raw: source,
+        items: [
+          {
+            type: "list_item",
+            raw: "- All 11 tests pass.",
+            tokens: [{ type: "paragraph", raw: "All 11 tests pass." }],
+          },
+        ],
+      },
+    ])
+
+    expect(claims).toEqual([])
+  })
+
   test("keeps the production module export surface limited to the atomizer", () => {
     expect(Object.keys(claimAtomization).sort()).toEqual(["atomizeResponseClaims"])
   })
