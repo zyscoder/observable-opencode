@@ -1363,6 +1363,93 @@ class SeedAttributionModelTests(unittest.TestCase):
 
         self.assertEqual(SeedAttributionResult.from_dict(valid.to_dict()), valid)
 
+    def test_seed_evidence_containers_are_strict_across_all_boundaries(self):
+        state = defect("strict-seed-evidence-containers")
+        concrete_fact = "The independent verification transcript is unavailable."
+        concrete_blocker = "independent_verification_unavailable"
+        filled = SeedAttributionResult(
+            start_ref="record:seed",
+            defect_fingerprint=state.fingerprint,
+            defect_state=state,
+            outcome="evidence_gap",
+            missing_evidence=[concrete_fact],
+            blocking_reasons=(concrete_blocker,),
+        )
+        empty = SeedAttributionResult(
+            start_ref="record:seed",
+            defect_fingerprint=state.fingerprint,
+            defect_state=state,
+            outcome="no_defect",
+            missing_evidence=[],
+            blocking_reasons=(),
+        )
+
+        self.assertEqual(filled.missing_evidence, (concrete_fact,))
+        self.assertEqual(filled.blocking_reasons, (concrete_blocker,))
+        self.assertEqual(empty.missing_evidence, ())
+        self.assertEqual(empty.blocking_reasons, ())
+        self.assertEqual(SeedAttributionResult.from_dict(filled.to_dict()), filled)
+
+        report = RecursiveAttributionReport(
+            case_id="strict-seed-evidence-containers",
+            objective="Reject unsupported seed evidence containers.",
+            start_refs=("record:seed",),
+            seed_results=(empty,),
+        ).to_dict()
+        self.assertEqual(RecursiveAttributionReport.from_dict(report).to_dict(), report)
+        _validate_report_shape(report, {"case_id": report["case_id"]})
+
+        for field in ("missing_evidence", "blocking_reasons"):
+            for invalid in (
+                concrete_fact,
+                {"detail": concrete_fact},
+                7,
+                {concrete_fact},
+            ):
+                fields = {
+                    "missing_evidence": (),
+                    "blocking_reasons": (),
+                }
+                fields[field] = invalid
+                with self.subTest(entry_point="direct", field=field, invalid=repr(invalid)):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SeedAttributionResult(
+                            start_ref="record:seed",
+                            defect_fingerprint=state.fingerprint,
+                            defect_state=state,
+                            outcome="no_defect",
+                            **fields,
+                        )
+
+                payload = empty.to_dict()
+                payload[field] = invalid
+                with self.subTest(entry_point="from_dict", field=field, invalid=repr(invalid)):
+                    with self.assertRaisesRegex(ValueError, field):
+                        SeedAttributionResult.from_dict(payload)
+
+                parsed_report = RecursiveAttributionReport(
+                    case_id="strict-seed-evidence-containers",
+                    objective="Reject unsupported seed evidence containers.",
+                    start_refs=("record:seed",),
+                    seed_results=(empty,),
+                ).to_dict()
+                parsed_report["seed_results"][0][field] = invalid
+                with self.subTest(entry_point="report", field=field, invalid=repr(invalid)):
+                    with self.assertRaisesRegex(ValueError, field):
+                        RecursiveAttributionReport.from_dict(parsed_report)
+
+                with self.subTest(entry_point="evaluator", field=field, invalid=repr(invalid)):
+                    with self.assertRaisesRegex(EvaluationSchemaError, field):
+                        _validate_report_shape(
+                            parsed_report,
+                            {"case_id": parsed_report["case_id"]},
+                        )
+
+        tuple_payload = filled.to_dict()
+        tuple_payload["missing_evidence"] = (concrete_fact,)
+        with self.assertRaisesRegex(ValueError, "missing_evidence"):
+            SeedAttributionResult.from_dict(tuple_payload)
+
     def test_unresolved_seed_does_not_publish_confirmed_root_payload(self):
         builder = SeedAttributionBuilder(
             start_ref="record:seed",
@@ -1422,7 +1509,12 @@ class SeedAttributionModelTests(unittest.TestCase):
                 defect_state=state,
                 outcome="no_defect",
             ).to_dict()
-            payload.update({"outcome": outcome, **fields})
+            payload.update(
+                {
+                    "outcome": outcome,
+                    **{key: list(value) for key, value in fields.items()},
+                }
+            )
             with self.subTest(entry_point="from_dict", case=label):
                 with self.assertRaisesRegex(ValueError, "seed outcome payload"):
                     SeedAttributionResult.from_dict(payload)

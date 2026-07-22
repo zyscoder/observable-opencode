@@ -218,13 +218,23 @@ def _frozen_strings(value: Any) -> Tuple[str, ...]:
 
 def _concrete_seed_strings(value: Any, field_name: str) -> Tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
-        return ()
+        raise ValueError(
+            "seed {0} must be a list or tuple".format(field_name)
+        )
     entries = tuple(value)
     if any(not isinstance(item, str) or not item.strip() for item in entries):
         raise ValueError(
             "seed {0} entries must be non-empty strings".format(field_name)
         )
     return entries
+
+
+def _seed_json_string_list(value: Any, field_name: str) -> List[Any]:
+    if not isinstance(value, list):
+        raise ValueError(
+            "seed {0} JSON payload must be an array".format(field_name)
+        )
+    return value
 
 
 def seed_binding_identity_for(start_ref: str, defect_fingerprint: str) -> str:
@@ -1849,8 +1859,12 @@ class SeedAttributionResult:
             confirmation_identities=_string_list(value.get("confirmation_identities")),
             confirmed_root_refs=_string_list(value.get("confirmed_root_refs")),
             decisive_evidence_refs=_string_list(value.get("decisive_evidence_refs")),
-            missing_evidence=value.get("missing_evidence"),
-            blocking_reasons=value.get("blocking_reasons"),
+            missing_evidence=_seed_json_string_list(
+                value.get("missing_evidence"), "missing_evidence"
+            ),
+            blocking_reasons=_seed_json_string_list(
+                value.get("blocking_reasons"), "blocking_reasons"
+            ),
             global_judgment=_json_dict(value.get("global_judgment")),
             expansion_history=tuple(
                 item
