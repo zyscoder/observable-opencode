@@ -159,16 +159,64 @@ describe("claim atomization", () => {
     ])
   })
 
+  test("ends an open list claim before following prose", () => {
+    const cases = [
+      {
+        name: "single list",
+        response: "- The discount cap remains 15% (see\nAfter 12 tests pass.",
+      },
+      {
+        name: "nested list",
+        response: "- Parent fact (open\n  - Nested fact (open\nAfter 12 tests pass.",
+      },
+      {
+        name: "consecutive list",
+        response: "- First fact (open\n- Second fact (open\nAfter 12 tests pass.",
+      },
+    ]
+
+    for (const item of cases) {
+      expect(atomizeResponseClaims(item.response).map((claim) => claim.text), item.name).toEqual([
+        "After 12 tests pass.",
+      ])
+    }
+  })
+
+  test("treats tilde fences as hard barriers", () => {
+    const response = "Before 11 (open\n~~~ts\nconst ignored = true\n~~~\nAfter 12 tests pass."
+
+    expect(atomizeResponseClaims(response).map((claim) => claim.text)).toEqual(["After 12 tests pass."])
+  })
+
+  test("protects double and multi-backtick inline code spans", () => {
+    const response = "The implementation uses ``foo(``. The verifier uses ```bar)```. All 11 tests pass."
+
+    expect(atomizeResponseClaims(response).map((claim) => claim.text)).toEqual([
+      "The implementation uses ``foo(``.",
+      "The verifier uses ```bar)```.",
+      "All 11 tests pass.",
+    ])
+  })
+
+  test("preserves duplicate claim occurrences with unique occurrence keys", () => {
+    const response = "All 11 tests pass. All 11 tests pass."
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims).toHaveLength(2)
+    expect(claims.map((claim) => claim.text)).toEqual(["All 11 tests pass.", "All 11 tests pass."])
+    expect(claims.map((claim) => claim.claim_group_id)).toEqual([claims[0]!.claim_group_id, claims[0]!.claim_group_id])
+    expect(claims[0]!.key).not.toBe(claims[1]!.key)
+    expect(claims.map((claim) => claim.claim_count)).toEqual([2, 2])
+  })
+
   test("uses byte ranges that reverse-slice each UTF-8 raw claim", () => {
     const response = "修改完成。\n\n- 所有 11 个测试通过。\nAll 11 tests pass."
     const claims = atomizeResponseClaims(response)
 
     for (const claim of claims) {
       const [start, end] = claim.source_byte_range
-      const prefix = Buffer.from(response).subarray(0, start).toString()
       const raw = Buffer.from(response).subarray(start, end).toString()
-      expect(response.slice(prefix.length, prefix.length + raw.length)).toContain(claim.raw_text)
-      expect(raw).toContain(claim.raw_text)
+      expect(raw).toBe(claim.raw_text)
     }
   })
 })

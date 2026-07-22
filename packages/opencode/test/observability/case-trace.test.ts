@@ -1866,12 +1866,23 @@ describe("case trace", () => {
     ) as any
     const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
     const claimTexts = claims.map((record: any) => record.data.text)
+    const responseClaimNode = trace.nodes.find((node: any) => node.kind === "response.claim")
+    const events = (await fs.readFile(path.join(dir, "parenthetical-claim-case", "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const traceClaim = events.find((event: any) => event.type === "semantic.response_claim")
+    const traceClaims = events.filter((event: any) => event.type === "semantic.response_claim")
+    const firstClaimKey = traceClaims[0]!.data.claim_key
+    const firstNextClaimKey = traceClaims[0]!.data.next_claim_key
+    const secondClaimKey = traceClaims[1]!.data.claim_key
+    const secondPreviousClaimKey = traceClaims[1]!.data.previous_claim_key
 
     expect(claimTexts).toEqual([
       "When _cstack handled a non-Model right operand (i.e., a pre-computed separability matrix from a nested compound model), it used the wrong shape.",
       "The fix preserves the nested matrix.",
     ])
-    expect(claims[0].data).toMatchObject({
+    expect(traceClaim.data).toMatchObject({
       claim_index: 1,
       claim_count: 2,
       claim_group_id: expect.stringMatching(/^claim_group_[a-f0-9]{12}$/),
@@ -1880,11 +1891,73 @@ describe("case trace", () => {
       atomization_reason: "complete_merged_statement",
       next_claim_key: expect.any(String),
     })
-    expect(claims[1].data).toMatchObject({
-      claim_index: 2,
-      claim_count: 2,
-      previous_claim_key: claims[0].data.next_claim_key,
+    expect(responseClaimNode.data).toMatchObject({ claim_index: 1 })
+    for (const field of [
+      "claim_key",
+      "claim_group_id",
+      "claim_count",
+      "source_byte_range",
+      "previous_claim_key",
+      "next_claim_key",
+      "atomization_status",
+      "atomization_reason",
+    ]) {
+      expect(responseClaimNode.data).not.toHaveProperty(field)
+    }
+    expect(firstNextClaimKey).toEqual(expect.any(String))
+    expect(firstNextClaimKey).toBe(secondClaimKey)
+    expect(secondPreviousClaimKey).toBe(firstClaimKey)
+  })
+
+  test("atomizes a long final response from original text while retaining its summary artifact", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-long-final-claim-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "long-final-claim.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const firstClaim = `Completed ${"x".repeat(2100)}.`
+    const secondClaim = "All 11 tests pass."
+    const text = `${firstClaim} ${secondClaim}`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ response_role: "final_answer", text: ${JSON.stringify(text)} })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "long-final-claim-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
     })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "long-final-claim-case", "trace.json"), "utf8")) as any
+    const response = trace.records.find((record: any) => record.event_type === "response.output")
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const events = (await fs.readFile(path.join(dir, "long-final-claim-case", "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((event: any) => event.type === "semantic.response_claim")
+
+    expect(response.data.text).toMatchObject({ artifact_id: expect.any(String), preview: firstClaim.slice(0, 2048) })
+    expect(claims).toHaveLength(2)
+    expect(claims[0]!.data.text).toMatchObject({ artifact_id: expect.any(String) })
+    expect(claims[1]!.data.text).toBe(secondClaim)
+    expect(events).toHaveLength(2)
+    const [start, end] = events[1]!.data.source_byte_range
+    expect(Buffer.from(text).subarray(start, end).toString()).toBe(secondClaim)
+    expect(events[1]!.data.raw_text).toMatchObject({ preview: secondClaim })
   })
 
   test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {

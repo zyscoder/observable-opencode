@@ -4680,6 +4680,7 @@ class ActiveCaseTrace {
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
   private responseSegments: TraceResponseSegment[] = []
+  private responseSourceBySegmentID = new Map<string, unknown>()
   private claimedResponseSegmentIDs = new Set<string>()
   private designRecords: TraceDesignRecord[] = []
   private recentFailedVerificationID: string | undefined
@@ -6457,6 +6458,7 @@ class ActiveCaseTrace {
       metadata,
     }
     this.responseSegments.push(segment)
+    this.responseSourceBySegmentID.set(segment.segment_id, input.text)
     this.write("semantic.response_output", segment)
     const record = this.node({
       node_id: `responsenode_${segment.segment_id}`,
@@ -6789,6 +6791,7 @@ class ActiveCaseTrace {
         generation_provenance_refs: generationProvenanceRefs,
       }),
     }
+    this.write("semantic.response_claim", claim)
     const responseNodeID =
       input.metadata && typeof input.metadata.response_node_id === "string"
         ? input.metadata.response_node_id
@@ -6811,7 +6814,6 @@ class ActiveCaseTrace {
       derivation: deterministicDerivation("response_claim_extraction", derivationInputRefs, derivedAt),
       data: {
         claim_id: claim.claim_id,
-        claim_key: claim.claim_key,
         response_segment_id: claim.response_segment_id,
         text: claimText,
         claim_format: claim.claim_format,
@@ -6823,14 +6825,7 @@ class ActiveCaseTrace {
         table_cells: claim.table_cells,
         table_subject: claim.table_subject,
         table_values: claim.table_values,
-        claim_group_id: claim.claim_group_id,
         claim_index: claim.claim_index,
-        claim_count: claim.claim_count,
-        source_byte_range: claim.source_byte_range,
-        previous_claim_key: claim.previous_claim_key,
-        next_claim_key: claim.next_claim_key,
-        atomization_status: claim.atomization_status,
-        atomization_reason: claim.atomization_reason,
         direct_evidence_refs: claim.direct_evidence_refs,
         direct_support_refs: claim.direct_support_refs,
         candidate_context_refs: claim.candidate_context_refs,
@@ -7233,7 +7228,7 @@ class ActiveCaseTrace {
       if (caseStatus !== "success" && segment.finality_source !== "explicit") continue
       const responseNodeID = `responsenode_${segment.segment_id}`
       const responseNode = this.causalNodes.find((item) => item.node_id === responseNodeID)
-      const responseText = responseNode?.data?.text ?? fieldSummaryText(segment.text)
+      const responseText = this.responseSourceBySegmentID.get(segment.segment_id) ?? responseNode?.data?.text ?? fieldSummaryText(segment.text)
       const claims = atomizeResponseClaims(responseText)
       claims.forEach((claim) => {
         this.responseClaim({
@@ -7269,6 +7264,7 @@ class ActiveCaseTrace {
         })
       })
       this.claimedResponseSegmentIDs.add(segment.segment_id)
+      this.responseSourceBySegmentID.delete(segment.segment_id)
     }
   }
 

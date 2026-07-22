@@ -39,16 +39,7 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
   const source = normalizeResponseText(input)
   const tokens = tokenizeClaimSource(source)
   const spans = mergeClaimContinuations(source, segmentClaimTokens(source, tokens))
-  const seen = new Set<string>()
-  const candidates = spans
-    .flatMap((span) => toFactualCandidate(source, span))
-    .filter((candidate) => {
-      const semanticKey = `${candidate.claim_format}:${candidate.canonical_text ?? candidate.text}`.toLowerCase()
-      if (seen.has(semanticKey)) return false
-      seen.add(semanticKey)
-      return true
-    })
-    .slice(0, 50)
+  const candidates = spans.flatMap((span) => toFactualCandidate(source, span)).slice(0, 50)
   const claimCount = candidates.length
 
   return candidates.map((candidate, index) => ({
@@ -76,7 +67,7 @@ function stringPreview(input: unknown, limit = 400) {
 
 function tokenizeClaimSource(source: string): ClaimToken[] {
   const tokens: ClaimToken[] = []
-  let inFence = false
+  let fence: { delimiter: "`" | "~"; length: number } | undefined
   let lineStart = 0
 
   while (lineStart < source.length) {
@@ -84,12 +75,17 @@ function tokenizeClaimSource(source: string): ClaimToken[] {
     const lineStop = newline === -1 ? source.length : newline + 1
     const lineEnd = newline !== -1 && source[newline - 1] === "\r" ? newline - 1 : newline === -1 ? source.length : newline
     const line = source.slice(lineStart, lineEnd)
-    const fence = /^\s*```/.test(line)
+    const fenceMarker = markdownFenceMarker(line)
 
     if (fence) {
       tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
-      inFence = !inFence
-    } else if (inFence || /^\s*#{1,6}\s+/.test(line) || !line.trim() || /^\s*>/.test(line)) {
+      if (fenceMarker && fenceMarker.delimiter === fence.delimiter && fenceMarker.length >= fence.length) {
+        fence = undefined
+      }
+    } else if (fenceMarker) {
+      tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
+      fence = fenceMarker
+    } else if (/^\s*#{1,6}\s+/.test(line) || !line.trim() || /^\s*>/.test(line)) {
       tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
     } else {
       const listMarker = line.match(/^\s*(?:[-*+]|\d+[.)])\s+/)?.[0]
@@ -97,7 +93,7 @@ function tokenizeClaimSource(source: string): ClaimToken[] {
         const contentStart = lineStart + listMarker.length
         tokens.push({ type: "HARD_BREAK", start: lineStart, end: contentStart })
         tokenizeInlineText(source, contentStart, lineEnd, tokens)
-        pushLineBreak(tokens, lineEnd, lineStop)
+        tokens.push({ type: "HARD_BREAK", start: lineEnd, end: lineStop })
       } else if (isMarkdownTableLine(line)) {
         // A table row forms its own candidate span; its surrounding breaks prevent prose from joining it.
         tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStart })
@@ -113,18 +109,44 @@ function tokenizeClaimSource(source: string): ClaimToken[] {
   return tokens
 }
 
+function markdownFenceMarker(line: string) {
+  const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1]
+  if (!marker) return undefined
+  return { delimiter: marker[0] as "`" | "~", length: marker.length }
+}
+
 function tokenizeInlineText(source: string, start: number, end: number, tokens: ClaimToken[]) {
   let textStart = start
   for (let index = start; index < end; index++) {
     if (source[index] !== "`") continue
-    const close = source.indexOf("`", index + 1)
-    if (close === -1 || close >= end) continue
+    const delimiterLength = backtickRunLength(source, index, end)
+    const close = matchingBacktickRun(source, index + delimiterLength, end, delimiterLength)
+    if (close === -1) {
+      index += delimiterLength - 1
+      continue
+    }
     if (textStart < index) tokens.push({ type: "TEXT", start: textStart, end: index })
-    tokens.push({ type: "PROTECTED_TEXT", start: index, end: close + 1 })
-    textStart = close + 1
-    index = close
+    tokens.push({ type: "PROTECTED_TEXT", start: index, end: close + delimiterLength })
+    textStart = close + delimiterLength
+    index = close + delimiterLength - 1
   }
   if (textStart < end) tokens.push({ type: "TEXT", start: textStart, end })
+}
+
+function backtickRunLength(source: string, start: number, end: number) {
+  let index = start
+  while (index < end && source[index] === "`") index++
+  return index - start
+}
+
+function matchingBacktickRun(source: string, start: number, end: number, length: number) {
+  for (let index = start; index < end; index++) {
+    if (source[index] !== "`") continue
+    const candidateLength = backtickRunLength(source, index, end)
+    if (candidateLength === length) return index
+    index += candidateLength - 1
+  }
+  return -1
 }
 
 function pushLineBreak(tokens: ClaimToken[], lineEnd: number, lineStop: number) {
@@ -256,7 +278,9 @@ function toFactualCandidate(source: string, span: ClaimSpan): ClaimCandidate[] {
 
   return [
     {
-      key: `claim_${stableHash(`${tableFact?.claim_format ?? "factual_claim"}:${semanticStatement}`).slice(0, 12)}`,
+      key: `claim_${stableHash(
+        `${tableFact?.claim_format ?? "factual_claim"}:${semanticStatement}:${byteRange[0]}:${byteRange[1]}`,
+      ).slice(0, 12)}`,
       text,
       raw_text: rawText,
       canonical_text: canonicalText,
