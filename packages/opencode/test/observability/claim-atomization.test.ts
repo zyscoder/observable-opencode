@@ -28,6 +28,30 @@ describe("claim atomization", () => {
     ])
   })
 
+  test("treats markdown headings as barriers for an open parenthetical claim", () => {
+    const response = "Before 11 (see\n## Summary\nAfter 12 tests pass."
+
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual(["After 12 tests pass."])
+    expect(claims[0]!.source_byte_range).toEqual([
+      Buffer.byteLength("Before 11 (see\n## Summary\n"),
+      Buffer.byteLength(response),
+    ])
+  })
+
+  test("treats fenced code as a barrier for an open parenthetical claim", () => {
+    const response = "Before 11 (see\n```ts\nconst ignored = true\n```\nAfter 12 tests pass."
+
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual(["After 12 tests pass."])
+    expect(claims[0]!.source_byte_range).toEqual([
+      Buffer.byteLength("Before 11 (see\n```ts\nconst ignored = true\n```\n"),
+      Buffer.byteLength(response),
+    ])
+  })
+
   test("uses UTF-8 byte offsets and preserves claim order", () => {
     const response = "修改完成。All 11 tests pass."
     const claims = atomizeResponseClaims(response)
@@ -51,15 +75,16 @@ describe("claim atomization", () => {
     ])
   })
 
-  test("uses stripped-source byte ranges after markdown scaffold removal", () => {
+  test("uses original-response byte ranges after markdown scaffold removal", () => {
     const response = "## Summary\n```ts\nconst ignored = true\n```\n修改完成。All 11 tests pass."
     const claims = atomizeResponseClaims(response)
 
     expect(claims.map((claim) => claim.text)).toEqual(["修改完成。", "All 11 tests pass."])
-    expect(claims[0]!.source_byte_range).toEqual([0, Buffer.byteLength("修改完成。")])
+    const claimStart = Buffer.byteLength("## Summary\n```ts\nconst ignored = true\n```\n")
+    expect(claims[0]!.source_byte_range).toEqual([claimStart, claimStart + Buffer.byteLength("修改完成。")])
     expect(claims[1]!.source_byte_range).toEqual([
-      Buffer.byteLength("修改完成。"),
-      Buffer.byteLength("修改完成。All 11 tests pass."),
+      claimStart + Buffer.byteLength("修改完成。"),
+      Buffer.byteLength(response),
     ])
   })
 

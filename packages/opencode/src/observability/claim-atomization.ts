@@ -26,14 +26,19 @@ type ClaimSpan = {
   end: number
 }
 
+type ClaimScanSource = {
+  text: string
+  boundaries: Map<number, "omit" | "reset">
+}
+
 type ClaimCandidate = Omit<AtomizedResponseClaim, "claim_index" | "claim_count" | "previous_claim_key" | "next_claim_key">
 
 export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
   const source = stripResponseClaimScaffolding(normalizeResponseText(input))
-  const spans = mergeClaimContinuations(source, splitClaimSpans(source))
+  const spans = mergeClaimContinuations(source.text, splitClaimSpans(source))
   const seen = new Set<string>()
   const candidates = spans
-    .flatMap((span) => toFactualCandidate(source, span))
+    .flatMap((span) => toFactualCandidate(source.text, span))
     .filter((candidate) => {
       const semanticKey = `${candidate.claim_format}:${candidate.canonical_text ?? candidate.text}`.toLowerCase()
       if (seen.has(semanticKey)) return false
@@ -66,43 +71,51 @@ function stringPreview(input: unknown, limit = 400) {
   }
 }
 
-function stripResponseClaimScaffolding(input: string) {
-  const output: string[] = []
+function stripResponseClaimScaffolding(input: string): ClaimScanSource {
+  const boundaries = new Map<number, "omit" | "reset">()
   let inFence = false
-  for (const line of input.replace(/\r\n/g, "\n").split("\n")) {
+  let lineStart = 0
+
+  for (let index = 0; index <= input.length; index++) {
+    if (index !== input.length && input[index] !== "\n") continue
+    const line = input.slice(lineStart, index)
     if (/^\s*```/.test(line)) {
+      boundaries.set(lineStart, "omit")
       inFence = !inFence
-      continue
+    } else if (inFence || /^\s*#{1,6}\s+/.test(line) || !line.trim()) {
+      boundaries.set(lineStart, "omit")
+    } else if (isMarkdownListItem(input, lineStart, index)) {
+      boundaries.set(lineStart, "reset")
     }
-    if (inFence) continue
-    if (/^\s*#{1,6}\s+/.test(line)) continue
-    output.push(line)
+    lineStart = index + 1
   }
-  return output.join("\n")
+
+  return { text: input, boundaries }
 }
 
-function splitClaimSpans(input: string): ClaimSpan[] {
+function splitClaimSpans(source: ClaimScanSource): ClaimSpan[] {
+  const { text: input, boundaries } = source
   const spans: ClaimSpan[] = []
   const protectedOffsets = protectedClaimOffsets(input)
   const stack: string[] = []
   let lineStart = 0
-  let inFence = false
   let spanStart: number | undefined
 
   for (let index = 0; index <= input.length; index++) {
     if (index !== input.length && input[index] !== "\n") continue
     const lineEnd = index
-    const line = input.slice(lineStart, lineEnd)
-    if (/^\s*```/.test(line)) {
-      inFence = !inFence
-    } else if (!inFence) {
+    const boundary = boundaries.get(lineStart)
+    if (boundary === "omit") {
+      spanStart = undefined
+      stack.length = 0
+    } else {
+      if (boundary === "reset") {
+        spanStart = undefined
+        stack.length = 0
+      }
       const contentStart = claimLineContentStart(input, lineStart, lineEnd)
       if (contentStart < lineEnd) {
-        if (spanStart === undefined || isMarkdownListItem(input, lineStart, lineEnd)) {
-          if (spanStart !== undefined) pushTrimmedSpan(input, spanStart, lineStart, spans)
-          spanStart = contentStart
-          stack.length = 0
-        }
+        if (spanStart === undefined) spanStart = contentStart
         spanStart = splitLineClaimSpans(input, contentStart, lineEnd, protectedOffsets, spans, stack, spanStart)
         if (!stack.length) {
           pushTrimmedSpan(input, spanStart, lineEnd, spans)
