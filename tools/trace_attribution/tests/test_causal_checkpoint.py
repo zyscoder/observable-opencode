@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -20,7 +22,10 @@ from trace_attribution.global_judge import (
     GlobalJudgeCapability,
 )
 from trace_attribution.causal_state import (
+    AttributionHypothesis,
     CausalStepJudgment,
+    DefectState,
+    FrontierItem,
     RecursiveAttributionReport,
     RootConfirmation,
 )
@@ -29,13 +34,17 @@ from trace_attribution.checkpoint import (
     CheckpointBundle,
     CheckpointCompatibilityError,
     CheckpointCorruptionError,
+    CheckpointState,
     _sha256,
     build_checkpoint_config,
 )
 from trace_attribution.graph import TraceGraph
+from trace_attribution.hypotheses import HypothesisLedger, RecursiveFrontier
+from trace_attribution.models import stable_json
 from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
+    _provider_state_payload,
 )
 
 
@@ -480,6 +489,193 @@ class InjectedRestoreCheckpoint:
 
 
 class CausalCheckpointTest(unittest.TestCase):
+    def test_v1_visit_key_migration_rewrites_all_occurrences_and_converges_with_v2(self):
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "checkpoints"
+            / "frontier-v1-pre-seed-binding.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        hypothesis = AttributionHypothesis.from_dict(fixture["hypothesis"])
+        legacy_item = fixture["frontier"]["queued"][0]
+        item = FrontierItem.from_legacy_dict(
+            legacy_item,
+            seed_binding_identity=hypothesis.seed_binding_identity,
+        )
+        old_visit_key = legacy_item["visit_key"]
+        new_visit_key = item.visit_key
+        trace = {
+            "case_id": "legacy-visit-migration",
+            "records": [
+                {
+                    "record_id": "shared_anchor",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"summary": "Shared expansion anchor."},
+                },
+                {
+                    "record_id": "seed_one",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:shared_anchor"],
+                    "data": {"actual": "The seed remains unresolved."},
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        ledger = HypothesisLedger.from_snapshot([fixture["hypothesis"]])
+        frontier = RecursiveFrontier()
+        frontier.push(item)
+        state = RecursiveAnalysisState(
+            graph=graph,
+            start_refs=("record:seed_one",),
+            objective="Find the defect.",
+            analysis_perspective="Improve repository reasoning.",
+            ledger=ledger,
+            frontier=frontier,
+        )
+        state.defect_states[item.defect_state.fingerprint] = item.defect_state
+        state.transformation_chains[item.defect_state.fingerprint] = (item.defect_state,)
+        state.visit_evidence[new_visit_key] = {"record:shared_anchor"}
+        context = {
+            "active_visit_key": new_visit_key,
+            "checked_evidence_refs": ["record:shared_anchor"],
+        }
+        context["evidence_hash"] = hashlib.sha256(
+            stable_json(context).encode("utf-8")
+        ).hexdigest()
+        context_hash = hashlib.sha256(stable_json(context).encode("utf-8")).hexdigest()
+        state.investigation_journal = [
+            {
+                "active_visit": {"visit_key": new_visit_key},
+                "context_before": copy.deepcopy(context),
+                "context_before_hash": context_hash,
+                "context_after": copy.deepcopy(context),
+                "context_after_hash": context_hash,
+                "rejudge_linkage": {
+                    "source_visit_key": new_visit_key,
+                    "source_context_hash": context_hash,
+                    "rejudge_visit_key": new_visit_key,
+                    "context_after_hash": context_hash,
+                },
+            }
+        ]
+        state.investigation_evidence = {
+            new_visit_key: [
+                {
+                    "active_visit_key": new_visit_key,
+                    "journal_key": "investigation:{0}".format(new_visit_key),
+                }
+            ]
+        }
+        state.investigation_evidence_hashes = {new_visit_key: {"evidence:one"}}
+        state.pending_rejudge_journal = {new_visit_key: [0]}
+        state.confirmation_journal = [
+            {"nested": {"active_visit_key": new_visit_key}}
+        ]
+        state.provider_state = _provider_state_payload(
+            CountingOfflineJudge(), state, cache_identity="cache:test"
+        )
+
+        native_frontier = state.frontier_checkpoint_payload()
+        native_hypotheses = state.hypothesis_checkpoint_payload()
+        native_action = state.action_checkpoint_payload()
+
+        def replace_visit_key(value, source, target):
+            if isinstance(value, dict):
+                return {
+                    str(key).replace(source, target): replace_visit_key(
+                        child, source, target
+                    )
+                    for key, child in value.items()
+                }
+            if isinstance(value, list):
+                return [replace_visit_key(child, source, target) for child in value]
+            if isinstance(value, str):
+                return value.replace(source, target)
+            return copy.deepcopy(value)
+
+        legacy_action = replace_visit_key(native_action, new_visit_key, old_visit_key)
+        legacy_context = legacy_action["investigation_journal"][0]
+        for context_key, hash_key in (
+            ("context_before", "context_before_hash"),
+            ("context_after", "context_after_hash"),
+        ):
+            migrated_context = legacy_context[context_key]
+            semantic_context = dict(migrated_context)
+            semantic_context.pop("evidence_hash")
+            migrated_context["evidence_hash"] = hashlib.sha256(
+                stable_json(semantic_context).encode("utf-8")
+            ).hexdigest()
+            legacy_context[hash_key] = hashlib.sha256(
+                stable_json(migrated_context).encode("utf-8")
+            ).hexdigest()
+        legacy_context["rejudge_linkage"]["source_context_hash"] = legacy_context[
+            "context_before_hash"
+        ]
+        legacy_context["rejudge_linkage"]["context_after_hash"] = legacy_context[
+            "context_after_hash"
+        ]
+        legacy_frontier = {
+            "schema": "recursive-analysis-frontier/v1",
+            "frontier": copy.deepcopy(fixture["frontier"]),
+            "visit_evidence": {old_visit_key: ["record:shared_anchor"]},
+        }
+
+        def checkpoint_state(frontier_payload, action_payload, semantic_key):
+            common = {
+                "transaction_sequence": 1,
+                "semantic_key": semantic_key,
+            }
+            return CheckpointState(
+                config={"cache_identity": "cache:test"},
+                run_id="migration-test",
+                transaction_sequence=1,
+                frontier_records=(
+                    {**common, "operation": "snapshot", "payload": frontier_payload},
+                ),
+                hypothesis_records=(
+                    {**common, "operation": "snapshot", "payload": native_hypotheses},
+                ),
+                actions=(
+                    {**common, "operation": "state_snapshot", "payload": action_payload},
+                ),
+            )
+
+        native = RecursiveAnalysisState.from_checkpoint(
+            graph=graph,
+            checkpoint=checkpoint_state(
+                native_frontier,
+                native_action,
+                "state:{0}".format(new_visit_key),
+            ),
+        )
+        migrated = RecursiveAnalysisState.from_checkpoint(
+            graph=graph,
+            checkpoint=checkpoint_state(
+                legacy_frontier,
+                legacy_action,
+                "state:{0}".format(old_visit_key),
+            ),
+        )
+
+        self.assertEqual(
+            migrated.frontier_checkpoint_payload(), native.frontier_checkpoint_payload()
+        )
+        self.assertEqual(
+            migrated.action_checkpoint_payload(), native.action_checkpoint_payload()
+        )
+        self.assertEqual(migrated.replay_actions, native.replay_actions)
+        migrated_output = stable_json(
+            {
+                "frontier": migrated.frontier_checkpoint_payload(),
+                "actions": migrated.action_checkpoint_payload(),
+                "replay": migrated.replay_actions,
+            }
+        )
+        self.assertNotIn(old_visit_key, migrated_output)
+
     def test_checkpoint_config_fingerprints_graph_evidence_eligibility_policy(self):
         config = sample_config()
 

@@ -154,18 +154,71 @@ def _migrate_checkpoint_visit_references(
     frontier: RecursiveFrontier,
 ) -> Any:
     if isinstance(value, Mapping):
-        return {
-            str(key): (
-                frontier.migrated_visit_key(str(item))
-                if key in {"visit_key", "source_visit_key", "rejudge_visit_key"}
-                and isinstance(item, str)
-                else _migrate_checkpoint_visit_references(item, frontier)
-            )
-            for key, item in value.items()
-        }
+        output: JsonDict = {}
+        for key, item in value.items():
+            migrated_key = frontier.migrate_visit_key_occurrences(str(key))
+            if migrated_key in output:
+                raise ValueError("visit-key migration would overwrite a checkpoint mapping")
+            output[migrated_key] = _migrate_checkpoint_visit_references(item, frontier)
+        return output
     if isinstance(value, list):
         return [_migrate_checkpoint_visit_references(item, frontier) for item in value]
+    if isinstance(value, str):
+        return frontier.migrate_visit_key_occurrences(value)
     return copy.deepcopy(value)
+
+
+def _normalize_migrated_context_hashes(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_normalize_migrated_context_hashes(item) for item in value]
+    if not isinstance(value, Mapping):
+        return copy.deepcopy(value)
+
+    output = {
+        str(key): _normalize_migrated_context_hashes(item)
+        for key, item in value.items()
+    }
+    context_hashes: Dict[str, str] = {}
+    for context_key, hash_key in (
+        ("context_before", "context_before_hash"),
+        ("context_after", "context_after_hash"),
+    ):
+        context = output.get(context_key)
+        if not isinstance(context, Mapping):
+            continue
+        normalized_context = dict(context)
+        if "evidence_hash" in normalized_context:
+            semantic_context = dict(normalized_context)
+            semantic_context.pop("evidence_hash")
+            normalized_context["evidence_hash"] = hashlib.sha256(
+                stable_json(semantic_context).encode("utf-8")
+            ).hexdigest()
+        output[context_key] = normalized_context
+        context_hashes[hash_key] = hashlib.sha256(
+            stable_json(normalized_context).encode("utf-8")
+        ).hexdigest()
+        if hash_key in output:
+            output[hash_key] = context_hashes[hash_key]
+
+    linkage = output.get("rejudge_linkage")
+    if isinstance(linkage, Mapping):
+        normalized_linkage = dict(linkage)
+        if (
+            "source_context_hash" in normalized_linkage
+            and "context_before_hash" in context_hashes
+        ):
+            normalized_linkage["source_context_hash"] = context_hashes[
+                "context_before_hash"
+            ]
+        if (
+            "context_after_hash" in normalized_linkage
+            and "context_after_hash" in context_hashes
+        ):
+            normalized_linkage["context_after_hash"] = context_hashes[
+                "context_after_hash"
+            ]
+        output["rejudge_linkage"] = normalized_linkage
+    return output
 
 
 def _dedupe_strings(values: Iterable[str]) -> Tuple[str, ...]:
@@ -1277,18 +1330,19 @@ class RecursiveAnalysisState:
         )
 
         ledger = HypothesisLedger.from_snapshot(hypothesis_payload["hypotheses"])
-        legacy_seed_bindings = (
-            {
-                str(item["hypothesis_id"]): str(item.get("seed_binding_identity") or "")
-                for item in ledger.snapshot()
-            }
-            if frontier_payload["schema"] == LEGACY_FRONTIER_STATE_SCHEMA
-            else None
-        )
         frontier = RecursiveFrontier.from_checkpoint(
             frontier_payload["frontier"],
-            legacy_seed_binding_by_hypothesis=legacy_seed_bindings,
+            hypotheses_by_id=ledger.hypotheses_by_id(),
         )
+        if frontier.has_legacy_visit_key_migrations():
+            visit_evidence_payload = _migrate_checkpoint_visit_references(
+                frontier_payload["visit_evidence"], frontier
+            )
+            action_payload = _normalize_migrated_context_hashes(
+                _migrate_checkpoint_visit_references(action_payload, frontier)
+            )
+        else:
+            visit_evidence_payload = copy.deepcopy(frontier_payload["visit_evidence"])
         state = cls(
             graph=graph,
             start_refs=tuple(str(item) for item in action_payload["start_refs"]),
@@ -1298,8 +1352,8 @@ class RecursiveAnalysisState:
             frontier=frontier,
         )
         state.visit_evidence = {
-            frontier.migrated_visit_key(str(key)): {str(item) for item in values}
-            for key, values in dict(frontier_payload["visit_evidence"]).items()
+            str(key): {str(item) for item in values}
+            for key, values in dict(visit_evidence_payload).items()
         }
         state.defect_states = {
             item.fingerprint: item
@@ -1447,7 +1501,14 @@ class RecursiveAnalysisState:
             for ref in state.unresolved_refs
             if ref not in transient_signal_refs or ref in retained_unresolved_refs
         ]
-        state.replay_actions = checkpoint.latest_actions
+        if frontier.has_legacy_visit_key_migrations():
+            state.replay_actions = _normalize_migrated_context_hashes(
+                _migrate_checkpoint_visit_references(
+                    checkpoint.latest_actions, frontier
+                )
+            )
+        else:
+            state.replay_actions = copy.deepcopy(checkpoint.latest_actions)
         return state
 
     def build_step_request(

@@ -3,7 +3,12 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from trace_attribution.causal_state import DefectState, FrontierItem, HypothesisEvidence
+from trace_attribution.causal_state import (
+    AttributionHypothesis,
+    DefectState,
+    FrontierItem,
+    HypothesisEvidence,
+)
 from trace_attribution.hypotheses import HypothesisLedger, RecursiveFrontier, hypothesis_order_key
 
 
@@ -27,6 +32,7 @@ def item_for(node_ref, defect_state, hypothesis, *, priority=0.75, depth=1, grap
         downstream_path=["record:observed", node_ref],
         hypothesis_id=hypothesis.hypothesis_id,
         hypothesis_semantic_hash=hypothesis.semantic_hash,
+        seed_binding_identity=hypothesis.seed_binding_identity,
         depth=depth,
         candidate_source="confirmed_edge",
         priority=priority,
@@ -195,7 +201,10 @@ class HypothesisLedgerTest(unittest.TestCase):
         ledger = HypothesisLedger()
         frontier = RecursiveFrontier()
         hypothesis = ledger.create(
-            "agent search closure is root", "record:decision", sample_defect_state()
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:checkpoint-transition",
         )
         item = item_for("record:decision", sample_defect_state(), hypothesis)
         frontier.push(item)
@@ -208,7 +217,10 @@ class HypothesisLedgerTest(unittest.TestCase):
         )
         migrated = item_for("record:decision", sample_defect_state(), updated)
         restored_ledger = HypothesisLedger.from_snapshot(ledger.snapshot())
-        restored_frontier = RecursiveFrontier.from_checkpoint(frontier.checkpoint())
+        restored_frontier = RecursiveFrontier.from_checkpoint(
+            frontier.checkpoint(),
+            hypotheses_by_id=restored_ledger.hypotheses_by_id(),
+        )
 
         self.assertEqual(restored_ledger.get(migrated.hypothesis_id).semantic_hash, migrated.hypothesis_semantic_hash)
         self.assertFalse(restored_frontier.push(migrated))
@@ -322,14 +334,20 @@ class RecursiveFrontierTest(unittest.TestCase):
 
     def test_checkpoint_requeues_interrupted_in_flight_work_deterministically(self):
         frontier = RecursiveFrontier()
-        hypothesis = HypothesisLedger().create(
-            "agent search closure is root", "record:decision", sample_defect_state()
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:interrupted",
         )
         item = item_for("record:decision", sample_defect_state(), hypothesis)
         frontier.push(item)
         frontier.pop()
 
-        restored = RecursiveFrontier.from_checkpoint(frontier.checkpoint())
+        restored = RecursiveFrontier.from_checkpoint(
+            frontier.checkpoint(), hypotheses_by_id=ledger.hypotheses_by_id()
+        )
 
         self.assertFalse(restored.in_flight_items())
         self.assertEqual(restored.pop(), item)
@@ -350,17 +368,21 @@ class RecursiveFrontierTest(unittest.TestCase):
             malformed.pop(section)
             with self.subTest(section=section):
                 with self.assertRaisesRegex(ValueError, "missing"):
-                    RecursiveFrontier.from_checkpoint(malformed)
+                    RecursiveFrontier.from_checkpoint(
+                        malformed, hypotheses_by_id={}
+                    )
 
         malformed = dict(checkpoint)
         malformed["completed"] = {}
         with self.assertRaisesRegex(ValueError, "list"):
-            RecursiveFrontier.from_checkpoint(malformed)
+            RecursiveFrontier.from_checkpoint(malformed, hypotheses_by_id={})
 
         unknown_version = dict(checkpoint)
         unknown_version["version"] = checkpoint["version"] + 1
         with self.assertRaisesRegex(ValueError, "version"):
-            RecursiveFrontier.from_checkpoint(unknown_version)
+            RecursiveFrontier.from_checkpoint(
+                unknown_version, hypotheses_by_id={}
+            )
 
         self.assertFalse(frontier.push(completed))
 
@@ -376,20 +398,22 @@ class RecursiveFrontierTest(unittest.TestCase):
                 payload["version"] = version
             with self.subTest(version=version):
                 with self.assertRaisesRegex(ValueError, "version"):
-                    RecursiveFrontier.from_checkpoint(payload)
+                    RecursiveFrontier.from_checkpoint(
+                        payload, hypotheses_by_id={}
+                    )
 
     def test_v1_checkpoint_fixture_validates_legacy_identity_then_migrates_seed_binding(self):
-        payload = json.loads(
+        fixture = json.loads(
             (FIXTURE_ROOT / "frontier-v1-pre-seed-binding.json").read_text(
                 encoding="utf-8"
             )
         )
+        payload = fixture["frontier"]
+        hypothesis = AttributionHypothesis.from_dict(fixture["hypothesis"])
 
         frontier = RecursiveFrontier.from_checkpoint(
             payload,
-            legacy_seed_binding_by_hypothesis={
-                "hyp:legacy-seed-one": "seed:legacy-seed-one"
-            },
+            hypotheses_by_id={hypothesis.hypothesis_id: hypothesis},
         )
 
         item = frontier.pop()
@@ -401,25 +425,117 @@ class RecursiveFrontierTest(unittest.TestCase):
         )
 
     def test_v1_checkpoint_rejects_forged_legacy_identity_before_migration(self):
-        payload = json.loads(
+        fixture = json.loads(
             (FIXTURE_ROOT / "frontier-v1-pre-seed-binding.json").read_text(
                 encoding="utf-8"
             )
         )
+        payload = fixture["frontier"]
+        hypothesis = AttributionHypothesis.from_dict(fixture["hypothesis"])
         payload["queued"][0]["item_id"] = "frontier:forged"
 
         with self.assertRaisesRegex(ValueError, "legacy FrontierItem item_id"):
             RecursiveFrontier.from_checkpoint(
                 payload,
-                legacy_seed_binding_by_hypothesis={
-                    "hyp:legacy-seed-one": "seed:legacy-seed-one"
+                hypotheses_by_id={hypothesis.hypothesis_id: hypothesis},
+            )
+
+    def test_checkpoint_rejects_empty_or_mismatched_frontier_binding(self):
+        hypothesis = HypothesisLedger().create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:one",
+        )
+        hypotheses = {hypothesis.hypothesis_id: hypothesis}
+
+        for version, binding in ((2, ""), (2, "seed:other"), (1, "seed:other")):
+            item = FrontierItem.create(
+                node_ref="record:decision",
+                defect_state=sample_defect_state(),
+                downstream_path=["record:observed", "record:decision"],
+                hypothesis_id=hypothesis.hypothesis_id,
+                hypothesis_semantic_hash=hypothesis.semantic_hash,
+                seed_binding_identity=binding,
+            )
+            payload = RecursiveFrontier().checkpoint()
+            payload["version"] = version
+            payload["queued"] = [item.to_dict()]
+
+            with self.subTest(version=version, binding=binding):
+                with self.assertRaisesRegex(ValueError, "seed binding"):
+                    RecursiveFrontier.from_checkpoint(
+                        payload, hypotheses_by_id=hypotheses
+                    )
+
+    def test_checkpoint_rejects_reused_hypothesis_id_with_different_semantic_hash(self):
+        ledger = HypothesisLedger()
+        enclosing = ledger.create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:one",
+        )
+        different = AttributionHypothesis.create(
+            "prompt omission is root",
+            "record:prompt",
+            sample_defect_state(),
+            seed_binding_identity="seed:one",
+        )
+        forged = FrontierItem.create(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            downstream_path=["record:observed", "record:decision"],
+            hypothesis_id=enclosing.hypothesis_id,
+            hypothesis_semantic_hash=different.semantic_hash,
+            seed_binding_identity=enclosing.seed_binding_identity,
+        )
+        for version in (1, 2):
+            payload = RecursiveFrontier().checkpoint()
+            payload["version"] = version
+            payload["queued"] = [forged.to_dict()]
+
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "semantic hash"):
+                    RecursiveFrontier.from_checkpoint(
+                        payload,
+                        hypotheses_by_id={enclosing.hypothesis_id: enclosing},
+                    )
+
+    def test_v1_checkpoint_rejects_duplicate_legacy_visit_key_before_migration(self):
+        fixture = json.loads(
+            (FIXTURE_ROOT / "frontier-v1-pre-seed-binding.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        first = AttributionHypothesis.from_dict(fixture["hypothesis"])
+        second = AttributionHypothesis.create(
+            first.claim,
+            first.candidate_root_ref,
+            DefectState.from_dict(fixture["frontier"]["queued"][0]["defect_state"]),
+            seed_binding_identity="seed:legacy-seed-two",
+        )
+        duplicate = dict(fixture["frontier"]["queued"][0])
+        duplicate["hypothesis_id"] = second.hypothesis_id
+        fixture["frontier"]["in_flight"] = [duplicate]
+
+        with self.assertRaisesRegex(ValueError, "duplicate legacy visit_key"):
+            RecursiveFrontier.from_checkpoint(
+                fixture["frontier"],
+                hypotheses_by_id={
+                    first.hypothesis_id: first,
+                    second.hypothesis_id: second,
                 },
             )
 
     def test_corrupt_checkpoint_and_reopen_rollback_preserve_completed_state(self):
         frontier = RecursiveFrontier()
-        hypothesis = HypothesisLedger().create(
-            "agent search closure is root", "record:decision", sample_defect_state()
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:corrupt",
         )
         item = item_for("record:decision", sample_defect_state(), hypothesis)
         frontier.push(item)
@@ -429,7 +545,9 @@ class RecursiveFrontierTest(unittest.TestCase):
         checkpoint["queued"] = [completed.to_dict()]
 
         with self.assertRaisesRegex(ValueError, "repeats"):
-            RecursiveFrontier.from_checkpoint(checkpoint)
+            RecursiveFrontier.from_checkpoint(
+                checkpoint, hypotheses_by_id=ledger.hypotheses_by_id()
+            )
 
         forged = replace(completed, priority=0.1)
         self.assertFalse(frontier.reopen(forged, evidence_hash="evidence:v2", reason="forged"))
@@ -438,8 +556,12 @@ class RecursiveFrontierTest(unittest.TestCase):
 
     def test_checkpoint_round_trip_restores_pending_and_completed_identity(self):
         frontier = RecursiveFrontier()
-        hypothesis = HypothesisLedger().create(
-            "agent search closure is root", "record:decision", sample_defect_state()
+        ledger = HypothesisLedger()
+        hypothesis = ledger.create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:round-trip",
         )
         completed = item_for(
             "record:completed", sample_defect_state("completed"), hypothesis, priority=0.95
@@ -449,7 +571,9 @@ class RecursiveFrontierTest(unittest.TestCase):
         frontier.push(pending)
         frontier.mark_completed(frontier.pop(), "evidence:completed")
 
-        restored = RecursiveFrontier.from_checkpoint(frontier.checkpoint())
+        restored = RecursiveFrontier.from_checkpoint(
+            frontier.checkpoint(), hypotheses_by_id=ledger.hypotheses_by_id()
+        )
 
         self.assertEqual(restored.snapshot(), frontier.snapshot())
         self.assertFalse(

@@ -1,39 +1,58 @@
 {
-  "schema": "trace_attribution.recursive_frontier",
-  "version": 1,
-  "queued": [
-    {
-      "item_id": "frontier:fcc5524af67f291649db",
-      "node_ref": "record:shared_anchor",
-      "defect_state": {
-        "actual": "A shared anchor collapsed two seed visits.",
-        "defect_state_id": "defect:23f0eb16f6bd6a7f2eb1",
-        "derived_from_defect_state_id": "",
-        "expected": "Each seed must retain its own recursive work.",
-        "fingerprint": "23f0eb16f6bd6a7f2eb1",
-        "label": "legacy_seed_binding_fixture",
-        "mechanism": "frontier visit identity omitted the seed binding",
-        "scope": "root_confirmation_task_1",
-        "transformation_reason": ""
-      },
-      "downstream_path": [
-        "record:shared_anchor",
-        "record:seed_one"
-      ],
-      "hypothesis_id": "hyp:legacy-seed-one",
-      "hypothesis_semantic_hash": "legacy-semantic-hash",
-      "depth": 1,
-      "candidate_source": "global_requested_expansion",
-      "priority": 1.0,
-      "checked_evidence_refs": [
-        "record:shared_anchor"
-      ],
-      "evidence_hash": "",
-      "reopen_reason": "",
-      "graph_position": 3,
-      "visit_key": "923518755f95af3e921f8f7c182f8fab4ade493229e43f174a6e182393807376"
-    }
-  ],
-  "in_flight": [],
-  "completed": []
+  "frontier": {
+    "completed": [],
+    "in_flight": [],
+    "queued": [
+      {
+        "candidate_source": "global_requested_expansion",
+        "checked_evidence_refs": [
+          "record:shared_anchor"
+        ],
+        "defect_state": {
+          "actual": "A shared anchor collapsed two seed visits.",
+          "defect_state_id": "defect:23f0eb16f6bd6a7f2eb1",
+          "derived_from_defect_state_id": "",
+          "expected": "Each seed must retain its own recursive work.",
+          "fingerprint": "23f0eb16f6bd6a7f2eb1",
+          "label": "legacy_seed_binding_fixture",
+          "mechanism": "frontier visit identity omitted the seed binding",
+          "scope": "root_confirmation_task_1",
+          "transformation_reason": ""
+        },
+        "depth": 1,
+        "downstream_path": [
+          "record:shared_anchor",
+          "record:seed_one"
+        ],
+        "evidence_hash": "",
+        "graph_position": 3,
+        "hypothesis_id": "hyp:e5a6cf369050cc0f7204",
+        "hypothesis_semantic_hash": "c0f94090134192434d2d3024b3bafa13b31d1f4629decee79b365b4409b38d00",
+        "item_id": "frontier:37b3d58d244b399befe1",
+        "node_ref": "record:shared_anchor",
+        "priority": 1.0,
+        "reopen_reason": "",
+        "visit_key": "6ef19315ff4cde98397c3df50631a22f5ec5701235d972661b3f7b234f3bb5cb"
+      }
+    ],
+    "schema": "trace_attribution.recursive_frontier",
+    "version": 1
+  },
+  "hypothesis": {
+    "active_defect_fingerprint": "23f0eb16f6bd6a7f2eb1",
+    "active_defect_state_id": "defect:23f0eb16f6bd6a7f2eb1",
+    "alternative_hypothesis_ids": [],
+    "candidate_root_ref": "record:shared_anchor",
+    "claim": "shared anchor is the root",
+    "confidence": 0.0,
+    "counterfactual": {},
+    "hypothesis_id": "hyp:e5a6cf369050cc0f7204",
+    "opposing_evidence": [],
+    "resolution_reason": "",
+    "seed_binding_identity": "seed:legacy-seed-one",
+    "semantic_hash": "c0f94090134192434d2d3024b3bafa13b31d1f4629decee79b365b4409b38d00",
+    "status": "active",
+    "supporting_evidence": [],
+    "unresolved_questions": []
+  }
 }
