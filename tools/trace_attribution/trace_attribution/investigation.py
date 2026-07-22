@@ -6,7 +6,6 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -919,35 +918,38 @@ class CausalInvestigationTools:
             directive.arguments, "length", default=32_000, minimum=1, maximum=1_048_576
         )
         artifact = self.graph._artifact_index.get(artifact_id)
-        root = self.graph._artifact_root
-        if not isinstance(artifact, Mapping) or root is None:
+        if not isinstance(artifact, Mapping):
             raise ValueError("artifact is not grounded in the trace manifest")
         path_value = str(artifact.get("path") or "")
         if not path_value:
             raise ValueError("artifact manifest path is missing")
-        resolved_root = Path(root).resolve()
-        candidate = (resolved_root / path_value).resolve()
-        try:
-            candidate.relative_to(resolved_root)
-        except ValueError as exc:
-            raise ValueError("artifact path escapes the trace root") from exc
-        stat = candidate.stat()
-        size = stat.st_size
-        if offset >= size:
+        verified = self.graph._artifact_reader.read(artifact_id, refresh=True)
+        if verified.content_bytes is None:
+            reason = verified.failures[0] if verified.failures else "artifact is unavailable"
+            raise ValueError("artifact verification failed: {0}".format(reason))
+        range_start = verified.byte_ranges[0][0]
+        range_end = verified.byte_ranges[-1][1]
+        if offset < range_start or offset >= range_end:
             raise ValueError("artifact range offset is at or beyond EOF")
-        manifest_hash = str(artifact.get("hash") or "").strip()
+        manifest_hash = str(artifact.get("content_hash") or artifact.get("hash") or "").strip()
         expected_hash = str(directive.arguments.get("expected_hash") or "").strip()
         if expected_hash and expected_hash != manifest_hash:
             raise ValueError("artifact stable identity is stale or mismatched")
-        file_identity = (size, stat.st_mtime_ns, stat.st_ino, manifest_hash)
-        previous_identity = self._artifact_file_identities.get(artifact_id)
-        if previous_identity is not None and previous_identity != file_identity:
-            raise ValueError("artifact stable identity changed during investigation")
-        self._artifact_file_identities.setdefault(artifact_id, file_identity)
-        with candidate.open("rb") as handle:
-            handle.seek(offset)
-            excerpt = handle.read(length)
-        truncated = offset > 0 or offset + len(excerpt) < size
+        if verified.file_identity is not None:
+            previous_identity = self._artifact_file_identities.get(artifact_id)
+            if previous_identity is not None and previous_identity != verified.file_identity:
+                raise ValueError("artifact stable identity changed during investigation")
+            self._artifact_file_identities.setdefault(artifact_id, verified.file_identity)
+        local_start = offset - range_start
+        excerpt = verified.content_bytes[local_start : local_start + length]
+        content = excerpt.decode("utf-8")
+        declared_length = artifact.get("byte_length")
+        size = (
+            declared_length
+            if isinstance(declared_length, int) and not isinstance(declared_length, bool) and declared_length >= 0
+            else len(verified.content_bytes)
+        )
+        truncated = verified.truncated or offset > 0 or offset + len(excerpt) < size
         identity = (
             artifact_id,
             offset,
@@ -979,7 +981,7 @@ class CausalInvestigationTools:
                 "size_bytes": size,
             },
             "range": {"offset": offset, "requested_length": length, "resolved_length": len(excerpt)},
-            "content": excerpt.decode("utf-8", errors="replace"),
+            "content": content,
             "content_length_bytes": size,
         }
         return InvestigationResult.success(
@@ -1003,18 +1005,10 @@ class CausalInvestigationTools:
         if previous is None:
             return
         artifact = self.graph._artifact_index.get(artifact_id)
-        root = self.graph._artifact_root
-        if not isinstance(artifact, Mapping) or root is None:
+        if not isinstance(artifact, Mapping):
             raise ValueError("artifact stable identity is no longer grounded")
-        candidate = (Path(root).resolve() / str(artifact.get("path") or "")).resolve()
-        stat = candidate.stat()
-        current = (
-            stat.st_size,
-            stat.st_mtime_ns,
-            stat.st_ino,
-            str(artifact.get("hash") or "").strip(),
-        )
-        if current != previous:
+        verified = self.graph._artifact_reader.read(artifact_id, refresh=True)
+        if verified.file_identity is None or verified.file_identity != previous:
             raise ValueError("artifact stable identity changed during investigation")
 
     def _inspect_episode(self, directive: InvestigationDirective) -> InvestigationResult:

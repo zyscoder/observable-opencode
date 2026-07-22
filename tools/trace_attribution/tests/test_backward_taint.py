@@ -586,6 +586,8 @@ class TraceGraphTest(unittest.TestCase):
                 json.dumps([{"role": "assistant", "content": rationale}, {"role": "user", "content": "continue"}]),
                 encoding="utf-8",
             )
+            artifact_content = artifact_path.read_bytes()
+            artifact_hash = hashlib.sha256(artifact_content).hexdigest()
             trace = {
                 "case_id": "retained-decision-case",
                 "artifacts": [
@@ -593,7 +595,8 @@ class TraceGraphTest(unittest.TestCase):
                         "artifact_id": "artifact_request",
                         "path": "artifacts/sha256/request.json",
                         "kind": "json",
-                        "hash": "request-hash",
+                        "hash": artifact_hash,
+                        "byte_length": len(artifact_content),
                     }
                 ],
                 "records": [
@@ -618,7 +621,7 @@ class TraceGraphTest(unittest.TestCase):
                             "input": {"sessionID": "ses_1"},
                             "input_messages": {
                                 "artifact_id": "artifact_request",
-                                "hash": "request-hash",
+                                "hash": artifact_hash,
                             },
                             "generated_response_refs": ["response_segment:final"],
                         },
@@ -644,6 +647,49 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0]["evidence_type"], "content_matched")
         self.assertTrue(retained[0]["eligible_for_attribution"])
+
+    def test_message_lineage_never_matches_tampered_artifact_bytes(self):
+        rationale = (
+            "A sufficiently long decision rationale must not become lineage evidence "
+            "when the artifact manifest hash does not verify its actual bytes."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_path = root / "artifacts" / "request.json"
+            artifact_path.parent.mkdir(parents=True)
+            artifact_path.write_text(json.dumps({"content": rationale}), encoding="utf-8")
+            trace = {
+                "case_id": "tampered-lineage-case",
+                "artifacts": [{
+                    "artifact_id": "artifact_request",
+                    "path": "artifacts/request.json",
+                    "kind": "json",
+                    "hash": hashlib.sha256(b"different bytes").hexdigest(),
+                    "byte_length": artifact_path.stat().st_size,
+                }],
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"decision_type": "reasoning_block", "rationale": rationale},
+                    },
+                    {
+                        "record_id": "llm",
+                        "component": "llm",
+                        "event_type": "llm.call",
+                        "data": {"input_messages": {"artifact_id": "artifact_request"}},
+                    },
+                ],
+            }
+            graph = TraceGraph.from_trace(trace, artifact_root=root)
+
+        retained = [
+            edge for edge in graph.message_lineage["edges"]
+            if edge["relation"] == "retained_in_context"
+        ]
+        self.assertEqual(retained, [])
+        self.assertEqual(graph.message_lineage["gaps"][0]["reason"], "bundle_file_hash_mismatch")
 
     def test_resolves_source_refs_and_dataflow_edges(self):
         graph = TraceGraph.from_trace(sample_trace())

@@ -173,6 +173,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "path": "artifacts/sha256/missing.txt",
                     "hash": hashlib.sha256(b"full artifact").hexdigest()[:16],
                     "availability": "bundled",
+                    "byte_length": len(content.encode("utf-8")) + 10,
                     "semantic_slices": [
                         {
                             "byte_range": [0, len(content.encode("utf-8"))],

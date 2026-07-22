@@ -1681,6 +1681,10 @@ function unicodePrefix(input: string, limit: number) {
   return prefix
 }
 
+function validUtf8(input: string) {
+  return Buffer.from(input, "utf8").toString("utf8")
+}
+
 function summarizeScalar(input: unknown): TraceFieldSummary {
   if (input === null) return { type: "null", value: null }
   if (typeof input === "string") return summarizeText(input)
@@ -10347,6 +10351,7 @@ class ActiveCaseTrace {
         storageEncoding = "json_minified"
       } catch {}
     }
+    storedContent = validUtf8(storedContent)
     const contentHash = hash(storedContent)
     const semanticContent = unicodePrefix(storedContent, maxFieldLength())
     const dedupeKey = `${kind}:${contentHash}`

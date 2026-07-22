@@ -6444,6 +6444,52 @@ describe("case trace", () => {
     expect(slice.truncated).toBe(true)
   })
 
+  test("normalizes unpaired surrogates before artifact hashes and byte ranges", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-artifact-utf8-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "artifact-utf8.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.compaction({ trigger: "auto", output_summary: "x".repeat(5000) + "prefix\\ud800suffix" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "artifact-utf8-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "2048",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await proc.exited).toBe(0)
+
+    const caseDir = path.join(dir, "artifact-utf8-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const artifact = trace.artifacts.find((item: any) => item.label === "compaction.output_summary")
+    const bytes = await fs.readFile(path.join(caseDir, artifact.path))
+    const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+    const slice = artifact.semantic_slices[0]
+    const sliceBytes = Buffer.from(slice.content, "utf8")
+
+    expect(content).toContain("prefix�suffix")
+    expect(content).not.toContain("\\ud800")
+    expect(artifact.byte_length).toBe(bytes.byteLength)
+    expect(artifact.content_hash).toBe(createHash("sha256").update(bytes).digest("hex").slice(0, 16))
+    expect(slice.byte_range).toEqual([0, sliceBytes.byteLength])
+    expect(slice.hash).toBe(createHash("sha256").update(sliceBytes).digest("hex").slice(0, 16))
+  })
+
   test("renders artifact-backed summaries with expandable full content", () => {
     const trace = {
       trace_version: "1.0",

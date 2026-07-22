@@ -65,3 +65,71 @@ included in that Task 3 commit; the final response records the resulting SHA.
   byte range and hash; that fallback is always truncated.
 - No new dependencies were added, and hydration remains confined to offline
   graph reads.
+
+## Review Fix Wave
+
+### RED Evidence
+
+- Focused Python RED ran 14 tests and failed with 9 failures plus 1 error. It
+  demonstrated gapped slice concatenation, unchecked/malformed
+  `byte_length`, duplicate-reference counter overcounting, lineage inference
+  from mismatched bytes, and investigation exposure of invalid UTF-8 and
+  mismatched content.
+- Focused Bun RED reached the intended producer mismatch after fixture
+  correction: the generated artifact declared 5014 bytes while the actual
+  normalized UTF-8 file contained 5015 bytes.
+- A follow-up Python RED proved hydration clipping exposed 64,000 UTF-8 bytes
+  while still reporting the original 80,000-byte semantic slice range.
+
+### Implementation
+
+- Added `VerifiedArtifactReader` as the sole artifact-content trust boundary.
+  It validates case-relative paths before resolution, rejects root escape via
+  symlink, hashes actual bytes using accepted raw/prefixed 16- or 64-hex
+  SHA-256 forms, checks declared byte length, and strictly decodes UTF-8.
+- Routed graph hydration, message-lineage reconstruction, artifact reference
+  status, and artifact investigation through the centralized reader. Failed
+  verification returns status only and never content bytes.
+- Validated every semantic slice against the artifact's declared
+  `byte_length`, sorted deterministically, rejected overlaps and gaps, and
+  reported only the UTF-8 byte ranges actually exposed after size clipping.
+- Kept `referenced` as the sum of per-record unique references, added
+  `unique_referenced`, and made `loaded`, `missing`, `truncated`,
+  `slice_fallbacks`, and `hash_mismatches` count each artifact identity once
+  across shared record references.
+- Normalized artifact text through a UTF-8 encode/decode round trip before
+  hashing, byte sizing, semantic slicing, and writing, replacing unpaired
+  surrogates deterministically.
+
+### Commands And Results
+
+- `PYTHONPATH=tools/trace_attribution python3 -m unittest tools/trace_attribution/tests/test_artifact_hydration.py tools/trace_attribution/tests/test_evidence_capsule.py tools/trace_attribution/tests/test_backward_taint.py tools/trace_attribution/tests/test_investigation.py` - PASS, 185 tests.
+- `PYTHONPATH=tools/trace_attribution python3 -m unittest discover -s tools/trace_attribution/tests -p 'test_*.py'` - PASS, 504 tests.
+- `cd packages/opencode && /private/tmp/bun-v1.3.13/bun-darwin-aarch64/bun test test/observability/case-trace.test.ts --timeout 30000` - PASS, 140 tests and 1,917 expectations.
+- `cd packages/opencode && /private/tmp/bun-v1.3.13/bun-darwin-aarch64/bun run typecheck` - PASS (`tsgo --noEmit`).
+- `PYTHONPYCACHEPREFIX=/private/tmp/observable-opencode-pycache python3 -m py_compile tools/trace_attribution/trace_attribution/artifact_reader.py tools/trace_attribution/trace_attribution/graph.py tools/trace_attribution/trace_attribution/reconstruction.py tools/trace_attribution/trace_attribution/investigation.py tools/trace_attribution/tests/test_artifact_hydration.py tools/trace_attribution/tests/test_evidence_capsule.py tools/trace_attribution/tests/test_backward_taint.py tools/trace_attribution/tests/test_investigation.py` - PASS.
+- `git diff --check` - PASS.
+
+### Files
+
+- `tools/trace_attribution/trace_attribution/artifact_reader.py`
+- `tools/trace_attribution/trace_attribution/graph.py`
+- `tools/trace_attribution/trace_attribution/reconstruction.py`
+- `tools/trace_attribution/trace_attribution/investigation.py`
+- `tools/trace_attribution/tests/test_artifact_hydration.py`
+- `tools/trace_attribution/tests/test_evidence_capsule.py`
+- `tools/trace_attribution/tests/test_backward_taint.py`
+- `tools/trace_attribution/tests/test_investigation.py`
+- `packages/opencode/src/observability/case-trace.ts`
+- `packages/opencode/test/observability/case-trace.test.ts`
+- `.superpowers/sdd/trace-fact-closure-task-3-report.md`
+
+### Concerns
+
+- The existing 16-hex SHA-256 compatibility form remains accepted alongside
+  full 64-hex raw and `sha256:`-prefixed forms because current CaseTrace
+  manifests emit it. Legacy content with no accepted declared hash still
+  fails closed.
+- `artifact_reference_status.availability` retains its public meaning of a
+  physically present safe-path file; `hydration_status` and integrity facts
+  separately indicate whether its content was verified and exposed.

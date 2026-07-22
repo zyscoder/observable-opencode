@@ -5,9 +5,9 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .artifact_reader import VerifiedArtifactReader
 from .models import JsonDict, TraceNode
 
 
@@ -22,7 +22,7 @@ def reconstruct_message_lineage(
     trace: JsonDict,
     nodes: Dict[str, TraceNode],
     aliases: Dict[str, str],
-    artifact_root: Optional[Path],
+    artifact_reader: VerifiedArtifactReader,
 ) -> JsonDict:
     positions = {ref: index for index, ref in enumerate(nodes)}
     identities = {ref: record_identity(node) for ref, node in nodes.items()}
@@ -65,11 +65,6 @@ def reconstruct_message_lineage(
                     )
                 )
 
-    artifact_index = {
-        str(item.get("artifact_id")): item
-        for item in trace.get("artifacts") or []
-        if isinstance(item, dict) and item.get("artifact_id")
-    }
     artifact_gaps: List[JsonDict] = []
     decision_refs = [ref for ref, node in nodes.items() if node.event_type == "decision"]
     llm_refs = [ref for ref, node in nodes.items() if node.event_type in ("llm.call", "llm.turn")]
@@ -82,8 +77,7 @@ def reconstruct_message_lineage(
         for artifact_id in artifact_ids:
             text, gap = read_artifact_search_text(
                 artifact_id=artifact_id,
-                artifact_index=artifact_index,
-                artifact_root=artifact_root,
+                artifact_reader=artifact_reader,
             )
             if gap:
                 artifact_gaps.append({"node_ref": llm_ref, "artifact_id": artifact_id, "reason": gap})
@@ -304,24 +298,12 @@ def input_message_artifact_ids(data: JsonDict) -> List[str]:
 def read_artifact_search_text(
     *,
     artifact_id: str,
-    artifact_index: Dict[str, JsonDict],
-    artifact_root: Optional[Path],
+    artifact_reader: VerifiedArtifactReader,
 ) -> Tuple[str, str]:
-    artifact = artifact_index.get(artifact_id)
-    if not artifact or not artifact.get("path"):
-        return "", "artifact_not_indexed"
-    if artifact_root is None:
-        return "", "artifact_root_missing"
-    root = Path(artifact_root).resolve()
-    candidate = (root / str(artifact["path"])).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return "", "artifact_path_outside_trace_root"
-    try:
-        content = candidate.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "", "artifact_unreadable"
+    resolved = artifact_reader.read(artifact_id)
+    if resolved.content is None:
+        return "", resolved.failures[0] if resolved.failures else "artifact_unreadable"
+    content = resolved.content
     if len(content) > MAX_ARTIFACT_CHARS:
         return "", "artifact_too_large_for_exact_matching"
     try:

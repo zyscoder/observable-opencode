@@ -430,13 +430,6 @@ class InvestigationToolTest(unittest.TestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(result.payload["content"], "3456")
         self.assertEqual(result.artifact_byte_count, 4)
-        (Path(self.temp.name) / "artifacts" / "payload.txt").write_text(
-            "changed-artifact-content-with-new-size", encoding="utf-8"
-        )
-        changed = tools.execute(ranged)
-        self.assertEqual(changed.status, "rejected")
-        self.assertIn("identity", changed.rejection_reason)
-
         eof = tools.execute(
             InvestigationDirective.create(
                 "inspect_artifact",
@@ -462,6 +455,53 @@ class InvestigationToolTest(unittest.TestCase):
         )
         self.assertEqual(stale.status, "rejected")
         self.assertIn("identity", stale.rejection_reason)
+        (Path(self.temp.name) / "artifacts" / "payload.txt").write_text(
+            "changed-artifact-content-with-new-size", encoding="utf-8"
+        )
+        changed = tools.execute(ranged)
+        self.assertEqual(changed.status, "rejected")
+        self.assertIn("identity", changed.rejection_reason)
+
+    def test_artifact_investigation_rejects_unverified_unsafe_and_invalid_utf8_inputs(self):
+        cases = []
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "case"
+            (root / "artifacts").mkdir(parents=True)
+            outside = base / "outside.txt"
+            outside.write_text("outside secret", encoding="utf-8")
+            (root / "artifacts" / "linked.txt").symlink_to(outside)
+            invalid = b"valid-prefix\xffsecret"
+            (root / "artifacts" / "invalid.txt").write_bytes(invalid)
+            tampered = "tampered secret"
+            (root / "artifacts" / "tampered.txt").write_text(tampered, encoding="utf-8")
+            cases.extend([
+                (str(outside), hashlib.sha256(outside.read_bytes()).hexdigest(), outside.stat().st_size),
+                ("../outside.txt", hashlib.sha256(outside.read_bytes()).hexdigest(), outside.stat().st_size),
+                ("artifacts/linked.txt", hashlib.sha256(outside.read_bytes()).hexdigest(), outside.stat().st_size),
+                ("artifacts/invalid.txt", hashlib.sha256(invalid).hexdigest(), len(invalid)),
+                ("artifacts/tampered.txt", hashlib.sha256(b"expected").hexdigest(), len(tampered)),
+            ])
+            for path_value, digest, byte_length in cases:
+                with self.subTest(path=path_value):
+                    trace = trace_with_artifact(None)
+                    trace["artifacts"][0].update({
+                        "path": path_value,
+                        "hash": digest,
+                        "byte_length": byte_length,
+                    })
+                    graph = TraceGraph.from_trace(trace, artifact_root=root)
+                    result = CausalInvestigationTools(graph).execute(
+                        InvestigationDirective.create(
+                            "inspect_artifact",
+                            {"artifact_id": "artifact_1", "offset": 0, "length": 64},
+                            requested_by_ref="record:decision",
+                            reason="Reject unverified artifact content.",
+                        )
+                    )
+
+                    self.assertEqual(result.status, "rejected")
+                    self.assertNotIn("secret", json.dumps(result.to_dict()))
 
     def test_all_allowed_tools_return_auditable_results(self):
         self.graph.message_lineage["turns"] = [
