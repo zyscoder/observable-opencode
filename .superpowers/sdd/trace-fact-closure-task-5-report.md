@@ -56,26 +56,29 @@ new acceptance harness and fixture metadata, not missing production code.
 
 - Passive focused gate: 1 pass, 0 fail, 3 filtered.
 - Exact Astropy producer gate: 1 pass, 0 fail, 142 filtered.
-- Hermetic Python closure fixtures: 2 tests, OK.
+- Hermetic Python digest fixtures: 4 tests, OK.
 - Required full TypeScript command: 241 pass, 0 fail.
-- Full offline Python suite: 551 tests, OK; no skipped tests or retries.
+- Full offline Python suite: 555 tests, OK; no skipped tests or retries.
 - TypeScript typecheck: exit 0.
 - Python compileall with `PYTHONPYCACHEPREFIX` under `/private/tmp`: exit 0.
 - `git diff --check`: exit 0.
 
 ## Passive Equivalence
 
-The disabled and enabled child outputs are exactly equal for both success and
-error execution. The test fixes and asserts:
+The disabled, enabled, and invalid-root child outputs are exactly equal for all
+three scenarios. The test fixes and asserts:
 
-- decoded tool inputs: success and error with `payload="fixed-input"`;
+- decoded tool inputs: success, error, and pre-aborted with
+  `payload="fixed-input"`;
 - success output: title `passive success`, output `stable tool output`, and
   metadata `{scenario: "success", truncated: false}`;
-- thrown error class, type, and message: `PassiveToolError`,
-  `PassiveToolError`, `passive benchmark failure`;
-- callback counts: metadata 2, permission 2;
-- the exact six-message Agent-visible metadata, permission, result, metadata,
-  permission, error sequence.
+- original thrown error constructor/name/type/message, captured before it is
+  passed to `SessionProcessor.failToolCall`: `PassiveToolError`,
+  `PassiveToolError`, `PassiveToolError`, `passive benchmark failure`;
+- callback counts: metadata 3, permission 3;
+- the exact production-generated three-message Agent-visible projection with
+  three tool calls and three tool results, not synthesized callback/result/error
+  items.
 
 The disabled trace case directory is absent. The enabled directory contains
 `records.jsonl`. No behavioral output includes trace state.
@@ -152,8 +155,8 @@ Planned commit: `test(trace): verify passive fact closure on benchmarks`.
 
 ## Review Closure Addendum (2026-07-22)
 
-This addendum supersedes the earlier description of a synthesized six-message
-passive oracle. The corrected test does not append result or error messages.
+This addendum corrects the earlier passive-oracle description. The corrected
+test does not append result or error messages.
 It executes a real `Tool.define` definition through the normal wrapper branch
 (the tool result does not predeclare `metadata.truncated`), then sends the
 resulting `tool-result` or `tool-error` stream event through
@@ -194,16 +197,20 @@ Deterministic no-LLM characterization command:
 
 ```bash
 PYTHONPATH=tools/trace_attribution python3 tools/trace_attribution/scripts/characterize_trace_fact_closure.py \
+  --expected-sha256 1c934c47fe01719abaed45b2825ab4b88b1f1ea7fc1d8885ea2f76feed9c9ead \
+  --expected-sha256 e5209173e7576b822921025b6cd9f80fde3d1062c3f85ceeae312c56e3012b17 \
+  --expected-sha256 3760043e3016d0ee29278cb5dd8b63f94575e8f3dcca70551c324e2409a5c011 \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-multilingual/axios__axios-5892/traces/axios__axios-5892/partial/latest.json \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-verified/astropy__astropy-12907/traces/astropy__astropy-12907/partial/latest.json \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/terminalbench/cancel-async-tasks/traces/cancel-async-tasks/partial/latest.json
 ```
 
-The script hashes source bytes, loads each archive twice, hydrates every graph
-node, rejects nondeterministic reconstruction, and emits the artifact, seed,
-revision, and IR/graph metrics used by the tables above. Its automated test
-uses only a temporary synthetic archive; the large local archives remain
-uncommitted.
+The script requires one expected SHA-256 per archive and validates every source
+digest before it loads, hydrates, or emits metrics. It then loads each archive
+twice, hydrates every graph node, rejects nondeterministic reconstruction, and
+emits the artifact, seed, revision, and IR/graph metrics used by the tables
+above. Its automated tests use only temporary synthetic archives; the large
+local archives remain uncommitted.
 
 ### Corrective RED/GREEN Evidence
 
@@ -216,10 +223,24 @@ uncommitted.
   permission metadata field, and an unbranded part ID.
 - GREEN: passive focused gate `1 pass, 0 fail`; full semantic-observability
   file `4 pass, 0 fail`; exact Astropy gate `1 pass, 0 fail`; Task 5 Python
-  class `3 tests, OK`.
+  digest gate `4 tests, OK`.
 - GREEN: required four-file Bun gate `241 pass, 0 fail`; full offline Python
-  suite `552 tests, OK`; TypeScript typecheck, isolated-pycache compileall, and
+  suite `555 tests, OK`; TypeScript typecheck, isolated-pycache compileall, and
   `git diff --check` all exited `0`.
 
 No production behavior change was needed. The correction replaces weak test
 boundaries and adds a deterministic offline characterization utility.
+
+## Fix Wave 2 Evidence (2026-07-22)
+
+- RED: focused passive execution failed because the returned oracle omitted
+  `errorOracles`; focused characterizer tests failed because the CLI did not
+  accept `--expected-sha256` and allowed a missing digest.
+- GREEN: the fixture now captures each squashed thrown value before passing it
+  into the `tool-error` event consumed by `SessionProcessor.failToolCall`. The
+  focused passive test passed `1/1`; the hermetic characterizer gate passed
+  `4 tests`, including matching, mismatched, and missing digest behavior.
+- GREEN: the documented command accepted all three explicit published digests
+  before emitting metrics. The four-file Bun gate passed `241/241`, the full
+  Python suite passed `555 tests`, and typecheck, isolated-pycache compileall,
+  and `git diff --check` exited `0`.

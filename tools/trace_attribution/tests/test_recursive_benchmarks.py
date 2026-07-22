@@ -6,7 +6,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,7 +32,7 @@ from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
-from scripts.characterize_trace_fact_closure import characterize_archive
+from scripts.characterize_trace_fact_closure import characterize_archive, main as characterize_main
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "recursive_cases"
@@ -263,6 +263,57 @@ class TraceFactClosureBenchmarkTest(unittest.TestCase):
         self.assertEqual(first["broken_claim_fragments"], 1)
         self.assertEqual(first["artifact_files"], 0)
         self.assertIsNone(first["subject_revision"])
+
+    def test_characterizer_publishes_metrics_after_matching_expected_digest(self):
+        trace = {"manifest": {"case_id": "matching-digest"}, "records": [], "artifacts": []}
+        source_bytes = json.dumps(trace, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "case" / "partial" / "latest.json"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(source_bytes)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = characterize_main(
+                    ["--expected-sha256", hashlib.sha256(source_bytes).hexdigest(), str(partial)]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue())[0]["case_id"], "matching-digest")
+
+    def test_characterizer_rejects_mismatched_expected_digest_before_publishing_metrics(self):
+        trace = {"manifest": {"case_id": "mismatched-digest"}, "records": [], "artifacts": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "case" / "partial" / "latest.json"
+            partial.parent.mkdir(parents=True)
+            partial.write_text(json.dumps(trace), encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = characterize_main(["--expected-sha256", "0" * 64, str(partial)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("digest mismatch", stderr.getvalue())
+
+    def test_characterizer_rejects_missing_expected_digest_before_publishing_metrics(self):
+        trace = {"manifest": {"case_id": "missing-digest"}, "records": [], "artifacts": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "case" / "partial" / "latest.json"
+            partial.parent.mkdir(parents=True)
+            partial.write_text(json.dumps(trace), encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = characterize_main([str(partial)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("expected digest count", stderr.getvalue())
 
     def test_legacy_archive_fixture_fails_closed_without_rewriting_historical_gaps(self):
         trace = {

@@ -127,6 +127,7 @@ const result = await Effect.runPromise(
     const inputs: unknown[] = []
     const metadataCallbacks: unknown[] = []
     const askCallbacks: unknown[] = []
+    const errorOracles: unknown[] = []
     const parameters = Schema.Struct({
       scenario: Schema.Union([Schema.Literal("success"), Schema.Literal("error"), Schema.Literal("pre-aborted")]),
       payload: Schema.String,
@@ -202,11 +203,19 @@ const result = await Effect.runPromise(
           Effect.gen(function* () {
             const exit = yield* Effect.exit(tool.execute(args, context))
             if (Exit.isFailure(exit)) {
+              const error = Cause.squash(exit.cause)
+              errorOracles.push({
+                scenario,
+                constructorName: error instanceof Error ? error.constructor.name : typeof error,
+                name: error instanceof Error ? error.name : undefined,
+                type: error instanceof Error ? error.name : typeof error,
+                message: error instanceof Error ? error.message : String(error),
+              })
               return {
                 type: "tool-error",
                 toolCallId: callID,
                 toolName: info.id,
-                error: Cause.squash(exit.cause),
+                error,
               } as LLM.Event
             }
             return {
@@ -282,6 +291,7 @@ const result = await Effect.runPromise(
       callbackCounts: { metadata: metadataCallbacks.length, ask: askCallbacks.length },
       metadataCallbacks,
       askCallbacks,
+      errorOracles,
       projectedToolParts,
       agentVisibleMessages,
     }

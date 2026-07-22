@@ -40,6 +40,22 @@ describe("tool semantic observability", () => {
 
       expect(enabled.result).toEqual(disabled.result)
       expect(invalid.result).toEqual(disabled.result)
+      expect(disabled.result.errorOracles).toEqual([
+        {
+          scenario: "error",
+          constructorName: "PassiveToolError",
+          name: "PassiveToolError",
+          type: "PassiveToolError",
+          message: "passive benchmark failure",
+        },
+        {
+          scenario: "pre-aborted",
+          constructorName: "DOMException",
+          name: "AbortError",
+          type: "AbortError",
+          message: "Passive tool pre-aborted",
+        },
+      ])
       expect(disabled.result.inputs).toEqual([
         { scenario: "success", payload: "fixed-input" },
         { scenario: "error", payload: "fixed-input" },

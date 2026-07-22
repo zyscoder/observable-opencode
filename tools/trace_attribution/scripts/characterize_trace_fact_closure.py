@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -77,10 +78,43 @@ def characterize_archive(path: Path) -> JsonDict:
     }
 
 
+def expected_digests_match(archives: Sequence[Path], expected_digests: Sequence[str]) -> bool:
+    if len(expected_digests) != len(archives):
+        print(
+            "error: expected digest count ({0}) must equal archive count ({1})".format(
+                len(expected_digests), len(archives)
+            ),
+            file=sys.stderr,
+        )
+        return False
+
+    for archive, expected in zip(archives, expected_digests):
+        source = Path(archive).resolve()
+        actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        if actual != expected.lower():
+            print(
+                "error: digest mismatch for {0}: expected {1}, got {2}".format(
+                    source, expected, actual
+                ),
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--expected-sha256",
+        action="append",
+        default=[],
+        metavar="SHA256",
+        help="Expected SHA-256 in positional archive order; provide once per archive.",
+    )
     parser.add_argument("archives", nargs="+", type=Path)
     args = parser.parse_args(argv)
+    if not expected_digests_match(args.archives, args.expected_sha256):
+        return 1
     print(
         json.dumps(
             [characterize_archive(path) for path in args.archives],

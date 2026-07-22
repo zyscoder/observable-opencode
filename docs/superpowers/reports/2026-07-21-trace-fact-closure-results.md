@@ -18,20 +18,23 @@ seeds.
 
 ## Passive Behavior
 
-Tracing disabled and enabled ran in separate processes with identical tool
-inputs and callbacks. Disabled ran first; enabled ran second. Neither execution
-read trace or attribution output.
+Tracing disabled, enabled, and enabled with a file-valued invalid trace root ran
+in separate processes with identical tool inputs and callbacks. Disabled ran
+first. Neither execution read trace or attribution output.
 
 The observed public result is byte-for-byte structurally equal across modes:
 
-- exact decoded success and error inputs;
+- exact decoded success, error, and pre-aborted inputs;
 - exact success tool output and metadata;
-- exact error class/type/message: `PassiveToolError` /
+- original thrown error identity captured before `SessionProcessor.failToolCall`:
+  constructor/name/type/message `PassiveToolError` / `PassiveToolError` /
   `PassiveToolError` / `passive benchmark failure`;
-- metadata callback count 2 and permission callback count 2;
-- exact six-item Agent-visible callback/result/error message sequence.
+- metadata callback count 3 and permission callback count 3;
+- exact production-generated three-message Agent-visible projection containing
+  three tool calls and three corresponding tool results, without synthesized or
+  appended messages.
 
-Only the enabled process creates a trace case directory and trace records.
+Only the valid enabled process creates a trace case directory and trace records.
 
 ## Historical Compatibility
 
@@ -83,7 +86,7 @@ With its bundle file intentionally absent, its verified semantic slice yields
 
 - Passive focused Bun gate: 1 pass, 0 fail.
 - Required four-file Bun suite: 241 pass, 0 fail.
-- Full Python suite: 551 tests, OK, with no skips or retries.
+- Full Python suite: 555 tests, OK, with no skips or retries.
 - TypeScript typecheck: passed.
 - Python compileall with isolated pycache: passed.
 - `git diff --check`: passed.
@@ -130,24 +133,42 @@ Run the deterministic no-LLM characterizer from the repository root:
 
 ```bash
 PYTHONPATH=tools/trace_attribution python3 tools/trace_attribution/scripts/characterize_trace_fact_closure.py \
+  --expected-sha256 1c934c47fe01719abaed45b2825ab4b88b1f1ea7fc1d8885ea2f76feed9c9ead \
+  --expected-sha256 e5209173e7576b822921025b6cd9f80fde3d1062c3f85ceeae312c56e3012b17 \
+  --expected-sha256 3760043e3016d0ee29278cb5dd8b63f94575e8f3dcca70551c324e2409a5c011 \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-multilingual/axios__axios-5892/traces/axios__axios-5892/partial/latest.json \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-verified/astropy__astropy-12907/traces/astropy__astropy-12907/partial/latest.json \
   /private/tmp/observable-opencode-multibench/runs/formal-v3/terminalbench/cancel-async-tasks/traces/cancel-async-tasks/partial/latest.json
 ```
 
-The characterizer verifies source digests, reconstructs and hydrates each
-archive twice, fails on metric drift, and prints the published closure metrics.
-Its test is hermetic and creates only a small synthetic archive.
+The characterizer requires one explicit expected SHA-256 per archive and
+validates all source bytes before reconstructing, hydrating, or publishing any
+metrics. It then reconstructs and hydrates each archive twice, fails on metric
+drift, and prints the published closure metrics. Its tests are hermetic and
+create only small synthetic archives.
 
 ### Corrective Verification
 
 - RED: missing production-path fixture and missing archive characterizer;
   subsequent typecheck RED exposed fixture contract errors before correction.
 - GREEN: passive focused `1/1`; semantic-observability `4/4`; exact Astropy
-  `1/1`; Task 5 Python `3/3`.
+  `1/1`; Task 5 Python digest gate `4 tests, OK`.
 - GREEN: four-file Bun observability gate `241 pass, 0 fail`; full Python suite
-  `552 tests, OK`; TypeScript typecheck, isolated-pycache compileall, and
+  `555 tests, OK`; TypeScript typecheck, isolated-pycache compileall, and
   `git diff --check` all exited `0`.
 
 These corrections change test evidence and reproducibility tooling only. The
 historical portability limitation remains unchanged.
+
+## Fix Wave 2 (2026-07-22)
+
+- RED: the passive identity assertion failed with `errorOracles` undefined;
+  the digest CLI tests failed because `--expected-sha256` was unrecognized and
+  a missing digest still returned zero.
+- GREEN: the focused passive gate passed `1/1`; the hermetic characterizer gate
+  passed `4 tests`; matching inputs publish metrics while missing or mismatched
+  digests return nonzero with no stdout.
+- GREEN: the published three-archive command with all three explicit digests
+  completed successfully; the four-file Bun gate passed `241/241`, the Python
+  suite passed `555 tests`, and typecheck, isolated-pycache compileall, and
+  `git diff --check` exited `0`.
