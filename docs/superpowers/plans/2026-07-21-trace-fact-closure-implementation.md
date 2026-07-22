@@ -28,11 +28,12 @@
 - Modify: `packages/opencode/src/observability/case-trace.ts:2460-2760`
 
 **Interfaces:**
-- Consumes: 任意 final response 值，通过现有 `stringPreview(input, 8000)` 等价规则转成文本。
+- Consumes: 任意 final response 值，通过 `createClaimSourceView(input, 8000)` 建立完整原文与 Unicode 安全扫描窗口。
 - Produces: `atomizeResponseClaims(input: unknown): AtomizedResponseClaim[]`。
 - Produces: `AtomizedResponseClaim`，包含 `text`、`raw_text`、`canonical_text`、`claim_format`、`claim_group_id`、`claim_index`、`claim_count`、`source_byte_range`、`previous_claim_key`、`next_claim_key`、`atomization_status`、`atomization_reason`。
-- Internal: `tokenizeClaimSource(source: string): ClaimToken[]`，token 类型限定为 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和 `HARD_BREAK`。
-- Internal: `segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[]`，只在 token 状态机中维护括号与活动 span。
+- Internal: `ClaimSourceView`，包含完整 `originalText`、不截断 UTF-16 代理对的 `scanEnd` 和基于原文的 UTF-8 byte offset 计算。
+- Internal: `tokenizeClaimSource(source: ClaimSourceView): ClaimToken[]`，token 类型限定为 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和 `HARD_BREAK`。
+- Internal: `segmentClaimTokens(source: ClaimSourceView, tokens: ClaimToken[]): ClaimSpan[]`，只在 token 状态机中维护括号与活动 span。
 
 - [ ] **Step 1: 写 `_cstack`、括号、代码片段和 UTF-8 字节范围的失败测试**
 
@@ -103,7 +104,7 @@ export type AtomizedResponseClaim = {
 }
 
 export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
-  const source = normalizeResponseText(input)
+  const source = createClaimSourceView(input, 8000)
   const tokens = tokenizeClaimSource(source)
   const spans = segmentClaimTokens(source, tokens)
   const candidates = spans.flatMap(toFactualCandidate).slice(0, 50)
@@ -118,26 +119,57 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
 }
 ```
 
+`createClaimSourceView()` 保留完整原始文本，仅限制 tokenizer 可访问的 `[0, scanEnd)`。
+若 code unit 7,999 是 high surrogate 且 8,000 是对应 low surrogate，`scanEnd` 必须
+回退一位。所有 byte range 都由 `originalText.slice(0, charOffset)` 计算，禁止对截断后
+产生的孤立 surrogate 编码。扫描窗口外不产生 claim。
+
 `tokenizeClaimSource()` 必须在原始响应上保留位置并生成：普通文本 `TEXT`、不参与
 括号/标点扫描的 `PROTECTED_TEXT`、可在括号未闭合时延续的 `SOFT_BREAK`，以及
 heading、fence、空段落、list、table、blockquote 对应的 `HARD_BREAK`。状态机遇到
 `HARD_BREAK` 必须终止或丢弃不完整 span 并清空括号栈；普通换行只有在括号未闭合
 时才延续。不得通过删除 Markdown 行后再扫描。table fact、非事实过滤、continuation
 合并和 broken fragment 判断必须发生在 span 形成之后。`source_byte_range` 使用
-`Buffer.byteLength(source.slice(0, charOffset))` 计算，且从原始响应按范围反切片后
+`Buffer.byteLength(source.originalText.slice(0, charOffset))` 计算，且从原始响应按范围反切片后
 必须包含 claim 原始文本。`claim_group_id` 使用完整合并语义声明的稳定 hash，格式为
 `claim_group_<hash前12位>`；现有 `claim_index` 与新增 `claim_count` 表示该 response
 segment 中的顺序和总数，相邻 ref 只表达 response 内顺序，不表示因果关系。
 
 除原有定向用例外，必须增加结构边界矩阵：普通括号跨行、inline code 未闭合括号、
 heading、fence、空段落、list、table、blockquote、嵌套/连续 list。任何 hard barrier
-前后的文本不得组成同一 claim，现有 CaseTrace 133 个测试必须全部通过。
+前后的文本不得组成同一 claim，既有 CaseTrace 134 个测试必须全部通过。
+
+未闭合 single/double/multi-backtick code span 在当前物理行内找不到同长度闭合符时，
+从 opening delimiter 到行末整体生成 `PROTECTED_TEXT`。增加参数化回归，证明其中的
+未闭合括号不会吞掉后续行事实。另增加恰好跨越 8,000 code unit 的 emoji 回归，并用
+`Buffer.from(originalResponse).subarray(start, end).toString()` 验证 byte range 可逆。
+
+```ts
+for (const delimiter of ["`", "``", "```"]) {
+  const response = `Example ${delimiter}foo(\nAll 11 tests pass.`
+  expect(atomizeResponseClaims(response).map((claim) => claim.text)).toContain("All 11 tests pass.")
+}
+
+const prefix = "All 11 tests pass: "
+const response = `${prefix}${"a".repeat(7_999 - prefix.length)}😀`
+const claims = atomizeResponseClaims(response)
+expect(claims.length).toBeGreaterThan(0)
+for (const claim of claims) {
+  const [start, end] = claim.source_byte_range
+  expect(Buffer.from(response).subarray(start, end).toString()).toContain(claim.raw_text)
+}
+```
+
+`ActiveCaseTrace.finish()` 必须以 `try/finally` 或等价单一清理点释放所有暂存的原始
+response source。CaseTrace 测试必须覆盖 final、non-final/cancelled 和重复 finish，
+并验证清理前后的 trace 输出、摘要和 artifact 行为不变。本任务只写 append-only Trace
+record；不得把新增 claim 字段写入 Causal IR node。
 
 - [ ] **Step 4: 运行原子化测试**
 
 Run: `cd packages/opencode && bun test test/observability/claim-atomization.test.ts --timeout 30000`
 
-Expected: PASS，2 tests passed。
+Expected: PASS，至少 19 tests passed，包含 malformed code span 与 Unicode 边界回归。
 
 - [ ] **Step 5: 提交原子化模块**
 

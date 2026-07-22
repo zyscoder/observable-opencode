@@ -111,6 +111,17 @@ list、table 和 blockquote 边界必须清空括号与活动 span。`PROTECTED_
 进入 claim 原文，但其内部括号和标点不参与外层状态迁移。所有 byte range 始终
 指向原始响应。
 
+原始响应必须先封装为 `ClaimSourceView`，统一持有完整原文、Unicode 安全的扫描
+终点和字符位置到 UTF-8 字节位置的映射。8,000 UTF-16 code unit 的扫描上限不得
+截断代理对；扫描窗口之外不生成 claim，但窗口内的 `source_byte_range` 仍以完整
+原始响应为坐标。反引号 code span 若在当前物理行内找不到同长度闭合 delimiter，
+则从 opening delimiter 到行末整体记为 `PROTECTED_TEXT`，不得让 malformed Markdown
+中的括号或标点污染外层状态机。
+
+CaseTrace 为原子化暂存的 response 原文只能存活到 `finish()`。final、non-final、
+cancelled、异常和重复 finish 路径都必须通过同一个生命周期清理点释放暂存原文；
+清理不得改变既有摘要、artifact 外置、Causal IR 或 Agent 执行行为。
+
 ### 5.2 Artifact Bundle
 
 归因所需 artifact 必须随 Trace 包一起可解析。每项 artifact 记录：
