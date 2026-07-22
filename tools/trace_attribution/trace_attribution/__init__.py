@@ -22,6 +22,7 @@ from .causal_state import (
     RecursiveAttributionReport,
     RejectedCandidate,
     RootConfirmation,
+    SeedAttributionResult,
     annotate_report_semantic_anchors,
     semantic_anchor_id,
     semantic_anchor_index,
@@ -57,7 +58,11 @@ from .investigation import (
     InvestigationResult,
 )
 from .models import AttributionReport, NodeJudgment, TaintInfluence, TraceNode
-from .recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
+from .recursive_analyzer import (
+    AgenticRecursiveAnalyzer,
+    RecursiveAnalysisState,
+    SeedAttributionBuilder,
+)
 
 __all__ = [
     "AttributionReport",
@@ -96,6 +101,8 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "RootConfirmationRequest",
+    "SeedAttributionBuilder",
+    "SeedAttributionResult",
     "TaintInfluence",
     "TraceGraph",
     "TraceNode",

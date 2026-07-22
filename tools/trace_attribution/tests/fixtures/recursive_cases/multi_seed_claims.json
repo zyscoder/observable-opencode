@@ -1,0 +1,37 @@
+{
+  "case_id": "multi-seed-claims",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {
+      "record_id": "claim_tests",
+      "component": "result",
+      "event_type": "response.claim",
+      "data": {"text": "All focused tests passed."}
+    },
+    {
+      "record_id": "claim_change",
+      "component": "result",
+      "event_type": "response.claim",
+      "data": {"text": "The requested change is complete."}
+    },
+    {
+      "record_id": "claim_fragment",
+      "component": "result",
+      "event_type": "response.claim",
+      "data": {"text": "The truncated log fragment proves the remaining behavior."}
+    }
+  ],
+  "dataflow_edges": [],
+  "scripted_analysis": {
+    "start_refs": [
+      "record:claim_tests",
+      "record:claim_change",
+      "record:claim_fragment"
+    ],
+    "outcomes": {
+      "record:claim_tests": "confirmed_root",
+      "record:claim_change": "no_defect",
+      "record:claim_fragment": "evidence_gap"
+    }
+  }
+}

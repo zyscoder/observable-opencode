@@ -37,6 +37,7 @@ from .causal_state import (
     RecursiveAttributionReport,
     RejectedCandidate,
     RootConfirmation,
+    SeedAttributionResult,
     confirmation_identity_for,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
@@ -83,7 +84,7 @@ EVALUATION_START_EVENTS = frozenset(
 )
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v2"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v3"
 PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
 PROVIDER_STATE_KEYS = {
     "schema",
@@ -695,6 +696,123 @@ def _rejudge_success_terminal_state(
     return "success"
 
 
+def _seed_ledger_key(start_ref: str, defect_fingerprint: str) -> str:
+    return stable_json(
+        {
+            "start_ref": str(start_ref),
+            "defect_fingerprint": str(defect_fingerprint),
+        }
+    )
+
+
+@dataclass
+class SeedAttributionBuilder:
+    start_ref: str
+    defect_state: DefectState
+    candidate_refs: Set[str] = field(default_factory=set)
+    selected_candidate_refs: Set[str] = field(default_factory=set)
+    confirmation_identities: Set[str] = field(default_factory=set)
+    confirmed_root_refs: Set[str] = field(default_factory=set)
+    decisive_evidence_refs: Set[str] = field(default_factory=set)
+    missing_evidence: Set[str] = field(default_factory=set)
+    blocking_reasons: Set[str] = field(default_factory=set)
+    global_judgment: JsonDict = field(default_factory=dict)
+    expansion_history: List[JsonDict] = field(default_factory=list)
+    no_defect: bool = False
+
+    @property
+    def key(self) -> str:
+        return _seed_ledger_key(self.start_ref, self.defect_state.fingerprint)
+
+    def mark_no_defect(self) -> None:
+        self.no_defect = True
+
+    def mark_unresolved(self, reason: str, details: str = "") -> None:
+        self.blocking_reasons.add(str(reason))
+        if details:
+            self.missing_evidence.add(str(details))
+
+    def record_global_judgment(
+        self,
+        judgment: GlobalCandidateJudgment,
+        candidate_refs: Iterable[str],
+    ) -> None:
+        self.candidate_refs.update(str(ref) for ref in candidate_refs if ref)
+        self.selected_candidate_refs.update(judgment.selected_candidate_refs)
+        self.decisive_evidence_refs.update(judgment.decisive_evidence_refs)
+        self.global_judgment = copy.deepcopy(judgment.to_dict())
+        self.expansion_history.extend(
+            copy.deepcopy(dict(item)) for item in judgment.expansion_requests
+        )
+        if judgment.outcome == "no_defect":
+            self.mark_no_defect()
+        elif judgment.outcome == "inconclusive":
+            self.mark_unresolved(
+                "global_judgment_inconclusive",
+                "; ".join(judgment.missing_evidence) or judgment.reason,
+            )
+
+    def record_confirmation(self, confirmation: RootConfirmation) -> None:
+        self.candidate_refs.add(confirmation.candidate_ref)
+        self.confirmation_identities.add(confirmation.confirmation_identity)
+        self.decisive_evidence_refs.update(confirmation.evidence_refs)
+        if confirmation.status == "confirmed":
+            self.confirmed_root_refs.add(confirmation.candidate_ref)
+            return
+        if confirmation.status == "unknown":
+            self.mark_unresolved("root_confirmation_unknown", confirmation.reason)
+
+    def to_result(self) -> SeedAttributionResult:
+        if self.blocking_reasons or self.missing_evidence:
+            outcome = "evidence_gap"
+        elif self.confirmed_root_refs:
+            outcome = "confirmed_root"
+        elif self.no_defect:
+            outcome = "no_defect"
+        else:
+            outcome = "inconclusive"
+        return SeedAttributionResult(
+            start_ref=self.start_ref,
+            defect_fingerprint=self.defect_state.fingerprint,
+            defect_state=self.defect_state,
+            outcome=outcome,
+            candidate_refs=tuple(self.candidate_refs),
+            selected_candidate_refs=tuple(self.selected_candidate_refs),
+            confirmation_identities=tuple(self.confirmation_identities),
+            confirmed_root_refs=tuple(self.confirmed_root_refs),
+            decisive_evidence_refs=tuple(self.decisive_evidence_refs),
+            missing_evidence=tuple(self.missing_evidence),
+            blocking_reasons=tuple(self.blocking_reasons),
+            global_judgment=self.global_judgment,
+            expansion_history=tuple(self.expansion_history),
+        )
+
+    def to_dict(self) -> JsonDict:
+        return {
+            **self.to_result().to_dict(),
+            "no_defect": self.no_defect,
+        }
+
+    @classmethod
+    def from_dict(cls, value: JsonDict) -> "SeedAttributionBuilder":
+        result = SeedAttributionResult.from_dict(value)
+        builder = cls(
+            start_ref=result.start_ref,
+            defect_state=result.defect_state,
+            candidate_refs=set(result.candidate_refs),
+            selected_candidate_refs=set(result.selected_candidate_refs),
+            confirmation_identities=set(result.confirmation_identities),
+            confirmed_root_refs=set(result.confirmed_root_refs),
+            decisive_evidence_refs=set(result.decisive_evidence_refs),
+            missing_evidence=set(result.missing_evidence),
+            blocking_reasons=set(result.blocking_reasons),
+            global_judgment=copy.deepcopy(result.to_dict()["global_judgment"]),
+            expansion_history=copy.deepcopy(result.to_dict()["expansion_history"]),
+            no_defect=bool(value.get("no_defect", result.outcome == "no_defect")),
+        )
+        return builder
+
+
 @dataclass
 class RecursiveAnalysisState:
     """Mutable orchestration state containing immutable causal domain values."""
@@ -748,6 +866,56 @@ class RecursiveAnalysisState:
     seed_count: int = 0
     provider_state: JsonDict = field(default_factory=dict)
     replay_actions: Dict[str, JsonDict] = field(default_factory=dict)
+    seed_ledger: Dict[str, SeedAttributionBuilder] = field(default_factory=dict)
+    hypothesis_seed_keys: Dict[str, str] = field(default_factory=dict)
+
+    def _ensure_seed(
+        self, start_ref: str, defect_state: DefectState
+    ) -> SeedAttributionBuilder:
+        key = _seed_ledger_key(start_ref, defect_state.fingerprint)
+        builder = self.seed_ledger.get(key)
+        if builder is None:
+            builder = SeedAttributionBuilder(
+                start_ref=str(start_ref),
+                defect_state=defect_state,
+            )
+            self.seed_ledger[key] = builder
+            self.seed_count = len(self.seed_ledger)
+        return builder
+
+    def _seed_builder_for_item(
+        self, item: FrontierItem
+    ) -> Optional[SeedAttributionBuilder]:
+        key = self.hypothesis_seed_keys.get(item.hypothesis_id)
+        if key is not None:
+            return self.seed_ledger.get(key)
+        start_ref = item.downstream_path[-1] if item.downstream_path else item.node_ref
+        candidates = [
+            builder
+            for builder in self.seed_ledger.values()
+            if builder.start_ref == start_ref
+            and any(
+                state.fingerprint == builder.defect_state.fingerprint
+                for state in self.transformation_chains.get(
+                    item.defect_state.fingerprint, (item.defect_state,)
+                )
+            )
+        ]
+        if len(candidates) != 1:
+            return None
+        self.hypothesis_seed_keys[item.hypothesis_id] = candidates[0].key
+        return candidates[0]
+
+    def _bind_hypothesis_to_seed(
+        self, hypothesis_id: str, builder: Optional[SeedAttributionBuilder]
+    ) -> None:
+        if builder is not None:
+            self.hypothesis_seed_keys[hypothesis_id] = builder.key
+
+    def seed_results(self) -> Tuple[SeedAttributionResult, ...]:
+        return tuple(
+            self.seed_ledger[key].to_result() for key in sorted(self.seed_ledger)
+        )
 
     @classmethod
     def create(
@@ -769,18 +937,33 @@ class RecursiveAnalysisState:
         for start_ref in resolved_starts:
             node = graph.nodes.get(start_ref)
             if node is None:
-                state._mark_seed_unresolved(start_ref, "start_ref_unresolved", "The start reference is absent.")
+                defect_state = DefectState.create(
+                    label="unresolved_attribution_seed",
+                    expected=objective,
+                    actual="The start reference is absent.",
+                    mechanism="No trace node can ground this attribution seed.",
+                    scope="attribution_seed:{0}".format(start_ref),
+                )
+                builder = state._ensure_seed(start_ref, defect_state)
+                state._remember_defect(defect_state)
+                state._mark_seed_unresolved(
+                    start_ref,
+                    "start_ref_unresolved",
+                    "The start reference is absent.",
+                    seed_key=builder.key,
+                )
                 continue
+            defect_state = _seed_defect_state(node, objective)
+            builder = state._ensure_seed(start_ref, defect_state)
+            state._remember_defect(defect_state)
             if not graph.analysis_start_eligible(start_ref):
                 state._mark_seed_unresolved(
                     start_ref,
                     "start_ref_ineligible",
                     "The external evaluation fact is ineligible for decisive judgment.",
+                    seed_key=builder.key,
                 )
                 continue
-            defect_state = _seed_defect_state(node, objective)
-            state._remember_defect(defect_state)
-            state.seed_count += 1
             if node.event_type in EVALUATION_START_EVENTS:
                 predecessors = [
                     ref
@@ -811,6 +994,7 @@ class RecursiveAnalysisState:
                             start_ref,
                             "process_signal_node_missing",
                             "The interrupted case records a shutdown signal but has no distinct process.signal causal node.",
+                            seed_key=builder.key,
                         )
                         continue
                     predecessors = signal_predecessors
@@ -819,6 +1003,7 @@ class RecursiveAnalysisState:
                         start_ref,
                         "outcome_evidence_missing",
                         "The evaluation assertion has no concrete outcome evidence.",
+                        seed_key=builder.key,
                     )
                     continue
                 progress_predecessors = [
@@ -867,6 +1052,7 @@ class RecursiveAnalysisState:
                             predecessor_ref,
                             "hypothesis_limit",
                             "The seed hypothesis budget is exhausted.",
+                            seed_key=builder.key,
                         )
                         continue
                     hypothesis = state.ledger.create(
@@ -875,6 +1061,9 @@ class RecursiveAnalysisState:
                         ),
                         predecessor_ref,
                         defect_state,
+                    )
+                    state._bind_hypothesis_to_seed(
+                        hypothesis.hypothesis_id, builder
                     )
                     item = FrontierItem.create(
                         node_ref=predecessor_ref,
@@ -893,7 +1082,10 @@ class RecursiveAnalysisState:
             if len(state.ledger.snapshot()) >= max_hypotheses:
                 state._increment_budget("hypotheses")
                 state._mark_seed_unresolved(
-                    start_ref, "hypothesis_limit", "The seed hypothesis budget is exhausted."
+                    start_ref,
+                    "hypothesis_limit",
+                    "The seed hypothesis budget is exhausted.",
+                    seed_key=builder.key,
                 )
                 continue
             hypothesis = state.ledger.create(
@@ -901,6 +1093,7 @@ class RecursiveAnalysisState:
                 start_ref,
                 defect_state,
             )
+            state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, builder)
             item = FrontierItem.create(
                 node_ref=start_ref,
                 defect_state=defect_state,
@@ -984,6 +1177,10 @@ class RecursiveAnalysisState:
             "logical_confirmation_calls": self.logical_confirmation_calls,
             "pending_rejudge_journal": _checkpoint_json(self.pending_rejudge_journal),
             "seed_count": self.seed_count,
+            "seed_ledger": [
+                self.seed_ledger[key].to_dict() for key in sorted(self.seed_ledger)
+            ],
+            "hypothesis_seed_keys": dict(sorted(self.hypothesis_seed_keys.items())),
             "provider_state": _checkpoint_json(self.provider_state),
         }
 
@@ -1156,6 +1353,26 @@ class RecursiveAnalysisState:
             str(key): [int(item) for item in values]
             for key, values in dict(action_payload["pending_rejudge_journal"]).items()
         }
+        state.seed_ledger = {
+            builder.key: builder
+            for builder in (
+                SeedAttributionBuilder.from_dict(item)
+                for item in action_payload["seed_ledger"]
+            )
+        }
+        if len(state.seed_ledger) != len(action_payload["seed_ledger"]):
+            raise ValueError("checkpoint contains duplicate per-seed attribution identity")
+        state.hypothesis_seed_keys = {
+            str(key): str(value)
+            for key, value in dict(action_payload["hypothesis_seed_keys"]).items()
+        }
+        if any(
+            key not in state.seed_ledger
+            for key in state.hypothesis_seed_keys.values()
+        ):
+            raise ValueError("checkpoint hypothesis references an unknown attribution seed")
+        if state.seed_count != len(state.seed_ledger):
+            raise ValueError("checkpoint seed_count contradicts seed ledger")
         state.provider_state = _validate_provider_state(
             action_payload["provider_state"],
             state,
@@ -1166,6 +1383,14 @@ class RecursiveAnalysisState:
             for item in state.unresolved_branches
             if item.get("reason") == "analysis_interrupted"
         }
+        transient_signal_details = {
+            str(item.get("details") or "")
+            for item in state.unresolved_branches
+            if item.get("reason") == "analysis_interrupted"
+        }
+        for builder in state.seed_ledger.values():
+            builder.blocking_reasons.discard("analysis_interrupted")
+            builder.missing_evidence.difference_update(transient_signal_details)
         state.unresolved_branches = [
             item
             for item in state.unresolved_branches
@@ -1449,6 +1674,7 @@ class RecursiveAnalysisState:
         max_hypotheses: int,
     ) -> None:
         hypothesis = self.ledger.get(item.hypothesis_id)
+        seed_builder = self._seed_builder_for_item(item)
         if hypothesis.status in {"rejected", "superseded"}:
             self._mark_ref_unresolved(
                 item.node_ref,
@@ -1471,6 +1697,11 @@ class RecursiveAnalysisState:
         is_navigation = bool(current_node and is_navigation_node(current_node))
         if is_present:
             self.present_hypothesis_ids.add(item.hypothesis_id)
+        elif (
+            judgment.current_defect_status == "absent"
+            and seed_builder is not None
+        ):
+            seed_builder.mark_no_defect()
 
         if judgment.current_defect_status == "unknown" or judgment.missing_evidence:
             details = "; ".join(judgment.missing_evidence) or judgment.current_defect_reason
@@ -1507,6 +1738,8 @@ class RecursiveAnalysisState:
                         evidence_refs=tuple(self.visit_evidence.get(item.visit_key, set())),
                     )
                     if candidate is not None:
+                        if seed_builder is not None:
+                            seed_builder.candidate_refs.add(candidate.ref)
                         self.introduction_candidates.append(candidate)
                         self._remember_candidate(candidate)
                         self.introduction_bindings.append(
@@ -1516,6 +1749,7 @@ class RecursiveAnalysisState:
                                 "defect_fingerprint": item.defect_state.fingerprint,
                                 "hypothesis_id": hypothesis.hypothesis_id,
                                 "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                                "seed_key": seed_builder.key if seed_builder else "",
                             }
                         )
                         self.introduction_binding_keys.add(binding_key)
@@ -1636,6 +1870,9 @@ class RecursiveAnalysisState:
                 assessment.ref,
                 upstream_defect,
             )
+            self._bind_hypothesis_to_seed(
+                hypothesis.hypothesis_id, seed_builder
+            )
             hypothesis = self.ledger.add_support(
                 hypothesis.hypothesis_id,
                 assessment.ref,
@@ -1674,6 +1911,7 @@ class RecursiveAnalysisState:
         graph_position: Any,
         max_hypotheses: int,
     ) -> int:
+        seed_builder = self._seed_builder_for_item(item)
         selected = [
             candidate
             for candidate in candidates
@@ -1731,6 +1969,9 @@ class RecursiveAnalysisState:
                 "offline ranking score {2:.3f} is retrieval-only."
             ).format(candidate.ref, item.defect_state.label, candidate.score)
             hypothesis = self.ledger.create(claim, candidate.ref, upstream_defect)
+            self._bind_hypothesis_to_seed(
+                hypothesis.hypothesis_id, seed_builder
+            )
             hypothesis = self.ledger.add_support(
                 hypothesis.hypothesis_id,
                 candidate.ref,
@@ -1827,6 +2068,14 @@ class RecursiveAnalysisState:
         ):
             unresolved_ids.update(self.present_hypothesis_ids)
             self.unresolved_hypothesis_ids.update(self.present_hypothesis_ids)
+            for hypothesis_id in self.present_hypothesis_ids:
+                seed_key = self.hypothesis_seed_keys.get(hypothesis_id, "")
+                builder = self.seed_ledger.get(seed_key)
+                if builder is not None:
+                    builder.mark_unresolved(
+                        "defect_chain_unresolved",
+                        "A visited defect remained present without an introduction candidate.",
+                    )
             for judgment in self.step_judgments:
                 if judgment.current_defect_status != "present":
                     continue
@@ -1924,6 +2173,7 @@ class RecursiveAnalysisState:
             case_id=self.graph.case_id,
             objective=self.objective,
             start_refs=self.start_refs,
+            seed_results=self.seed_results(),
             analysis_perspective=self.analysis_perspective,
             defect_states=tuple(self.defect_states.values()),
             causal_candidates=tuple(causal_candidates),
@@ -1978,7 +2228,22 @@ class RecursiveAnalysisState:
     def _increment_budget(self, name: str) -> None:
         self.exhausted_budgets[name] = self.exhausted_budgets.get(name, 0) + 1
 
-    def _mark_seed_unresolved(self, ref: str, reason: str, details: str) -> None:
+    def _mark_seed_unresolved(
+        self,
+        ref: str,
+        reason: str,
+        details: str,
+        *,
+        seed_key: str = "",
+    ) -> None:
+        if seed_key:
+            builder = self.seed_ledger.get(seed_key)
+            if builder is not None:
+                builder.mark_unresolved(reason, details)
+        elif ref == "analysis:signal":
+            for builder in self.seed_ledger.values():
+                if builder.to_result().outcome == "inconclusive":
+                    builder.mark_unresolved(reason, details)
         self.unresolved_refs.append(ref)
         self.unresolved_branches.append(
             {
@@ -1998,6 +2263,9 @@ class RecursiveAnalysisState:
         reason: str,
         details: str,
     ) -> None:
+        builder = self._seed_builder_for_item(item)
+        if builder is not None:
+            builder.mark_unresolved(reason, details)
         self.unresolved_refs.append(ref)
         self.unresolved_hypothesis_ids.add(item.hypothesis_id)
         self.unresolved_branches.append(
@@ -2475,6 +2743,12 @@ class AgenticRecursiveAnalyzer:
         capsules: Sequence[CandidateEvidenceCapsule],
         judgment: GlobalCandidateJudgment,
     ) -> None:
+        seed_builder = state._seed_builder_for_item(item)
+        if seed_builder is not None:
+            seed_builder.record_global_judgment(
+                judgment,
+                (candidate.ref for candidate in candidates),
+            )
         if judgment.outcome == "no_defect":
             hypothesis = state.ledger.get(item.hypothesis_id)
             if hypothesis.status in {"active", "supported"}:
@@ -2520,6 +2794,9 @@ class AgenticRecursiveAnalyzer:
                     selected_ref,
                     item.defect_state,
                 )
+                state._bind_hypothesis_to_seed(
+                    hypothesis.hypothesis_id, seed_builder
+                )
                 created_hypotheses.add(hypothesis.hypothesis_id)
                 support_refs = _dedupe_strings(
                     [
@@ -2552,6 +2829,7 @@ class AgenticRecursiveAnalyzer:
                             "hypothesis_id": hypothesis.hypothesis_id,
                             "hypothesis_semantic_hash": hypothesis.semantic_hash,
                             "origin": "global_candidate_judgment",
+                            "seed_key": seed_builder.key if seed_builder else "",
                         }
                     )
                     state.introduction_candidates.append(candidate)
@@ -2581,6 +2859,7 @@ class AgenticRecursiveAnalyzer:
                             ).hexdigest(),
                             "status": "queued",
                             "origin": "global_candidate_judgment",
+                            "seed_key": seed_builder.key if seed_builder else "",
                         }
                     )
 
@@ -2619,6 +2898,9 @@ class AgenticRecursiveAnalyzer:
                     ),
                     anchor,
                     item.defect_state,
+                )
+                state._bind_hypothesis_to_seed(
+                    hypothesis.hypothesis_id, seed_builder
                 )
                 created_hypotheses.add(hypothesis.hypothesis_id)
                 state.ledger.add_support(
@@ -3654,6 +3936,14 @@ class AgenticRecursiveAnalyzer:
                     "depth": max(0, len(root.recursive_path) - 1),
                 }
             )
+            seed_key = state.hypothesis_seed_keys.get(root.hypothesis_id, "")
+            builder = state.seed_ledger.get(seed_key)
+            if builder is not None:
+                builder.confirmed_root_refs.discard(root.node_ref)
+                builder.mark_unresolved(
+                    "confirmation_graph_inconsistent",
+                    ", ".join(sorted(reasons.get(identity, ()))),
+                )
         state.confirmed_roots = retained
 
     def _build_confirmation_request(
@@ -3914,6 +4204,13 @@ class AgenticRecursiveAnalyzer:
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
         hypothesis_id = str(queued.get("hypothesis_id") or "")
+        seed_key = str(
+            queued.get("seed_key")
+            or state.hypothesis_seed_keys.get(hypothesis_id, "")
+        )
+        seed_builder = state.seed_ledger.get(seed_key)
+        if seed_builder is not None:
+            seed_builder.record_confirmation(confirmation)
         state.confirmations.append(confirmation)
         state.confirmation_journal.append(
             {
@@ -3943,7 +4240,11 @@ class AgenticRecursiveAnalyzer:
                     component=node.component,
                     event_type=node.event_type,
                     defect_type=defect_state.label,
-                    observed_defect_refs=state.start_refs,
+                    observed_defect_refs=(
+                        (seed_builder.start_ref,)
+                        if seed_builder is not None
+                        else state.start_refs
+                    ),
                     hypothesis_id=hypothesis_id,
                     recursive_path=confirmation.recursive_path,
                     excerpt=confirmation.excerpt,
@@ -4329,8 +4630,12 @@ class AgenticRecursiveAnalyzer:
                     and len(before) >= self.max_hypotheses
                 ):
                     raise ValueError("hypothesis budget exhausted")
-                state.ledger.create(
+                created = state.ledger.create(
                     str(arguments["claim"]), resolved, item.defect_state
+                )
+                state._bind_hypothesis_to_seed(
+                    created.hypothesis_id,
+                    state._seed_builder_for_item(item),
                 )
             elif directive.action == "reject_hypothesis":
                 hypothesis_id = str(arguments["hypothesis_id"])
@@ -4407,6 +4712,9 @@ class AgenticRecursiveAnalyzer:
                                 stable_json(queue_key).encode("utf-8")
                             ).hexdigest(),
                             "status": "queued",
+                            "seed_key": state.hypothesis_seed_keys.get(
+                                hypothesis_id, ""
+                            ),
                         }
                     )
                 status = "deferred"
@@ -4439,4 +4747,8 @@ class AgenticRecursiveAnalyzer:
         return "control"
 
 
-__all__ = ["AgenticRecursiveAnalyzer", "RecursiveAnalysisState"]
+__all__ = [
+    "AgenticRecursiveAnalyzer",
+    "RecursiveAnalysisState",
+    "SeedAttributionBuilder",
+]

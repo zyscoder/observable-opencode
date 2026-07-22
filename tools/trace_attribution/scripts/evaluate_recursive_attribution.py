@@ -24,7 +24,7 @@ from trace_attribution.models import TraceNode, stable_json
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v4"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v3"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -67,6 +67,7 @@ REPORT_KEYS = frozenset(
         "case_id",
         "objective",
         "start_refs",
+        "seed_results",
         "analysis_outcome",
         "analysis_perspective",
         "defect_states",
@@ -88,6 +89,23 @@ REPORT_KEYS = frozenset(
         "unresolved_refs",
         "investigation_journal",
         "metadata",
+    }
+)
+SEED_RESULT_KEYS = frozenset(
+    {
+        "start_ref",
+        "defect_fingerprint",
+        "defect_state",
+        "outcome",
+        "candidate_refs",
+        "selected_candidate_refs",
+        "confirmation_identities",
+        "confirmed_root_refs",
+        "decisive_evidence_refs",
+        "missing_evidence",
+        "blocking_reasons",
+        "global_judgment",
+        "expansion_history",
     }
 )
 
@@ -166,7 +184,10 @@ def validate_labels(value: Mapping[str, Any]) -> JsonDict:
                 refs.add(node_ref)
             occurrences.add(occurrence)
     outcomes = _list(labels["allowed_unresolved_outcomes"], "allowed_unresolved_outcomes")
-    if any(item not in {"inconclusive", "partial_root_found"} for item in outcomes):
+    if any(
+        item not in {"inconclusive", "partial", "partial_root_found"}
+        for item in outcomes
+    ):
         raise EvaluationSchemaError(
             "allowed_unresolved_outcomes contains an unsupported state"
         )
@@ -291,6 +312,7 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
     if report.get("case_id") != labels["case_id"]:
         raise EvaluationSchemaError("report and labels case_id differ")
     for key in (
+        "seed_results",
         "confirmed_roots",
         "co_roots",
         "contributing_conditions",
@@ -302,6 +324,46 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         "investigation_journal",
     ):
         _list(report.get(key), "report.{0}".format(key))
+    seed_identities: Set[Tuple[str, str]] = set()
+    for index, raw in enumerate(report["seed_results"]):
+        item = _mapping(raw, "report.seed_results[{0}]".format(index))
+        _exact_keys(
+            item,
+            SEED_RESULT_KEYS,
+            "report.seed_results[{0}]".format(index),
+        )
+        start_ref = item.get("start_ref")
+        fingerprint = item.get("defect_fingerprint")
+        if not isinstance(start_ref, str) or not start_ref:
+            raise EvaluationSchemaError("seed result start_ref must be non-empty")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise EvaluationSchemaError(
+                "seed result defect_fingerprint must be non-empty"
+            )
+        identity = (start_ref, fingerprint)
+        if identity in seed_identities:
+            raise EvaluationSchemaError("duplicate seed result identity")
+        seed_identities.add(identity)
+        if item.get("outcome") not in {
+            "confirmed_root",
+            "no_defect",
+            "evidence_gap",
+            "inconclusive",
+        }:
+            raise EvaluationSchemaError("unsupported seed result outcome")
+        _mapping(item.get("defect_state"), "seed result defect_state")
+        _mapping(item.get("global_judgment"), "seed result global_judgment")
+        for key in (
+            "candidate_refs",
+            "selected_candidate_refs",
+            "confirmation_identities",
+            "confirmed_root_refs",
+            "decisive_evidence_refs",
+            "missing_evidence",
+            "blocking_reasons",
+            "expansion_history",
+        ):
+            _list(item.get(key), "seed result {0}".format(key))
     _mapping(report.get("metadata"), "report.metadata")
 
 
@@ -798,8 +860,16 @@ def _trace_backed_safety_violations(
     violations.extend(_source_trace_violations(graph))
     if report.get("analysis_outcome") != parsed.analysis_outcome:
         violations.append("analysis_outcome_state_machine_mismatch")
-    if parsed.analysis_outcome in {"inconclusive", "partial_root_found"} and parsed.analysis_outcome not in labels["allowed_unresolved_outcomes"]:
-        violations.append("disallowed_unresolved_outcome:{0}".format(parsed.analysis_outcome))
+    if parsed.analysis_outcome in {"inconclusive", "partial"}:
+        allowed = set(labels["allowed_unresolved_outcomes"])
+        if parsed.analysis_outcome == "partial" and "partial_root_found" in allowed:
+            allowed.add("partial")
+        if parsed.analysis_outcome not in allowed:
+            violations.append(
+                "disallowed_unresolved_outcome:{0}".format(
+                    parsed.analysis_outcome
+                )
+            )
 
     metadata = _mapping(report.get("metadata"), "report.metadata")
     if metadata.get("fabricated_refs"):

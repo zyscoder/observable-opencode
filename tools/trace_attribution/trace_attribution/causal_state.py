@@ -50,7 +50,8 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v3"
+PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -1608,11 +1609,121 @@ class RejectedCandidate:
 
 
 @dataclass(frozen=True)
+class SeedAttributionResult:
+    start_ref: str
+    defect_fingerprint: str
+    defect_state: DefectState
+    outcome: str
+    candidate_refs: Tuple[str, ...] = field(default_factory=tuple)
+    selected_candidate_refs: Tuple[str, ...] = field(default_factory=tuple)
+    confirmation_identities: Tuple[str, ...] = field(default_factory=tuple)
+    confirmed_root_refs: Tuple[str, ...] = field(default_factory=tuple)
+    decisive_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
+    blocking_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    global_judgment: JsonDict = field(default_factory=FrozenMapping)
+    expansion_history: Tuple[JsonDict, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.outcome not in {
+            "confirmed_root",
+            "no_defect",
+            "evidence_gap",
+            "inconclusive",
+        }:
+            raise ValueError("unsupported per-seed attribution outcome")
+        if not self.start_ref:
+            raise ValueError("per-seed attribution requires start_ref")
+        if self.defect_fingerprint != self.defect_state.fingerprint:
+            raise ValueError("per-seed defect fingerprint contradicts defect_state")
+        for name in (
+            "candidate_refs",
+            "selected_candidate_refs",
+            "confirmation_identities",
+            "confirmed_root_refs",
+            "decisive_evidence_refs",
+            "missing_evidence",
+            "blocking_reasons",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                tuple(sorted(set(_frozen_strings(getattr(self, name))))),
+            )
+        object.__setattr__(
+            self,
+            "global_judgment",
+            FrozenMapping(_thaw(self.global_judgment)),
+        )
+        object.__setattr__(
+            self,
+            "expansion_history",
+            tuple(FrozenMapping(_thaw(item)) for item in self.expansion_history),
+        )
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "start_ref": self.start_ref,
+            "defect_fingerprint": self.defect_fingerprint,
+            "defect_state": self.defect_state.to_dict(),
+            "outcome": self.outcome,
+            "candidate_refs": list(self.candidate_refs),
+            "selected_candidate_refs": list(self.selected_candidate_refs),
+            "confirmation_identities": list(self.confirmation_identities),
+            "confirmed_root_refs": list(self.confirmed_root_refs),
+            "decisive_evidence_refs": list(self.decisive_evidence_refs),
+            "missing_evidence": list(self.missing_evidence),
+            "blocking_reasons": list(self.blocking_reasons),
+            "global_judgment": _thaw(self.global_judgment),
+            "expansion_history": [_thaw(item) for item in self.expansion_history],
+        }
+
+    @classmethod
+    def from_dict(cls, value: JsonDict) -> "SeedAttributionResult":
+        defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
+        return cls(
+            start_ref=str(value.get("start_ref") or ""),
+            defect_fingerprint=str(value.get("defect_fingerprint") or ""),
+            defect_state=defect_state,
+            outcome=str(value.get("outcome") or "inconclusive"),
+            candidate_refs=_string_list(value.get("candidate_refs")),
+            selected_candidate_refs=_string_list(value.get("selected_candidate_refs")),
+            confirmation_identities=_string_list(value.get("confirmation_identities")),
+            confirmed_root_refs=_string_list(value.get("confirmed_root_refs")),
+            decisive_evidence_refs=_string_list(value.get("decisive_evidence_refs")),
+            missing_evidence=_string_list(value.get("missing_evidence")),
+            blocking_reasons=_string_list(value.get("blocking_reasons")),
+            global_judgment=_json_dict(value.get("global_judgment")),
+            expansion_history=tuple(
+                item
+                for item in value.get("expansion_history", [])
+                if isinstance(item, dict)
+            ),
+        )
+
+
+def _aggregate_seed_outcomes(
+    seed_results: Tuple[SeedAttributionResult, ...],
+) -> str:
+    outcomes = tuple(item.outcome for item in seed_results)
+    if outcomes and all(item == "no_defect" for item in outcomes):
+        return "no_defect"
+    if outcomes and all(
+        item in {"confirmed_root", "no_defect"} for item in outcomes
+    ) and "confirmed_root" in outcomes:
+        return "confirmed_root"
+    if outcomes and "inconclusive" not in outcomes and len(set(outcomes)) > 1:
+        return "partial"
+    return "inconclusive"
+
+
+@dataclass(frozen=True)
 class RecursiveAttributionReport:
     case_id: str
     objective: str
     schema_version: str = MODERN_REPORT_SCHEMA_VERSION
     start_refs: Tuple[str, ...] = field(default_factory=tuple)
+    seed_results: Tuple[SeedAttributionResult, ...] = field(default_factory=tuple)
     analysis_outcome: str = "inconclusive"
     analysis_perspective: str = ""
     defect_states: Tuple[DefectState, ...] = field(default_factory=tuple)
@@ -1653,7 +1764,26 @@ class RecursiveAttributionReport:
             "unresolved_hypotheses",
         ):
             object.__setattr__(self, name, tuple(getattr(self, name)))
-        object.__setattr__(self, "start_refs", _frozen_strings(self.start_refs))
+        object.__setattr__(
+            self,
+            "start_refs",
+            tuple(sorted(set(_frozen_strings(self.start_refs)))),
+        )
+        object.__setattr__(
+            self,
+            "seed_results",
+            tuple(
+                sorted(
+                    self.seed_results,
+                    key=lambda item: (item.start_ref, item.defect_fingerprint),
+                )
+            ),
+        )
+        seed_keys = [
+            (item.start_ref, item.defect_fingerprint) for item in self.seed_results
+        ]
+        if len(seed_keys) != len(set(seed_keys)):
+            raise ValueError("duplicate per-seed attribution identity")
         object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
         object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
         object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
@@ -1859,26 +1989,11 @@ class RecursiveAttributionReport:
             }
         metadata["confirmation_node_summary"] = summary
         object.__setattr__(self, "metadata", FrozenMapping(metadata))
-        confirmed_root_refs = {item.node_ref for item in (*self.confirmed_roots, *self.co_roots)}
-        has_unknown_non_root_confirmation = any(
-            confirmation.status == "unknown"
-            and confirmation.confirmation_identity not in root_identities
-            for confirmation in self.confirmations
+        object.__setattr__(
+            self,
+            "analysis_outcome",
+            _aggregate_seed_outcomes(self.seed_results),
         )
-        has_blocking_evidence = bool(
-            self.unresolved_refs
-            or self.unresolved_hypotheses
-            or orphan_confirmed
-            or has_unknown_non_root_confirmation
-            or (factor_identities and not confirmed_root_refs)
-            or _has_unresolved_judgment_state(self.step_judgments, self.causal_relations)
-            or _has_blocking_metadata(self.metadata)
-        )
-        if confirmed_root_refs:
-            outcome = "partial_root_found" if has_blocking_evidence else "root_found"
-        else:
-            outcome = "inconclusive" if has_blocking_evidence else "no_defect"
-        object.__setattr__(self, "analysis_outcome", outcome)
 
     def to_dict(self) -> JsonDict:
         legacy_root_causes: List[JsonDict] = []
@@ -1895,6 +2010,7 @@ class RecursiveAttributionReport:
             "case_id": self.case_id,
             "objective": self.objective,
             "start_refs": list(self.start_refs),
+            "seed_results": [item.to_dict() for item in self.seed_results],
             "analysis_outcome": self.analysis_outcome,
             "analysis_perspective": self.analysis_perspective,
             "defect_states": [item.to_dict() for item in self.defect_states],
@@ -1949,21 +2065,63 @@ class RecursiveAttributionReport:
                 unresolved_refs=unresolved_refs,
                 metadata=metadata,
             )
-        if schema_version and schema_version != MODERN_REPORT_SCHEMA_VERSION:
+        if schema_version and schema_version not in {
+            MODERN_REPORT_SCHEMA_VERSION,
+            PREVIOUS_REPORT_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported report schema_version: {0}".format(schema_version))
         confirmed_roots = items("confirmed_roots", ConfirmedRoot.from_dict)
         if not confirmed_roots and value.get("root_causes"):
             raise ValueError(
                 "legacy root_causes require schema migration with independent confirmation"
             )
+        start_refs = _string_list(value.get("start_refs"))
+        defect_states = items("defect_states", DefectState.from_dict)
+        seed_results = items("seed_results", SeedAttributionResult.from_dict)
+        metadata = _json_dict(value.get("metadata"))
+        if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
+            migrated_states = [
+                DefectState.create(
+                    label="legacy_seed_attribution_unresolved",
+                    expected=str(value.get("objective") or ""),
+                    actual="The v2 report did not retain a per-seed defect binding.",
+                    mechanism="Read-only v2 migration preserves the evidence gap without inferring a local root.",
+                    scope="report_migration:{0}".format(start_ref),
+                )
+                for start_ref in start_refs
+            ]
+            seed_results = [
+                SeedAttributionResult(
+                    start_ref=start_ref,
+                    defect_fingerprint=state.fingerprint,
+                    defect_state=state,
+                    outcome="inconclusive",
+                    blocking_reasons=("v2_seed_binding_unavailable",),
+                )
+                for start_ref, state in zip(start_refs, migrated_states)
+            ]
+            known_fingerprints = {item.fingerprint for item in defect_states}
+            defect_states.extend(
+                item for item in migrated_states if item.fingerprint not in known_fingerprints
+            )
+            metadata.update(
+                {
+                    "report_migration": {
+                        "source_schema": PREVIOUS_REPORT_SCHEMA_VERSION,
+                        "status": "per_seed_attribution_inconclusive",
+                        "global_roots_not_projected_to_seed_results": True,
+                    }
+                }
+            )
         return cls(
             case_id=str(value.get("case_id") or ""),
             objective=str(value.get("objective") or ""),
             schema_version=MODERN_REPORT_SCHEMA_VERSION,
-            start_refs=_string_list(value.get("start_refs")),
+            start_refs=start_refs,
+            seed_results=seed_results,
             analysis_outcome=str(value.get("analysis_outcome") or "inconclusive"),
             analysis_perspective=str(value.get("analysis_perspective") or ""),
-            defect_states=items("defect_states", DefectState.from_dict),
+            defect_states=defect_states,
             causal_candidates=items("causal_candidates", CausalCandidate.from_dict),
             causal_relations=items("causal_relations", PredecessorAssessment.from_dict),
             step_judgments=items("step_judgments", CausalStepJudgment.from_dict),
@@ -1984,7 +2142,7 @@ class RecursiveAttributionReport:
                 for item in value.get("investigation_journal", [])
                 if isinstance(item, dict)
             ),
-            metadata=_json_dict(value.get("metadata")),
+            metadata=metadata,
         )
 
 
@@ -2002,6 +2160,7 @@ __all__ = [
     "RecursiveAttributionReport",
     "RejectedCandidate",
     "RootConfirmation",
+    "SeedAttributionResult",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
     "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",
     "annotate_report_semantic_anchors",

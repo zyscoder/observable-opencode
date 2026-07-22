@@ -920,7 +920,8 @@ class RecursiveTraversalTest(unittest.TestCase):
             analysis_perspective="Find the cause.",
         )
 
-        self.assertEqual(state.seed_count, 0)
+        self.assertEqual(state.seed_count, 1)
+        self.assertEqual(state.seed_results()[0].outcome, "evidence_gap")
         self.assertEqual(state.frontier.snapshot(), [])
 
     def test_ineligible_external_evaluation_start_never_reaches_recursive_judge(self):
@@ -958,7 +959,8 @@ class RecursiveTraversalTest(unittest.TestCase):
                 )
 
                 self.assertEqual(report.step_judgments, ())
-                self.assertEqual(report.metadata["seed_count"], 0)
+                self.assertEqual(report.metadata["seed_count"], 1)
+                self.assertEqual(report.seed_results[0].outcome, "evidence_gap")
                 self.assertIn(
                     "start_ref_ineligible",
                     [
@@ -1069,7 +1071,8 @@ class RecursiveTraversalTest(unittest.TestCase):
             analysis_perspective="Find the cause.",
         )
 
-        self.assertEqual(passed_seed.seed_count, 0)
+        self.assertEqual(passed_seed.seed_count, 1)
+        self.assertEqual(passed_seed.seed_results()[0].outcome, "evidence_gap")
         self.assertEqual(passed_seed.frontier.snapshot(), [])
         self.assertTrue(graph.evidence_eligible(passed_ref))
         self.assertFalse(graph.analysis_start_eligible(passed_ref))
@@ -2621,6 +2624,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             report.metadata["global_candidate_judgments"][0]["outcome"],
             "no_defect",
         )
+        self.assertEqual(report.seed_results[0].outcome, "no_defect")
+        self.assertEqual(
+            report.seed_results[0].global_judgment["outcome"],
+            "no_defect",
+        )
+        self.assertNotIn("score", json.dumps(report.seed_results[0].to_dict()))
 
     def test_global_pool_keeps_disconnected_successful_verification_as_counterevidence(self):
         trace = {
@@ -2823,6 +2832,16 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             [item.node_ref for item in report.confirmed_roots],
             ["record:decision"],
         )
+        self.assertEqual(report.seed_results[0].outcome, "confirmed_root")
+        self.assertEqual(
+            report.seed_results[0].selected_candidate_refs,
+            ("record:decision",),
+        )
+        self.assertEqual(
+            report.seed_results[0].confirmed_root_refs,
+            ("record:decision",),
+        )
+        self.assertNotIn("score", json.dumps(report.seed_results[0].to_dict()))
 
     def test_global_expansion_routes_only_the_requested_anchor_to_recursion(self):
         judge = FusionScriptedJudge(
@@ -2848,6 +2867,11 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             report.metadata["recursive_expansion_reasons"][0]["anchor_ref"],
             "record:decision",
         )
+        self.assertEqual(
+            report.seed_results[0].expansion_history[0]["anchor_ref"],
+            "record:decision",
+        )
+        self.assertEqual(report.seed_results[0].outcome, "no_defect")
 
 
 if __name__ == "__main__":
