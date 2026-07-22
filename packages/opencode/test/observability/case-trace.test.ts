@@ -392,6 +392,8 @@ describe("case trace", () => {
       "supports_claim",
       "contextualizes_claim",
       "executed_for_claim",
+      "response_to_claim_group",
+      "claim_group_precedes",
     ])
 
     expect(manifest.trace_version).toBe("6.0")
@@ -1891,22 +1893,84 @@ describe("case trace", () => {
       atomization_reason: "complete_merged_statement",
       next_claim_key: expect.any(String),
     })
-    expect(responseClaimNode.data).toMatchObject({ claim_index: 1 })
-    for (const field of [
-      "claim_key",
-      "claim_group_id",
-      "claim_count",
-      "source_byte_range",
-      "previous_claim_key",
-      "next_claim_key",
-      "atomization_status",
-      "atomization_reason",
-    ]) {
-      expect(responseClaimNode.data).not.toHaveProperty(field)
-    }
+    const [firstClaim, secondClaim] = claims
+    const firstRecordRef = `record:${firstClaim!.record_id}`
+    const secondRecordRef = `record:${secondClaim!.record_id}`
+    const claimGroupEdges = trace.dataflow_edges.filter(
+      (edge: any) => edge.relation === "response_to_claim_group",
+    )
+    const claimOrderEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "claim_group_precedes")
+
+    expect(firstClaim!.data.next_claim_ref).toBe(secondRecordRef)
+    expect(secondClaim!.data.previous_claim_ref).toBe(firstRecordRef)
+    expect(responseClaimNode.data).toMatchObject({
+      claim_group_id: firstClaim!.data.claim_group_id,
+      claim_count: 2,
+      source_byte_range: firstClaim!.data.source_byte_range,
+      next_claim_ref: secondRecordRef,
+      atomization_status: "atomic",
+      atomization_reason: "complete_merged_statement",
+    })
+    expect(responseClaimNode.metadata).toMatchObject({
+      claim_group_id: firstClaim!.data.claim_group_id,
+      claim_count: 2,
+      source_byte_range: firstClaim!.data.source_byte_range,
+      next_claim_ref: secondRecordRef,
+      atomization_status: "atomic",
+      atomization_reason: "complete_merged_statement",
+    })
+    expect(claimGroupEdges).toHaveLength(2)
+    expect(claimGroupEdges.map((edge: any) => edge.metadata.claim_group_id).sort()).toEqual(
+      [firstClaim!.data.claim_group_id, secondClaim!.data.claim_group_id].sort(),
+    )
+    expect(claimOrderEdges).toEqual([])
     expect(firstNextClaimKey).toEqual(expect.any(String))
     expect(firstNextClaimKey).toBe(secondClaimKey)
     expect(secondPreviousClaimKey).toBe(firstClaimKey)
+  })
+
+  test("keeps claim group order within a response segment and omits it for single claims", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-claim-group-boundaries-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "claim-group-boundaries.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.responseOutput({ segment_id: "segment_one", response_role: "intermediate_summary", text: "First response segment." })`,
+        `CaseTrace.responseOutput({ segment_id: "segment_two", response_role: "intermediate_summary", text: "Second response segment." })`,
+        `const trace = CaseTrace.get()`,
+        `trace?.responseClaim({ claim_id: "claim_one", response_segment_id: "segment_one", text: "First independent claim.", claim_group_id: "group_one", claim_index: 1, claim_count: 1, source_byte_range: [0, 24], atomization_status: "atomic", atomization_reason: "complete_merged_statement", metadata: { response_node_id: "responsenode_segment_one" } })`,
+        `trace?.responseClaim({ claim_id: "claim_two", response_segment_id: "segment_two", text: "Second independent claim.", claim_group_id: "group_two", claim_index: 1, claim_count: 1, source_byte_range: [0, 25], atomization_status: "atomic", atomization_reason: "complete_merged_statement", metadata: { response_node_id: "responsenode_segment_two" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "claim-group-boundaries-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "claim-group-boundaries-case", "trace.json"), "utf8"),
+    ) as any
+    const claimGroupEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "response_to_claim_group")
+    const claimOrderEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "claim_group_precedes")
+
+    expect(claimGroupEdges).toHaveLength(2)
+    expect(claimGroupEdges.map((edge: any) => edge.metadata.claim_group_id).sort()).toEqual(["group_one", "group_two"])
+    expect(claimOrderEdges).toEqual([])
   })
 
   test("atomizes a long final response from original text while retaining its summary artifact", async () => {

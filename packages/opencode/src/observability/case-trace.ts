@@ -633,6 +633,8 @@ export type TraceResponseClaimRecord = {
   source_byte_range?: [number, number]
   previous_claim_key?: string
   next_claim_key?: string
+  previous_claim_ref?: string
+  next_claim_ref?: string
   atomization_status?: "atomic" | "group_required" | "invalid_fragment" | string
   atomization_reason?: string
   direct_evidence_refs: string[]
@@ -909,6 +911,8 @@ export type DataflowEdge = {
     | "supports_claim"
     | "contextualizes_claim"
     | "executed_for_claim"
+    | "response_to_claim_group"
+    | "claim_group_precedes"
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -1109,6 +1113,8 @@ type ResponseClaimInput = Omit<
   | "source_byte_range"
   | "previous_claim_key"
   | "next_claim_key"
+  | "previous_claim_ref"
+  | "next_claim_ref"
   | "atomization_status"
   | "atomization_reason"
   | "direct_evidence_refs"
@@ -1138,6 +1144,8 @@ type ResponseClaimInput = Omit<
   source_byte_range?: [number, number]
   previous_claim_key?: string
   next_claim_key?: string
+  previous_claim_ref?: string
+  next_claim_ref?: string
   atomization_status?: TraceResponseClaimRecord["atomization_status"]
   atomization_reason?: string
   source_refs?: string[]
@@ -6748,6 +6756,8 @@ class ActiveCaseTrace {
       source_byte_range: input.source_byte_range,
       previous_claim_key: input.previous_claim_key,
       next_claim_key: input.next_claim_key,
+      previous_claim_ref: input.previous_claim_ref,
+      next_claim_ref: input.next_claim_ref,
       atomization_status: input.atomization_status,
       atomization_reason: input.atomization_reason,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
@@ -6781,6 +6791,13 @@ class ActiveCaseTrace {
       quality_flags: qualityFlags,
       metadata: omitUndefined({
         ...(input.metadata ?? {}),
+        claim_group_id: input.claim_group_id,
+        claim_count: input.claim_count,
+        source_byte_range: input.source_byte_range,
+        previous_claim_ref: input.previous_claim_ref,
+        next_claim_ref: input.next_claim_ref,
+        atomization_status: input.atomization_status,
+        atomization_reason: input.atomization_reason,
         original_direct_evidence_refs: classifiedRefs.direct_evidence_refs,
         derived_tool_outcome_refs: dependencyToolOutcomeRefs,
         candidate_tool_outcome_refs: candidateToolOutcomeRefs,
@@ -6822,7 +6839,16 @@ class ActiveCaseTrace {
         table_cells: claim.table_cells,
         table_subject: claim.table_subject,
         table_values: claim.table_values,
+        claim_group_id: claim.claim_group_id,
         claim_index: claim.claim_index,
+        claim_count: claim.claim_count,
+        source_byte_range: claim.source_byte_range,
+        previous_claim_key: claim.previous_claim_key,
+        next_claim_key: claim.next_claim_key,
+        previous_claim_ref: claim.previous_claim_ref,
+        next_claim_ref: claim.next_claim_ref,
+        atomization_status: claim.atomization_status,
+        atomization_reason: claim.atomization_reason,
         direct_evidence_refs: claim.direct_evidence_refs,
         direct_support_refs: claim.direct_support_refs,
         candidate_context_refs: claim.candidate_context_refs,
@@ -6865,6 +6891,15 @@ class ActiveCaseTrace {
         relation: "response_to_claim",
         label: "Response output was split into a claim",
       })
+      if (claim.claim_group_id) {
+        this.causalEdge({
+          from: { type: "node", id: responseNodeID, label: "response.output" },
+          to: { type: "response_claim", id: node.node_id, label: "response.claim" },
+          relation: "response_to_claim_group",
+          label: "Response output contains a claim in this claim group",
+          metadata: { claim_group_id: claim.claim_group_id },
+        })
+      }
     }
     for (const ref of claim.direct_evidence_refs) this.linkSourceToClaim(ref, node.node_id, "evidence_to_claim")
     for (const ref of claim.direct_support_refs ?? []) {
@@ -7227,8 +7262,17 @@ class ActiveCaseTrace {
       const responseNode = this.causalNodes.find((item) => item.node_id === responseNodeID)
       const responseText = this.responseSourceBySegmentID.get(segment.segment_id) ?? responseNode?.data?.text ?? fieldSummaryText(segment.text)
       const claims = atomizeResponseClaims(responseText)
-      claims.forEach((claim) => {
+      const plannedClaims = claims.map((claim, index) => {
+        const claimID = semanticID("claim", this.causalNodes.length + index + 1)
+        return {
+          claim,
+          claim_id: claimID,
+          record_ref: `record:responseclaim_${claimID}`,
+        }
+      })
+      plannedClaims.forEach(({ claim, claim_id }, index) => {
         this.responseClaim({
+          claim_id,
           response_segment_id: segment.segment_id,
           claim_key: claim.key,
           text: claim.text,
@@ -7244,6 +7288,8 @@ class ActiveCaseTrace {
           source_byte_range: claim.source_byte_range,
           previous_claim_key: claim.previous_claim_key,
           next_claim_key: claim.next_claim_key,
+          previous_claim_ref: plannedClaims[index - 1]?.record_ref,
+          next_claim_ref: plannedClaims[index + 1]?.record_ref,
           atomization_status: claim.atomization_status,
           atomization_reason: claim.atomization_reason,
           source_refs: segment.source_refs,
@@ -7260,6 +7306,23 @@ class ActiveCaseTrace {
           },
         })
       })
+      for (let index = 0; index + 1 < plannedClaims.length; index++) {
+        const current = plannedClaims[index]!
+        const next = plannedClaims[index + 1]!
+        if (current.claim.claim_group_id !== next.claim.claim_group_id) continue
+        this.causalEdge({
+          from: { type: "response_claim", id: `responseclaim_${current.claim_id}`, label: "response.claim" },
+          to: { type: "response_claim", id: `responseclaim_${next.claim_id}`, label: "response.claim" },
+          relation: "claim_group_precedes",
+          eligible_for_attribution: false,
+          label: "Claim order within a response claim group",
+          metadata: {
+            causal_semantics: "claim_group_order_only",
+            eligible_for_attribution: false,
+            behavior_impact: "none",
+          },
+        })
+      }
       this.claimedResponseSegmentIDs.add(segment.segment_id)
       this.responseSourceBySegmentID.delete(segment.segment_id)
     }

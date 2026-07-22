@@ -89,6 +89,91 @@ describe("causal IR store", () => {
     expect(journal.map((entry: any) => entry.record_type)).toEqual(["node", "node.update"])
   })
 
+  test("replays claim group aliases and attribution-ineligible ordering without temporal causality", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_claim_group",
+      caseID: "case_claim_group",
+      append: (entry) => journal.push(entry),
+    })
+    const claimGroupData = {
+      claim_group_id: "claim_group_1",
+      claim_count: 2,
+      source_byte_range: [0, 42],
+      atomization_status: "atomic",
+      atomization_reason: "complete_merged_statement",
+    }
+    store.createNode({
+      node_id: "responsenode_segment_1",
+      kind: "response.output",
+      component: "result",
+      timestamp: "2026-07-22T00:00:00.000Z",
+      time_ms: 1,
+      data: { segment_id: "segment_1" },
+    })
+    store.createNode({
+      node_id: "responseclaim_claim_1",
+      kind: "response.claim",
+      component: "result",
+      timestamp: "2026-07-22T00:00:01.000Z",
+      time_ms: 2,
+      data: { ...claimGroupData, claim_id: "claim_1", next_claim_ref: "record:responseclaim_claim_2" },
+      metadata: { ...claimGroupData, next_claim_ref: "record:responseclaim_claim_2" },
+    })
+    store.createNode({
+      node_id: "responseclaim_claim_2",
+      kind: "response.claim",
+      component: "result",
+      timestamp: "2026-07-22T00:00:02.000Z",
+      time_ms: 3,
+      data: { ...claimGroupData, claim_id: "claim_2", source_byte_range: [43, 84], previous_claim_ref: "record:responseclaim_claim_1" },
+      metadata: { ...claimGroupData, source_byte_range: [43, 84], previous_claim_ref: "record:responseclaim_claim_1" },
+    })
+    store.createEdge({
+      edge_id: "edge_response_claim_group_1",
+      from: { type: "node", id: "responsenode_segment_1" },
+      to: { type: "response_claim", id: "responseclaim_claim_1" },
+      relation: "response_to_claim_group",
+      metadata: { claim_group_id: "claim_group_1" },
+    })
+    store.createEdge({
+      edge_id: "edge_claim_group_precedes_1",
+      from: { type: "response_claim", id: "responseclaim_claim_1" },
+      to: { type: "response_claim", id: "responseclaim_claim_2" },
+      relation: "claim_group_precedes",
+      eligible_for_attribution: false,
+      metadata: {
+        causal_semantics: "claim_group_order_only",
+        eligible_for_attribution: false,
+        behavior_impact: "none",
+      },
+    })
+
+    const replayed = replayCausalIRJournal(journal)
+
+    expect(replayed).toEqual(store.snapshot())
+    expect(replayed.nodes.find((node) => node.node_id === "responseclaim_claim_1")).toMatchObject({
+      aliases: expect.arrayContaining(["response_claim:claim_1"]),
+      payload: { ...claimGroupData, claim_id: "claim_1", next_claim_ref: "record:responseclaim_claim_2" },
+      metadata: { ...claimGroupData, next_claim_ref: "record:responseclaim_claim_2" },
+    })
+    expect(replayed.edges).toContainEqual(
+      expect.objectContaining({
+        original_relation: "claim_group_precedes",
+        normalized_relation: "claim_group_precedes",
+        evidence_tier: "confirmed",
+        eligible_for_attribution: false,
+        metadata: {
+          causal_semantics: "claim_group_order_only",
+          eligible_for_attribution: false,
+          behavior_impact: "none",
+        },
+      }),
+    )
+    expect(replayed.edges.some((edge) => edge.evidence_tier === "temporal_advisory")).toBe(false)
+    expect(replayed.diagnostics).toEqual([])
+  })
+
   test("replays a node replacement journal prefix without a later lifecycle snapshot", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({

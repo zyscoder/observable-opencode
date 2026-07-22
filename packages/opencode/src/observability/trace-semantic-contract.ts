@@ -74,6 +74,8 @@ export const FORMAL_DATAFLOW_RELATIONS = [
   "supports_claim",
   "contextualizes_claim",
   "executed_for_claim",
+  "response_to_claim_group",
+  "claim_group_precedes",
 ] as const
 
 export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]
