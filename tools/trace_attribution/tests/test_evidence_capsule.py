@@ -95,6 +95,73 @@ def sample_graph() -> TraceGraph:
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def test_duplicate_routes_preserve_recorded_provenance_independent_of_score(self):
+        graph = sample_graph()
+        node = graph.nodes["record:decision"]
+        recorded_edge = next(
+            edge
+            for edge in graph.semantic_predecessor_edges(
+                "record:observed_defect"
+            )
+            if edge.get("ref") == node.ref
+        )
+
+        def build(recorded_score, inferred_score, reverse):
+            candidates = [
+                CausalCandidate(
+                    ref=node.ref,
+                    node=node,
+                    source="confirmed_edge",
+                    edge=recorded_edge,
+                    score=recorded_score,
+                    evidence_refs=(node.ref,),
+                ),
+                CausalCandidate(
+                    ref=node.ref,
+                    node=node,
+                    source="semantic_fallback",
+                    edge={
+                        "from_ref": node.ref,
+                        "to_ref": "record:observed_defect",
+                        "relation": "semantic_predecessor_match",
+                        "evidence_type": "semantic_inferred",
+                        "confidence": inferred_score,
+                        "eligible_for_attribution": False,
+                        "retrieval_candidate": True,
+                    },
+                    score=inferred_score,
+                    evidence_refs=(node.ref,),
+                ),
+            ]
+            if reverse:
+                candidates.reverse()
+            return build_candidate_evidence_capsules(
+                graph=graph,
+                candidates=candidates,
+                defect_state=DefectState.create(
+                    label="sigint_cleanup_interrupted",
+                    expected="cleanup completes",
+                    actual="cleanup interrupted",
+                    mechanism="cancellation mismatch",
+                    scope="task_quality",
+                ),
+                downstream_paths={
+                    node.ref: (node.ref, "record:observed_defect")
+                },
+                start_refs=("record:observed_defect",),
+            )[0].to_dict()["candidate"]
+
+        recorded_high = build(0.99, 0.01, False)
+        inferred_high = build(0.01, 0.99, True)
+
+        self.assertEqual(recorded_high, inferred_high)
+        self.assertEqual(recorded_high["source"], "confirmed_edge")
+        self.assertEqual(
+            recorded_high["retrieval_edge"]["relation"],
+            "decision_exposed_by_evaluation",
+        )
+        self.assertEqual(recorded_high["retrieval_edge"]["confidence"], 1.0)
+
     def _external_candidate_capsules(self, *, status: str, subject_revision: str):
         trace = inject_external_evaluation_facts(
             {

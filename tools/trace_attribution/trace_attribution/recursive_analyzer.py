@@ -22,6 +22,7 @@ from .causal_judge import (
 )
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
+    canonical_candidate_route,
     is_navigation_node,
     root_candidate_eligible,
 )
@@ -39,6 +40,7 @@ from .causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     confirmation_identity_for,
+    seed_binding_identity_for,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
 from .errors import JudgeProviderError, JudgeProviderUnavailable
@@ -697,12 +699,7 @@ def _rejudge_success_terminal_state(
 
 
 def _seed_ledger_key(start_ref: str, defect_fingerprint: str) -> str:
-    return stable_json(
-        {
-            "start_ref": str(start_ref),
-            "defect_fingerprint": str(defect_fingerprint),
-        }
-    )
+    return seed_binding_identity_for(start_ref, defect_fingerprint)
 
 
 @dataclass
@@ -829,7 +826,7 @@ class RecursiveAnalysisState:
     step_judgments: List[CausalStepJudgment] = field(default_factory=list)
     introduction_candidates: List[CausalCandidate] = field(default_factory=list)
     introduction_bindings: List[JsonDict] = field(default_factory=list)
-    introduction_binding_keys: Set[Tuple[str, str, str]] = field(default_factory=set)
+    introduction_binding_keys: Set[Tuple[str, str, str, str]] = field(default_factory=set)
     contributing_conditions: List[CausalFactor] = field(default_factory=list)
     rejected_candidates: List[RejectedCandidate] = field(default_factory=list)
     taint_paths: List[Tuple[str, ...]] = field(default_factory=list)
@@ -855,7 +852,7 @@ class RecursiveAnalysisState:
     investigation_evidence_hashes: Dict[str, Set[str]] = field(default_factory=dict)
     control_directive_ids: Set[str] = field(default_factory=set)
     confirmation_queue: List[JsonDict] = field(default_factory=list)
-    confirmation_queue_keys: Set[Tuple[str, str, str]] = field(default_factory=set)
+    confirmation_queue_keys: Set[Tuple[str, str, str, str]] = field(default_factory=set)
     confirmations: List[RootConfirmation] = field(default_factory=list)
     confirmed_roots: List[ConfirmedRoot] = field(default_factory=list)
     co_roots: List[ConfirmedRoot] = field(default_factory=list)
@@ -1061,6 +1058,7 @@ class RecursiveAnalysisState:
                         ),
                         predecessor_ref,
                         defect_state,
+                        seed_binding_identity=builder.key,
                     )
                     state._bind_hypothesis_to_seed(
                         hypothesis.hypothesis_id, builder
@@ -1092,6 +1090,7 @@ class RecursiveAnalysisState:
                 "Investigate the observed defect at {0}.".format(start_ref),
                 start_ref,
                 defect_state,
+                seed_binding_identity=builder.key,
             )
             state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, builder)
             item = FrontierItem.create(
@@ -1300,6 +1299,7 @@ class RecursiveAnalysisState:
                 str(item.get("candidate_ref") or ""),
                 str(item.get("defect_fingerprint") or ""),
                 str(item.get("hypothesis_semantic_hash") or ""),
+                str(item.get("seed_binding_identity") or ""),
             )
             for item in state.introduction_bindings
         }
@@ -1725,6 +1725,7 @@ class RecursiveAnalysisState:
                     item.node_ref,
                     item.defect_state.fingerprint,
                     hypothesis.semantic_hash,
+                    hypothesis.seed_binding_identity,
                 )
                 if binding_key not in self.introduction_binding_keys:
                     candidate = self._candidate_for_ref(
@@ -1749,6 +1750,7 @@ class RecursiveAnalysisState:
                                 "defect_fingerprint": item.defect_state.fingerprint,
                                 "hypothesis_id": hypothesis.hypothesis_id,
                                 "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                                "seed_binding_identity": hypothesis.seed_binding_identity,
                                 "seed_key": seed_builder.key if seed_builder else "",
                             }
                         )
@@ -1847,7 +1849,10 @@ class RecursiveAnalysisState:
                 " ".join(assessment.reason.split()),
             )
             proposed = AttributionHypothesis.create(
-                claim, assessment.ref, upstream_defect
+                claim,
+                assessment.ref,
+                upstream_defect,
+                seed_binding_identity=seed_builder.key if seed_builder else "",
             )
             snapshot = self.ledger.snapshot()
             existing_ids = {
@@ -1869,6 +1874,7 @@ class RecursiveAnalysisState:
                 claim,
                 assessment.ref,
                 upstream_defect,
+                seed_binding_identity=seed_builder.key if seed_builder else "",
             )
             self._bind_hypothesis_to_seed(
                 hypothesis.hypothesis_id, seed_builder
@@ -1966,9 +1972,14 @@ class RecursiveAnalysisState:
             )
             claim = (
                 "Independently judge whether {0} introduces an upstream semantic cause of {1}; "
-                "offline ranking score {2:.3f} is retrieval-only."
-            ).format(candidate.ref, item.defect_state.label, candidate.score)
-            hypothesis = self.ledger.create(claim, candidate.ref, upstream_defect)
+                "offline ranking is retrieval-only."
+            ).format(candidate.ref, item.defect_state.label)
+            hypothesis = self.ledger.create(
+                claim,
+                candidate.ref,
+                upstream_defect,
+                seed_binding_identity=seed_builder.key if seed_builder else "",
+            )
             self._bind_hypothesis_to_seed(
                 hypothesis.hypothesis_id, seed_builder
             )
@@ -1976,7 +1987,7 @@ class RecursiveAnalysisState:
                 hypothesis.hypothesis_id,
                 candidate.ref,
                 "Selected as a bounded progress-navigation candidate; causality is unconfirmed.",
-                candidate.score,
+                0.0,
             )
             evidence_refs = tuple(
                 dict.fromkeys(
@@ -1991,7 +2002,7 @@ class RecursiveAnalysisState:
                 candidate.ref,
                 item.node_ref,
                 evidence_refs=evidence_refs,
-                confidence=candidate.score,
+                confidence=0.0,
             )
             predecessor = FrontierItem.create(
                 node_ref=candidate.ref,
@@ -2216,6 +2227,8 @@ class RecursiveAnalysisState:
         )
 
     def _remember_candidate(self, candidate: CausalCandidate) -> None:
+        if any(existing == candidate for existing in self.causal_candidates):
+            return
         self.causal_candidates.append(candidate)
 
     def _remember_defect(self, defect_state: DefectState) -> None:
@@ -2583,6 +2596,7 @@ class AgenticRecursiveAnalyzer:
             *decisive_evidence,
         ]
         selected: Dict[str, CausalCandidate] = {}
+        routes_by_ref: Dict[str, List[CausalCandidate]] = {}
         refs: List[str] = []
         for candidate in ordered:
             resolved = graph.resolve(candidate.ref) or candidate.ref
@@ -2591,12 +2605,14 @@ class AgenticRecursiveAnalyzer:
                 or not graph.evidence_eligible(resolved)
             ):
                 continue
-            existing = selected.get(resolved)
-            if existing is None:
+            if resolved not in routes_by_ref:
                 refs.append(resolved)
-                selected[resolved] = candidate
-            elif candidate.score > existing.score:
-                selected[resolved] = candidate
+                routes_by_ref[resolved] = []
+            routes_by_ref[resolved].append(candidate)
+        for ref in refs:
+            selected[ref] = canonical_candidate_route(
+                graph, ref, routes_by_ref[ref]
+            )
         paths: Dict[str, Tuple[str, ...]] = {}
         for ref in refs:
             candidate = selected[ref]
@@ -2802,6 +2818,7 @@ class AgenticRecursiveAnalyzer:
                     ),
                     selected_ref,
                     item.defect_state,
+                    seed_binding_identity=seed_builder.key if seed_builder else "",
                 )
                 state._bind_hypothesis_to_seed(
                     hypothesis.hypothesis_id, seed_builder
@@ -2827,6 +2844,7 @@ class AgenticRecursiveAnalyzer:
                     selected_ref,
                     item.defect_state.fingerprint,
                     hypothesis.semantic_hash,
+                    hypothesis.seed_binding_identity,
                 )
                 if binding_key not in state.introduction_binding_keys:
                     state.introduction_binding_keys.add(binding_key)
@@ -2837,6 +2855,7 @@ class AgenticRecursiveAnalyzer:
                             "defect_fingerprint": item.defect_state.fingerprint,
                             "hypothesis_id": hypothesis.hypothesis_id,
                             "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                            "seed_binding_identity": hypothesis.seed_binding_identity,
                             "origin": "global_candidate_judgment",
                             "seed_key": seed_builder.key if seed_builder else "",
                         }
@@ -2848,6 +2867,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis.hypothesis_id,
                     selected_ref,
                     item.defect_state.fingerprint,
+                    hypothesis.seed_binding_identity,
                 )
                 if queue_key not in state.confirmation_queue_keys:
                     state.confirmation_queue_keys.add(queue_key)
@@ -2856,6 +2876,7 @@ class AgenticRecursiveAnalyzer:
                             "hypothesis_id": hypothesis.hypothesis_id,
                             "candidate_ref": selected_ref,
                             "defect_fingerprint": item.defect_state.fingerprint,
+                            "seed_binding_identity": hypothesis.seed_binding_identity,
                             "requested_by_ref": item.node_ref,
                             "recursive_path": list(capsule.downstream_path),
                             "checked_evidence_refs": list(support_refs),
@@ -2907,6 +2928,7 @@ class AgenticRecursiveAnalyzer:
                     ),
                     anchor,
                     item.defect_state,
+                    seed_binding_identity=seed_builder.key if seed_builder else "",
                 )
                 state._bind_hypothesis_to_seed(
                     hypothesis.hypothesis_id, seed_builder
@@ -3623,6 +3645,9 @@ class AgenticRecursiveAnalyzer:
                     ),
                     defect_fingerprint=str(queued.get("defect_fingerprint") or ""),
                     recursive_path=tuple(queued.get("recursive_path") or ()),
+                    seed_binding_identity=str(
+                        queued.get("seed_binding_identity") or ""
+                    ),
                 )
                 self._record_confirmation(state, queued, confirmation, 0)
                 continue
@@ -3639,6 +3664,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
+                    seed_binding_identity=request.seed_binding_identity,
                 )
                 self._record_confirmation(state, queued, confirmation, 0)
                 continue
@@ -3653,6 +3679,7 @@ class AgenticRecursiveAnalyzer:
                         candidate_ref=request.candidate_ref,
                         defect_fingerprint=request.defect_state.fingerprint,
                         recursive_path=request.recursive_path,
+                        seed_binding_identity=request.seed_binding_identity,
                     )
                 )
             )
@@ -3678,6 +3705,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
+                    seed_binding_identity=request.seed_binding_identity,
                 )
                 self._record_confirmation(state, queued, confirmation, 0)
                 self._checkpoint_state(state, confirmation_action_key)
@@ -3766,6 +3794,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
+                    seed_binding_identity=request.seed_binding_identity,
                 )
             except (JudgeProviderError, JudgeProviderUnavailable, TypeError, ValueError) as exc:
                 confirmation = RootConfirmation(
@@ -3777,6 +3806,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
+                    seed_binding_identity=request.seed_binding_identity,
                 )
             except Exception as exc:
                 confirmation = RootConfirmation(
@@ -3790,6 +3820,7 @@ class AgenticRecursiveAnalyzer:
                     hypothesis_semantic_hash=request.hypothesis_semantic_hash,
                     defect_fingerprint=request.defect_state.fingerprint,
                     recursive_path=request.recursive_path,
+                    seed_binding_identity=request.seed_binding_identity,
                 )
             if physical_exact:
                 state.judge_requests += physical_delta - reserved_requests
@@ -3961,10 +3992,12 @@ class AgenticRecursiveAnalyzer:
         hypothesis_id = str(queued.get("hypothesis_id") or "")
         candidate_ref = str(queued.get("candidate_ref") or "")
         fingerprint = str(queued.get("defect_fingerprint") or "")
+        seed_binding_identity = str(queued.get("seed_binding_identity") or "")
         hypothesis = state.ledger.get(hypothesis_id)
         if (
             hypothesis.candidate_root_ref != candidate_ref
             or hypothesis.active_defect_fingerprint != fingerprint
+            or hypothesis.seed_binding_identity != seed_binding_identity
         ):
             raise ValueError("queued confirmation is cross-bound to another hypothesis")
         binding = next(
@@ -3975,6 +4008,7 @@ class AgenticRecursiveAnalyzer:
                 and item.get("hypothesis_id") == hypothesis_id
                 and item.get("defect_fingerprint") == fingerprint
                 and item.get("hypothesis_semantic_hash") == hypothesis.semantic_hash
+                and item.get("seed_binding_identity") == seed_binding_identity
             ),
             None,
         )
@@ -4046,6 +4080,9 @@ class AgenticRecursiveAnalyzer:
                 value.get("active_defect_fingerprint") or ""
             )
             competitor_semantic_hash = str(value.get("semantic_hash") or "")
+            competitor_seed_binding_identity = str(
+                value.get("seed_binding_identity") or ""
+            )
             competitor_binding = next(
                 (
                     item
@@ -4056,6 +4093,8 @@ class AgenticRecursiveAnalyzer:
                     == competitor_fingerprint
                     and str(item.get("hypothesis_semantic_hash") or "")
                     == competitor_semantic_hash
+                    and str(item.get("seed_binding_identity") or "")
+                    == competitor_seed_binding_identity
                 ),
                 None,
             )
@@ -4107,6 +4146,8 @@ class AgenticRecursiveAnalyzer:
                     and str(item.get("candidate_ref") or "") == resolved
                     and str(item.get("defect_fingerprint") or "")
                     == competitor_fingerprint
+                    and str(item.get("seed_binding_identity") or "")
+                    == competitor_seed_binding_identity
                 ),
                 None,
             )
@@ -4131,6 +4172,7 @@ class AgenticRecursiveAnalyzer:
                 candidate_ref=resolved,
                 defect_fingerprint=competitor_fingerprint,
                 recursive_path=competitor_path,
+                seed_binding_identity=competitor_seed_binding_identity,
             )
             competitors.append(
                 {
@@ -4138,6 +4180,7 @@ class AgenticRecursiveAnalyzer:
                     "hypothesis_semantic_hash": competitor_semantic_hash,
                     "confirmation_identity": competitor_confirmation_identity,
                     "recursive_path": list(competitor_path),
+                    "seed_binding_identity": competitor_seed_binding_identity,
                     "requires_independent_confirmation": queued_competitor is not None,
                     "status": str(value.get("status") or "unresolved"),
                     "claim": str(value.get("claim") or ""),
@@ -4201,6 +4244,7 @@ class AgenticRecursiveAnalyzer:
             analysis_perspective="",
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis.semantic_hash,
+            seed_binding_identity=seed_binding_identity,
         )
 
     def _record_confirmation(
@@ -4227,6 +4271,8 @@ class AgenticRecursiveAnalyzer:
                 "candidate_ref": confirmation.candidate_ref,
                 "hypothesis_id": hypothesis_id,
                 "defect_fingerprint": confirmation.defect_fingerprint,
+                "seed_binding_identity": confirmation.seed_binding_identity,
+                "seed_key": seed_key,
                 "recursive_path": list(confirmation.recursive_path),
                 "status": confirmation.status,
                 "physical_request_delta": physical_request_delta,
@@ -4629,7 +4675,14 @@ class AgenticRecursiveAnalyzer:
                 if not resolved:
                     raise ValueError("candidate_ref is unresolved")
                 proposed = AttributionHypothesis.create(
-                    str(arguments["claim"]), resolved, item.defect_state
+                    str(arguments["claim"]),
+                    resolved,
+                    item.defect_state,
+                    seed_binding_identity=(
+                        state._seed_builder_for_item(item).key
+                        if state._seed_builder_for_item(item) is not None
+                        else ""
+                    ),
                 )
                 existing_ids = {
                     str(value.get("hypothesis_id") or "") for value in before
@@ -4640,7 +4693,14 @@ class AgenticRecursiveAnalyzer:
                 ):
                     raise ValueError("hypothesis budget exhausted")
                 created = state.ledger.create(
-                    str(arguments["claim"]), resolved, item.defect_state
+                    str(arguments["claim"]),
+                    resolved,
+                    item.defect_state,
+                    seed_binding_identity=(
+                        state._seed_builder_for_item(item).key
+                        if state._seed_builder_for_item(item) is not None
+                        else ""
+                    ),
                 )
                 state._bind_hypothesis_to_seed(
                     created.hypothesis_id,
@@ -4696,11 +4756,18 @@ class AgenticRecursiveAnalyzer:
                     binding.get("candidate_ref") == candidate_ref
                     and binding.get("hypothesis_id") == hypothesis_id
                     and binding.get("defect_fingerprint") == defect_fingerprint
+                    and binding.get("seed_binding_identity")
+                    == hypothesis.seed_binding_identity
                     for binding in state.introduction_bindings
                 )
                 if not binding_exists:
                     raise ValueError("confirmation requires an existing introduction binding")
-                queue_key = (hypothesis_id, candidate_ref, defect_fingerprint)
+                queue_key = (
+                    hypothesis_id,
+                    candidate_ref,
+                    defect_fingerprint,
+                    hypothesis.seed_binding_identity,
+                )
                 if queue_key not in state.confirmation_queue_keys:
                     state.confirmation_queue_keys.add(queue_key)
                     state.confirmation_queue.append(
@@ -4708,6 +4775,7 @@ class AgenticRecursiveAnalyzer:
                             "hypothesis_id": hypothesis_id,
                             "candidate_ref": candidate_ref,
                             "defect_fingerprint": defect_fingerprint,
+                            "seed_binding_identity": hypothesis.seed_binding_identity,
                             "requested_by_ref": item.node_ref,
                             "recursive_path": list(item.downstream_path),
                             "checked_evidence_refs": sorted(

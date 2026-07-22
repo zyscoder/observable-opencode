@@ -17,6 +17,7 @@ from trace_attribution.causal_judge import (
     OfflineJudgeCapability,
 )
 from trace_attribution.causal_state import (
+    CausalCandidate,
     CausalStepJudgment,
     DefectState,
     PredecessorAssessment,
@@ -2547,6 +2548,198 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
 
 class RetrievalGlobalFusionTest(unittest.TestCase):
+    def test_progress_navigation_score_only_changes_queue_priority(self):
+        class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
+            def __init__(self, score):
+                self.score = score
+
+            def retrieve(self, *args, **kwargs):
+                return [
+                    replace(candidate, score=self.score)
+                    for candidate in super().retrieve(*args, **kwargs)
+                ]
+
+        trace = {
+            "case_id": "progress-score-invariance",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": "Assume cancellation is equivalent.",
+                    },
+                },
+                {
+                    "record_id": "progress",
+                    "component": "progress",
+                    "event_type": "progress.episode",
+                    "data": {
+                        "offline_only": True,
+                        "member_refs": ["record:decision"],
+                        "candidate_member_refs": ["record:decision"],
+                    },
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:progress"],
+                    "data": {"defect_type": "sigint_cleanup_failure"},
+                },
+            ],
+        }
+
+        def run(score):
+            judge = ScriptedCausalJudge(
+                {
+                    (
+                        "record:decision",
+                        "navigation_candidate_semantic_cause",
+                    ): step("record:decision", introduction=True),
+                }
+            )
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                retriever=ScoreAdjustedRetriever(score),
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the cancellation root cause.",
+            )
+            hypothesis = next(
+                item
+                for item in report.hypotheses
+                if item.candidate_root_ref == "record:decision"
+            )
+            return {
+                "claim": hypothesis.claim,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "semantic_hash": hypothesis.semantic_hash,
+                "supporting_evidence": [
+                    item.to_dict() for item in hypothesis.supporting_evidence
+                ],
+                "recursive_judgment_facts": judge.requests[0].to_dict(),
+            }
+
+        self.assertEqual(run(0.01), run(0.99))
+
+    def test_duplicate_retrieval_routes_only_use_score_to_select_and_order_refs(self):
+        class DuplicateRouteRetriever(SemanticPredecessorRetriever):
+            def __init__(self, *, authentic_score, inferred_score, reverse):
+                self.authentic_score = authentic_score
+                self.inferred_score = inferred_score
+                self.reverse = reverse
+
+            def retrieve(self, graph, node_ref, defect_state, hypothesis, **kwargs):
+                recorded_edge = next(
+                    edge
+                    for edge in graph.semantic_predecessor_edges(node_ref)
+                    if edge.get("ref") == "record:decision"
+                )
+                node = graph.nodes["record:decision"]
+                routes = [
+                    CausalCandidate(
+                        ref=node.ref,
+                        node=node,
+                        source="confirmed_edge",
+                        edge=recorded_edge,
+                        score=self.authentic_score,
+                        evidence_refs=(node.ref,),
+                    ),
+                    CausalCandidate(
+                        ref=node.ref,
+                        node=node,
+                        source="semantic_fallback",
+                        edge={
+                            "from_ref": node.ref,
+                            "to_ref": node_ref,
+                            "relation": "semantic_predecessor_match",
+                            "evidence_type": "semantic_inferred",
+                            "confidence": self.inferred_score,
+                            "eligible_for_attribution": False,
+                            "retrieval_candidate": True,
+                            "inference_method": "token_overlap_retrieval",
+                            "edge_origin": "offline.semantic_retrieval",
+                        },
+                        score=self.inferred_score,
+                        evidence_refs=(node.ref,),
+                    ),
+                ]
+                return list(reversed(routes)) if self.reverse else routes
+
+        def run(*, authentic_score, inferred_score, reverse):
+            judge = FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="Implement only the methods found in the first search.",
+                        reason="The decision is the necessary local root.",
+                        counterfactual="Searching all methods prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    )
+                },
+            )
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                retriever=DuplicateRouteRetriever(
+                    authentic_score=authentic_score,
+                    inferred_score=inferred_score,
+                    reverse=reverse,
+                ),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(observed_trace()),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+            hypothesis = next(
+                item
+                for item in report.hypotheses
+                if item.candidate_root_ref == "record:decision"
+            )
+            return {
+                "global_facts": judge.global_requests[0].to_dict(),
+                "candidate_source": report.introduction_candidates[0].source,
+                "candidate_relation": report.introduction_candidates[0].edge["relation"],
+                "hypothesis_claim": hypothesis.claim,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                "confirmation_identity": report.confirmations[0].confirmation_identity,
+                "independent_confirmation_facts": judge.confirmation_requests[
+                    0
+                ].factual_dict(),
+            }
+
+        authentic_high = run(
+            authentic_score=0.99,
+            inferred_score=0.01,
+            reverse=False,
+        )
+        inferred_high = run(
+            authentic_score=0.01,
+            inferred_score=0.99,
+            reverse=True,
+        )
+
+        self.assertEqual(authentic_high, inferred_high)
+        candidate = next(
+            capsule["candidate"]
+            for capsule in authentic_high["global_facts"][
+                "candidate_evidence_capsules"
+            ]
+            if capsule["candidate_ref"] == "record:decision"
+        )
+        self.assertEqual(candidate["source"], "confirmed_edge")
+        self.assertEqual(
+            candidate["retrieval_edge"]["relation"],
+            "decision_guided_change",
+        )
+        self.assertEqual(candidate["retrieval_edge"]["confidence"], 0.98)
+
     def test_retrieval_score_does_not_change_confirmation_facts_on_real_fusion_path(self):
         class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
             def __init__(self, score):

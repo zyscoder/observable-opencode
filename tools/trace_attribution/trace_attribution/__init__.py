@@ -30,6 +30,7 @@ from .causal_state import (
     semantic_occurrence_index,
     semantic_visit_key,
     confirmation_identity_for,
+    seed_binding_identity_for,
 )
 from .checkpoint import (
     CheckpointBundle,
@@ -113,6 +114,7 @@ __all__ = [
     "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
+    "seed_binding_identity_for",
     "build_checkpoint_config",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",

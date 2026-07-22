@@ -369,6 +369,10 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
             "expansion_history",
         ):
             _list(item.get(key), "seed result {0}".format(key))
+    if {identity[0] for identity in seed_identities} != report_start_refs:
+        raise EvaluationSchemaError(
+            "v3 seed_results must cover exactly report.start_refs"
+        )
     _mapping(report.get("metadata"), "report.metadata")
 
 
@@ -781,6 +785,8 @@ def _validate_confirmation(
             )
         for evidence_ref in comparison.get("evidence_refs") or []:
             violations.extend(_validate_ref(graph, evidence_ref, owner_ref=candidate_ref))
+        persisted_identity = str(comparison.get("confirmation_identity") or "")
+        target = confirmation_by_identity.get(persisted_identity)
         expected_identity = confirmation_identity_for(
             hypothesis_id=str(comparison.get("hypothesis_id") or ""),
             hypothesis_semantic_hash=str(
@@ -791,9 +797,12 @@ def _validate_confirmation(
             recursive_path=tuple(
                 str(item) for item in comparison.get("recursive_path") or []
             ),
+            seed_binding_identity=(
+                str(target.get("seed_binding_identity") or "")
+                if target is not None
+                else str(comparison.get("seed_binding_identity") or "")
+            ),
         )
-        persisted_identity = str(comparison.get("confirmation_identity") or "")
-        target = confirmation_by_identity.get(persisted_identity)
         target_mismatch = target is not None and any(
             comparison.get(key) != target.get(key)
             for key in ("candidate_ref", "hypothesis_id", "hypothesis_semantic_hash", "defect_fingerprint", "recursive_path")

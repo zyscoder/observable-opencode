@@ -4,10 +4,14 @@ import json
 import tempfile
 import unittest
 from collections.abc import Mapping
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
-from trace_attribution.causal_judge import OfflineJudgeCapability
+from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
+    GlobalJudgeCapability,
+    OfflineJudgeCapability,
+)
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
@@ -21,12 +25,20 @@ from trace_attribution.checkpoint import (
     build_checkpoint_config,
 )
 from trace_attribution.graph import TraceGraph
+from trace_attribution.global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgment,
+)
 from trace_attribution.models import stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
 from trace_attribution.recursive_analyzer import (
     RecursiveAnalysisState,
     SeedAttributionBuilder,
     _provider_state_payload,
+)
+from scripts.evaluate_recursive_attribution import (
+    EvaluationSchemaError,
+    _validate_report_shape,
 )
 
 
@@ -89,6 +101,172 @@ class FailingFragmentJudge(MultiSeedJudge):
         if request.current_node.ref == "record:claim_fragment":
             raise RuntimeError("seed-local scripted failure")
         return super().judge_step_offline(request)
+
+
+class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
+    def __init__(self) -> None:
+        self.global_requests = []
+        self.confirmation_requests = []
+        self.provider_circuit_open = False
+        self.provider_circuit_reason = ""
+        self.consecutive_provider_errors = 0
+        self.provider_error_threshold = 3
+
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.global_requests.append(request)
+        assessments = tuple(
+            GlobalCandidateAssessment(
+                candidate_ref=capsule.candidate_ref,
+                defect_status=(
+                    "present" if capsule.candidate_ref == "record:shared_root" else "absent"
+                ),
+                causal_role=(
+                    "root_candidate"
+                    if capsule.candidate_ref == "record:shared_root"
+                    else "exculpatory_evidence"
+                ),
+                reason="The shared decision is the trace-visible defect source.",
+                evidence_refs=(capsule.candidate_ref,),
+                confidence=0.9,
+            )
+            for capsule in request.capsules
+        )
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome="candidate_roots",
+                reason="Both seeds independently select the shared root.",
+                assessments=assessments,
+                selected_candidate_refs=("record:shared_root",),
+                expansion_requests=(),
+                decisive_evidence_refs=("record:shared_root",),
+                missing_evidence=(),
+                confidence=0.9,
+            ),
+            0,
+        )
+
+    def judge_step_offline(self, request):
+        raise AssertionError("global selection should supersede recursive traversal")
+
+    def confirm_candidate_offline(self, request):
+        self.confirmation_requests.append(request)
+        result = RootConfirmation.confirmed(
+            request.candidate_ref,
+            excerpt="The shared root decision omitted required evidence.",
+            reason="The shared decision independently caused this seed's defect.",
+            counterfactual="A grounded decision prevents the unsupported claim.",
+            confidence=0.95,
+            evidence_refs=(request.candidate_ref,),
+        )
+        return replace(
+            result,
+            competitor_comparisons=tuple(
+                {
+                    "hypothesis_id": item["hypothesis_id"],
+                    "hypothesis_semantic_hash": item["hypothesis_semantic_hash"],
+                    "candidate_ref": item["candidate_reference"]["resolved_ref"],
+                    "defect_fingerprint": item["active_defect"]["fingerprint"],
+                    "confirmation_identity": item["confirmation_identity"],
+                    "recursive_path": list(item["recursive_path"]),
+                    "requires_independent_confirmation": item[
+                        "requires_independent_confirmation"
+                    ],
+                    "status": "co_root",
+                    "reason": "The same shared root independently binds both seeds.",
+                    "evidence_refs": [request.candidate_ref],
+                }
+                for item in request.competing_hypotheses
+            ),
+        )
+
+
+class CrashAfterFirstCompletedConfirmation(CheckpointBundle):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.crashed = False
+
+    def record_action(self, operation, semantic_key, payload):
+        record = super().record_action(operation, semantic_key, payload)
+        if operation == "confirmation_completed" and not self.crashed:
+            self.crashed = True
+            raise KeyboardInterrupt("crash after first durable confirmation")
+        return record
+
+
+def shared_root_trace():
+    return {
+        "case_id": "shared-root-seeds",
+        "records": [
+            {
+                "record_id": "shared_root",
+                "component": "agent",
+                "event_type": "decision",
+                "data": {
+                    "rationale": "The shared root decision omitted required evidence."
+                },
+            },
+            *(
+                {
+                    "record_id": seed,
+                    "component": "assistant",
+                    "event_type": "response.claim",
+                    "data": {"text": "The same unsupported claim."},
+                }
+                for seed in ("seed_one", "seed_two")
+            ),
+        ],
+        "dataflow_edges": [
+            {
+                "from": {"type": "record", "id": "shared_root"},
+                "to": {"type": "record", "id": seed},
+                "relation": "decision_guided_claim",
+                "evidence_type": "confirmed",
+                "confidence": 0.9,
+                "eligible_for_attribution": True,
+            }
+            for seed in ("seed_one", "seed_two")
+        ],
+    }
+
+
+def shared_root_checkpoint_config(trace, objective, start_refs):
+    return build_checkpoint_config(
+        trace=trace,
+        case_id=trace["case_id"],
+        objective=objective,
+        analysis_perspective="",
+        start_refs=start_refs,
+        budgets={
+            "max_frontier_items": 96,
+            "max_depth": 20,
+            "max_hypotheses": 24,
+            "max_investigation_rounds": 12,
+            "max_artifact_bytes": 1_048_576,
+            "max_judge_requests": 128,
+        },
+        model_identity="offline:test",
+        cache_identity="cache:test",
+        runtime_identity={
+            "judge_timeout_sec": 3600.0,
+            "judge_max_tokens": 4096,
+            "thinking_mode": "disabled",
+            "base_url": "offline://test",
+            "provider_error_threshold": 3,
+        },
+    )
+
+
+def run_shared_root_report(trace=None):
+    document = trace or shared_root_trace()
+    return AgenticRecursiveAnalyzer(
+        judge=SharedRootFusionJudge(),
+        fusion_mode="retrieval-global",
+    ).analyze(
+        TraceGraph.from_trace(document),
+        start_refs=("record:seed_one", "record:seed_two"),
+        objective="Confirm each identical claim independently.",
+        analysis_perspective="",
+    )
 
 
 def run_fixture(name: str):
@@ -157,8 +335,165 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             by_ref["record:claim_fragment"].blocking_reasons,
         )
 
+    def test_shared_root_same_fingerprint_keeps_seed_confirmations_independent_after_resume(self):
+        trace = shared_root_trace()
+        graph = TraceGraph.from_trace(trace)
+        start_refs = ("record:seed_one", "record:seed_two")
+        objective = "Confirm each identical claim independently."
+
+        def analyze(judge, checkpoint=None, checkpoint_config=None):
+            return AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=checkpoint,
+                checkpoint_config=checkpoint_config,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                graph,
+                start_refs=start_refs,
+                objective=objective,
+                analysis_perspective="",
+            )
+
+        uninterrupted_judge = SharedRootFusionJudge()
+        uninterrupted = analyze(uninterrupted_judge)
+        self.assertEqual(
+            {item.defect_fingerprint for item in uninterrupted.seed_results},
+            {uninterrupted.seed_results[0].defect_fingerprint},
+        )
+        self.assertEqual(len(uninterrupted.confirmations), 2)
+        self.assertEqual(
+            len({item.confirmation_identity for item in uninterrupted.confirmations}),
+            2,
+        )
+        self.assertEqual(
+            len(
+                {
+                    item.hypothesis_id
+                    for item in uninterrupted.hypotheses
+                    if item.candidate_root_ref == "record:shared_root"
+                }
+            ),
+            2,
+        )
+        for key in (
+            "introduction_bindings",
+            "confirmation_queue",
+            "confirmation_journal",
+        ):
+            values = uninterrupted.metadata[key]
+            self.assertEqual(len(values), 2, key)
+            self.assertEqual(len({item["seed_key"] for item in values}), 2, key)
+        self.assertEqual(
+            {item.outcome for item in uninterrupted.seed_results},
+            {"confirmed_root"},
+        )
+        self.assertTrue(
+            all(len(item.confirmation_identities) == 1 for item in uninterrupted.seed_results)
+        )
+
+        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "shared-root.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                analyze(
+                    SharedRootFusionJudge(),
+                    CrashAfterFirstCompletedConfirmation(root),
+                    config,
+                )
+            resumed_judge = SharedRootFusionJudge()
+            resumed = analyze(resumed_judge, CheckpointBundle(root), config)
+
+        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+        self.assertEqual(len(resumed_judge.confirmation_requests), 1)
+
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_every_seed_confirmation_identity_must_bind_individually(self):
+        report = run_shared_root_report()
+        first, second = report.seed_results
+        foreign_identity = second.confirmation_identities[0]
+
+        for label, extra_identity in (
+            ("missing", "confirmation:missing"),
+            ("other-seed", foreign_identity),
+        ):
+            with self.subTest(entry_point="direct", identity=label):
+                mutated = replace(
+                    first,
+                    confirmation_identities=(
+                        *first.confirmation_identities,
+                        extra_identity,
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "confirmation identities.*seed"
+                ):
+                    replace(report, seed_results=(mutated, second))
+
+            with self.subTest(entry_point="from_dict", identity=label):
+                payload = report.to_dict()
+                payload["seed_results"][0]["confirmation_identities"].append(
+                    extra_identity
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "confirmation identities.*seed"
+                ):
+                    RecursiveAttributionReport.from_dict(payload)
+
+    def test_v3_requires_seed_results_to_cover_every_start_ref_across_all_entry_points(self):
+        complete = RecursiveAttributionReport(
+            case_id="seed-coverage",
+            objective="Cover every declared seed.",
+            start_refs=("record:one", "record:two"),
+            seed_results=(
+                seed_result("record:one", "no_defect"),
+                seed_result("record:two", "evidence_gap"),
+            ),
+        )
+        incomplete_results = (complete.seed_results[0],)
+
+        with self.assertRaisesRegex(ValueError, "cover.*start_refs"):
+            RecursiveAttributionReport(
+                case_id=complete.case_id,
+                objective=complete.objective,
+                start_refs=complete.start_refs,
+                seed_results=incomplete_results,
+            )
+
+        incomplete_payload = complete.to_dict()
+        incomplete_payload["seed_results"] = incomplete_payload["seed_results"][:1]
+        with self.assertRaisesRegex(ValueError, "cover.*start_refs"):
+            RecursiveAttributionReport.from_dict(incomplete_payload)
+        with self.assertRaisesRegex(EvaluationSchemaError, "cover.*start_refs"):
+            _validate_report_shape(
+                incomplete_payload,
+                {"case_id": complete.case_id},
+            )
+
+    def test_v3_allows_multiple_defect_fingerprints_for_one_start_ref(self):
+        first = seed_result("record:one", "no_defect")
+        second_state = defect("second-fingerprint")
+        second = SeedAttributionResult(
+            start_ref="record:one",
+            defect_fingerprint=second_state.fingerprint,
+            defect_state=second_state,
+            outcome="evidence_gap",
+            missing_evidence=("second defect evidence",),
+        )
+
+        report = RecursiveAttributionReport(
+            case_id="multi-fingerprint",
+            objective="Retain both defects for one seed ref.",
+            start_refs=("record:one",),
+            seed_results=(first, second),
+        )
+
+        self.assertEqual(len(report.seed_results), 2)
+        self.assertEqual(
+            {item.start_ref for item in report.seed_results},
+            {"record:one"},
+        )
+
     def test_no_defect_does_not_clear_an_existing_seed_failure(self):
         builder = SeedAttributionBuilder(
             start_ref="record:seed",
@@ -228,13 +563,22 @@ class SeedAttributionModelTests(unittest.TestCase):
 
     def test_confirmed_seed_cannot_fabricate_root_without_top_level_confirmation(self):
         result = seed_result("record:seed", "confirmed_root")
+        with self.assertRaisesRegex(ValueError, "confirmed_root"):
+            RecursiveAttributionReport(
+                case_id="forged-seed",
+                objective="Reject fabricated local roots.",
+                start_refs=["record:seed"],
+                seed_results=[result],
+            )
+
+        conservative = seed_result("record:seed", "no_defect")
         payload = RecursiveAttributionReport(
             case_id="forged-seed",
             objective="Reject fabricated local roots.",
             start_refs=["record:seed"],
-            seed_results=[result],
+            seed_results=[conservative],
         ).to_dict()
-
+        payload["seed_results"][0].update(result.to_dict())
         with self.assertRaisesRegex(ValueError, "confirmed_root"):
             RecursiveAttributionReport.from_dict(payload)
 
@@ -276,48 +620,35 @@ class SeedAttributionModelTests(unittest.TestCase):
         self.assertEqual(migrated.analysis_outcome, "inconclusive")
 
     def test_top_level_aggregation_uses_only_seed_outcomes(self):
-        cases = {
-            "all_no_defect": (
-                (seed_result("a", "no_defect"), seed_result("b", "no_defect")),
-                "no_defect",
-            ),
-            "confirmed_and_no_defect": (
-                (
-                    seed_result("a", "confirmed_root"),
-                    seed_result("b", "no_defect"),
-                ),
-                "confirmed_root",
-            ),
-            "partial": (
-                (
-                    seed_result("a", "confirmed_root"),
-                    seed_result("b", "no_defect"),
-                    seed_result("c", "evidence_gap"),
-                ),
-                "partial",
-            ),
-            "unresolved": (
-                (
-                    seed_result("a", "confirmed_root"),
-                    seed_result("b", "inconclusive"),
-                ),
-                "inconclusive",
-            ),
-        }
-        for name, (seed_results, expected) in cases.items():
+        no_defect_seeds = (
+            seed_result("a", "no_defect"),
+            seed_result("b", "no_defect"),
+        )
+        no_defect = RecursiveAttributionReport(
+            case_id="aggregation",
+            objective="Aggregate seed outcomes.",
+            start_refs=tuple(item.start_ref for item in no_defect_seeds),
+            seed_results=no_defect_seeds,
+        )
+        self.assertEqual(no_defect.analysis_outcome, "no_defect")
+
+        confirmed = run_shared_root_report()
+        self.assertEqual(confirmed.analysis_outcome, "confirmed_root")
+        first, second = confirmed.seed_results
+        for name, replacement, expected in (
+            ("confirmed_and_no_defect", replace(first, outcome="no_defect", confirmed_root_refs=(), confirmation_identities=()), "confirmed_root"),
+            ("partial", replace(first, outcome="evidence_gap", confirmed_root_refs=(), confirmation_identities=(), missing_evidence=("missing",)), "partial"),
+            ("unresolved", replace(first, outcome="inconclusive", confirmed_root_refs=(), confirmation_identities=()), "inconclusive"),
+        ):
             with self.subTest(name=name):
-                report = RecursiveAttributionReport(
-                    case_id="aggregation",
-                    objective="Aggregate seed outcomes.",
-                    seed_results=seed_results,
-                )
+                report = replace(confirmed, seed_results=(replacement, second))
                 self.assertEqual(report.analysis_outcome, expected)
 
     def test_output_order_is_deterministic(self):
         seeds = (
             seed_result("record:z", "evidence_gap"),
             seed_result("record:a", "no_defect"),
-            seed_result("record:m", "confirmed_root"),
+            seed_result("record:m", "inconclusive"),
         )
         forward = RecursiveAttributionReport(
             case_id="order",

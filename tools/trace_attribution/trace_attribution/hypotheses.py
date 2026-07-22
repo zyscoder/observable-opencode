@@ -85,9 +85,19 @@ class HypothesisLedger:
         self._items: Dict[str, AttributionHypothesis] = {}
 
     def create(
-        self, claim: str, candidate_root_ref: str, defect_state: DefectState
+        self,
+        claim: str,
+        candidate_root_ref: str,
+        defect_state: DefectState,
+        *,
+        seed_binding_identity: str = "",
     ) -> AttributionHypothesis:
-        hypothesis = AttributionHypothesis.create(claim, candidate_root_ref, defect_state)
+        hypothesis = AttributionHypothesis.create(
+            claim,
+            candidate_root_ref,
+            defect_state,
+            seed_binding_identity=seed_binding_identity,
+        )
         existing = self._items.get(hypothesis.hypothesis_id)
         if existing is not None:
             return existing

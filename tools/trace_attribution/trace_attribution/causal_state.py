@@ -216,6 +216,16 @@ def _frozen_strings(value: Any) -> Tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def seed_binding_identity_for(start_ref: str, defect_fingerprint: str) -> str:
+    semantic = {
+        "start_ref": str(start_ref),
+        "defect_fingerprint": str(defect_fingerprint),
+    }
+    return "seed:{0}".format(
+        hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
+    )
+
+
 def confirmation_identity_for(
     *,
     hypothesis_id: str,
@@ -223,6 +233,7 @@ def confirmation_identity_for(
     candidate_ref: str,
     defect_fingerprint: str,
     recursive_path: Tuple[str, ...],
+    seed_binding_identity: str = "",
 ) -> str:
     semantic = {
         "hypothesis_id": hypothesis_id,
@@ -231,6 +242,8 @@ def confirmation_identity_for(
         "defect_fingerprint": defect_fingerprint,
         "recursive_path": list(recursive_path),
     }
+    if seed_binding_identity:
+        semantic["seed_binding_identity"] = seed_binding_identity
     return "confirmation:{0}".format(
         hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
     )
@@ -1116,6 +1129,7 @@ class AttributionHypothesis:
     candidate_root_ref: str
     active_defect_state_id: str
     active_defect_fingerprint: str
+    seed_binding_identity: str = ""
     supporting_evidence: Tuple[HypothesisEvidence, ...] = field(default_factory=tuple)
     opposing_evidence: Tuple[HypothesisEvidence, ...] = field(default_factory=tuple)
     unresolved_questions: Tuple[str, ...] = field(default_factory=tuple)
@@ -1138,17 +1152,35 @@ class AttributionHypothesis:
 
     @classmethod
     def create(
-        cls, claim: str, candidate_root_ref: str, defect_state: DefectState
+        cls,
+        claim: str,
+        candidate_root_ref: str,
+        defect_state: DefectState,
+        *,
+        seed_binding_identity: str = "",
     ) -> "AttributionHypothesis":
         semantic_hash = cls._semantic_hash(claim, candidate_root_ref, defect_state.fingerprint, [])
         return cls(
-            hypothesis_id="hyp:{0}".format(semantic_hash[:20]),
+            hypothesis_id=cls._hypothesis_id(semantic_hash, seed_binding_identity),
             claim=claim,
             candidate_root_ref=candidate_root_ref,
             active_defect_state_id=defect_state.defect_state_id,
             active_defect_fingerprint=defect_state.fingerprint,
+            seed_binding_identity=seed_binding_identity,
             semantic_hash=semantic_hash,
         )
+
+    @staticmethod
+    def _hypothesis_id(semantic_hash: str, seed_binding_identity: str) -> str:
+        if not seed_binding_identity:
+            return "hyp:{0}".format(semantic_hash[:20])
+        identity_hash = _hash(
+            {
+                "semantic_hash": semantic_hash,
+                "seed_binding_identity": seed_binding_identity,
+            }
+        )
+        return "hyp:{0}".format(identity_hash[:20])
 
     @staticmethod
     def _semantic_hash(
@@ -1173,7 +1205,9 @@ class AttributionHypothesis:
         )
         return replace(
             updated,
-            hypothesis_id="hyp:{0}".format(semantic_hash[:20]),
+            hypothesis_id=self._hypothesis_id(
+                semantic_hash, updated.seed_binding_identity
+            ),
             semantic_hash=semantic_hash,
         )
 
@@ -1184,6 +1218,7 @@ class AttributionHypothesis:
             "candidate_root_ref": self.candidate_root_ref,
             "active_defect_state_id": self.active_defect_state_id,
             "active_defect_fingerprint": self.active_defect_fingerprint,
+            "seed_binding_identity": self.seed_binding_identity,
             "supporting_evidence": [item.to_dict() for item in self.supporting_evidence],
             "opposing_evidence": [item.to_dict() for item in self.opposing_evidence],
             "unresolved_questions": list(self.unresolved_questions),
@@ -1206,7 +1241,8 @@ class AttributionHypothesis:
         semantic_hash = cls._semantic_hash(
             claim, candidate_root_ref, active_defect_fingerprint, unresolved_questions
         )
-        hypothesis_id = "hyp:{0}".format(semantic_hash[:20])
+        seed_binding_identity = str(value.get("seed_binding_identity") or "")
+        hypothesis_id = cls._hypothesis_id(semantic_hash, seed_binding_identity)
         persisted_semantic_hash = str(value.get("semantic_hash") or "")
         if persisted_semantic_hash and persisted_semantic_hash != semantic_hash:
             raise ValueError("AttributionHypothesis semantic_hash does not match semantic fields")
@@ -1223,6 +1259,7 @@ class AttributionHypothesis:
             candidate_root_ref=candidate_root_ref,
             active_defect_state_id=expected_defect_state_id,
             active_defect_fingerprint=active_defect_fingerprint,
+            seed_binding_identity=seed_binding_identity,
             supporting_evidence=[HypothesisEvidence.from_dict(item) for item in supporting if isinstance(item, dict)]
             if isinstance(supporting, list)
             else [],
@@ -1253,6 +1290,7 @@ class RootConfirmation:
     hypothesis_semantic_hash: str = ""
     defect_fingerprint: str = ""
     recursive_path: Tuple[str, ...] = field(default_factory=tuple)
+    seed_binding_identity: str = ""
     factor_role: str = "unknown"
     competitor_comparisons: Tuple[JsonDict, ...] = field(default_factory=tuple)
     factor_mechanism: JsonDict = field(default_factory=FrozenMapping)
@@ -1302,6 +1340,7 @@ class RootConfirmation:
             candidate_ref=self.candidate_ref,
             defect_fingerprint=self.defect_fingerprint,
             recursive_path=self.recursive_path,
+            seed_binding_identity=self.seed_binding_identity,
         )
 
     @classmethod
@@ -1372,6 +1411,7 @@ class RootConfirmation:
             "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
             "defect_fingerprint": self.defect_fingerprint,
             "recursive_path": list(self.recursive_path),
+            "seed_binding_identity": self.seed_binding_identity,
             "factor_role": self.factor_role,
             "competitor_comparisons": [_thaw(item) for item in self.competitor_comparisons],
             "factor_mechanism": _thaw(self.factor_mechanism),
@@ -1404,6 +1444,7 @@ class RootConfirmation:
             hypothesis_semantic_hash=str(value.get("hypothesis_semantic_hash") or ""),
             defect_fingerprint=str(value.get("defect_fingerprint") or ""),
             recursive_path=_string_list(value.get("recursive_path")),
+            seed_binding_identity=str(value.get("seed_binding_identity") or ""),
             factor_role=str(
                 value.get("factor_role")
                 or {
@@ -1794,6 +1835,10 @@ class RecursiveAttributionReport:
         ]
         if len(seed_keys) != len(set(seed_keys)):
             raise ValueError("duplicate per-seed attribution identity")
+        if {item.start_ref for item in self.seed_results} != set(self.start_refs):
+            raise ValueError(
+                "v3 seed_results must cover exactly report start_refs"
+            )
         object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
         object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
         object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
@@ -1862,6 +1907,98 @@ class RecursiveAttributionReport:
         if set(primary_identities).intersection(co_root_identities):
             raise ValueError("primary and co-root roles share a confirmation identity")
         root_identities = set(primary_identities).union(co_root_identities)
+        root_by_identity = {
+            root_identity(root, role=role): root
+            for role, roots in (
+                ("primary root", self.confirmed_roots),
+                ("co-root", self.co_roots),
+            )
+            for root in roots
+        }
+        defect_states_by_id: Dict[str, DefectState] = {}
+        defect_states_by_fingerprint: Dict[str, DefectState] = {}
+        for defect_state in (
+            *self.defect_states,
+            *(item.defect_state for item in self.seed_results),
+            *(item.defect_state for item in (*self.confirmed_roots, *self.co_roots)),
+        ):
+            existing = defect_states_by_id.setdefault(
+                defect_state.defect_state_id, defect_state
+            )
+            if existing != defect_state:
+                raise ValueError("conflicting report defect_state identity")
+            defect_states_by_fingerprint[defect_state.fingerprint] = defect_state
+
+        def defect_lineage_reaches_seed(
+            defect_fingerprint: str, seed: SeedAttributionResult
+        ) -> bool:
+            current = defect_states_by_fingerprint.get(defect_fingerprint)
+            visited_ids: Set[str] = set()
+            while current is not None and current.defect_state_id not in visited_ids:
+                if current.fingerprint == seed.defect_fingerprint:
+                    return True
+                visited_ids.add(current.defect_state_id)
+                current = defect_states_by_id.get(
+                    current.derived_from_defect_state_id
+                )
+            return False
+
+        for seed in self.seed_results:
+            expected_seed_binding = seed_binding_identity_for(
+                seed.start_ref, seed.defect_fingerprint
+            )
+            seed_confirmations: Dict[str, RootConfirmation] = {}
+            for identity in seed.confirmation_identities:
+                confirmation = confirmation_by_identity.get(identity)
+                if (
+                    confirmation is None
+                    or confirmation.seed_binding_identity != expected_seed_binding
+                    or not confirmation.recursive_path
+                    or confirmation.recursive_path[-1] != seed.start_ref
+                    or not defect_lineage_reaches_seed(
+                        confirmation.defect_fingerprint, seed
+                    )
+                ):
+                    raise ValueError(
+                        "confirmation identities must individually bind to their seed"
+                    )
+                seed_confirmations[identity] = confirmation
+
+            if seed.outcome != "confirmed_root":
+                if seed.confirmed_root_refs:
+                    raise ValueError(
+                        "non-confirmed seed cannot retain confirmed_root_refs"
+                    )
+                continue
+            confirmed_seed_roots = {
+                identity: root_by_identity[identity]
+                for identity, confirmation in seed_confirmations.items()
+                if confirmation.status == "confirmed" and identity in root_by_identity
+            }
+            if (
+                not seed.confirmation_identities
+                or not seed.confirmed_root_refs
+                or set(confirmed_seed_roots) != {
+                    identity
+                    for identity, confirmation in seed_confirmations.items()
+                    if confirmation.status == "confirmed"
+                }
+                or {
+                    root.node_ref for root in confirmed_seed_roots.values()
+                }
+                != set(seed.confirmed_root_refs)
+                or any(
+                    seed.start_ref not in root.observed_defect_refs
+                    or root.recursive_path[-1] != seed.start_ref
+                    or not defect_lineage_reaches_seed(
+                        root.defect_state.fingerprint, seed
+                    )
+                    for root in confirmed_seed_roots.values()
+                )
+            ):
+                raise ValueError(
+                    "confirmed_root seed is not bound to top-level confirmed roots"
+                )
         ordered_root_identities = sorted(root_identities)
         for index, left_identity in enumerate(ordered_root_identities):
             left = confirmation_by_identity[left_identity]
@@ -2088,99 +2225,6 @@ class RecursiveAttributionReport:
         start_refs = _string_list(value.get("start_refs"))
         defect_states = items("defect_states", DefectState.from_dict)
         seed_results = items("seed_results", SeedAttributionResult.from_dict)
-        raw_start_refs = _frozen_strings(value.get("start_refs"))
-        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
-            unknown_seed_refs = sorted(
-                {
-                    item.start_ref
-                    for item in seed_results
-                    if item.start_ref not in raw_start_refs
-                }
-            )
-            if unknown_seed_refs:
-                raise ValueError(
-                    "per-seed start_ref is absent from report start_refs: {0}".format(
-                        ", ".join(unknown_seed_refs)
-                    )
-                )
-            confirmation_by_identity = {
-                item.confirmation_identity: item
-                for item in items("confirmations", RootConfirmation.from_dict)
-            }
-            published_roots = [
-                *confirmed_roots,
-                *items("co_roots", ConfirmedRoot.from_dict),
-            ]
-            defect_states_by_id: Dict[str, DefectState] = {}
-            for defect_state in (
-                *defect_states,
-                *(item.defect_state for item in seed_results),
-                *(item.defect_state for item in published_roots),
-            ):
-                existing = defect_states_by_id.setdefault(
-                    defect_state.defect_state_id, defect_state
-                )
-                if existing != defect_state:
-                    raise ValueError("conflicting report defect_state identity")
-
-            def root_defect_is_bound_to_seed(
-                root: ConfirmedRoot, seed: SeedAttributionResult
-            ) -> bool:
-                current = root.defect_state
-                visited_ids: Set[str] = set()
-                while current.defect_state_id not in visited_ids:
-                    if current.fingerprint == seed.defect_fingerprint:
-                        return True
-                    visited_ids.add(current.defect_state_id)
-                    parent_id = current.derived_from_defect_state_id
-                    if not parent_id:
-                        return False
-                    parent = defect_states_by_id.get(parent_id)
-                    if parent is None:
-                        return False
-                    current = parent
-                return False
-
-            for seed in seed_results:
-                if seed.outcome != "confirmed_root":
-                    if seed.confirmed_root_refs:
-                        raise ValueError(
-                            "non-confirmed seed cannot retain confirmed_root_refs"
-                        )
-                    continue
-                if not seed.confirmed_root_refs or not seed.confirmation_identities:
-                    raise ValueError(
-                        "confirmed_root seed requires root refs and confirmation identities"
-                    )
-                bound_refs: Set[str] = set()
-                bound_identities: Set[str] = set()
-                for root in published_roots:
-                    confirmation_payload = root.confirmation
-                    identity = str(
-                        confirmation_payload.get("confirmation_identity") or ""
-                    )
-                    confirmation = confirmation_by_identity.get(identity)
-                    if (
-                        root.node_ref in seed.confirmed_root_refs
-                        and identity in seed.confirmation_identities
-                        and confirmation is not None
-                        and confirmation
-                        == RootConfirmation.from_dict(_thaw(confirmation_payload))
-                        and confirmation.status == "confirmed"
-                        and confirmation.defect_fingerprint
-                        == root.defect_state.fingerprint
-                        and root_defect_is_bound_to_seed(root, seed)
-                        and seed.start_ref in root.observed_defect_refs
-                    ):
-                        bound_refs.add(root.node_ref)
-                        bound_identities.add(identity)
-                if (
-                    bound_refs != set(seed.confirmed_root_refs)
-                    or not bound_identities
-                ):
-                    raise ValueError(
-                        "confirmed_root seed is not bound to top-level confirmed roots"
-                    )
         metadata = _json_dict(value.get("metadata"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
             migrated_states = [
@@ -2274,4 +2318,5 @@ __all__ = [
     "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
+    "seed_binding_identity_for",
 ]

@@ -212,7 +212,18 @@ def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[De
 
 def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -> JsonDict:
     hydrated = graph.hydrate_node(candidate.ref)
-    edge = graph.sanitize_edge_evidence(candidate.edge)
+    edge = {
+        key: value
+        for key, value in graph.sanitize_edge_evidence(candidate.edge).items()
+        if key not in {"score", "retrieval_score"}
+        and not (
+            key == "confidence"
+            and (
+                bool(candidate.edge.get("retrieval_candidate"))
+                or not bool(candidate.edge.get("eligible_for_attribution"))
+            )
+        )
+    }
     candidate_evidence_refs = graph.filter_evidence_refs(candidate.evidence_refs)
     edge_evidence_references = [
         ground_reference(graph, ref, edge_provenance_class(edge))
@@ -224,7 +235,6 @@ def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -
         "ref": candidate.ref,
         "reference": ground_reference(graph, candidate.ref, edge_provenance_class(edge)),
         "source": candidate.source,
-        "score": candidate.score,
         "edge": edge,
         "edge_endpoint_references": {
             "from": ground_reference(graph, edge.get("from_ref") or candidate.ref, edge_provenance_class(edge)),

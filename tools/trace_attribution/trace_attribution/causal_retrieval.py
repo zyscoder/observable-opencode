@@ -12,7 +12,7 @@ from .graph import (
     TraceGraph,
     is_temporal_only_edge,
 )
-from .models import TraceNode
+from .models import TraceNode, stable_json
 from .progress import progress_navigation_window
 
 
@@ -298,6 +298,90 @@ def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limi
                 selected[existing] = (layer_index, min(existing_ordinal, ordinal), candidate)
     selected.sort(key=lambda item: (item[0], -item[2].score, item[1], item[2].ref))
     return [item[2] for item in selected[:limit]]
+
+
+def canonical_candidate_route(
+    graph: TraceGraph,
+    resolved_ref: str,
+    routes: Sequence[CausalCandidate],
+) -> CausalCandidate:
+    """Choose stable route facts while retaining score only for ref ranking."""
+    if not routes:
+        raise ValueError("candidate route group cannot be empty")
+    recorded_routes: List[Tuple[int, str, Mapping[str, Any]]] = []
+    for route in routes:
+        target_ref = graph.resolve(str(route.edge.get("to_ref") or ""))
+        if not target_ref:
+            continue
+        for edge in graph.edge_context(resolved_ref, target_ref):
+            evidence_type = str(edge.get("evidence_type") or "")
+            if (
+                str(edge.get("relation") or "")
+                == str(route.edge.get("relation") or "")
+                and evidence_type
+                == str(route.edge.get("evidence_type") or "")
+            ):
+                confirmed = evidence_type in {"confirmed", "content_matched"}
+                recorded_routes.append(
+                    (
+                        0 if confirmed else 1,
+                        "confirmed_edge" if confirmed else "attribution_edge",
+                        edge,
+                    )
+                )
+    if recorded_routes:
+        _, source, edge = min(
+            recorded_routes,
+            key=lambda item: (
+                item[0],
+                str(item[2].get("relation") or ""),
+                stable_json(item[2]),
+            ),
+        )
+        canonical = routes[0]
+        return CausalCandidate(
+            ref=resolved_ref,
+            node=canonical.node,
+            source=source,
+            edge=dict(edge),
+            score=max(route.score for route in routes),
+            evidence_refs=tuple(
+                sorted(
+                    {
+                        *(ref for route in routes for ref in route.evidence_refs),
+                        *(str(ref) for ref in edge.get("evidence_refs") or ()),
+                    }
+                )
+            ),
+        )
+
+    def route_key(route: CausalCandidate) -> Tuple[int, str, str, str]:
+        edge = {
+            str(key): value
+            for key, value in route.edge.items()
+            if str(key) not in {"confidence", "score", "retrieval_score"}
+        }
+        return (
+            0
+            if bool(edge.get("eligible_for_attribution"))
+            and not bool(edge.get("retrieval_candidate"))
+            else 1,
+            route.source,
+            str(edge.get("relation") or ""),
+            stable_json(edge),
+        )
+
+    canonical = min(routes, key=route_key)
+    return CausalCandidate(
+        ref=resolved_ref,
+        node=canonical.node,
+        source=canonical.source,
+        edge=dict(canonical.edge),
+        score=max(route.score for route in routes),
+        evidence_refs=tuple(
+            sorted({ref for route in routes for ref in route.evidence_refs})
+        ),
+    )
 
 
 def bound_provenance_envelopes(

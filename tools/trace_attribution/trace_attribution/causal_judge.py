@@ -159,6 +159,7 @@ class RootConfirmationRequest:
     analysis_perspective: str
     hypothesis_id: str = ""
     hypothesis_semantic_hash: str = ""
+    seed_binding_identity: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recursive_path", tuple(str(item) for item in self.recursive_path))
@@ -196,6 +197,7 @@ class RootConfirmationRequest:
             "task_obligations": _thaw_json(self.task_obligations),
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
+            "seed_binding_identity": self.seed_binding_identity,
         }
 
 
@@ -1923,6 +1925,9 @@ class _ConfirmationFactTreeValidator:
                         if isinstance(recursive_path, (list, tuple))
                         else ()
                     ),
+                    seed_binding_identity=str(
+                        hypothesis.get("seed_binding_identity") or ""
+                    ),
                 )
                 if str(hypothesis.get("confirmation_identity") or "") != expected_identity:
                     self._error(path, "competitor confirmation identity is invalid")
@@ -2254,6 +2259,7 @@ def validate_recursive_confirmation(
         hypothesis_semantic_hash=request.hypothesis_semantic_hash,
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
+        seed_binding_identity=request.seed_binding_identity,
         factor_role=factor_role,
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
@@ -2290,6 +2296,11 @@ def bind_root_confirmation(
         raise ValueError("confirmation is cross-bound to another defect")
     if confirmation.recursive_path and confirmation.recursive_path != request.recursive_path:
         raise ValueError("confirmation is cross-bound to another recursive path")
+    if (
+        confirmation.seed_binding_identity
+        and confirmation.seed_binding_identity != request.seed_binding_identity
+    ):
+        raise ValueError("confirmation is cross-bound to another seed")
     allowed_factor_roles = {
         "confirmed": {"necessary_cause"},
         "rejected": {
@@ -2346,6 +2357,7 @@ def bind_root_confirmation(
         hypothesis_semantic_hash=request.hypothesis_semantic_hash,
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
+        seed_binding_identity=request.seed_binding_identity,
         factor_role=confirmation.factor_role,
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,

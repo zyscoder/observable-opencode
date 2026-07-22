@@ -16,6 +16,7 @@ from trace_attribution.causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
+    seed_binding_identity_for,
     semantic_visit_key,
 )
 from trace_attribution.models import TraceNode
@@ -70,7 +71,13 @@ def report_seed(
 
 
 def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:test-root"):
-    path = root.recursive_path or (root.node_ref,)
+    seed_ref = (
+        root.observed_defect_refs[0]
+        if root.observed_defect_refs
+        else "record:observed"
+    )
+    path = root.recursive_path or (root.node_ref, seed_ref)
+    seed_ref = path[-1]
     confirmation = replace(
         RootConfirmation.confirmed(
             root.node_ref,
@@ -84,11 +91,15 @@ def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:
         hypothesis_semantic_hash=semantic_hash,
         defect_fingerprint=root.defect_state.fingerprint,
         recursive_path=path,
+        seed_binding_identity=seed_binding_identity_for(
+            seed_ref, root.defect_state.fingerprint
+        ),
     )
     return replace(
         root,
         hypothesis_id=hypothesis_id,
         recursive_path=path,
+        observed_defect_refs=(seed_ref,),
         confirmation=confirmation.to_dict(),
     )
 
@@ -96,7 +107,12 @@ def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:
 def confirmation_for(root):
     if not root.confirmation:
         bound = modern_root(root)
-        for name in ("hypothesis_id", "recursive_path", "confirmation"):
+        for name in (
+            "hypothesis_id",
+            "recursive_path",
+            "observed_defect_refs",
+            "confirmation",
+        ):
             object.__setattr__(root, name, getattr(bound, name))
     return RootConfirmation.from_dict(dict(root.confirmation))
 
@@ -440,6 +456,9 @@ class CausalStateTest(unittest.TestCase):
             hypothesis_semantic_hash="semantic:first",
             defect_fingerprint=defect.fingerprint,
             recursive_path=path,
+            seed_binding_identity=seed_binding_identity_for(
+                path[-1], defect.fingerprint
+            ),
         )
         rejected = replace(
             RootConfirmation.rejected("record:decision", "The second claim is weaker."),
@@ -447,6 +466,9 @@ class CausalStateTest(unittest.TestCase):
             hypothesis_semantic_hash="semantic:second",
             defect_fingerprint=defect.fingerprint,
             recursive_path=path,
+            seed_binding_identity=seed_binding_identity_for(
+                path[-1], defect.fingerprint
+            ),
         )
         root = ConfirmedRoot(
             node_ref="record:decision",
@@ -456,17 +478,21 @@ class CausalStateTest(unittest.TestCase):
             confidence=confirmed.confidence,
             hypothesis_id="hyp:first",
             recursive_path=path,
+            observed_defect_refs=(path[-1],),
             confirmation=confirmed.to_dict(),
         )
 
         report = RecursiveAttributionReport(
             case_id="multi-identity",
             objective="Find roots.",
+            start_refs=(path[-1],),
             seed_results=[
                 report_seed(
                     "confirmed_root",
+                    start_ref=path[-1],
                     defect_state=defect,
                     root_refs=(root.node_ref,),
+                    confirmation_identities=(confirmed.confirmation_identity,),
                 )
             ],
             confirmations=[confirmed, rejected],
@@ -725,6 +751,9 @@ class CausalStateTest(unittest.TestCase):
             hypothesis_semantic_hash=hypothesis.semantic_hash,
             defect_fingerprint=defect_state.fingerprint,
             recursive_path=root_path,
+            seed_binding_identity=seed_binding_identity_for(
+                root_path[-1], defect_state.fingerprint
+            ),
         )
         root = ConfirmedRoot(
             node_ref=node.ref,
@@ -918,6 +947,7 @@ class CausalStateTest(unittest.TestCase):
             case_id="no-root",
             objective="Find the root.",
             analysis_outcome="root_found",
+            start_refs=["record:observed"],
             seed_results=[report_seed("no_defect")],
         )
         self.assertEqual(root_found.analysis_outcome, "no_defect")
@@ -926,6 +956,7 @@ class CausalStateTest(unittest.TestCase):
             case_id="no-partial-root",
             objective="Find the root.",
             analysis_outcome="partial_root_found",
+            start_refs=["record:observed"],
             seed_results=[report_seed("inconclusive")],
             unresolved_refs=["record:change"],
         )
@@ -942,11 +973,15 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="mixed-identities",
             objective="Find the root.",
+            start_refs=["record:observed", "record:other"],
             seed_results=[
                 report_seed(
                     "confirmed_root",
                     defect_state=root.defect_state,
                     root_refs=(root.node_ref,),
+                    confirmation_identities=(
+                        confirmation_for(root).confirmation_identity,
+                    ),
                 ),
                 report_seed("evidence_gap", start_ref="record:other"),
             ],
@@ -1013,12 +1048,16 @@ class CausalStateTest(unittest.TestCase):
             RecursiveAttributionReport(
                 case_id="unknown-with-root",
                 objective="Find the root.",
+                start_refs=["record:observed", "record:prompt"],
                 confirmed_roots=[root],
                 seed_results=[
                     report_seed(
                         "confirmed_root",
                         defect_state=root.defect_state,
                         root_refs=(root.node_ref,),
+                        confirmation_identities=(
+                            confirmation_for(root).confirmation_identity,
+                        ),
                     ),
                     report_seed("evidence_gap", start_ref="record:prompt"),
                 ],
@@ -1082,11 +1121,15 @@ class CausalStateTest(unittest.TestCase):
         partial = RecursiveAttributionReport(
             case_id="root-plus-unknown-step",
             objective="Find root.",
+            start_refs=["record:observed", "record:change"],
             seed_results=[
                 report_seed(
                     "confirmed_root",
                     defect_state=root.defect_state,
                     root_refs=(root.node_ref,),
+                    confirmation_identities=(
+                        confirmation_for(root).confirmation_identity,
+                    ),
                 ),
                 report_seed("evidence_gap", start_ref="record:change"),
             ],
@@ -1126,6 +1169,7 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="resolved-rejudgment",
             objective="Find root.",
+            start_refs=["record:observed"],
             seed_results=[report_seed("no_defect")],
             step_judgments=[earlier, later],
         )
@@ -1144,11 +1188,15 @@ class CausalStateTest(unittest.TestCase):
                 case_id="root-overrides-caller",
                 objective="Find the root.",
                 analysis_outcome="no_defect",
+                start_refs=["record:observed"],
                 seed_results=[
                     report_seed(
                         "confirmed_root",
                         defect_state=root.defect_state,
                         root_refs=(root.node_ref,),
+                        confirmation_identities=(
+                            confirmation_for(root).confirmation_identity,
+                        ),
                     )
                 ],
                 confirmed_roots=[root],
@@ -1161,6 +1209,7 @@ class CausalStateTest(unittest.TestCase):
                 case_id="unresolved-overrides-caller",
                 objective="Find the root.",
                 analysis_outcome="no_defect",
+                start_refs=["record:observed"],
                 seed_results=[report_seed("inconclusive")],
                 unresolved_refs=["record:change"],
             ).analysis_outcome,
@@ -1200,11 +1249,15 @@ class CausalStateTest(unittest.TestCase):
                 case_id="partial-metadata",
                 objective="Find the root.",
                 analysis_outcome="no_defect",
+                start_refs=["record:observed", "record:provider"],
                 seed_results=[
                     report_seed(
                         "confirmed_root",
                         defect_state=root.defect_state,
                         root_refs=(root.node_ref,),
+                        confirmation_identities=(
+                            confirmation_for(root).confirmation_identity,
+                        ),
                     ),
                     report_seed("evidence_gap", start_ref="record:provider"),
                 ],

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
-from .causal_retrieval import root_candidate_eligible
+from .causal_retrieval import canonical_candidate_route, root_candidate_eligible
 from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
@@ -122,17 +122,20 @@ def build_candidate_evidence_capsules(
     start_refs: Sequence[str],
 ) -> Tuple[CandidateEvidenceCapsule, ...]:
     selected: Dict[str, CausalCandidate] = {}
+    routes_by_ref: Dict[str, List[CausalCandidate]] = {}
     order: List[str] = []
     for candidate in candidates:
         resolved = graph.resolve(candidate.ref) or candidate.ref
         if resolved not in graph.nodes or not graph.evidence_eligible(resolved):
             continue
-        existing = selected.get(resolved)
-        if existing is None:
+        if resolved not in routes_by_ref:
             order.append(resolved)
-            selected[resolved] = candidate
-        elif candidate.score > existing.score:
-            selected[resolved] = candidate
+            routes_by_ref[resolved] = []
+        routes_by_ref[resolved].append(candidate)
+    for ref in order:
+        selected[ref] = canonical_candidate_route(
+            graph, ref, routes_by_ref[ref]
+        )
 
     capsules: List[CandidateEvidenceCapsule] = []
     for ref in order:
@@ -155,7 +158,14 @@ def build_candidate_evidence_capsules(
         retrieval_edge = {
             key: value
             for key, value in graph.sanitize_edge_evidence(candidate.edge).items()
-            if key not in {"confidence", "score", "retrieval_score"}
+            if key not in {"score", "retrieval_score"}
+            and not (
+                key == "confidence"
+                and (
+                    bool(candidate.edge.get("retrieval_candidate"))
+                    or not bool(candidate.edge.get("eligible_for_attribution"))
+                )
+            )
         }
         evidence_refs = _dedupe_strings(
             graph.filter_evidence_refs(
