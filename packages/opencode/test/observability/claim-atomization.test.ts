@@ -19,6 +19,15 @@ describe("claim atomization", () => {
     expect(claims[0]!.text).not.toMatch(/^[,，;；)）\]］}｝]/)
   })
 
+  test("preserves parenthetical bracket state across line boundaries", () => {
+    const response = "The result (see\nthe detailed source). All 11 tests pass."
+
+    expect(atomizeResponseClaims(response).map((claim) => claim.text)).toEqual([
+      "The result (see the detailed source).",
+      "All 11 tests pass.",
+    ])
+  })
+
   test("uses UTF-8 byte offsets and preserves claim order", () => {
     const response = "修改完成。All 11 tests pass."
     const claims = atomizeResponseClaims(response)

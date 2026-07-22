@@ -84,8 +84,10 @@ function stripResponseClaimScaffolding(input: string) {
 function splitClaimSpans(input: string): ClaimSpan[] {
   const spans: ClaimSpan[] = []
   const protectedOffsets = protectedClaimOffsets(input)
+  const stack: string[] = []
   let lineStart = 0
   let inFence = false
+  let spanStart: number | undefined
 
   for (let index = 0; index <= input.length; index++) {
     if (index !== input.length && input[index] !== "\n") continue
@@ -95,11 +97,23 @@ function splitClaimSpans(input: string): ClaimSpan[] {
       inFence = !inFence
     } else if (!inFence) {
       const contentStart = claimLineContentStart(input, lineStart, lineEnd)
-      if (contentStart < lineEnd) splitLineClaimSpans(input, contentStart, lineEnd, protectedOffsets, spans)
+      if (contentStart < lineEnd) {
+        if (spanStart === undefined || isMarkdownListItem(input, lineStart, lineEnd)) {
+          if (spanStart !== undefined) pushTrimmedSpan(input, spanStart, lineStart, spans)
+          spanStart = contentStart
+          stack.length = 0
+        }
+        spanStart = splitLineClaimSpans(input, contentStart, lineEnd, protectedOffsets, spans, stack, spanStart)
+        if (!stack.length) {
+          pushTrimmedSpan(input, spanStart, lineEnd, spans)
+          spanStart = undefined
+        }
+      }
     }
     lineStart = index + 1
   }
 
+  if (spanStart !== undefined) pushTrimmedSpan(input, spanStart, input.length, spans)
   return spans
 }
 
@@ -110,14 +124,19 @@ function claimLineContentStart(input: string, lineStart: number, lineEnd: number
   return marker ? start + marker[0].length : start
 }
 
+function isMarkdownListItem(input: string, lineStart: number, lineEnd: number) {
+  return /^\s*(?:[-*]|\d+\.)\s+/.test(input.slice(lineStart, lineEnd))
+}
+
 function splitLineClaimSpans(
   input: string,
   start: number,
   end: number,
   protectedOffsets: Set<number>,
   output: ClaimSpan[],
+  stack: string[],
+  spanStart: number,
 ) {
-  const stack: string[] = []
   const closing = new Map([
     [")", "("],
     ["）", "（"],
@@ -127,7 +146,6 @@ function splitLineClaimSpans(
     ["｝", "｛"],
   ])
   const opening = new Set(closing.values())
-  let spanStart = start
 
   for (let index = start; index < end; index++) {
     const value = input[index]!
@@ -145,7 +163,7 @@ function splitLineClaimSpans(
     pushTrimmedSpan(input, spanStart, index + 1, output)
     spanStart = index + 1
   }
-  pushTrimmedSpan(input, spanStart, end, output)
+  return spanStart
 }
 
 function pushTrimmedSpan(input: string, start: number, end: number, output: ClaimSpan[]) {
