@@ -14,12 +14,14 @@ from trace_attribution.checkpoint import (
 )
 from trace_attribution.cli import (
     GracefulSignalState,
+    analysis_start_refs,
     atomic_write_json,
     judge_cache_output_path,
     lineage_output_path,
     parse_args,
     recursive_checkpoint_path,
 )
+from trace_attribution.graph import TraceGraph
 
 
 def output_config():
@@ -50,6 +52,28 @@ def output_config():
 
 
 class RecursiveCliTest(unittest.TestCase):
+    def test_explicit_ineligible_external_evaluation_start_is_rejected(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "ineligible-external-start",
+                "records": [
+                    {
+                        "record_id": "evaluation",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                        "status": "failed",
+                        "data": {
+                            "revision_status": "mismatched",
+                            "eligible_for_decisive_judgment": False,
+                        },
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "ineligible.*decisive judgment"):
+            analysis_start_refs(graph, ["record:evaluation"])
+
     def test_legacy_remains_default_and_existing_paths_are_unchanged(self):
         args = parse_args(["--trace", "/tmp/trace.json", "--out", "/tmp/result.json"])
         self.assertEqual(args.engine, "legacy")

@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 
 from trace_attribution.causal_state import AttributionHypothesis, CausalStepJudgment, DefectState, HypothesisEvidence
-from trace_attribution.causal_retrieval import SemanticPredecessorRetriever
+from trace_attribution.causal_retrieval import (
+    SemanticPredecessorRetriever,
+    root_candidate_eligible,
+)
 from trace_attribution.graph import TraceGraph
 from trace_attribution.judgment_context import build_recursive_judgment_context
 
@@ -288,6 +291,22 @@ def trace_with_artifact_evidence():
 
 
 class CausalRetrievalTest(unittest.TestCase):
+    def test_canonical_root_contract_excludes_external_evaluation_facts(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "canonical-root-contract",
+                "records": [
+                    {
+                        "record_id": "candidate",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                    }
+                ],
+            }
+        )
+
+        self.assertFalse(root_candidate_eligible(graph.nodes["record:candidate"]))
+
     def test_retriever_bounds_provenance_envelopes_and_keeps_the_semantic_match(self):
         records = []
         edges = []

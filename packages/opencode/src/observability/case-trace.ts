@@ -848,6 +848,14 @@ export type TraceManifest = {
   case_completed_at?: string
   collection_mode: "passive_sidecar"
   behavior_impact: "none" | "modified"
+  subject_revision?: string
+  subject_revision_provenance?: {
+    method: "case_trace_config" | "environment_variable"
+    source: "CaseTraceConfig.subjectRevision" | "OPENCODE_TRACE_SUBJECT_REVISION"
+    bound_at: "case_start"
+    case_id: string
+    run_id: string
+  }
   input?: Record<string, unknown>
   environment: Record<string, unknown>
   token_usage: TraceTokenUsage
@@ -1000,6 +1008,7 @@ export type TraceSummary = {
 type CaseTraceConfig = {
   caseID?: string
   traceDir?: string
+  subjectRevision?: string
   input?: Record<string, unknown>
   environment?: Record<string, unknown>
 }
@@ -4710,6 +4719,8 @@ class ActiveCaseTrace {
   private input: Record<string, unknown> | undefined
   private result: Record<string, unknown> | undefined
   private environment: Record<string, unknown>
+  private readonly subjectRevision: string | undefined
+  private readonly subjectRevisionProvenance: TraceManifest["subject_revision_provenance"]
   private spans = new Map<string, TraceSpan>()
   private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
@@ -4779,6 +4790,18 @@ class ActiveCaseTrace {
     this.partialDir = path.join(this.caseDir, "partial")
     this.partialFile = path.join(this.partialDir, "latest.json")
     this.input = config.input
+    const configuredSubjectRevision = config.subjectRevision?.trim()
+    const environmentSubjectRevision = process.env.OPENCODE_TRACE_SUBJECT_REVISION?.trim()
+    this.subjectRevision = configuredSubjectRevision || environmentSubjectRevision || undefined
+    this.subjectRevisionProvenance = this.subjectRevision
+      ? {
+          method: configuredSubjectRevision ? "case_trace_config" : "environment_variable",
+          source: configuredSubjectRevision ? "CaseTraceConfig.subjectRevision" : "OPENCODE_TRACE_SUBJECT_REVISION",
+          bound_at: "case_start",
+          case_id: this.caseID,
+          run_id: this.runID,
+        }
+      : undefined
     this.environment = {
       cwd: process.cwd(),
       argv: process.argv.slice(2),
@@ -8295,6 +8318,8 @@ class ActiveCaseTrace {
       case_completed_at: caseStatus === "success" ? new Date(ended).toISOString() : undefined,
       collection_mode: "passive_sidecar",
       behavior_impact: "none",
+      subject_revision: this.subjectRevision,
+      subject_revision_provenance: this.subjectRevisionProvenance,
       input: this.input,
       environment: this.environment,
       token_usage: cloneTokenUsage(this.tokenUsage) ?? {},

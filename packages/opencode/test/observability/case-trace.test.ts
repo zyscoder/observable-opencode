@@ -311,6 +311,94 @@ function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partia
 }
 
 describe("case trace", () => {
+  test("captures config subject revision at case start and keeps it immutable", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-subject-revision-config-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subject-revision-config.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ subjectRevision: "git:config-start", environment: { revision: "git:legacy-untrusted" } })`,
+        `CaseTrace.configure({ subjectRevision: "git:late-change", environment: { revision: "git:legacy-changed" } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subject-revision-config",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_TRACE_SUBJECT_REVISION: "git:env-fallback",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await proc.exited).toBe(0)
+
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dir, "subject-revision-config", "manifest.json"), "utf8"),
+    ) as any
+    expect(manifest.subject_revision).toBe("git:config-start")
+    expect(manifest.subject_revision_provenance).toEqual({
+      method: "case_trace_config",
+      source: "CaseTraceConfig.subjectRevision",
+      bound_at: "case_start",
+      case_id: manifest.case_id,
+      run_id: manifest.run_id,
+    })
+    expect(manifest.environment.revision).toBe("git:legacy-changed")
+  })
+
+  test("lazy serve path captures dedicated subject revision environment variable", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-subject-revision-env-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "subject-revision-env.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "runtime", event_type: "serve.lazy.start" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "subject-revision-env",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_TRACE_SUBJECT_REVISION: "git:serve-env",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await proc.exited).toBe(0)
+
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(dir, "subject-revision-env", "manifest.json"), "utf8"),
+    ) as any
+    expect(manifest.subject_revision).toBe("git:serve-env")
+    expect(manifest.subject_revision_provenance).toEqual({
+      method: "environment_variable",
+      source: "OPENCODE_TRACE_SUBJECT_REVISION",
+      bound_at: "case_start",
+      case_id: manifest.case_id,
+      run_id: manifest.run_id,
+    })
+  })
+
   test("writes trace semantic contract v6.0 bundle with trace.html as the only HTML entry point", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

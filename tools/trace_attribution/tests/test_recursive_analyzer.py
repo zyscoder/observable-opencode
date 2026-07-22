@@ -817,6 +817,80 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(report.defect_states[0].label, "missing_namespace_contract")
         self.assertEqual(report.metadata["seed_count"], 1)
 
+    def test_external_evaluation_seed_preserves_expected_actual_scope_and_status(self):
+        trace = observed_trace()
+        trace["records"][-1] = {
+            "record_id": "external_evaluation",
+            "component": "evaluation",
+            "event_type": "external.evaluation_fact",
+            "status": "failed",
+            "source_refs": ["record:change"],
+            "data": {
+                "assertion": "Cleanup completes after SIGINT.",
+                "observation": "Cleanup was interrupted.",
+                "scope": "process_sigint_behavior",
+                "status": "failed",
+                "revision_status": "matched",
+                "eligible_for_decisive_judgment": True,
+            },
+        }
+        state = RecursiveAnalysisState.create(
+            graph=TraceGraph.from_trace(trace),
+            start_refs=["record:external_evaluation"],
+            objective="Generic objective text must not replace benchmark semantics.",
+            analysis_perspective="Find the cause.",
+        )
+
+        defect = next(iter(state.defect_states.values()))
+        self.assertEqual(defect.expected, "Cleanup completes after SIGINT.")
+        self.assertEqual(defect.actual, "Cleanup was interrupted.")
+        self.assertEqual(defect.scope, "process_sigint_behavior")
+        self.assertEqual(defect.label, "external_evaluation_failed")
+
+    def test_ineligible_external_evaluation_start_never_reaches_recursive_judge(self):
+        for status, revision_status in (
+            ("failed", "mismatched"),
+            ("failed", "missing"),
+            ("passed", "matched"),
+            ("unknown", "matched"),
+        ):
+            with self.subTest(status=status, revision_status=revision_status):
+                trace = observed_trace()
+                trace["records"][-1] = {
+                    "record_id": "external_evaluation",
+                    "component": "evaluation",
+                    "event_type": "external.evaluation_fact",
+                    "status": status,
+                    "source_refs": ["record:change"],
+                    "data": {
+                        "assertion": "Cleanup completes.",
+                        "observation": "Observed outcome.",
+                        "scope": "cleanup",
+                        "status": status,
+                        "revision_status": revision_status,
+                        "eligible_for_decisive_judgment": False,
+                    },
+                }
+                judge = ScriptedCausalJudge(
+                    {"record:change": step("record:change", introduction=True)}
+                )
+
+                report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:external_evaluation"],
+                    objective="Find the cause.",
+                )
+
+                self.assertEqual(report.step_judgments, ())
+                self.assertEqual(report.metadata["seed_count"], 0)
+                self.assertIn(
+                    "start_ref_ineligible",
+                    [
+                        item["reason"]
+                        for item in report.metadata["unresolved_branches"]
+                    ],
+                )
+
     def test_evaluation_seed_prefers_progress_navigation_over_parallel_outcome_surfaces(self):
         trace = {
             "case_id": "progress-seed-priority",

@@ -6,7 +6,8 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .episodes import CausalEpisodeIndex
 from .errors import JudgeProviderUnavailable
-from .graph import TraceGraph
+from .causal_retrieval import root_candidate_eligible
+from .graph import TraceGraph, eligible_for_decisive_judgment
 from .judgment_context import build_causal_judgment_context
 from .models import (
     AttributionReport,
@@ -47,6 +48,11 @@ class BackwardTaintAnalyzer:
     ) -> AttributionReport:
         starts = [graph.resolve(ref) or ref for ref in (start_refs or graph.default_start_refs())]
         starts = [ref for ref in starts if ref in graph.nodes]
+        starts = [
+            ref
+            for ref in starts
+            if eligible_for_decisive_judgment(graph.nodes[ref])
+        ]
         episode_index = CausalEpisodeIndex.from_graph(graph)
         branches = [
             self._analyze_branch(
@@ -348,6 +354,8 @@ class BackwardTaintAnalyzer:
                     continue
                 if is_offline_aggregate(node):
                     continue
+                if not root_candidate_eligible(node):
+                    continue
                 if judgment.causal_role != "defect_introduction" or not judgment.is_root_cause:
                     continue
                 candidate = RootCauseCandidate(
@@ -396,6 +404,8 @@ class BackwardTaintAnalyzer:
             if not node:
                 continue
             if is_evaluation_assertion(node):
+                continue
+            if not root_candidate_eligible(node):
                 continue
             if any(status == "unknown" for status in upstream_statuses):
                 continue
@@ -878,11 +888,16 @@ def dedupe_paths(paths: Iterable[List[str]]) -> List[List[str]]:
 
 
 def is_evaluation_assertion(node: TraceNode) -> bool:
-    return node.event_type in ("case.observed_defect", "case.quality_gap", "case.missing_semantic")
+    return node.event_type in (
+        "case.observed_defect",
+        "case.quality_gap",
+        "case.missing_semantic",
+        "external.evaluation_fact",
+    )
 
 
 def is_promotable_first_observed_boundary(node: TraceNode) -> bool:
-    return node.event_type not in {
+    return root_candidate_eligible(node) and node.event_type not in {
         "progress.episode",
         "response.claim",
         "claim.support_assessment",

@@ -19,7 +19,11 @@ from .checkpoint import (
 )
 from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
 from .evaluation_facts import inject_external_evaluation_facts
-from .graph import TraceGraph, artifact_root_for_trace_path
+from .graph import (
+    TraceGraph,
+    artifact_root_for_trace_path,
+    eligible_for_decisive_judgment,
+)
 from .models import stable_json
 from .quality_review import inject_quality_gap_records
 from .recursive_analyzer import AgenticRecursiveAnalyzer
@@ -160,6 +164,10 @@ def main() -> int:
         Path(args.review) if args.review else None,
         [Path(path) for path in args.evaluation],
     )
+    try:
+        starts = analysis_start_refs(graph, args.start_ref)
+    except ValueError as exc:
+        raise SystemExit("error: {0}".format(exc)) from exc
     out = Path(args.out)
     cache_path = judge_cache_output_path(out, args.judge_cache)
     transport = ClaudeJudgeClient(
@@ -176,7 +184,6 @@ def main() -> int:
     if args.engine == "recursive-agentic":
         checkpoint_path = recursive_checkpoint_path(out, args.checkpoint_dir)
         lineage_out = lineage_output_path(out, args.lineage_out)
-        starts = tuple(args.start_ref or graph.default_start_refs())
         budgets = {
             "max_frontier_items": args.max_frontier_items,
             "max_depth": args.max_depth,
@@ -267,7 +274,7 @@ def main() -> int:
             judge=transport, max_depth=args.max_depth, max_nodes=args.max_nodes
         ).analyze(
             graph,
-            start_refs=args.start_ref or None,
+            start_refs=starts,
             objective=args.objective,
         )
         atomic_write_json(out, attribution_output_payload(report, graph))
@@ -275,6 +282,25 @@ def main() -> int:
         atomic_write_json(lineage_out, graph.message_lineage)
     print(str(out))
     return 0
+
+
+def analysis_start_refs(
+    graph: TraceGraph, explicit_refs: Iterable[str]
+) -> tuple[str, ...]:
+    requested = tuple(explicit_refs)
+    if not requested:
+        return tuple(graph.default_start_refs())
+    resolved = tuple(graph.resolve(ref) or ref for ref in requested)
+    for requested_ref, resolved_ref in zip(requested, resolved):
+        node = graph.nodes.get(resolved_ref)
+        if node is None or eligible_for_decisive_judgment(node):
+            continue
+        raise ValueError(
+            "--start-ref {0} resolves to an external evaluation fact that is ineligible for decisive judgment".format(
+                requested_ref
+            )
+        )
+    return resolved
 
 
 def attribution_output_payload(report: Any, graph: TraceGraph) -> dict[str, Any]:

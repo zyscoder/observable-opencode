@@ -16,12 +16,11 @@ from .models import JsonDict, TraceNode, stable_json
 CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v1"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
-GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
+GLOBAL_EVIDENCE_ONLY_EVENT_TYPES = frozenset(
     {
         "claim.support_assessment",
         "evidence.fact",
         "evidence.semantic_fact",
-        "external.evaluation_fact",
         "tool.result",
         "verification",
     }
@@ -177,7 +176,7 @@ def build_candidate_evidence_capsules(
                     "retrieval_is_not_causal_verdict": True,
                     "root_candidate_eligible": (
                         root_candidate_eligible(node)
-                        and node.event_type not in GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES
+                        and node.event_type not in GLOBAL_EVIDENCE_ONLY_EVENT_TYPES
                     ),
                     "retrieval_edge": dict(candidate.edge),
                     "node": node.compact(max_chars=3200),

@@ -704,9 +704,7 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type == "external.evaluation_fact"
-            and node.data.get("status") == "failed"
-            and node.data.get("revision_status") == "matched"
-            and node.data.get("eligible_for_decisive_judgment") is True
+            and eligible_for_decisive_judgment(node)
         ]
         if external_evaluation_starts:
             return dedupe(external_evaluation_starts)
@@ -805,6 +803,17 @@ def artifact_root_for_trace_path(trace_path: Path, trace: JsonDict) -> Path:
             root = root.parent
         return root
     return path.parent
+
+
+def eligible_for_decisive_judgment(node: TraceNode) -> bool:
+    if node.event_type != "external.evaluation_fact":
+        return True
+    return (
+        node.status == "failed"
+        and node.data.get("status") == "failed"
+        and node.data.get("revision_status") == "matched"
+        and node.data.get("eligible_for_decisive_judgment") is True
+    )
 
 
 def hydrate_record_artifacts(

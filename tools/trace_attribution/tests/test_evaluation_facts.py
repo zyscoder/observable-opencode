@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,13 +15,25 @@ from trace_attribution.graph import TraceGraph
 from trace_attribution.models import stable_json
 
 
-def base_trace(revision: str | None = "git:abc123"):
-    environment = {"revision": revision} if revision is not None else {}
+def base_trace(revision: str | None = "git:abc123", *, provenanced: bool = True):
+    manifest = {
+        "case_id": "external-evaluation-case",
+        "run_id": "external-evaluation-run",
+        "started_at": "2026-07-21T11:59:00Z",
+        "environment": {"revision": "git:untrusted-legacy"},
+    }
+    if revision is not None:
+        manifest["subject_revision"] = revision
+        if provenanced:
+            manifest["subject_revision_provenance"] = {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": manifest["case_id"],
+                "run_id": manifest["run_id"],
+            }
     return {
-        "manifest": {
-            "case_id": "external-evaluation-case",
-            "environment": environment,
-        },
+        "manifest": manifest,
         "records": [
             {
                 "record_id": "tool_result",
@@ -97,6 +110,43 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
         self.assertFalse(fact.data["eligible_for_decisive_judgment"])
         self.assertNotIn(fact.ref, graph.default_start_refs())
 
+    def test_legacy_environment_revision_and_unbound_formal_revision_fail_closed(self):
+        for trace, expected_status in (
+            (base_trace(revision=None), "missing"),
+            (base_trace(provenanced=False), "unprovenanced"),
+        ):
+            with self.subTest(expected_status=expected_status):
+                graph = TraceGraph.from_trace(
+                    inject_external_evaluation_facts(trace, [evaluation_payload()])
+                )
+                fact = next(
+                    node
+                    for node in graph.nodes.values()
+                    if node.event_type == "external.evaluation_fact"
+                )
+                self.assertEqual(fact.data["revision_status"], expected_status)
+                self.assertIs(fact.data["eligible_for_decisive_judgment"], False)
+                self.assertNotIn(fact.ref, graph.default_start_refs())
+
+    def test_revision_provenance_must_bind_the_revision_to_this_run_and_case_start(self):
+        invalid_bindings = [
+            {"case_id": "different-case"},
+            {"run_id": "different-run"},
+            {"bound_at": "after_case_start"},
+            {"method": "repository_inspection"},
+            {"source": "config.environment.revision"},
+        ]
+        for override in invalid_bindings:
+            with self.subTest(override=override):
+                trace = base_trace()
+                trace["manifest"]["subject_revision_provenance"].update(override)
+                enriched = inject_external_evaluation_facts(
+                    trace, [evaluation_payload()]
+                )
+                fact = enriched["records"][-1]["data"]
+                self.assertEqual(fact["revision_status"], "unprovenanced")
+                self.assertIs(fact["eligible_for_decisive_judgment"], False)
+
     def test_passed_and_unknown_facts_are_not_decisive_or_default_starts(self):
         for status in ("passed", "unknown"):
             with self.subTest(status=status):
@@ -138,6 +188,45 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
                         base_trace(), [evaluation_payload(status=status)]
                     )
 
+    def test_rejects_empty_trimmed_strings_malformed_timestamps_and_bad_evidence_refs(self):
+        invalid_payloads = [
+            (evaluation_payload(source="  \t"), "source"),
+            (evaluation_payload(assertion="\n"), "assertion"),
+            (evaluation_payload(observed_at="2026-07-21"), "observed_at"),
+            (evaluation_payload(observed_at="2026-07-21T12:00:00"), "observed_at"),
+            (evaluation_payload(observed_at="not-a-timestamp"), "observed_at"),
+            (evaluation_payload(evidence_refs=[]), "evidence_refs"),
+            (evaluation_payload(evidence_refs=["  "]), "evidence_refs"),
+            (
+                evaluation_payload(
+                    evidence_refs=["record:tool_result", "record:tool_result"]
+                ),
+                "unique",
+            ),
+        ]
+        for payload, message in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(ValueError, message):
+                    inject_external_evaluation_facts(base_trace(), [payload])
+
+    def test_rejects_empty_or_non_json_safe_provenance(self):
+        invalid_provenance = [
+            {},
+            {"method": "", "version": "1.0"},
+            {"method": "grader", "version": "  "},
+            {"method": "grader", "version": True},
+            {"method": "grader", "version": "1.0", "score": math.nan},
+            {"method": "grader", "version": "1.0", "score": math.inf},
+            {"method": "grader", "version": "1.0", "nested": {1: "bad"}},
+            {"method": "grader", "version": "1.0", "nested": {"bad"}},
+        ]
+        for provenance in invalid_provenance:
+            with self.subTest(provenance=provenance):
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    inject_external_evaluation_facts(
+                        base_trace(), [evaluation_payload(provenance=provenance)]
+                    )
+
     def test_record_id_uses_normalized_payload_hash_and_repeated_payload_is_idempotent(self):
         payload = evaluation_payload()
         expected = "external_evaluation_{0}".format(
@@ -176,6 +265,39 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
         self.assertEqual(
             fact["data"]["unresolved_evidence_refs"], ["record:not_present"]
         )
+
+    def test_ambiguous_evidence_alias_stays_unresolved_without_an_edge(self):
+        trace = base_trace()
+        trace["records"].append(
+            {
+                "record_id": "other_tool_result",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {"call_id": "grader_probe"},
+            }
+        )
+        payload = evaluation_payload(evidence_refs=["tool_result:grader_probe"])
+
+        enriched = inject_external_evaluation_facts(trace, [payload])
+
+        self.assertEqual(enriched["dataflow_edges"], [])
+        self.assertEqual(
+            enriched["records"][-1]["data"]["unresolved_evidence_refs"],
+            ["tool_result:grader_probe"],
+        )
+
+    def test_generated_edge_id_is_idempotent_only_for_the_full_semantic_edge(self):
+        payload = evaluation_payload()
+        once = inject_external_evaluation_facts(base_trace(), [payload])
+        edge = copy.deepcopy(once["dataflow_edges"][0])
+
+        identical = inject_external_evaluation_facts(once, [payload])
+        self.assertEqual(identical["dataflow_edges"], [edge])
+
+        collided = copy.deepcopy(once)
+        collided["dataflow_edges"][0]["relation"] = "incompatible_relation"
+        with self.assertRaisesRegex(ValueError, "edge ID collision"):
+            inject_external_evaluation_facts(collided, [payload])
 
     def test_repeatable_cli_evaluations_load_after_review_in_argument_order(self):
         with tempfile.TemporaryDirectory() as directory:

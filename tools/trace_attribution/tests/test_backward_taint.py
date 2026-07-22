@@ -3090,6 +3090,50 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
             [gap["gap_type"] for gap in report.trace_improvement_report["blocking_gaps"]],
         )
 
+    def test_legacy_analyzer_never_judges_or_roots_external_evaluation_fact(self):
+        fact_ref = "record:external_evaluation"
+        judge = FakeJudge(
+            {
+                fact_ref: NodeJudgment(
+                    node_ref=fact_ref,
+                    component="evaluation",
+                    event_type="external.evaluation_fact",
+                    has_defect=True,
+                    defect_status="present",
+                    defect_type="external_failure",
+                    defect_reason="The evaluator reported a failure.",
+                    causal_role="defect_introduction",
+                    is_root_cause=True,
+                    confidence=1.0,
+                )
+            }
+        )
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "legacy-external-root-exclusion",
+                "records": [
+                    {
+                        "record_id": "external_evaluation",
+                        "component": "evaluation",
+                        "event_type": "external.evaluation_fact",
+                        "status": "failed",
+                        "data": {
+                            "status": "failed",
+                            "revision_status": "matched",
+                            "eligible_for_decisive_judgment": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        report = BackwardTaintAnalyzer(judge=judge).analyze(
+            graph, start_refs=[fact_ref]
+        )
+
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(report.root_causes, [])
+
     def test_trace_without_analysis_start_is_inconclusive(self):
         report = BackwardTaintAnalyzer(judge=FakeJudge({}), max_depth=8).analyze(
             TraceGraph.from_trace({"case_id": "empty-case", "records": []})

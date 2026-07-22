@@ -51,7 +51,7 @@ from .global_judge import (
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
 )
-from .graph import TraceGraph
+from .graph import TraceGraph, eligible_for_decisive_judgment
 from .hypotheses import HypothesisLedger, RecursiveFrontier
 from .investigation import (
     AttributionControlDirective,
@@ -170,6 +170,27 @@ def _first_semantic_value(data: Mapping[str, Any], keys: Sequence[str], fallback
 
 def _seed_defect_state(node: TraceNode, objective: str) -> DefectState:
     data = node.data
+    if node.event_type == "external.evaluation_fact":
+        status = _first_semantic_value(
+            data, ("status",), node.status or "unknown"
+        ).lower()
+        return DefectState.create(
+            label="external_evaluation_{0}".format(status),
+            expected=_first_semantic_value(
+                data,
+                ("assertion",),
+                "The externally evaluated behavior satisfies its assertion.",
+            ),
+            actual=_first_semantic_value(
+                data,
+                ("observation",),
+                "The external evaluator did not record an observation.",
+            ),
+            mechanism="External evaluation status: {0}.".format(status),
+            scope=_first_semantic_value(
+                data, ("scope",), "external_evaluation"
+            ),
+        )
     if node.event_type == "response.claim":
         claim = _first_semantic_value(
             data,
@@ -743,6 +764,13 @@ class RecursiveAnalysisState:
             node = graph.nodes.get(start_ref)
             if node is None:
                 state._mark_seed_unresolved(start_ref, "start_ref_unresolved", "The start reference is absent.")
+                continue
+            if not eligible_for_decisive_judgment(node):
+                state._mark_seed_unresolved(
+                    start_ref,
+                    "start_ref_ineligible",
+                    "The external evaluation fact is ineligible for decisive judgment.",
+                )
                 continue
             defect_state = _seed_defect_state(node, objective)
             state._remember_defect(defect_state)
