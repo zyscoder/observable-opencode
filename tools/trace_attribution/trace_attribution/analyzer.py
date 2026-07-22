@@ -224,12 +224,23 @@ class BackwardTaintAnalyzer:
                     confidence=1.0,
                 )
             elif is_evaluation_assertion(node):
-                judge_evaluation_with_context = getattr(
-                    self.judge,
-                    "judge_evaluation_assertion_with_context",
-                    None,
+                external_outcome_boundary = (
+                    node.event_type == "external.evaluation_fact"
                 )
-                judge_evaluation = getattr(self.judge, "judge_evaluation_assertion", None)
+                judge_evaluation_with_context = (
+                    None
+                    if external_outcome_boundary
+                    else getattr(
+                        self.judge,
+                        "judge_evaluation_assertion_with_context",
+                        None,
+                    )
+                )
+                judge_evaluation = (
+                    None
+                    if external_outcome_boundary
+                    else getattr(self.judge, "judge_evaluation_assertion", None)
+                )
                 if callable(judge_evaluation_with_context) or callable(judge_evaluation):
                     try:
                         if callable(judge_evaluation_with_context):

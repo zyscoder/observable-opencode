@@ -24,6 +24,7 @@ from trace_attribution.claude import (
 from trace_attribution.cli import judge_cache_output_path, lineage_output_path, parse_args
 from trace_attribution.episodes import CausalEpisodeIndex
 from trace_attribution.errors import JudgeProviderUnavailable
+from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import NodeJudgment, TaintInfluence, judgment_from_dict, stable_json
 from trace_attribution.models import TraceNode
@@ -3091,48 +3092,88 @@ class BackwardTaintAnalyzerTest(unittest.TestCase):
         )
 
     def test_legacy_analyzer_never_judges_or_roots_external_evaluation_fact(self):
-        fact_ref = "record:external_evaluation"
-        judge = FakeJudge(
+        class ExternalBoundaryJudge(FakeJudge):
+            def __init__(self, judgments):
+                super().__init__(judgments)
+                self.evaluation_calls = []
+
+            def judge_evaluation_assertion(self, **kwargs):
+                self.evaluation_calls.append(kwargs["node"].ref)
+                raise AssertionError("external evaluation fact reached evaluation Judge")
+
+        trace = inject_external_evaluation_facts(
             {
-                fact_ref: NodeJudgment(
-                    node_ref=fact_ref,
-                    component="evaluation",
-                    event_type="external.evaluation_fact",
+                "manifest": {
+                    "case_id": "legacy-external-root-exclusion",
+                    "run_id": "legacy-external-root-exclusion-run",
+                    "subject_revision": "git:abc123",
+                    "subject_revision_provenance": {
+                        "method": "case_trace_config",
+                        "source": "CaseTraceConfig.subjectRevision",
+                        "bound_at": "case_start",
+                        "case_id": "legacy-external-root-exclusion",
+                        "run_id": "legacy-external-root-exclusion-run",
+                    },
+                },
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "Cleanup preservation was omitted."},
+                    }
+                ],
+                "dataflow_edges": [],
+            },
+            [
+                {
+                    "source": "terminalbench",
+                    "scope": "process_sigint_behavior",
+                    "subject_revision": "git:abc123",
+                    "assertion": "cleanup completes",
+                    "observation": "cleanup was interrupted",
+                    "status": "failed",
+                    "observed_at": "2026-07-21T12:00:00Z",
+                    "evidence_refs": ["record:decision"],
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                }
+            ],
+        )
+        fact_ref = "record:{0}".format(trace["records"][-1]["record_id"])
+        judge = ExternalBoundaryJudge(
+            {
+                "record:decision": NodeJudgment(
+                    node_ref="record:decision",
+                    component="processor",
+                    event_type="decision",
                     has_defect=True,
                     defect_status="present",
-                    defect_type="external_failure",
-                    defect_reason="The evaluator reported a failure.",
+                    defect_type="missing_cleanup_preservation",
+                    defect_reason="The decision omitted cleanup preservation.",
                     causal_role="defect_introduction",
                     is_root_cause=True,
-                    confidence=1.0,
+                    confidence=0.95,
                 )
             }
         )
-        graph = TraceGraph.from_trace(
-            {
-                "case_id": "legacy-external-root-exclusion",
-                "records": [
-                    {
-                        "record_id": "external_evaluation",
-                        "component": "evaluation",
-                        "event_type": "external.evaluation_fact",
-                        "status": "failed",
-                        "data": {
-                            "status": "failed",
-                            "revision_status": "matched",
-                            "eligible_for_decisive_judgment": True,
-                        },
-                    }
-                ],
-            }
-        )
+        graph = TraceGraph.from_trace(trace)
 
         report = BackwardTaintAnalyzer(judge=judge).analyze(
             graph, start_refs=[fact_ref]
         )
 
-        self.assertEqual(judge.calls, [])
-        self.assertEqual(report.root_causes, [])
+        self.assertTrue(graph.analysis_start_eligible(fact_ref))
+        self.assertEqual(judge.evaluation_calls, [])
+        self.assertEqual(judge.calls, ["record:decision"])
+        self.assertEqual(report.start_refs, [fact_ref])
+        self.assertEqual(report.visited_order, [fact_ref, "record:decision"])
+        self.assertFalse(report.node_judgments[fact_ref].is_root_cause)
+        self.assertEqual(
+            [item.node_ref for item in report.root_causes], ["record:decision"]
+        )
 
     def test_trace_without_analysis_start_is_inconclusive(self):
         report = BackwardTaintAnalyzer(judge=FakeJudge({}), max_depth=8).analyze(

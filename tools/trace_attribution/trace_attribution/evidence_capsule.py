@@ -125,7 +125,7 @@ def build_candidate_evidence_capsules(
     order: List[str] = []
     for candidate in candidates:
         resolved = graph.resolve(candidate.ref) or candidate.ref
-        if resolved not in graph.nodes:
+        if resolved not in graph.nodes or not graph.evidence_eligible(resolved):
             continue
         existing = selected.get(resolved)
         if existing is None:

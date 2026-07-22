@@ -72,36 +72,50 @@ def inject_external_evaluation_facts(
         if prior is not None and prior != edge:
             raise ValueError("existing edge ID collision for {0}".format(edge_id))
         existing_edges[edge_id] = edge
-    for index, candidate in enumerate(payloads):
-        payload = _validated_payload(candidate, index)
+    validated_payloads = [
+        _validated_payload(candidate, index)
+        for index, candidate in enumerate(payloads)
+    ]
+    for payload in validated_payloads:
+        record_id = _external_evaluation_record_id(payload)
+        ref = "record:{0}".format(record_id)
+        identity_record = {
+            "record_id": record_id,
+            "event_type": "external.evaluation_fact",
+            "data": {"evaluation_id": record_id},
+        }
+        for alias in record_aliases(identity_record):
+            aliases.setdefault(alias, set()).add(ref)
+
+    prepared: List[Tuple[JsonDict, JsonDict, List[Tuple[str, str]]]] = []
+    for payload in validated_payloads:
+        record_ref = "record:{0}".format(_external_evaluation_record_id(payload))
+        resolution_aliases = {
+            alias: owners - {record_ref}
+            for alias, owners in aliases.items()
+            if owners - {record_ref}
+        }
         record, resolved_evidence = _build_external_evaluation_record(
-            enriched, payload, aliases
+            enriched, payload, resolution_aliases
         )
+        record_id = str(record["record_id"])
+        ref = "record:{0}".format(record_id)
+        existing = records_by_ref.get(ref)
+        if existing is None:
+            records.append(record)
+            records_by_ref[ref] = record
+        elif existing != record:
+            raise ValueError(
+                "external evaluation record ID collision for {0}".format(record_id)
+            )
+        prepared.append((payload, record, resolved_evidence))
+
+    for payload, record, resolved_evidence in prepared:
         record_id = str(record["record_id"])
         data = record["data"]
         revision_status = str(data["revision_status"])
         trace_revision = data["trace_revision"]
         revision_provenance_status = str(data["revision_provenance_status"])
-        existing = next(
-            (
-                item
-                for item in records
-                if isinstance(item, dict) and item.get("record_id") == record_id
-            ),
-            None,
-        )
-        if existing is None:
-            records.append(record)
-            records_by_ref["record:{0}".format(record_id)] = record
-            for alias in record_aliases(record):
-                aliases.setdefault(alias, set()).add(
-                    "record:{0}".format(record_id)
-                )
-        elif existing != record:
-            raise ValueError(
-                "external evaluation record ID collision for {0}".format(record_id)
-            )
-
         for evidence_ref, resolved in resolved_evidence:
             edge_id = "external_evaluation_edge_{0}".format(
                 hashlib.sha256(
@@ -188,9 +202,7 @@ def _build_external_evaluation_record(
     payload: JsonDict,
     aliases: Dict[str, Set[str]],
 ) -> Tuple[JsonDict, List[Tuple[str, str]]]:
-    record_id = "external_evaluation_{0}".format(
-        hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()[:16]
-    )
+    record_id = _external_evaluation_record_id(payload)
     trace_revision, revision_provenance_status = _trace_execution_revision(trace)
     revision_status = revision_provenance_status
     if trace_revision is not None:
@@ -234,6 +246,12 @@ def _build_external_evaluation_record(
             "data": data,
         },
         resolved_evidence,
+    )
+
+
+def _external_evaluation_record_id(payload: JsonDict) -> str:
+    return "external_evaluation_{0}".format(
+        hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()[:16]
     )
 
 

@@ -95,6 +95,90 @@ def sample_graph() -> TraceGraph:
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def _external_candidate_capsules(self, *, status: str, subject_revision: str):
+        trace = inject_external_evaluation_facts(
+            {
+                "manifest": {
+                    "case_id": "capsule-candidate-case",
+                    "run_id": "capsule-candidate-run",
+                    "subject_revision": "git:abc123",
+                    "subject_revision_provenance": {
+                        "method": "case_trace_config",
+                        "source": "CaseTraceConfig.subjectRevision",
+                        "bound_at": "case_start",
+                        "case_id": "capsule-candidate-case",
+                        "run_id": "capsule-candidate-run",
+                    },
+                },
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "Preserve cleanup."},
+                    }
+                ],
+                "dataflow_edges": [],
+            },
+            [
+                {
+                    "source": "terminalbench",
+                    "scope": "cleanup",
+                    "subject_revision": subject_revision,
+                    "assertion": "Cleanup completes.",
+                    "observation": "Cleanup {0}.".format(status),
+                    "status": status,
+                    "observed_at": "2026-07-21T12:00:00Z",
+                    "evidence_refs": ["record:decision"],
+                    "provenance": {
+                        "method": "benchmark_grader",
+                        "version": "1.0",
+                    },
+                }
+            ],
+        )
+        ref = "record:{0}".format(trace["records"][-1]["record_id"])
+        graph = TraceGraph.from_trace(trace)
+        capsules = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[
+                CausalCandidate(
+                    ref=ref,
+                    node=graph.nodes[ref],
+                    source="global_evidence",
+                    score=1.0,
+                )
+            ],
+            defect_state=DefectState.create(
+                label="cleanup_failed",
+                expected="Cleanup completes.",
+                actual="Cleanup stopped.",
+                mechanism="The implementation omitted cleanup preservation.",
+                scope="cleanup",
+            ),
+            downstream_paths={},
+            start_refs=(ref,),
+        )
+        return graph, ref, capsules
+
+    def test_capsule_rejects_audit_only_external_candidate(self):
+        graph, ref, capsules = self._external_candidate_capsules(
+            status="failed", subject_revision="git:stale"
+        )
+
+        self.assertFalse(graph.evidence_eligible(ref))
+        self.assertEqual(capsules, ())
+
+    def test_capsule_supports_matched_passed_external_candidate(self):
+        graph, ref, capsules = self._external_candidate_capsules(
+            status="passed", subject_revision="git:abc123"
+        )
+
+        self.assertTrue(graph.evidence_eligible(ref))
+        self.assertFalse(graph.analysis_start_eligible(ref))
+        self.assertEqual([item.candidate_ref for item in capsules], [ref])
+        self.assertFalse(capsules[0].to_dict()["candidate"]["root_candidate_eligible"])
+
     def test_capsule_filters_audit_only_external_refs_but_preserves_other_ref_classes(self):
         trace = {
             "manifest": {

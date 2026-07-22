@@ -308,6 +308,81 @@ class ExternalEvaluationFactsTest(unittest.TestCase):
         self.assertEqual(len(enriched["dataflow_edges"]), 1)
         self.assertEqual(facts[0]["data"]["evaluation_id"], expected)
 
+    def test_batch_forward_references_are_order_independent(self):
+        passed = evaluation_payload(
+            scope="upstream_verification",
+            observation="cleanup passed",
+            status="passed",
+        )
+        passed_id = "external_evaluation_{0}".format(
+            hashlib.sha256(stable_json(passed).encode("utf-8")).hexdigest()[:16]
+        )
+        failed = evaluation_payload(
+            scope="downstream_failure",
+            evidence_refs=["external_evaluation:{0}".format(passed_id)],
+        )
+        failed_id = "external_evaluation_{0}".format(
+            hashlib.sha256(stable_json(failed).encode("utf-8")).hexdigest()[:16]
+        )
+        semantics = []
+
+        for payloads in ([failed, passed], [passed, failed]):
+            enriched = inject_external_evaluation_facts(base_trace(), payloads)
+            graph = TraceGraph.from_trace(enriched)
+            external_records = [
+                record
+                for record in enriched["records"]
+                if record.get("event_type") == "external.evaluation_fact"
+            ]
+            edges = [
+                edge
+                for edge in enriched["dataflow_edges"]
+                if edge.get("relation") == "external_evaluation_observed"
+            ]
+            failed_record = next(
+                record
+                for record in external_records
+                if record["record_id"] == failed_id
+            )
+
+            self.assertEqual(
+                [record["data"]["scope"] for record in external_records],
+                [payload["scope"] for payload in payloads],
+            )
+            self.assertEqual(
+                [edge["to"]["id"] for edge in edges],
+                [
+                    failed_id if payload is failed else passed_id
+                    for payload in payloads
+                ],
+            )
+            self.assertEqual(failed_record["data"]["unresolved_evidence_refs"], [])
+            self.assertEqual(
+                graph.upstream_refs("record:{0}".format(failed_id)),
+                ["record:{0}".format(passed_id)],
+            )
+            semantics.append(
+                {
+                    "eligible_refs": {
+                        ref for ref in graph.nodes if graph.evidence_eligible(ref)
+                    },
+                    "eligible_edges": {
+                        (
+                            edge["from"]["id"],
+                            edge["to"]["id"],
+                            edge["eligible_for_attribution"],
+                        )
+                        for edge in edges
+                    },
+                    "default_starts": set(graph.default_start_refs()),
+                }
+            )
+
+        self.assertEqual(semantics[0], semantics[1])
+        self.assertEqual(
+            semantics[0]["default_starts"], {"record:{0}".format(failed_id)}
+        )
+
     def test_creates_only_resolved_evidence_edges_and_keeps_unresolved_refs_explicit(self):
         payload = evaluation_payload(
             evidence_refs=["record:tool_result", "record:not_present"]
