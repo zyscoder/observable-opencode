@@ -67,6 +67,7 @@ class SemanticPredecessorRetriever:
             return canonicalize_ranked_candidates(
                 graph,
                 merge_ranked_candidates(
+                    graph,
                     [
                         [
                             candidate
@@ -86,10 +87,12 @@ class SemanticPredecessorRetriever:
             terms = semantic_terms(defect_state, hypothesis)
             layers = [
                 bound_provenance_envelopes(
+                    graph,
                     self._direct_candidates(graph, resolved), terms
                 ),
                 self._episode_candidates(graph, resolved, defect_state, hypothesis),
                 bound_provenance_envelopes(
+                    graph,
                     self._sibling_candidates(graph, resolved), terms
                 ),
             ]
@@ -108,12 +111,13 @@ class SemanticPredecessorRetriever:
                 [candidate for candidate in layer if not is_stale_completion_diagnostic(candidate.node)]
                 for layer in layers
             ]
-        merged = merge_ranked_candidates(layers, limit=limit)
+        merged = merge_ranked_candidates(graph, layers, limit=limit)
         if graph.nodes[resolved].event_type == "progress.episode":
             return canonicalize_ranked_candidates(graph, merged, limit=limit)
         return canonicalize_ranked_candidates(
             graph,
             bound_provenance_envelopes(
+                graph,
                 merged,
                 semantic_terms(defect_state, hypothesis),
             ),
@@ -289,7 +293,12 @@ class SemanticPredecessorRetriever:
         return candidates
 
 
-def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limit: int) -> List[CausalCandidate]:
+def merge_ranked_candidates(
+    graph: TraceGraph,
+    layers: Sequence[Sequence[CausalCandidate]],
+    *,
+    limit: int,
+) -> List[CausalCandidate]:
     """Keep all routes for ranked refs until provenance canonicalization."""
     routes: List[Tuple[int, int, CausalCandidate]] = []
     for layer_index, layer in enumerate(layers):
@@ -297,7 +306,8 @@ def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limi
             routes.append((layer_index, ordinal, candidate))
     grouped: dict[str, List[Tuple[int, int, CausalCandidate]]] = {}
     for route in routes:
-        grouped.setdefault(route[2].ref, []).append(route)
+        resolved = graph.resolve(route[2].ref) or route[2].ref
+        grouped.setdefault(resolved, []).append(route)
     ranked_refs = sorted(
         grouped,
         key=lambda ref: (
@@ -308,7 +318,14 @@ def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limi
         ),
     )[:limit]
     selected = [item for ref in ranked_refs for item in grouped[ref]]
-    selected.sort(key=lambda item: (ranked_refs.index(item[2].ref), item[0], item[1]))
+    rank_by_ref = {ref: index for index, ref in enumerate(ranked_refs)}
+    selected.sort(
+        key=lambda item: (
+            rank_by_ref[graph.resolve(item[2].ref) or item[2].ref],
+            item[0],
+            item[1],
+        )
+    )
     return [item[2] for item in selected]
 
 
@@ -418,19 +435,21 @@ def canonical_candidate_route(
 
 
 def bound_provenance_envelopes(
+    graph: TraceGraph,
     candidates: Sequence[CausalCandidate],
     terms: Sequence[str],
     *,
     limit: Optional[int] = None,
 ) -> List[CausalCandidate]:
-    ranked_envelopes: List[Tuple[float, int, CausalCandidate]] = []
+    ranked_envelopes: dict[str, List[Tuple[float, int, CausalCandidate]]] = {}
     concrete: List[Tuple[int, CausalCandidate]] = []
     for index, candidate in enumerate(candidates):
         if candidate.node.event_type not in PROVENANCE_ENVELOPE_EVENT_TYPES:
             concrete.append((index, candidate))
             continue
         semantic_score = progress_candidate_score(candidate.node, terms)
-        ranked_envelopes.append(
+        resolved = graph.resolve(candidate.ref) or candidate.ref
+        ranked_envelopes.setdefault(resolved, []).append(
             (
                 semantic_score,
                 index,
@@ -444,14 +463,33 @@ def bound_provenance_envelopes(
                 ),
             )
         )
-    selected_envelopes = sorted(
+    concrete_refs = {graph.resolve(candidate.ref) or candidate.ref for _, candidate in concrete}
+    selected_envelope_refs = sorted(
         ranked_envelopes,
-        key=lambda item: (-item[0], item[1], item[2].ref),
+        key=lambda ref: (
+            -max(item[0] for item in ranked_envelopes[ref]),
+            min(item[1] for item in ranked_envelopes[ref]),
+            ref,
+        ),
     )[:PROVENANCE_ENVELOPE_LIMIT]
-    retained = concrete + [(index, candidate) for _, index, candidate in selected_envelopes]
+    retained = concrete + [
+        (index, candidate)
+        for ref, routes in ranked_envelopes.items()
+        if ref in concrete_refs or ref in selected_envelope_refs
+        for _, index, candidate in routes
+    ]
     retained.sort(key=lambda item: item[0])
     output = [candidate for _, candidate in retained]
-    return output if limit is None else output[:limit]
+    if limit is None:
+        return output
+    selected_refs = list(
+        dict.fromkeys(graph.resolve(candidate.ref) or candidate.ref for candidate in output)
+    )[:limit]
+    return [
+        candidate
+        for candidate in output
+        if (graph.resolve(candidate.ref) or candidate.ref) in selected_refs
+    ]
 
 
 def edge_evidence_refs(edge: Mapping[str, Any]) -> Tuple[str, ...]:

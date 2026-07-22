@@ -2834,6 +2834,142 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertEqual(confirmed_high, inferred_high)
 
+    def test_provenance_envelope_limit_keeps_all_routes_for_selected_resolved_refs(self):
+        def without_navigation_scores(value):
+            if isinstance(value, dict):
+                return {
+                    key: without_navigation_scores(item)
+                    for key, item in value.items()
+                    if key not in {"confidence", "score", "retrieval_score"}
+                }
+            if isinstance(value, list):
+                return [without_navigation_scores(item) for item in value]
+            return value
+
+        def run(*, authentic_confidence, synthetic_confidence):
+            trace = {
+                "case_id": "provenance-envelope-resolved-ref-limit",
+                "records": [
+                    {
+                        "record_id": "route_a",
+                        "component": "context",
+                        "event_type": "message.input",
+                        "data": {"text": "The implementation search was incomplete."},
+                    },
+                    {
+                        "record_id": "route_b",
+                        "component": "context",
+                        "event_type": "context.transform",
+                        "data": {
+                            "text": (
+                                "The implementation search omitted every required "
+                                "implementation before the observed defect."
+                            )
+                        },
+                    },
+                    {
+                        "record_id": "change",
+                        "component": "agent",
+                        "event_type": "change",
+                        "data": {"summary": "Applied the incomplete implementation search."},
+                    },
+                    {
+                        "record_id": "observed_defect",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "data": {
+                            "expected": "Every implementation is inspected.",
+                            "actual": "One implementation was omitted.",
+                        },
+                    },
+                ],
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": "route_a"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "authentic_route",
+                        "evidence_type": "confirmed",
+                        "confidence": authentic_confidence,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "route_a"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "synthetic_route",
+                        "evidence_type": "semantic_inferred",
+                        "confidence": synthetic_confidence,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "route_b"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "higher_scored_distinct_route",
+                        "evidence_type": "confirmed",
+                        "confidence": 0.8,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "change"},
+                        "to": {"type": "record", "id": "observed_defect"},
+                        "relation": "change_created_observed_defect",
+                        "evidence_type": "confirmed",
+                        "confidence": 0.9,
+                        "eligible_for_attribution": True,
+                    },
+                ],
+            }
+            judge = FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:route_a": RootConfirmation.confirmed(
+                        "record:route_a",
+                        excerpt="The implementation search was incomplete.",
+                        reason="The authentic route carries the omitted-search defect.",
+                        counterfactual="Inspecting every implementation prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:route_a"],
+                    )
+                },
+                selected_candidate_refs=("record:route_a",),
+            )
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the trace-visible root.",
+            )
+            capsules = judge.global_requests[0].to_dict()["candidate_evidence_capsules"]
+            return {
+                "normalized_global_capsules": without_navigation_scores(capsules),
+                "capsule_refs": [item["candidate_ref"] for item in capsules],
+                "hypotheses": [item.to_dict() for item in report.hypotheses],
+                "confirmation_facts": [
+                    item.factual_dict() for item in judge.confirmation_requests
+                ],
+            }
+
+        authentic_high = run(authentic_confidence=0.99, synthetic_confidence=0.01)
+        synthetic_high = run(authentic_confidence=0.01, synthetic_confidence=0.99)
+
+        self.assertEqual(authentic_high, synthetic_high)
+        self.assertEqual(len(authentic_high["confirmation_facts"]), 1)
+        self.assertLess(
+            authentic_high["capsule_refs"].index("record:route_b"),
+            authentic_high["capsule_refs"].index("record:route_a"),
+        )
+        route_a = next(
+            item
+            for item in authentic_high["normalized_global_capsules"]
+            if item["candidate_ref"] == "record:route_a"
+        )
+        self.assertEqual(route_a["candidate"]["source"], "confirmed_edge")
+        self.assertEqual(
+            route_a["candidate"]["retrieval_edge"]["relation"],
+            "authentic_route",
+        )
+
     def test_retrieval_score_does_not_change_confirmation_facts_on_real_fusion_path(self):
         class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
             def __init__(self, score):
