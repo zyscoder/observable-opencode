@@ -390,6 +390,93 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "causal_path_refs.*eligible.*hop"):
             validate_global_candidate_payload(value, request=request)
 
+    def test_rejects_eligible_noncausal_confirmation_relations(self):
+        request = sample_request()
+        for relation in (
+            "semantic_navigation_route",
+            "temporal_sequence",
+            "fallback_sequence",
+            "previous_progress_episode",
+        ):
+            with self.subTest(relation=relation):
+                capsule = replace(
+                    request.capsules[0],
+                    causal_path_edges=(
+                        {
+                            "from_ref": "record:decision",
+                            "to_ref": "record:defect",
+                            "relation": relation,
+                            "eligible_for_attribution": True,
+                        },
+                    ),
+                    incoming_edges=(),
+                    outgoing_edges=(),
+                )
+                rejected_request = replace(
+                    request,
+                    capsules=(capsule, request.capsules[1]),
+                )
+
+                with self.assertRaisesRegex(ValueError, "causal_path_refs.*eligible.*hop"):
+                    validate_global_candidate_payload(
+                        payload(outcome="candidate_roots", request=rejected_request),
+                        request=rejected_request,
+                    )
+
+    def test_rejects_mixed_noncausal_confirmation_path_hop(self):
+        request = sample_request()
+        capsule = replace(
+            request.capsules[0],
+            downstream_path=("record:decision", "record:action", "record:defect"),
+            causal_path_edges=(
+                {
+                    "from_ref": "record:decision",
+                    "to_ref": "record:action",
+                    "relation": "produced",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from_ref": "record:action",
+                    "to_ref": "record:defect",
+                    "relation": "temporal_sequence",
+                    "eligible_for_attribution": True,
+                },
+            ),
+            incoming_edges=(),
+            outgoing_edges=(),
+        )
+        rejected_request = replace(request, capsules=(capsule, request.capsules[1]))
+
+        with self.assertRaisesRegex(ValueError, "causal_path_refs.*eligible.*hop"):
+            validate_global_candidate_payload(
+                payload(outcome="candidate_roots", request=rejected_request),
+                request=rejected_request,
+            )
+
+    def test_accepts_eligible_causal_confirmation_relation(self):
+        request = sample_request()
+        capsule = replace(
+            request.capsules[0],
+            causal_path_edges=(
+                {
+                    "from_ref": "record:decision",
+                    "to_ref": "record:defect",
+                    "relation": "produced",
+                    "eligible_for_attribution": True,
+                },
+            ),
+            incoming_edges=(),
+            outgoing_edges=(),
+        )
+        accepted_request = replace(request, capsules=(capsule, request.capsules[1]))
+
+        judgment = validate_global_candidate_payload(
+            payload(outcome="candidate_roots", request=accepted_request),
+            request=accepted_request,
+        )
+
+        self.assertEqual(judgment.outcome, "candidate_roots")
+
     def test_rejects_unselected_present_causal_candidate_without_path(self):
         request = sample_request()
         value = payload(outcome="candidate_roots", request=request)

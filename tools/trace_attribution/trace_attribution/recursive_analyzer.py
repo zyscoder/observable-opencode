@@ -43,6 +43,7 @@ from .causal_state import (
     seed_binding_identity_for,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
+from .confirmation_path import is_confirmation_causal_edge
 from .errors import JudgeProviderError, JudgeProviderUnavailable
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
@@ -114,18 +115,6 @@ PROVIDER_ACCOUNTING_KEYS = {
     "investigation_rounds",
     "artifact_bytes",
 }
-NON_CAUSAL_CONFIRMATION_RELATIONS = frozenset(
-    {
-        "temporal_proximity",
-        "temporal_sequence",
-        "previous_progress_episode",
-        "progress_episode_member",
-        "progress_episode_projects_to_target",
-        "semantic_navigation_route",
-    }
-)
-
-
 def _require_exact_checkpoint_keys(
     value: Mapping[str, Any], expected: Set[str], label: str
 ) -> None:
@@ -443,9 +432,7 @@ def _grounded_downstream_path(
                 continue
             edges = graph.edge_context(current, next_ref)
             if not any(
-                bool(edge.get("eligible_for_attribution", True))
-                and str(edge.get("relation") or "")
-                not in NON_CAUSAL_CONFIRMATION_RELATIONS
+                is_confirmation_causal_edge(edge, default_eligible=True)
                 for edge in edges
             ) or not graph.edge_endpoints_eligible(current, next_ref):
                 continue
@@ -4267,9 +4254,7 @@ class AgenticRecursiveAnalyzer:
         for upstream, downstream in zip(path, path[1:]):
             edges = state.graph.edge_context(upstream, downstream)
             if not any(
-                bool(edge.get("eligible_for_attribution", True))
-                and str(edge.get("relation") or "")
-                not in NON_CAUSAL_CONFIRMATION_RELATIONS
+                is_confirmation_causal_edge(edge, default_eligible=True)
                 for edge in edges
             ):
                 raise ValueError(

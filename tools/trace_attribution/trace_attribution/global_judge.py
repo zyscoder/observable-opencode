@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
 from .causal_state import DefectState, FrozenMapping
+from .confirmation_path import is_confirmation_causal_edge
 from .evidence_capsule import CandidateEvidenceCapsule
 from .models import JsonDict, stable_json
 
@@ -691,7 +692,7 @@ def _has_eligible_causal_path_hops(
         any(
             str(edge.get("from_ref") or "") == source_ref
             and str(edge.get("to_ref") or "") == target_ref
-            and edge.get("eligible_for_attribution") is True
+            and is_confirmation_causal_edge(edge, default_eligible=False)
             for edge in edges
             if isinstance(edge, Mapping)
         )

@@ -3188,6 +3188,76 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             ),
         )
 
+    def test_grounded_downstream_path_rejects_eligible_noncausal_hops(self):
+        for relation in (
+            "semantic_navigation_route",
+            "temporal_sequence",
+            "fallback_sequence",
+            "previous_progress_episode",
+        ):
+            with self.subTest(relation=relation):
+                graph = TraceGraph.from_trace(
+                    {
+                        "case_id": "noncausal-grounded-path",
+                        "records": [
+                            {
+                                "record_id": ref,
+                                "component": "processor",
+                                "event_type": "decision",
+                            }
+                            for ref in ("decision", "defect")
+                        ],
+                        "dataflow_edges": [
+                            {
+                                "from": {"type": "record", "id": "decision"},
+                                "to": {"type": "record", "id": "defect"},
+                                "relation": relation,
+                                "eligible_for_attribution": True,
+                            }
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    _grounded_downstream_path(
+                        graph,
+                        "record:decision",
+                        ("record:defect",),
+                    ),
+                    (),
+                )
+
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "mixed-noncausal-grounded-path",
+                "records": [
+                    {"record_id": ref, "component": "processor", "event_type": "decision"}
+                    for ref in ("decision", "action", "defect")
+                ],
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": source},
+                        "to": {"type": "record", "id": target},
+                        "relation": relation,
+                        "eligible_for_attribution": True,
+                    }
+                    for source, target, relation in (
+                        ("decision", "action", "produced"),
+                        ("action", "defect", "temporal_sequence"),
+                    )
+                ],
+            }
+        )
+
+        self.assertEqual(
+            _grounded_downstream_path(
+                graph,
+                "record:decision",
+                ("record:defect",),
+            ),
+            (),
+        )
+
     def test_response_claim_seed_is_an_unconfirmed_claim_quality_candidate(self):
         graph = TraceGraph.from_trace(
             {
