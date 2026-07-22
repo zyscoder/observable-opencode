@@ -104,12 +104,20 @@ Agent / Harness 原始执行
 右括号等开始的片段作为独立 claim。无法可靠切分时，以完整 claim group 作为
 评估 seed，不生成伪原子事实。
 
-原子化内部采用基于原始响应的单遍 Token + State Machine，不允许先删除 Markdown
-再计算 span。词法层只生成 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和带来源类型的
-`HARD_BREAK`。普通物理换行仅在括号未闭合时延续 claim；heading、fence、空段落、
-list、table 和 blockquote 边界必须清空括号与活动 span。`PROTECTED_TEXT` 的内容
-进入 claim 原文，但其内部括号和标点不参与外层状态迁移。所有 byte range 始终
-指向原始响应。
+原子化内部采用 source-preserving Markdown block lexer + 单遍 Claim State Machine，
+不允许先删除 Markdown 再计算 span。block lexer 使用仓库 catalog 中固定版本的
+`marked@17.0.1`，只读取同步 lexer token，不渲染 HTML、不安装全局 extension。
+每个 `token.raw` 必须按顺序映射回 `ClaimSourceView` 的原始字符范围；解析异常、
+raw 无法无歧义映射或未知 block token 必须 fail-closed 为 `HARD_BREAK`，不得让 Trace
+插装中断 Agent 执行。
+
+适配层只向 Claim State Machine 输出 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和带
+来源类型的 `HARD_BREAK`。paragraph 进入 inline tokenizer；ATX/Setext heading、
+thematic break、fence/indented code、HTML block、link definition、空段落和 blockquote
+整体成为 hard barrier；list item 在 item 起止处产生 barrier，并递归处理 item 内
+paragraph；table 在完整 table block 边界内继续生成带原始范围的 table fact。普通
+物理换行仅在括号未闭合时延续 claim。`PROTECTED_TEXT` 的内容进入 claim 原文，但其
+内部括号和标点不参与外层状态迁移。所有 byte range 始终指向原始响应。
 
 原始响应必须先封装为 `ClaimSourceView`，统一持有完整原文、Unicode 安全的扫描
 终点和字符位置到 UTF-8 字节位置的映射。8,000 UTF-16 code unit 的扫描上限不得
@@ -117,6 +125,10 @@ list、table 和 blockquote 边界必须清空括号与活动 span。`PROTECTED_
 原始响应为坐标。反引号 code span 若在当前物理行内找不到同长度闭合 delimiter，
 则从 opening delimiter 到行末整体记为 `PROTECTED_TEXT`，不得让 malformed Markdown
 中的括号或标点污染外层状态机。
+
+任意 `unknown` response 的规范化必须是 total function：JSON 序列化和显式字符串
+转换都失败时使用固定 ASCII fallback `[unserializable response]`，不得因 hostile
+`toJSON`、`toString` 或 `Symbol.toPrimitive` 让被动 Trace 抛错。
 
 CaseTrace 为原子化暂存的 response 原文只能存活到 `finish()`。final、non-final、
 cancelled、异常和重复 finish 路径都必须通过同一个生命周期清理点释放暂存原文；
