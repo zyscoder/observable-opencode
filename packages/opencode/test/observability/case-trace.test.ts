@@ -1970,14 +1970,29 @@ describe("case trace", () => {
       script,
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `import fs from "node:fs"`,
+        `import path from "node:path"`,
         `const results = []`,
         `const responseText = "All 11 tests pass. " + "artifact detail ".repeat(220)`,
         `const sourceCount = (trace: any) => trace.responseSourceBySegmentID.size`,
+        `const read = (file: string) => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined`,
+        `const publicSnapshot = (caseID: string) => {`,
+        `  const caseDir = path.join(${JSON.stringify(dir)}, caseID)`,
+        `  const events = read(path.join(caseDir, "events.jsonl")) ?? ""`,
+        `  const summaryRecord = events.trim().split("\\n").filter(Boolean).map((line) => JSON.parse(line)).findLast((event) => event.type === "trace.finish")`,
+        `  const persisted = ["manifest.json", "trace.json", "partial/latest.json", "legacy-trace.json"].map((file) => [file, read(path.join(caseDir, file))])`,
+        `  const artifactDir = path.join(caseDir, "artifacts")`,
+        `  const artifactFiles = fs.existsSync(artifactDir) ? fs.readdirSync(artifactDir, { recursive: true }).filter((file) => fs.statSync(path.join(artifactDir, file.toString())).isFile()).map((file) => [file.toString(), read(path.join(artifactDir, file.toString()))]) : []`,
+        `  const artifactRefs = Array.from(new Set((persisted.map((item) => item[1]).join("\\n") + events).match(/artifact_[a-z0-9_]+/g) ?? [])).sort()`,
+        `  return { manifest: persisted[0][1], trace: persisted[1][1], partial: persisted[2][1], summary: persisted[3][1], summaryRecord, artifactRefs, artifactFiles, records: read(path.join(caseDir, "records.jsonl")), events }`,
+        `}`,
         `const finalTrace = CaseTrace.get() as any`,
         `CaseTrace.responseOutput({ text: responseText })`,
         `CaseTrace.finish({ status: "success" })`,
         `results.push({ kind: "final", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
+        `const repeatBefore = publicSnapshot("response-source-final")`,
         `CaseTrace.finish({ status: "success" })`,
+        `const repeatAfter = publicSnapshot("response-source-final")`,
         `results.push({ kind: "repeat", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
         `CaseTrace.configure({ caseID: "response-source-non-final" })`,
         `const nonFinalTrace = CaseTrace.get() as any`,
@@ -1992,11 +2007,13 @@ describe("case trace", () => {
         `CaseTrace.configure({ caseID: "response-source-exception" })`,
         `CaseTrace.responseOutput({ text: responseText })`,
         `const trace = CaseTrace.get() as any`,
+        `const exceptionBefore = publicSnapshot("response-source-exception")`,
         `trace.emitFinalResponseClaims = () => { throw new Error("forced claim emission failure") }`,
         `try { CaseTrace.finish({ status: "success" }) } catch {}`,
+        `const exceptionAfter = publicSnapshot("response-source-exception")`,
         `results.push({ kind: "exception", count: sourceCount(trace), finished: trace.finished })`,
         `trace.finished = true`,
-        `process.stdout.write(JSON.stringify(results))`,
+        `process.stdout.write(JSON.stringify({ results, repeatBefore, repeatAfter, exceptionBefore, exceptionAfter }))`,
       ].join("\n"),
     )
 
@@ -2014,13 +2031,37 @@ describe("case trace", () => {
 
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
-    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual([
+    const lifecycle = JSON.parse(await new Response(proc.stdout).text())
+    expect(lifecycle.results).toEqual([
       { kind: "final", count: 0, finished: true },
       { kind: "repeat", count: 0, finished: true },
       { kind: "non_final", count: 0, finished: true },
       { kind: "cancelled", count: 0, finished: true },
       { kind: "exception", count: 0, finished: false },
     ])
+    expect(lifecycle.repeatBefore.manifest).toBeDefined()
+    expect(lifecycle.repeatBefore.trace).toBeDefined()
+    expect(lifecycle.repeatBefore.partial).toBeDefined()
+    expect(lifecycle.repeatBefore.summaryRecord).toBeDefined()
+    expect(lifecycle.repeatBefore.artifactRefs.length).toBeGreaterThan(0)
+    expect(lifecycle.repeatAfter.manifest).toBe(lifecycle.repeatBefore.manifest)
+    expect(lifecycle.repeatAfter.trace).toBe(lifecycle.repeatBefore.trace)
+    expect(lifecycle.repeatAfter.partial).toBe(lifecycle.repeatBefore.partial)
+    expect(lifecycle.repeatAfter.summary).toBe(lifecycle.repeatBefore.summary)
+    expect(lifecycle.repeatAfter.summaryRecord).toEqual(lifecycle.repeatBefore.summaryRecord)
+    expect(lifecycle.repeatAfter.artifactRefs).toEqual(lifecycle.repeatBefore.artifactRefs)
+    expect(lifecycle.repeatAfter.artifactFiles).toEqual(lifecycle.repeatBefore.artifactFiles)
+    expect(lifecycle.exceptionBefore.partial).toBeDefined()
+    expect(lifecycle.exceptionBefore.artifactRefs.length).toBeGreaterThan(0)
+    expect(lifecycle.exceptionAfter.manifest).toBe(lifecycle.exceptionBefore.manifest)
+    expect(lifecycle.exceptionAfter.trace).toBe(lifecycle.exceptionBefore.trace)
+    expect(lifecycle.exceptionAfter.partial).toBe(lifecycle.exceptionBefore.partial)
+    expect(lifecycle.exceptionAfter.summary).toBe(lifecycle.exceptionBefore.summary)
+    expect(lifecycle.exceptionAfter.summaryRecord).toEqual(lifecycle.exceptionBefore.summaryRecord)
+    expect(lifecycle.exceptionAfter.artifactRefs).toEqual(lifecycle.exceptionBefore.artifactRefs)
+    expect(lifecycle.exceptionAfter.artifactFiles).toEqual(lifecycle.exceptionBefore.artifactFiles)
+    expect(lifecycle.exceptionAfter.records.startsWith(lifecycle.exceptionBefore.records)).toBe(true)
+    expect(lifecycle.exceptionAfter.events.startsWith(lifecycle.exceptionBefore.events)).toBe(true)
 
     const readCaseOutputs = async (caseID: string) => {
       const caseDir = path.join(dir, caseID)

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { atomizeResponseClaims, atomizeResponseClaimsWithLexerForTest } from "../../src/observability/claim-atomization"
+import { atomizeResponseClaims } from "../../src/observability/claim-atomization"
+import { atomizeResponseClaimsWithLexerForTest } from "../../src/observability/claim-atomization.test-support"
 
 describe("claim atomization", () => {
   test("keeps a parenthetical cstack statement as one auditable claim", () => {
@@ -60,6 +61,55 @@ describe("claim atomization", () => {
     expect(claims[0]!.source_byte_range).toEqual([0, Buffer.byteLength("修改完成。")])
     expect(claims[1]!.source_byte_range[0]).toBe(Buffer.byteLength("修改完成。"))
     expect(claims.every((item) => item.claim_group_id)).toBe(true)
+  })
+
+  test("maps marked paragraph LF tokens back to CRLF source ranges", () => {
+    const response = "修改完成。\r\nAll 11 tests pass."
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual(["修改完成。", "All 11 tests pass."])
+    expect(claims.map((claim) => claim.raw_text)).toEqual(["修改完成。", "All 11 tests pass."])
+    expect(claims[1]!.source_byte_range).toEqual([Buffer.byteLength("修改完成。\r\n"), Buffer.byteLength(response)])
+  })
+
+  test("maps marked list LF tokens back to CRLF source ranges", () => {
+    const response = "- 所有 11 个测试通过。\r\n- All 12 tests pass."
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual(["所有 11 个测试通过。", "All 12 tests pass."])
+    expect(claims.map((claim) => claim.raw_text)).toEqual(["所有 11 个测试通过。", "All 12 tests pass."])
+    expect(claims[1]!.source_byte_range).toEqual([
+      Buffer.byteLength("- 所有 11 个测试通过。\r\n- "),
+      Buffer.byteLength(response),
+    ])
+  })
+
+  test("maps marked table LF tokens back to CRLF source ranges", () => {
+    const response = ["| 项目 | 值 |", "| --- | --- |", "| 测试😀 | All 11 tests pass. |"].join("\r\n")
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.map((claim) => claim.text)).toEqual(["测试😀: All 11 tests pass."])
+    expect(claims[0]).toMatchObject({
+      raw_text: "| 测试😀 | All 11 tests pass. |",
+      table_cells: ["测试😀", "All 11 tests pass."],
+      table_subject: "测试😀",
+      table_values: ["All 11 tests pass."],
+    })
+    expect(claims[0]!.source_byte_range).toEqual([
+      Buffer.byteLength("| 项目 | 值 |\r\n| --- | --- |\r\n"),
+      Buffer.byteLength(response),
+    ])
+  })
+
+  test("keeps CRLF mapping monotonic at the scan limit", () => {
+    const prefix = "All 11 tests pass.\r\n`"
+    const response = `${prefix}${"a".repeat(7_998 - prefix.length)}\r\nAfter 12 tests pass.`
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims[0]!.text).toBe("All 11 tests pass.")
+    expect(claims.every((claim) => !claim.text.includes("After 12 tests pass."))).toBe(true)
+    expect(claims[0]!.source_byte_range).toEqual([0, Buffer.byteLength("All 11 tests pass.")])
+    expect(claims[0]!.raw_text).toBe("All 11 tests pass.")
   })
 
   test("drops a continuation fragment without a preceding claim", () => {
@@ -209,6 +259,45 @@ describe("claim atomization", () => {
     expect(Buffer.from(response).subarray(start, end).toString()).toBe(tableFact!.raw_text)
   })
 
+  test("uses marked table cells for escaped pipes, inline-code pipes, and Unicode", () => {
+    const response = [
+      "| Field | Value |",
+      "| --- | --- |",
+      "| Owner | billing\\|platform |",
+      "| Expression | `left|right` |",
+      "| 状态😀 | 所有 11 个测试通过。 |",
+    ].join("\n")
+    const first = atomizeResponseClaims(response)
+    const second = atomizeResponseClaims(response)
+
+    expect(first.map((claim) => claim.text)).toEqual([
+      "Owner: billing|platform",
+      "Expression: left|right",
+      "状态😀: 所有 11 个测试通过。",
+    ])
+    expect(first.map((claim) => claim.table_cells)).toEqual([
+      ["Owner", "billing|platform"],
+      ["Expression", "left|right"],
+      ["状态😀", "所有 11 个测试通过。"],
+    ])
+    expect(first.map((claim) => claim.canonical_text)).toEqual(first.map((claim) => claim.text))
+    expect(first.map((claim) => claim.claim_group_id)).toEqual(second.map((claim) => claim.claim_group_id))
+    expect(first.map((claim) => claim.key)).toEqual(second.map((claim) => claim.key))
+    expect(first.map((claim) => claim.source_byte_range)).toEqual(
+      ["| Owner | billing\\|platform |", "| Expression | `left|right` |", "| 状态😀 | 所有 11 个测试通过。 |"].map(
+        (row) => [
+          Buffer.byteLength(response.slice(0, response.indexOf(row))),
+          Buffer.byteLength(response.slice(0, response.indexOf(row) + row.length)),
+        ],
+      ),
+    )
+    expect(first.map((claim) => claim.raw_text)).toEqual([
+      "| Owner | billing\\|platform |",
+      "| Expression | `left|right` |",
+      "| 状态😀 | 所有 11 个测试通过。 |",
+    ])
+  })
+
   test("keeps list items independent across nested and consecutive lists", () => {
     const response = [
       "Before 11 (open",
@@ -281,6 +370,8 @@ describe("claim atomization", () => {
     const response = "修改完成。\n\n- 所有 11 个测试通过。\nAll 11 tests pass."
     const claims = atomizeResponseClaims(response)
 
+    expect(claims.map((claim) => claim.text)).toEqual(["修改完成。", "所有 11 个测试通过。", "All 11 tests pass."])
+    expect(claims.map((claim) => claim.raw_text)).toEqual(["修改完成。", "所有 11 个测试通过。", "All 11 tests pass."])
     for (const claim of claims) {
       const [start, end] = claim.source_byte_range
       const raw = Buffer.from(response).subarray(start, end).toString()
@@ -326,7 +417,11 @@ describe("claim atomization", () => {
     }
 
     expect(() => atomizeResponseClaims(hostile)).not.toThrow()
-    expect(atomizeResponseClaims(hostile).map((claim) => claim.raw_text)).toEqual(["[unserializable response]"])
+    const first = atomizeResponseClaims(hostile)
+    const second = atomizeResponseClaims(hostile)
+    expect(first).toEqual(second)
+    expect(first.map((claim) => claim.text)).toEqual(["[unserializable response]"])
+    expect(first.map((claim) => claim.raw_text)).toEqual(["[unserializable response]"])
   })
 
   test("fails closed when the Markdown lexer throws", () => {
