@@ -6368,7 +6368,7 @@ describe("case trace", () => {
     expect(trace.artifacts.length).toBeGreaterThanOrEqual(1)
     expect(JSON.stringify(trace).includes(payload)).toBe(false)
 
-    const artifact = trace.artifacts.find((item: any) => item.kind === "json")
+    const artifact = trace.artifacts.find((item: any) => item.label === "context.context.before_compaction.data")
     expect(artifact).toBeTruthy()
     const artifactText = await fs.readFile(path.join(caseDir, artifact.path), "utf8")
     expect(artifactText).toContain(payload)
@@ -6376,6 +6376,72 @@ describe("case trace", () => {
     const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     expect(html).toContain("Trace Provenance")
     expect(html).toContain("Artifacts")
+  })
+
+  test("writes a redacted and byte-verifiable artifact semantic slice manifest", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-artifact-manifest-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "artifact-manifest.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const secret = "sk-artifact-secret"
+    const payload = `token=${secret} ${"😀".repeat(80)}`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "context", event_type: "context.before_compaction", data: { payload: ${JSON.stringify(payload)} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "artifact-manifest-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "30",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(stderr).toBe("")
+    expect(code).toBe(0)
+
+    const caseDir = path.join(dir, "artifact-manifest-case")
+    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const artifact = trace.artifacts.find((item: any) => item.label === "context.context.before_compaction.data")
+    const artifactText = await fs.readFile(path.join(caseDir, artifact.path), "utf8")
+    const slices = artifact.semantic_slices as Array<{
+      byte_range: [number, number]
+      content: string
+      hash: string
+      truncated: boolean
+    }>
+
+    expect(artifact.availability).toBe("bundled")
+    expect(artifact.content_hash).toBe(artifact.hash)
+    expect(artifact.content_hash).toBe(createHash("sha256").update(artifactText).digest("hex").slice(0, 16))
+    expect(artifact.byte_length).toBe(Buffer.byteLength(artifactText))
+    expect(artifactText).not.toContain(secret)
+    expect(artifactText).toContain("[REDACTED]")
+    expect(slices).toHaveLength(1)
+    expect(slices.reduce((total, slice) => total + slice.content.length, 0)).toBeLessThanOrEqual(30)
+
+    const slice = slices[0]!
+    const sliceBytes = Buffer.from(slice.content, "utf8")
+    expect(sliceBytes.toString("utf8")).toBe(slice.content)
+    expect(slice.content).toContain("[REDACTED]")
+    expect(slice.content).not.toContain(secret)
+    expect(slice.byte_range).toEqual([0, sliceBytes.byteLength])
+    expect(artifactText.slice(0, slice.content.length)).toBe(slice.content)
+    expect(slice.hash).toBe(createHash("sha256").update(slice.content).digest("hex").slice(0, 16))
+    expect(slice.truncated).toBe(true)
   })
 
   test("renders artifact-backed summaries with expandable full content", () => {

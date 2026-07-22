@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -151,7 +152,7 @@ def episode_adjacency_graph(upstream_count: int, downstream_count: int):
     return graph, upstream, downstream
 
 
-def trace_with_artifact() -> dict:
+def trace_with_artifact(artifact_content: str | None = None) -> dict:
     return {
         "case_id": "investigation-case",
         "manifest": {
@@ -163,7 +164,11 @@ def trace_with_artifact() -> dict:
                 "artifact_id": "artifact_1",
                 "kind": "tool-output",
                 "path": "artifacts/payload.txt",
-                "hash": "sha256:payload",
+                "hash": (
+                    hashlib.sha256(artifact_content.encode("utf-8")).hexdigest()[:16]
+                    if artifact_content is not None
+                    else "sha256:payload"
+                ),
             }
         ],
         "records": [
@@ -361,10 +366,9 @@ class InvestigationToolTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         (root / "artifacts").mkdir()
-        (root / "artifacts" / "payload.txt").write_text(
-            "0123456789-compatibility-owner", encoding="utf-8"
-        )
-        self.graph = TraceGraph.from_trace(trace_with_artifact(), artifact_root=root)
+        artifact_content = "0123456789-compatibility-owner"
+        (root / "artifacts" / "payload.txt").write_text(artifact_content, encoding="utf-8")
+        self.graph = TraceGraph.from_trace(trace_with_artifact(artifact_content), artifact_root=root)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -912,10 +916,9 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         (root / "artifacts").mkdir()
-        (root / "artifacts" / "payload.txt").write_text(
-            "compatibility owner contract", encoding="utf-8"
-        )
-        self.graph = TraceGraph.from_trace(trace_with_artifact(), artifact_root=root)
+        artifact_content = "compatibility owner contract"
+        (root / "artifacts" / "payload.txt").write_text(artifact_content, encoding="utf-8")
+        self.graph = TraceGraph.from_trace(trace_with_artifact(artifact_content), artifact_root=root)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1574,8 +1577,9 @@ class AnalyzerInvestigationTest(unittest.TestCase):
 
     def test_artifact_investigation_shares_the_analysis_byte_budget(self):
         root = Path(self.temp.name)
-        (root / "artifacts" / "payload.txt").write_text("x" * 33_000, encoding="utf-8")
-        graph = TraceGraph.from_trace(trace_with_artifact(), artifact_root=root)
+        artifact_content = "x" * 33_000
+        (root / "artifacts" / "payload.txt").write_text(artifact_content, encoding="utf-8")
+        graph = TraceGraph.from_trace(trace_with_artifact(artifact_content), artifact_root=root)
         judge = ScriptedInvestigatingJudge(
             [
                 judgment(

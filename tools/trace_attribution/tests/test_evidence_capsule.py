@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution.evidence_capsule import (
@@ -157,6 +160,71 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 for edge in capsule["outgoing_edges"]
             )
         )
+
+    def test_capsule_reports_embedded_slice_fallback_as_truncated(self):
+        content = "redacted decisive rationale"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        trace = {
+            "case_id": "slice-fallback-capsule",
+            "artifacts": [
+                {
+                    "artifact_id": "decision-rationale",
+                    "kind": "text",
+                    "path": "artifacts/sha256/missing.txt",
+                    "hash": hashlib.sha256(b"full artifact").hexdigest()[:16],
+                    "availability": "bundled",
+                    "semantic_slices": [
+                        {
+                            "byte_range": [0, len(content.encode("utf-8"))],
+                            "content": content,
+                            "hash": digest,
+                            "truncated": False,
+                        }
+                    ],
+                }
+            ],
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "artifact_refs": ["artifact:decision-rationale"],
+                    "data": {"decision_id": "dec_1"},
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            graph = TraceGraph.from_trace(trace, artifact_root=Path(directory))
+            candidate = CausalCandidate(
+                ref="record:decision",
+                node=graph.nodes["record:decision"],
+                source="progress_window",
+                score=0.9,
+            )
+            capsule = build_candidate_evidence_capsules(
+                graph=graph,
+                candidates=[candidate],
+                defect_state=DefectState.create(
+                    label="missing_cleanup",
+                    expected="cleanup completes",
+                    actual="cleanup stopped",
+                    mechanism="decision omitted the cleanup boundary",
+                    scope="task_quality",
+                ),
+                downstream_paths={},
+                start_refs=("record:decision",),
+            )[0].to_dict()
+
+        hydrated = capsule["artifact_hydration"]["hydrated_artifacts"][0]
+        self.assertEqual(hydrated["source"], "embedded_semantic_slice")
+        self.assertEqual(hydrated["content"], content)
+        self.assertTrue(hydrated["truncated"])
+        self.assertEqual(
+            capsule["artifact_hydration"]["truncated_artifact_ids"],
+            ["decision-rationale"],
+        )
+        self.assertNotIn("artifact:decision-rationale", capsule["missing_evidence_refs"])
+        self.assertEqual(graph.artifact_hydration["slice_fallbacks"], 1)
 
     def test_compression_metrics_compare_unique_capsules_with_trace_nodes(self):
         graph = sample_graph()

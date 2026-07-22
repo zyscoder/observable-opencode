@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -80,6 +81,9 @@ class TraceGraph:
             "loaded": 0,
             "missing": 0,
             "truncated": 0,
+            "slice_fallbacks": 0,
+            "hash_mismatches": 0,
+            "integrity_failures": [],
             "artifact_root": str(artifact_root) if artifact_root else "",
         }
         artifact_records: Dict[str, JsonDict] = {}
@@ -502,12 +506,18 @@ class TraceGraph:
             for item in hydrated_items
             if item.get("truncated") and item.get("artifact_id")
         ]
+        integrity_failures = [
+            dict(item)
+            for item in self.artifact_hydration.get("integrity_failures") or []
+            if isinstance(item, dict) and str(item.get("artifact_id") or "") in artifact_ids
+        ]
         return {
             "node_ref": resolved,
             "referenced_artifact_ids": artifact_ids,
             "hydrated_artifacts": hydrated_items,
             "missing_artifact_ids": missing_ids,
             "truncated_artifact_ids": truncated_ids,
+            "integrity_failures": integrity_failures,
         }
 
     def artifact_reference_status(self, ref: str) -> Optional[JsonDict]:
@@ -789,50 +799,193 @@ def hydrate_record_artifacts(
     max_artifacts: int = 6,
 ) -> List[JsonDict]:
     artifact_ids = collect_artifact_ids(record, data)
-    if not artifact_ids or artifact_root is None:
+    if not artifact_ids:
         return []
-    root = Path(artifact_root).resolve()
+    root = Path(artifact_root).resolve() if artifact_root is not None else None
     remaining = max_chars
     hydrated: List[JsonDict] = []
     for artifact_id in artifact_ids[:max_artifacts]:
         artifact = artifact_index.get(artifact_id)
-        if not artifact or not artifact.get("path"):
-            stats["missing"] += 1
-            continue
-        candidate = (root / str(artifact["path"])).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError:
-            stats["missing"] += 1
-            continue
-        try:
-            content = candidate.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        if not artifact:
             stats["missing"] += 1
             continue
         limit = min(max_artifact_chars, remaining)
         if limit <= 0:
             stats["truncated"] += 1
             break
-        excerpt = content[:limit]
-        truncated = len(content) > len(excerpt)
+        path_value = artifact.get("path")
+        file_hash_status = "missing"
+        file_content: Optional[str] = None
+        if root is not None and isinstance(path_value, str) and _case_relative_artifact_path(path_value):
+            candidate = (root / path_value).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                file_hash_status = "invalid_path"
+            else:
+                try:
+                    content_bytes = candidate.read_bytes()
+                except OSError:
+                    pass
+                else:
+                    expected_hash = artifact.get("content_hash") or artifact.get("hash")
+                    if not _content_hash_matches(content_bytes, expected_hash):
+                        file_hash_status = "mismatch"
+                        stats["hash_mismatches"] += 1
+                        _record_artifact_integrity_failure(stats, artifact_id, "bundle_file_hash_mismatch")
+                    else:
+                        try:
+                            file_content = content_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            file_hash_status = "invalid_utf8"
+                            _record_artifact_integrity_failure(stats, artifact_id, "bundle_file_invalid_utf8")
+                        else:
+                            file_hash_status = "verified"
+        elif path_value:
+            file_hash_status = "invalid_path"
+
+        if file_content is not None:
+            excerpt = file_content[:limit]
+            truncated = len(file_content) > len(excerpt)
+            hydrated.append(
+                {
+                    "artifact_id": artifact_id,
+                    "kind": artifact.get("kind"),
+                    "label": artifact.get("label"),
+                    "path": path_value,
+                    "hash": artifact.get("hash"),
+                    "content_hash": artifact.get("content_hash") or artifact.get("hash"),
+                    "content": excerpt,
+                    "content_length": len(file_content),
+                    "byte_length": len(file_content.encode("utf-8")),
+                    "source": "bundle_file",
+                    "hash_status": "verified",
+                    "file_hash_status": file_hash_status,
+                    "truncated": truncated,
+                }
+            )
+            stats["loaded"] += 1
+            if truncated:
+                stats["truncated"] += 1
+            remaining -= len(excerpt)
+            continue
+
+        accepted_slices: List[Tuple[int, int, str]] = []
+        rejected_slices = 0
+        last_end = -1
+        slices = artifact.get("semantic_slices")
+        ordered_slices = sorted(
+            (item for item in slices if isinstance(item, dict)) if isinstance(slices, list) else (),
+            key=_semantic_slice_sort_key,
+        )
+        for item in ordered_slices:
+            byte_range = item.get("byte_range")
+            content = item.get("content")
+            if not _valid_semantic_slice_range(byte_range, content):
+                rejected_slices += 1
+                _record_artifact_integrity_failure(stats, artifact_id, "semantic_slice_range_mismatch")
+                continue
+            start, end = int(byte_range[0]), int(byte_range[1])
+            if start < last_end:
+                rejected_slices += 1
+                _record_artifact_integrity_failure(stats, artifact_id, "semantic_slice_overlap")
+                continue
+            encoded = content.encode("utf-8")
+            if not _content_hash_matches(encoded, item.get("hash")):
+                rejected_slices += 1
+                stats["hash_mismatches"] += 1
+                _record_artifact_integrity_failure(stats, artifact_id, "semantic_slice_hash_mismatch")
+                continue
+            accepted_slices.append((start, end, content))
+            last_end = end
+
+        slice_content = "".join(item[2] for item in accepted_slices)
+        if not accepted_slices or not slice_content:
+            stats["missing"] += 1
+            continue
+        excerpt = slice_content[:limit]
         hydrated.append(
             {
                 "artifact_id": artifact_id,
                 "kind": artifact.get("kind"),
                 "label": artifact.get("label"),
-                "path": artifact.get("path"),
+                "path": path_value,
                 "hash": artifact.get("hash"),
+                "content_hash": artifact.get("content_hash") or artifact.get("hash"),
                 "content": excerpt,
-                "content_length": len(content),
-                "truncated": truncated,
+                "content_length": len(slice_content),
+                "byte_length": len(slice_content.encode("utf-8")),
+                "byte_ranges": [[item[0], item[1]] for item in accepted_slices],
+                "semantic_slice_count": len(accepted_slices),
+                "rejected_semantic_slice_count": rejected_slices,
+                "source": "embedded_semantic_slice",
+                "hash_status": "verified",
+                "file_hash_status": file_hash_status,
+                "slice_hash_status": "partial" if rejected_slices else "verified",
+                "truncated": True,
             }
         )
         stats["loaded"] += 1
-        if truncated:
-            stats["truncated"] += 1
+        stats["truncated"] += 1
+        stats["slice_fallbacks"] += 1
         remaining -= len(excerpt)
     return hydrated
+
+
+def _case_relative_artifact_path(value: str) -> bool:
+    if not value or "\x00" in value or "\\" in value or re.match(r"^[A-Za-z]:", value):
+        return False
+    path = Path(value)
+    return not path.is_absolute() and ".." not in path.parts
+
+
+def _content_hash_matches(content: bytes, expected: Any) -> bool:
+    match = re.fullmatch(r"(?:sha256:)?([0-9a-fA-F]{16}|[0-9a-fA-F]{64})", str(expected or ""))
+    if not match:
+        return False
+    actual = hashlib.sha256(content).hexdigest()
+    digest = match.group(1).lower()
+    return actual[: len(digest)] == digest
+
+
+def _semantic_slice_sort_key(item: JsonDict) -> Tuple[int, int]:
+    byte_range = item.get("byte_range")
+    if (
+        isinstance(byte_range, (list, tuple))
+        and len(byte_range) == 2
+        and isinstance(byte_range[0], int)
+        and not isinstance(byte_range[0], bool)
+        and isinstance(byte_range[1], int)
+        and not isinstance(byte_range[1], bool)
+    ):
+        return byte_range[0], byte_range[1]
+    return (2**63 - 1, 2**63 - 1)
+
+
+def _valid_semantic_slice_range(byte_range: Any, content: Any) -> bool:
+    if not isinstance(content, str) or not isinstance(byte_range, (list, tuple)) or len(byte_range) != 2:
+        return False
+    start, end = byte_range
+    if (
+        not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or start < 0
+        or end < start
+    ):
+        return False
+    try:
+        return len(content.encode("utf-8")) == end - start
+    except UnicodeEncodeError:
+        return False
+
+
+def _record_artifact_integrity_failure(stats: JsonDict, artifact_id: str, status: str) -> None:
+    failures = stats.setdefault("integrity_failures", [])
+    failure = {"artifact_id": artifact_id, "status": status}
+    if isinstance(failures, list) and failure not in failures:
+        failures.append(failure)
 
 
 def collect_artifact_ids(record: JsonDict, data: JsonDict) -> List[str]:

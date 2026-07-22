@@ -186,6 +186,15 @@ export type TraceArtifact = {
   storage_encoding?: "identity" | "json_minified"
   original_length?: number
   stored_length?: number
+  availability?: "embedded" | "bundled" | "external" | "missing" | "truncated"
+  content_hash?: string
+  byte_length?: number
+  semantic_slices?: Array<{
+    byte_range: [number, number]
+    content: string
+    hash: string
+    truncated: boolean
+  }>
 }
 
 export type TraceTokenUsage = {
@@ -1663,6 +1672,13 @@ function textForSummary(input: unknown) {
 
 function maxFieldLength() {
   return safeNumber(process.env.OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH || 2048) || 2048
+}
+
+function unicodePrefix(input: string, limit: number) {
+  const prefix = input.slice(0, limit)
+  const last = prefix.charCodeAt(prefix.length - 1)
+  if (last >= 0xd800 && last <= 0xdbff) return prefix.slice(0, -1)
+  return prefix
 }
 
 function summarizeScalar(input: unknown): TraceFieldSummary {
@@ -10332,6 +10348,7 @@ class ActiveCaseTrace {
       } catch {}
     }
     const contentHash = hash(storedContent)
+    const semanticContent = unicodePrefix(storedContent, maxFieldLength())
     const dedupeKey = `${kind}:${contentHash}`
     const existing = this.artifactByDedupeKey.get(dedupeKey)
     if (existing) {
@@ -10358,6 +10375,17 @@ class ActiveCaseTrace {
       storage_encoding: storageEncoding,
       original_length: Buffer.byteLength(redacted),
       stored_length: Buffer.byteLength(storedContent),
+      availability: "bundled",
+      content_hash: contentHash,
+      byte_length: Buffer.byteLength(storedContent),
+      semantic_slices: [
+        {
+          byte_range: [0, Buffer.byteLength(semanticContent)],
+          content: semanticContent,
+          hash: hash(semanticContent),
+          truncated: semanticContent.length < storedContent.length,
+        },
+      ],
     }
     const target = path.join(this.caseDir, relativePath)
     const temp = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`

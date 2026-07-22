@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -195,6 +196,7 @@ class CausalEpisodeIndexTest(unittest.TestCase):
 
     def test_hydrates_externalized_call_identity_before_grouping(self):
         trace = episode_trace()
+        artifact_content = json.dumps({"callID": "call_edit", "messageID": "msg_1"})
         tool_execute = next(item for item in trace["records"] if item["record_id"] == "tool_execute")
         tool_execute["data"]["metadata"] = {
             "artifact_id": "artifact_tool_metadata",
@@ -206,16 +208,14 @@ class CausalEpisodeIndexTest(unittest.TestCase):
                 "kind": "json",
                 "label": "decision.metadata",
                 "path": "artifacts/tool-metadata.json",
+                "hash": hashlib.sha256(artifact_content.encode("utf-8")).hexdigest()[:16],
             }
         ]
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "artifacts").mkdir()
-            (root / "artifacts" / "tool-metadata.json").write_text(
-                json.dumps({"callID": "call_edit", "messageID": "msg_1"}),
-                encoding="utf-8",
-            )
+            (root / "artifacts" / "tool-metadata.json").write_text(artifact_content, encoding="utf-8")
             trace_file = root / "trace.json"
             trace_file.write_text(json.dumps(trace), encoding="utf-8")
             graph = TraceGraph.from_file(trace_file)

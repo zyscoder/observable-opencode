@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -899,10 +900,8 @@ class TraceGraphTest(unittest.TestCase):
             root = Path(tmp)
             artifact_path = root / "artifacts" / "sha256" / "tool-output.txt"
             artifact_path.parent.mkdir(parents=True)
-            artifact_path.write_text(
-                "The decisive architecture boundary is billing-core, which owns renewalQuote end to end.",
-                encoding="utf-8",
-            )
+            artifact_content = "The decisive architecture boundary is billing-core, which owns renewalQuote end to end."
+            artifact_path.write_text(artifact_content, encoding="utf-8")
             trace = {
                 "case_id": "artifact-case",
                 "artifacts": [
@@ -910,7 +909,7 @@ class TraceGraphTest(unittest.TestCase):
                         "artifact_id": "artifact_tool_output",
                         "path": "artifacts/sha256/tool-output.txt",
                         "kind": "text",
-                        "hash": "unit-hash",
+                        "hash": hashlib.sha256(artifact_content.encode("utf-8")).hexdigest()[:16],
                     }
                 ],
                 "records": [
@@ -964,6 +963,7 @@ class TraceGraphTest(unittest.TestCase):
                                 "artifact_id": "decision-rationale",
                                 "path": "artifacts/sha256/decision.txt",
                                 "kind": "text",
+                                "hash": hashlib.sha256(b"Complete cancellation rationale.").hexdigest()[:16],
                             }
                         ],
                         "records": [
