@@ -116,9 +116,7 @@ function contextSetMemberRefs(trace: any, edge: any) {
 
 function temporalAdvisoryMemberRefs(trace: any, targetID: string) {
   return [
-    ...new Set(
-      temporalAdvisoryEdgesTo(trace, targetID).flatMap((edge: any) => contextSetMemberRefs(trace, edge)),
-    ),
+    ...new Set(temporalAdvisoryEdgesTo(trace, targetID).flatMap((edge: any) => contextSetMemberRefs(trace, edge))),
   ]
 }
 
@@ -1416,11 +1414,14 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "confirmed-context-set-case", "trace.json"), "utf8")) as any
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "confirmed-context-set-case", "trace.json"), "utf8"),
+    ) as any
     const toolResult = trace.records.find((record: any) => record.event_type === "tool.result")
     const transforms = trace.records.filter((record: any) => record.event_type === "context.transform")
     const sets = trace.records.filter(
-      (record: any) => record.event_type === "context.pack" && record.data.context_set_kind === "confirmed_tool_selection",
+      (record: any) =>
+        record.event_type === "context.pack" && record.data.context_set_kind === "confirmed_tool_selection",
     )
     expect(sets).toHaveLength(1)
     expect(sets[0].data.member_refs).toEqual([`node:${toolResult.record_id}`])
@@ -1446,7 +1447,8 @@ describe("case trace", () => {
     expect(
       trace.edges.some(
         (edge: any) =>
-          edge.from.ref_id === toolResult.record_id && transforms.some((record: any) => record.record_id === edge.to.ref_id),
+          edge.from.ref_id === toolResult.record_id &&
+          transforms.some((record: any) => record.record_id === edge.to.ref_id),
       ),
     ).toBe(false)
   })
@@ -1483,7 +1485,9 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "temporal-context-set-case", "trace.json"), "utf8")) as any
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "temporal-context-set-case", "trace.json"), "utf8"),
+    ) as any
     const facts = trace.records.filter((record: any) => record.event_type === "evidence.semantic_fact")
     const targets = trace.records.filter((record: any) => record.record_id.startsWith("temporal_set_target_"))
     const allSets = trace.records.filter(
@@ -1491,9 +1495,7 @@ describe("case trace", () => {
     )
     const targetIDs = new Set(targets.map((record: any) => record.record_id))
     const sets = allSets.filter((record: any) =>
-      trace.edges.some(
-        (edge: any) => edge.from.ref_id === record.record_id && targetIDs.has(edge.to.ref_id),
-      ),
+      trace.edges.some((edge: any) => edge.from.ref_id === record.record_id && targetIDs.has(edge.to.ref_id)),
     )
     expect(sets).toHaveLength(1)
     expect(sets[0].data.member_refs.sort()).toEqual(facts.map((record: any) => `evidence:${record.record_id}`).sort())
@@ -1567,12 +1569,10 @@ describe("case trace", () => {
         record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "renewalQuote",
     )
     const unrelated = trace.records.find(
-      (record: any) =>
-        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "shipping",
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "shipping",
     )
     const old = trace.records.find(
-      (record: any) =>
-        record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "discount",
+      (record: any) => record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "discount",
     )
     const outside = trace.records.find(
       (record: any) => record.event_type === "evidence.semantic_fact" && record.data.canonical_subject === "tax",
@@ -1585,8 +1585,7 @@ describe("case trace", () => {
       (record: any) => record.event_type === "response.claim" && String(record.data.text).includes("Math.round"),
     )
     const assessment = trace.records.find(
-      (record: any) =>
-        record.event_type === "claim.support_assessment" && record.data.claim_id === claim.data.claim_id,
+      (record: any) => record.event_type === "claim.support_assessment" && record.data.claim_id === claim.data.claim_id,
     )
     const currentRef = `evidence:${current.record_id}`
     const oldRef = `evidence:${old.record_id}`
@@ -1597,7 +1596,9 @@ describe("case trace", () => {
       expect.arrayContaining([currentRef, oldRef, unrelatedRef]),
     )
     expect(response.data.generation_grounding_candidate_refs).not.toContain(outsideRef)
-    expect(response.data.generation_grounding_candidate_refs.some((ref: string) => ref.startsWith("node:toolresult"))).toBe(false)
+    expect(
+      response.data.generation_grounding_candidate_refs.some((ref: string) => ref.startsWith("node:toolresult")),
+    ).toBe(false)
     expect(claim.data.direct_evidence_refs).toContain(currentRef)
     expect(claim.data.direct_evidence_refs).toContain(oldRef)
     expect(claim.data.direct_evidence_refs).not.toContain(unrelatedRef)
@@ -1629,14 +1630,10 @@ describe("case trace", () => {
     expect(codeClaim.data.direct_evidence_refs).toContain("tool_result:call_code")
     expect(codeClaim.data.quality_flags).not.toContain("unsupported_response_claim")
     expect(
-      trace.edges.some(
-        (edge: any) => edge.from.ref_id === current.record_id && edge.to.ref_id === claim.record_id,
-      ),
+      trace.edges.some((edge: any) => edge.from.ref_id === current.record_id && edge.to.ref_id === claim.record_id),
     ).toBe(true)
     expect(
-      trace.edges.some(
-        (edge: any) => edge.from.ref_id === unrelated.record_id && edge.to.ref_id === claim.record_id,
-      ),
+      trace.edges.some((edge: any) => edge.from.ref_id === unrelated.record_id && edge.to.ref_id === claim.record_id),
     ).toBe(false)
   })
 
@@ -1969,9 +1966,7 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(
-      await fs.readFile(path.join(dir, "parenthetical-claim-case", "trace.json"), "utf8"),
-    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "parenthetical-claim-case", "trace.json"), "utf8")) as any
     const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
     const claimTexts = claims.map((record: any) => record.data.text)
     const responseClaimNodes = trace.nodes.filter((node: any) => node.kind === "response.claim")
@@ -2004,9 +1999,7 @@ describe("case trace", () => {
     const secondRecordRef = `record:${secondClaim!.record_id}`
     const firstClaimNode = responseClaimNodes.find((node: any) => node.node_id === firstClaim!.record_id)
     const secondClaimNode = responseClaimNodes.find((node: any) => node.node_id === secondClaim!.record_id)
-    const claimGroupEdges = trace.dataflow_edges.filter(
-      (edge: any) => edge.relation === "response_to_claim_group",
-    )
+    const claimGroupEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "response_to_claim_group")
     const claimOrderEdges = trace.dataflow_edges.filter((edge: any) => edge.relation === "claim_group_precedes")
 
     expect(claims).toHaveLength(2)
@@ -2411,12 +2404,14 @@ describe("case trace", () => {
       expect(output.trace.metrics).toBeDefined()
       const response = output.trace.records.find((record: any) => record.event_type === "response.output")
       expect(response.data.text.artifact_id).toEqual(expect.any(String))
-      expect(output.trace.artifacts.some((artifact: any) => artifact.artifact_id === response.data.text.artifact_id)).toBe(
-        true,
-      )
+      expect(
+        output.trace.artifacts.some((artifact: any) => artifact.artifact_id === response.data.text.artifact_id),
+      ).toBe(true)
     }
     expect(final.manifest).toMatchObject({ status: "success", case_status: "success" })
-    expect(final.trace.records.filter((record: any) => record.event_type === "response.claim").length).toBeGreaterThan(0)
+    expect(final.trace.records.filter((record: any) => record.event_type === "response.claim").length).toBeGreaterThan(
+      0,
+    )
     expect(nonFinal.manifest).toMatchObject({ status: "success", case_status: "success" })
     expect(nonFinal.trace.records.filter((record: any) => record.event_type === "response.claim")).toHaveLength(0)
     expect(cancelled.manifest).toMatchObject({ status: "cancelled", case_status: "cancelled" })
@@ -3115,9 +3110,7 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(
-      await fs.readFile(path.join(dir, "conflict-heading-case", "trace.json"), "utf8"),
-    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "conflict-heading-case", "trace.json"), "utf8")) as any
     const claimText = trace.records
       .filter((record: any) => record.event_type === "response.claim")
       .map((record: any) => record.data.text)
@@ -5453,8 +5446,7 @@ describe("case trace", () => {
     expect(advisoryEdges.length).toBeGreaterThan(0)
     expect(
       advisoryEdges.every(
-        (edge: any) =>
-          edge.evidence_tier === "temporal_advisory" && edge.eligible_for_attribution === false,
+        (edge: any) => edge.evidence_tier === "temporal_advisory" && edge.eligible_for_attribution === false,
       ),
     ).toBe(true)
   })
@@ -6920,9 +6912,7 @@ describe("case trace", () => {
     const legacy = JSON.parse(
       await fs.readFile(path.join(dir, "passing-location-case", "legacy-trace.json"), "utf8"),
     ) as any
-    const trace = JSON.parse(
-      await fs.readFile(path.join(dir, "passing-location-case", "trace.json"), "utf8"),
-    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "passing-location-case", "trace.json"), "utf8")) as any
     const verification = trace.records.find((record: any) => record.event_type === "verification")
 
     expect(legacy.verification_records[0].status).toBe("passed")
@@ -9020,76 +9010,85 @@ describe("case trace", () => {
     const response =
       "All 11 tests pass. The fix was a one-character change in `astropy/modeling/separable.py:245`: `= 1` → `= right`. When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix from a nested compound model), it was filling the block with all 1s instead of the actual matrix values, causing nested compound models to appear non-separable."
     const artifactPayload = `task-5-artifact-closure:${"verifiable semantic evidence ".repeat(100)}`
+    const expectedArtifactText = JSON.stringify({ payload: artifactPayload })
+    const expectedArtifactBytes = Buffer.from(expectedArtifactText, "utf8")
+    const expectedArtifactSha256 = createHash("sha256").update(expectedArtifactBytes).digest("hex")
+    const expectedSemanticPrefix = expectedArtifactText.slice(0, 512)
+    const expectedSemanticBytes = Buffer.from(expectedSemanticPrefix, "utf8")
+    const expectedSemanticSha256 = createHash("sha256").update(expectedSemanticBytes).digest("hex")
 
-    await fs.writeFile(
-      script,
-      [
-        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-        `CaseTrace.configure({ subjectRevision: "git:task5-current-producer" })`,
-        `CaseTrace.responseOutput({ response_role: "final_answer", text: ${JSON.stringify(response)} })`,
-        `CaseTrace.event({ component: "context", event_type: "context.before_compaction", data: { payload: ${JSON.stringify(artifactPayload)} } })`,
-        `CaseTrace.finish({ status: "success" })`,
-      ].join("\n"),
-    )
+    try {
+      await fs.writeFile(
+        script,
+        [
+          `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+          `CaseTrace.configure({ subjectRevision: "git:task5-current-producer" })`,
+          `CaseTrace.responseOutput({ response_role: "final_answer", text: ${JSON.stringify(response)} })`,
+          `CaseTrace.event({ component: "context", event_type: "context.before_compaction", data: { payload: ${JSON.stringify(artifactPayload)} } })`,
+          `CaseTrace.finish({ status: "success" })`,
+        ].join("\n"),
+      )
 
-    const proc = Bun.spawn([process.execPath, script], {
-      cwd: packageDir,
-      env: {
-        ...process.env,
-        OPENCODE_CASE_TRACE: "1",
-        OPENCODE_CASE_ID: "task5-astropy-closure",
-        OPENCODE_CASE_TRACE_DIR: dir,
-        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "512",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    expect(await proc.exited).toBe(0)
-    expect(await new Response(proc.stderr).text()).toBe("")
+      const proc = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: "1",
+          OPENCODE_CASE_ID: "task5-astropy-closure",
+          OPENCODE_CASE_TRACE_DIR: dir,
+          OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "512",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(await proc.exited).toBe(0)
+      expect(await new Response(proc.stderr).text()).toBe("")
 
-    const caseDir = path.join(dir, "task5-astropy-closure")
-    const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
-    const claimTexts = claims.map((record: any) => record.data.text)
+      const caseDir = path.join(dir, "task5-astropy-closure")
+      const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+      const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+      const claimTexts = claims.map((record: any) => record.data.text)
 
-    expect(trace.manifest.subject_revision).toBe("git:task5-current-producer")
-    expect(trace.manifest.subject_revision_provenance).toMatchObject({
-      method: "case_trace_config",
-      source: "CaseTraceConfig.subjectRevision",
-      bound_at: "case_start",
-      case_id: trace.manifest.case_id,
-      run_id: trace.manifest.run_id,
-    })
-    expect(claimTexts).toEqual([
-      "All 11 tests pass.",
-      "The fix was a one-character change in `astropy/modeling/separable.py:245`: `= 1` → `= right`.",
-      "When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix from a nested compound model), it was filling the block with all 1s instead of the actual matrix values, causing nested compound models to appear non-separable.",
-    ])
-    expect(claimTexts.some((text: string) => /^[,，;；)）\]］}｝]/.test(text))).toBe(false)
-    for (const claim of claims) {
-      expectResponseClaimAtomizationClosure(claim.data)
-      const [start, end] = claim.data.source_byte_range
-      expect(Buffer.from(response).subarray(start, end).toString()).toContain(claim.data.text)
-    }
+      expect(trace.manifest.subject_revision).toBe("git:task5-current-producer")
+      expect(trace.manifest.subject_revision_provenance).toMatchObject({
+        method: "case_trace_config",
+        source: "CaseTraceConfig.subjectRevision",
+        bound_at: "case_start",
+        case_id: trace.manifest.case_id,
+        run_id: trace.manifest.run_id,
+      })
+      expect(claimTexts).toEqual([
+        "All 11 tests pass.",
+        "The fix was a one-character change in `astropy/modeling/separable.py:245`: `= 1` → `= right`.",
+        "When `_cstack` handled a non-Model `right` operand (i.e., a pre-computed separability matrix from a nested compound model), it was filling the block with all 1s instead of the actual matrix values, causing nested compound models to appear non-separable.",
+      ])
+      expect(claimTexts.some((text: string) => /^[,，;；)）\]］}｝]/.test(text))).toBe(false)
+      for (const claim of claims) {
+        expectResponseClaimAtomizationClosure(claim.data)
+        const [start, end] = claim.data.source_byte_range
+        expect(Buffer.from(response).subarray(start, end).toString()).toContain(claim.data.text)
+      }
 
-    const artifact = trace.artifacts.find((item: any) => item.label === "context.context.before_compaction.data")
-    expect(artifact.availability).toBe("bundled")
-    expect(typeof artifact.path).toBe("string")
-    expect(typeof artifact.content_hash).toBe("string")
-    expect(typeof artifact.byte_length).toBe("number")
-    expect(Array.isArray(artifact.semantic_slices)).toBe(true)
-    expect(path.isAbsolute(artifact.path)).toBe(false)
-    expect(artifact.path.split(path.sep)).not.toContain("..")
-    const artifactBytes = await fs.readFile(path.join(caseDir, artifact.path))
-    expect(artifact.byte_length).toBe(artifactBytes.byteLength)
-    expect(artifact.content_hash).toBe(createHash("sha256").update(artifactBytes).digest("hex").slice(0, 16))
-    expect(artifact.semantic_slices.length).toBeGreaterThan(0)
-    for (const slice of artifact.semantic_slices) {
-      const [start, end] = slice.byte_range
-      const bytes = artifactBytes.subarray(start, end)
-      expect(bytes.toString()).toBe(slice.content)
-      expect(slice.hash).toBe(createHash("sha256").update(bytes).digest("hex").slice(0, 16))
-      expect(slice.truncated).toBe(true)
+      const artifact = trace.artifacts.find((item: any) => item.label === "context.context.before_compaction.data")
+      expect(artifact.availability).toBe("bundled")
+      expect(typeof artifact.path).toBe("string")
+      expect(path.isAbsolute(artifact.path)).toBe(false)
+      expect(artifact.path.split(path.sep)).not.toContain("..")
+      const artifactBytes = await fs.readFile(path.join(caseDir, artifact.path))
+      expect(artifactBytes.equals(expectedArtifactBytes)).toBe(true)
+      expect(artifactBytes.toString("utf8")).toBe(expectedArtifactText)
+      expect(artifact.byte_length).toBe(expectedArtifactBytes.byteLength)
+      expect(artifact.content_hash).toBe(expectedArtifactSha256.slice(0, 16))
+      expect(artifact.semantic_slices).toEqual([
+        {
+          byte_range: [0, expectedSemanticBytes.byteLength],
+          content: expectedSemanticPrefix,
+          hash: expectedSemanticSha256.slice(0, 16),
+          truncated: true,
+        },
+      ])
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
     }
   })
 })

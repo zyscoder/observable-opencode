@@ -32,6 +32,7 @@ from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
+from scripts.characterize_trace_fact_closure import characterize_archive
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "recursive_cases"
@@ -230,6 +231,39 @@ def task5_broken_claim_fragments(trace: dict) -> list[str]:
 
 
 class TraceFactClosureBenchmarkTest(unittest.TestCase):
+    def test_archive_characterizer_is_deterministic_and_hermetic(self):
+        trace = {
+            "manifest": {"case_id": "characterizer-fixture", "run_id": "run"},
+            "nodes": [],
+            "edges": [],
+            "artifacts": [],
+            "records": [
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": ", broken historical fragment"},
+                }
+            ],
+            "dataflow_edges": [],
+        }
+        source_bytes = json.dumps(trace, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "case" / "partial" / "latest.json"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(source_bytes)
+            first = characterize_archive(partial)
+            second = characterize_archive(partial)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["path"], str(partial.resolve()))
+        self.assertEqual(first["sha256"], hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(first["byte_length"], len(source_bytes))
+        self.assertEqual(first["broken_claim_fragments"], 1)
+        self.assertEqual(first["artifact_files"], 0)
+        self.assertIsNone(first["subject_revision"])
+
     def test_legacy_archive_fixture_fails_closed_without_rewriting_historical_gaps(self):
         trace = {
             "manifest": {"case_id": "legacy-astropy", "run_id": "legacy-run"},

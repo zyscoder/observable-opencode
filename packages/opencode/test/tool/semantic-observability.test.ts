@@ -4,148 +4,171 @@ import { captureRepositorySnapshot, repositorySnapshotDelta } from "../../src/ob
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
 import { execFileSync } from "node:child_process"
 
 describe("tool semantic observability", () => {
-  test("keeps passive tool behavior identical for success and error paths", async () => {
+  test("keeps production-projected passive tool behavior identical across tracing boundaries", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-passive-tool-equivalence-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
-    const script = path.join(root, "passive-tool-equivalence.ts")
-    const toolModule = pathToFileURL(path.join(packageDir, "src/tool/tool.ts")).href
-    const truncateModule = pathToFileURL(path.join(packageDir, "src/tool/truncate.ts")).href
-    const agentModule = pathToFileURL(path.join(packageDir, "src/agent/agent.ts")).href
-    const schemaModule = pathToFileURL(path.join(packageDir, "src/session/schema.ts")).href
-    const effectModule = pathToFileURL(path.join(packageDir, "node_modules/effect/dist/index.js")).href
+    const script = path.join(import.meta.dir, "fixture", "passive-tool-projection.ts")
+    const invalidRoot = path.join(root, "invalid-root")
 
-    fs.writeFileSync(
-      script,
-      [
-        `import { Effect, Layer, ManagedRuntime, Schema } from ${JSON.stringify(effectModule)}`,
-        `import { Tool } from ${JSON.stringify(toolModule)}`,
-        `import { Truncate } from ${JSON.stringify(truncateModule)}`,
-        `import { Agent } from ${JSON.stringify(agentModule)}`,
-        `import { MessageID, SessionID } from ${JSON.stringify(schemaModule)}`,
-        `class PassiveToolError extends Error { constructor() { super("passive benchmark failure"); this.name = "PassiveToolError" } }`,
-        `const runtime = ManagedRuntime.make(Layer.mergeAll(Truncate.defaultLayer, Agent.defaultLayer))`,
-        `const inputs = []`,
-        `const callbackCounts = { metadata: 0, ask: 0 }`,
-        `const agentVisibleMessages = []`,
-        `const context = {`,
-        `  sessionID: SessionID.descending(),`,
-        `  messageID: MessageID.ascending(),`,
-        `  agent: "build",`,
-        `  abort: new AbortController().signal,`,
-        `  callID: "passive-call",`,
-        `  messages: [{ info: { role: "user" }, parts: [{ type: "text", text: "run passive benchmark" }] }],`,
-        `  metadata(input) { callbackCounts.metadata++; agentVisibleMessages.push({ role: "tool", kind: "metadata", input }); return Effect.void },`,
-        `  ask(input) { callbackCounts.ask++; agentVisibleMessages.push({ role: "tool", kind: "permission", input }); return Effect.void },`,
-        `}`,
-        `const info = await runtime.runPromise(Tool.define("passive-benchmark", Effect.succeed({`,
-        `  description: "exercise passive tracing",`,
-        `  parameters: Schema.Struct({ scenario: Schema.Union([Schema.Literal("success"), Schema.Literal("error")]), payload: Schema.String }),`,
-        `  execute(args, ctx) {`,
-        `    return Effect.gen(function* () {`,
-        `      inputs.push(args)`,
-        `      yield* ctx.metadata({ title: "passive callback", metadata: { scenario: args.scenario } })`,
-        `      yield* ctx.ask({ permission: "read", patterns: [args.payload], always: [] })`,
-        `      if (args.scenario === "error") return yield* Effect.fail(new PassiveToolError())`,
-        `      return { title: "passive success", output: "stable tool output", metadata: { scenario: args.scenario, truncated: false } }`,
-        `    })`,
-        `  },`,
-        `})))`,
-        `const tool = await Effect.runPromise(info.init())`,
-        `const outcomes = []`,
-        `for (const args of [{ scenario: "success", payload: "fixed-input" }, { scenario: "error", payload: "fixed-input" }]) {`,
-        `  try {`,
-        `    const result = await Effect.runPromise(tool.execute(args, context))`,
-        `    outcomes.push({ scenario: args.scenario, result })`,
-        `    agentVisibleMessages.push({ role: "tool", kind: "result", content: result.output })`,
-        `  } catch (error) {`,
-        `    outcomes.push({ scenario: args.scenario, error: { class: error?.constructor?.name, type: error?.name, message: error?.message } })`,
-        `    agentVisibleMessages.push({ role: "tool", kind: "error", content: error?.message })`,
-        `  }`,
-        `}`,
-        `await runtime.dispose()`,
-        `process.stdout.write(JSON.stringify({ inputs, outcomes, callbackCounts, agentVisibleMessages }))`,
-      ].join("\n"),
-    )
+    try {
+      fs.writeFileSync(invalidRoot, "not a directory")
+      const run = async (enabled: boolean, traceRoot: string) => {
+        const proc = Bun.spawn([process.execPath, script], {
+          cwd: packageDir,
+          env: {
+            ...process.env,
+            OPENCODE_CASE_TRACE: enabled ? "1" : "0",
+            OPENCODE_CASE_ID: "passive-tool-equivalence",
+            OPENCODE_CASE_TRACE_DIR: traceRoot,
+          },
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        const code = await proc.exited
+        const stderr = await new Response(proc.stderr).text()
+        const stdout = await new Response(proc.stdout).text()
+        expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
+        return { result: JSON.parse(stdout), traceRoot }
+      }
 
-    const run = async (enabled: boolean) => {
-      const traceRoot = path.join(root, enabled ? "enabled" : "disabled")
-      const proc = Bun.spawn([process.execPath, script], {
-        cwd: packageDir,
-        env: {
-          ...process.env,
-          OPENCODE_CASE_TRACE: enabled ? "1" : "0",
-          OPENCODE_CASE_ID: "passive-tool-equivalence",
-          OPENCODE_CASE_TRACE_DIR: traceRoot,
+      const disabled = await run(false, path.join(root, "disabled"))
+      const enabled = await run(true, path.join(root, "enabled"))
+      const invalid = await run(true, invalidRoot)
+
+      expect(enabled.result).toEqual(disabled.result)
+      expect(invalid.result).toEqual(disabled.result)
+      expect(disabled.result.inputs).toEqual([
+        { scenario: "success", payload: "fixed-input" },
+        { scenario: "error", payload: "fixed-input" },
+        { scenario: "pre-aborted", payload: "fixed-input" },
+      ])
+      expect(disabled.result.callbackCounts).toEqual({ metadata: 3, ask: 3 })
+      expect(disabled.result.metadataCallbacks).toEqual([
+        {
+          scenario: "success",
+          value: { title: "passive success", metadata: { callback: "success" } },
         },
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      const code = await proc.exited
-      const stderr = await new Response(proc.stderr).text()
-      const stdout = await new Response(proc.stdout).text()
-      expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
-      return { code, stderr, result: JSON.parse(stdout), traceRoot }
+        {
+          scenario: "error",
+          value: { title: "passive error", metadata: { callback: "error" } },
+        },
+        {
+          scenario: "pre-aborted",
+          value: { title: "passive pre-aborted", metadata: { callback: "pre-aborted" } },
+        },
+      ])
+      expect(disabled.result.askCallbacks).toEqual(
+        ["success", "error", "pre-aborted"].map((scenario) => ({
+          scenario,
+          value: { permission: "read", patterns: ["fixed-input"], always: [], metadata: {} },
+        })),
+      )
+      expect(disabled.result.projectedToolParts).toEqual([
+        {
+          callID: "passive-success",
+          tool: "passive-benchmark",
+          state: {
+            status: "completed",
+            input: { scenario: "success", payload: "fixed-input" },
+            output: "stable tool output",
+            metadata: { scenario: "success", truncated: false },
+            title: "passive success",
+            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
+            attachments: [
+              {
+                type: "file",
+                mime: "text/plain",
+                filename: "passive.txt",
+                url: "data:text/plain;base64,cGFzc2l2ZQ==",
+              },
+            ],
+          },
+        },
+        {
+          callID: "passive-error",
+          tool: "passive-benchmark",
+          state: {
+            status: "error",
+            input: { scenario: "error", payload: "fixed-input" },
+            error: "passive benchmark failure",
+            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
+          },
+        },
+        {
+          callID: "passive-pre-aborted",
+          tool: "passive-benchmark",
+          state: {
+            status: "error",
+            input: { scenario: "pre-aborted", payload: "fixed-input" },
+            error: "Passive tool pre-aborted",
+            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
+          },
+        },
+      ])
+      expect(disabled.result.agentVisibleMessages).toEqual([
+        { role: "user", content: [{ type: "text", text: "run passive benchmark" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "passive-success",
+              toolName: "passive-benchmark",
+              input: { scenario: "success", payload: "fixed-input" },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "passive-error",
+              toolName: "passive-benchmark",
+              input: { scenario: "error", payload: "fixed-input" },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "passive-pre-aborted",
+              toolName: "passive-benchmark",
+              input: { scenario: "pre-aborted", payload: "fixed-input" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "passive-success",
+              toolName: "passive-benchmark",
+              output: {
+                type: "content",
+                value: [
+                  { type: "text", text: "stable tool output" },
+                  { type: "media", mediaType: "text/plain", data: "cGFzc2l2ZQ==" },
+                ],
+              },
+            },
+            {
+              type: "tool-result",
+              toolCallId: "passive-error",
+              toolName: "passive-benchmark",
+              output: { type: "error-text", value: "passive benchmark failure" },
+            },
+            {
+              type: "tool-result",
+              toolCallId: "passive-pre-aborted",
+              toolName: "passive-benchmark",
+              output: { type: "error-text", value: "Passive tool pre-aborted" },
+            },
+          ],
+        },
+      ])
+      expect(fs.existsSync(path.join(disabled.traceRoot, "passive-tool-equivalence"))).toBe(false)
+      expect(fs.existsSync(path.join(enabled.traceRoot, "passive-tool-equivalence", "records.jsonl"))).toBe(true)
+      expect(fs.statSync(invalidRoot).isFile()).toBe(true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
     }
-
-    const disabled = await run(false)
-    const enabled = await run(true)
-
-    expect(disabled.code).toBe(0)
-    expect(enabled.code).toBe(0)
-    expect(disabled.stderr).toBe("")
-    expect(enabled.stderr).toBe("")
-    expect(enabled.result).toEqual(disabled.result)
-    expect(disabled.result.inputs).toEqual([
-      { scenario: "success", payload: "fixed-input" },
-      { scenario: "error", payload: "fixed-input" },
-    ])
-    expect(disabled.result.outcomes[0]).toEqual({
-      scenario: "success",
-      result: {
-        title: "passive success",
-        output: "stable tool output",
-        metadata: { scenario: "success", truncated: false },
-      },
-    })
-    expect(disabled.result.outcomes[1]).toEqual({
-      scenario: "error",
-      error: {
-        class: "PassiveToolError",
-        type: "PassiveToolError",
-        message: "passive benchmark failure",
-      },
-    })
-    expect(disabled.result.callbackCounts).toEqual({ metadata: 2, ask: 2 })
-    expect(disabled.result.agentVisibleMessages).toEqual([
-      {
-        role: "tool",
-        kind: "metadata",
-        input: { title: "passive callback", metadata: { scenario: "success" } },
-      },
-      {
-        role: "tool",
-        kind: "permission",
-        input: { permission: "read", patterns: ["fixed-input"], always: [] },
-      },
-      { role: "tool", kind: "result", content: "stable tool output" },
-      {
-        role: "tool",
-        kind: "metadata",
-        input: { title: "passive callback", metadata: { scenario: "error" } },
-      },
-      {
-        role: "tool",
-        kind: "permission",
-        input: { permission: "read", patterns: ["fixed-input"], always: [] },
-      },
-      { role: "tool", kind: "error", content: "passive benchmark failure" },
-    ])
-    expect(fs.existsSync(path.join(disabled.traceRoot, "passive-tool-equivalence"))).toBe(false)
-    expect(fs.existsSync(path.join(enabled.traceRoot, "passive-tool-equivalence", "records.jsonl"))).toBe(true)
   })
 
   test("classifies shell commands by their actual semantic operation", () => {

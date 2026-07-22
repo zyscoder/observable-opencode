@@ -149,3 +149,77 @@ the historical bytes.
 ## Commit
 
 Planned commit: `test(trace): verify passive fact closure on benchmarks`.
+
+## Review Closure Addendum (2026-07-22)
+
+This addendum supersedes the earlier description of a synthesized six-message
+passive oracle. The corrected test does not append result or error messages.
+It executes a real `Tool.define` definition through the normal wrapper branch
+(the tool result does not predeclare `metadata.truncated`), then sends the
+resulting `tool-result` or `tool-error` stream event through
+`SessionProcessor.process`. Production `completeToolCall` / `failToolCall`
+persist the final tool part, and `MessageV2.toModelMessages` produces the
+Agent-visible projection.
+
+The deep-equality oracle compares the full stable projection for tracing off,
+tracing on, and tracing on with a trace root that is an ordinary file. It
+covers success, a thrown `PassiveToolError`, and a pre-aborted signal. Exact
+assertions cover decoded inputs; three metadata and three permission callback
+payloads; completed/error status; wrapper-added `truncated=false`; title,
+output, metadata, attachment projection; and production-formatted error text.
+The invalid trace root changes none of these values or callback behaviors.
+
+The focused passive test took 1.72-2.09 seconds in fresh local runs, including
+three child executions. This is characterization only: the test has no elapsed
+time assertion and this phase defines no hard latency SLA.
+
+The artifact oracle now derives source bytes as
+`Buffer.from(JSON.stringify({ payload: artifactPayload }), "utf8")`, without
+reading expected values from the producer manifest. It compares exact bytes
+and UTF-8 text, derives the full SHA-256 independently, checks the public
+16-hex manifest projection, exact byte length, and the exact 512-character
+semantic prefix, byte range, truncated marker, and independently computed
+slice hash. Both new TypeScript temporary roots are removed in `finally`
+blocks.
+
+### Reproducible Historical Inputs
+
+| Case | Exact local `partial/latest.json` | SHA-256 |
+| --- | --- | --- |
+| Axios | `/private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-multilingual/axios__axios-5892/traces/axios__axios-5892/partial/latest.json` | `1c934c47fe01719abaed45b2825ab4b88b1f1ea7fc1d8885ea2f76feed9c9ead` |
+| Astropy | `/private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-verified/astropy__astropy-12907/traces/astropy__astropy-12907/partial/latest.json` | `e5209173e7576b822921025b6cd9f80fde3d1062c3f85ceeae312c56e3012b17` |
+| TerminalBench | `/private/tmp/observable-opencode-multibench/runs/formal-v3/terminalbench/cancel-async-tasks/traces/cancel-async-tasks/partial/latest.json` | `3760043e3016d0ee29278cb5dd8b63f94575e8f3dcca70551c324e2409a5c011` |
+
+Deterministic no-LLM characterization command:
+
+```bash
+PYTHONPATH=tools/trace_attribution python3 tools/trace_attribution/scripts/characterize_trace_fact_closure.py \
+  /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-multilingual/axios__axios-5892/traces/axios__axios-5892/partial/latest.json \
+  /private/tmp/observable-opencode-multibench/runs/formal-v3/swebench-verified/astropy__astropy-12907/traces/astropy__astropy-12907/partial/latest.json \
+  /private/tmp/observable-opencode-multibench/runs/formal-v3/terminalbench/cancel-async-tasks/traces/cancel-async-tasks/partial/latest.json
+```
+
+The script hashes source bytes, loads each archive twice, hydrates every graph
+node, rejects nondeterministic reconstruction, and emits the artifact, seed,
+revision, and IR/graph metrics used by the tables above. Its automated test
+uses only a temporary synthetic archive; the large local archives remain
+uncommitted.
+
+### Corrective RED/GREEN Evidence
+
+- RED: focused Bun failed because
+  `test/tool/fixture/passive-tool-projection.ts` did not exist; focused Python
+  failed with `ModuleNotFoundError` for
+  `scripts.characterize_trace_fact_closure`.
+- RED: the first typed fixture run rejected invalid branded IDs; the first
+  full typecheck then rejected an error-channel tool definition, a missing
+  permission metadata field, and an unbranded part ID.
+- GREEN: passive focused gate `1 pass, 0 fail`; full semantic-observability
+  file `4 pass, 0 fail`; exact Astropy gate `1 pass, 0 fail`; Task 5 Python
+  class `3 tests, OK`.
+- GREEN: required four-file Bun gate `241 pass, 0 fail`; full offline Python
+  suite `552 tests, OK`; TypeScript typecheck, isolated-pycache compileall, and
+  `git diff --check` all exited `0`.
+
+No production behavior change was needed. The correction replaces weak test
+boundaries and adds a deterministic offline characterization utility.
