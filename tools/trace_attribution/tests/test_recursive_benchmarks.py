@@ -22,7 +22,9 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
     PredecessorAssessment,
+    RecursiveAttributionReport,
     RootConfirmation,
+    SeedAttributionResult,
     annotate_report_semantic_anchors,
     semantic_anchor_id,
     semantic_anchor_index,
@@ -684,6 +686,58 @@ class RecursiveMetricTest(unittest.TestCase):
             EvaluationSafetyError, "observed_defect_refs.*owning seed"
         ):
             compare_report(report, labels, None, graph=graph)
+
+    def test_evaluator_rejects_same_start_ref_sibling_matching_root_lineage(self):
+        report, labels, _, graph = self.fixture("inferred_missing_edge.json")
+        parsed = RecursiveAttributionReport.from_dict(report)
+        root = parsed.confirmed_roots[0]
+        owner = next(
+            item for item in parsed.seed_results if item.outcome == "confirmed_root"
+        )
+        root_defect = owner.defect_state.transformed(
+            label="evaluator-published-root-lineage",
+            mechanism="The published root carries a derived defect state.",
+            transformation_reason="Exercise composite root ownership validation.",
+        )
+        confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+        root_confirmation = replace(
+            confirmation,
+            defect_fingerprint=root_defect.fingerprint,
+        )
+        sibling = SeedAttributionResult(
+            start_ref=owner.start_ref,
+            defect_fingerprint=root_defect.fingerprint,
+            defect_state=root_defect,
+            outcome="no_defect",
+        )
+        updated_owner = replace(
+            owner,
+            confirmation_identities=(root_confirmation.confirmation_identity,),
+        )
+        updated_root = replace(
+            root,
+            defect_state=root_defect,
+            confirmation=root_confirmation.to_dict(),
+        )
+        mutated = parsed.to_dict()
+        mutated["seed_results"] = [
+            (updated_owner if item == owner else item).to_dict()
+            for item in parsed.seed_results
+        ] + [sibling.to_dict()]
+        mutated["confirmations"] = [
+            (root_confirmation if item == confirmation else item).to_dict()
+            for item in parsed.confirmations
+        ]
+        mutated["confirmed_roots"] = [
+            (updated_root if item == root else item).to_dict()
+            for item in parsed.confirmed_roots
+        ]
+        projected = annotate_report_semantic_anchors(
+            graph.case_id, graph.nodes, mutated, graph=graph
+        )
+
+        with self.assertRaisesRegex(EvaluationSafetyError, "composite owner"):
+            compare_report(projected, labels, None, graph=graph)
 
     def test_missing_current_request_measurement_does_not_invent_reduction(self):
         report, labels, _, graph = self.fixture()

@@ -577,6 +577,66 @@ def seed_result(ref: str, outcome: str) -> SeedAttributionResult:
     )
 
 
+def same_start_ref_sibling_mutation(
+    report: RecursiveAttributionReport,
+    *,
+    sibling_outcome: str,
+    sibling_matches_root_lineage: bool,
+) -> dict:
+    """Return a root-owner mutation with a distinct seed fingerprint at one ref."""
+    root = report.confirmed_roots[0]
+    owner = next(
+        item for item in report.seed_results if item.outcome == "confirmed_root"
+    )
+    root_defect = owner.defect_state.transformed(
+        label="published_root_lineage",
+        mechanism="The published root carries a derived defect state.",
+        transformation_reason="Exercise composite root ownership validation.",
+    )
+    confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+    root_confirmation = replace(
+        confirmation,
+        defect_fingerprint=root_defect.fingerprint,
+    )
+    updated_root = replace(
+        root,
+        defect_state=root_defect,
+        confirmation=root_confirmation.to_dict(),
+    )
+    updated_owner = replace(
+        owner,
+        confirmation_identities=(root_confirmation.confirmation_identity,),
+    )
+    sibling_defect = (
+        root_defect
+        if sibling_matches_root_lineage
+        else defect("same-start-ref-independent-sibling")
+    )
+    sibling = SeedAttributionResult(
+        start_ref=owner.start_ref,
+        defect_fingerprint=sibling_defect.fingerprint,
+        defect_state=sibling_defect,
+        outcome=sibling_outcome,
+        missing_evidence=("sibling evidence is incomplete",)
+        if sibling_outcome == "evidence_gap"
+        else (),
+    )
+    return {
+        "seed_results": tuple(
+            updated_owner if item == owner else item
+            for item in report.seed_results
+        )
+        + (sibling,),
+        "confirmations": tuple(
+            root_confirmation if item == confirmation else item
+            for item in report.confirmations
+        ),
+        "confirmed_roots": tuple(
+            updated_root if item == root else item for item in report.confirmed_roots
+        ),
+    }
+
+
 class SeedAttributionIntegrationTests(unittest.TestCase):
     def test_report_preserves_independent_seed_outcomes(self):
         report = run_fixture("multi_seed_claims.json")
@@ -889,6 +949,60 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_same_start_ref_sibling_with_matching_lineage_is_rejected(self):
+        report = run_fixture("multi_seed_claims.json")
+        for sibling_outcome in ("no_defect", "evidence_gap"):
+            with self.subTest(entry_point="direct", outcome=sibling_outcome):
+                mutation = same_start_ref_sibling_mutation(
+                    report,
+                    sibling_outcome=sibling_outcome,
+                    sibling_matches_root_lineage=True,
+                )
+                with self.assertRaisesRegex(ValueError, "composite.*owner"):
+                    replace(report, **mutation)
+
+            with self.subTest(entry_point="from_dict", outcome=sibling_outcome):
+                mutation = same_start_ref_sibling_mutation(
+                    report,
+                    sibling_outcome=sibling_outcome,
+                    sibling_matches_root_lineage=True,
+                )
+                payload = report.to_dict()
+                payload.update(
+                    {
+                        key: [item.to_dict() for item in value]
+                        for key, value in mutation.items()
+                    }
+                )
+                with self.assertRaisesRegex(ValueError, "composite.*owner"):
+                    RecursiveAttributionReport.from_dict(payload)
+
+    def test_same_start_ref_sibling_with_distinct_lineage_is_disambiguated(self):
+        report = run_fixture("multi_seed_claims.json")
+        mutation = same_start_ref_sibling_mutation(
+            report,
+            sibling_outcome="evidence_gap",
+            sibling_matches_root_lineage=False,
+        )
+        disambiguated = replace(report, **mutation)
+        same_ref_seeds = [
+            item
+            for item in disambiguated.seed_results
+            if item.start_ref == disambiguated.confirmed_roots[0].recursive_path[-1]
+        ]
+        self.assertEqual(
+            {item.outcome for item in same_ref_seeds},
+            {"confirmed_root", "evidence_gap"},
+        )
+        self.assertEqual(
+            len({item.defect_fingerprint for item in same_ref_seeds}),
+            2,
+        )
+        self.assertEqual(
+            RecursiveAttributionReport.from_dict(disambiguated.to_dict()).to_dict(),
+            disambiguated.to_dict(),
+        )
+
     def test_published_root_rejects_another_report_seed_in_observed_refs(self):
         report = run_fixture("multi_seed_claims.json")
         root = report.confirmed_roots[0]

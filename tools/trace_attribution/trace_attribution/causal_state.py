@@ -2036,6 +2036,36 @@ class RecursiveAttributionReport:
 
         root_owner_counts = {identity: 0 for identity in root_identities}
         report_seed_refs = {seed.start_ref for seed in self.seed_results}
+
+        def has_unambiguous_composite_owner(
+            root: ConfirmedRoot,
+            seed: SeedAttributionResult,
+            confirmation: RootConfirmation,
+        ) -> bool:
+            owner_candidates = [
+                candidate
+                for candidate in self.seed_results
+                if candidate.outcome == "confirmed_root"
+                and confirmation.seed_binding_identity
+                == seed_binding_identity_for(
+                    candidate.start_ref, candidate.defect_fingerprint
+                )
+                and root.recursive_path[-1] == candidate.start_ref
+                and defect_lineage_reaches_seed(
+                    root.defect_state.fingerprint, candidate
+                )
+            ]
+            if owner_candidates != [seed]:
+                return False
+            return not any(
+                candidate.start_ref == seed.start_ref
+                and candidate.outcome != "confirmed_root"
+                and defect_lineage_reaches_seed(
+                    root.defect_state.fingerprint, candidate
+                )
+                for candidate in self.seed_results
+            )
+
         for seed in self.seed_results:
             expected_seed_binding = seed_binding_identity_for(
                 seed.start_ref, seed.defect_fingerprint
@@ -2091,16 +2121,17 @@ class RecursiveAttributionReport:
                         if ref in report_seed_refs
                     }
                     != {seed.start_ref}
-                    or root.recursive_path[-1] != seed.start_ref
-                    or not defect_lineage_reaches_seed(
-                        root.defect_state.fingerprint, seed
+                    or not has_unambiguous_composite_owner(
+                        root,
+                        seed,
+                        confirmation_by_identity[identity],
                     )
                     for root in confirmed_seed_roots.values()
                 )
             ):
                 raise ValueError(
                     "confirmed_root seed is not bound to top-level confirmed roots or "
-                    "observed_defect_refs owning seed projection"
+                    "observed_defect_refs owning seed projection or composite owner"
                 )
             for identity in confirmed_seed_roots:
                 root_owner_counts[identity] += 1
