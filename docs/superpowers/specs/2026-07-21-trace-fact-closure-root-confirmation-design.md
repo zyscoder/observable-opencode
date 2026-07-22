@@ -111,6 +111,11 @@ Agent / Harness 原始执行
 raw 无法无歧义映射或未知 block token 必须 fail-closed 为 `HARD_BREAK`，不得让 Trace
 插装中断 Agent 执行。
 
+`marked` 会把 CRLF 规范化为 LF，因此 raw 映射必须使用单调、newline-aware cursor：
+lexer raw 中的 `\n` 可以消费原文当前位置的 `\n` 或 `\r\n`，其他字符必须逐字符
+完全相等。映射只返回原文 char range，不得先全局规范化响应，否则 UTF-8 byte range
+将失去可逆性。
+
 适配层只向 Claim State Machine 输出 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和带
 来源类型的 `HARD_BREAK`。paragraph 进入 inline tokenizer；ATX/Setext heading、
 thematic break、fence/indented code、HTML block、link definition、空段落和 blockquote
@@ -118,6 +123,10 @@ thematic break、fence/indented code、HTML block、link definition、空段落�
 paragraph；table 在完整 table block 边界内继续生成带原始范围的 table fact。普通
 物理换行仅在括号未闭合时延续 claim。`PROTECTED_TEXT` 的内容进入 claim 原文，但其
 内部括号和标点不参与外层状态迁移。所有 byte range 始终指向原始响应。
+
+GFM table 的语义 cell 必须来自 `marked` table token 的结构化 `header`/`rows`，禁止
+再次通过 `split("|")` 解析。每个 data row 的 `raw_text` 和 byte range 仍来自按顺序
+映射的原始物理行；escaped pipe、inline-code pipe 和多字节 cell 不得改变列数。
 
 原始响应必须先封装为 `ClaimSourceView`，统一持有完整原文、Unicode 安全的扫描
 终点和字符位置到 UTF-8 字节位置的映射。8,000 UTF-16 code unit 的扫描上限不得

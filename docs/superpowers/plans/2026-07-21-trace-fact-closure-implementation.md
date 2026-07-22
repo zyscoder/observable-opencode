@@ -36,6 +36,7 @@
 - Internal: `ClaimSourceView`，包含完整 `originalText`、不截断 UTF-16 代理对的 `scanEnd` 和基于原文的 UTF-8 byte offset 计算。
 - Internal: `normalizeClaimSource(input: unknown): string`，对任意输入不抛异常，双重转换失败时返回固定 `[unserializable response]`。
 - Internal: `lexMarkdownBlocks(source: ClaimSourceView): ClaimToken[]`，使用 `marked.Lexer.lex(scanText, { gfm: true })` 并将 `token.raw` 顺序映射回原文。
+- Internal: `mapMarkedRawToSource(raw: string, source: ClaimSourceView, cursor: number): [number, number] | undefined`，只允许 LF 对 LF/CRLF 的可逆映射。
 - Internal: `tokenizeClaimSource(source: ClaimSourceView): ClaimToken[]`，token 类型限定为 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和 `HARD_BREAK`。
 - Internal: `segmentClaimTokens(source: ClaimSourceView, tokens: ClaimToken[]): ClaimSpan[]`，只在 token 状态机中维护括号与活动 span。
 
@@ -139,13 +140,19 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
 block token，必须把该 token 或剩余 scan window 作为 `HARD_BREAK`，并返回已有事实，
 不得向 CaseTrace 抛异常。
 
+`mapMarkedRawToSource()` 以单调 cursor 逐字符消费：普通字符必须完全一致；raw 中
+每个 `\n` 可消费原文的一个 `\n` 或一个 `\r\n`。返回值始终是完整原文中的 char
+range，禁止对 source 先执行 newline normalization。测试必须覆盖 CRLF paragraph、
+list、table、中文/emoji 和 scanEnd 附近的换行。
+
 block adapter 规则固定为：
 
 - `paragraph`：按原始范围交给现有 inline protected-text tokenizer；
 - `heading`（含 ATX/Setext）、`hr`、`code`、`html`、`def`、`blockquote`、`space`：
   整个 raw range 输出 `HARD_BREAK`；
 - `list`：每个 item 的起止都输出 `HARD_BREAK`，item 内 paragraph 按原始范围递归；
-- `table`：table block 起止输出 `HARD_BREAK`，中间沿用 table fact 适配器并保留原始 range；
+- `table`：table block 起止输出 `HARD_BREAK`；语义 cells 使用 marked token 的结构化
+  `header`/`rows`，data row 原文与 byte range 使用单调映射后的原始物理行；
 - 其他 token：fail-closed 为 `HARD_BREAK`。
 
 `tokenizeClaimSource()` 必须在原始响应上保留位置并生成：普通文本 `TEXT`、不参与
@@ -168,6 +175,10 @@ break、backtick/tilde fence、indented code、HTML block、link definition、bl
 ordered/unordered/nested list 和 table。每个用例在 block 前放置未闭合括号，在 block
 后放置 `After 12 tests pass.`，并断言后者仍是独立 claim；list/table 中原有事实提取
 行为必须保持。另模拟 lexer 异常或 raw mismatch，断言 atomizer fail-closed 且不抛错。
+
+table 回归必须包含 `billing\\|platform`、`` `left|right` `` 和中文/emoji cell，断言
+结构化 `table_cells`、`table_subject`、`table_values`、canonical text、claim key 和
+原文 byte range 均正确，header/alignment row 不得成为事实。
 
 未闭合 single/double/multi-backtick code span 在当前物理行内找不到同长度闭合符时，
 从 opening delimiter 到行末整体生成 `PROTECTED_TEXT`。增加参数化回归，证明其中的
@@ -195,6 +206,10 @@ response source。CaseTrace 测试必须覆盖 final、non-final/cancelled 和�
 并对每条路径断言公开 trace status、已有 summary record、artifact 引用和持久化输出
 保持原有语义；私有 source map 的 size 断言只能作为补充。本任务只写 append-only
 Trace record；不得把新增 claim 字段写入 Causal IR node。
+
+重复 `finish()` 前后必须读取并比较 manifest、partial/latest trace、summary record
+和 artifact 引用；强制 claim emission 异常后也必须断言既有公开持久化输出没有被
+删除或重写。lexer failure seam 应放在内部 test-support 边界，不得增加主模块公开 API。
 
 - [ ] **Step 4: 运行原子化测试**
 
