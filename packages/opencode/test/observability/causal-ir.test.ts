@@ -170,6 +170,19 @@ describe("causal IR store", () => {
         },
       }),
     )
+    const projection = projectProvenanceTrace(replayed, {
+      traceVersion: "6.0",
+      manifest: { case_id: "case_claim_group", run_id: "run_claim_group" },
+      metrics: { token_usage: {}, trace_health: { issues: [] } },
+    })
+    expect(projection.dataflow_edges.find((edge) => edge.relation === "claim_group_precedes")).toMatchObject({
+      eligible_for_attribution: false,
+      metadata: {
+        causal_semantics: "claim_group_order_only",
+        eligible_for_attribution: false,
+        behavior_impact: "none",
+      },
+    })
     expect(replayed.edges.some((edge) => edge.evidence_tier === "temporal_advisory")).toBe(false)
     expect(replayed.diagnostics).toEqual([])
   })

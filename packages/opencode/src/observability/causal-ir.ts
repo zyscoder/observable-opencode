@@ -2059,6 +2059,7 @@ export function projectProvenanceTrace(
       from: provenanceRef(compatibilityRef(edge.from)),
       to: provenanceRef(compatibilityRef(edge.to)),
       relation: attributes.normalized_relation,
+      eligible_for_attribution: attributes.eligible_for_attribution,
       label: provenanceLabel(edge.label),
       metadata: projectedEdgeMetadata(edge, attributes),
     } satisfies ProvenanceCompatibilityDataflowEdge

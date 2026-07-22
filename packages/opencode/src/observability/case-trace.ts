@@ -913,6 +913,7 @@ export type DataflowEdge = {
     | "executed_for_claim"
     | "response_to_claim_group"
     | "claim_group_precedes"
+  eligible_for_attribution?: boolean
   label?: string
   metadata?: Record<string, unknown>
 }
@@ -7309,7 +7310,6 @@ class ActiveCaseTrace {
       for (let index = 0; index + 1 < plannedClaims.length; index++) {
         const current = plannedClaims[index]!
         const next = plannedClaims[index + 1]!
-        if (current.claim.claim_group_id !== next.claim.claim_group_id) continue
         this.causalEdge({
           from: { type: "response_claim", id: `responseclaim_${current.claim_id}`, label: "response.claim" },
           to: { type: "response_claim", id: `responseclaim_${next.claim_id}`, label: "response.claim" },
