@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
@@ -80,7 +79,7 @@ def _confidence(value: Any, field_name: str = "confidence") -> float:
 
 
 def normalize_active_focus_text(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", str(value)).split()).casefold()
+    return str(value).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def active_focus_text_sha256(value: str) -> str:
@@ -103,12 +102,12 @@ class GlobalCandidateJudgeRequest:
 
     def __post_init__(self) -> None:
         seed_ref = str(self.seed_ref).strip()
-        focus_text = str(self.active_focus_text).strip()
+        focus_text = str(self.active_focus_text)
         if not seed_ref:
             raise ValueError("global candidate request requires seed_ref")
         if not isinstance(self.active_defect, DefectState):
             raise TypeError("global candidate request active_defect must be DefectState")
-        if not normalize_active_focus_text(focus_text):
+        if not focus_text.strip():
             raise ValueError("global candidate request requires active_focus_text")
         object.__setattr__(self, "seed_ref", seed_ref)
         object.__setattr__(self, "active_focus_text", focus_text)
@@ -122,7 +121,7 @@ class GlobalCandidateJudgeRequest:
             raise ValueError("global candidate request requires seed_ref")
         if not isinstance(self.active_defect, DefectState):
             raise TypeError("global candidate request active_defect must be DefectState")
-        if not normalize_active_focus_text(self.active_focus_text):
+        if not str(self.active_focus_text).strip():
             raise ValueError("global candidate request requires active_focus_text")
         expected_hash = active_focus_text_sha256(self.active_focus_text)
         if self.active_focus_text_hash != expected_hash:

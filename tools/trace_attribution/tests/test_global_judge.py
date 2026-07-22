@@ -17,6 +17,7 @@ from trace_attribution.global_judge import (
     active_focus_text_sha256,
     build_global_candidate_prompt,
     global_candidate_judgment_from_payload,
+    normalize_active_focus_text,
     validate_global_candidate_payload,
 )
 from trace_attribution.graph import TraceGraph
@@ -194,17 +195,83 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
 
 
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
-    def test_request_validates_normalized_active_focus_sha256(self):
-        request = sample_request()
-
-        normalized_equivalent = replace(
-            request,
-            active_focus_text="  STARTED   cleanup is interrupted.  ",
+    def test_active_focus_canonicalization_only_normalizes_line_endings(self):
+        self.assertEqual(
+            normalize_active_focus_text("first\r\nsecond\rthird"),
+            "first\nsecond\nthird",
         )
         self.assertEqual(
-            normalized_equivalent.active_focus_text_hash,
-            request.active_focus_text_hash,
+            active_focus_text_sha256("first\r\nsecond\rthird"),
+            active_focus_text_sha256("first\nsecond\nthird"),
         )
+
+        for actual, changed in (
+            ("x\N{SUPERSCRIPT TWO}", "x2"),
+            ("ParseJSON", "parsejson"),
+            (" leading and  internal trailing ", "leading and internal trailing"),
+            ("\N{LATIN SMALL LIGATURE FI}", "fi"),
+        ):
+            with self.subTest(actual=actual, changed=changed):
+                self.assertNotEqual(normalize_active_focus_text(actual), changed)
+                self.assertNotEqual(
+                    active_focus_text_sha256(actual), active_focus_text_sha256(changed)
+                )
+
+    def test_request_rejects_lossy_active_focus_equivalence(self):
+        request = sample_request()
+        for actual, changed in (
+            ("x\N{SUPERSCRIPT TWO}", "x2"),
+            ("ParseJSON", "parsejson"),
+            (" leading and  internal trailing ", "leading and internal trailing"),
+            ("\N{LATIN SMALL LIGATURE FI}", "fi"),
+        ):
+            with self.subTest(actual=actual, changed=changed):
+                defect = request.active_defect.transformed(
+                    label="focus_canonicalization_boundary",
+                    actual=actual,
+                    mechanism=request.active_defect.mechanism,
+                    transformation_reason="exercise exact active focus binding",
+                )
+                with self.assertRaisesRegex(ValueError, "active_focus_text must match"):
+                    replace(
+                        request,
+                        active_defect=defect,
+                        active_focus_text=changed,
+                        active_focus_text_hash=active_focus_text_sha256(changed),
+                        capsules=tuple(
+                            replace(capsule, defect_state=defect)
+                            for capsule in request.capsules
+                        ),
+                    )
+
+    def test_request_accepts_line_ending_equivalent_active_focus(self):
+        request = sample_request()
+        defect = request.active_defect.transformed(
+            label="focus_line_ending_boundary",
+            actual="first\r\nsecond\rthird",
+            mechanism=request.active_defect.mechanism,
+            transformation_reason="exercise line ending focus binding",
+        )
+        normalized_line_endings = "first\nsecond\nthird"
+
+        equivalent = replace(
+            request,
+            active_defect=defect,
+            active_focus_text=normalized_line_endings,
+            active_focus_text_hash=active_focus_text_sha256(normalized_line_endings),
+            capsules=tuple(
+                replace(capsule, defect_state=defect) for capsule in request.capsules
+            ),
+        )
+
+        self.assertEqual(equivalent.active_focus_text, normalized_line_endings)
+        self.assertEqual(
+            equivalent.active_focus_text_hash,
+            active_focus_text_sha256(defect.actual),
+        )
+
+    def test_request_rejects_mismatched_active_focus_hash(self):
+        request = sample_request()
         with self.assertRaisesRegex(ValueError, "active_focus_text_hash"):
             replace(request, active_focus_text_hash="0" * 64)
 
