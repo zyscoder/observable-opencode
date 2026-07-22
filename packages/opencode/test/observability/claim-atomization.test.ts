@@ -117,4 +117,58 @@ describe("claim atomization", () => {
     })
     expect(first.map((claim) => claim.claim_group_id)).toEqual(second.map((claim) => claim.claim_group_id))
   })
+
+  test("drops an open span before structural markdown barriers", () => {
+    const cases = [
+      {
+        name: "empty paragraph",
+        response: "Before 11 (open\n\nAfter 12 tests pass.",
+        expected: ["After 12 tests pass."],
+      },
+      {
+        name: "table",
+        response: "Before 11 (open\n| Result | All 11 tests pass. |\nAfter 12 tests pass.",
+        expected: ["Result: All 11 tests pass.", "After 12 tests pass."],
+      },
+      {
+        name: "blockquote",
+        response: "Before 11 (open\n> Quoted 11 tests pass.\nAfter 12 tests pass.",
+        expected: ["After 12 tests pass."],
+      },
+    ]
+
+    for (const item of cases) {
+      expect(atomizeResponseClaims(item.response).map((claim) => claim.text), item.name).toEqual(item.expected)
+    }
+  })
+
+  test("keeps list items independent across nested and consecutive lists", () => {
+    const response = [
+      "Before 11 (open",
+      "- Owner is billing-platform.",
+      "  - All 11 tests pass.",
+      "- The discount cap remains 15%.",
+      "After 12 tests pass.",
+    ].join("\n")
+
+    expect(atomizeResponseClaims(response).map((claim) => claim.text)).toEqual([
+      "Owner is billing-platform.",
+      "All 11 tests pass.",
+      "The discount cap remains 15%.",
+      "After 12 tests pass.",
+    ])
+  })
+
+  test("uses byte ranges that reverse-slice each UTF-8 raw claim", () => {
+    const response = "修改完成。\n\n- 所有 11 个测试通过。\nAll 11 tests pass."
+    const claims = atomizeResponseClaims(response)
+
+    for (const claim of claims) {
+      const [start, end] = claim.source_byte_range
+      const prefix = Buffer.from(response).subarray(0, start).toString()
+      const raw = Buffer.from(response).subarray(start, end).toString()
+      expect(response.slice(prefix.length, prefix.length + raw.length)).toContain(claim.raw_text)
+      expect(raw).toContain(claim.raw_text)
+    }
+  })
 })

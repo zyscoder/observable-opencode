@@ -1864,14 +1864,27 @@ describe("case trace", () => {
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "parenthetical-claim-case", "trace.json"), "utf8"),
     ) as any
-    const claims = trace.records
-      .filter((record: any) => record.event_type === "response.claim")
-      .map((record: any) => record.data.text)
+    const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
+    const claimTexts = claims.map((record: any) => record.data.text)
 
-    expect(claims).toEqual([
+    expect(claimTexts).toEqual([
       "When _cstack handled a non-Model right operand (i.e., a pre-computed separability matrix from a nested compound model), it used the wrong shape.",
       "The fix preserves the nested matrix.",
     ])
+    expect(claims[0].data).toMatchObject({
+      claim_index: 1,
+      claim_count: 2,
+      claim_group_id: expect.stringMatching(/^claim_group_[a-f0-9]{12}$/),
+      source_byte_range: [0, Buffer.byteLength(claimTexts[0])],
+      atomization_status: "atomic",
+      atomization_reason: "complete_merged_statement",
+      next_claim_key: expect.any(String),
+    })
+    expect(claims[1].data).toMatchObject({
+      claim_index: 2,
+      claim_count: 2,
+      previous_claim_key: claims[0].data.next_claim_key,
+    })
   })
 
   test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {

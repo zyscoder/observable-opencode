@@ -618,6 +618,7 @@ export type TraceStructuredClaim = {
 
 export type TraceResponseClaimRecord = {
   claim_id: string
+  claim_key?: string
   response_segment_id?: string
   text: TraceFieldSummary
   claim_format?: "factual_claim" | "table_fact" | string
@@ -629,7 +630,14 @@ export type TraceResponseClaimRecord = {
   table_cells?: string[]
   table_subject?: string
   table_values?: string[]
+  claim_group_id?: string
   claim_index: number
+  claim_count?: number
+  source_byte_range?: [number, number]
+  previous_claim_key?: string
+  next_claim_key?: string
+  atomization_status?: "atomic" | "group_required" | "invalid_fragment" | string
+  atomization_reason?: string
   direct_evidence_refs: string[]
   direct_support_refs?: string[]
   candidate_context_refs?: string[]
@@ -1091,6 +1099,7 @@ type ResponseOutputInput = Omit<TraceResponseSegment, "segment_id" | "text" | "s
 type ResponseClaimInput = Omit<
   TraceResponseClaimRecord,
   | "claim_id"
+  | "claim_key"
   | "text"
   | "claim_format"
   | "raw_text"
@@ -1098,6 +1107,13 @@ type ResponseClaimInput = Omit<
   | "table_cells"
   | "table_subject"
   | "table_values"
+  | "claim_group_id"
+  | "claim_count"
+  | "source_byte_range"
+  | "previous_claim_key"
+  | "next_claim_key"
+  | "atomization_status"
+  | "atomization_reason"
   | "direct_evidence_refs"
   | "context_refs"
   | "execution_refs"
@@ -1112,6 +1128,7 @@ type ResponseClaimInput = Omit<
   | "quality_flags"
 > & {
   claim_id?: string
+  claim_key?: string
   text: unknown
   claim_format?: TraceResponseClaimRecord["claim_format"]
   raw_text?: unknown
@@ -1119,6 +1136,13 @@ type ResponseClaimInput = Omit<
   table_cells?: string[]
   table_subject?: string
   table_values?: string[]
+  claim_group_id?: string
+  claim_count?: number
+  source_byte_range?: [number, number]
+  previous_claim_key?: string
+  next_claim_key?: string
+  atomization_status?: TraceResponseClaimRecord["atomization_status"]
+  atomization_reason?: string
   source_refs?: string[]
   source_locations?: TraceSourceLocation[]
   evidence_refs?: string[]
@@ -6703,6 +6727,7 @@ class ActiveCaseTrace {
     ])
     const claim: TraceResponseClaimRecord = {
       claim_id: input.claim_id ?? semanticID("claim", this.causalNodes.length + 1),
+      claim_key: input.claim_key,
       response_segment_id: input.response_segment_id,
       text: this.summarizeText(claimText, "result.response.claim"),
       claim_format: input.claim_format ?? "factual_claim",
@@ -6718,7 +6743,14 @@ class ActiveCaseTrace {
       table_cells: input.table_cells,
       table_subject: input.table_subject,
       table_values: input.table_values,
+      claim_group_id: input.claim_group_id,
       claim_index: input.claim_index,
+      claim_count: input.claim_count,
+      source_byte_range: input.source_byte_range,
+      previous_claim_key: input.previous_claim_key,
+      next_claim_key: input.next_claim_key,
+      atomization_status: input.atomization_status,
+      atomization_reason: input.atomization_reason,
       direct_evidence_refs: effectiveDirectEvidenceRefs,
       direct_support_refs: directSupportRefs,
       candidate_context_refs: classifiedRefs.context_refs,
@@ -6779,6 +6811,7 @@ class ActiveCaseTrace {
       derivation: deterministicDerivation("response_claim_extraction", derivationInputRefs, derivedAt),
       data: {
         claim_id: claim.claim_id,
+        claim_key: claim.claim_key,
         response_segment_id: claim.response_segment_id,
         text: claimText,
         claim_format: claim.claim_format,
@@ -6790,7 +6823,14 @@ class ActiveCaseTrace {
         table_cells: claim.table_cells,
         table_subject: claim.table_subject,
         table_values: claim.table_values,
+        claim_group_id: claim.claim_group_id,
         claim_index: claim.claim_index,
+        claim_count: claim.claim_count,
+        source_byte_range: claim.source_byte_range,
+        previous_claim_key: claim.previous_claim_key,
+        next_claim_key: claim.next_claim_key,
+        atomization_status: claim.atomization_status,
+        atomization_reason: claim.atomization_reason,
         direct_evidence_refs: claim.direct_evidence_refs,
         direct_support_refs: claim.direct_support_refs,
         candidate_context_refs: claim.candidate_context_refs,
@@ -7198,14 +7238,22 @@ class ActiveCaseTrace {
       claims.forEach((claim) => {
         this.responseClaim({
           response_segment_id: segment.segment_id,
+          claim_key: claim.key,
           text: claim.text,
           claim_format: claim.claim_format,
-          raw_text: claim.claim_format === "table_fact" ? claim.raw_text : undefined,
+          raw_text: claim.raw_text,
           canonical_text: claim.canonical_text,
           table_cells: claim.table_cells,
           table_subject: claim.table_subject,
           table_values: claim.table_values,
+          claim_group_id: claim.claim_group_id,
           claim_index: claim.claim_index,
+          claim_count: claim.claim_count,
+          source_byte_range: claim.source_byte_range,
+          previous_claim_key: claim.previous_claim_key,
+          next_claim_key: claim.next_claim_key,
+          atomization_status: claim.atomization_status,
+          atomization_reason: claim.atomization_reason,
           source_refs: segment.source_refs,
           source_locations: segment.source_locations,
           generation_provenance_refs: segment.generation_provenance_refs,
