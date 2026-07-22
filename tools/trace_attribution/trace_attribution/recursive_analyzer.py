@@ -826,10 +826,12 @@ class SeedAttributionBuilder:
         self.no_defect = True
 
     def mark_unresolved(self, reason: str, details: str = "") -> None:
-        normalized_reason = str(reason)
+        normalized_reason = (
+            reason.strip() if isinstance(reason, str) else ""
+        ) or "unresolved_evidence"
         self.blocking_reasons.add(normalized_reason)
         self.missing_evidence.add(
-            str(details)
+            (details.strip() if isinstance(details, str) else "")
             or "The required evidence remains unresolved: {0}.".format(
                 normalized_reason
             )

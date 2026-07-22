@@ -216,6 +216,17 @@ def _frozen_strings(value: Any) -> Tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def _concrete_seed_strings(value: Any, field_name: str) -> Tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    entries = tuple(value)
+    if any(not isinstance(item, str) or not item.strip() for item in entries):
+        raise ValueError(
+            "seed {0} entries must be non-empty strings".format(field_name)
+        )
+    return entries
+
+
 def seed_binding_identity_for(start_ref: str, defect_fingerprint: str) -> str:
     semantic = {
         "start_ref": str(start_ref),
@@ -1779,13 +1790,17 @@ class SeedAttributionResult:
             "confirmation_identities",
             "confirmed_root_refs",
             "decisive_evidence_refs",
-            "missing_evidence",
-            "blocking_reasons",
         ):
             object.__setattr__(
                 self,
                 name,
                 tuple(sorted(set(_frozen_strings(getattr(self, name))))),
+            )
+        for name in ("missing_evidence", "blocking_reasons"):
+            object.__setattr__(
+                self,
+                name,
+                tuple(sorted(set(_concrete_seed_strings(getattr(self, name), name)))),
             )
         object.__setattr__(
             self,
@@ -1834,8 +1849,8 @@ class SeedAttributionResult:
             confirmation_identities=_string_list(value.get("confirmation_identities")),
             confirmed_root_refs=_string_list(value.get("confirmed_root_refs")),
             decisive_evidence_refs=_string_list(value.get("decisive_evidence_refs")),
-            missing_evidence=_string_list(value.get("missing_evidence")),
-            blocking_reasons=_string_list(value.get("blocking_reasons")),
+            missing_evidence=value.get("missing_evidence"),
+            blocking_reasons=value.get("blocking_reasons"),
             global_judgment=_json_dict(value.get("global_judgment")),
             expansion_history=tuple(
                 item
@@ -1854,8 +1869,8 @@ def validate_seed_outcome_payload(
 ) -> None:
     """Reject terminal seed payloads that contradict their declared outcome."""
     roots = tuple(confirmed_root_refs)
-    unresolved_facts = tuple(missing_evidence)
-    blockers = tuple(blocking_reasons)
+    unresolved_facts = _concrete_seed_strings(missing_evidence, "missing_evidence")
+    blockers = _concrete_seed_strings(blocking_reasons, "blocking_reasons")
     if outcome in {"confirmed_root", "no_defect"} and (
         unresolved_facts or blockers
     ):

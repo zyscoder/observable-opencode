@@ -1305,6 +1305,64 @@ class SeedAttributionModelTests(unittest.TestCase):
             ("The required evidence remains unresolved: judge_error.",),
         )
 
+    def test_seed_evidence_details_require_concrete_strings_everywhere(self):
+        state = defect("concrete-seed-evidence")
+        concrete_fact = "The independent verification transcript is unavailable."
+        concrete_blocker = "independent_verification_unavailable"
+        valid = SeedAttributionResult(
+            start_ref="record:seed",
+            defect_fingerprint=state.fingerprint,
+            defect_state=state,
+            outcome="evidence_gap",
+            missing_evidence=(concrete_fact,),
+            blocking_reasons=(concrete_blocker,),
+        )
+
+        for field in ("missing_evidence", "blocking_reasons"):
+            for invalid in ("", " \t\n", 7):
+                with self.subTest(entry_point="direct", field=field, invalid=repr(invalid)):
+                    fields = {"missing_evidence": (concrete_fact,)}
+                    fields[field] = (invalid,)
+                    with self.assertRaisesRegex(ValueError, field):
+                        SeedAttributionResult(
+                            start_ref="record:seed",
+                            defect_fingerprint=state.fingerprint,
+                            defect_state=state,
+                            outcome="evidence_gap",
+                            **fields,
+                        )
+
+                with self.subTest(entry_point="from_dict", field=field, invalid=repr(invalid)):
+                    payload = valid.to_dict()
+                    payload[field] = [invalid]
+                    with self.assertRaisesRegex(ValueError, field):
+                        SeedAttributionResult.from_dict(payload)
+
+                with self.subTest(entry_point="evaluator", field=field, invalid=repr(invalid)):
+                    report = RecursiveAttributionReport(
+                        case_id="concrete-seed-evidence",
+                        objective="Reject non-concrete seed evidence details.",
+                        start_refs=("record:seed",),
+                        seed_results=(valid,),
+                    ).to_dict()
+                    report["seed_results"][0][field] = [invalid]
+                    with self.assertRaisesRegex(EvaluationSchemaError, field):
+                        _validate_report_shape(report, {"case_id": report["case_id"]})
+
+        for details in ("", " \t\n"):
+            with self.subTest(entry_point="builder", details=repr(details)):
+                builder = SeedAttributionBuilder(
+                    start_ref="record:seed",
+                    defect_state=state,
+                )
+                builder.mark_unresolved("judge_error", details)
+                self.assertEqual(
+                    builder.to_result().missing_evidence,
+                    ("The required evidence remains unresolved: judge_error.",),
+                )
+
+        self.assertEqual(SeedAttributionResult.from_dict(valid.to_dict()), valid)
+
     def test_unresolved_seed_does_not_publish_confirmed_root_payload(self):
         builder = SeedAttributionBuilder(
             start_ref="record:seed",
