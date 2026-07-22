@@ -145,6 +145,10 @@ block token，必须把该 token 或剩余 scan window 作为 `HARD_BREAK`，并
 range，禁止对 source 先执行 newline normalization。测试必须覆盖 CRLF paragraph、
 list、table、中文/emoji 和 scanEnd 附近的换行。
 
+`createClaimSourceView()` 还必须在 `scanEnd` 位于原文 `\r` 与紧随其后的 `\n` 之间时
+回退到 `\r` 之前。nested list adapter 必须在父 item 的原始 range 内建立物理行映射，
+允许 marked child raw 去除每行公共 indentation，但不允许跳过、回退或跨出父 range。
+
 block adapter 规则固定为：
 
 - `paragraph`：按原始范围交给现有 inline protected-text tokenizer；
@@ -176,9 +180,15 @@ ordered/unordered/nested list 和 table。每个用例在 block 前放置未闭�
 后放置 `After 12 tests pass.`，并断言后者仍是独立 claim；list/table 中原有事实提取
 行为必须保持。另模拟 lexer 异常或 raw mismatch，断言 atomizer fail-closed 且不抛错。
 
-table 回归必须包含 `billing\\|platform`、`` `left|right` `` 和中文/emoji cell，断言
+table 回归必须包含 `billing\\|platform`、`` `left\\|right` `` 和中文/emoji cell，断言
 结构化 `table_cells`、`table_subject`、`table_values`、canonical text、claim key 和
-原文 byte range 均正确，header/alignment row 不得成为事实。
+原文 byte range 均正确，header/alignment row 不得成为事实。其中 GFM escaped pipe
+必须正确记录；未转义 inline-code pipe 若令 marked 分列与 code span 冲突，必须断言
+该 data row 不生成 claim，禁止猜测补全。
+
+增加两个以上 nested items、缩进续行 prose、CRLF nested list 和重复 item 文本回归，
+断言每个事实的 range 都位于对应父 item 原始范围。增加 scanEnd 恰好位于 CRLF 中间
+的 top-level/list/table 回归，并证明窗口前已闭合事实仍保留。
 
 未闭合 single/double/multi-backtick code span 在当前物理行内找不到同长度闭合符时，
 从 opening delimiter 到行末整体生成 `PROTECTED_TEXT`。增加参数化回归，证明其中的
@@ -209,7 +219,9 @@ Trace record；不得把新增 claim 字段写入 Causal IR node。
 
 重复 `finish()` 前后必须读取并比较 manifest、partial/latest trace、summary record
 和 artifact 引用；强制 claim emission 异常后也必须断言既有公开持久化输出没有被
-删除或重写。lexer failure seam 应放在内部 test-support 边界，不得增加主模块公开 API。
+删除或重写。异常测试必须先建立并断言这些文件与 summary record 均非空，再注入
+失败，禁止使用 `undefined === undefined` 作为不变性证据。lexer failure seam 应放在
+内部 test-support 边界，不得增加主模块公开 API；主模块只导出正式 atomizer 与类型。
 
 - [ ] **Step 4: 运行原子化测试**
 

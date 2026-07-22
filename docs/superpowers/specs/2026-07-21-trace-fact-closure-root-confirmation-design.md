@@ -116,6 +116,11 @@ lexer raw 中的 `\n` 可以消费原文当前位置的 `\n` 或 `\r\n`，其他
 完全相等。映射只返回原文 char range，不得先全局规范化响应，否则 UTF-8 byte range
 将失去可逆性。
 
+`ClaimSourceView.scanEnd` 除不得截断 UTF-16 代理对外，也不得落在 `\r|\n` 之间；
+命中 CRLF 中间时回退到 `\r` 之前。嵌套 list 的 child raw 可能被 marked 去除公共
+缩进，必须使用父 item 原始范围内的逐物理行、indentation-aware 单调映射，禁止对
+完整去缩进 raw 使用无范围文本搜索。
+
 适配层只向 Claim State Machine 输出 `TEXT`、`PROTECTED_TEXT`、`SOFT_BREAK` 和带
 来源类型的 `HARD_BREAK`。paragraph 进入 inline tokenizer；ATX/Setext heading、
 thematic break、fence/indented code、HTML block、link definition、空段落和 blockquote
@@ -126,7 +131,9 @@ paragraph；table 在完整 table block 边界内继续生成带原始范围的 
 
 GFM table 的语义 cell 必须来自 `marked` table token 的结构化 `header`/`rows`，禁止
 再次通过 `split("|")` 解析。每个 data row 的 `raw_text` 和 byte range 仍来自按顺序
-映射的原始物理行；escaped pipe、inline-code pipe 和多字节 cell 不得改变列数。
+映射的原始物理行；escaped pipe 和多字节 cell 不得改变列数。若未转义 pipe 位于
+inline code 并导致 marked 结构与原始 code span 无法一一证明，整行必须 fail-closed，
+禁止通过文本搜索或补全猜测 cell 语义。
 
 原始响应必须先封装为 `ClaimSourceView`，统一持有完整原文、Unicode 安全的扫描
 终点和字符位置到 UTF-8 字节位置的映射。8,000 UTF-16 code unit 的扫描上限不得
