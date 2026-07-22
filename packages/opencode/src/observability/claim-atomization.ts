@@ -27,6 +27,11 @@ type ClaimSpan = {
   barrier_epoch: number
 }
 
+type ClaimSourceView = {
+  originalText: string
+  scanEnd: number
+}
+
 type ClaimToken = {
   type: "TEXT" | "PROTECTED_TEXT" | "SOFT_BREAK" | "HARD_BREAK"
   start: number
@@ -36,7 +41,7 @@ type ClaimToken = {
 type ClaimCandidate = Omit<AtomizedResponseClaim, "claim_index" | "claim_count" | "previous_claim_key" | "next_claim_key">
 
 export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
-  const source = normalizeResponseText(input)
+  const source = createClaimSourceView(input, 8000)
   const tokens = tokenizeClaimSource(source)
   const spans = mergeClaimContinuations(source, segmentClaimTokens(source, tokens))
   const candidates = spans.flatMap((span) => toFactualCandidate(source, span)).slice(0, 50)
@@ -51,8 +56,38 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
   }))
 }
 
+function createClaimSourceView(input: unknown, limit: number): ClaimSourceView {
+  const originalText = normalizeResponseText(input)
+  let scanEnd = Math.min(originalText.length, limit)
+  if (
+    scanEnd > 0 &&
+    scanEnd < originalText.length &&
+    isHighSurrogate(originalText.charCodeAt(scanEnd - 1)) &&
+    isLowSurrogate(originalText.charCodeAt(scanEnd))
+  ) {
+    scanEnd--
+  }
+  return { originalText, scanEnd }
+}
+
+function isHighSurrogate(value: number) {
+  return value >= 0xd800 && value <= 0xdbff
+}
+
+function isLowSurrogate(value: number) {
+  return value >= 0xdc00 && value <= 0xdfff
+}
+
 function normalizeResponseText(input: unknown) {
-  return typeof input === "string" ? input.slice(0, 8000) : stringPreview(input, 8000)
+  if (typeof input === "string") return input
+  if (input === undefined || input === null) return ""
+  try {
+    const serialized = JSON.stringify(input)
+    if (typeof serialized === "string") return serialized
+  } catch {
+    // Fall through to preserve a stable source for unsupported values.
+  }
+  return String(input)
 }
 
 function stringPreview(input: unknown, limit = 400) {
@@ -65,16 +100,17 @@ function stringPreview(input: unknown, limit = 400) {
   }
 }
 
-function tokenizeClaimSource(source: string): ClaimToken[] {
+function tokenizeClaimSource(source: ClaimSourceView): ClaimToken[] {
   const tokens: ClaimToken[] = []
   let fence: { delimiter: "`" | "~"; length: number } | undefined
   let lineStart = 0
 
-  while (lineStart < source.length) {
-    const newline = source.indexOf("\n", lineStart)
-    const lineStop = newline === -1 ? source.length : newline + 1
-    const lineEnd = newline !== -1 && source[newline - 1] === "\r" ? newline - 1 : newline === -1 ? source.length : newline
-    const line = source.slice(lineStart, lineEnd)
+  while (lineStart < source.scanEnd) {
+    const newline = source.originalText.indexOf("\n", lineStart)
+    const hasNewline = newline !== -1 && newline < source.scanEnd
+    const lineStop = hasNewline ? newline + 1 : source.scanEnd
+    const lineEnd = hasNewline && source.originalText[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : source.scanEnd
+    const line = source.originalText.slice(lineStart, lineEnd)
     const fenceMarker = markdownFenceMarker(line)
 
     if (fence) {
@@ -115,15 +151,16 @@ function markdownFenceMarker(line: string) {
   return { delimiter: marker[0] as "`" | "~", length: marker.length }
 }
 
-function tokenizeInlineText(source: string, start: number, end: number, tokens: ClaimToken[]) {
+function tokenizeInlineText(source: ClaimSourceView, start: number, end: number, tokens: ClaimToken[]) {
   let textStart = start
   for (let index = start; index < end; index++) {
-    if (source[index] !== "`") continue
+    if (source.originalText[index] !== "`") continue
     const delimiterLength = backtickRunLength(source, index, end)
     const close = matchingBacktickRun(source, index + delimiterLength, end, delimiterLength)
     if (close === -1) {
-      index += delimiterLength - 1
-      continue
+      if (textStart < index) tokens.push({ type: "TEXT", start: textStart, end: index })
+      tokens.push({ type: "PROTECTED_TEXT", start: index, end })
+      return
     }
     if (textStart < index) tokens.push({ type: "TEXT", start: textStart, end: index })
     tokens.push({ type: "PROTECTED_TEXT", start: index, end: close + delimiterLength })
@@ -133,15 +170,15 @@ function tokenizeInlineText(source: string, start: number, end: number, tokens: 
   if (textStart < end) tokens.push({ type: "TEXT", start: textStart, end })
 }
 
-function backtickRunLength(source: string, start: number, end: number) {
+function backtickRunLength(source: ClaimSourceView, start: number, end: number) {
   let index = start
-  while (index < end && source[index] === "`") index++
+  while (index < end && source.originalText[index] === "`") index++
   return index - start
 }
 
-function matchingBacktickRun(source: string, start: number, end: number, length: number) {
+function matchingBacktickRun(source: ClaimSourceView, start: number, end: number, length: number) {
   for (let index = start; index < end; index++) {
-    if (source[index] !== "`") continue
+    if (source.originalText[index] !== "`") continue
     const candidateLength = backtickRunLength(source, index, end)
     if (candidateLength === length) return index
     index += candidateLength - 1
@@ -158,7 +195,7 @@ function isMarkdownTableLine(line: string) {
   return cells.length >= 2
 }
 
-function segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[] {
+function segmentClaimTokens(source: ClaimSourceView, tokens: ClaimToken[]): ClaimSpan[] {
   const spans: ClaimSpan[] = []
   const stack: string[] = []
   let spanStart: number | undefined
@@ -166,7 +203,7 @@ function segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[] {
 
   for (const token of tokens) {
     if (token.type === "HARD_BREAK") {
-      if (spanStart !== undefined && !stack.length) pushTrimmedSpan(source, spanStart, token.start, barrierEpoch, spans)
+      if (spanStart !== undefined && !stack.length) pushTrimmedSpan(source.originalText, spanStart, token.start, barrierEpoch, spans)
       spanStart = undefined
       stack.length = 0
       barrierEpoch++
@@ -174,7 +211,7 @@ function segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[] {
     }
     if (token.type === "SOFT_BREAK") {
       if (spanStart !== undefined && !stack.length) {
-        pushTrimmedSpan(source, spanStart, token.start, barrierEpoch, spans)
+        pushTrimmedSpan(source.originalText, spanStart, token.start, barrierEpoch, spans)
         spanStart = undefined
       }
       continue
@@ -183,7 +220,7 @@ function segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[] {
     if (token.type === "PROTECTED_TEXT") continue
     for (let index = token.start; index < token.end; index++) {
       if (spanStart === undefined) spanStart = index
-      const value = source[index]!
+      const value = source.originalText[index]!
       if (isOpeningBracket(value)) {
         stack.push(value)
         continue
@@ -193,13 +230,13 @@ function segmentClaimTokens(source: string, tokens: ClaimToken[]): ClaimSpan[] {
         if (stack.at(-1) === expected) stack.pop()
         continue
       }
-      if (stack.length || !isClaimTerminator(source, index, token.end)) continue
-      pushTrimmedSpan(source, spanStart, index + 1, barrierEpoch, spans)
+      if (stack.length || !isClaimTerminator(source.originalText, index, token.end)) continue
+      pushTrimmedSpan(source.originalText, spanStart, index + 1, barrierEpoch, spans)
       spanStart = undefined
     }
   }
 
-  if (spanStart !== undefined && !stack.length) pushTrimmedSpan(source, spanStart, source.length, barrierEpoch, spans)
+  if (spanStart !== undefined && !stack.length) pushTrimmedSpan(source.originalText, spanStart, source.scanEnd, barrierEpoch, spans)
   return spans
 }
 
@@ -240,10 +277,10 @@ function pushTrimmedSpan(
   if (start < end) output.push({ start, end, barrier_epoch: barrierEpoch })
 }
 
-function mergeClaimContinuations(source: string, input: ClaimSpan[]) {
+function mergeClaimContinuations(source: ClaimSourceView, input: ClaimSpan[]) {
   const output: ClaimSpan[] = []
   for (const span of input) {
-    if (/^[,，、:：)）\]］}｝]/.test(source.slice(span.start, span.end))) {
+    if (/^[,，、:：)）\]］}｝]/.test(source.originalText.slice(span.start, span.end))) {
       const previous = output.at(-1)
       if (previous && previous.barrier_epoch === span.barrier_epoch) {
         output[output.length - 1] = { ...previous, end: span.end }
@@ -255,8 +292,8 @@ function mergeClaimContinuations(source: string, input: ClaimSpan[]) {
   return output
 }
 
-function toFactualCandidate(source: string, span: ClaimSpan): ClaimCandidate[] {
-  const rawText = source.slice(span.start, span.end)
+function toFactualCandidate(source: ClaimSourceView, span: ClaimSpan): ClaimCandidate[] {
+  const rawText = source.originalText.slice(span.start, span.end)
   const normalized = rawText.replace(/\s+/g, " ").trim()
   if (isBrokenClaimFragment(normalized) || isNonFactualResponseClaim(normalized)) return []
   const textLength = normalized.replace(/\s/g, "").length
@@ -272,8 +309,8 @@ function toFactualCandidate(source: string, span: ClaimSpan): ClaimCandidate[] {
   const semanticStatement = canonicalText ?? text
   const semanticHash = stableHash(semanticStatement)
   const byteRange: [number, number] = [
-    Buffer.byteLength(source.slice(0, span.start)),
-    Buffer.byteLength(source.slice(0, span.end)),
+    Buffer.byteLength(source.originalText.slice(0, span.start)),
+    Buffer.byteLength(source.originalText.slice(0, span.end)),
   ]
 
   return [

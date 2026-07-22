@@ -8059,46 +8059,50 @@ class ActiveCaseTrace {
   }
 
   finish(input?: FinishTraceInput) {
-    if (this.finished) return
-    this.evaluateConstraints()
-    this.normalizeFinalResponseSegments()
-    this.pruneDesignRecordsForFinalResponses()
-    const error = input?.error ? errorInfo(input.error) : undefined
-    if (error) this.errors.push(error)
-    this.result = input?.result ?? this.result
-    const status = input?.status ?? (error ? "error" : "success")
-    const caseStatus = this.inferCaseStatus(status, error)
-    this.enrichSemanticFactApplicabilityAndConflicts()
-    this.emitFinalResponseClaims(caseStatus)
-    this.emitTaskObligations()
-    this.finalizeOpenRecords(status, caseStatus)
-    this.backfillCompactionEstimates()
-    this.enrichInlineSubagentRefs()
-    this.enrichMcpConsumptionRefs()
-    this.emitCaseLifecycleRecord(status, caseStatus)
-    this.finished = true
-    const checkpointSummary = this.causalIRSummary(status, caseStatus, true)
-    const summary = this.summary(status, checkpointSummary)
-    this.write("trace.finish", summary)
-    const causalIR: CausalIRTraceSummary = {
-      ...checkpointSummary,
-      journal: this.causalIR.journalSummary(),
+    try {
+      if (this.finished) return
+      this.evaluateConstraints()
+      this.normalizeFinalResponseSegments()
+      this.pruneDesignRecordsForFinalResponses()
+      const error = input?.error ? errorInfo(input.error) : undefined
+      if (error) this.errors.push(error)
+      this.result = input?.result ?? this.result
+      const status = input?.status ?? (error ? "error" : "success")
+      const caseStatus = this.inferCaseStatus(status, error)
+      this.enrichSemanticFactApplicabilityAndConflicts()
+      this.emitFinalResponseClaims(caseStatus)
+      this.emitTaskObligations()
+      this.finalizeOpenRecords(status, caseStatus)
+      this.backfillCompactionEstimates()
+      this.enrichInlineSubagentRefs()
+      this.enrichMcpConsumptionRefs()
+      this.emitCaseLifecycleRecord(status, caseStatus)
+      this.finished = true
+      const checkpointSummary = this.causalIRSummary(status, caseStatus, true)
+      const summary = this.summary(status, checkpointSummary)
+      this.write("trace.finish", summary)
+      const causalIR: CausalIRTraceSummary = {
+        ...checkpointSummary,
+        journal: this.causalIR.journalSummary(),
+      }
+      const finalization = this.causalIR.finalize(causalIR)
+      const emittedCausalIR: CausalIRTraceSummary = finalization.committed
+        ? causalIR
+        : {
+            ...causalIR,
+            journal: this.causalIR.journalSummary(),
+          }
+      const provenance = this.projectProvenanceSummary(emittedCausalIR)
+      const canonical = jsonPretty(emittedCausalIR)
+      this.safeWrite(this.traceFile, canonical)
+      this.safeWrite(this.manifestFile, jsonPretty(emittedCausalIR.manifest))
+      this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
+      this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
+      this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
+      this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
+    } finally {
+      this.responseSourceBySegmentID.clear()
     }
-    const finalization = this.causalIR.finalize(causalIR)
-    const emittedCausalIR: CausalIRTraceSummary = finalization.committed
-      ? causalIR
-      : {
-          ...causalIR,
-          journal: this.causalIR.journalSummary(),
-        }
-    const provenance = this.projectProvenanceSummary(emittedCausalIR)
-    const canonical = jsonPretty(emittedCausalIR)
-    this.safeWrite(this.traceFile, canonical)
-    this.safeWrite(this.manifestFile, jsonPretty(emittedCausalIR.manifest))
-    this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
-    this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
-    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
   }
 
   flushForSignal(signal: NodeJS.Signals) {

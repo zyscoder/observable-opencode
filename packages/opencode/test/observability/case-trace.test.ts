@@ -1960,6 +1960,71 @@ describe("case trace", () => {
     expect(events[1]!.data.raw_text).toMatchObject({ preview: secondClaim })
   })
 
+  test("clears retained response sources from every finish lifecycle exit", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-response-source-cleanup-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "response-source-cleanup.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const results = []`,
+        `const sourceCount = (trace: any) => trace.responseSourceBySegmentID.size`,
+        `const finalTrace = CaseTrace.get() as any`,
+        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `results.push({ kind: "final", count: sourceCount(finalTrace) })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `results.push({ kind: "repeat", count: sourceCount(finalTrace) })`,
+        `CaseTrace.configure({ caseID: "response-source-non-final" })`,
+        `const nonFinalTrace = CaseTrace.get() as any`,
+        `CaseTrace.responseOutput({ response_role: "intermediate_summary", text: "All 11 tests pass." })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `results.push({ kind: "non_final", count: sourceCount(nonFinalTrace) })`,
+        `CaseTrace.configure({ caseID: "response-source-cancelled" })`,
+        `const cancelledTrace = CaseTrace.get() as any`,
+        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `CaseTrace.finish({ status: "cancelled" })`,
+        `results.push({ kind: "cancelled", count: sourceCount(cancelledTrace) })`,
+        `CaseTrace.configure({ caseID: "response-source-exception" })`,
+        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `const trace = CaseTrace.get() as any`,
+        `trace.emitFinalResponseClaims = () => { throw new Error("forced claim emission failure") }`,
+        `try { CaseTrace.finish({ status: "success" }) } catch {}`,
+        `results.push({ kind: "exception", count: sourceCount(trace) })`,
+        `trace.finished = true`,
+        `process.stdout.write(JSON.stringify(results))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "response-source-final",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual([
+      { kind: "final", count: 0 },
+      { kind: "repeat", count: 0 },
+      { kind: "non_final", count: 0 },
+      { kind: "cancelled", count: 0 },
+      { kind: "exception", count: 0 },
+    ])
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "response-source-final", "trace.json"), "utf8")) as any
+    expect(trace.records.some((record: any) => record.event_type === "response.output")).toBe(true)
+    expect(trace.metrics).toBeDefined()
+  })
+
   test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-v56-discount-values-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

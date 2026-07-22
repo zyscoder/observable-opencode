@@ -219,4 +219,29 @@ describe("claim atomization", () => {
       expect(raw).toBe(claim.raw_text)
     }
   })
+
+  test("keeps later facts after an unclosed inline backtick delimiter", () => {
+    for (const delimiter of ["`", "``", "```"]) {
+      const response = `Example ${delimiter}foo(\nAll 11 tests pass.`
+
+      expect(atomizeResponseClaims(response).map((claim) => claim.text), delimiter).toContain("All 11 tests pass.")
+    }
+  })
+
+  test("uses the full source for an emoji straddling the scan limit", () => {
+    const prefix = "All 11 tests pass: "
+    const response = `${prefix}${"a".repeat(7_999 - prefix.length)}😀`
+    const claims = atomizeResponseClaims(response)
+
+    expect(claims.length).toBeGreaterThan(0)
+    for (const claim of claims) {
+      const [start, end] = claim.source_byte_range
+      expect(Buffer.from(response).subarray(start, end).toString()).toBe(claim.raw_text)
+      expect(claim.raw_text).toBe(response.slice(0, 7_999))
+    }
+  })
+
+  test("normalizes non-serializable final response values without losing the source view", () => {
+    expect(() => atomizeResponseClaims(() => "All 11 tests pass.")).not.toThrow()
+  })
 })
