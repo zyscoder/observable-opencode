@@ -322,6 +322,66 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
         )
 
 
+class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.step_requests = []
+
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.global_requests.append(request)
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome="needs_expansion",
+                reason="The shared anchor needs an independent recursive check.",
+                assessments=tuple(
+                    GlobalCandidateAssessment(
+                        candidate_ref=capsule.candidate_ref,
+                        defect_status="unknown",
+                        causal_role="unknown",
+                        reason="Expansion is required before selecting a root.",
+                        evidence_refs=(capsule.candidate_ref,),
+                        confidence=0.5,
+                    )
+                    for capsule in request.capsules
+                ),
+                selected_candidate_refs=(),
+                expansion_requests=(
+                    {
+                        "anchor_ref": "record:shared_root",
+                        "context_kind": "upstream",
+                        "reason": "Independently inspect the shared root.",
+                    },
+                ),
+                decisive_evidence_refs=("record:shared_root",),
+                missing_evidence=("Independent recursive inspection.",),
+                confidence=0.5,
+            ),
+            0,
+        )
+
+    def judge_step_offline(self, request):
+        self.step_requests.append(request)
+        if request.current_node.ref != "record:shared_root":
+            raise AssertionError("unexpected node: {0}".format(request.current_node.ref))
+        return CausalStepJudgment(
+            current_node_ref="record:shared_root",
+            current_defect_status="present",
+            current_defect_reason="The shared root introduced the unsupported claim.",
+            predecessors=(),
+            candidate_introduction=True,
+            suggested_investigation={
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "hypothesis_id": request.recursive_context["active_hypothesis_id"],
+                    "candidate_ref": "record:shared_root",
+                    "defect_fingerprint": request.defect_state.fingerprint,
+                },
+                "reason": "Confirm the shared root for this seed.",
+            },
+            confidence=0.9,
+        )
+
+
 class DivergentSharedRootFusionJudge(SharedRootFusionJudge):
     def confirm_candidate_offline(self, request):
         self.confirmation_requests.append(request)
@@ -615,6 +675,64 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             ],
             [],
         )
+
+    def test_global_expansion_preserves_same_fingerprint_seed_frontiers_and_resume(self):
+        trace = shared_root_trace()
+        graph = TraceGraph.from_trace(trace)
+        start_refs = ("record:seed_one", "record:seed_two")
+        objective = "Independently confirm each seed through the shared expansion anchor."
+
+        def analyze(judge, checkpoint=None, checkpoint_config=None):
+            return AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=checkpoint,
+                checkpoint_config=checkpoint_config,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                graph,
+                start_refs=start_refs,
+                objective=objective,
+                analysis_perspective="",
+            )
+
+        uninterrupted_judge = NeedsExpansionSharedRootFusionJudge()
+        uninterrupted = analyze(uninterrupted_judge)
+        root_steps = [
+            request
+            for request in uninterrupted_judge.step_requests
+            if request.current_node.ref == "record:shared_root"
+        ]
+
+        self.assertEqual(len(root_steps), 2)
+        self.assertEqual(len(uninterrupted.confirmations), 2)
+        self.assertEqual(
+            len(
+                {
+                    request.seed_binding_identity
+                    for request in uninterrupted_judge.confirmation_requests
+                }
+            ),
+            2,
+        )
+        self.assertEqual(
+            {item.outcome for item in uninterrupted.seed_results},
+            {"confirmed_root"},
+        )
+
+        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "global-expansion.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                analyze(
+                    NeedsExpansionSharedRootFusionJudge(),
+                    CrashAfterFirstCompletedConfirmation(root),
+                    config,
+                )
+            resumed_judge = NeedsExpansionSharedRootFusionJudge()
+            resumed = analyze(resumed_judge, CheckpointBundle(root), config)
+
+        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
+        self.assertEqual(len(resumed_judge.confirmation_requests), 1)
 
     def test_shared_root_same_fingerprint_keeps_seed_confirmations_independent_after_resume(self):
         trace = shared_root_trace()

@@ -84,7 +84,8 @@ EVALUATION_START_EVENTS = frozenset(
         "external.evaluation_fact",
     }
 )
-FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
+FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
+LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
 ACTION_STATE_SCHEMA = "recursive-analysis-actions/v3"
 PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
@@ -146,6 +147,25 @@ def _checkpoint_json(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise ValueError("checkpoint state contains a non-JSON value: {0}".format(type(value).__name__))
+
+
+def _migrate_checkpoint_visit_references(
+    value: Any,
+    frontier: RecursiveFrontier,
+) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): (
+                frontier.migrated_visit_key(str(item))
+                if key in {"visit_key", "source_visit_key", "rejudge_visit_key"}
+                and isinstance(item, str)
+                else _migrate_checkpoint_visit_references(item, frontier)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_migrate_checkpoint_visit_references(item, frontier) for item in value]
+    return copy.deepcopy(value)
 
 
 def _dedupe_strings(values: Iterable[str]) -> Tuple[str, ...]:
@@ -1234,7 +1254,10 @@ class RecursiveAnalysisState:
         )
         action_keys = set(cls(graph=graph, start_refs=(), objective="", analysis_perspective="").action_checkpoint_payload())
         _require_exact_checkpoint_keys(action_payload, action_keys, "action state")
-        if frontier_payload["schema"] != FRONTIER_STATE_SCHEMA:
+        if frontier_payload["schema"] not in {
+            LEGACY_FRONTIER_STATE_SCHEMA,
+            FRONTIER_STATE_SCHEMA,
+        }:
             raise ValueError("unsupported recursive frontier state schema")
         if hypothesis_payload["schema"] != HYPOTHESIS_STATE_SCHEMA:
             raise ValueError("unsupported recursive hypothesis state schema")
@@ -1253,16 +1276,29 @@ class RecursiveAnalysisState:
             label="restored recursive action state",
         )
 
+        ledger = HypothesisLedger.from_snapshot(hypothesis_payload["hypotheses"])
+        legacy_seed_bindings = (
+            {
+                str(item["hypothesis_id"]): str(item.get("seed_binding_identity") or "")
+                for item in ledger.snapshot()
+            }
+            if frontier_payload["schema"] == LEGACY_FRONTIER_STATE_SCHEMA
+            else None
+        )
+        frontier = RecursiveFrontier.from_checkpoint(
+            frontier_payload["frontier"],
+            legacy_seed_binding_by_hypothesis=legacy_seed_bindings,
+        )
         state = cls(
             graph=graph,
             start_refs=tuple(str(item) for item in action_payload["start_refs"]),
             objective=str(action_payload["objective"]),
             analysis_perspective=str(action_payload["analysis_perspective"]),
-            ledger=HypothesisLedger.from_snapshot(hypothesis_payload["hypotheses"]),
-            frontier=RecursiveFrontier.from_checkpoint(frontier_payload["frontier"]),
+            ledger=ledger,
+            frontier=frontier,
         )
         state.visit_evidence = {
-            str(key): {str(item) for item in values}
+            frontier.migrated_visit_key(str(key)): {str(item) for item in values}
             for key, values in dict(frontier_payload["visit_evidence"]).items()
         }
         state.defect_states = {
@@ -1335,10 +1371,15 @@ class RecursiveAnalysisState:
         if requeued_inflight > state.processed_items:
             raise ValueError("checkpoint in-flight frontier count exceeds processed items")
         state.processed_items -= requeued_inflight
-        state.investigation_journal = copy.deepcopy(action_payload["investigation_journal"])
-        state.investigation_evidence = copy.deepcopy(action_payload["investigation_evidence"])
+        state.investigation_journal = _migrate_checkpoint_visit_references(
+            action_payload["investigation_journal"], frontier
+        )
+        state.investigation_evidence = {
+            frontier.migrated_visit_key(str(key)): copy.deepcopy(value)
+            for key, value in dict(action_payload["investigation_evidence"]).items()
+        }
         state.investigation_evidence_hashes = {
-            str(key): {str(item) for item in values}
+            frontier.migrated_visit_key(str(key)): {str(item) for item in values}
             for key, values in dict(action_payload["investigation_evidence_hashes"]).items()
         }
         state.control_directive_ids = {str(item) for item in action_payload["control_directive_ids"]}
@@ -1352,7 +1393,7 @@ class RecursiveAnalysisState:
         state.amplifying_factors = [CausalFactor.from_dict(item) for item in action_payload["amplifying_factors"]]
         state.confirmation_journal = copy.deepcopy(action_payload["confirmation_journal"])
         state.pending_rejudge_journal = {
-            str(key): [int(item) for item in values]
+            frontier.migrated_visit_key(str(key)): [int(item) for item in values]
             for key, values in dict(action_payload["pending_rejudge_journal"]).items()
         }
         state.seed_ledger = {
@@ -2952,6 +2993,7 @@ class AgenticRecursiveAnalyzer:
                         downstream_path=path,
                         hypothesis_id=hypothesis.hypothesis_id,
                         hypothesis_semantic_hash=hypothesis.semantic_hash,
+                        seed_binding_identity=hypothesis.seed_binding_identity,
                         depth=item.depth + 1,
                         candidate_source="global_requested_expansion",
                         priority=1.0,

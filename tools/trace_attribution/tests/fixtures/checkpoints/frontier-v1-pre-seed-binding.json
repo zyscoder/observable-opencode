@@ -1,0 +1,39 @@
+{
+  "schema": "trace_attribution.recursive_frontier",
+  "version": 1,
+  "queued": [
+    {
+      "item_id": "frontier:fcc5524af67f291649db",
+      "node_ref": "record:shared_anchor",
+      "defect_state": {
+        "actual": "A shared anchor collapsed two seed visits.",
+        "defect_state_id": "defect:23f0eb16f6bd6a7f2eb1",
+        "derived_from_defect_state_id": "",
+        "expected": "Each seed must retain its own recursive work.",
+        "fingerprint": "23f0eb16f6bd6a7f2eb1",
+        "label": "legacy_seed_binding_fixture",
+        "mechanism": "frontier visit identity omitted the seed binding",
+        "scope": "root_confirmation_task_1",
+        "transformation_reason": ""
+      },
+      "downstream_path": [
+        "record:shared_anchor",
+        "record:seed_one"
+      ],
+      "hypothesis_id": "hyp:legacy-seed-one",
+      "hypothesis_semantic_hash": "legacy-semantic-hash",
+      "depth": 1,
+      "candidate_source": "global_requested_expansion",
+      "priority": 1.0,
+      "checked_evidence_refs": [
+        "record:shared_anchor"
+      ],
+      "evidence_hash": "",
+      "reopen_reason": "",
+      "graph_position": 3,
+      "visit_key": "923518755f95af3e921f8f7c182f8fab4ade493229e43f174a6e182393807376"
+    }
+  ],
+  "in_flight": [],
+  "completed": []
+}

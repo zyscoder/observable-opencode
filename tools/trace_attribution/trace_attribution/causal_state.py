@@ -845,6 +845,20 @@ def semantic_visit_key(
     )
 
 
+def _legacy_semantic_visit_key(
+    node_ref: str,
+    defect_state: DefectState,
+    hypothesis_semantic_hash: str,
+) -> str:
+    return _hash(
+        {
+            "node_ref": node_ref,
+            "defect_fingerprint": defect_state.fingerprint,
+            "hypothesis_semantic_hash": hypothesis_semantic_hash,
+        }
+    )
+
+
 @dataclass(frozen=True)
 class CausalCandidate:
     ref: str
@@ -1116,6 +1130,61 @@ class FrontierItem:
         if visit_key and visit_key != item.visit_key:
             raise ValueError("FrontierItem visit_key does not match semantic fields")
         return item
+
+    @classmethod
+    def from_legacy_dict(
+        cls,
+        value: JsonDict,
+        *,
+        seed_binding_identity: str,
+    ) -> "FrontierItem":
+        """Verify a v1 item before binding it to its enclosing seed."""
+        if not seed_binding_identity:
+            raise ValueError("legacy FrontierItem requires an unambiguous seed binding")
+        defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
+        node_ref = str(value.get("node_ref") or "")
+        downstream_path = _string_list(value.get("downstream_path"))
+        hypothesis_id = str(value.get("hypothesis_id") or "")
+        hypothesis_semantic_hash = str(value.get("hypothesis_semantic_hash") or "")
+        depth = int(value.get("depth") or 0)
+        legacy_item_id = "frontier:{0}".format(
+            _hash(
+                {
+                    "node_ref": node_ref,
+                    "defect_fingerprint": defect_state.fingerprint,
+                    "downstream_path": downstream_path,
+                    "hypothesis_id": hypothesis_id,
+                    "hypothesis_semantic_hash": hypothesis_semantic_hash,
+                    "depth": depth,
+                }
+            )[:20]
+        )
+        item_id = str(value.get("item_id") or "")
+        if not item_id or item_id != legacy_item_id:
+            raise ValueError("legacy FrontierItem item_id does not match semantic fields")
+        legacy_visit_key = _legacy_semantic_visit_key(
+            node_ref,
+            defect_state,
+            hypothesis_semantic_hash,
+        )
+        visit_key = str(value.get("visit_key") or "")
+        if not visit_key or visit_key != legacy_visit_key:
+            raise ValueError("legacy FrontierItem visit_key does not match semantic fields")
+        return cls.create(
+            node_ref=node_ref,
+            defect_state=defect_state,
+            downstream_path=list(downstream_path),
+            hypothesis_id=hypothesis_id,
+            hypothesis_semantic_hash=hypothesis_semantic_hash,
+            seed_binding_identity=seed_binding_identity,
+            depth=depth,
+            candidate_source=str(value.get("candidate_source") or ""),
+            priority=_priority(value.get("priority", 0.0)),
+            checked_evidence_refs=_string_list(value.get("checked_evidence_refs")),
+            evidence_hash=str(value.get("evidence_hash") or ""),
+            reopen_reason=str(value.get("reopen_reason") or ""),
+            graph_position=int(value.get("graph_position") or 0),
+        )
 
 
 @dataclass(frozen=True)

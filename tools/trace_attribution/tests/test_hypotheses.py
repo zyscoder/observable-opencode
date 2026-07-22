@@ -1,8 +1,13 @@
+import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from trace_attribution.causal_state import DefectState, FrontierItem, HypothesisEvidence
 from trace_attribution.hypotheses import HypothesisLedger, RecursiveFrontier, hypothesis_order_key
+
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "checkpoints"
 
 
 def sample_defect_state(label="missing_namespace_contract"):
@@ -361,7 +366,7 @@ class RecursiveFrontierTest(unittest.TestCase):
 
     def test_checkpoint_version_must_be_the_exact_supported_integer(self):
         checkpoint = RecursiveFrontier().checkpoint()
-        invalid_versions = (True, 1.0, "1", None, 2)
+        invalid_versions = (True, 1.0, "1", None, 3)
 
         for version in invalid_versions:
             payload = dict(checkpoint)
@@ -372,6 +377,44 @@ class RecursiveFrontierTest(unittest.TestCase):
             with self.subTest(version=version):
                 with self.assertRaisesRegex(ValueError, "version"):
                     RecursiveFrontier.from_checkpoint(payload)
+
+    def test_v1_checkpoint_fixture_validates_legacy_identity_then_migrates_seed_binding(self):
+        payload = json.loads(
+            (FIXTURE_ROOT / "frontier-v1-pre-seed-binding.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        frontier = RecursiveFrontier.from_checkpoint(
+            payload,
+            legacy_seed_binding_by_hypothesis={
+                "hyp:legacy-seed-one": "seed:legacy-seed-one"
+            },
+        )
+
+        item = frontier.pop()
+        self.assertEqual(frontier.checkpoint()["version"], 2)
+        self.assertEqual(item.seed_binding_identity, "seed:legacy-seed-one")
+        self.assertNotEqual(
+            item.visit_key,
+            payload["queued"][0]["visit_key"],
+        )
+
+    def test_v1_checkpoint_rejects_forged_legacy_identity_before_migration(self):
+        payload = json.loads(
+            (FIXTURE_ROOT / "frontier-v1-pre-seed-binding.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        payload["queued"][0]["item_id"] = "frontier:forged"
+
+        with self.assertRaisesRegex(ValueError, "legacy FrontierItem item_id"):
+            RecursiveFrontier.from_checkpoint(
+                payload,
+                legacy_seed_binding_by_hypothesis={
+                    "hyp:legacy-seed-one": "seed:legacy-seed-one"
+                },
+            )
 
     def test_corrupt_checkpoint_and_reopen_rollback_preserve_completed_state(self):
         frontier = RecursiveFrontier()

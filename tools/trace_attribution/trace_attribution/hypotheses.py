@@ -12,7 +12,8 @@ from .models import JsonDict
 
 
 FRONTIER_CHECKPOINT_SCHEMA = "trace_attribution.recursive_frontier"
-FRONTIER_CHECKPOINT_VERSION = 1
+FRONTIER_CHECKPOINT_VERSION = 2
+LEGACY_FRONTIER_CHECKPOINT_VERSION = 1
 
 
 def _normalized_evidence_reason(reason: str) -> str:
@@ -286,6 +287,7 @@ class RecursiveFrontier:
         self._queued: Set[str] = set()
         self._in_flight: Dict[str, FrontierItem] = {}
         self._completed: Dict[str, _CompletedFrontierItem] = {}
+        self._legacy_visit_key_migrations: Dict[str, str] = {}
 
     def push(self, item: FrontierItem) -> bool:
         if self._visit_exists(item.visit_key):
@@ -372,21 +374,49 @@ class RecursiveFrontier:
         }
 
     @classmethod
-    def from_checkpoint(cls, checkpoint: Mapping[str, object]) -> "RecursiveFrontier":
+    def from_checkpoint(
+        cls,
+        checkpoint: Mapping[str, object],
+        *,
+        legacy_seed_binding_by_hypothesis: Optional[Mapping[str, str]] = None,
+    ) -> "RecursiveFrontier":
         """Restore completed work and requeue interrupted work by its stable heap key."""
         if not isinstance(checkpoint, Mapping):
             raise ValueError("frontier checkpoint must be a mapping")
         if checkpoint.get("schema") != FRONTIER_CHECKPOINT_SCHEMA:
             raise ValueError("unsupported frontier checkpoint schema")
         version = checkpoint.get("version")
-        if type(version) is not int or version != FRONTIER_CHECKPOINT_VERSION:
+        if type(version) is not int or version not in {
+            LEGACY_FRONTIER_CHECKPOINT_VERSION,
+            FRONTIER_CHECKPOINT_VERSION,
+        }:
             raise ValueError("unsupported frontier checkpoint version")
         for section in ("queued", "in_flight", "completed"):
             if section not in checkpoint:
                 raise ValueError("frontier checkpoint missing {0}".format(section))
-        queued = cls._load_checkpoint_items(checkpoint["queued"], "queued")
-        in_flight = cls._load_checkpoint_items(checkpoint["in_flight"], "in_flight")
-        completed = cls._load_completed_items(checkpoint["completed"])
+        legacy_bindings = (
+            legacy_seed_binding_by_hypothesis
+            if version == LEGACY_FRONTIER_CHECKPOINT_VERSION
+            else None
+        )
+        migrations: Dict[str, str] = {}
+        queued = cls._load_checkpoint_items(
+            checkpoint["queued"],
+            "queued",
+            legacy_seed_binding_by_hypothesis=legacy_bindings,
+            legacy_visit_key_migrations=migrations,
+        )
+        in_flight = cls._load_checkpoint_items(
+            checkpoint["in_flight"],
+            "in_flight",
+            legacy_seed_binding_by_hypothesis=legacy_bindings,
+            legacy_visit_key_migrations=migrations,
+        )
+        completed = cls._load_completed_items(
+            checkpoint["completed"],
+            legacy_seed_binding_by_hypothesis=legacy_bindings,
+            legacy_visit_key_migrations=migrations,
+        )
         all_visits: Dict[str, str] = {}
         for state, items in (("queued", queued), ("in-flight", in_flight)):
             for item in items:
@@ -400,7 +430,11 @@ class RecursiveFrontier:
             tuple(),
             tuple(completed),
         )
+        frontier._legacy_visit_key_migrations = migrations
         return frontier
+
+    def migrated_visit_key(self, visit_key: str) -> str:
+        return self._legacy_visit_key_migrations.get(str(visit_key), str(visit_key))
 
     def _plan_hypothesis_migration(
         self, previous: AttributionHypothesis, updated: AttributionHypothesis
@@ -454,19 +488,38 @@ class RecursiveFrontier:
         )
         self._set_state(migration.queued, migration.in_flight, migration.completed)
 
-    @staticmethod
-    def _load_checkpoint_items(value: object, state: str) -> Tuple[FrontierItem, ...]:
+    @classmethod
+    def _load_checkpoint_items(
+        cls,
+        value: object,
+        state: str,
+        *,
+        legacy_seed_binding_by_hypothesis: Optional[Mapping[str, str]],
+        legacy_visit_key_migrations: Dict[str, str],
+    ) -> Tuple[FrontierItem, ...]:
         if not isinstance(value, list):
             raise ValueError("frontier checkpoint {0} must be a list".format(state))
         items: List[FrontierItem] = []
         for raw_item in value:
             if not isinstance(raw_item, Mapping):
                 raise ValueError("frontier checkpoint {0} contains an invalid item".format(state))
-            items.append(FrontierItem.from_dict(dict(raw_item)))
+            items.append(
+                cls._load_checkpoint_item(
+                    dict(raw_item),
+                    legacy_seed_binding_by_hypothesis=legacy_seed_binding_by_hypothesis,
+                    legacy_visit_key_migrations=legacy_visit_key_migrations,
+                )
+            )
         return tuple(items)
 
-    @staticmethod
-    def _load_completed_items(value: object) -> Tuple[_CompletedFrontierItem, ...]:
+    @classmethod
+    def _load_completed_items(
+        cls,
+        value: object,
+        *,
+        legacy_seed_binding_by_hypothesis: Optional[Mapping[str, str]],
+        legacy_visit_key_migrations: Dict[str, str],
+    ) -> Tuple[_CompletedFrontierItem, ...]:
         if not isinstance(value, list):
             raise ValueError("frontier checkpoint completed must be a list")
         items: List[_CompletedFrontierItem] = []
@@ -475,11 +528,38 @@ class RecursiveFrontier:
                 raise ValueError("frontier checkpoint completed contains an invalid item")
             items.append(
                 _CompletedFrontierItem(
-                    FrontierItem.from_dict(dict(raw_item["item"])),
+                    cls._load_checkpoint_item(
+                        dict(raw_item["item"]),
+                        legacy_seed_binding_by_hypothesis=legacy_seed_binding_by_hypothesis,
+                        legacy_visit_key_migrations=legacy_visit_key_migrations,
+                    ),
                     str(raw_item.get("evidence_hash") or ""),
                 )
             )
         return tuple(items)
+
+    @staticmethod
+    def _load_checkpoint_item(
+        raw_item: JsonDict,
+        *,
+        legacy_seed_binding_by_hypothesis: Optional[Mapping[str, str]],
+        legacy_visit_key_migrations: Dict[str, str],
+    ) -> FrontierItem:
+        if legacy_seed_binding_by_hypothesis is None:
+            return FrontierItem.from_dict(raw_item)
+        persisted_seed = str(raw_item.get("seed_binding_identity") or "")
+        if persisted_seed:
+            return FrontierItem.from_dict(raw_item)
+        hypothesis_id = str(raw_item.get("hypothesis_id") or "")
+        seed_binding_identity = str(
+            legacy_seed_binding_by_hypothesis.get(hypothesis_id) or ""
+        )
+        item = FrontierItem.from_legacy_dict(
+            raw_item,
+            seed_binding_identity=seed_binding_identity,
+        )
+        legacy_visit_key_migrations[str(raw_item["visit_key"])] = item.visit_key
+        return item
 
     @staticmethod
     def _register_visit(visits: Dict[str, str], visit_key: str, state: str) -> None:
