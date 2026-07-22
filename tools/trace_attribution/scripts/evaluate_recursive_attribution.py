@@ -16,6 +16,7 @@ from trace_attribution.causal_state import (
     confirmation_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
+    validate_seed_outcome_payload,
 )
 from trace_attribution.graph import TraceGraph, collect_artifact_ids, resolve_edge_endpoint
 from trace_attribution.models import TraceNode, stable_json
@@ -369,6 +370,15 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
             "expansion_history",
         ):
             _list(item.get(key), "seed result {0}".format(key))
+        try:
+            validate_seed_outcome_payload(
+                outcome=str(item.get("outcome") or ""),
+                confirmed_root_refs=item.get("confirmed_root_refs") or (),
+                missing_evidence=item.get("missing_evidence") or (),
+                blocking_reasons=item.get("blocking_reasons") or (),
+            )
+        except ValueError as exc:
+            raise EvaluationSchemaError(str(exc)) from exc
     if {identity[0] for identity in seed_identities} != report_start_refs:
         raise EvaluationSchemaError(
             "v3 seed_results must cover exactly report.start_refs"

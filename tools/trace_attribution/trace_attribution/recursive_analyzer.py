@@ -809,6 +809,7 @@ class SeedAttributionBuilder:
     candidate_refs: Set[str] = field(default_factory=set)
     selected_candidate_refs: Set[str] = field(default_factory=set)
     confirmation_identities: Set[str] = field(default_factory=set)
+    confirmed_root_confirmation_identities: Set[str] = field(default_factory=set)
     confirmed_root_refs: Set[str] = field(default_factory=set)
     decisive_evidence_refs: Set[str] = field(default_factory=set)
     missing_evidence: Set[str] = field(default_factory=set)
@@ -825,9 +826,14 @@ class SeedAttributionBuilder:
         self.no_defect = True
 
     def mark_unresolved(self, reason: str, details: str = "") -> None:
-        self.blocking_reasons.add(str(reason))
-        if details:
-            self.missing_evidence.add(str(details))
+        normalized_reason = str(reason)
+        self.blocking_reasons.add(normalized_reason)
+        self.missing_evidence.add(
+            str(details)
+            or "The required evidence remains unresolved: {0}.".format(
+                normalized_reason
+            )
+        )
 
     def record_global_judgment(
         self,
@@ -854,6 +860,9 @@ class SeedAttributionBuilder:
         self.confirmation_identities.add(confirmation.confirmation_identity)
         self.decisive_evidence_refs.update(confirmation.evidence_refs)
         if confirmation.status == "confirmed":
+            self.confirmed_root_confirmation_identities.add(
+                confirmation.confirmation_identity
+            )
             self.confirmed_root_refs.add(confirmation.candidate_ref)
             return
         if confirmation.status == "unknown":
@@ -868,6 +877,14 @@ class SeedAttributionBuilder:
             outcome = "no_defect"
         else:
             outcome = "inconclusive"
+        confirmation_identities = self.confirmation_identities
+        confirmed_root_refs = self.confirmed_root_refs
+        if outcome != "confirmed_root":
+            confirmation_identities = (
+                self.confirmation_identities
+                - self.confirmed_root_confirmation_identities
+            )
+            confirmed_root_refs = set()
         return SeedAttributionResult(
             start_ref=self.start_ref,
             defect_fingerprint=self.defect_state.fingerprint,
@@ -875,8 +892,8 @@ class SeedAttributionBuilder:
             outcome=outcome,
             candidate_refs=tuple(self.candidate_refs),
             selected_candidate_refs=tuple(self.selected_candidate_refs),
-            confirmation_identities=tuple(self.confirmation_identities),
-            confirmed_root_refs=tuple(self.confirmed_root_refs),
+            confirmation_identities=tuple(confirmation_identities),
+            confirmed_root_refs=tuple(confirmed_root_refs),
             decisive_evidence_refs=tuple(self.decisive_evidence_refs),
             missing_evidence=tuple(self.missing_evidence),
             blocking_reasons=tuple(self.blocking_reasons),
@@ -899,6 +916,7 @@ class SeedAttributionBuilder:
             candidate_refs=set(result.candidate_refs),
             selected_candidate_refs=set(result.selected_candidate_refs),
             confirmation_identities=set(result.confirmation_identities),
+            confirmed_root_confirmation_identities=set(),
             confirmed_root_refs=set(result.confirmed_root_refs),
             decisive_evidence_refs=set(result.decisive_evidence_refs),
             missing_evidence=set(result.missing_evidence),
@@ -1484,6 +1502,13 @@ class RecursiveAnalysisState:
                 for item in action_payload["seed_ledger"]
             )
         }
+        for builder in state.seed_ledger.values():
+            builder.confirmed_root_confirmation_identities.update(
+                confirmation.confirmation_identity
+                for confirmation in state.confirmations
+                if confirmation.status == "confirmed"
+                and confirmation.seed_binding_identity == builder.key
+            )
         if len(state.seed_ledger) != len(action_payload["seed_ledger"]):
             raise ValueError("checkpoint contains duplicate per-seed attribution identity")
         state.hypothesis_seed_keys = {
@@ -2221,6 +2246,7 @@ class RecursiveAnalysisState:
 
     def build_report(self, *, judge: CausalJudge) -> RecursiveAttributionReport:
         self.finalize_pending_rejudges()
+        self._suppress_roots_for_conservative_seed_outcomes()
         hypotheses = [AttributionHypothesis.from_dict(item) for item in self.ledger.snapshot()]
         by_id = {item.hypothesis_id: item for item in hypotheses}
         unresolved_ids = self.unresolved_hypothesis_ids | self.introduction_hypothesis_ids
@@ -2355,6 +2381,42 @@ class RecursiveAnalysisState:
             investigation_journal=tuple(self.investigation_journal),
             metadata=metadata,
         )
+
+    def _suppress_roots_for_conservative_seed_outcomes(self) -> None:
+        unpublished_seed_bindings = {
+            builder.key
+            for builder in self.seed_ledger.values()
+            if builder.to_result().outcome != "confirmed_root"
+        }
+        if not unpublished_seed_bindings:
+            return
+        retained_primary: List[ConfirmedRoot] = []
+        retained_co_roots: List[ConfirmedRoot] = []
+        for roots, retained in (
+            (self.confirmed_roots, retained_primary),
+            (self.co_roots, retained_co_roots),
+        ):
+            for root in roots:
+                confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+                if confirmation.seed_binding_identity not in unpublished_seed_bindings:
+                    retained.append(root)
+                    continue
+                self.unresolved_hypothesis_ids.add(root.hypothesis_id)
+                if root.node_ref not in self.unresolved_refs:
+                    self.unresolved_refs.append(root.node_ref)
+                self.unresolved_branches.append(
+                    {
+                        "node_ref": root.node_ref,
+                        "defect_state_id": root.defect_state.defect_state_id,
+                        "hypothesis_id": root.hypothesis_id,
+                        "confirmation_identity": confirmation.confirmation_identity,
+                        "reason": "seed_outcome_conservative",
+                        "details": "The seed retained unresolved evidence, so its confirmed branch remains diagnostic only.",
+                        "depth": max(0, len(root.recursive_path) - 1),
+                    }
+                )
+        self.confirmed_roots = retained_primary
+        self.co_roots = retained_co_roots
 
     def _candidate_for_ref(
         self,

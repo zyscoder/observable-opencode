@@ -11,7 +11,7 @@ import re
 import unicodedata
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .models import JsonDict, TraceNode, stable_json
 
@@ -1797,6 +1797,12 @@ class SeedAttributionResult:
             "expansion_history",
             tuple(FrozenMapping(_thaw(item)) for item in self.expansion_history),
         )
+        validate_seed_outcome_payload(
+            outcome=self.outcome,
+            confirmed_root_refs=self.confirmed_root_refs,
+            missing_evidence=self.missing_evidence,
+            blocking_reasons=self.blocking_reasons,
+        )
 
     def to_dict(self) -> JsonDict:
         return {
@@ -1836,6 +1842,33 @@ class SeedAttributionResult:
                 for item in value.get("expansion_history", [])
                 if isinstance(item, dict)
             ),
+        )
+
+
+def validate_seed_outcome_payload(
+    *,
+    outcome: str,
+    confirmed_root_refs: Iterable[str],
+    missing_evidence: Iterable[str],
+    blocking_reasons: Iterable[str],
+) -> None:
+    """Reject terminal seed payloads that contradict their declared outcome."""
+    roots = tuple(confirmed_root_refs)
+    unresolved_facts = tuple(missing_evidence)
+    blockers = tuple(blocking_reasons)
+    if outcome in {"confirmed_root", "no_defect"} and (
+        unresolved_facts or blockers
+    ):
+        raise ValueError(
+            "seed outcome payload cannot combine a terminal outcome with unresolved evidence"
+        )
+    if outcome == "evidence_gap" and not unresolved_facts:
+        raise ValueError(
+            "seed outcome payload requires concrete unresolved evidence for evidence_gap"
+        )
+    if outcome != "confirmed_root" and roots:
+        raise ValueError(
+            "seed outcome payload cannot publish confirmed_root_refs for a non-confirmed outcome"
         )
 
 
@@ -2503,4 +2536,5 @@ __all__ = [
     "semantic_visit_key",
     "confirmation_identity_for",
     "seed_binding_identity_for",
+    "validate_seed_outcome_payload",
 ]

@@ -1290,6 +1290,108 @@ class SeedAttributionModelTests(unittest.TestCase):
         self.assertEqual(result.outcome, "evidence_gap")
         self.assertEqual(result.blocking_reasons, ("judge_error",))
 
+    def test_blocker_without_detail_gets_a_concrete_unresolved_fact(self):
+        builder = SeedAttributionBuilder(
+            start_ref="record:seed",
+            defect_state=defect("blocker-without-detail"),
+        )
+        builder.mark_unresolved("judge_error")
+
+        result = builder.to_result()
+
+        self.assertEqual(result.outcome, "evidence_gap")
+        self.assertEqual(
+            result.missing_evidence,
+            ("The required evidence remains unresolved: judge_error.",),
+        )
+
+    def test_unresolved_seed_does_not_publish_confirmed_root_payload(self):
+        builder = SeedAttributionBuilder(
+            start_ref="record:seed",
+            defect_state=defect("unresolved-confirmation"),
+        )
+        builder.mark_unresolved("judge_error", "The sibling branch failed.")
+        builder.record_confirmation(
+            RootConfirmation.confirmed(
+                "record:root",
+                excerpt="The local action introduced the defect.",
+                reason="Independent confirmation succeeded before the sibling failed.",
+                counterfactual="Avoiding the action prevents the defect.",
+                confidence=0.9,
+                evidence_refs=("record:root",),
+            )
+        )
+
+        result = builder.to_result()
+
+        self.assertEqual(result.outcome, "evidence_gap")
+        self.assertEqual(result.confirmed_root_refs, ())
+        self.assertEqual(result.confirmation_identities, ())
+
+    def test_seed_outcome_payload_contract_is_rejected_everywhere(self):
+        state = defect("payload-contract")
+        cases = (
+            (
+                "confirmed-root-missing-evidence",
+                "confirmed_root",
+                {"missing_evidence": ("Need the exact test output.",)},
+            ),
+            (
+                "no-defect-blocker",
+                "no_defect",
+                {"blocking_reasons": ("judge_error",)},
+            ),
+            (
+                "evidence-gap-without-facts",
+                "evidence_gap",
+                {},
+            ),
+        )
+        for label, outcome, fields in cases:
+            with self.subTest(entry_point="direct", case=label):
+                with self.assertRaisesRegex(ValueError, "seed outcome payload"):
+                    SeedAttributionResult(
+                        start_ref="record:seed",
+                        defect_fingerprint=state.fingerprint,
+                        defect_state=state,
+                        outcome=outcome,
+                        **fields,
+                    )
+
+            payload = SeedAttributionResult(
+                start_ref="record:seed",
+                defect_fingerprint=state.fingerprint,
+                defect_state=state,
+                outcome="no_defect",
+            ).to_dict()
+            payload.update({"outcome": outcome, **fields})
+            with self.subTest(entry_point="from_dict", case=label):
+                with self.assertRaisesRegex(ValueError, "seed outcome payload"):
+                    SeedAttributionResult.from_dict(payload)
+
+            report = RecursiveAttributionReport(
+                case_id="seed-outcome-payload-contract",
+                objective="Reject contradictory terminal seed payloads.",
+                start_refs=("record:seed",),
+                seed_results=(
+                    SeedAttributionResult(
+                        start_ref="record:seed",
+                        defect_fingerprint=state.fingerprint,
+                        defect_state=state,
+                        outcome="no_defect",
+                    ),
+                ),
+            ).to_dict()
+            report["seed_results"][0].update(
+                {
+                    "outcome": outcome,
+                    **{key: list(value) for key, value in fields.items()},
+                }
+            )
+            with self.subTest(entry_point="evaluator", case=label):
+                with self.assertRaisesRegex(EvaluationSchemaError, "seed outcome payload"):
+                    _validate_report_shape(report, {"case_id": report["case_id"]})
+
     def test_seed_result_is_deeply_immutable_and_round_trips_defaults(self):
         state = defect("immutable")
         result = SeedAttributionResult(
@@ -1298,6 +1400,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             defect_state=state,
             outcome="evidence_gap",
             candidate_refs=["record:z", "record:a"],
+            missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={"nested": [{"status": "unknown"}]},
             expansion_history=[{"anchor_ref": "record:a", "refs": ["record:b"]}],
         )

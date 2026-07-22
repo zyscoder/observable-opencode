@@ -21,6 +21,7 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
     PredecessorAssessment,
+    RecursiveAttributionReport,
     RootConfirmation,
 )
 from trace_attribution.errors import (
@@ -3420,6 +3421,94 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             ("record:decision",),
         )
         self.assertNotIn("score", json.dumps(report.seed_results[0].to_dict()))
+
+    def test_global_inconclusive_then_recursive_confirmation_stays_conservative(self):
+        judge = FusionScriptedJudge(
+            global_outcome="inconclusive",
+            script={
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": RecursiveRootRankingTest._confirmation_step,
+            },
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The local decision introduced the observed omission.",
+                    counterfactual="Searching every implementation avoids the omission.",
+                    confidence=0.9,
+                    evidence_refs=("record:decision",),
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        seed = report.seed_results[0]
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertEqual(seed.outcome, "evidence_gap")
+        self.assertEqual(seed.confirmed_root_refs, ())
+        self.assertEqual(seed.confirmation_identities, ())
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual([item.status for item in report.confirmations], ["confirmed"])
+        self.assertEqual(RecursiveAttributionReport.from_dict(report.to_dict()), report)
+
+    def test_mixed_seed_branch_failure_and_confirmation_stays_conservative(self):
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                        relation("record:context", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": RecursiveRootRankingTest._confirmation_step,
+                "record:context": step(
+                    "record:context",
+                    status="unknown",
+                    missing=("The sibling context branch is truncated.",),
+                ),
+            },
+            {
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The branch-local counterfactual holds.",
+                    counterfactual="Searching every implementation avoids the omission.",
+                    confidence=0.9,
+                    evidence_refs=("record:decision",),
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace(branching=True)),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        seed = report.seed_results[0]
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertEqual(seed.outcome, "evidence_gap")
+        self.assertEqual(seed.confirmed_root_refs, ())
+        self.assertEqual(seed.confirmation_identities, ())
+        self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(report.co_roots, ())
+        self.assertEqual([item.status for item in report.confirmations], ["confirmed"])
+        self.assertEqual(RecursiveAttributionReport.from_dict(report.to_dict()), report)
 
     def test_global_expansion_routes_only_the_requested_anchor_to_recursion(self):
         judge = FusionScriptedJudge(
