@@ -796,6 +796,9 @@ function nodeAliases(node: CausalNodeLike, payload: Record<string, unknown>) {
     case "evidence.semantic_fact":
       addTypes(["evidence", "repo_fact"], ["fact_id"])
       break
+    case "external.evaluation_fact":
+      addTypes(["external_evaluation"], ["evaluation_id"])
+      break
     case "change":
       addTypes(["change"], ["change_id"])
       break

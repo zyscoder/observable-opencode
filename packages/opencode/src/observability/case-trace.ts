@@ -40,6 +40,7 @@ export type TraceComponent =
   | "mcp"
   | "plugin"
   | "result"
+  | "evaluation"
   | "trace"
 
 export type TraceFieldSummary = {
@@ -922,6 +923,7 @@ export type DataflowEdge = {
     | "executed_for_claim"
     | "response_to_claim_group"
     | "claim_group_precedes"
+    | "external_evaluation_observed"
   eligible_for_attribution?: boolean
   label?: string
   metadata?: Record<string, unknown>

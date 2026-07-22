@@ -700,6 +700,16 @@ class TraceGraph:
         return [self.hydrate_node(item) for item in refs[:limit]]
 
     def default_start_refs(self) -> List[str]:
+        external_evaluation_starts = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type == "external.evaluation_fact"
+            and node.data.get("status") == "failed"
+            and node.data.get("revision_status") == "matched"
+            and node.data.get("eligible_for_decisive_judgment") is True
+        ]
+        if external_evaluation_starts:
+            return dedupe(external_evaluation_starts)
         failed_cases = [ref for ref, node in self.nodes.items() if node.event_type == "case.failed"]
         manifest = self.raw_trace.get("manifest") if isinstance(self.raw_trace.get("manifest"), dict) else {}
         interrupted = manifest.get("shutdown_disposition") == "interrupted_before_case_completion"
@@ -770,7 +780,12 @@ class TraceGraph:
         if starts:
             return dedupe(starts)
         case_records = [ref for ref, node in self.nodes.items() if node.event_type in ("case.completed", "case.failed")]
-        return case_records[-1:] if case_records else list(self.nodes.keys())[-1:]
+        fallback_records = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type != "external.evaluation_fact"
+        ]
+        return case_records[-1:] if case_records else fallback_records[-1:]
 
 
 def artifact_root_for_trace_path(trace_path: Path, trace: JsonDict) -> Path:
@@ -945,6 +960,11 @@ def record_aliases(record: JsonDict) -> Iterable[str]:
         yield f"node:{record_id}"
     if event_type in ("evidence.semantic_fact", "evidence.fact") and record_id:
         yield f"evidence:{record_id}"
+    if event_type == "external.evaluation_fact":
+        if record_id:
+            yield f"external_evaluation:{record_id}"
+        if data.get("evaluation_id"):
+            yield f"external_evaluation:{data['evaluation_id']}"
     if event_type == "change":
         if record_id:
             yield f"change:{record_id}"

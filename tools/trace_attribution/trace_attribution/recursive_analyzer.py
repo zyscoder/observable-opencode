@@ -69,7 +69,13 @@ RECURSIVE_RELATIONS = frozenset(
 CAUSAL_STEP_CANDIDATE_LIMIT = 8
 NAVIGATION_ROUTE_CANDIDATE_LIMIT = 2
 EVALUATION_START_EVENTS = frozenset(
-    {"case.failed", "case.observed_defect", "case.quality_gap", "case.missing_semantic"}
+    {
+        "case.failed",
+        "case.observed_defect",
+        "case.quality_gap",
+        "case.missing_semantic",
+        "external.evaluation_fact",
+    }
 )
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"

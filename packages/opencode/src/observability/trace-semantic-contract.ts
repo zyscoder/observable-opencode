@@ -9,6 +9,7 @@ export const FORMAL_RECORD_TYPES = [
   "case.failed",
   "case.observed_defect",
   "case.missing_semantic",
+  "external.evaluation_fact",
   "task.loop",
   "task.plan_state",
   "task.obligation",
@@ -76,6 +77,7 @@ export const FORMAL_DATAFLOW_RELATIONS = [
   "executed_for_claim",
   "response_to_claim_group",
   "claim_group_precedes",
+  "external_evaluation_observed",
 ] as const
 
 export type FormalDataflowRelation = (typeof FORMAL_DATAFLOW_RELATIONS)[number]

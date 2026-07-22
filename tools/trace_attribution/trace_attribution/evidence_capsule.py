@@ -21,6 +21,7 @@ GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
         "claim.support_assessment",
         "evidence.fact",
         "evidence.semantic_fact",
+        "external.evaluation_fact",
         "tool.result",
         "verification",
     }

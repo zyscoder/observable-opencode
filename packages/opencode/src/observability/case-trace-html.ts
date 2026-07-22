@@ -51,6 +51,7 @@ const componentOrder: TraceComponent[] = [
   "task",
   "mcp",
   "plugin",
+  "evaluation",
   "result",
   "trace",
 ]
@@ -67,6 +68,7 @@ const componentLabel: Record<TraceComponent, string> = {
   task: "子任务 Agent",
   mcp: "MCP 执行",
   plugin: "插件",
+  evaluation: "外部评测",
   result: "最终结果",
   trace: "Trace",
 }

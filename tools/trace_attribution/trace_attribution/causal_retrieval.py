@@ -37,6 +37,7 @@ ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
         "case.observed_defect",
         "case.quality_gap",
         "case.missing_semantic",
+        "external.evaluation_fact",
         "context.pack",
         "run.start",
     }

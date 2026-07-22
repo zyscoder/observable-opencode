@@ -9,7 +9,12 @@ import {
   type CausalIRNodeInput,
 } from "@/observability/causal-ir"
 import type { ProvenanceRecord, TraceArtifact } from "@/observability/case-trace"
-import { RELATION_MIGRATIONS } from "@/observability/trace-semantic-contract"
+import {
+  FORMAL_DATAFLOW_RELATIONS,
+  FORMAL_RECORD_TYPES,
+  RELATION_MIGRATIONS,
+  normalizeRelationDetails,
+} from "@/observability/trace-semantic-contract"
 
 function node(nodeID: string, data: Record<string, unknown> = {}): CausalIRNodeInput {
   return {
@@ -39,6 +44,65 @@ function relationEdge(edgeID: string, relation: string) {
     relation,
   }
 }
+
+test("external evaluation semantic contract preserves aliases and replay", () => {
+  expect(FORMAL_RECORD_TYPES).toContain("external.evaluation_fact")
+  expect(FORMAL_DATAFLOW_RELATIONS).toContain("external_evaluation_observed")
+  expect(normalizeRelationDetails("external_evaluation_observed")).toEqual({
+    original: "external_evaluation_observed",
+    normalized: "external_evaluation_observed",
+    known: true,
+  })
+
+  const journal: CausalIRJournalEntry[] = []
+  const store = new CausalIRStore({
+    runID: "run_external_evaluation",
+    caseID: "case_external_evaluation",
+    append: (entry) => journal.push(entry),
+  })
+  store.createEdge({
+    edge_id: "edge_external_evaluation",
+    from: { type: "verification", id: "verification_1" },
+    to: { type: "external_evaluation", id: "terminalbench_1" },
+    relation: "external_evaluation_observed",
+    eligible_for_attribution: true,
+  })
+  store.createNode({
+    node_id: "external_evaluation_record_1",
+    kind: "external.evaluation_fact",
+    component: "evaluation",
+    timestamp: "2026-07-21T12:00:00.000Z",
+    time_ms: 1,
+    status: "failed",
+    data: {
+      evaluation_id: "terminalbench_1",
+      subject_revision: "git:abc123",
+      revision_status: "matched",
+      eligible_for_decisive_judgment: true,
+      root_candidate_eligible: false,
+    },
+  })
+  store.createNode({
+    ...node("verification_record_1"),
+    kind: "verification",
+    data: { verification_id: "verification_1" },
+  })
+
+  const snapshot = store.snapshot()
+  const evaluation = snapshot.nodes.find((item) => item.node_id === "external_evaluation_record_1")
+  expect(evaluation?.aliases).toEqual(
+    expect.arrayContaining([
+      "external_evaluation:terminalbench_1",
+      "external_evaluation:external_evaluation_record_1",
+    ]),
+  )
+  expect(snapshot.edges[0]).toMatchObject({
+    normalized_relation: "external_evaluation_observed",
+    eligible_for_attribution: true,
+    to: { ref_type: "node", ref_id: "external_evaluation_record_1" },
+  })
+  expect(replayCausalIRJournal(journal)).toEqual(snapshot)
+})
 
 function canonicalJSONForAudit(input: unknown, arrayValue = false): string | undefined {
   if (input === null) return "null"

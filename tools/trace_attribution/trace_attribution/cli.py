@@ -6,7 +6,7 @@ import os
 import signal
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from .analyzer import BackwardTaintAnalyzer
 from .cache import JudgmentCache
@@ -18,6 +18,7 @@ from .checkpoint import (
     publish_output_transaction,
 )
 from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
+from .evaluation_facts import inject_external_evaluation_facts
 from .graph import TraceGraph, artifact_root_for_trace_path
 from .models import stable_json
 from .quality_review import inject_quality_gap_records
@@ -70,6 +71,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
     parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
+    parser.add_argument(
+        "--evaluation",
+        action="append",
+        default=[],
+        help="External benchmark evaluation fact JSON; repeatable.",
+    )
     parser.add_argument("--out", required=True, help="Path to write attribution JSON report")
     parser.add_argument(
         "--lineage-out",
@@ -148,7 +155,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    graph = load_graph(Path(args.trace), Path(args.review) if args.review else None)
+    graph = load_graph(
+        Path(args.trace),
+        Path(args.review) if args.review else None,
+        [Path(path) for path in args.evaluation],
+    )
     out = Path(args.out)
     cache_path = judge_cache_output_path(out, args.judge_cache)
     transport = ClaudeJudgeClient(
@@ -316,11 +327,20 @@ def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
-def load_graph(trace_path: Path, review_path: Optional[Path] = None) -> TraceGraph:
+def load_graph(
+    trace_path: Path,
+    review_path: Optional[Path] = None,
+    evaluation_paths: Iterable[Path] = (),
+) -> TraceGraph:
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     if review_path:
         review = json.loads(review_path.read_text(encoding="utf-8"))
         trace = inject_quality_gap_records(trace, review)
+    payloads = [
+        json.loads(path.read_text(encoding="utf-8")) for path in evaluation_paths
+    ]
+    if payloads:
+        trace = inject_external_evaluation_facts(trace, payloads)
     return TraceGraph.from_trace(
         trace,
         artifact_root=artifact_root_for_trace_path(trace_path, trace),
