@@ -71,6 +71,8 @@ class CandidateEvidenceCapsule:
     missing_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        candidate_ref = str(self.candidate_ref).strip()
+        object.__setattr__(self, "candidate_ref", candidate_ref)
         object.__setattr__(self, "candidate", _freeze(self.candidate))
         object.__setattr__(self, "downstream_path", _dedupe_strings(self.downstream_path))
         object.__setattr__(
@@ -98,6 +100,57 @@ class CandidateEvidenceCapsule:
         object.__setattr__(
             self, "missing_evidence_refs", _dedupe_strings(self.missing_evidence_refs)
         )
+        self.validate()
+
+    def validate(self) -> None:
+        if not self.candidate_ref:
+            raise ValueError("candidate evidence capsule requires candidate identity")
+        if not isinstance(self.candidate, Mapping):
+            raise TypeError("candidate evidence capsule candidate must be an object")
+        if type(self.candidate.get("root_candidate_eligible")) is not bool:
+            raise ValueError("candidate root_candidate_eligible must be an exact boolean")
+        self._validate_identity_mapping(self.candidate, label="candidate")
+        node = self.candidate.get("node")
+        if not isinstance(node, Mapping):
+            raise ValueError("candidate identity requires an embedded candidate node")
+        self._validate_identity_mapping(node, label="embedded candidate node")
+        if not self.downstream_path or self.downstream_path[0] != self.candidate_ref:
+            raise ValueError("candidate identity must match downstream path start")
+        for path_ref, reference in zip(
+            self.downstream_path[:1], self.downstream_path_references[:1]
+        ):
+            if not isinstance(reference, Mapping):
+                raise TypeError("candidate downstream path reference must be an object")
+            if reference.get("resolution_status") != "resolved":
+                raise ValueError("candidate downstream path reference must be resolved")
+            resolved_ref = str(reference.get("resolved_ref") or "")
+            canonical_ref = str(reference.get("canonical_ref") or resolved_ref)
+            if resolved_ref != path_ref or canonical_ref != path_ref:
+                raise ValueError(
+                    "candidate identity must match every resolved downstream path reference"
+                )
+            reference_node = reference.get("node")
+            if isinstance(reference_node, Mapping):
+                ref = str(reference_node.get("ref") or "")
+                if ref != path_ref:
+                    raise ValueError(
+                        "candidate identity must match embedded downstream path node"
+                    )
+
+    def _validate_identity_mapping(
+        self, value: Mapping[str, Any], *, label: str
+    ) -> None:
+        if str(value.get("ref") or "") != self.candidate_ref:
+            raise ValueError("candidate identity mismatch in {0}".format(label))
+        identity_fields = (
+            str(value.get(key) or "")
+            for key in ("candidate_ref", "resolved_ref", "canonical_ref")
+            if key in value
+        )
+        if any(ref != self.candidate_ref for ref in identity_fields):
+            raise ValueError(
+                "candidate identity mismatch in {0}".format(label)
+            )
 
     def to_dict(self) -> JsonDict:
         return {

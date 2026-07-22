@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution.evidence_capsule import (
+    CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
 )
@@ -95,6 +97,72 @@ def sample_graph() -> TraceGraph:
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def _decision_capsule(self) -> CandidateEvidenceCapsule:
+        graph = sample_graph()
+        return build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[
+                CausalCandidate(
+                    ref="record:decision",
+                    node=graph.nodes["record:decision"],
+                    source="confirmed_edge",
+                    score=0.9,
+                    evidence_refs=("record:decision",),
+                )
+            ],
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+        )[0]
+
+    def test_capsule_restore_rejects_cross_candidate_identity_substitution(self):
+        original = self._decision_capsule().to_dict()
+
+        mutations = {}
+        candidate_ref = copy.deepcopy(original)
+        candidate_ref["candidate_ref"] = "record:prompt"
+        mutations["capsule ref"] = candidate_ref
+        candidate_fact = copy.deepcopy(original)
+        candidate_fact["candidate"]["ref"] = "record:prompt"
+        mutations["candidate fact"] = candidate_fact
+        embedded_node = copy.deepcopy(original)
+        embedded_node["candidate"]["node"]["ref"] = "record:prompt"
+        mutations["embedded node"] = embedded_node
+        path_start = copy.deepcopy(original)
+        path_start["downstream_path"][0] = "record:prompt"
+        mutations["path start"] = path_start
+        resolved_start = copy.deepcopy(original)
+        resolved_start["downstream_path_references"][0]["resolved_ref"] = (
+            "record:prompt"
+        )
+        mutations["resolved path start"] = resolved_start
+
+        for label, payload in mutations.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ValueError, "candidate identity"):
+                    CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_capsule_requires_boolean_candidate_eligibility_on_restore(self):
+        original = self._decision_capsule().to_dict()
+
+        for malformed in ("true", "false", 1, 0, None):
+            with self.subTest(value=malformed):
+                payload = copy.deepcopy(original)
+                payload["candidate"]["root_candidate_eligible"] = malformed
+                with self.assertRaisesRegex(ValueError, "root_candidate_eligible"):
+                    CandidateEvidenceCapsule.from_dict(payload)
+
     def test_duplicate_routes_preserve_recorded_provenance_independent_of_score(self):
         graph = sample_graph()
         node = graph.nodes["record:decision"]

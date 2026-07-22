@@ -20,6 +20,7 @@ from .models import JsonDict, stable_json
 
 
 GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
+MAX_ROOT_CONFIRMATION_CANDIDATES = 3
 GLOBAL_OUTCOMES = frozenset(
     {"candidate_roots", "no_defect", "needs_expansion", "inconclusive"}
 )
@@ -142,6 +143,7 @@ class GlobalCandidateJudgeRequest:
         if self.start_refs != (self.seed_ref,):
             raise ValueError("global candidate request must bind exactly one active seed_ref")
         for capsule in self.capsules:
+            capsule.validate()
             if capsule.defect_state != self.active_defect:
                 raise ValueError("global candidate request capsule defect drifts from active_defect")
             if tuple(capsule.start_refs) != (self.seed_ref,):
@@ -157,7 +159,7 @@ class GlobalCandidateJudgeRequest:
             sorted(
                 item.candidate_ref
                 for item in self.capsules
-                if bool(item.candidate.get("root_candidate_eligible"))
+                if item.candidate.get("root_candidate_eligible") is True
             )
         )
 
@@ -369,6 +371,7 @@ class GlobalCandidateAssessment:
         )
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
+        _validate_assessment_counterfactual_consistency(self)
 
     def to_dict(self) -> JsonDict:
         return {
@@ -404,7 +407,18 @@ class GlobalCandidateJudgment:
         if not self.reason.strip():
             raise ValueError("global candidate judgment reason must be non-empty")
         object.__setattr__(self, "assessments", tuple(self.assessments))
-        object.__setattr__(self, "selected_candidate_refs", tuple(self.selected_candidate_refs))
+        selected_candidate_refs = tuple(
+            sorted(
+                _immutable_strings(
+                    self.selected_candidate_refs, "selected_candidate_refs"
+                )
+            )
+        )
+        if len(selected_candidate_refs) > MAX_ROOT_CONFIRMATION_CANDIDATES:
+            raise ValueError("global judgment may select at most three candidates")
+        object.__setattr__(
+            self, "selected_candidate_refs", selected_candidate_refs
+        )
         object.__setattr__(
             self, "expansion_requests", tuple(_freeze(item) for item in self.expansion_requests)
         )
@@ -552,6 +566,9 @@ def validate_global_candidate_payload(
     if len(assessed) != len(set(assessed)) or set(assessed) != offered:
         raise ValueError("global judgment must assess every offered candidate exactly once")
     selected = _strings(value.get("selected_candidate_refs"), "selected_candidate_refs")
+    if len(selected) > MAX_ROOT_CONFIRMATION_CANDIDATES:
+        raise ValueError("global judgment may select at most three candidates")
+    selected = tuple(sorted(selected))
     if any(ref not in offered for ref in selected):
         raise ValueError("selected root must be an offered candidate")
     grounded = set(request.grounded_refs)
@@ -618,7 +635,7 @@ def validate_global_candidate_payload(
             if assessment.counterfactual["predicted_defect_status"] != "absent":
                 raise ValueError("selected root counterfactual must predict absent output defect")
             capsule = next(item for item in request.capsules if item.candidate_ref == ref)
-            if not bool(capsule.candidate.get("root_candidate_eligible")):
+            if capsule.candidate.get("root_candidate_eligible") is not True:
                 raise ValueError("selected root candidate is ineligible for attribution")
         if expansion:
             raise ValueError("candidate_roots cannot simultaneously request expansion")
@@ -769,6 +786,32 @@ def _counterfactual(
     )
 
 
+def _validate_assessment_counterfactual_consistency(
+    assessment: GlobalCandidateAssessment,
+) -> None:
+    counterfactual_prevents = (
+        assessment.counterfactual.get("predicted_defect_status") == "absent"
+        and assessment.counterfactual.get("causal_effect") == "prevents_defect"
+    )
+    if assessment.causal_role == "root_candidate":
+        if (
+            assessment.input_defect_status != "absent"
+            or assessment.output_defect_status != "present"
+            or not assessment.causal_path_refs
+        ):
+            raise ValueError(
+                "root_candidate causal role requires input defect not present, "
+                "present output, and a causal path"
+            )
+        expected_prevents = True
+    else:
+        expected_prevents = False
+    if counterfactual_prevents is not expected_prevents:
+        raise ValueError(
+            "counterfactual contradicts assessment causal role and defect status"
+        )
+
+
 def _immutable_strings(value: Any, field_name: str) -> Tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise TypeError("{0} must be an array".format(field_name))
@@ -848,6 +891,7 @@ def _expansion_requests(value: Any, grounded: set[str]) -> Tuple[Mapping[str, An
 
 __all__ = [
     "GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION",
+    "MAX_ROOT_CONFIRMATION_CANDIDATES",
     "GlobalCandidateAssessment",
     "GlobalCandidateJudgeRequest",
     "GlobalCandidateJudgment",

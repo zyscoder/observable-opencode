@@ -17,6 +17,7 @@ from trace_attribution.global_judge import (
     GlobalCandidateJudgeRequest,
     active_focus_text_sha256,
     build_global_candidate_prompt,
+    global_candidate_request_from_validation_envelope,
     global_candidate_judgment_from_payload,
     normalize_active_focus_text,
     validate_global_candidate_payload,
@@ -125,6 +126,117 @@ def sample_request(
     )
 
 
+def multi_root_request(*refs: str) -> GlobalCandidateJudgeRequest:
+    trace = {
+        "case_id": "multi-root-global-judge-case",
+        "records": [
+            {
+                "record_id": ref.removeprefix("record:"),
+                "component": "agent",
+                "event_type": "decision",
+                "data": {"rationale": "Candidate {0}.".format(ref)},
+            }
+            for ref in refs
+        ]
+        + [
+            {
+                "record_id": "defect",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": list(refs),
+                "data": {"actual": "The active defect is present."},
+            }
+        ],
+        "dataflow_edges": [
+            {
+                "from": {
+                    "type": "record",
+                    "id": ref.removeprefix("record:"),
+                },
+                "to": {"type": "record", "id": "defect"},
+                "relation": "decision_exposed_by_evaluation",
+                "evidence_type": "confirmed",
+                "confidence": 0.9,
+                "eligible_for_attribution": True,
+            }
+            for ref in refs
+        ],
+    }
+    graph = TraceGraph.from_trace(trace)
+    defect = DefectState.create(
+        label="active_defect",
+        expected="The active defect is absent.",
+        actual="The active defect is present.",
+        mechanism="One of the authored decisions introduced it.",
+        scope="task_quality",
+    )
+    capsules = build_candidate_evidence_capsules(
+        graph=graph,
+        candidates=[
+            CausalCandidate(
+                ref=ref,
+                node=graph.nodes[ref],
+                source="confirmed_edge",
+                score=0.9,
+                evidence_refs=(ref,),
+            )
+            for ref in refs
+        ],
+        defect_state=defect,
+        downstream_paths={ref: (ref, "record:defect") for ref in refs},
+        start_refs=("record:defect",),
+    )
+    return GlobalCandidateJudgeRequest(
+        case_id=trace["case_id"],
+        objective="Select no more than three authored root candidates.",
+        analysis_perspective="task quality",
+        seed_ref="record:defect",
+        active_defect=defect,
+        active_focus_text=defect.actual,
+        active_focus_text_hash=active_focus_text_sha256(defect.actual),
+        start_refs=("record:defect",),
+        capsules=capsules,
+    )
+
+
+def multi_root_payload(
+    request: GlobalCandidateJudgeRequest, selected: list[str]
+) -> dict:
+    eligible = list(request.open_authored_root_candidate_refs)
+    return {
+        "outcome": "candidate_roots",
+        "reason": "The selected authored candidates each require confirmation.",
+        "active_focus_binding": {
+            "seed_ref": request.seed_ref,
+            "defect_fingerprint": request.active_defect.fingerprint,
+            "active_focus_text_hash": request.active_focus_text_hash,
+        },
+        "assessments": [
+            {
+                "candidate_ref": capsule.candidate_ref,
+                "defect_status": "present",
+                "input_defect_status": "absent",
+                "output_defect_status": "present",
+                "causal_path_refs": list(capsule.downstream_path),
+                "counterfactual": counterfactual(
+                    capsule.candidate_ref, prevents_defect=True
+                ),
+                "compared_candidate_refs": eligible,
+                "causal_role": "root_candidate",
+                "reason": "The candidate can independently explain the defect.",
+                "evidence_refs": [capsule.candidate_ref],
+                "confidence": 0.8,
+            }
+            for capsule in request.capsules
+        ],
+        "selected_candidate_refs": selected,
+        "expansion_requests": [],
+        "decisive_evidence_refs": list(selected),
+        "missing_evidence": [],
+        "confidence": 0.8,
+    }
+
+
 def assessment(
     ref: str,
     *,
@@ -203,6 +315,97 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
 
 
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
+    def test_live_capsule_rejects_non_boolean_candidate_eligibility(self):
+        request = sample_request()
+
+        for malformed in ("true", "false", 1, 0, None):
+            with self.subTest(value=malformed):
+                candidate = dict(request.capsules[0].candidate)
+                candidate["root_candidate_eligible"] = malformed
+                with self.assertRaisesRegex(ValueError, "root_candidate_eligible"):
+                    replace(request.capsules[0], candidate=candidate)
+
+    def test_global_selection_is_deterministic_and_bounded_to_three(self):
+        request = multi_root_request(
+            "record:delta",
+            "record:alpha",
+            "record:charlie",
+            "record:bravo",
+        )
+        four = multi_root_payload(
+            request,
+            ["record:delta", "record:alpha", "record:charlie", "record:bravo"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "at most three"):
+            validate_global_candidate_payload(four, request=request)
+
+        first = validate_global_candidate_payload(
+            multi_root_payload(
+                request, ["record:delta", "record:alpha", "record:charlie"]
+            ),
+            request=request,
+        )
+        second = validate_global_candidate_payload(
+            multi_root_payload(
+                request, ["record:charlie", "record:delta", "record:alpha"]
+            ),
+            request=request,
+        )
+        self.assertEqual(
+            first.selected_candidate_refs,
+            ("record:alpha", "record:charlie", "record:delta"),
+        )
+        self.assertEqual(second.selected_candidate_refs, first.selected_candidate_refs)
+
+        restored_request = global_candidate_request_from_validation_envelope(
+            request.validation_envelope()
+        )
+        with self.assertRaisesRegex(ValueError, "at most three"):
+            validate_global_candidate_payload(
+                multi_root_payload(
+                    restored_request,
+                    [
+                        "record:delta",
+                        "record:alpha",
+                        "record:charlie",
+                        "record:bravo",
+                    ],
+                ),
+                request=restored_request,
+            )
+
+    def test_validation_envelope_rejects_cross_candidate_capsule_identity(self):
+        envelope = sample_request().validation_envelope()
+        envelope["candidate_evidence_capsules"][0]["candidate"]["node"][
+            "ref"
+        ] = "record:verification"
+
+        with self.assertRaisesRegex(ValueError, "candidate identity"):
+            global_candidate_request_from_validation_envelope(envelope)
+
+    def test_counterfactual_consistency_applies_to_every_assessment(self):
+        request = sample_request()
+        unselected_root = payload(outcome="candidate_roots", request=request)
+        unselected_root["outcome"] = "inconclusive"
+        unselected_root["selected_candidate_refs"] = []
+        unselected_root["assessments"][0]["counterfactual"] = counterfactual(
+            "record:decision", prevents_defect=False
+        )
+
+        non_root_prevents = payload(outcome="no_defect", request=request)
+        non_root_prevents["assessments"][0]["counterfactual"] = counterfactual(
+            "record:decision", prevents_defect=True
+        )
+
+        for label, value in (
+            ("unselected root", unselected_root),
+            ("non-root role", non_root_prevents),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ValueError, "counterfactual.*causal role"):
+                    validate_global_candidate_payload(value, request=request)
+
     def test_active_focus_canonicalization_only_normalizes_line_endings(self):
         self.assertEqual(
             normalize_active_focus_text("first\r\nsecond\rthird"),
@@ -787,6 +990,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "defect_status": "absent",
                 "output_defect_status": "absent",
                 "causal_role": "unrelated",
+                "counterfactual": counterfactual(
+                    "record:decision", prevents_defect=False
+                ),
             }
         )
         value["assessments"][1].update(

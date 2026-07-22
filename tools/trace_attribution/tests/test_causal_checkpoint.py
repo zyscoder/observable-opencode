@@ -302,6 +302,25 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
 
 
+def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) -> None:
+    confirmation = report_payload["confirmations"][0]
+    confirmation["recursive_path"] = list(recursive_path)
+    confirmation["confirmation_identity"] = confirmation_identity_for(
+        hypothesis_id=confirmation["hypothesis_id"],
+        hypothesis_semantic_hash=confirmation["hypothesis_semantic_hash"],
+        candidate_ref=confirmation["candidate_ref"],
+        defect_fingerprint=confirmation["defect_fingerprint"],
+        recursive_path=confirmation["recursive_path"],
+        seed_binding_identity=confirmation["seed_binding_identity"],
+    )
+    root = report_payload["confirmed_roots"][0]
+    root["recursive_path"] = list(recursive_path)
+    root["confirmation"] = copy.deepcopy(confirmation)
+    report_payload["seed_results"][0]["confirmation_identities"] = [
+        confirmation["confirmation_identity"]
+    ]
+
+
 class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapability):
     def __init__(self, *, interrupt_on_call=0):
         super().__init__()
@@ -1345,6 +1364,54 @@ class CausalCheckpointTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 ValueError, "publication identity.*record:ghost"
+            ):
+                AgenticRecursiveAnalyzer(
+                    judge=ConfirmedSingleNodeJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:defect"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+    def test_completed_checkpoint_rejects_disconnected_confirmation_path(self):
+        trace = confirmed_root_trace()
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:defect"],
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "completed-path.checkpoint"
+            AgenticRecursiveAnalyzer(
+                judge=ConfirmedSingleNodeJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["operation"] = "analysis_completed"
+            forge_checkpoint_root_path(
+                report_action["payload"]["report"],
+                ["record:decision", "record:decision", "record:defect"],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "confirmation path lacks a grounded causal edge"
             ):
                 AgenticRecursiveAnalyzer(
                     judge=ConfirmedSingleNodeJudge(),

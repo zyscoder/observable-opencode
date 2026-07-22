@@ -52,6 +52,7 @@ from .evidence_capsule import (
 )
 from .global_judge import (
     GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+    MAX_ROOT_CONFIRMATION_CANDIDATES,
     GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
@@ -487,6 +488,110 @@ def _assert_report_grounded_evidence(
     graph.assert_resolved_node_references(
         _dedupe_strings(identity_refs), label=label
     )
+    for confirmation in report.confirmations:
+        if confirmation.status != "confirmed":
+            continue
+        owners = [
+            seed
+            for seed in report.seed_results
+            if confirmation.seed_binding_identity
+            == seed_binding_identity_for(seed.start_ref, seed.defect_fingerprint)
+            and confirmation.recursive_path
+            and confirmation.recursive_path[-1] == seed.start_ref
+        ]
+        if len(owners) != 1:
+            raise ValueError(
+                "{0} confirmation path has no unique seed owner".format(label)
+            )
+        seed = owners[0]
+        _assert_active_confirmation_path(
+            graph,
+            confirmation.recursive_path,
+            candidate_ref=confirmation.candidate_ref,
+            seed_ref=seed.start_ref,
+            label=label,
+        )
+        global_judgment = seed.global_judgment
+        if global_judgment.get("outcome") == "candidate_roots":
+            selected = tuple(
+                str(ref)
+                for ref in global_judgment.get("selected_candidate_refs") or ()
+            )
+            assessments = [
+                item
+                for item in global_judgment.get("assessments") or ()
+                if isinstance(item, Mapping)
+                and str(item.get("candidate_ref") or "")
+                == confirmation.candidate_ref
+            ]
+            if (
+                confirmation.candidate_ref not in selected
+                or len(assessments) != 1
+                or tuple(assessments[0].get("causal_path_refs") or ())
+                != confirmation.recursive_path
+            ):
+                raise ValueError(
+                    "{0} confirmation path does not match its selected global assessment path".format(
+                        label
+                    )
+                )
+    for root in (*report.confirmed_roots, *report.co_roots):
+        confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+        owner = next(
+            (
+                seed
+                for seed in report.seed_results
+                if confirmation.seed_binding_identity
+                == seed_binding_identity_for(
+                    seed.start_ref, seed.defect_fingerprint
+                )
+                and root.recursive_path
+                and root.recursive_path[-1] == seed.start_ref
+            ),
+            None,
+        )
+        if owner is None:
+            raise ValueError("{0} root path has no seed owner".format(label))
+        _assert_active_confirmation_path(
+            graph,
+            root.recursive_path,
+            candidate_ref=root.node_ref,
+            seed_ref=owner.start_ref,
+            label=label,
+        )
+
+
+def _assert_active_confirmation_path(
+    graph: TraceGraph,
+    path: Sequence[str],
+    *,
+    candidate_ref: str,
+    seed_ref: str,
+    label: str,
+) -> None:
+    canonical_path = tuple(str(ref) for ref in path)
+    if (
+        not canonical_path
+        or canonical_path[0] != candidate_ref
+        or canonical_path[-1] != seed_ref
+        or any(graph.resolve(ref) != ref for ref in canonical_path)
+    ):
+        raise ValueError(
+            "{0} confirmation path must exactly bind its candidate and seed".format(
+                label
+            )
+        )
+    for source_ref, target_ref in zip(canonical_path, canonical_path[1:]):
+        edges = graph.edge_context(source_ref, target_ref)
+        if not graph.edge_endpoints_eligible(source_ref, target_ref) or not any(
+            is_confirmation_causal_edge(edge, default_eligible=True)
+            for edge in edges
+        ):
+            raise ValueError(
+                "{0} confirmation path lacks a grounded causal edge: {1}->{2}".format(
+                    label, source_ref, target_ref
+                )
+            )
 
 
 def _global_evidence_score(node: TraceNode) -> float:
@@ -1042,6 +1147,56 @@ class RecursiveAnalysisState:
             self.seed_count = len(self.seed_ledger)
         return builder
 
+    def enqueue_confirmation(self, value: Mapping[str, Any]) -> bool:
+        candidate_ref = str(value.get("candidate_ref") or "")
+        hypothesis_id = str(value.get("hypothesis_id") or "")
+        defect_fingerprint = str(value.get("defect_fingerprint") or "")
+        seed_binding_identity = str(value.get("seed_binding_identity") or "")
+        if not all(
+            (candidate_ref, hypothesis_id, defect_fingerprint, seed_binding_identity)
+        ):
+            raise ValueError("confirmation queue entry requires exact semantic identity")
+        node = self.graph.nodes.get(candidate_ref)
+        if node is None or not root_candidate_eligible(node):
+            return False
+        queue_key = (
+            hypothesis_id,
+            candidate_ref,
+            defect_fingerprint,
+            seed_binding_identity,
+        )
+        if queue_key in self.confirmation_queue_keys:
+            return False
+        same_seed_candidates = {
+            str(item.get("candidate_ref") or "")
+            for item in self.confirmation_queue
+            if str(item.get("seed_binding_identity") or "")
+            == seed_binding_identity
+        }
+        if candidate_ref in same_seed_candidates:
+            return False
+        if len(same_seed_candidates) >= MAX_ROOT_CONFIRMATION_CANDIDATES:
+            return False
+        self.confirmation_queue_keys.add(queue_key)
+        self.confirmation_queue.append(copy.deepcopy(dict(value)))
+        return True
+
+    def validate_confirmation_queue_bound(self) -> None:
+        candidates_by_seed: Dict[str, Set[str]] = {}
+        for item in self.confirmation_queue:
+            seed_binding_identity = str(
+                item.get("seed_binding_identity") or ""
+            )
+            candidate_ref = str(item.get("candidate_ref") or "")
+            if not seed_binding_identity or not candidate_ref:
+                raise ValueError("restored confirmation queue identity is incomplete")
+            candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
+            candidates.add(candidate_ref)
+            if len(candidates) > MAX_ROOT_CONFIRMATION_CANDIDATES:
+                raise ValueError(
+                    "restored confirmation queue exceeds three candidates per seed"
+                )
+
     def _seed_builder_for_item(
         self, item: FrontierItem
     ) -> Optional[SeedAttributionBuilder]:
@@ -1530,6 +1685,7 @@ class RecursiveAnalysisState:
         state.confirmation_queue_keys = {
             tuple(str(part) for part in item) for item in action_payload["confirmation_queue_keys"]
         }
+        state.validate_confirmation_queue_bound()
         state.confirmations = [RootConfirmation.from_dict(item) for item in action_payload["confirmations"]]
         state.confirmed_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["confirmed_roots"]]
         state.co_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["co_roots"]]
@@ -3136,29 +3292,27 @@ class AgenticRecursiveAnalyzer:
                     item.defect_state.fingerprint,
                     hypothesis.seed_binding_identity,
                 )
-                if queue_key not in state.confirmation_queue_keys:
-                    state.confirmation_queue_keys.add(queue_key)
-                    state.confirmation_queue.append(
-                        {
-                            "hypothesis_id": hypothesis.hypothesis_id,
-                            "candidate_ref": selected_ref,
-                            "defect_fingerprint": item.defect_state.fingerprint,
-                            "seed_binding_identity": hypothesis.seed_binding_identity,
-                            "requested_by_ref": item.node_ref,
-                            "recursive_path": list(capsule.downstream_path),
-                            "checked_evidence_refs": list(support_refs),
-                            "task_obligations": task_obligations(
-                                state.graph, state.objective
-                            ),
-                            "analysis_perspective": state.analysis_perspective,
-                            "semantic_identity": hashlib.sha256(
-                                stable_json(queue_key).encode("utf-8")
-                            ).hexdigest(),
-                            "status": "queued",
-                            "origin": "global_candidate_judgment",
-                            "seed_key": seed_builder.key if seed_builder else "",
-                        }
-                    )
+                state.enqueue_confirmation(
+                    {
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "candidate_ref": selected_ref,
+                        "defect_fingerprint": item.defect_state.fingerprint,
+                        "seed_binding_identity": hypothesis.seed_binding_identity,
+                        "requested_by_ref": item.node_ref,
+                        "recursive_path": list(capsule.downstream_path),
+                        "checked_evidence_refs": list(support_refs),
+                        "task_obligations": task_obligations(
+                            state.graph, state.objective
+                        ),
+                        "analysis_perspective": state.analysis_perspective,
+                        "semantic_identity": hashlib.sha256(
+                            stable_json(queue_key).encode("utf-8")
+                        ).hexdigest(),
+                        "status": "queued",
+                        "origin": "global_candidate_judgment",
+                        "seed_key": seed_builder.key if seed_builder else "",
+                    }
+                )
 
         if judgment.outcome == "needs_expansion":
             for request in judgment.expansion_requests:
@@ -5064,32 +5218,30 @@ class AgenticRecursiveAnalyzer:
                     defect_fingerprint,
                     hypothesis.seed_binding_identity,
                 )
-                if queue_key not in state.confirmation_queue_keys:
-                    state.confirmation_queue_keys.add(queue_key)
-                    state.confirmation_queue.append(
-                        {
-                            "hypothesis_id": hypothesis_id,
-                            "candidate_ref": candidate_ref,
-                            "defect_fingerprint": defect_fingerprint,
-                            "seed_binding_identity": hypothesis.seed_binding_identity,
-                            "requested_by_ref": item.node_ref,
-                            "recursive_path": list(item.downstream_path),
-                            "checked_evidence_refs": sorted(
-                                state.visit_evidence.get(item.visit_key, set())
-                            ),
-                            "task_obligations": copy.deepcopy(
-                                list(request.recursive_context.get("task_obligations") or [])
-                            ),
-                            "analysis_perspective": state.analysis_perspective,
-                            "semantic_identity": hashlib.sha256(
-                                stable_json(queue_key).encode("utf-8")
-                            ).hexdigest(),
-                            "status": "queued",
-                            "seed_key": state.hypothesis_seed_keys.get(
-                                hypothesis_id, ""
-                            ),
-                        }
-                    )
+                state.enqueue_confirmation(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "candidate_ref": candidate_ref,
+                        "defect_fingerprint": defect_fingerprint,
+                        "seed_binding_identity": hypothesis.seed_binding_identity,
+                        "requested_by_ref": item.node_ref,
+                        "recursive_path": list(item.downstream_path),
+                        "checked_evidence_refs": sorted(
+                            state.visit_evidence.get(item.visit_key, set())
+                        ),
+                        "task_obligations": copy.deepcopy(
+                            list(request.recursive_context.get("task_obligations") or [])
+                        ),
+                        "analysis_perspective": state.analysis_perspective,
+                        "semantic_identity": hashlib.sha256(
+                            stable_json(queue_key).encode("utf-8")
+                        ).hexdigest(),
+                        "status": "queued",
+                        "seed_key": state.hypothesis_seed_keys.get(
+                            hypothesis_id, ""
+                        ),
+                    }
+                )
                 status = "deferred"
         except (KeyError, ValueError) as exc:
             status = "rejected"

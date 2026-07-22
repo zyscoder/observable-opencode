@@ -245,6 +245,25 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
 
 
+def forge_published_root_path(report_payload: dict, recursive_path: list[str]) -> None:
+    confirmation = report_payload["confirmations"][0]
+    confirmation["recursive_path"] = list(recursive_path)
+    confirmation["confirmation_identity"] = confirmation_identity_for(
+        hypothesis_id=confirmation["hypothesis_id"],
+        hypothesis_semantic_hash=confirmation["hypothesis_semantic_hash"],
+        candidate_ref=confirmation["candidate_ref"],
+        defect_fingerprint=confirmation["defect_fingerprint"],
+        recursive_path=confirmation["recursive_path"],
+        seed_binding_identity=confirmation["seed_binding_identity"],
+    )
+    root = report_payload["confirmed_roots"][0]
+    root["recursive_path"] = list(recursive_path)
+    root["confirmation"] = copy.deepcopy(confirmation)
+    report_payload["seed_results"][0]["confirmation_identities"] = [
+        confirmation["confirmation_identity"]
+    ]
+
+
 class ScriptedCausalJudge(OfflineJudgeCapability):
     def __init__(self, script):
         self.script = script
@@ -3923,6 +3942,102 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 forged_report,
                 label="final attribution report",
             )
+
+    def test_publication_audit_rejects_real_path_that_drifts_from_global_selection(self):
+        trace = observed_trace(branching=True)
+        trace["dataflow_edges"].append(
+            {
+                "from": {"type": "record", "id": "decision"},
+                "to": {"type": "record", "id": "context"},
+                "relation": "used_as_context",
+                "evidence_type": "confirmed",
+                "confidence": 0.9,
+                "eligible_for_attribution": True,
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+        report = AgenticRecursiveAnalyzer(
+            judge=FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="Implement only the methods found in the first search.",
+                        reason="The decision remains necessary under independent review.",
+                        counterfactual="Searching the complete contract prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    )
+                },
+            ),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            graph,
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+        forged = report.to_dict()
+        forge_published_root_path(
+            forged,
+            [
+                "record:decision",
+                "record:context",
+                "record:change",
+                "record:observed_defect",
+            ],
+        )
+        forged_report = RecursiveAttributionReport.from_dict(forged)
+
+        with self.assertRaisesRegex(ValueError, "selected global assessment path"):
+            _assert_report_grounded_evidence(
+                graph,
+                forged_report,
+                label="final attribution report",
+            )
+
+    def test_confirmation_queue_never_accepts_more_than_three_candidates_per_seed(self):
+        refs = ("record:alpha", "record:bravo", "record:charlie", "record:delta")
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "confirmation-queue-bound",
+                "records": [
+                    {
+                        "record_id": ref.removeprefix("record:"),
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"rationale": "Candidate {0}.".format(ref)},
+                    }
+                    for ref in refs
+                ],
+                "dataflow_edges": [],
+            }
+        )
+        state = RecursiveAnalysisState(
+            graph=graph,
+            start_refs=("record:defect",),
+            objective="Bound independent confirmation.",
+            analysis_perspective="task quality",
+        )
+
+        accepted = []
+        for index, ref in enumerate(refs):
+            accepted.append(
+                state.enqueue_confirmation(
+                    {
+                        "hypothesis_id": "hyp:{0}".format(index),
+                        "candidate_ref": ref,
+                        "defect_fingerprint": "defect-fingerprint",
+                        "seed_binding_identity": "seed-binding",
+                        "status": "queued",
+                    }
+                )
+            )
+
+        self.assertEqual(accepted, [True, True, True, False])
+        self.assertEqual(
+            [item["candidate_ref"] for item in state.confirmation_queue],
+            ["record:alpha", "record:bravo", "record:charlie"],
+        )
 
     def test_conflicting_raw_provenance_never_publishes_global_root(self):
         trace = observed_trace()
