@@ -1720,6 +1720,97 @@ class SeedAttributionModelTests(unittest.TestCase):
 
 
 class SeedAttributionCheckpointTests(unittest.TestCase):
+    def test_checkpoint_rejects_missing_completed_frontier_hypothesis_seed_routing(self):
+        trace = {
+            "case_id": "completed-hypothesis-seed-key-routing",
+            "records": [
+                {
+                    "record_id": "seed",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {"text": "A seed with completed frontier work."},
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState(
+            graph=graph,
+            start_refs=("record:seed",),
+            objective="Keep every completed frontier hypothesis bound to its seed.",
+            analysis_perspective="",
+        )
+        owner = state._ensure_seed("record:seed", defect("owner"))
+        hypothesis = state.ledger.create(
+            "The completed item belongs to the owner seed.",
+            "record:seed",
+            owner.defect_state,
+            seed_binding_identity=owner.key,
+        )
+        state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, owner)
+        state.frontier.push(
+            FrontierItem.create(
+                node_ref="record:seed",
+                defect_state=owner.defect_state,
+                downstream_path=["record:seed"],
+                hypothesis_id=hypothesis.hypothesis_id,
+                hypothesis_semantic_hash=hypothesis.semantic_hash,
+                seed_binding_identity=owner.key,
+                candidate_source="checkpoint-test",
+            )
+        )
+        completed = state.frontier.pop()
+        state.frontier.mark_completed(completed, evidence_hash="completed-evidence")
+        config = build_checkpoint_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            objective=state.objective,
+            analysis_perspective="",
+            start_refs=state.start_refs,
+            budgets={
+                "max_frontier_items": 96,
+                "max_depth": 20,
+                "max_hypotheses": 24,
+                "max_investigation_rounds": 12,
+                "max_artifact_bytes": 1_048_576,
+                "max_judge_requests": 128,
+            },
+            model_identity="offline:test",
+            cache_identity="cache:test",
+            runtime_identity={
+                "judge_timeout_sec": 3600.0,
+                "judge_max_tokens": 4096,
+                "thinking_mode": "disabled",
+                "base_url": "offline://test",
+                "provider_error_threshold": 3,
+            },
+        )
+        state.provider_state = _provider_state_payload(
+            MultiSeedJudge(), state, cache_identity="cache:test"
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "case.checkpoint")
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="completed-hypothesis-seed-key-routing",
+                frontier_payload=state.frontier_checkpoint_payload(),
+                hypothesis_payload=state.hypothesis_checkpoint_payload(),
+                action_payload=state.action_checkpoint_payload(),
+            )
+            checkpoint = bundle.restore(expected_config=config)
+
+        actions = json.loads(json.dumps(checkpoint.actions))
+        snapshot = next(
+            item
+            for item in reversed(actions)
+            if item["operation"] == "state_snapshot"
+        )
+        snapshot["payload"]["hypothesis_seed_keys"].pop(hypothesis.hypothesis_id)
+        with self.assertRaisesRegex(ValueError, "hypothesis_seed_keys"):
+            RecursiveAnalysisState.from_checkpoint(
+                graph=graph,
+                checkpoint=replace(checkpoint, actions=tuple(actions)),
+            )
+
     def test_checkpoint_preserves_duplicate_ref_with_distinct_fingerprints(self):
         trace = {
             "case_id": "duplicate-seed-checkpoint",
@@ -1797,7 +1888,7 @@ class SeedAttributionCheckpointTests(unittest.TestCase):
             [item.to_dict() for item in state.seed_results()],
         )
 
-    def test_checkpoint_rejects_noncanonical_hypothesis_seed_key_routing(self):
+    def test_checkpoint_resumes_mixed_frontier_lifecycle_with_canonical_seed_routing(self):
         trace = {
             "case_id": "hypothesis-seed-key-routing",
             "records": [
@@ -1805,7 +1896,7 @@ class SeedAttributionCheckpointTests(unittest.TestCase):
                     "record_id": "seed",
                     "component": "result",
                     "event_type": "response.claim",
-                    "data": {"text": "A seed with pending frontier work."},
+                    "data": {"text": "A seed with restored frontier work."},
                 }
             ],
         }
@@ -1818,24 +1909,34 @@ class SeedAttributionCheckpointTests(unittest.TestCase):
         )
         owner = state._ensure_seed("record:seed", defect("owner"))
         other = state._ensure_seed("record:seed", defect("other"))
-        hypothesis = state.ledger.create(
-            "The pending item belongs to the owner seed.",
-            "record:seed",
-            owner.defect_state,
-            seed_binding_identity=owner.key,
-        )
-        state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, owner)
-        state.frontier.push(
-            FrontierItem.create(
-                node_ref="record:seed",
-                defect_state=owner.defect_state,
-                downstream_path=["record:seed"],
-                hypothesis_id=hypothesis.hypothesis_id,
-                hypothesis_semantic_hash=hypothesis.semantic_hash,
+        hypotheses = {}
+        for lifecycle in ("completed", "in_flight", "queued"):
+            hypothesis = state.ledger.create(
+                "The {0} item belongs to the owner seed.".format(lifecycle),
+                "record:seed",
+                owner.defect_state,
                 seed_binding_identity=owner.key,
-                candidate_source="checkpoint-test",
             )
-        )
+            state._bind_hypothesis_to_seed(hypothesis.hypothesis_id, owner)
+            state.frontier.push(
+                FrontierItem.create(
+                    node_ref="record:seed",
+                    defect_state=owner.defect_state,
+                    downstream_path=["record:seed"],
+                    hypothesis_id=hypothesis.hypothesis_id,
+                    hypothesis_semantic_hash=hypothesis.semantic_hash,
+                    seed_binding_identity=owner.key,
+                    candidate_source="checkpoint-{0}".format(lifecycle),
+                )
+            )
+            hypotheses[lifecycle] = hypothesis
+            if lifecycle == "completed":
+                state.frontier.mark_completed(
+                    state.frontier.pop(), evidence_hash="completed-evidence"
+                )
+            if lifecycle == "in_flight":
+                state.frontier.pop()
+        state.processed_items = 1
         config = build_checkpoint_config(
             trace=trace,
             case_id=trace["case_id"],
@@ -1876,16 +1977,30 @@ class SeedAttributionCheckpointTests(unittest.TestCase):
             restored = RecursiveAnalysisState.from_checkpoint(
                 graph=graph, checkpoint=checkpoint
             )
-            restored_item = FrontierItem.from_dict(restored.frontier.snapshot()[0])
+            restored_items = restored.frontier.lifecycle_items()
+            self.assertIsInstance(restored_items, tuple)
             self.assertEqual(
-                restored._seed_builder_for_item(restored_item).key, owner.key
+                {item.hypothesis_id for item in restored_items},
+                {hypothesis.hypothesis_id for hypothesis in hypotheses.values()},
             )
+            for restored_item in restored_items:
+                self.assertEqual(
+                    restored._seed_builder_for_item(restored_item).key, owner.key
+                )
 
         mutations = {
             "extra": lambda mapping: mapping.update({"hyp:extra": owner.key}),
-            "missing_frontier": lambda mapping: mapping.pop(hypothesis.hypothesis_id),
+            "missing_queued": lambda mapping: mapping.pop(
+                hypotheses["queued"].hypothesis_id
+            ),
+            "missing_requeued_in_flight": lambda mapping: mapping.pop(
+                hypotheses["in_flight"].hypothesis_id
+            ),
+            "missing_completed": lambda mapping: mapping.pop(
+                hypotheses["completed"].hypothesis_id
+            ),
             "cross_seed": lambda mapping: mapping.update(
-                {hypothesis.hypothesis_id: other.key}
+                {hypotheses["completed"].hypothesis_id: other.key}
             ),
         }
         for name, mutate in mutations.items():

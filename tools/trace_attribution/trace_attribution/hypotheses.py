@@ -355,6 +355,13 @@ class RecursiveFrontier:
     def snapshot(self) -> List[JsonDict]:
         return [item.to_dict() for _, item in sorted(self._heap)]
 
+    def lifecycle_items(self) -> Tuple[FrontierItem, ...]:
+        return (
+            tuple(item for _, item in sorted(self._heap))
+            + tuple(self.in_flight_items())
+            + tuple(completed.item for _, completed in sorted(self._completed.items()))
+        )
+
     @classmethod
     def from_snapshot(cls, snapshot: Sequence[Mapping[str, object]]) -> "RecursiveFrontier":
         frontier = cls()

@@ -1534,8 +1534,7 @@ class RecursiveAnalysisState:
                 "checkpoint hypothesis_seed_keys must match restored hypothesis seed bindings"
             )
         frontier_hypothesis_ids = {
-            FrontierItem.from_dict(item).hypothesis_id
-            for item in state.frontier.snapshot()
+            item.hypothesis_id for item in state.frontier.lifecycle_items()
         }
         if not frontier_hypothesis_ids.issubset(state.hypothesis_seed_keys):
             raise ValueError(
