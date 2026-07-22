@@ -1971,29 +1971,30 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `const results = []`,
+        `const responseText = "All 11 tests pass. " + "artifact detail ".repeat(220)`,
         `const sourceCount = (trace: any) => trace.responseSourceBySegmentID.size`,
         `const finalTrace = CaseTrace.get() as any`,
-        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `CaseTrace.responseOutput({ text: responseText })`,
         `CaseTrace.finish({ status: "success" })`,
-        `results.push({ kind: "final", count: sourceCount(finalTrace) })`,
+        `results.push({ kind: "final", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
         `CaseTrace.finish({ status: "success" })`,
-        `results.push({ kind: "repeat", count: sourceCount(finalTrace) })`,
+        `results.push({ kind: "repeat", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
         `CaseTrace.configure({ caseID: "response-source-non-final" })`,
         `const nonFinalTrace = CaseTrace.get() as any`,
-        `CaseTrace.responseOutput({ response_role: "intermediate_summary", text: "All 11 tests pass." })`,
+        `CaseTrace.responseOutput({ response_role: "intermediate_summary", text: responseText })`,
         `CaseTrace.finish({ status: "success" })`,
-        `results.push({ kind: "non_final", count: sourceCount(nonFinalTrace) })`,
+        `results.push({ kind: "non_final", count: sourceCount(nonFinalTrace), finished: nonFinalTrace.finished })`,
         `CaseTrace.configure({ caseID: "response-source-cancelled" })`,
         `const cancelledTrace = CaseTrace.get() as any`,
-        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `CaseTrace.responseOutput({ text: responseText })`,
         `CaseTrace.finish({ status: "cancelled" })`,
-        `results.push({ kind: "cancelled", count: sourceCount(cancelledTrace) })`,
+        `results.push({ kind: "cancelled", count: sourceCount(cancelledTrace), finished: cancelledTrace.finished })`,
         `CaseTrace.configure({ caseID: "response-source-exception" })`,
-        `CaseTrace.responseOutput({ text: "All 11 tests pass." })`,
+        `CaseTrace.responseOutput({ text: responseText })`,
         `const trace = CaseTrace.get() as any`,
         `trace.emitFinalResponseClaims = () => { throw new Error("forced claim emission failure") }`,
         `try { CaseTrace.finish({ status: "success" }) } catch {}`,
-        `results.push({ kind: "exception", count: sourceCount(trace) })`,
+        `results.push({ kind: "exception", count: sourceCount(trace), finished: trace.finished })`,
         `trace.finished = true`,
         `process.stdout.write(JSON.stringify(results))`,
       ].join("\n"),
@@ -2014,15 +2015,44 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
     expect(JSON.parse(await new Response(proc.stdout).text())).toEqual([
-      { kind: "final", count: 0 },
-      { kind: "repeat", count: 0 },
-      { kind: "non_final", count: 0 },
-      { kind: "cancelled", count: 0 },
-      { kind: "exception", count: 0 },
+      { kind: "final", count: 0, finished: true },
+      { kind: "repeat", count: 0, finished: true },
+      { kind: "non_final", count: 0, finished: true },
+      { kind: "cancelled", count: 0, finished: true },
+      { kind: "exception", count: 0, finished: false },
     ])
-    const trace = JSON.parse(await fs.readFile(path.join(dir, "response-source-final", "trace.json"), "utf8")) as any
-    expect(trace.records.some((record: any) => record.event_type === "response.output")).toBe(true)
-    expect(trace.metrics).toBeDefined()
+
+    const readCaseOutputs = async (caseID: string) => {
+      const caseDir = path.join(dir, caseID)
+      return {
+        trace: JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any,
+        manifest: JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any,
+        legacy: JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any,
+        partial: JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any,
+      }
+    }
+    const final = await readCaseOutputs("response-source-final")
+    const nonFinal = await readCaseOutputs("response-source-non-final")
+    const cancelled = await readCaseOutputs("response-source-cancelled")
+
+    for (const output of [final, nonFinal, cancelled]) {
+      expect(output.trace.manifest).toEqual(output.manifest)
+      expect(output.partial.manifest).toEqual(output.manifest)
+      expect(output.legacy.status).toBe(output.manifest.status)
+      expect(output.trace.artifacts).toEqual(output.partial.artifacts)
+      expect(output.trace.metrics).toBeDefined()
+      const response = output.trace.records.find((record: any) => record.event_type === "response.output")
+      expect(response.data.text.artifact_id).toEqual(expect.any(String))
+      expect(output.trace.artifacts.some((artifact: any) => artifact.artifact_id === response.data.text.artifact_id)).toBe(
+        true,
+      )
+    }
+    expect(final.manifest).toMatchObject({ status: "success", case_status: "success" })
+    expect(final.trace.records.filter((record: any) => record.event_type === "response.claim").length).toBeGreaterThan(0)
+    expect(nonFinal.manifest).toMatchObject({ status: "success", case_status: "success" })
+    expect(nonFinal.trace.records.filter((record: any) => record.event_type === "response.claim")).toHaveLength(0)
+    expect(cancelled.manifest).toMatchObject({ status: "cancelled", case_status: "cancelled" })
+    expect(cancelled.trace.records.filter((record: any) => record.event_type === "response.claim")).toHaveLength(0)
   })
 
   test("extracts explicit discount cap values without defaulting unrelated cap lines to 15 percent", async () => {

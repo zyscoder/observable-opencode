@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { Lexer } from "marked"
 
 export type ClaimAtomizationStatus = "atomic" | "group_required" | "invalid_fragment"
 
@@ -38,11 +39,31 @@ type ClaimToken = {
   end: number
 }
 
-type ClaimCandidate = Omit<AtomizedResponseClaim, "claim_index" | "claim_count" | "previous_claim_key" | "next_claim_key">
+type ClaimCandidate = Omit<
+  AtomizedResponseClaim,
+  "claim_index" | "claim_count" | "previous_claim_key" | "next_claim_key"
+>
+
+type MarkdownBlockToken = {
+  type: string
+  raw: string
+  items?: MarkdownBlockToken[]
+  tokens?: MarkdownBlockToken[]
+}
+
+type MarkdownBlockLexer = (source: string, options: { gfm: true }) => MarkdownBlockToken[]
 
 export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
+  return atomizeResponseClaimsWithLexer(input, (source, options) => Lexer.lex(source, options) as MarkdownBlockToken[])
+}
+
+export function atomizeResponseClaimsWithLexerForTest(input: unknown, lexer: MarkdownBlockLexer) {
+  return atomizeResponseClaimsWithLexer(input, lexer)
+}
+
+function atomizeResponseClaimsWithLexer(input: unknown, lexer: MarkdownBlockLexer): AtomizedResponseClaim[] {
   const source = createClaimSourceView(input, 8000)
-  const tokens = tokenizeClaimSource(source)
+  const tokens = tokenizeClaimSource(source, lexer)
   const spans = mergeClaimContinuations(source, segmentClaimTokens(source, tokens))
   const candidates = spans.flatMap((span) => toFactualCandidate(source, span)).slice(0, 50)
   const claimCount = candidates.length
@@ -57,7 +78,7 @@ export function atomizeResponseClaims(input: unknown): AtomizedResponseClaim[] {
 }
 
 function createClaimSourceView(input: unknown, limit: number): ClaimSourceView {
-  const originalText = normalizeResponseText(input)
+  const originalText = normalizeClaimSource(input)
   let scanEnd = Math.min(originalText.length, limit)
   if (
     scanEnd > 0 &&
@@ -78,7 +99,7 @@ function isLowSurrogate(value: number) {
   return value >= 0xdc00 && value <= 0xdfff
 }
 
-function normalizeResponseText(input: unknown) {
+function normalizeClaimSource(input: unknown): string {
   if (typeof input === "string") return input
   if (input === undefined || input === null) return ""
   try {
@@ -87,7 +108,11 @@ function normalizeResponseText(input: unknown) {
   } catch {
     // Fall through to preserve a stable source for unsupported values.
   }
-  return String(input)
+  try {
+    return String(input)
+  } catch {
+    return "[unserializable response]"
+  }
 }
 
 function stringPreview(input: unknown, limit = 400) {
@@ -100,55 +125,188 @@ function stringPreview(input: unknown, limit = 400) {
   }
 }
 
-function tokenizeClaimSource(source: ClaimSourceView): ClaimToken[] {
+function tokenizeClaimSource(source: ClaimSourceView, lexer: MarkdownBlockLexer): ClaimToken[] {
+  return lexMarkdownBlocks(source, lexer)
+}
+
+function lexMarkdownBlocks(source: ClaimSourceView, lexer: MarkdownBlockLexer): ClaimToken[] {
   const tokens: ClaimToken[] = []
-  let fence: { delimiter: "`" | "~"; length: number } | undefined
-  let lineStart = 0
+  let cursor = 0
 
-  while (lineStart < source.scanEnd) {
-    const newline = source.originalText.indexOf("\n", lineStart)
-    const hasNewline = newline !== -1 && newline < source.scanEnd
-    const lineStop = hasNewline ? newline + 1 : source.scanEnd
-    const lineEnd = hasNewline && source.originalText[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : source.scanEnd
-    const line = source.originalText.slice(lineStart, lineEnd)
-    const fenceMarker = markdownFenceMarker(line)
-
-    if (fence) {
-      tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
-      if (fenceMarker && fenceMarker.delimiter === fence.delimiter && fenceMarker.length >= fence.length) {
-        fence = undefined
+  try {
+    const blocks = lexer(source.originalText.slice(0, source.scanEnd), { gfm: true })
+    for (const block of blocks) {
+      if (!block || typeof block.raw !== "string" || !block.raw) {
+        tokens.push({ type: "HARD_BREAK", start: cursor, end: source.scanEnd })
+        return tokens
       }
-    } else if (fenceMarker) {
-      tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
-      fence = fenceMarker
-    } else if (/^\s*#{1,6}\s+/.test(line) || !line.trim() || /^\s*>/.test(line)) {
-      tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStop })
-    } else {
-      const listMarker = line.match(/^\s*(?:[-*+]|\d+[.)])\s+/)?.[0]
-      if (listMarker) {
-        const contentStart = lineStart + listMarker.length
-        tokens.push({ type: "HARD_BREAK", start: lineStart, end: contentStart })
-        tokenizeInlineText(source, contentStart, lineEnd, tokens)
-        tokens.push({ type: "HARD_BREAK", start: lineEnd, end: lineStop })
-      } else if (isMarkdownTableLine(line)) {
-        // A table row forms its own candidate span; its surrounding breaks prevent prose from joining it.
-        tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStart })
-        tokenizeInlineText(source, lineStart, lineEnd, tokens)
-        tokens.push({ type: "HARD_BREAK", start: lineEnd, end: lineStop })
-      } else {
-        tokenizeInlineText(source, lineStart, lineEnd, tokens)
-        pushLineBreak(tokens, lineEnd, lineStop)
+      const end = cursor + block.raw.length
+      if (end > source.scanEnd || source.originalText.slice(cursor, end) !== block.raw) {
+        tokens.push({ type: "HARD_BREAK", start: cursor, end: source.scanEnd })
+        return tokens
       }
+      adaptMarkdownBlock(source, block, cursor, end, tokens)
+      cursor = end
     }
-    lineStart = lineStop
+  } catch {
+    tokens.push({ type: "HARD_BREAK", start: cursor, end: source.scanEnd })
+    return tokens
   }
+
+  if (cursor < source.scanEnd) tokens.push({ type: "HARD_BREAK", start: cursor, end: source.scanEnd })
   return tokens
 }
 
-function markdownFenceMarker(line: string) {
-  const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1]
-  if (!marker) return undefined
-  return { delimiter: marker[0] as "`" | "~", length: marker.length }
+function adaptMarkdownBlock(
+  source: ClaimSourceView,
+  block: MarkdownBlockToken,
+  start: number,
+  end: number,
+  tokens: ClaimToken[],
+) {
+  if (block.type === "paragraph") {
+    tokenizeParagraphRange(source, start, end, tokens)
+    return
+  }
+  if (block.type === "list") {
+    tokenizeMarkdownList(source, block, start, end, tokens)
+    return
+  }
+  if (block.type === "table") {
+    tokenizeMarkdownTable(source, start, end, tokens)
+    return
+  }
+  tokens.push({ type: "HARD_BREAK", start, end })
+}
+
+function tokenizeMarkdownList(
+  source: ClaimSourceView,
+  block: MarkdownBlockToken,
+  start: number,
+  end: number,
+  tokens: ClaimToken[],
+) {
+  if (!Array.isArray(block.items)) {
+    tokens.push({ type: "HARD_BREAK", start, end })
+    return
+  }
+
+  tokens.push({ type: "HARD_BREAK", start, end: start })
+  let cursor = start
+  for (const item of block.items) {
+    const itemRange = mapNestedRawRange(source.originalText, item?.raw, cursor, end)
+    if (!itemRange) {
+      tokens.push({ type: "HARD_BREAK", start: cursor, end })
+      return
+    }
+    if (cursor < itemRange.start) tokens.push({ type: "HARD_BREAK", start: cursor, end: itemRange.start })
+    tokens.push({ type: "HARD_BREAK", start: itemRange.start, end: itemRange.start })
+    tokenizeMarkdownListItem(source, item, itemRange.start, itemRange.end, tokens)
+    tokens.push({ type: "HARD_BREAK", start: itemRange.end, end: itemRange.end })
+    cursor = itemRange.end
+  }
+  if (cursor < end) tokens.push({ type: "HARD_BREAK", start: cursor, end })
+  tokens.push({ type: "HARD_BREAK", start: end, end })
+}
+
+function tokenizeMarkdownListItem(
+  source: ClaimSourceView,
+  item: MarkdownBlockToken,
+  start: number,
+  end: number,
+  tokens: ClaimToken[],
+) {
+  if (!Array.isArray(item.tokens)) {
+    tokens.push({ type: "HARD_BREAK", start, end })
+    return
+  }
+
+  let cursor = start
+  for (const child of item.tokens) {
+    const childRange = mapNestedRawRange(source.originalText, child?.raw, cursor, end)
+    if (!childRange) {
+      tokens.push({ type: "HARD_BREAK", start: cursor, end })
+      return
+    }
+    if (cursor < childRange.start) tokens.push({ type: "HARD_BREAK", start: cursor, end: childRange.start })
+    if (child.type === "paragraph" || child.type === "text") {
+      tokenizeListParagraphRange(source, childRange.start, childRange.end, tokens)
+    } else if (child.type === "list") {
+      tokenizeMarkdownList(source, child, childRange.start, childRange.end, tokens)
+    } else {
+      tokens.push({ type: "HARD_BREAK", start: childRange.start, end: childRange.end })
+    }
+    cursor = childRange.end
+  }
+  if (cursor < end) tokens.push({ type: "HARD_BREAK", start: cursor, end })
+}
+
+function tokenizeListParagraphRange(source: ClaimSourceView, start: number, end: number, tokens: ClaimToken[]) {
+  let lineStart = start
+  let firstLine = true
+  while (lineStart < end) {
+    const newline = source.originalText.indexOf("\n", lineStart)
+    const hasNewline = newline !== -1 && newline < end
+    const lineStop = hasNewline ? newline + 1 : end
+    const lineEnd = hasNewline && source.originalText[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : end
+    if (!firstLine && lineStart < lineEnd && !/[ \t]/.test(source.originalText[lineStart]!)) {
+      tokens.push({ type: "HARD_BREAK", start: lineStart, end: lineStart })
+    }
+    tokenizeInlineText(source, lineStart, lineEnd, tokens)
+    pushLineBreak(tokens, lineEnd, lineStop)
+    lineStart = lineStop
+    firstLine = false
+  }
+}
+
+function mapNestedRawRange(source: string, raw: unknown, cursor: number, end: number) {
+  if (typeof raw !== "string" || !raw) return undefined
+  const start = source.indexOf(raw, cursor)
+  if (start === -1 || start + raw.length > end) return undefined
+  return { start, end: start + raw.length }
+}
+
+function tokenizeMarkdownTable(source: ClaimSourceView, start: number, end: number, tokens: ClaimToken[]) {
+  tokens.push({ type: "HARD_BREAK", start, end: start })
+  let lineStart = 0
+  let lineIndex = 0
+
+  while (start + lineStart < end) {
+    const absoluteLineStart = start + lineStart
+    const newline = source.originalText.indexOf("\n", absoluteLineStart)
+    const hasNewline = newline !== -1 && newline < end
+    const lineStop = hasNewline ? newline + 1 : end
+    const lineEnd = hasNewline && source.originalText[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : end
+    const line = source.originalText.slice(absoluteLineStart, lineEnd)
+
+    if (lineIndex < 2) {
+      tokens.push({ type: "HARD_BREAK", start: absoluteLineStart, end: lineStop })
+    } else if (markdownTableCells(line).length >= 2) {
+      tokens.push({ type: "HARD_BREAK", start: absoluteLineStart, end: absoluteLineStart })
+      tokens.push({ type: "PROTECTED_TEXT", start: absoluteLineStart, end: lineEnd })
+      tokens.push({ type: "HARD_BREAK", start: lineEnd, end: lineStop })
+    } else {
+      tokenizeInlineText(source, absoluteLineStart, lineEnd, tokens)
+      pushLineBreak(tokens, lineEnd, lineStop)
+    }
+    lineStart = lineStop
+    lineStart -= start
+    lineIndex++
+  }
+  tokens.push({ type: "HARD_BREAK", start: end, end })
+}
+
+function tokenizeParagraphRange(source: ClaimSourceView, start: number, end: number, tokens: ClaimToken[]) {
+  let lineStart = start
+  while (lineStart < end) {
+    const newline = source.originalText.indexOf("\n", lineStart)
+    const hasNewline = newline !== -1 && newline < end
+    const lineStop = hasNewline ? newline + 1 : end
+    const lineEnd = hasNewline && source.originalText[newline - 1] === "\r" ? newline - 1 : hasNewline ? newline : end
+    tokenizeInlineText(source, lineStart, lineEnd, tokens)
+    pushLineBreak(tokens, lineEnd, lineStop)
+    lineStart = lineStop
+  }
 }
 
 function tokenizeInlineText(source: ClaimSourceView, start: number, end: number, tokens: ClaimToken[]) {
@@ -188,11 +346,6 @@ function matchingBacktickRun(source: ClaimSourceView, start: number, end: number
 
 function pushLineBreak(tokens: ClaimToken[], lineEnd: number, lineStop: number) {
   if (lineEnd < lineStop) tokens.push({ type: "SOFT_BREAK", start: lineEnd, end: lineStop })
-}
-
-function isMarkdownTableLine(line: string) {
-  const cells = markdownTableCells(line)
-  return cells.length >= 2
 }
 
 function segmentClaimTokens(source: ClaimSourceView, tokens: ClaimToken[]): ClaimSpan[] {

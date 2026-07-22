@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { atomizeResponseClaims } from "../../src/observability/claim-atomization"
+import { atomizeResponseClaims, atomizeResponseClaimsWithLexerForTest } from "../../src/observability/claim-atomization"
 
 describe("claim atomization", () => {
   test("keeps a parenthetical cstack statement as one auditable claim", () => {
@@ -127,19 +127,86 @@ describe("claim atomization", () => {
       },
       {
         name: "table",
-        response: "Before 11 (open\n| Result | All 11 tests pass. |\nAfter 12 tests pass.",
-        expected: ["Result: All 11 tests pass.", "After 12 tests pass."],
+        response:
+          "Before 11 (open\n| Result | Value |\n| --- | --- |\n| Tests | All 11 tests pass. |\nAfter 12 tests pass.",
+        expected: ["Tests: All 11 tests pass.", "After 12 tests pass."],
       },
       {
         name: "blockquote",
-        response: "Before 11 (open\n> Quoted 11 tests pass.\nAfter 12 tests pass.",
+        response: "Before 11 (open\n> Quoted 11 tests pass.\n\nAfter 12 tests pass.",
         expected: ["After 12 tests pass."],
       },
     ]
 
     for (const item of cases) {
-      expect(atomizeResponseClaims(item.response).map((claim) => claim.text), item.name).toEqual(item.expected)
+      expect(
+        atomizeResponseClaims(item.response).map((claim) => claim.text),
+        item.name,
+      ).toEqual(item.expected)
     }
+  })
+
+  test("treats CommonMark and GFM blocks as hard barriers", () => {
+    const cases = [
+      { name: "ATX heading", block: "## Summary" },
+      { name: "Setext equals heading", block: "Summary\n=======" },
+      { name: "Setext dash heading", block: "Summary\n-------" },
+      { name: "thematic break", block: "***" },
+      { name: "backtick fence", block: "```ts\nconst ignored = true\n```" },
+      { name: "tilde fence", block: "~~~ts\nconst ignored = true\n~~~" },
+      { name: "indented code", block: "\n    const ignored = true" },
+      { name: "HTML block", block: "<div>\nIgnored 11 tests pass.\n</div>" },
+      { name: "link definition", block: "[result]: https://example.com/tests" },
+      { name: "blockquote", block: "> Quoted 11 tests pass." },
+    ]
+
+    for (const item of cases) {
+      const response = `Before 11 (open\n${item.block}\n\nAfter 12 tests pass.`
+      expect(
+        atomizeResponseClaims(response).map((claim) => claim.text),
+        item.name,
+      ).toEqual(["After 12 tests pass."])
+    }
+  })
+
+  test("preserves facts inside ordered, unordered, and nested lists", () => {
+    const cases = [
+      { name: "unordered", block: "- Owner is billing-platform." },
+      { name: "ordered", block: "1. All 11 tests pass." },
+      {
+        name: "nested",
+        block: "- Owner is billing-platform.\n  - All 11 tests pass.\n- The discount cap remains 15%.",
+      },
+    ]
+
+    for (const item of cases) {
+      const response = `Before 11 (open\n${item.block}\nAfter 12 tests pass.`
+      const texts = atomizeResponseClaims(response).map((claim) => claim.text)
+      expect(texts.at(-1), item.name).toBe("After 12 tests pass.")
+      expect(
+        texts.some((text) => text.includes("11 tests pass") || text.includes("billing-platform")),
+        item.name,
+      ).toBe(true)
+      expect(
+        texts.every((text) => !text.includes("Before 11")),
+        item.name,
+      ).toBe(true)
+    }
+  })
+
+  test("preserves GFM table facts with original byte ranges", () => {
+    const block = ["| Result | Value |", "| --- | --- |", "| Tests | All 11 tests pass. |"].join("\n")
+    const response = `Before 11 (open\n${block}\nAfter 12 tests pass.`
+    const claims = atomizeResponseClaims(response)
+    const tableFact = claims.find((claim) => claim.claim_format === "table_fact")
+
+    expect(claims.map((claim) => claim.text)).toEqual(["Tests: All 11 tests pass.", "After 12 tests pass."])
+    expect(tableFact).toMatchObject({
+      raw_text: "| Tests | All 11 tests pass. |",
+      table_cells: ["Tests", "All 11 tests pass."],
+    })
+    const [start, end] = tableFact!.source_byte_range
+    expect(Buffer.from(response).subarray(start, end).toString()).toBe(tableFact!.raw_text)
   })
 
   test("keeps list items independent across nested and consecutive lists", () => {
@@ -176,9 +243,10 @@ describe("claim atomization", () => {
     ]
 
     for (const item of cases) {
-      expect(atomizeResponseClaims(item.response).map((claim) => claim.text), item.name).toEqual([
-        "After 12 tests pass.",
-      ])
+      expect(
+        atomizeResponseClaims(item.response).map((claim) => claim.text),
+        item.name,
+      ).toEqual(["After 12 tests pass."])
     }
   })
 
@@ -224,7 +292,10 @@ describe("claim atomization", () => {
     for (const delimiter of ["`", "``", "```"]) {
       const response = `Example ${delimiter}foo(\nAll 11 tests pass.`
 
-      expect(atomizeResponseClaims(response).map((claim) => claim.text), delimiter).toContain("All 11 tests pass.")
+      expect(
+        atomizeResponseClaims(response).map((claim) => claim.text),
+        delimiter,
+      ).toContain("All 11 tests pass.")
     }
   })
 
@@ -241,7 +312,53 @@ describe("claim atomization", () => {
     }
   })
 
-  test("normalizes non-serializable final response values without losing the source view", () => {
-    expect(() => atomizeResponseClaims(() => "All 11 tests pass.")).not.toThrow()
+  test("normalizes hostile final response values as a total function", () => {
+    const hostile = {
+      toJSON() {
+        throw new Error("hostile toJSON")
+      },
+      toString() {
+        throw new Error("hostile toString")
+      },
+      [Symbol.toPrimitive]() {
+        throw new Error("hostile Symbol.toPrimitive")
+      },
+    }
+
+    expect(() => atomizeResponseClaims(hostile)).not.toThrow()
+    expect(atomizeResponseClaims(hostile).map((claim) => claim.raw_text)).toEqual(["[unserializable response]"])
+  })
+
+  test("fails closed when the Markdown lexer throws", () => {
+    expect(() =>
+      atomizeResponseClaimsWithLexerForTest("All 11 tests pass.", () => {
+        throw new Error("forced lexer failure")
+      }),
+    ).not.toThrow()
+    expect(
+      atomizeResponseClaimsWithLexerForTest("All 11 tests pass.", () => {
+        throw new Error("forced lexer failure")
+      }),
+    ).toEqual([])
+  })
+
+  test("keeps prior facts and fails closed after a lexer raw mismatch", () => {
+    const response = "All 11 tests pass.\nAfter 12 tests pass."
+    const claims = atomizeResponseClaimsWithLexerForTest(response, () => [
+      { type: "paragraph", raw: "All 11 tests pass.\n", text: "All 11 tests pass." },
+      { type: "paragraph", raw: "not the remaining source", text: "not the remaining source" },
+    ])
+
+    expect(claims.map((claim) => claim.text)).toEqual(["All 11 tests pass."])
+  })
+
+  test("fails closed for an unknown Markdown block token", () => {
+    const response = "All 11 tests pass.\nAfter 12 tests pass."
+    const claims = atomizeResponseClaimsWithLexerForTest(response, () => [
+      { type: "paragraph", raw: "All 11 tests pass.\n", text: "All 11 tests pass." },
+      { type: "unknown_block", raw: "After 12 tests pass." },
+    ])
+
+    expect(claims.map((claim) => claim.text)).toEqual(["All 11 tests pass."])
   })
 })
