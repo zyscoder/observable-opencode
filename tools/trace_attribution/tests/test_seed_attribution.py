@@ -16,9 +16,13 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
     FrozenMapping,
+    PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
     SeedAttributionResult,
+    annotate_report_semantic_anchors,
+    semantic_anchor_index,
+    semantic_occurrence_index,
 )
 from trace_attribution.checkpoint import (
     CheckpointBundle,
@@ -39,6 +43,7 @@ from trace_attribution.recursive_analyzer import (
 from scripts.evaluate_recursive_attribution import (
     EvaluationSchemaError,
     _validate_report_shape,
+    compare_report,
 )
 
 
@@ -101,6 +106,67 @@ class FailingFragmentJudge(MultiSeedJudge):
         if request.current_node.ref == "record:claim_fragment":
             raise RuntimeError("seed-local scripted failure")
         return super().judge_step_offline(request)
+
+
+class TransformingRootJudge(OfflineJudgeCapability):
+    def __init__(self) -> None:
+        self.confirmation_requests = []
+
+    def judge_step_offline(self, request):
+        if request.current_node.ref == "record:seed":
+            upstream = request.defect_state.transformed(
+                label="incomplete_repository_discovery",
+                mechanism="the decision stopped before inspecting every implementation",
+                transformation_reason="the incomplete discovery decision produced the downstream omission",
+            )
+            return CausalStepJudgment(
+                current_node_ref="record:seed",
+                current_defect_status="present",
+                current_defect_reason="The observed omission propagates from an earlier discovery decision.",
+                predecessors=(
+                    PredecessorAssessment(
+                        ref="record:root",
+                        relation="defect_transformation",
+                        reason="The decision transformed into the downstream omitted implementation.",
+                        confidence=0.9,
+                        recurse=True,
+                        upstream_defect=upstream,
+                        evidence_refs=("record:root", "record:seed"),
+                    ),
+                ),
+                candidate_introduction=False,
+                confidence=0.9,
+            )
+        if request.current_node.ref == "record:root":
+            return CausalStepJudgment(
+                current_node_ref="record:root",
+                current_defect_status="present",
+                current_defect_reason="The recorded decision stopped discovery before every implementation was inspected.",
+                predecessors=(),
+                candidate_introduction=True,
+                suggested_investigation={
+                    "action": "request_root_confirmation",
+                    "arguments": {
+                        "hypothesis_id": request.recursive_context["active_hypothesis_id"],
+                        "candidate_ref": "record:root",
+                        "defect_fingerprint": request.defect_state.fingerprint,
+                    },
+                    "reason": "Independently confirm the transformed defect root.",
+                },
+                confidence=0.9,
+            )
+        raise AssertionError("unexpected node: {0}".format(request.current_node.ref))
+
+    def confirm_candidate_offline(self, request):
+        self.confirmation_requests.append(request)
+        return RootConfirmation.confirmed(
+            request.candidate_ref,
+            excerpt="Search only the first matching implementation.",
+            reason="The decision independently introduced the incomplete discovery defect.",
+            counterfactual="Inspecting every implementation prevents the downstream omission.",
+            confidence=0.95,
+            evidence_refs=(request.candidate_ref,),
+        )
 
 
 class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
@@ -408,6 +474,100 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_v3_seed_results_reject_non_object_entries_across_entry_points(self):
+        valid = seed_result("record:seed", "no_defect")
+        payload = RecursiveAttributionReport(
+            case_id="non-object-seed-results",
+            objective="Reject malformed seed entries.",
+            start_refs=(valid.start_ref,),
+            seed_results=(valid,),
+        ).to_dict()
+        payload["seed_results"].append("not-an-object")
+
+        with self.assertRaisesRegex(TypeError, "seed_results"):
+            RecursiveAttributionReport(
+                case_id=payload["case_id"],
+                objective=payload["objective"],
+                start_refs=(valid.start_ref,),
+                seed_results=(valid, "not-an-object"),
+            )
+        with self.assertRaisesRegex(TypeError, "seed_results"):
+            RecursiveAttributionReport.from_dict(payload)
+        with self.assertRaisesRegex(EvaluationSchemaError, "seed_results"):
+            _validate_report_shape(payload, {"case_id": payload["case_id"]})
+
+    def test_transformed_seed_lineage_with_real_confirmation_is_accepted_everywhere(self):
+        trace = {
+            "case_id": "transformed-seed-confirmation",
+            "records": [
+                {
+                    "record_id": "root",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {
+                        "rationale": "Search only the first matching implementation."
+                    },
+                },
+                {
+                    "record_id": "seed",
+                    "component": "assistant",
+                    "event_type": "response.claim",
+                    "source_refs": ["record:root"],
+                    "data": {"text": "Every implementation was inspected."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "root"},
+                    "to": {"type": "record", "id": "seed"},
+                    "relation": "decision_guided_claim",
+                    "evidence_type": "confirmed",
+                    "confidence": 0.9,
+                    "eligible_for_attribution": True,
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        judge = TransformingRootJudge()
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            graph,
+            start_refs=("record:seed",),
+            objective="Find the omitted implementation root.",
+        )
+
+        direct = replace(report)
+        payload = report.to_dict()
+        parsed = RecursiveAttributionReport.from_dict(payload)
+        self.assertEqual(direct.to_dict(), payload)
+        self.assertEqual(parsed.to_dict(), payload)
+        self.assertEqual(len(judge.confirmation_requests), 1)
+        self.assertNotEqual(
+            report.seed_results[0].defect_fingerprint,
+            report.confirmed_roots[0].defect_state.fingerprint,
+        )
+
+        anchors = semantic_anchor_index(graph.case_id, graph)
+        occurrences = semantic_occurrence_index(graph.case_id, graph)
+        labels = {
+            "schema_version": "recursive-attribution-labels/v3",
+            "case_id": graph.case_id,
+            "roots": [
+                {
+                    "node_ref": "record:root",
+                    "semantic_anchor_id": anchors["record:root"],
+                    "semantic_occurrence_id": occurrences["record:root"],
+                }
+            ],
+            "conditions": [],
+            "amplifiers": [],
+            "forbidden_roots": [],
+            "allowed_unresolved_outcomes": [],
+        }
+        projected = annotate_report_semantic_anchors(
+            graph.case_id, graph.nodes, payload, graph=graph
+        )
+        self.assertTrue(compare_report(projected, labels, None, graph=graph)["safety"]["passed"])
+
     def test_every_seed_confirmation_identity_must_bind_individually(self):
         report = run_shared_root_report()
         first, second = report.seed_results

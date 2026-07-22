@@ -1820,6 +1820,11 @@ class RecursiveAttributionReport:
             "start_refs",
             tuple(sorted(set(_frozen_strings(self.start_refs)))),
         )
+        if any(
+            not isinstance(item, SeedAttributionResult)
+            for item in self.seed_results
+        ):
+            raise TypeError("seed_results must contain SeedAttributionResult objects")
         object.__setattr__(
             self,
             "seed_results",
@@ -2183,11 +2188,21 @@ class RecursiveAttributionReport:
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RecursiveAttributionReport":
-        def items(key: str, factory: Any) -> List[Any]:
-            raw = value.get(key)
-            return [factory(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
-
         schema_version = str(value.get("schema_version") or "")
+
+        def items(key: str, factory: Any, *, strict_objects: bool = False) -> List[Any]:
+            raw = value.get(key)
+            if not isinstance(raw, list):
+                return []
+            parsed = []
+            for index, item in enumerate(raw):
+                if not isinstance(item, Mapping):
+                    if strict_objects:
+                        raise TypeError("{0}[{1}] must be an object".format(key, index))
+                    continue
+                parsed.append(factory(dict(item)))
+            return parsed
+
         if schema_version == LEGACY_REPORT_SCHEMA_VERSION:
             legacy_roots = value.get("root_causes")
             if not isinstance(legacy_roots, list):
@@ -2224,7 +2239,11 @@ class RecursiveAttributionReport:
             )
         start_refs = _string_list(value.get("start_refs"))
         defect_states = items("defect_states", DefectState.from_dict)
-        seed_results = items("seed_results", SeedAttributionResult.from_dict)
+        seed_results = items(
+            "seed_results",
+            SeedAttributionResult.from_dict,
+            strict_objects=schema_version != PREVIOUS_REPORT_SCHEMA_VERSION,
+        )
         metadata = _json_dict(value.get("metadata"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
             migrated_states = [

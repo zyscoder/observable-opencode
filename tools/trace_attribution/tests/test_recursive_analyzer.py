@@ -2740,6 +2740,100 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         )
         self.assertEqual(candidate["retrieval_edge"]["confidence"], 0.98)
 
+    def test_standard_retriever_keeps_real_duplicate_routes_until_provenance_is_canonical(self):
+        def without_navigation_scores(value):
+            if isinstance(value, dict):
+                return {
+                    key: without_navigation_scores(item)
+                    for key, item in value.items()
+                    if key not in {"confidence", "score", "retrieval_score"}
+                }
+            if isinstance(value, list):
+                return [without_navigation_scores(item) for item in value]
+            return value
+
+        def run(*, confirmed_confidence, inferred_confidence):
+            trace = {
+                "case_id": "standard-duplicate-route-provenance",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "rationale": "Search only the first matching implementation."
+                        },
+                    },
+                    {
+                        "record_id": "observed_defect",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "data": {
+                            "expected": "Every implementation is inspected.",
+                            "actual": "One implementation was omitted.",
+                        },
+                    },
+                ],
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": "decision"},
+                        "to": {"type": "record", "id": "observed_defect"},
+                        "relation": "decision_guided_change",
+                        "evidence_type": "confirmed",
+                        "confidence": confirmed_confidence,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "decision"},
+                        "to": {"type": "record", "id": "observed_defect"},
+                        "relation": "semantic_predecessor_match",
+                        "evidence_type": "semantic_inferred",
+                        "confidence": inferred_confidence,
+                        "eligible_for_attribution": True,
+                    },
+                ],
+            }
+            judge = FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="Search only the first matching implementation.",
+                        reason="The decision is the necessary local root.",
+                        counterfactual="Inspecting every implementation prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision"],
+                    )
+                },
+            )
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the trace-visible root.",
+            )
+            hypothesis = next(
+                item
+                for item in report.hypotheses
+                if item.candidate_root_ref == "record:decision"
+            )
+            return {
+                "global_facts": without_navigation_scores(
+                    judge.global_requests[0].to_dict()
+                ),
+                "hypothesis_claim": hypothesis.claim,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                "confirmation_facts": judge.confirmation_requests[0].factual_dict(),
+            }
+
+        confirmed_high = run(confirmed_confidence=0.99, inferred_confidence=0.01)
+        inferred_high = run(confirmed_confidence=0.01, inferred_confidence=0.99)
+
+        self.assertEqual(confirmed_high, inferred_high)
+
     def test_retrieval_score_does_not_change_confirmation_facts_on_real_fusion_path(self):
         class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
             def __init__(self, score):

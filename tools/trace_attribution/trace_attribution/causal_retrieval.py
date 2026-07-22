@@ -64,14 +64,18 @@ class SemanticPredecessorRetriever:
         if resolved not in graph.nodes:
             return []
         if graph.nodes[resolved].event_type == "process.signal":
-            return merge_ranked_candidates(
-                [
+            return canonicalize_ranked_candidates(
+                graph,
+                merge_ranked_candidates(
                     [
-                        candidate
-                        for candidate in self._direct_candidates(graph, resolved)
-                        if graph.evidence_eligible(candidate.ref)
-                    ]
-                ],
+                        [
+                            candidate
+                            for candidate in self._direct_candidates(graph, resolved)
+                            if graph.evidence_eligible(candidate.ref)
+                        ]
+                    ],
+                    limit=limit,
+                ),
                 limit=limit,
             )
         if graph.nodes[resolved].event_type == "progress.episode":
@@ -106,10 +110,13 @@ class SemanticPredecessorRetriever:
             ]
         merged = merge_ranked_candidates(layers, limit=limit)
         if graph.nodes[resolved].event_type == "progress.episode":
-            return merged
-        return bound_provenance_envelopes(
-            merged,
-            semantic_terms(defect_state, hypothesis),
+            return canonicalize_ranked_candidates(graph, merged, limit=limit)
+        return canonicalize_ranked_candidates(
+            graph,
+            bound_provenance_envelopes(
+                merged,
+                semantic_terms(defect_state, hypothesis),
+            ),
             limit=limit,
         )
 
@@ -283,21 +290,47 @@ class SemanticPredecessorRetriever:
 
 
 def merge_ranked_candidates(layers: Sequence[Sequence[CausalCandidate]], *, limit: int) -> List[CausalCandidate]:
-    """Deduplicate by ref while preserving the highest-provenance first occurrence."""
-    selected: List[Tuple[int, int, CausalCandidate]] = []
-    positions = {}
+    """Keep all routes for ranked refs until provenance canonicalization."""
+    routes: List[Tuple[int, int, CausalCandidate]] = []
     for layer_index, layer in enumerate(layers):
         for ordinal, candidate in enumerate(layer):
-            existing = positions.get(candidate.ref)
-            if existing is None:
-                positions[candidate.ref] = len(selected)
-                selected.append((layer_index, ordinal, candidate))
-                continue
-            existing_layer, existing_ordinal, existing_candidate = selected[existing]
-            if layer_index == existing_layer and candidate.score > existing_candidate.score:
-                selected[existing] = (layer_index, min(existing_ordinal, ordinal), candidate)
-    selected.sort(key=lambda item: (item[0], -item[2].score, item[1], item[2].ref))
-    return [item[2] for item in selected[:limit]]
+            routes.append((layer_index, ordinal, candidate))
+    grouped: dict[str, List[Tuple[int, int, CausalCandidate]]] = {}
+    for route in routes:
+        grouped.setdefault(route[2].ref, []).append(route)
+    ranked_refs = sorted(
+        grouped,
+        key=lambda ref: (
+            min(item[0] for item in grouped[ref]),
+            -max(item[2].score for item in grouped[ref]),
+            min(item[1] for item in grouped[ref]),
+            ref,
+        ),
+    )[:limit]
+    selected = [item for ref in ranked_refs for item in grouped[ref]]
+    selected.sort(key=lambda item: (ranked_refs.index(item[2].ref), item[0], item[1]))
+    return [item[2] for item in selected]
+
+
+def canonicalize_ranked_candidates(
+    graph: TraceGraph,
+    candidates: Sequence[CausalCandidate],
+    *,
+    limit: int,
+) -> List[CausalCandidate]:
+    """Collapse each selected ref after all of its routes can inform provenance."""
+    routes_by_ref: dict[str, List[CausalCandidate]] = {}
+    order: List[str] = []
+    for candidate in candidates:
+        resolved = graph.resolve(candidate.ref) or candidate.ref
+        if resolved not in routes_by_ref:
+            order.append(resolved)
+            routes_by_ref[resolved] = []
+        routes_by_ref[resolved].append(candidate)
+    return [
+        canonical_candidate_route(graph, ref, routes_by_ref[ref])
+        for ref in order[:limit]
+    ]
 
 
 def canonical_candidate_route(
