@@ -349,6 +349,32 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                             else "absent"
                         )
                     ),
+                    input_defect_status="absent" if is_selected else "unknown",
+                    output_defect_status=(
+                        "present"
+                        if is_selected
+                        else (
+                            "unknown"
+                            if self.global_outcome in {"needs_expansion", "inconclusive"}
+                            else "absent"
+                        )
+                    ),
+                    causal_path_refs=(
+                        tuple(capsule.downstream_path) if is_selected else ()
+                    ),
+                    counterfactual={
+                        "intervention_ref": capsule.candidate_ref,
+                        "intervention_kind": "replace_with_semantically_correct_behavior",
+                        "predicted_defect_status": (
+                            "absent" if is_selected else "present"
+                        ),
+                        "causal_effect": (
+                            "prevents_defect"
+                            if is_selected
+                            else "does_not_prevent_defect"
+                        ),
+                    },
+                    compared_candidate_refs=request.open_authored_root_candidate_refs,
                     causal_role=(
                         "root_candidate"
                         if is_selected
@@ -387,6 +413,11 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                 decisive_evidence_refs=decisive,
                 missing_evidence=missing,
                 confidence=0.9 if self.global_outcome != "inconclusive" else 0.0,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": request.active_defect.fingerprint,
+                    "active_focus_text_hash": request.active_focus_text_hash,
+                },
             ),
             0,
         )

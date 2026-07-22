@@ -51,6 +51,9 @@ from .global_judge import (
     GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
+    active_focus_text_sha256,
+    normalize_active_focus_text,
+    validate_active_focus_binding,
 )
 from .investigation import (
     AttributionControlDirective,
@@ -108,15 +111,18 @@ __all__ = [
     "TraceGraph",
     "TraceNode",
     "annotate_report_semantic_anchors",
+    "active_focus_text_sha256",
     "semantic_anchor_id",
     "semantic_anchor_index",
     "semantic_occurrence_id",
     "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
+    "normalize_active_focus_text",
     "seed_binding_identity_for",
     "build_checkpoint_config",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
     "publish_output_transaction",
+    "validate_active_focus_binding",
 ]

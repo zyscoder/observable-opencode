@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import unittest
 import json
+import tempfile
+from dataclasses import replace
+from pathlib import Path
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import ClaudeCausalJudge
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution.evidence_capsule import build_candidate_evidence_capsules
 from trace_attribution.global_judge import (
+    GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     GlobalCandidateJudgeRequest,
+    active_focus_text_sha256,
     build_global_candidate_prompt,
     global_candidate_judgment_from_payload,
     validate_global_candidate_payload,
@@ -101,6 +106,10 @@ def sample_request() -> GlobalCandidateJudgeRequest:
         case_id="global-judge-case",
         objective="Find the trace-visible root or determine that the observed defect is contradicted.",
         analysis_perspective="task quality",
+        seed_ref="record:defect",
+        active_defect=defect,
+        active_focus_text=defect.actual,
+        active_focus_text_hash=active_focus_text_sha256(defect.actual),
         start_refs=("record:defect",),
         capsules=capsules,
     )
@@ -123,8 +132,18 @@ def assessment(
     }
 
 
-def payload(*, outcome: str) -> dict:
+def counterfactual(ref: str, *, prevents_defect: bool) -> dict:
     return {
+        "intervention_ref": ref,
+        "intervention_kind": "replace_with_semantically_correct_behavior",
+        "predicted_defect_status": "absent" if prevents_defect else "present",
+        "causal_effect": "prevents_defect" if prevents_defect else "does_not_prevent_defect",
+    }
+
+
+def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None) -> dict:
+    request = request or sample_request()
+    value = {
         "outcome": outcome,
         "reason": "Global comparison across all offered candidate evidence closures.",
         "assessments": [
@@ -147,14 +166,192 @@ def payload(*, outcome: str) -> dict:
         "missing_evidence": [],
         "confidence": 0.91,
     }
+    eligible_refs = [
+        capsule.candidate_ref
+        for capsule in request.capsules
+        if capsule.candidate.get("root_candidate_eligible")
+    ]
+    value["active_focus_binding"] = {
+        "seed_ref": request.seed_ref,
+        "defect_fingerprint": request.active_defect.fingerprint,
+        "active_focus_text_hash": request.active_focus_text_hash,
+    }
+    for item, capsule in zip(value["assessments"], request.capsules):
+        is_root = item["causal_role"] == "root_candidate"
+        item.update(
+            {
+                "input_defect_status": "absent" if is_root else "unknown",
+                "output_defect_status": item["defect_status"],
+                "causal_path_refs": list(capsule.downstream_path),
+                "counterfactual": counterfactual(
+                    item["candidate_ref"], prevents_defect=is_root
+                ),
+                "compared_candidate_refs": eligible_refs,
+            }
+        )
+    return value
 
 
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
+    def test_request_validates_normalized_active_focus_sha256(self):
+        request = sample_request()
+
+        normalized_equivalent = replace(
+            request,
+            active_focus_text="  STARTED   cleanup is interrupted.  ",
+        )
+        self.assertEqual(
+            normalized_equivalent.active_focus_text_hash,
+            request.active_focus_text_hash,
+        )
+        with self.assertRaisesRegex(ValueError, "active_focus_text_hash"):
+            replace(request, active_focus_text_hash="0" * 64)
+
+    def test_rejects_judgment_that_answers_neighboring_claim(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["active_focus_binding"]["seed_ref"] = "record:neighboring_claim"
+
+        with self.assertRaisesRegex(ValueError, "active focus"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_active_focus_binding_with_wrong_text_hash(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["active_focus_binding"]["active_focus_text_hash"] = "0" * 64
+
+        with self.assertRaisesRegex(ValueError, "active focus"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_each_missing_candidate_matrix_field(self):
+        request = sample_request()
+        required_fields = (
+            "input_defect_status",
+            "output_defect_status",
+            "causal_path_refs",
+            "counterfactual",
+            "compared_candidate_refs",
+        )
+
+        for field_name in required_fields:
+            with self.subTest(field_name=field_name):
+                value = payload(outcome="candidate_roots", request=request)
+                del value["assessments"][0][field_name]
+                with self.assertRaisesRegex(ValueError, field_name):
+                    validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_extra_candidate_matrix_field(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["retrieval_rank"] = 1
+
+        with self.assertRaisesRegex(ValueError, "extra.*retrieval_rank"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_invalid_candidate_to_seed_path(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["causal_path_refs"] = [
+            "record:decision",
+            "record:verification",
+            "record:defect",
+        ]
+
+        with self.assertRaisesRegex(ValueError, "causal_path_refs"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_root_whose_input_already_has_active_defect(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["input_defect_status"] = "present"
+
+        with self.assertRaisesRegex(ValueError, "input defect not present"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_rejects_counterfactual_with_missing_prediction(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        del value["assessments"][0]["counterfactual"]["predicted_defect_status"]
+
+        with self.assertRaisesRegex(ValueError, "counterfactual.*missing"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_compared_candidates_cover_all_open_eligible_refs_including_self(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        self.assertEqual(
+            value["assessments"][0]["compared_candidate_refs"],
+            ["record:decision"],
+        )
+        value["assessments"][0]["compared_candidate_refs"] = []
+
+        with self.assertRaisesRegex(ValueError, "compared_candidate_refs"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_judgment_is_deeply_immutable_and_roundtrips_deterministically(self):
+        request = sample_request()
+        judgment = validate_global_candidate_payload(
+            payload(outcome="candidate_roots", request=request), request=request
+        )
+
+        with self.assertRaises(TypeError):
+            judgment.active_focus_binding["seed_ref"] = "record:neighbor"
+        with self.assertRaises(TypeError):
+            judgment.assessments[0].counterfactual["causal_effect"] = "changed"
+        roundtripped = validate_global_candidate_payload(
+            judgment.to_dict(), request=request
+        )
+        self.assertEqual(roundtripped, judgment)
+        self.assertEqual(
+            json.dumps(roundtripped.to_dict(), sort_keys=True),
+            json.dumps(judgment.to_dict(), sort_keys=True),
+        )
+
+    def test_schema_version_is_v2(self):
+        self.assertEqual(
+            GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
+            "global-candidate-judgment/v2",
+        )
+
+    def test_v2_global_judgment_cache_hits_only_after_validated_write(self):
+        request = sample_request()
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def create_message_text_with_usage(self, *, system, messages, max_tokens):
+                self.calls += 1
+                return TransportCallResult(
+                    json.dumps(payload(outcome="candidate_roots", request=request)),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache = JudgmentCache(Path(tempdir) / "global-cache.jsonl")
+            judge = ClaudeCausalJudge(transport=transport, cache=cache)
+
+            first = judge.judge_candidates_bounded(request, max_physical_requests=1)
+            second = judge.judge_candidates_bounded(request, max_physical_requests=0)
+
+            self.assertEqual(first.physical_requests, 1)
+            self.assertEqual(second.physical_requests, 0)
+            self.assertEqual(second.value, first.value)
+            self.assertEqual(transport.calls, 1)
+            self.assertEqual(cache.stats()["writes"], 1)
+            self.assertEqual(cache.stats()["hits"], 1)
+
     def test_candidate_roots_require_present_root_assessment(self):
         request = sample_request()
 
         judgment = global_candidate_judgment_from_payload(
-            payload(outcome="candidate_roots"), request=request
+            payload(outcome="candidate_roots", request=request), request=request
         )
 
         self.assertEqual(judgment.outcome, "candidate_roots")
@@ -162,12 +359,24 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_candidate_roots_reject_result_evidence_nodes(self):
         request = sample_request()
-        value = payload(outcome="candidate_roots")
+        value = payload(outcome="candidate_roots", request=request)
         value["assessments"][0].update(
-            {"defect_status": "absent", "causal_role": "unrelated"}
+            {
+                "defect_status": "absent",
+                "output_defect_status": "absent",
+                "causal_role": "unrelated",
+            }
         )
         value["assessments"][1].update(
-            {"defect_status": "present", "causal_role": "root_candidate"}
+            {
+                "defect_status": "present",
+                "input_defect_status": "absent",
+                "output_defect_status": "present",
+                "causal_role": "root_candidate",
+                "counterfactual": counterfactual(
+                    "record:verification", prevents_defect=True
+                ),
+            }
         )
         value["selected_candidate_refs"] = ["record:verification"]
         value["decisive_evidence_refs"] = ["record:verification"]
@@ -177,7 +386,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_no_defect_requires_grounded_decisive_evidence(self):
         request = sample_request()
-        value = payload(outcome="no_defect")
+        value = payload(outcome="no_defect", request=request)
 
         judgment = global_candidate_judgment_from_payload(value, request=request)
 
@@ -190,10 +399,11 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_no_defect_allows_a_recorded_observation_refuted_by_counterevidence(self):
         request = sample_request()
-        value = payload(outcome="no_defect")
+        value = payload(outcome="no_defect", request=request)
         value["assessments"][0].update(
             {
                 "defect_status": "present",
+                "output_defect_status": "present",
                 "causal_role": "outcome_evidence",
             }
         )
@@ -208,7 +418,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_no_defect_accepts_decisive_absent_outcome_evidence(self):
         request = sample_request()
-        value = payload(outcome="no_defect")
+        value = payload(outcome="no_defect", request=request)
         value["assessments"][1]["causal_role"] = "outcome_evidence"
 
         judgment = validate_global_candidate_payload(value, request=request)
@@ -221,7 +431,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_unknown_selected_candidate_is_rejected(self):
         request = sample_request()
-        value = payload(outcome="candidate_roots")
+        value = payload(outcome="candidate_roots", request=request)
         value["selected_candidate_refs"] = ["record:not_offered"]
 
         with self.assertRaisesRegex(ValueError, "offered candidate"):
@@ -229,7 +439,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_needs_expansion_requires_grounded_anchor_and_context_kind(self):
         request = sample_request()
-        value = payload(outcome="needs_expansion")
+        value = payload(outcome="needs_expansion", request=request)
         value["decisive_evidence_refs"] = []
         value["missing_evidence"] = ["Need the exact process-level SIGINT test result."]
         value["expansion_requests"] = [
@@ -251,10 +461,22 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
     def test_prompt_states_that_retrieval_rank_is_not_a_causal_verdict(self):
         prompt = build_global_candidate_prompt(sample_request())
+        parsed = json.loads(prompt)
 
-        self.assertIn("retrieval rank is navigation evidence", prompt)
+        self.assertIn("retrieval_is_not_causal_verdict=true", prompt)
+        self.assertIn("rank and score are navigation evidence only", prompt)
         self.assertIn("no_defect", prompt)
         self.assertIn("needs_expansion", prompt)
+        self.assertEqual(
+            parsed["comparison_then_selection"],
+            [
+                "compare_input_and_output_defect_status",
+                "ground_causal_paths",
+                "evaluate_counterfactual_predictions",
+                "compare_all_open_authored_root_candidates_including_self",
+                "select_candidate_roots_last",
+            ],
+        )
 
     def test_prompt_distinguishes_active_defect_truth_from_record_presence(self):
         prompt = build_global_candidate_prompt(sample_request())
@@ -265,7 +487,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertIn("would change the current judgment", prompt)
         self.assertIn("root_candidate_eligible=false", prompt)
         self.assertEqual(
-            parsed["request"]["active_focus"]["defect_state"]["actual"],
+            parsed["request"]["active_defect"]["actual"],
             "Started cleanup is interrupted.",
         )
         self.assertIn("Do not substitute another claim", prompt)
@@ -299,6 +521,29 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertEqual(result.physical_requests, 1)
         self.assertEqual(result.value.outcome, "candidate_roots")
         self.assertIn("globally compare", transport.calls[0]["system"])
+
+    def test_claude_judge_fallback_is_a_valid_v2_bound_judgment(self):
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def create_message_text_with_usage(self, *, system, messages, max_tokens):
+                return TransportCallResult("{}", physical_requests=1)
+
+        request = sample_request()
+        result = ClaudeCausalJudge(
+            transport=Transport(), cache=JudgmentCache()
+        ).judge_candidates_bounded(request, max_physical_requests=1)
+
+        self.assertEqual(result.value.outcome, "inconclusive")
+        self.assertEqual(
+            validate_global_candidate_payload(
+                result.value.to_dict(), request=request
+            ),
+            result.value,
+        )
 
 
 if __name__ == "__main__":

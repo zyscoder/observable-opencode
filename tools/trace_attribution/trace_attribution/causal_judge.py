@@ -2387,6 +2387,19 @@ def _repair_constraints(
         return {
             "offered_candidate_refs": list(offered) if isinstance(offered, list) else [],
             "grounded_refs": list(grounded) if isinstance(grounded, list) else [],
+            "active_focus_binding": {
+                "seed_ref": request_context.get("seed_ref"),
+                "defect_fingerprint": (
+                    request_context.get("active_defect", {}).get("fingerprint")
+                    if isinstance(request_context.get("active_defect"), Mapping)
+                    else ""
+                ),
+                "active_focus_text_hash": request_context.get("active_focus_text_hash"),
+            },
+            "open_authored_root_candidate_refs": list(
+                request_context.get("open_authored_root_candidate_refs") or []
+            ),
+            "comparison_then_selection": True,
             "valid_outcomes": [
                 "candidate_roots",
                 "no_defect",
@@ -2437,7 +2450,7 @@ class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
             schema_version=GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
             system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
             prompt=prompt,
-            node_ref="global:{0}".format(request.case_id),
+            node_ref="global:{0}:{1}".format(request.case_id, request.seed_ref),
             request_context=request.to_dict(),
             validator=lambda value: validate_global_candidate_payload(
                 value, request=request
@@ -2471,6 +2484,16 @@ class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
                     GlobalCandidateAssessment(
                         candidate_ref=capsule.candidate_ref,
                         defect_status="unknown",
+                        input_defect_status="unknown",
+                        output_defect_status="unknown",
+                        causal_path_refs=(),
+                        counterfactual={
+                            "intervention_ref": capsule.candidate_ref,
+                            "intervention_kind": "replace_with_semantically_correct_behavior",
+                            "predicted_defect_status": "present",
+                            "causal_effect": "does_not_prevent_defect",
+                        },
+                        compared_candidate_refs=request.open_authored_root_candidate_refs,
                         causal_role="unknown",
                         reason="Global candidate judgment is unavailable.",
                         evidence_refs=(),
@@ -2483,6 +2506,11 @@ class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
                 decisive_evidence_refs=(),
                 missing_evidence=(detail,),
                 confidence=0.0,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": request.active_defect.fingerprint,
+                    "active_focus_text_hash": request.active_focus_text_hash,
+                },
             ),
             outcome.physical_requests,
         )

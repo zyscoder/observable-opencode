@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
-from .causal_state import FrozenMapping
+from .causal_state import DefectState, FrozenMapping
 from .evidence_capsule import CandidateEvidenceCapsule
 from .models import JsonDict, stable_json
 
 
-GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = "global-candidate-judgment/v1"
+GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = "global-candidate-judgment/v2"
 GLOBAL_OUTCOMES = frozenset(
     {"candidate_roots", "no_defect", "needs_expansion", "inconclusive"}
 )
@@ -77,26 +79,69 @@ def _confidence(value: Any, field_name: str = "confidence") -> float:
     return result
 
 
+def normalize_active_focus_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value)).split()).casefold()
+
+
+def active_focus_text_sha256(value: str) -> str:
+    normalized = normalize_active_focus_text(value)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class GlobalCandidateJudgeRequest:
     case_id: str
     objective: str
     analysis_perspective: str
+    seed_ref: str
+    active_defect: DefectState
+    active_focus_text: str
+    active_focus_text_hash: str
     start_refs: Tuple[str, ...]
     capsules: Tuple[CandidateEvidenceCapsule, ...]
     trace_health: Mapping[str, Any] = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
+        seed_ref = str(self.seed_ref).strip()
+        focus_text = str(self.active_focus_text).strip()
+        if not seed_ref:
+            raise ValueError("global candidate request requires seed_ref")
+        if not isinstance(self.active_defect, DefectState):
+            raise TypeError("global candidate request active_defect must be DefectState")
+        if not normalize_active_focus_text(focus_text):
+            raise ValueError("global candidate request requires active_focus_text")
+        expected_hash = active_focus_text_sha256(focus_text)
+        if self.active_focus_text_hash != expected_hash:
+            raise ValueError("global candidate request active_focus_text_hash mismatch")
+        object.__setattr__(self, "seed_ref", seed_ref)
+        object.__setattr__(self, "active_focus_text", focus_text)
         object.__setattr__(self, "start_refs", tuple(str(item) for item in self.start_refs))
         object.__setattr__(self, "capsules", tuple(self.capsules))
         object.__setattr__(self, "trace_health", _freeze(self.trace_health))
         refs = [item.candidate_ref for item in self.capsules]
         if len(refs) != len(set(refs)):
             raise ValueError("global candidate request contains duplicate candidate refs")
+        if self.start_refs != (self.seed_ref,):
+            raise ValueError("global candidate request must bind exactly one active seed_ref")
+        for capsule in self.capsules:
+            if capsule.defect_state != self.active_defect:
+                raise ValueError("global candidate request capsule defect drifts from active_defect")
+            if tuple(capsule.start_refs) != (self.seed_ref,):
+                raise ValueError("global candidate request capsule drifts from active seed_ref")
 
     @property
     def offered_candidate_refs(self) -> Tuple[str, ...]:
         return tuple(item.candidate_ref for item in self.capsules)
+
+    @property
+    def open_authored_root_candidate_refs(self) -> Tuple[str, ...]:
+        return tuple(
+            sorted(
+                item.candidate_ref
+                for item in self.capsules
+                if bool(item.candidate.get("root_candidate_eligible"))
+            )
+        )
 
     @property
     def grounded_refs(self) -> Tuple[str, ...]:
@@ -141,20 +186,27 @@ class GlobalCandidateJudgeRequest:
         return tuple(output)
 
     def to_dict(self) -> JsonDict:
-        defect_state = (
-            self.capsules[0].defect_state.to_dict() if self.capsules else {}
-        )
         return {
             "case_id": self.case_id,
             "objective": self.objective,
             "analysis_perspective": self.analysis_perspective,
+            "seed_ref": self.seed_ref,
+            "active_defect": self.active_defect.to_dict(),
+            "active_focus_text": self.active_focus_text,
+            "active_focus_text_hash": self.active_focus_text_hash,
             "start_refs": list(self.start_refs),
             "active_focus": {
-                "start_refs": list(self.start_refs),
-                "defect_state": defect_state,
+                "seed_ref": self.seed_ref,
+                "defect_fingerprint": self.active_defect.fingerprint,
+                "active_focus_text": self.active_focus_text,
+                "active_focus_text_hash": self.active_focus_text_hash,
             },
             "trace_health": _thaw(self.trace_health),
             "offered_candidate_refs": list(self.offered_candidate_refs),
+            "open_authored_root_candidate_refs": list(
+                self.open_authored_root_candidate_refs
+            ),
+            "retrieval_is_not_causal_verdict": True,
             "grounded_refs": list(self.grounded_refs),
             "candidate_evidence_capsules": [item.to_dict() for item in self.capsules],
         }
@@ -164,6 +216,11 @@ class GlobalCandidateJudgeRequest:
 class GlobalCandidateAssessment:
     candidate_ref: str
     defect_status: str
+    input_defect_status: str
+    output_defect_status: str
+    causal_path_refs: Tuple[str, ...]
+    counterfactual: Mapping[str, Any]
+    compared_candidate_refs: Tuple[str, ...]
     causal_role: str
     reason: str
     evidence_refs: Tuple[str, ...]
@@ -172,10 +229,35 @@ class GlobalCandidateAssessment:
     def __post_init__(self) -> None:
         if self.defect_status not in DEFECT_STATUSES:
             raise ValueError("unsupported global candidate defect_status")
+        if self.input_defect_status not in DEFECT_STATUSES:
+            raise ValueError("unsupported global candidate input_defect_status")
+        if self.output_defect_status not in DEFECT_STATUSES:
+            raise ValueError("unsupported global candidate output_defect_status")
+        if self.defect_status != self.output_defect_status:
+            raise ValueError("defect_status must match output_defect_status")
         if self.causal_role not in CAUSAL_ROLES:
             raise ValueError("unsupported global candidate causal_role")
         if not self.reason.strip():
             raise ValueError("global candidate assessment reason must be non-empty")
+        causal_path_refs = _immutable_strings(
+            self.causal_path_refs, "causal_path_refs"
+        )
+        compared_candidate_refs = tuple(
+            sorted(
+                _immutable_strings(
+                    self.compared_candidate_refs, "compared_candidate_refs"
+                )
+            )
+        )
+        object.__setattr__(self, "causal_path_refs", causal_path_refs)
+        object.__setattr__(
+            self,
+            "counterfactual",
+            _counterfactual(self.counterfactual, candidate_ref=self.candidate_ref),
+        )
+        object.__setattr__(
+            self, "compared_candidate_refs", compared_candidate_refs
+        )
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
 
@@ -183,6 +265,11 @@ class GlobalCandidateAssessment:
         return {
             "candidate_ref": self.candidate_ref,
             "defect_status": self.defect_status,
+            "input_defect_status": self.input_defect_status,
+            "output_defect_status": self.output_defect_status,
+            "causal_path_refs": list(self.causal_path_refs),
+            "counterfactual": _thaw(self.counterfactual),
+            "compared_candidate_refs": list(self.compared_candidate_refs),
             "causal_role": self.causal_role,
             "reason": self.reason,
             "evidence_refs": list(self.evidence_refs),
@@ -200,6 +287,7 @@ class GlobalCandidateJudgment:
     decisive_evidence_refs: Tuple[str, ...]
     missing_evidence: Tuple[str, ...]
     confidence: float
+    active_focus_binding: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if self.outcome not in GLOBAL_OUTCOMES:
@@ -214,6 +302,9 @@ class GlobalCandidateJudgment:
         object.__setattr__(self, "decisive_evidence_refs", tuple(self.decisive_evidence_refs))
         object.__setattr__(self, "missing_evidence", tuple(self.missing_evidence))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
+        object.__setattr__(
+            self, "active_focus_binding", _active_focus_binding(self.active_focus_binding)
+        )
 
     def to_dict(self) -> JsonDict:
         return {
@@ -225,6 +316,7 @@ class GlobalCandidateJudgment:
             "decisive_evidence_refs": list(self.decisive_evidence_refs),
             "missing_evidence": list(self.missing_evidence),
             "confidence": self.confidence,
+            "active_focus_binding": _thaw(self.active_focus_binding),
         }
 
 
@@ -242,12 +334,21 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
     return stable_json(
         {
             "request": request.to_dict(),
+            "comparison_then_selection": [
+                "compare_input_and_output_defect_status",
+                "ground_causal_paths",
+                "evaluate_counterfactual_predictions",
+                "compare_all_open_authored_root_candidates_including_self",
+                "select_candidate_roots_last",
+            ],
             "rules": [
                 "Use only grounded facts in the supplied candidate evidence capsules.",
-                "The retrieval rank is navigation evidence, not a causal verdict.",
-                "Compare every offered candidate and return exactly one assessment per candidate.",
+                "retrieval_is_not_causal_verdict=true. Retrieval rank and score are navigation evidence only and MUST NOT enter root selection rules.",
+                "First compare every offered candidate and return exactly one complete assessment per candidate; only after the comparison matrix is complete may selected_candidate_refs be chosen.",
                 "Judge only request.active_focus. Do not substitute another claim or defect from a shared response, neighboring capsule, or broader objective.",
-                "For each assessment, defect_status answers whether the active defect is true at that candidate; it does not answer whether the record itself exists or contains defect-related words.",
+                "For each assessment, judge input_defect_status before the candidate and output_defect_status after it to determine whether the active defect is true; defect_status must equal output_defect_status and does not answer whether the record itself exists or contains defect-related words.",
+                "causal_path_refs must be the supplied candidate-to-seed path when claiming a causal role, and counterfactual must make a decidable present-or-absent output prediction.",
+                "compared_candidate_refs must list every open authored root-eligible candidate, including the assessed candidate itself when eligible; retrieval order never changes this set.",
                 "When decisive counterevidence refutes a derived defect observation, mark that observation absent for the active defect even though its trace record exists.",
                 "Choose candidate_roots only for defective authored nodes that may introduce the active defect.",
                 "Never select a candidate with root_candidate_eligible=false as a root; treat tool results, verification, and evidence facts as evidence instead.",
@@ -260,10 +361,25 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
             "required_json_schema": {
                 "outcome": "candidate_roots|no_defect|needs_expansion|inconclusive",
                 "reason": "non-empty string",
+                "active_focus_binding": {
+                    "seed_ref": "exact request.seed_ref",
+                    "defect_fingerprint": "exact request.active_defect.fingerprint",
+                    "active_focus_text_hash": "exact request.active_focus_text_hash",
+                },
                 "assessments": [
                     {
                         "candidate_ref": "one exact offered candidate ref",
                         "defect_status": "present|absent|unknown",
+                        "input_defect_status": "present|absent|unknown",
+                        "output_defect_status": "present|absent|unknown",
+                        "causal_path_refs": ["grounded candidate-to-seed refs, or empty for non-causal evidence"],
+                        "counterfactual": {
+                            "intervention_ref": "exact candidate_ref",
+                            "intervention_kind": "replace_with_semantically_correct_behavior",
+                            "predicted_defect_status": "present|absent",
+                            "causal_effect": "prevents_defect|does_not_prevent_defect",
+                        },
+                        "compared_candidate_refs": ["all open authored root-eligible refs, including self when eligible"],
                         "causal_role": "root_candidate|contributing_condition|amplifying_factor|outcome_evidence|exculpatory_evidence|unrelated|unknown",
                         "reason": "non-empty grounded comparative reason",
                         "evidence_refs": ["grounded refs"],
@@ -300,6 +416,7 @@ def validate_global_candidate_payload(
         "decisive_evidence_refs",
         "missing_evidence",
         "confidence",
+        "active_focus_binding",
     }
     actual = {str(key) for key in value}
     if actual != required:
@@ -314,6 +431,7 @@ def validate_global_candidate_payload(
     reason = str(value.get("reason") or "").strip()
     if not reason:
         raise ValueError("global candidate judgment reason must be non-empty")
+    binding = _active_focus_binding(value.get("active_focus_binding"))
     raw_assessments = value.get("assessments")
     if not isinstance(raw_assessments, list):
         raise TypeError("global candidate assessments must be an array")
@@ -332,6 +450,25 @@ def validate_global_candidate_payload(
     for item in assessments:
         if any(ref not in grounded for ref in item.evidence_refs):
             raise ValueError("assessment evidence must use grounded refs")
+        if any(ref not in grounded for ref in item.causal_path_refs):
+            raise ValueError("causal_path_refs must use grounded refs")
+        capsule = next(
+            capsule
+            for capsule in request.capsules
+            if capsule.candidate_ref == item.candidate_ref
+        )
+        if item.causal_path_refs and item.causal_path_refs != tuple(capsule.downstream_path):
+            raise ValueError("causal_path_refs must match the grounded candidate path")
+        if item.causal_path_refs and (
+            item.causal_path_refs[0] != item.candidate_ref
+            or item.causal_path_refs[-1] != request.seed_ref
+        ):
+            raise ValueError("causal_path_refs must connect candidate to active seed")
+        expected_compared = set(request.open_authored_root_candidate_refs)
+        if set(item.compared_candidate_refs) != expected_compared:
+            raise ValueError(
+                "compared_candidate_refs must cover every open authored root-eligible candidate"
+            )
     missing = _strings(value.get("missing_evidence"), "missing_evidence")
     expansion = _expansion_requests(value.get("expansion_requests"), grounded)
     by_ref = {item.candidate_ref: item for item in assessments}
@@ -342,8 +479,18 @@ def validate_global_candidate_payload(
             raise ValueError("candidate_roots requires decisive evidence")
         for ref in selected:
             assessment = by_ref[ref]
-            if assessment.defect_status != "present" or assessment.causal_role != "root_candidate":
-                raise ValueError("selected root requires a present root_candidate assessment")
+            if (
+                assessment.input_defect_status == "present"
+                or assessment.output_defect_status != "present"
+                or assessment.causal_role != "root_candidate"
+            ):
+                raise ValueError(
+                    "selected root requires input defect not present and output defect present"
+                )
+            if not assessment.causal_path_refs:
+                raise ValueError("selected root requires a grounded causal_path_refs")
+            if assessment.counterfactual["predicted_defect_status"] != "absent":
+                raise ValueError("selected root counterfactual must predict absent output defect")
             capsule = next(item for item in request.capsules if item.candidate_ref == ref)
             if not bool(capsule.candidate.get("root_candidate_eligible")):
                 raise ValueError("selected root candidate is ineligible for attribution")
@@ -362,12 +509,12 @@ def validate_global_candidate_payload(
             "amplifying_factor",
         }
         if any(
-            item.causal_role in causal_roles and item.defect_status != "absent"
+            item.causal_role in causal_roles and item.output_defect_status != "absent"
             for item in assessments
         ):
             raise ValueError("no_defect cannot retain a present causal candidate")
         if any(
-            item.defect_status == "present"
+            item.output_defect_status == "present"
             and item.causal_role != "outcome_evidence"
             for item in assessments
         ):
@@ -376,7 +523,7 @@ def validate_global_candidate_payload(
             )
         decisive_set = set(decisive)
         if not any(
-            item.defect_status == "absent"
+            item.output_defect_status == "absent"
             and item.causal_role in {"exculpatory_evidence", "outcome_evidence"}
             and item.candidate_ref in decisive_set
             for item in assessments
@@ -389,7 +536,7 @@ def validate_global_candidate_payload(
             raise ValueError("needs_expansion requires requests and missing evidence")
     elif selected or expansion:
         raise ValueError("inconclusive cannot select roots or request expansion")
-    return GlobalCandidateJudgment(
+    judgment = GlobalCandidateJudgment(
         outcome=outcome,
         reason=reason,
         assessments=assessments,
@@ -398,7 +545,10 @@ def validate_global_candidate_payload(
         decisive_evidence_refs=decisive,
         missing_evidence=missing,
         confidence=_confidence(value.get("confidence")),
+        active_focus_binding=binding,
     )
+    validate_active_focus_binding(request, judgment)
+    return judgment
 
 
 def global_candidate_judgment_from_payload(
@@ -413,6 +563,11 @@ def _assessment_from_payload(value: Any) -> GlobalCandidateAssessment:
     required = {
         "candidate_ref",
         "defect_status",
+        "input_defect_status",
+        "output_defect_status",
+        "causal_path_refs",
+        "counterfactual",
+        "compared_candidate_refs",
         "causal_role",
         "reason",
         "evidence_refs",
@@ -420,15 +575,104 @@ def _assessment_from_payload(value: Any) -> GlobalCandidateAssessment:
     }
     actual = {str(key) for key in value}
     if actual != required:
-        raise ValueError("global candidate assessment schema mismatch")
+        raise ValueError(
+            "global candidate assessment schema mismatch (missing={0}, extra={1})".format(
+                sorted(required - actual), sorted(actual - required)
+            )
+        )
     return GlobalCandidateAssessment(
         candidate_ref=str(value.get("candidate_ref") or ""),
         defect_status=str(value.get("defect_status") or ""),
+        input_defect_status=str(value.get("input_defect_status") or ""),
+        output_defect_status=str(value.get("output_defect_status") or ""),
+        causal_path_refs=_strings(value.get("causal_path_refs"), "causal_path_refs"),
+        counterfactual=value.get("counterfactual"),
+        compared_candidate_refs=_strings(
+            value.get("compared_candidate_refs"), "compared_candidate_refs"
+        ),
         causal_role=str(value.get("causal_role") or ""),
         reason=str(value.get("reason") or ""),
         evidence_refs=_strings(value.get("evidence_refs"), "assessment evidence_refs"),
         confidence=_confidence(value.get("confidence")),
     )
+
+
+def _counterfactual(
+    value: Any, *, candidate_ref: str = ""
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("counterfactual must be an object")
+    required = {
+        "intervention_ref",
+        "intervention_kind",
+        "predicted_defect_status",
+        "causal_effect",
+    }
+    actual = {str(key) for key in value}
+    if actual != required:
+        raise ValueError(
+            "counterfactual schema mismatch (missing={0}, extra={1})".format(
+                sorted(required - actual), sorted(actual - required)
+            )
+        )
+    intervention_ref = str(value.get("intervention_ref") or "").strip()
+    intervention_kind = str(value.get("intervention_kind") or "").strip()
+    predicted = str(value.get("predicted_defect_status") or "").strip()
+    causal_effect = str(value.get("causal_effect") or "").strip()
+    if not intervention_ref or (candidate_ref and intervention_ref != candidate_ref):
+        raise ValueError("counterfactual intervention_ref must match candidate_ref")
+    if intervention_kind != "replace_with_semantically_correct_behavior":
+        raise ValueError(
+            "counterfactual intervention_kind must replace with correct behavior"
+        )
+    if predicted not in {"present", "absent"}:
+        raise ValueError("counterfactual prediction must be decidable as present or absent")
+    expected_effect = {
+        "absent": "prevents_defect",
+        "present": "does_not_prevent_defect",
+    }[predicted]
+    if causal_effect != expected_effect:
+        raise ValueError("counterfactual causal_effect contradicts prediction")
+    return FrozenMapping(
+        {
+            "intervention_ref": intervention_ref,
+            "intervention_kind": intervention_kind,
+            "predicted_defect_status": predicted,
+            "causal_effect": causal_effect,
+        }
+    )
+
+
+def _immutable_strings(value: Any, field_name: str) -> Tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("{0} must be an array".format(field_name))
+    return _strings(list(value), field_name)
+
+
+def _active_focus_binding(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("active focus binding must be an object")
+    required = {"seed_ref", "defect_fingerprint", "active_focus_text_hash"}
+    actual = {str(key) for key in value}
+    if actual != required:
+        raise ValueError(
+            "active focus binding schema mismatch (missing={0}, extra={1})".format(
+                sorted(required - actual), sorted(actual - required)
+            )
+        )
+    return FrozenMapping({key: str(value.get(key) or "") for key in sorted(required)})
+
+
+def validate_active_focus_binding(
+    request: GlobalCandidateJudgeRequest, judgment: GlobalCandidateJudgment
+) -> None:
+    expected = {
+        "seed_ref": request.seed_ref,
+        "defect_fingerprint": request.active_defect.fingerprint,
+        "active_focus_text_hash": request.active_focus_text_hash,
+    }
+    if _thaw(judgment.active_focus_binding) != expected:
+        raise ValueError("active focus binding does not match request")
 
 
 def _expansion_requests(value: Any, grounded: set[str]) -> Tuple[Mapping[str, Any], ...]:
@@ -463,6 +707,9 @@ __all__ = [
     "GlobalCandidateJudgment",
     "GlobalJudgeCapability",
     "build_global_candidate_prompt",
+    "active_focus_text_sha256",
     "global_candidate_judgment_from_payload",
+    "normalize_active_focus_text",
+    "validate_active_focus_binding",
     "validate_global_candidate_payload",
 ]

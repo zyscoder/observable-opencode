@@ -53,6 +53,9 @@ from .global_judge import (
     GlobalCandidateJudgeRequest,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
+    active_focus_text_sha256,
+    validate_active_focus_binding,
+    validate_global_candidate_payload,
 )
 from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
@@ -2649,6 +2652,10 @@ class AgenticRecursiveAnalyzer:
             hypothesis = state.ledger.get(item.hypothesis_id)
             if hypothesis.status not in {"active", "supported"}:
                 continue
+            active_seed_ref = (
+                graph.resolve(item.downstream_path[-1])
+                or item.downstream_path[-1]
+            )
             try:
                 candidates, paths = self._global_candidate_pool(
                     state, graph, item
@@ -2658,14 +2665,14 @@ class AgenticRecursiveAnalyzer:
                     candidates=candidates,
                     defect_state=item.defect_state,
                     downstream_paths=paths,
-                    start_refs=(item.downstream_path[-1],),
+                    start_refs=(active_seed_ref,),
                 )
             except Exception as exc:
                 state.investigation_journal.append(
                     {
                         "kind": "global_candidate_pass",
                         "status": "fallback_recursive",
-                        "seed_ref": item.node_ref,
+                        "seed_ref": active_seed_ref,
                         "reason": "capsule_build_error: {0}: {1}".format(
                             type(exc).__name__, exc
                         ),
@@ -2678,7 +2685,7 @@ class AgenticRecursiveAnalyzer:
                     {
                         "kind": "global_candidate_pass",
                         "status": "fallback_recursive",
-                        "seed_ref": item.node_ref,
+                        "seed_ref": active_seed_ref,
                         "reason": "candidate_evidence_capsules_empty",
                         "behavior_impact": "none_offline_analysis_only",
                     }
@@ -2691,7 +2698,13 @@ class AgenticRecursiveAnalyzer:
                 case_id=graph.case_id,
                 objective=state.objective,
                 analysis_perspective=state.analysis_perspective,
-                start_refs=(item.downstream_path[-1],),
+                seed_ref=active_seed_ref,
+                active_defect=item.defect_state,
+                active_focus_text=item.defect_state.actual,
+                active_focus_text_hash=active_focus_text_sha256(
+                    item.defect_state.actual
+                ),
+                start_refs=(active_seed_ref,),
                 capsules=capsules,
                 trace_health={
                     "missing_artifact_count": sum(
@@ -2717,6 +2730,10 @@ class AgenticRecursiveAnalyzer:
                     raise TypeError(
                         "global Judge returned an unsupported judgment"
                     )
+                validate_active_focus_binding(request, judgment)
+                judgment = validate_global_candidate_payload(
+                    judgment.to_dict(), request=request
+                )
                 state.logical_judge_calls += 1
                 state.judge_requests += result.physical_requests
             except BoundedJudgeCallError as exc:
@@ -2725,7 +2742,7 @@ class AgenticRecursiveAnalyzer:
                     {
                         "kind": "global_candidate_pass",
                         "status": "fallback_recursive",
-                        "seed_ref": item.node_ref,
+                        "seed_ref": active_seed_ref,
                         "reason": "global_judge_error: {0}".format(exc),
                         "physical_request_delta": exc.physical_requests,
                         "candidate_compression": metrics,
@@ -2738,7 +2755,7 @@ class AgenticRecursiveAnalyzer:
                     {
                         "kind": "global_candidate_pass",
                         "status": "fallback_recursive",
-                        "seed_ref": item.node_ref,
+                        "seed_ref": active_seed_ref,
                         "reason": "global_judge_error: {0}: {1}".format(
                             type(exc).__name__, exc
                         ),
@@ -2751,7 +2768,7 @@ class AgenticRecursiveAnalyzer:
             event = {
                 "kind": "global_candidate_pass",
                 "status": "completed",
-                "seed_ref": item.node_ref,
+                "seed_ref": active_seed_ref,
                 "hypothesis_id": item.hypothesis_id,
                 "defect_fingerprint": item.defect_state.fingerprint,
                 "visit_key": item.visit_key,
@@ -2828,8 +2845,6 @@ class AgenticRecursiveAnalyzer:
             )
         paths: Dict[str, Tuple[str, ...]] = {}
         for ref in refs:
-            candidate = selected[ref]
-            target = graph.resolve(str(candidate.edge.get("to_ref") or ""))
             grounded_path = _grounded_downstream_path(
                 graph,
                 ref,
@@ -2842,13 +2857,10 @@ class AgenticRecursiveAnalyzer:
                     *grounded_path,
                     *item.downstream_path[offset + 1 :],
                 )
-            elif target and target in item.downstream_path:
-                offset = item.downstream_path.index(target)
-                paths[ref] = (ref, *item.downstream_path[offset:])
             elif ref == item.node_ref:
                 paths[ref] = item.downstream_path
             else:
-                paths[ref] = (ref, *item.downstream_path)
+                paths[ref] = (ref,)
         return [selected[ref] for ref in refs], paths
 
     def _global_authored_decision_siblings(

@@ -216,6 +216,16 @@ class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapabilit
             GlobalCandidateAssessment(
                 candidate_ref=capsule.candidate_ref,
                 defect_status="absent",
+                input_defect_status="unknown",
+                output_defect_status="absent",
+                causal_path_refs=(),
+                counterfactual={
+                    "intervention_ref": capsule.candidate_ref,
+                    "intervention_kind": "replace_with_semantically_correct_behavior",
+                    "predicted_defect_status": "present",
+                    "causal_effect": "does_not_prevent_defect",
+                },
+                compared_candidate_refs=request.open_authored_root_candidate_refs,
                 causal_role="exculpatory_evidence",
                 reason="The scripted evidence refutes this observed defect.",
                 evidence_refs=(capsule.candidate_ref,),
@@ -233,6 +243,11 @@ class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapabilit
                 decisive_evidence_refs=(request.capsules[0].candidate_ref,),
                 missing_evidence=(),
                 confidence=1.0,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": request.active_defect.fingerprint,
+                    "active_focus_text_hash": request.active_focus_text_hash,
+                },
             ),
             0,
         )

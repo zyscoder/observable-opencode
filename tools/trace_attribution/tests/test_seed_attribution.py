@@ -33,6 +33,7 @@ from trace_attribution.graph import TraceGraph
 from trace_attribution.global_judge import (
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
+    active_focus_text_sha256,
 )
 from trace_attribution.models import stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
@@ -263,6 +264,30 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
                 defect_status=(
                     "present" if capsule.candidate_ref == "record:shared_root" else "absent"
                 ),
+                input_defect_status=(
+                    "absent" if capsule.candidate_ref == "record:shared_root" else "unknown"
+                ),
+                output_defect_status=(
+                    "present" if capsule.candidate_ref == "record:shared_root" else "absent"
+                ),
+                causal_path_refs=(
+                    tuple(capsule.downstream_path)
+                    if capsule.candidate_ref == "record:shared_root"
+                    else ()
+                ),
+                counterfactual={
+                    "intervention_ref": capsule.candidate_ref,
+                    "intervention_kind": "replace_with_semantically_correct_behavior",
+                    "predicted_defect_status": (
+                        "absent" if capsule.candidate_ref == "record:shared_root" else "present"
+                    ),
+                    "causal_effect": (
+                        "prevents_defect"
+                        if capsule.candidate_ref == "record:shared_root"
+                        else "does_not_prevent_defect"
+                    ),
+                },
+                compared_candidate_refs=request.open_authored_root_candidate_refs,
                 causal_role=(
                     "root_candidate"
                     if capsule.candidate_ref == "record:shared_root"
@@ -284,6 +309,11 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
                 decisive_evidence_refs=("record:shared_root",),
                 missing_evidence=(),
                 confidence=0.9,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": request.active_defect.fingerprint,
+                    "active_focus_text_hash": request.active_focus_text_hash,
+                },
             ),
             0,
         )
@@ -338,6 +368,16 @@ class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
                     GlobalCandidateAssessment(
                         candidate_ref=capsule.candidate_ref,
                         defect_status="unknown",
+                        input_defect_status="unknown",
+                        output_defect_status="unknown",
+                        causal_path_refs=(),
+                        counterfactual={
+                            "intervention_ref": capsule.candidate_ref,
+                            "intervention_kind": "replace_with_semantically_correct_behavior",
+                            "predicted_defect_status": "present",
+                            "causal_effect": "does_not_prevent_defect",
+                        },
+                        compared_candidate_refs=request.open_authored_root_candidate_refs,
                         causal_role="unknown",
                         reason="Expansion is required before selecting a root.",
                         evidence_refs=(capsule.candidate_ref,),
@@ -356,6 +396,11 @@ class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
                 decisive_evidence_refs=("record:shared_root",),
                 missing_evidence=("Independent recursive inspection.",),
                 confidence=0.5,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": request.active_defect.fingerprint,
+                    "active_focus_text_hash": request.active_focus_text_hash,
+                },
             ),
             0,
         )
@@ -638,6 +683,86 @@ def same_start_ref_sibling_mutation(
 
 
 class SeedAttributionIntegrationTests(unittest.TestCase):
+    def test_global_requests_bind_each_seed_ref_fingerprint_text_and_hash(self):
+        trace = shared_root_trace()
+        expected_text = {
+            "record:seed_one": "The first unsupported claim.",
+            "record:seed_two": "The neighboring unsupported claim.",
+        }
+        trace["records"][1]["data"]["text"] = expected_text["record:seed_one"]
+        trace["records"][2]["data"]["text"] = expected_text["record:seed_two"]
+        judge = SharedRootFusionJudge()
+
+        AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=tuple(expected_text),
+            objective="Confirm each neighboring claim independently.",
+        )
+
+        self.assertEqual({request.seed_ref for request in judge.global_requests}, set(expected_text))
+        for request in judge.global_requests:
+            self.assertEqual(request.start_refs, (request.seed_ref,))
+            self.assertEqual(request.active_focus_text, expected_text[request.seed_ref])
+            self.assertEqual(request.active_defect.actual, expected_text[request.seed_ref])
+            self.assertEqual(
+                request.active_focus_text_hash,
+                active_focus_text_sha256(expected_text[request.seed_ref]),
+            )
+            self.assertTrue(
+                all(
+                    capsule.defect_state.fingerprint
+                    == request.active_defect.fingerprint
+                    and capsule.start_refs == (request.seed_ref,)
+                    for capsule in request.capsules
+                )
+            )
+
+    def test_analyzer_rejects_neighbor_seed_binding_drift(self):
+        class DriftingJudge(SharedRootFusionJudge):
+            def judge_candidates_bounded(self, request, *, max_physical_requests):
+                result = super().judge_candidates_bounded(
+                    request, max_physical_requests=max_physical_requests
+                )
+                if request.seed_ref != "record:seed_two":
+                    return result
+                return replace(
+                    result,
+                    value=replace(
+                        result.value,
+                        active_focus_binding={
+                            **dict(result.value.active_focus_binding),
+                            "seed_ref": "record:seed_one",
+                        },
+                    ),
+                )
+
+            def judge_step_offline(self, request):
+                return CausalStepJudgment(
+                    current_node_ref=request.current_node.ref,
+                    current_defect_status="unknown",
+                    current_defect_reason="The drifted global result was rejected.",
+                    predecessors=(),
+                    candidate_introduction=False,
+                    missing_evidence=("seed-local global judgment",),
+                    confidence=0.0,
+                )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=DriftingJudge(),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(shared_root_trace()),
+            start_refs=("record:seed_one", "record:seed_two"),
+            objective="Confirm each identical claim independently.",
+        )
+        by_ref = {item.start_ref: item for item in report.seed_results}
+
+        self.assertEqual(by_ref["record:seed_one"].outcome, "confirmed_root")
+        self.assertNotEqual(by_ref["record:seed_two"].outcome, "confirmed_root")
+
     def test_report_preserves_independent_seed_outcomes(self):
         report = run_fixture("multi_seed_claims.json")
         by_ref = {item.start_ref: item for item in report.seed_results}
