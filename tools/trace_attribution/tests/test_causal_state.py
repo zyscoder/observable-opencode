@@ -117,6 +117,39 @@ def confirmation_for(root):
     return RootConfirmation.from_dict(dict(root.confirmation))
 
 
+def root_seed_fields(*roots):
+    grouped = {}
+    for root in roots:
+        confirmation = confirmation_for(root)
+        seed_ref = root.recursive_path[-1]
+        key = (seed_ref, root.defect_state.fingerprint)
+        entry = grouped.setdefault(
+            key,
+            {
+                "defect_state": root.defect_state,
+                "root_refs": [],
+                "confirmation_identities": [],
+            },
+        )
+        entry["root_refs"].append(root.node_ref)
+        entry["confirmation_identities"].append(
+            confirmation.confirmation_identity
+        )
+    return {
+        "start_refs": tuple(sorted({key[0] for key in grouped})),
+        "seed_results": tuple(
+            report_seed(
+                "confirmed_root",
+                start_ref=seed_ref,
+                defect_state=entry["defect_state"],
+                root_refs=entry["root_refs"],
+                confirmation_identities=entry["confirmation_identities"],
+            )
+            for (seed_ref, _), entry in sorted(grouped.items())
+        ),
+    }
+
+
 def factor_bundle(*, role="contributing_condition"):
     node_ref = "record:context"
     target_ref = "record:decision"
@@ -229,6 +262,7 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="legacy-dedup",
             objective="Find roots.",
+            **root_seed_fields(first, second),
             confirmations=[first_confirmation, second_confirmation],
             confirmed_roots=[first],
             co_roots=[second],
@@ -246,6 +280,7 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="legacy-order",
             objective="Find roots.",
+            **root_seed_fields(first, second),
             confirmations=[first_confirmation, second_confirmation],
             confirmed_roots=[first],
             co_roots=[second],
@@ -303,6 +338,7 @@ class CausalStateTest(unittest.TestCase):
         return root, confirmation, RecursiveAttributionReport(
             case_id="modern",
             objective="Find roots.",
+            **root_seed_fields(root),
             confirmations=[confirmation],
             confirmed_roots=[root],
         )
@@ -377,6 +413,7 @@ class CausalStateTest(unittest.TestCase):
             RecursiveAttributionReport(
                 case_id="missing-reciprocal",
                 objective="Find roots.",
+                **root_seed_fields(first, second),
                 confirmations=[confirmation_for(first), confirmation_for(second)],
                 confirmed_roots=[first],
                 co_roots=[second],
@@ -415,6 +452,7 @@ class CausalStateTest(unittest.TestCase):
             RecursiveAttributionReport(
                 case_id="role-conflict",
                 objective="Find roots.",
+                **root_seed_fields(root),
                 confirmations=[confirmation],
                 confirmed_roots=[root],
                 rejected_candidates=[rejected],
@@ -502,8 +540,8 @@ class CausalStateTest(unittest.TestCase):
         self.assertEqual(report.analysis_outcome, "confirmed_root")
         self.assertEqual(report.metadata["confirmation_node_summary"]["record:decision"]["status"], "mixed")
 
-    def test_legacy_root_causes_require_explicit_independent_confirmation_migration(self):
-        with self.assertRaisesRegex(ValueError, "legacy root_causes.*independent confirmation"):
+    def test_schema_less_legacy_root_causes_require_explicit_schema(self):
+        with self.assertRaisesRegex(ValueError, "schema_version"):
             RecursiveAttributionReport.from_dict({
                 "case_id": "legacy",
                 "objective": "Find root.",
@@ -1429,6 +1467,7 @@ class CausalStateTest(unittest.TestCase):
         report = RecursiveAttributionReport(
             case_id="legacy",
             objective="Find root.",
+            **root_seed_fields(root),
             confirmed_roots=[root],
             confirmations=[confirmation_for(root)],
         )

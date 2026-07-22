@@ -221,6 +221,33 @@ def _normalize_migrated_context_hashes(value: Any) -> Any:
     return output
 
 
+def _migrate_checkpoint_journal_records(
+    records: Sequence[Mapping[str, Any]], frontier: RecursiveFrontier
+) -> Dict[str, JsonDict]:
+    latest: Dict[str, JsonDict] = {}
+    previous_hash = ""
+    for source in sorted(records, key=lambda item: int(item["sequence"])):
+        migrated = _normalize_migrated_context_hashes(
+            _migrate_checkpoint_visit_references(source, frontier)
+        )
+        unsigned = {
+            str(key): copy.deepcopy(value)
+            for key, value in migrated.items()
+            if key != "record_hash"
+        }
+        unsigned["previous_hash"] = previous_hash
+        record = {
+            **unsigned,
+            "record_hash": hashlib.sha256(
+                stable_json(unsigned).encode("utf-8")
+            ).hexdigest(),
+        }
+        semantic_key = str(record["semantic_key"])
+        latest[semantic_key] = record
+        previous_hash = record["record_hash"]
+    return latest
+
+
 def _dedupe_strings(values: Iterable[str]) -> Tuple[str, ...]:
     output: List[str] = []
     seen: Set[str] = set()
@@ -1502,10 +1529,8 @@ class RecursiveAnalysisState:
             if ref not in transient_signal_refs or ref in retained_unresolved_refs
         ]
         if frontier.has_legacy_visit_key_migrations():
-            state.replay_actions = _normalize_migrated_context_hashes(
-                _migrate_checkpoint_visit_references(
-                    checkpoint.latest_actions, frontier
-                )
+            state.replay_actions = _migrate_checkpoint_journal_records(
+                checkpoint.actions, frontier
             )
         else:
             state.replay_actions = copy.deepcopy(checkpoint.latest_actions)

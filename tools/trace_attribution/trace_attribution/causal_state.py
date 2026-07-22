@@ -1124,10 +1124,10 @@ class FrontierItem:
             graph_position=int(value.get("graph_position") or 0),
         )
         item_id = str(value.get("item_id") or "")
-        if item_id and item_id != item.item_id:
+        if not item_id or item_id != item.item_id:
             raise ValueError("FrontierItem item_id does not match semantic fields")
         visit_key = str(value.get("visit_key") or "")
-        if visit_key and visit_key != item.visit_key:
+        if not visit_key or visit_key != item.visit_key:
             raise ValueError("FrontierItem visit_key does not match semantic fields")
         return item
 
@@ -2034,6 +2034,7 @@ class RecursiveAttributionReport:
                 )
             return False
 
+        root_owner_counts = {identity: 0 for identity in root_identities}
         for seed in self.seed_results:
             expected_seed_binding = seed_binding_identity_for(
                 seed.start_ref, seed.defect_fingerprint
@@ -2059,6 +2060,10 @@ class RecursiveAttributionReport:
                 if seed.confirmed_root_refs:
                     raise ValueError(
                         "non-confirmed seed cannot retain confirmed_root_refs"
+                    )
+                if set(seed.confirmation_identities).intersection(root_identities):
+                    raise ValueError(
+                        "non-confirmed seed cannot retain an identity owning a published root"
                     )
                 continue
             confirmed_seed_roots = {
@@ -2090,6 +2095,12 @@ class RecursiveAttributionReport:
                 raise ValueError(
                     "confirmed_root seed is not bound to top-level confirmed roots"
                 )
+            for identity in confirmed_seed_roots:
+                root_owner_counts[identity] += 1
+        if any(count != 1 for count in root_owner_counts.values()):
+            raise ValueError(
+                "each published root must belong to exactly one confirmed_root seed"
+            )
         ordered_root_identities = sorted(root_identities)
         for index, left_identity in enumerate(ordered_root_identities):
             left = confirmation_by_identity[left_identity]
@@ -2277,6 +2288,8 @@ class RecursiveAttributionReport:
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RecursiveAttributionReport":
         schema_version = str(value.get("schema_version") or "")
+        if not schema_version:
+            raise ValueError("report schema_version is required")
 
         def items(key: str, factory: Any, *, strict_objects: bool = False) -> List[Any]:
             raw = value.get(key)
@@ -2315,12 +2328,13 @@ class RecursiveAttributionReport:
                 unresolved_refs=unresolved_refs,
                 metadata=metadata,
             )
-        if schema_version and schema_version not in {
+        if schema_version not in {
             MODERN_REPORT_SCHEMA_VERSION,
             PREVIOUS_REPORT_SCHEMA_VERSION,
         }:
             raise ValueError("unsupported report schema_version: {0}".format(schema_version))
         confirmed_roots = items("confirmed_roots", ConfirmedRoot.from_dict)
+        co_roots = items("co_roots", ConfirmedRoot.from_dict)
         if not confirmed_roots and value.get("root_causes"):
             raise ValueError(
                 "legacy root_causes require schema migration with independent confirmation"
@@ -2333,6 +2347,7 @@ class RecursiveAttributionReport:
             strict_objects=schema_version != PREVIOUS_REPORT_SCHEMA_VERSION,
         )
         metadata = _json_dict(value.get("metadata"))
+        unresolved_refs = _string_list(value.get("unresolved_refs"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
             migrated_states = [
                 DefectState.create(
@@ -2363,10 +2378,34 @@ class RecursiveAttributionReport:
                     "report_migration": {
                         "source_schema": PREVIOUS_REPORT_SCHEMA_VERSION,
                         "status": "per_seed_attribution_inconclusive",
-                        "global_roots_not_projected_to_seed_results": True,
+                        "unpublished_confirmed_roots": [
+                            root.to_dict() for root in (*confirmed_roots, *co_roots)
+                        ],
                     }
                 }
             )
+            unresolved_branches = list(metadata.get("unresolved_branches") or [])
+            unresolved_branches.extend(
+                {
+                    "node_ref": root.node_ref,
+                    "confirmation_identity": RootConfirmation.from_dict(
+                        dict(root.confirmation)
+                    ).confirmation_identity,
+                    "reason": "v2_seed_binding_unavailable",
+                }
+                for root in (*confirmed_roots, *co_roots)
+            )
+            metadata["unresolved_branches"] = unresolved_branches
+            unresolved_refs = list(
+                dict.fromkeys(
+                    [
+                        *unresolved_refs,
+                        *(root.node_ref for root in (*confirmed_roots, *co_roots)),
+                    ]
+                )
+            )
+            confirmed_roots = []
+            co_roots = []
         return cls(
             case_id=str(value.get("case_id") or ""),
             objective=str(value.get("objective") or ""),
@@ -2383,14 +2422,14 @@ class RecursiveAttributionReport:
             introduction_candidates=items("introduction_candidates", CausalCandidate.from_dict),
             confirmations=items("confirmations", RootConfirmation.from_dict),
             confirmed_roots=confirmed_roots,
-            co_roots=items("co_roots", ConfirmedRoot.from_dict),
+            co_roots=co_roots,
             contributing_conditions=items("contributing_conditions", CausalFactor.from_dict),
             amplifying_factors=items("amplifying_factors", CausalFactor.from_dict),
             rejected_candidates=items("rejected_candidates", RejectedCandidate.from_dict),
             unresolved_hypotheses=items("unresolved_hypotheses", AttributionHypothesis.from_dict),
             taint_paths=[_string_list(path) for path in value.get("taint_paths", []) if isinstance(path, list)],
             visited_order=_string_list(value.get("visited_order")),
-            unresolved_refs=_string_list(value.get("unresolved_refs")),
+            unresolved_refs=unresolved_refs,
             investigation_journal=tuple(
                 item
                 for item in value.get("investigation_journal", [])

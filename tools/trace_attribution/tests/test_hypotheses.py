@@ -468,6 +468,35 @@ class RecursiveFrontierTest(unittest.TestCase):
                         payload, hypotheses_by_id=hypotheses
                     )
 
+    def test_v2_checkpoint_requires_persisted_item_and_visit_identities(self):
+        hypothesis = HypothesisLedger().create(
+            "agent search closure is root",
+            "record:decision",
+            sample_defect_state(),
+            seed_binding_identity="seed:one",
+        )
+        item = FrontierItem.create(
+            node_ref="record:decision",
+            defect_state=sample_defect_state(),
+            downstream_path=["record:observed", "record:decision"],
+            hypothesis_id=hypothesis.hypothesis_id,
+            hypothesis_semantic_hash=hypothesis.semantic_hash,
+            seed_binding_identity=hypothesis.seed_binding_identity,
+        )
+
+        for missing in ("item_id", "visit_key"):
+            payload = RecursiveFrontier().checkpoint()
+            raw_item = item.to_dict()
+            raw_item.pop(missing)
+            payload["queued"] = [raw_item]
+
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(ValueError, missing):
+                    RecursiveFrontier.from_checkpoint(
+                        payload,
+                        hypotheses_by_id={hypothesis.hypothesis_id: hypothesis},
+                    )
+
     def test_checkpoint_rejects_reused_hypothesis_id_with_different_semantic_hash(self):
         ledger = HypothesisLedger()
         enclosing = ledger.create(

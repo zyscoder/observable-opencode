@@ -639,6 +639,21 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["investigation_yield"], 0.0)
         self.assertEqual(result["metrics"]["checkpoint_reuse_rate"], 0.0)
 
+    def test_evaluator_rejects_all_no_defect_seeds_with_published_roots(self):
+        report, labels, _, graph = self.fixture()
+        for seed in report["seed_results"]:
+            seed["outcome"] = "no_defect"
+            seed["confirmation_identities"] = []
+            seed["confirmed_root_refs"] = []
+            seed["missing_evidence"] = []
+            seed["blocking_reasons"] = []
+        report["analysis_outcome"] = "no_defect"
+
+        with self.assertRaisesRegex(
+            EvaluationSafetyError, "exactly one confirmed_root seed"
+        ):
+            compare_report(report, labels, None, graph=graph)
+
     def test_missing_current_request_measurement_does_not_invent_reduction(self):
         report, labels, _, graph = self.fixture()
         for key in (

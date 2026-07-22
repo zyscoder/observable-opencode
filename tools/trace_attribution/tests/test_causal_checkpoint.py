@@ -623,24 +623,60 @@ class CausalCheckpointTest(unittest.TestCase):
             "visit_evidence": {old_visit_key: ["record:shared_anchor"]},
         }
 
-        def checkpoint_state(frontier_payload, action_payload, semantic_key):
-            common = {
-                "transaction_sequence": 1,
+        def checkpoint_record(
+            journal,
+            sequence,
+            transaction_sequence,
+            operation,
+            semantic_key,
+            payload,
+            previous_hash="",
+        ):
+            unsigned = {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "run_id": "migration-test",
+                "journal": journal,
+                "sequence": sequence,
+                "transaction_sequence": transaction_sequence,
+                "timestamp": "2026-07-22T00:00:0{0}Z".format(sequence),
+                "operation": operation,
                 "semantic_key": semantic_key,
+                "payload": copy.deepcopy(payload),
+                "previous_hash": previous_hash,
             }
+            return {**unsigned, "record_hash": _sha256(unsigned)}
+
+        def checkpoint_state(frontier_payload, action_payload, semantic_key, visit_key):
+            frontier_record = checkpoint_record(
+                "frontier", 1, 2, "snapshot", semantic_key, frontier_payload
+            )
+            hypothesis_record = checkpoint_record(
+                "hypotheses", 1, 2, "snapshot", semantic_key, native_hypotheses
+            )
+            provider_record = checkpoint_record(
+                "actions",
+                1,
+                1,
+                "provider_call_completed",
+                "provider:{0}".format(visit_key),
+                {"visit_key": visit_key, "status": "completed"},
+            )
+            snapshot_record = checkpoint_record(
+                "actions",
+                2,
+                2,
+                "state_snapshot",
+                semantic_key,
+                action_payload,
+                provider_record["record_hash"],
+            )
             return CheckpointState(
                 config={"cache_identity": "cache:test"},
                 run_id="migration-test",
-                transaction_sequence=1,
-                frontier_records=(
-                    {**common, "operation": "snapshot", "payload": frontier_payload},
-                ),
-                hypothesis_records=(
-                    {**common, "operation": "snapshot", "payload": native_hypotheses},
-                ),
-                actions=(
-                    {**common, "operation": "state_snapshot", "payload": action_payload},
-                ),
+                transaction_sequence=2,
+                frontier_records=(frontier_record,),
+                hypothesis_records=(hypothesis_record,),
+                actions=(provider_record, snapshot_record),
             )
 
         native = RecursiveAnalysisState.from_checkpoint(
@@ -649,6 +685,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 native_frontier,
                 native_action,
                 "state:{0}".format(new_visit_key),
+                new_visit_key,
             ),
         )
         migrated = RecursiveAnalysisState.from_checkpoint(
@@ -657,6 +694,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 legacy_frontier,
                 legacy_action,
                 "state:{0}".format(old_visit_key),
+                old_visit_key,
             ),
         )
 
@@ -667,6 +705,23 @@ class CausalCheckpointTest(unittest.TestCase):
             migrated.action_checkpoint_payload(), native.action_checkpoint_payload()
         )
         self.assertEqual(migrated.replay_actions, native.replay_actions)
+        for replay_actions in (migrated.replay_actions, native.replay_actions):
+            previous_hash = ""
+            for record in sorted(
+                replay_actions.values(), key=lambda item: item["sequence"]
+            ):
+                self.assertEqual(record["previous_hash"], previous_hash)
+                self.assertEqual(
+                    record["record_hash"],
+                    _sha256(
+                        {
+                            key: value
+                            for key, value in record.items()
+                            if key != "record_hash"
+                        }
+                    ),
+                )
+                previous_hash = record["record_hash"]
         migrated_output = stable_json(
             {
                 "frontier": migrated.frontier_checkpoint_payload(),
@@ -860,6 +915,44 @@ class CausalCheckpointTest(unittest.TestCase):
                             objective="Find the defect.",
                             analysis_perspective="Improve repository reasoning.",
                         )
+
+    def test_checkpoint_report_restoration_rejects_schema_less_report(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            trace = sample_trace()
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config(trace=trace)
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["payload"]["report"].pop("schema_version")
+
+            with self.assertRaisesRegex(ValueError, "schema_version"):
+                AgenticRecursiveAnalyzer(
+                    judge=CountingOfflineJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
 
     def test_snapshot_commit_has_one_run_id_and_global_transaction_sequence(self):
         with tempfile.TemporaryDirectory() as tempdir:

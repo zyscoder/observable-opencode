@@ -859,6 +859,74 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_published_root_requires_exactly_one_confirmed_seed_owner(self):
+        report = run_fixture("multi_seed_claims.json")
+        owning = next(
+            item for item in report.seed_results if item.outcome == "confirmed_root"
+        )
+        non_confirmed_owner = replace(
+            owning,
+            outcome="no_defect",
+            confirmed_root_refs=(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "non-confirmed.*published root"):
+            replace(
+                report,
+                seed_results=tuple(
+                    non_confirmed_owner if item == owning else item
+                    for item in report.seed_results
+                ),
+            )
+
+        orphaned_owner = replace(
+            non_confirmed_owner,
+            confirmation_identities=(),
+        )
+        payload = report.to_dict()
+        payload["seed_results"] = [
+            orphaned_owner.to_dict() if item == owning else item.to_dict()
+            for item in report.seed_results
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly one confirmed_root seed"):
+            RecursiveAttributionReport.from_dict(payload)
+
+    def test_all_no_defect_seeds_cannot_publish_top_level_roots(self):
+        report = run_fixture("multi_seed_claims.json")
+        no_defect_seeds = tuple(
+            replace(
+                item,
+                outcome="no_defect",
+                confirmation_identities=(),
+                confirmed_root_refs=(),
+                missing_evidence=(),
+                blocking_reasons=(),
+            )
+            for item in report.seed_results
+        )
+
+        with self.assertRaisesRegex(ValueError, "exactly one confirmed_root seed"):
+            replace(report, seed_results=no_defect_seeds)
+
+        payload = report.to_dict()
+        payload["seed_results"] = [item.to_dict() for item in no_defect_seeds]
+        payload["analysis_outcome"] = "no_defect"
+        with self.assertRaisesRegex(ValueError, "exactly one confirmed_root seed"):
+            RecursiveAttributionReport.from_dict(payload)
+
+    def test_schema_less_report_is_not_implicitly_parsed_as_modern(self):
+        seed = seed_result("record:seed", "no_defect")
+        payload = RecursiveAttributionReport(
+            case_id="schema-less",
+            objective="Reject ambiguous report versions.",
+            start_refs=(seed.start_ref,),
+            seed_results=(seed,),
+        ).to_dict()
+        payload.pop("schema_version")
+
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            RecursiveAttributionReport.from_dict(payload)
+
     def test_v3_seed_results_reject_non_object_entries_across_entry_points(self):
         valid = seed_result("record:seed", "no_defect")
         payload = RecursiveAttributionReport(
@@ -1158,13 +1226,17 @@ class SeedAttributionModelTests(unittest.TestCase):
             {item.outcome for item in migrated.seed_results},
             {"inconclusive"},
         )
-        self.assertTrue(migrated.confirmed_roots)
+        self.assertFalse(migrated.confirmed_roots)
+        self.assertFalse(migrated.co_roots)
         self.assertTrue(
             all(not item.confirmed_root_refs for item in migrated.seed_results)
         )
         self.assertEqual(migrated.analysis_outcome, "inconclusive")
+        self.assertTrue(
+            migrated.metadata["report_migration"]["unpublished_confirmed_roots"]
+        )
 
-    def test_top_level_aggregation_uses_only_seed_outcomes(self):
+    def test_top_level_aggregation_requires_root_ownership_when_outcomes_change(self):
         no_defect_seeds = (
             seed_result("a", "no_defect"),
             seed_result("b", "no_defect"),
@@ -1180,14 +1252,16 @@ class SeedAttributionModelTests(unittest.TestCase):
         confirmed = run_shared_root_report()
         self.assertEqual(confirmed.analysis_outcome, "confirmed_root")
         first, second = confirmed.seed_results
-        for name, replacement, expected in (
-            ("confirmed_and_no_defect", replace(first, outcome="no_defect", confirmed_root_refs=(), confirmation_identities=()), "confirmed_root"),
-            ("partial", replace(first, outcome="evidence_gap", confirmed_root_refs=(), confirmation_identities=(), missing_evidence=("missing",)), "partial"),
-            ("unresolved", replace(first, outcome="inconclusive", confirmed_root_refs=(), confirmation_identities=()), "inconclusive"),
+        for name, replacement in (
+            ("confirmed_and_no_defect", replace(first, outcome="no_defect", confirmed_root_refs=(), confirmation_identities=())),
+            ("partial", replace(first, outcome="evidence_gap", confirmed_root_refs=(), confirmation_identities=(), missing_evidence=("missing",))),
+            ("unresolved", replace(first, outcome="inconclusive", confirmed_root_refs=(), confirmation_identities=())),
         ):
             with self.subTest(name=name):
-                report = replace(confirmed, seed_results=(replacement, second))
-                self.assertEqual(report.analysis_outcome, expected)
+                with self.assertRaisesRegex(
+                    ValueError, "exactly one confirmed_root seed"
+                ):
+                    replace(confirmed, seed_results=(replacement, second))
 
     def test_output_order_is_deterministic(self):
         seeds = (
