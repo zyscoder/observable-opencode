@@ -716,15 +716,16 @@ function stableHash(input: string) {
   return createHash("sha256").update(input).digest("hex")
 }
 
-export function isNonFactualResponseClaim(input: string) {
-  if (/__TRACE_PROTECTED_\d+__/.test(input)) return true
+export function isNonFactualResponseClaim(input: unknown) {
+  const text = typeof input === "string" ? input : stringPreview(input)
+  if (/__TRACE_PROTECTED_\d+__/.test(text)) return true
   if (
-    /^\s*[+-]\s+/.test(input) &&
-    (/(?:\b(?:const|let|var|return|import|export)\b|[{};=]|=>)/.test(input) ||
-      /^\s*[+-]\s*(?:async\s+)?function\s+\w+\s*\(/.test(input))
+    /^\s*[+-]\s+/.test(text) &&
+    (/(?:\b(?:const|let|var|return|import|export)\b|[{};=]|=>)/.test(text) ||
+      /^\s*[+-]\s*(?:async\s+)?function\s+\w+\s*\(/.test(text))
   )
     return true
-  const normalized = input
+  const normalized = text
     .trim()
     .replace(/^#+\s*/, "")
     .replace(/\*\*/g, "")

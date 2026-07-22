@@ -1,10 +1,42 @@
 import { describe, expect, test } from "bun:test"
 import * as claimAtomization from "../../src/observability/claim-atomization"
 import { atomizeResponseClaims } from "../../src/observability/claim-atomization"
-import { isBrokenClaimFragment } from "../../src/observability/claim-atomization-core"
+import { isBrokenClaimFragment, isNonFactualResponseClaim } from "../../src/observability/claim-atomization-core"
 import { atomizeResponseClaimsWithLexerForTest } from "../../src/observability/claim-atomization.test-support"
 
 describe("claim atomization", () => {
+  test("keeps internal claim filters total for hostile coercion inputs", () => {
+    const hostileInputs: unknown[] = [
+      new Proxy(
+        {},
+        {
+          get() {
+            throw new Error("proxy access failed")
+          },
+        },
+      ),
+      {
+        toJSON: () => undefined,
+        [Symbol.toPrimitive]: () => {
+          throw new Error("primitive conversion failed")
+        },
+      },
+      {
+        toJSON: () => undefined,
+        toString: () => {
+          throw new Error("string conversion failed")
+        },
+      },
+    ]
+
+    for (const input of hostileInputs) {
+      expect(() => isNonFactualResponseClaim(input)).not.toThrow()
+      expect(isNonFactualResponseClaim(input)).toBe(false)
+      expect(() => isBrokenClaimFragment(input)).not.toThrow()
+      expect(isBrokenClaimFragment(input)).toBe(false)
+    }
+  })
+
   test("keeps the production module export surface limited to the atomizer", () => {
     expect(Object.keys(claimAtomization).sort()).toEqual(["atomizeResponseClaims"])
   })
