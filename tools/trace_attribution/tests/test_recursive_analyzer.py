@@ -4207,6 +4207,122 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertEqual(leaked_surfaces, [])
 
+    def test_stale_intermediate_invalidates_capsule_confirmation_and_publication(self):
+        class PathDecisiveFusionJudge(FusionScriptedJudge):
+            def judge_candidates_bounded(self, request, *, max_physical_requests):
+                result = super().judge_candidates_bounded(
+                    request, max_physical_requests=max_physical_requests
+                )
+                if "record:decision" not in result.value.selected_candidate_refs:
+                    return result
+                return BoundedJudgeCallResult(
+                    replace(
+                        result.value,
+                        decisive_evidence_refs=("record:decision", "record:change"),
+                    ),
+                    result.physical_requests,
+                )
+
+        def analyze(*, stale_intermediate):
+            trace = observed_trace()
+            trace["manifest"] = {"subject_revision": "git:active"}
+            for record in trace["records"]:
+                record.setdefault("data", {})["subject_revision"] = "git:active"
+            if stale_intermediate:
+                change = next(
+                    item
+                    for item in trace["records"]
+                    if item["record_id"] == "change"
+                )
+                change["data"]["subject_revision"] = "git:stale"
+            judge = PathDecisiveFusionJudge(
+                global_outcome="candidate_roots",
+                selected_candidate_refs=("record:decision",),
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt="Implement only the methods found in the first search.",
+                        reason="The active decision appears necessary under independent review.",
+                        counterfactual="A complete search prevents the omission.",
+                        confidence=0.9,
+                        evidence_refs=["record:decision", "record:change"],
+                    )
+                },
+            )
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+            return judge, report
+
+        stale_judge, stale_report = analyze(stale_intermediate=True)
+        stale_leaks = []
+        for request in stale_judge.global_requests:
+            if "record:decision" not in request.offered_candidate_refs:
+                continue
+            capsule = next(
+                item
+                for item in request.capsules
+                if item.candidate_ref == "record:decision"
+            )
+            if "record:change" in capsule.downstream_path:
+                stale_leaks.append("capsule_path")
+            if "record:change" in request.grounded_refs:
+                stale_leaks.append("grounded_refs")
+        for judgment in stale_report.metadata["global_candidate_judgments"]:
+            if "record:change" in {
+                ref
+                for assessment in judgment.get("assessments") or ()
+                for ref in assessment.get("causal_path_refs") or ()
+            }:
+                stale_leaks.append("global_assessment")
+            if "record:change" in judgment.get("decisive_evidence_refs", ()):
+                stale_leaks.append("decisive_evidence")
+        if any(
+            "record:change" in item.get("recursive_path", ())
+            for item in stale_report.metadata["confirmation_queue"]
+        ):
+            stale_leaks.append("confirmation")
+        if any(
+            "record:change" in root.recursive_path
+            for root in (
+                *stale_report.confirmed_roots,
+                *stale_report.co_roots,
+                *stale_report.contributing_conditions,
+                *stale_report.amplifying_factors,
+            )
+        ):
+            stale_leaks.append("publication")
+        self.assertEqual(stale_leaks, [])
+
+        active_judge, active_report = analyze(stale_intermediate=False)
+        active_request = next(
+            request
+            for request in active_judge.global_requests
+            if "record:decision" in request.offered_candidate_refs
+        )
+        active_capsule = next(
+            item
+            for item in active_request.capsules
+            if item.candidate_ref == "record:decision"
+        )
+        self.assertEqual(
+            active_capsule.downstream_path,
+            (
+                "record:decision",
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+        self.assertEqual(
+            [root.node_ref for root in active_report.confirmed_roots],
+            ["record:decision"],
+        )
+
     def test_current_numeric_repository_generation_can_reach_root_publication(self):
         trace = observed_trace()
         trace["manifest"] = {"subject_revision": "git:active"}

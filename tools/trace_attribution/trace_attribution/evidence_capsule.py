@@ -372,6 +372,13 @@ def build_candidate_evidence_capsules(
             path = (ref,)
         elif path[0] != ref:
             path = (ref, *path)
+        if any(
+            not graph.active_revision_evidence_eligible(path_ref)
+            for path_ref in path
+        ):
+            raise ValueError(
+                "candidate downstream path contains evidence ineligible for the active revision"
+            )
         causal_path_edges = tuple(_causal_path_edges(graph, path))
         incoming_edges = tuple(
             graph.sanitize_judge_edge_evidence(edge)
@@ -400,7 +407,7 @@ def build_candidate_evidence_capsules(
                 "ref": ref,
                 "source": candidate.source,
                 "retrieval_is_not_causal_verdict": True,
-                "evidence_eligible": graph.evidence_eligible(ref),
+                "evidence_eligible": graph.active_revision_evidence_eligible(ref),
                 "root_candidate_eligible": root_candidate_eligible(node),
                 "active_graph_facts": _active_candidate_graph_facts(graph, node),
                 "retrieval_edge": prompt_collections["retrieval_edge"],
@@ -623,7 +630,7 @@ def _active_candidate_graph_facts(
         "offline_only": node.data.get("offline_only"),
         "semantic_role": str(node.data.get("semantic_role") or ""),
         "navigation_role": str(node.data.get("navigation_role") or ""),
-        "evidence_eligible": graph.evidence_eligible(node.ref),
+        "evidence_eligible": graph.active_revision_evidence_eligible(node.ref),
         "root_candidate_eligible": root_candidate_eligible(node),
     }
 
@@ -686,9 +693,9 @@ def validate_candidate_evidence_capsule_against_graph(
     for path_ref, reference in zip(
         capsule.downstream_path, capsule.downstream_path_references
     ):
-        if not graph.evidence_eligible(path_ref):
+        if not graph.active_revision_evidence_eligible(path_ref):
             raise ValueError(
-                "candidate downstream path reference is ineligible in active graph"
+                "candidate downstream path reference is ineligible for the active revision"
             )
         if _thaw(reference) != _reference(graph, path_ref):
             raise ValueError(
@@ -848,6 +855,8 @@ def validate_candidate_evidence_capsules_against_graph(
 def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict]:
     output: List[JsonDict] = []
     for downstream in graph.downstream_refs(ref):
+        if not graph.edge_endpoints_eligible(ref, downstream):
+            continue
         output.extend(
             graph.sanitize_judge_edge_evidence(edge)
             for edge in graph.edge_context(ref, downstream)
@@ -861,6 +870,8 @@ def _causal_path_edges(graph: TraceGraph, path: Tuple[str, ...]) -> List[JsonDic
     output: List[JsonDict] = []
     seen = set()
     for source_ref, target_ref in zip(path, path[1:]):
+        if not graph.edge_endpoints_eligible(source_ref, target_ref):
+            continue
         for edge in graph.edge_context(source_ref, target_ref):
             sanitized = graph.sanitize_judge_edge_evidence(edge)
             signature = stable_json(sanitized)
@@ -880,7 +891,7 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
             if (
                 resolved != node.ref
                 or resolved not in graph.nodes
-                or not active_revision_candidate_eligible(graph, resolved)
+                or not graph.active_revision_evidence_eligible(resolved)
             ):
                 continue
             active_node = graph.hydrate_node(resolved)
@@ -892,7 +903,7 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
         members.sort(key=lambda item: graph.position(str(item.get("ref") or "")))
     if (
         not members
-        and active_revision_candidate_eligible(graph, candidate.ref)
+        and graph.active_revision_evidence_eligible(candidate.ref)
         and root_candidate_eligible(candidate)
     ):
         members = [candidate.compact(max_chars=1800)]
@@ -925,8 +936,8 @@ def _action_revision_eligible(
     graph: TraceGraph, candidate: TraceNode, member: TraceNode
 ) -> bool:
     return (
-        active_revision_candidate_eligible(graph, candidate.ref)
-        and active_revision_candidate_eligible(graph, member.ref)
+        graph.active_revision_evidence_eligible(candidate.ref)
+        and graph.active_revision_evidence_eligible(member.ref)
     )
 
 

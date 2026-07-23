@@ -445,8 +445,8 @@ class TraceGraph:
         self._active_repository_revision = max(revisions) if revisions else None
         return self._active_repository_revision
 
-    def active_revision_candidate_eligible(self, ref: str) -> bool:
-        """Apply field-specific subject and repository revision contracts."""
+    def active_revision_evidence_eligible(self, ref: str) -> bool:
+        """Require canonical evidence to satisfy active revision contracts."""
         resolved = self.resolve(str(ref))
         if (
             not resolved
@@ -495,6 +495,10 @@ class TraceGraph:
                 return False
         return True
 
+    def active_revision_candidate_eligible(self, ref: str) -> bool:
+        """Compatibility alias for the graph-level active evidence policy."""
+        return self.active_revision_evidence_eligible(ref)
+
     def filter_evidence_refs(self, refs: Iterable[Any]) -> List[str]:
         """Keep unresolved refs and refs to nodes allowed by the evidence policy."""
         output: List[str] = []
@@ -507,7 +511,7 @@ class TraceGraph:
                 continue
             if (
                 resolved in self.nodes
-                and not self.active_revision_candidate_eligible(resolved)
+                and not self.active_revision_evidence_eligible(resolved)
             ):
                 continue
             output.append(ref)
@@ -550,7 +554,10 @@ class TraceGraph:
         if not isinstance(value, str):
             return
         resolved = self.resolve(value)
-        if resolved in self.nodes and not self.evidence_eligible(resolved):
+        if (
+            resolved in self.nodes
+            and not self.active_revision_evidence_eligible(resolved)
+        ):
             raise ValueError(
                 "{0} violates graph evidence eligibility: {1}".format(label, value)
             )
@@ -561,7 +568,10 @@ class TraceGraph:
         for value in refs:
             ref = str(value or "")
             resolved = self.resolve(ref)
-            if resolved in self.nodes and self.evidence_eligible(resolved):
+            if (
+                resolved in self.nodes
+                and self.active_revision_evidence_eligible(resolved)
+            ):
                 continue
             artifact = self.artifact_reference_status(ref)
             if artifact is not None and artifact.get("resolution_status") == "resolved":
@@ -576,7 +586,10 @@ class TraceGraph:
         for value in refs:
             ref = str(value or "")
             resolved = self.resolve(ref)
-            if resolved in self.nodes and self.evidence_eligible(resolved):
+            if (
+                resolved in self.nodes
+                and self.active_revision_evidence_eligible(resolved)
+            ):
                 continue
             raise ValueError(
                 "{0} contains unresolved or revision-ineligible publication identity: {1}".format(
@@ -591,8 +604,9 @@ class TraceGraph:
     def edge_endpoints_eligible(self, source_ref: str, target_ref: str) -> bool:
         source = self.resolve(source_ref) or source_ref
         target = self.resolve(target_ref) or target_ref
-        return _edge_endpoints_eligible(
-            self.nodes, self._evidence_eligible_refs, source, target
+        return (
+            self.active_revision_evidence_eligible(source)
+            and self.active_revision_evidence_eligible(target)
         )
 
     def upstream_refs(self, ref: str) -> List[str]:
@@ -859,7 +873,7 @@ class TraceGraph:
         for upstream_ref in self.upstream_refs(resolved):
             if (
                 not self.edge_endpoints_eligible(upstream_ref, resolved)
-                or not self.active_revision_candidate_eligible(upstream_ref)
+                or not self.active_revision_evidence_eligible(upstream_ref)
             ):
                 continue
             for edge in self.edge_context(upstream_ref, resolved):
@@ -892,8 +906,7 @@ class TraceGraph:
             if (
                 node.event_type == "progress.episode"
                 or self.position(node.ref) >= before_position
-                or not self.evidence_eligible(node.ref)
-                or not self.active_revision_candidate_eligible(node.ref)
+                or not self.active_revision_evidence_eligible(node.ref)
             ):
                 continue
             tokens = set(re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower()))
@@ -982,7 +995,11 @@ class TraceGraph:
             allowed = {self.resolve(item) or item for item in allowed_refs}
         output: List[JsonDict] = []
         for (source, edge_target), edges in self._edge_context_index.items():
-            if edge_target != target or (allowed is not None and source not in allowed):
+            if (
+                edge_target != target
+                or (allowed is not None and source not in allowed)
+                or not self.edge_endpoints_eligible(source, edge_target)
+            ):
                 continue
             output.extend(self.sanitize_edge_evidence(item) for item in edges)
         output.sort(
@@ -999,11 +1016,16 @@ class TraceGraph:
         return self._positions.get(resolved, len(self._positions))
 
     def causal_decision_refs(self, ref: str, limit: int = 24) -> List[str]:
+        from .causal_retrieval import root_candidate_eligible
+
         resolved = self.resolve(ref) or ref
         refs = [
             item
             for item in self.upstream_refs(resolved)
-            if item in self.nodes and self.nodes[item].event_type == "decision"
+            if item in self.nodes
+            and self.nodes[item].event_type == "decision"
+            and self.active_revision_evidence_eligible(item)
+            and root_candidate_eligible(self.nodes[item])
         ]
         refs.sort(key=lambda item: self._positions.get(item, 0), reverse=True)
         return refs[:limit]
@@ -1011,7 +1033,12 @@ class TraceGraph:
     def upstream_nodes(self, ref: str, limit: int = 12) -> List[TraceNode]:
         resolved = self.resolve(ref) or ref
         current = self.nodes.get(resolved)
-        refs = [item for item in self.upstream_refs(resolved) if item in self.nodes]
+        refs = [
+            item
+            for item in self.upstream_refs(resolved)
+            if item in self.nodes
+            and self.active_revision_evidence_eligible(item)
+        ]
         if current and current.event_type == "response.claim":
             direct_support = resolved_data_refs(current.data.get("direct_support_refs"), self.aliases)
             superseded = resolved_data_refs(current.data.get("superseded_evidence_refs"), self.aliases)

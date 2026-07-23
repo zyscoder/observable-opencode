@@ -736,6 +736,15 @@ def _assert_active_confirmation_path(
                 label
             )
         )
+    if any(
+        not graph.active_revision_evidence_eligible(ref)
+        for ref in canonical_path
+    ):
+        raise ValueError(
+            "{0} confirmation path contains evidence ineligible for the active revision".format(
+                label
+            )
+        )
     for source_ref, target_ref in zip(canonical_path, canonical_path[1:]):
         edges = graph.edge_context(source_ref, target_ref)
         if not graph.edge_endpoints_eligible(source_ref, target_ref) or not any(
@@ -1322,6 +1331,25 @@ class RecursiveAnalysisState:
             or not root_candidate_eligible(node)
         ):
             return False
+        recursive_path = tuple(
+            str(ref) for ref in value.get("recursive_path") or ()
+        )
+        checked_evidence_refs = tuple(
+            str(ref) for ref in value.get("checked_evidence_refs") or ()
+        )
+        if recursive_path and (
+            recursive_path[0] != candidate_ref
+            or any(
+                not self.graph.active_revision_evidence_eligible(ref)
+                for ref in recursive_path
+            )
+        ):
+            return False
+        if any(
+            not self.graph.active_revision_evidence_eligible(ref)
+            for ref in checked_evidence_refs
+        ):
+            return False
         queue_key = (
             hypothesis_id,
             candidate_ref,
@@ -1363,6 +1391,29 @@ class RecursiveAnalysisState:
             ):
                 raise ValueError(
                     "restored confirmation queue contains a root candidate ineligible for the active revision"
+                )
+            recursive_path = tuple(
+                str(ref) for ref in item.get("recursive_path") or ()
+            )
+            checked_evidence_refs = tuple(
+                str(ref) for ref in item.get("checked_evidence_refs") or ()
+            )
+            if recursive_path and (
+                recursive_path[0] != candidate_ref
+                or any(
+                    not self.graph.active_revision_evidence_eligible(ref)
+                    for ref in recursive_path
+                )
+            ):
+                raise ValueError(
+                    "restored confirmation queue path contains evidence ineligible for the active revision"
+                )
+            if any(
+                not self.graph.active_revision_evidence_eligible(ref)
+                for ref in checked_evidence_refs
+            ):
+                raise ValueError(
+                    "restored confirmation queue contains evidence ineligible for the active revision"
                 )
             candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
             candidates.add(candidate_ref)
@@ -1457,7 +1508,7 @@ class RecursiveAnalysisState:
                     ref
                     for ref in graph.upstream_refs(start_ref)
                     if graph.nodes.get(ref)
-                    and graph.evidence_eligible(ref)
+                    and graph.active_revision_evidence_eligible(ref)
                 ]
                 manifest = (
                     graph.raw_trace.get("manifest")
@@ -4724,6 +4775,13 @@ class AgenticRecursiveAnalyzer:
             raise ValueError("queued confirmation path is not candidate-rooted")
         if any(state.graph.resolve(ref) != ref for ref in path):
             raise ValueError("queued confirmation path contains unresolved references")
+        if any(
+            not state.graph.active_revision_evidence_eligible(ref)
+            for ref in path
+        ):
+            raise ValueError(
+                "queued confirmation path contains evidence ineligible for the active revision"
+            )
         for upstream, downstream in zip(path, path[1:]):
             edges = state.graph.edge_context(upstream, downstream)
             if not any(
@@ -4755,6 +4813,12 @@ class AgenticRecursiveAnalyzer:
                 resolved = state.graph.resolve(raw_ref)
                 if not resolved or resolved not in state.graph.nodes:
                     raise ValueError("confirmation evidence ref is unresolved: {0}".format(raw_ref))
+                if not state.graph.active_revision_evidence_eligible(resolved):
+                    raise ValueError(
+                        "confirmation evidence ref is ineligible for the active revision: {0}".format(
+                            raw_ref
+                        )
+                    )
                 output.append(
                     _reference_envelope(
                         resolved,
@@ -4819,6 +4883,12 @@ class AgenticRecursiveAnalyzer:
                     resolved_ref = state.graph.resolve(ref)
                     if not resolved_ref or resolved_ref not in state.graph.nodes:
                         raise ValueError("competing hypothesis evidence is unresolved")
+                    if not state.graph.active_revision_evidence_eligible(
+                        resolved_ref
+                    ):
+                        raise ValueError(
+                            "competing hypothesis evidence is ineligible for the active revision"
+                        )
                     output.append(
                         {
                             "reason": str(item.get("reason") or ""),
@@ -4868,6 +4938,11 @@ class AgenticRecursiveAnalyzer:
                     else ()
                 )
             )
+            if any(
+                not state.graph.active_revision_evidence_eligible(ref)
+                for ref in competitor_path
+            ):
+                continue
             competitor_confirmation_identity = confirmation_identity_for(
                 hypothesis_id=competitor_hypothesis_id,
                 hypothesis_semantic_hash=competitor_semantic_hash,
@@ -4967,6 +5042,17 @@ class AgenticRecursiveAnalyzer:
             raise ValueError(
                 "confirmation candidate is ineligible for the active revision"
             )
+        if any(
+            not state.graph.active_revision_evidence_eligible(ref)
+            for ref in confirmation.recursive_path
+        ):
+            raise ValueError(
+                "confirmation path contains evidence ineligible for the active revision"
+            )
+        state.graph.assert_resolved_evidence_references(
+            confirmation.evidence_refs,
+            label="confirmation",
+        )
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
         hypothesis_id = str(queued.get("hypothesis_id") or "")

@@ -499,6 +499,73 @@ class InvestigationToolTest(unittest.TestCase):
             ["record:normal_decision"],
         )
 
+    def test_semantic_investigation_filters_stale_revisions_before_limit(self):
+        def search(graph):
+            return CausalInvestigationTools(graph).execute(
+                InvestigationDirective.create(
+                    "search_semantic_nodes",
+                    {
+                        "query": "cleanup contract boundary",
+                        "before_ref": "record:current",
+                        "limit": 1,
+                    },
+                    requested_by_ref="record:current",
+                    reason="Find active cleanup evidence.",
+                )
+            )
+
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "active-semantic-backfill",
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "stale",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {
+                            "text": "cleanup contract boundary",
+                            "subject_revision": "git:stale",
+                        },
+                    },
+                    {
+                        "record_id": "active",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {
+                            "text": "cleanup boundary",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                    {
+                        "record_id": "current",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "text": "cleanup failed",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                ],
+            }
+        )
+
+        result = search(graph)
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [item["ref"] for item in result.payload["matches"]],
+            ["record:active"],
+        )
+
+        stale_only = copy.deepcopy(graph.raw_trace)
+        active = next(
+            item for item in stale_only["records"] if item["record_id"] == "active"
+        )
+        active["data"]["subject_revision"] = "git:stale"
+        empty = search(TraceGraph.from_trace(stale_only))
+        self.assertEqual(empty.status, "success")
+        self.assertEqual(list(empty.payload["matches"]), [])
+
     def test_context_lineage_investigation_rejects_audit_only_external_reference(self):
         graph = TraceGraph.from_trace(
             {

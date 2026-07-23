@@ -1696,6 +1696,148 @@ class CausalCheckpointTest(unittest.TestCase):
                     analysis_perspective="Improve repository reasoning.",
                 )
 
+    def test_partial_and_completed_restore_reject_stale_intermediate_root_path(self):
+        trace = confirmed_root_trace()
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:defect"],
+        )
+
+        def forge_stale_path(value):
+            replacements = {}
+
+            def rewrite(item):
+                if isinstance(item, dict):
+                    if (
+                        item.get("candidate_ref") == "record:decision"
+                        and isinstance(item.get("recursive_path"), (list, tuple))
+                    ):
+                        old_identity = str(
+                            item.get("confirmation_identity") or ""
+                        )
+                        item["recursive_path"] = [
+                            "record:decision",
+                            "record:stale_fact",
+                            "record:defect",
+                        ]
+                        identity_fields = (
+                            "hypothesis_id",
+                            "hypothesis_semantic_hash",
+                            "defect_fingerprint",
+                            "seed_binding_identity",
+                        )
+                        if all(field in item for field in identity_fields):
+                            new_identity = confirmation_identity_for(
+                                hypothesis_id=item["hypothesis_id"],
+                                hypothesis_semantic_hash=item[
+                                    "hypothesis_semantic_hash"
+                                ],
+                                candidate_ref=item["candidate_ref"],
+                                defect_fingerprint=item["defect_fingerprint"],
+                                recursive_path=item["recursive_path"],
+                                seed_binding_identity=item[
+                                    "seed_binding_identity"
+                                ],
+                            )
+                            item["confirmation_identity"] = new_identity
+                            if old_identity:
+                                replacements[old_identity] = new_identity
+                    for child in item.values():
+                        rewrite(child)
+                elif isinstance(item, list):
+                    for child in item:
+                        rewrite(child)
+
+            def replace_identities(item):
+                if isinstance(item, dict):
+                    for key, child in list(item.items()):
+                        if isinstance(child, str) and child in replacements:
+                            item[key] = replacements[child]
+                        else:
+                            replace_identities(child)
+                elif isinstance(item, list):
+                    for index, child in enumerate(item):
+                        if isinstance(child, str) and child in replacements:
+                            item[index] = replacements[child]
+                        else:
+                            replace_identities(child)
+
+            rewrite(value)
+            replace_identities(value)
+
+        stale_trace = copy.deepcopy(trace)
+        stale_trace["manifest"] = {"subject_revision": "git:active"}
+        for record in stale_trace["records"]:
+            record["data"]["subject_revision"] = "git:active"
+        stale_trace["records"].insert(
+            1,
+            {
+                "record_id": "stale_fact",
+                "component": "processor",
+                "event_type": "evidence.fact",
+                "data": {
+                    "text": "This fact belongs to an older subject revision.",
+                    "subject_revision": "git:stale",
+                },
+            },
+        )
+        stale_trace["dataflow_edges"] = [
+            {
+                "from": {"type": "record", "id": "decision"},
+                "to": {"type": "record", "id": "stale_fact"},
+                "relation": "decision_produced_fact",
+                "evidence_type": "confirmed",
+                "eligible_for_attribution": True,
+            },
+            {
+                "from": {"type": "record", "id": "stale_fact"},
+                "to": {"type": "record", "id": "defect"},
+                "relation": "fact_exposed_by_evaluation",
+                "evidence_type": "confirmed",
+                "eligible_for_attribution": True,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "stale-intermediate-root.checkpoint"
+            AgenticRecursiveAnalyzer(
+                judge=ConfirmedSingleNodeJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            actions = json.loads(json.dumps(restored.actions))
+            forge_stale_path(actions)
+            forged = replace(restored, actions=tuple(actions))
+
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(stale_trace),
+                    checkpoint=forged,
+                )
+
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
+                AgenticRecursiveAnalyzer(
+                    judge=ConfirmedSingleNodeJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(forged, root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(stale_trace),
+                    start_refs=["record:defect"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
     def test_partial_and_completed_restore_reject_stale_repository_generation_root_candidate(self):
         trace = confirmed_root_trace()
         trace["manifest"] = {"subject_revision": "git:active"}
@@ -1737,13 +1879,17 @@ class CausalCheckpointTest(unittest.TestCase):
             stale_trace = copy.deepcopy(trace)
             stale_trace["records"][-1]["data"]["repository_revision"] = 1
 
-            with self.assertRaisesRegex(ValueError, "active revision"):
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
                 RecursiveAnalysisState.from_checkpoint(
                     graph=TraceGraph.from_trace(stale_trace),
                     checkpoint=restored,
                 )
 
-            with self.assertRaisesRegex(ValueError, "active revision"):
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
                 AgenticRecursiveAnalyzer(
                     judge=ConfirmedSingleNodeJudge(),
                     checkpoint=InjectedRestoreCheckpoint(restored, root),
@@ -1751,6 +1897,94 @@ class CausalCheckpointTest(unittest.TestCase):
                 ).analyze(
                     TraceGraph.from_trace(stale_trace),
                     start_refs=["record:defect"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+    def test_partial_and_completed_restore_reject_stale_intermediate_factor_path(self):
+        from tests.test_recursive_analyzer import (
+            ConfirmingScriptedJudge,
+            RecursiveRootRankingTest,
+            observed_trace,
+            relation,
+            step,
+        )
+
+        trace = observed_trace(branching=True)
+        trace["manifest"] = {"subject_revision": "git:active"}
+        for record in trace["records"]:
+            record.setdefault("data", {})["subject_revision"] = "git:active"
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:observed_defect"],
+        )
+
+        def judge():
+            return ConfirmingScriptedJudge(
+                {
+                    "record:change": step(
+                        "record:change",
+                        predecessors=(
+                            relation("record:context", "same_defect_propagation"),
+                        ),
+                    ),
+                    "record:context": RecursiveRootRankingTest()._confirmation_step,
+                },
+                {
+                    "record:context": RootConfirmation.rejected(
+                        "record:context",
+                        "The context is a condition, not a necessary root.",
+                        evidence_refs=[
+                            "record:context",
+                            "record:change",
+                            "record:observed_defect",
+                        ],
+                        factor_role="contributing_condition",
+                    )
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "stale-intermediate-factor.checkpoint"
+            report = AgenticRecursiveAnalyzer(
+                judge=judge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(len(report.contributing_conditions), 1)
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            stale_trace = copy.deepcopy(trace)
+            change = next(
+                item
+                for item in stale_trace["records"]
+                if item["record_id"] == "change"
+            )
+            change["data"]["subject_revision"] = "git:stale"
+
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(stale_trace),
+                    checkpoint=restored,
+                )
+
+            with self.assertRaisesRegex(
+                ValueError, "active revision|evidence eligibility"
+            ):
+                AgenticRecursiveAnalyzer(
+                    judge=judge(),
+                    checkpoint=InjectedRestoreCheckpoint(restored, root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(stale_trace),
+                    start_refs=["record:observed_defect"],
                     objective="Find the defect.",
                     analysis_perspective="Improve repository reasoning.",
                 )

@@ -1088,9 +1088,203 @@ class TraceGraphTest(unittest.TestCase):
         graph = TraceGraph.from_trace(trace)
         refs = [node.ref for node in graph.upstream_nodes("record:claim")]
 
-        self.assertEqual(refs[0], "record:post_change")
-        self.assertLess(refs.index("record:change"), refs.index("record:baseline"))
-        self.assertEqual(refs[-1], "record:baseline")
+        self.assertEqual(refs, ["record:post_change", "record:change"])
+        self.assertNotIn("record:baseline", refs)
+
+    def test_graph_ranking_helpers_filter_stale_revisions_before_limit(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "active-revision-ranking-case",
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "active_decision",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_id": "active_decision",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                    {
+                        "record_id": "stale_decision",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_id": "stale_decision",
+                            "subject_revision": "git:stale",
+                        },
+                    },
+                    {
+                        "record_id": "stale_support",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "stale_support",
+                            "subject_revision": "git:stale",
+                        },
+                    },
+                    {
+                        "record_id": "active_support_a",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "active_support_a",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                    {
+                        "record_id": "active_support_b",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "active_support_b",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                    {
+                        "record_id": "claim",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "source_refs": [
+                            "verification:stale_support",
+                            "verification:active_support_a",
+                            "verification:active_support_b",
+                            "decision:active_decision",
+                            "decision:stale_decision",
+                        ],
+                        "data": {
+                            "subject_revision": "git:active",
+                            "direct_support_refs": [
+                                "verification:stale_support",
+                                "verification:active_support_a",
+                                "verification:active_support_b",
+                            ],
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            graph.causal_decision_refs("record:claim", limit=1),
+            ["record:active_decision"],
+        )
+        self.assertEqual(
+            [
+                node.ref
+                for node in graph.upstream_nodes("record:claim", limit=2)
+            ],
+            ["record:active_support_a", "record:active_support_b"],
+        )
+
+        stale_only = TraceGraph.from_trace(
+            {
+                "case_id": "no-active-ranking-case",
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "stale",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_id": "stale",
+                            "subject_revision": "git:stale",
+                        },
+                    },
+                    {
+                        "record_id": "target",
+                        "component": "result",
+                        "event_type": "response.output",
+                        "source_refs": ["decision:stale"],
+                        "data": {"subject_revision": "git:active"},
+                    },
+                ],
+            }
+        )
+        self.assertEqual(stale_only.causal_decision_refs("record:target", limit=1), [])
+        self.assertEqual(stale_only.upstream_nodes("record:target", limit=1), [])
+
+    def test_judgment_context_and_analyzer_receive_active_upstream_backfill(self):
+        from trace_attribution.judgment_context import build_causal_judgment_context
+
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "active-context-backfill-case",
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "stale",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "data": {
+                            "text": "stale support",
+                            "subject_revision": "git:stale",
+                        },
+                    },
+                    {
+                        "record_id": "active",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "data": {
+                            "text": "active support",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                    {
+                        "record_id": "defect",
+                        "component": "result",
+                        "event_type": "response.output",
+                        "source_refs": ["record:stale", "record:active"],
+                        "data": {
+                            "actual": "The active result is defective.",
+                            "subject_revision": "git:active",
+                        },
+                    },
+                ],
+            }
+        )
+        context = build_causal_judgment_context(
+            graph=graph,
+            node_ref="record:defect",
+            path=["record:defect"],
+            judgments={},
+            episode_index=CausalEpisodeIndex.from_graph(graph),
+            objective="Inspect active evidence only.",
+        )
+
+        self.assertEqual(context["context_manifest"]["upstream_candidate_count"], 1)
+        self.assertEqual(
+            {
+                edge["from_ref"]
+                for edge in context["incoming_edges"]
+            },
+            {"record:active"},
+        )
+
+        class CapturingJudge:
+            def __init__(self):
+                self.upstream_refs = []
+
+            def judge_node(
+                self, *, node, upstream_nodes, downstream_context, objective
+            ):
+                self.upstream_refs.append([item.ref for item in upstream_nodes])
+                return NodeJudgment(
+                    node_ref=node.ref,
+                    component=node.component,
+                    event_type=node.event_type,
+                    has_defect=False,
+                    defect_reason="The test only inspects Judge-facing context.",
+                )
+
+        judge = CapturingJudge()
+        BackwardTaintAnalyzer(judge=judge).analyze(
+            graph,
+            start_refs=["record:defect"],
+            objective="Inspect active evidence only.",
+        )
+        self.assertEqual(judge.upstream_refs[0], ["record:active"])
 
     def test_completed_trace_prefers_atomic_claims_over_full_response_output(self):
         trace = {

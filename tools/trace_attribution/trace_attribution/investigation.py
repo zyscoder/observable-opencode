@@ -791,7 +791,10 @@ class CausalInvestigationTools:
 
     def execute(self, directive: InvestigationDirective) -> InvestigationResult:
         requester = self.graph.resolve(directive.requested_by_ref)
-        if requester in self.graph.nodes and not self.graph.evidence_eligible(requester):
+        if (
+            requester in self.graph.nodes
+            and not self.graph.active_revision_evidence_eligible(requester)
+        ):
             return InvestigationResult.rejected(
                 directive, "investigation requester is ineligible attribution evidence"
             )
@@ -836,7 +839,8 @@ class CausalInvestigationTools:
         ineligible = [
             ref
             for ref in result.resolved_refs
-            if ref in self.graph.nodes and not self.graph.evidence_eligible(ref)
+            if ref in self.graph.nodes
+            and not self.graph.active_revision_evidence_eligible(ref)
         ]
         if ineligible:
             raise ValueError(
@@ -859,7 +863,7 @@ class CausalInvestigationTools:
         resolved = self.graph.resolve(raw_ref)
         if not resolved or resolved not in self.graph.nodes:
             raise ValueError("unresolved trace node ref: {0}".format(raw_ref))
-        if not self.graph.evidence_eligible(resolved):
+        if not self.graph.active_revision_evidence_eligible(resolved):
             raise ValueError(
                 "trace node is ineligible for attribution evidence: {0}".format(
                     raw_ref
@@ -1214,7 +1218,9 @@ class CausalInvestigationTools:
                     )
                 )
             ineligible = [
-                ref for ref in resolved if not self.graph.evidence_eligible(ref)
+                ref
+                for ref in resolved
+                if not self.graph.active_revision_evidence_eligible(ref)
             ]
             if ineligible:
                 raise ValueError(
@@ -1277,7 +1283,7 @@ class CausalInvestigationTools:
             if (
                 node.event_type == "progress.episode"
                 or self.graph.position(node.ref) >= before_position
-                or not self.graph.evidence_eligible(node.ref)
+                or not self.graph.active_revision_evidence_eligible(node.ref)
             ):
                 continue
             tokens = set(

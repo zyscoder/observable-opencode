@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 import json
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
+from trace_attribution import evidence_capsule
 from trace_attribution.causal_judge import ClaudeCausalJudge
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution.evidence_capsule import (
@@ -23,6 +25,7 @@ from trace_attribution.global_judge import (
     global_candidate_request_from_validation_envelope,
     global_candidate_judgment_from_payload,
     normalize_active_focus_text,
+    validate_global_candidate_request_against_graph,
     validate_global_candidate_payload,
 )
 from trace_attribution.graph import TraceGraph
@@ -673,6 +676,126 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "validation source"):
             global_candidate_request_from_validation_envelope(envelope)
+
+    def test_direct_global_validation_rejects_stale_intermediate_path(self):
+        trace = {
+            "case_id": "stale-intermediate-global-validation",
+            "manifest": {"subject_revision": "git:active"},
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {
+                        "rationale": "Use the incomplete implementation.",
+                        "subject_revision": "git:active",
+                    },
+                },
+                {
+                    "record_id": "fact",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {
+                        "summary": "The implementation remains incomplete.",
+                        "subject_revision": "git:active",
+                    },
+                },
+                {
+                    "record_id": "defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "data": {
+                        "actual": "The implementation is incomplete.",
+                        "subject_revision": "git:active",
+                    },
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "fact"},
+                    "relation": "decision_guided_change",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "fact"},
+                    "to": {"type": "record", "id": "defect"},
+                    "relation": "change_observed_by_evaluation",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        defect = DefectState.create(
+            label="incomplete_implementation",
+            expected="The implementation is complete.",
+            actual="The implementation is incomplete.",
+            mechanism="An incomplete decision propagated through the change.",
+            scope="task_quality",
+        )
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+            edge=graph.edge_context("record:decision", "record:fact")[0],
+            score=0.9,
+            evidence_refs=("record:decision",),
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=(candidate,),
+            defect_state=defect,
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:fact",
+                    "record:defect",
+                )
+            },
+            start_refs=("record:defect",),
+        )[0]
+        request = GlobalCandidateJudgeRequest(
+            case_id=trace["case_id"],
+            objective="Find the active root.",
+            analysis_perspective="task quality",
+            seed_ref="record:defect",
+            active_defect=defect,
+            active_focus_text=defect.actual,
+            active_focus_text_hash=active_focus_text_sha256(defect.actual),
+            start_refs=("record:defect",),
+            capsules=(capsule,),
+        )
+        validate_global_candidate_request_against_graph(
+            graph,
+            request,
+            authoritative_candidates=(candidate,),
+        )
+
+        stale_trace = copy.deepcopy(trace)
+        stale_fact = next(
+            item
+            for item in stale_trace["records"]
+            if item["record_id"] == "fact"
+        )
+        stale_fact["data"]["subject_revision"] = "git:stale"
+        stale_graph = TraceGraph.from_trace(stale_trace)
+        stale_capsule = replace(
+            capsule,
+            downstream_path_references=tuple(
+                evidence_capsule._reference(stale_graph, ref)
+                for ref in capsule.downstream_path
+            ),
+        )
+        stale_request = replace(request, capsules=(stale_capsule,))
+
+        with self.assertRaisesRegex(ValueError, "active revision"):
+            validate_global_candidate_request_against_graph(
+                stale_graph,
+                stale_request,
+                authoritative_candidates=(candidate,),
+            )
 
     def test_substituted_action_group_member_cannot_become_expansion_anchor(self):
         envelope = sample_request().validation_envelope()

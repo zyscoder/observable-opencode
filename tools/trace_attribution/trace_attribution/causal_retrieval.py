@@ -651,7 +651,7 @@ def root_candidate_eligible(node: TraceNode) -> bool:
 
 def active_revision_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
     """Require a canonical evidence candidate to match active revision identities."""
-    return graph.active_revision_candidate_eligible(ref)
+    return graph.active_revision_evidence_eligible(ref)
 
 
 def is_evidence_only_node(node: TraceNode) -> bool:
