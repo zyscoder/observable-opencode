@@ -1449,7 +1449,9 @@ class TraceGraph:
         response_outputs = [
             ref
             for ref, node in self.nodes.items()
-            if node.event_type == "response.output" and node.component == "result"
+            if node.event_type == "response.output"
+            and node.component == "result"
+            and self.active_revision_evidence_eligible(ref)
         ]
         explicit_final_outputs = [
             ref for ref in response_outputs if self.nodes[ref].data.get("is_final_for_case") is True
@@ -1467,15 +1469,26 @@ class TraceGraph:
         starts: List[str] = []
         for ref, node in self.nodes.items():
             flags = node.data.get("quality_flags")
-            if node.event_type == "response.claim" and isinstance(flags, list) and flags:
+            if (
+                node.event_type == "response.claim"
+                and isinstance(flags, list)
+                and flags
+                and self.active_revision_evidence_eligible(ref)
+            ):
                 starts.append(ref)
         if starts:
             return dedupe(starts)
-        case_records = [ref for ref, node in self.nodes.items() if node.event_type in ("case.completed", "case.failed")]
+        case_records = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type in ("case.completed", "case.failed")
+            and self.active_revision_evidence_eligible(ref)
+        ]
         fallback_records = [
             ref
             for ref, node in self.nodes.items()
             if node.event_type != "external.evaluation_fact"
+            and self.active_revision_evidence_eligible(ref)
         ]
         return case_records[-1:] if case_records else fallback_records[-1:]
 

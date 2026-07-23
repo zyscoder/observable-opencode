@@ -2636,9 +2636,12 @@ class RecursiveAnalysisState:
                 projection = _confirmation_action_projection_from_record(item)
                 seed_key = projection["seed_binding_identity"]
                 builder = self.seed_ledger.get(seed_key)
+                if builder is None:
+                    raise ValueError(
+                        "confirmation action has no seed ledger owner"
+                    )
                 if (
-                    builder is None
-                    or "start_ref_active_revision_ineligible"
+                    "start_ref_active_revision_ineligible"
                     in builder.blocking_reasons
                 ):
                     continue
