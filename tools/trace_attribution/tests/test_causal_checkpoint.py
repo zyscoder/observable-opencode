@@ -1207,7 +1207,7 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v4+validation-envelope/v4+capsule/v4",
+            "global-candidate-judgment/v4+validation-envelope/v4+capsule/v5",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
@@ -1696,10 +1696,26 @@ class CausalCheckpointTest(unittest.TestCase):
                     analysis_perspective="Improve repository reasoning.",
                 )
 
-    def test_partial_and_completed_restore_reject_stale_revision_root_candidate(self):
+    def test_partial_and_completed_restore_reject_stale_repository_generation_root_candidate(self):
         trace = confirmed_root_trace()
         trace["manifest"] = {"subject_revision": "git:active"}
-        trace["records"][0]["data"]["repository_revision"] = "git:active"
+        trace["records"][0]["data"].update(
+            {
+                "subject_revision": "git:active",
+                "repository_revision": 0,
+            }
+        )
+        trace["records"].append(
+            {
+                "record_id": "current_claim",
+                "component": "result",
+                "event_type": "response.claim",
+                "data": {
+                    "temporal_scope": "current_revision",
+                    "repository_revision": 0,
+                },
+            }
+        )
         config = sample_config(
             trace=trace,
             case_id=trace["case_id"],
@@ -1719,9 +1735,7 @@ class CausalCheckpointTest(unittest.TestCase):
             )
             restored = CheckpointBundle(root).restore(expected_config=config)
             stale_trace = copy.deepcopy(trace)
-            stale_trace["records"][0]["data"][
-                "repository_revision"
-            ] = "git:stale"
+            stale_trace["records"][-1]["data"]["repository_revision"] = 1
 
             with self.assertRaisesRegex(ValueError, "active revision"):
                 RecursiveAnalysisState.from_checkpoint(

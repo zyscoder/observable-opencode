@@ -7,6 +7,7 @@ from pathlib import Path
 from trace_attribution.causal_state import AttributionHypothesis, CausalStepJudgment, DefectState, HypothesisEvidence
 from trace_attribution.causal_retrieval import (
     SemanticPredecessorRetriever,
+    active_revision_candidate_eligible,
     root_candidate_eligible,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
@@ -995,6 +996,299 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertEqual([item["ref"] for item in matches], ["record:normal_decision"])
         self.assertEqual([item.ref for item in candidates], ["record:normal_decision"])
         self.assertEqual(candidates[0].source, "semantic_fallback")
+
+    def test_stale_candidates_cannot_consume_a_bounded_retrieval_slot(self):
+        defect_state = sample_defect_state()
+        retriever = SemanticPredecessorRetriever()
+
+        def retrieve(route):
+            current_type = {
+                "process_signal": "process.signal",
+                "progress": "progress.episode",
+            }.get(route, "response.claim")
+            current_data = {
+                "text": "The parser namespace compatibility contract is missing."
+            }
+            if route == "sibling":
+                current_data["candidate_context_refs"] = [
+                    "record:stale",
+                    "record:active",
+                    "decision:active",
+                ]
+            if route == "progress":
+                current_data.update(
+                    {
+                        "offline_only": True,
+                        "member_refs": ["record:stale", "record:active"],
+                        "candidate_member_refs": [
+                            "record:stale",
+                            "record:active",
+                            "decision:active",
+                        ],
+                    }
+                )
+            records = [
+                {
+                    "record_id": "stale",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_id": "stale",
+                        "subject_revision": "git:stale",
+                        "rationale": (
+                            "Recover the missing parser namespace compatibility contract."
+                        ),
+                    },
+                },
+                {
+                    "record_id": "active",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_id": "active",
+                        "subject_revision": "git:active",
+                        "rationale": (
+                            "Recover the parser namespace compatibility contract."
+                        ),
+                    },
+                },
+                {
+                    "record_id": "current",
+                    "component": "result",
+                    "event_type": current_type,
+                    "data": current_data,
+                },
+            ]
+            edges = []
+            if route in {"direct", "process_signal"}:
+                edges = [
+                    {
+                        "from": {"type": "record", "id": "stale"},
+                        "to": {"type": "record", "id": "current"},
+                        "relation": "stale_candidate",
+                        "evidence_type": "confirmed",
+                        "confidence": 0.99,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "active"},
+                        "to": {"type": "record", "id": "current"},
+                        "relation": "active_candidate",
+                        "evidence_type": "confirmed",
+                        "confidence": 0.90,
+                        "eligible_for_attribution": True,
+                    },
+                ]
+            graph = TraceGraph.from_trace(
+                {
+                    "case_id": "bounded-{0}".format(route),
+                    "manifest": {"subject_revision": "git:active"},
+                    "records": records,
+                    "dataflow_edges": edges,
+                }
+            )
+            return retriever.retrieve(
+                graph=graph,
+                node_ref="record:current",
+                defect_state=defect_state,
+                hypothesis=sample_hypothesis(defect_state),
+                limit=1,
+                allow_semantic_fallback=route == "semantic",
+            )
+
+        for route in (
+            "direct",
+            "process_signal",
+            "semantic",
+            "sibling",
+            "progress",
+        ):
+            with self.subTest(route=route):
+                candidates = retrieve(route)
+                self.assertEqual([item.ref for item in candidates], ["record:active"])
+                self.assertTrue(candidates[0].edge.get("retrieval_candidate") or route in {
+                    "direct",
+                    "process_signal",
+                })
+
+    def test_revision_filter_isolated_by_seed_and_handles_duplicates_and_empty_sets(self):
+        graph = TraceGraph.from_trace(
+            {
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "stale_one",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"subject_revision": "git:stale"},
+                    },
+                    {
+                        "record_id": "active_one",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"subject_revision": "git:active"},
+                    },
+                    {
+                        "record_id": "stale_two",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"subject_revision": "git:other"},
+                    },
+                    {
+                        "record_id": "active_two",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"subject_revision": "git:active"},
+                    },
+                    {
+                        "record_id": "seed_one",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "candidate_context_refs": [
+                                "record:stale_one",
+                                "record:active_one",
+                                "record:active_one",
+                            ]
+                        },
+                    },
+                    {
+                        "record_id": "seed_two",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "candidate_context_refs": [
+                                "record:stale_two",
+                                "record:active_two",
+                            ]
+                        },
+                    },
+                    {
+                        "record_id": "empty_seed",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "candidate_context_refs": [
+                                "record:stale_one",
+                                "record:stale_two",
+                            ]
+                        },
+                    },
+                ],
+            }
+        )
+        defect_state = sample_defect_state()
+        retriever = SemanticPredecessorRetriever()
+
+        results = [
+            [
+                item.ref
+                for item in retriever.retrieve(
+                    graph=graph,
+                    node_ref=seed,
+                    defect_state=defect_state,
+                    hypothesis=sample_hypothesis(defect_state),
+                    limit=1,
+                )
+            ]
+            for seed in ("record:seed_one", "record:seed_two", "record:empty_seed")
+        ]
+
+        self.assertEqual(
+            results,
+            [["record:active_one"], ["record:active_two"], []],
+        )
+
+    def test_revision_contract_separates_subject_identity_from_repository_generation(self):
+        def eligible(
+            candidate_data,
+            *,
+            manifest_revision="git:active",
+            active_generation=None,
+            candidate_event_type="decision",
+        ):
+            records = [
+                {
+                    "record_id": "candidate",
+                    "component": "agent",
+                    "event_type": candidate_event_type,
+                    "data": candidate_data,
+                }
+            ]
+            if active_generation is not None:
+                records.append(
+                    {
+                        "record_id": "current_claim",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "temporal_scope": "current_revision",
+                            "repository_revision": active_generation,
+                        },
+                    }
+                )
+            graph = TraceGraph.from_trace(
+                {
+                    "manifest": {"subject_revision": manifest_revision},
+                    "records": records,
+                }
+            )
+            return active_revision_candidate_eligible(graph, "record:candidate")
+
+        cases = (
+            ("legacy missing", {}, None, True),
+            ("legacy nulls", {"subject_revision": None, "repository_revision": None}, None, True),
+            ("numeric zero without authority", {"repository_revision": 0}, None, True),
+            ("numeric one without authority", {"repository_revision": 1}, None, True),
+            ("numeric N without authority", {"repository_revision": 7}, None, True),
+            ("matching zero", {"repository_revision": 0}, 0, True),
+            ("zero is stale for one", {"repository_revision": 0}, 1, False),
+            ("matching one", {"repository_revision": 1}, 1, True),
+            ("matching N", {"repository_revision": 7}, 7, True),
+            ("stale N", {"repository_revision": 6}, 7, False),
+            ("matching subject", {"subject_revision": "git:active"}, None, True),
+            ("stale subject", {"subject_revision": "git:stale"}, None, False),
+            (
+                "both fields match",
+                {"subject_revision": "git:active", "repository_revision": 7},
+                7,
+                True,
+            ),
+            (
+                "subject mismatch wins",
+                {"subject_revision": "git:stale", "repository_revision": 7},
+                7,
+                False,
+            ),
+            ("matched status", {"revision_status": "matched"}, None, True),
+            ("missing status", {"revision_status": "missing"}, None, False),
+            ("mismatched status", {"revision_status": "mismatched"}, None, False),
+            ("malformed subject", {"subject_revision": 7}, None, False),
+            ("string generation", {"repository_revision": "7"}, 7, False),
+            ("float generation", {"repository_revision": 7.0}, 7, False),
+            ("boolean generation", {"repository_revision": False}, 0, False),
+            ("negative generation", {"repository_revision": -1}, None, False),
+        )
+        for label, candidate_data, active_generation, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(
+                    eligible(
+                        candidate_data,
+                        active_generation=active_generation,
+                    ),
+                    expected,
+                )
+
+        self.assertTrue(
+            eligible(
+                {
+                    "temporal_scope": "current_revision",
+                    "repository_revision": 0,
+                },
+                active_generation=0,
+                candidate_event_type="response.claim",
+            )
+        )
 
     def test_malformed_eligible_edge_from_audit_only_external_source_is_filtered(self):
         trace = {

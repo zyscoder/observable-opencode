@@ -4107,7 +4107,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )
-        decision["data"]["repository_revision"] = "git:active"
+        decision["data"]["subject_revision"] = "git:active"
         report = AgenticRecursiveAnalyzer(
             judge=FusionScriptedJudge(global_outcome="no_defect"),
             fusion_mode="retrieval-global",
@@ -4125,7 +4125,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             (
                 "revision",
                 lambda record: record["data"].update(
-                    {"repository_revision": "git:stale"}
+                    {"subject_revision": "git:stale"}
                 ),
             ),
         ):
@@ -4150,7 +4150,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )
-        decision["data"]["repository_revision"] = "git:stale"
+        decision["data"]["subject_revision"] = "git:stale"
         judge = FusionScriptedJudge(
             global_outcome="candidate_roots",
             selected_candidate_refs=("record:decision",),
@@ -4207,6 +4207,58 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertEqual(leaked_surfaces, [])
 
+    def test_current_numeric_repository_generation_can_reach_root_publication(self):
+        trace = observed_trace()
+        trace["manifest"] = {"subject_revision": "git:active"}
+        decision = next(
+            item for item in trace["records"] if item["record_id"] == "decision"
+        )
+        decision["data"].update(
+            {
+                "subject_revision": "git:active",
+                "repository_revision": 1,
+            }
+        )
+        trace["records"].append(
+            {
+                "record_id": "current_claim",
+                "component": "result",
+                "event_type": "response.claim",
+                "data": {
+                    "temporal_scope": "current_revision",
+                    "repository_revision": 1,
+                },
+            }
+        )
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            selected_candidate_refs=("record:decision",),
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The current decision remains necessary under independent review.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        self.assertEqual(
+            [root.node_ref for root in report.confirmed_roots],
+            ["record:decision"],
+        )
+
     def test_confirmation_queue_revision_filter_preserves_other_seed_candidates(self):
         graph = TraceGraph.from_trace(
             {
@@ -4216,13 +4268,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record_id": "stale",
                         "component": "agent",
                         "event_type": "decision",
-                        "data": {"repository_revision": "git:stale"},
+                        "data": {"subject_revision": "git:stale"},
                     },
                     {
                         "record_id": "active",
                         "component": "agent",
                         "event_type": "decision",
-                        "data": {"repository_revision": "git:active"},
+                        "data": {"subject_revision": "git:active"},
                     },
                 ],
             }

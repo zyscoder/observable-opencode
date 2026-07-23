@@ -93,7 +93,9 @@ class SemanticPredecessorRetriever:
                         [
                             candidate
                             for candidate in self._direct_candidates(graph, resolved)
-                            if graph.evidence_eligible(candidate.ref)
+                            if active_revision_candidate_eligible(
+                                graph, candidate.ref
+                            )
                         ]
                     ],
                     limit=limit,
@@ -123,7 +125,7 @@ class SemanticPredecessorRetriever:
             [
                 candidate
                 for candidate in layer
-                if graph.evidence_eligible(candidate.ref)
+                if active_revision_candidate_eligible(graph, candidate.ref)
             ]
             for layer in layers
         ]
@@ -150,7 +152,12 @@ class SemanticPredecessorRetriever:
         for edge in graph.semantic_predecessor_edges(node_ref):
             ref = str(edge.get("ref") or "")
             node = graph.nodes.get(ref)
-            if not node or is_navigation_node(node) or is_temporal_only_edge(edge):
+            if (
+                not node
+                or is_navigation_node(node)
+                or is_temporal_only_edge(edge)
+                or not active_revision_candidate_eligible(graph, ref)
+            ):
                 continue
             evidence_type = str(edge.get("evidence_type") or "")
             source = "confirmed_edge" if evidence_type in {"confirmed", "content_matched"} else "attribution_edge"
@@ -200,7 +207,14 @@ class SemanticPredecessorRetriever:
                 and not is_navigation_node(graph.nodes[ref])
             ]
         candidates: List[CausalCandidate] = []
-        for ref in dedupe_refs(graph, refs):
+        for ref in dedupe_refs(
+            graph,
+            (
+                ref
+                for ref in refs
+                if active_revision_candidate_eligible(graph, ref)
+            ),
+        ):
             node = graph.nodes.get(ref)
             if not node or ref == node_ref or is_navigation_node(node):
                 continue
@@ -244,7 +258,14 @@ class SemanticPredecessorRetriever:
                 and identity_value(node, "messageid", "message_id") == message_id
             )
         candidates: List[CausalCandidate] = []
-        for ref in dedupe_refs(graph, refs):
+        for ref in dedupe_refs(
+            graph,
+            (
+                ref
+                for ref in refs
+                if active_revision_candidate_eligible(graph, ref)
+            ),
+        ):
             node = graph.nodes.get(ref)
             if not node or ref == node_ref or ref in direct_refs or is_navigation_node(node):
                 continue
@@ -287,7 +308,7 @@ class SemanticPredecessorRetriever:
         ):
             ref = str(match["ref"])
             node = graph.nodes.get(ref)
-            if not node:
+            if not node or not active_revision_candidate_eligible(graph, ref):
                 continue
             score = float(match["score"])
             candidates.append(
@@ -324,6 +345,8 @@ def merge_ranked_candidates(
     routes: List[Tuple[int, int, CausalCandidate]] = []
     for layer_index, layer in enumerate(layers):
         for ordinal, candidate in enumerate(layer):
+            if not active_revision_candidate_eligible(graph, candidate.ref):
+                continue
             routes.append((layer_index, ordinal, candidate))
     grouped: dict[str, List[Tuple[int, int, CausalCandidate]]] = {}
     for route in routes:
@@ -360,6 +383,8 @@ def canonicalize_ranked_candidates(
     routes_by_ref: dict[str, List[CausalCandidate]] = {}
     order: List[str] = []
     for candidate in candidates:
+        if not active_revision_candidate_eligible(graph, candidate.ref):
+            continue
         resolved = graph.resolve(candidate.ref) or candidate.ref
         if resolved not in routes_by_ref:
             order.append(resolved)
@@ -465,6 +490,8 @@ def bound_provenance_envelopes(
     ranked_envelopes: dict[str, List[Tuple[float, int, CausalCandidate]]] = {}
     concrete: List[Tuple[int, CausalCandidate]] = []
     for index, candidate in enumerate(candidates):
+        if not active_revision_candidate_eligible(graph, candidate.ref):
+            continue
         if candidate.node.event_type not in PROVENANCE_ENVELOPE_EVENT_TYPES:
             concrete.append((index, candidate))
             continue
@@ -623,31 +650,8 @@ def root_candidate_eligible(node: TraceNode) -> bool:
 
 
 def active_revision_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
-    """Require a canonical evidence candidate to agree with the active trace revision."""
-    resolved = graph.resolve(str(ref))
-    if (
-        not resolved
-        or resolved not in graph.nodes
-        or not graph.evidence_eligible(resolved)
-    ):
-        return False
-    node = graph.nodes[resolved]
-    data = node.data if isinstance(node.data, Mapping) else {}
-    revision_status = str(data.get("revision_status") or "").strip().lower()
-    if revision_status and revision_status != "matched":
-        return False
-    manifest = (
-        graph.raw_trace.get("manifest")
-        if isinstance(graph.raw_trace.get("manifest"), Mapping)
-        else {}
-    )
-    active_revision = str(manifest.get("subject_revision") or "").strip()
-    revisions = {
-        str(data.get(key) or "").strip()
-        for key in ("subject_revision", "repository_revision")
-        if str(data.get(key) or "").strip()
-    }
-    return not active_revision or not revisions or revisions == {active_revision}
+    """Require a canonical evidence candidate to match active revision identities."""
+    return graph.active_revision_candidate_eligible(ref)
 
 
 def is_evidence_only_node(node: TraceNode) -> bool:

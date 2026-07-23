@@ -18,7 +18,7 @@ from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v4"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v5"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
@@ -604,11 +604,21 @@ def _active_candidate_graph_facts(
             or manifest.get("subject_revision")
             or ""
         ),
-        "repository_revision": str(
-            node.data.get("repository_revision") or ""
+        "repository_revision": (
+            ""
+            if node.data.get("repository_revision") is None
+            else str(node.data.get("repository_revision"))
         ),
-        "revision_before": str(node.data.get("revision_before") or ""),
-        "revision_after": str(node.data.get("revision_after") or ""),
+        "revision_before": (
+            ""
+            if node.data.get("revision_before") is None
+            else str(node.data.get("revision_before"))
+        ),
+        "revision_after": (
+            ""
+            if node.data.get("revision_after") is None
+            else str(node.data.get("revision_after"))
+        ),
         "revision_status": str(node.data.get("revision_status") or ""),
         "offline_only": node.data.get("offline_only"),
         "semantic_role": str(node.data.get("semantic_role") or ""),
@@ -914,33 +924,9 @@ def _action_identity(node: TraceNode) -> str:
 def _action_revision_eligible(
     graph: TraceGraph, candidate: TraceNode, member: TraceNode
 ) -> bool:
-    candidate_data = (
-        candidate.data if isinstance(candidate.data, Mapping) else {}
-    )
-    member_data = member.data if isinstance(member.data, Mapping) else {}
-    revision_status = str(member_data.get("revision_status") or "")
-    if revision_status and revision_status != "matched":
-        return False
-    manifest = (
-        graph.raw_trace.get("manifest")
-        if isinstance(graph.raw_trace.get("manifest"), Mapping)
-        else {}
-    )
-    active_revision = str(
-        manifest.get("subject_revision")
-        or candidate_data.get("repository_revision")
-        or candidate_data.get("subject_revision")
-        or ""
-    )
-    member_revision = str(
-        member_data.get("repository_revision")
-        or member_data.get("subject_revision")
-        or ""
-    )
-    return not (
-        active_revision
-        and member_revision
-        and member_revision != active_revision
+    return (
+        active_revision_candidate_eligible(graph, candidate.ref)
+        and active_revision_candidate_eligible(graph, member.ref)
     )
 
 

@@ -423,6 +423,78 @@ class TraceGraph:
         resolved = self.resolve(ref) or ref
         return resolved in self._evidence_eligible_refs
 
+    def active_repository_revision(self) -> Optional[int]:
+        """Return the current CaseTrace generation only from authoritative records."""
+        cached = getattr(self, "_active_repository_revision", None)
+        if hasattr(self, "_active_repository_revision"):
+            return cached
+        revisions: List[int] = []
+        for node in self.nodes.values():
+            value = None
+            if node.event_type == "response.claim":
+                value = node.data.get("repository_revision")
+            elif (
+                node.event_type == "verification"
+                and node.data.get("effective_for_final_state") is True
+            ):
+                value = node.data.get("repository_revision")
+            elif node.event_type == "change":
+                value = node.data.get("revision_after")
+            if type(value) is int and value >= 0:
+                revisions.append(value)
+        self._active_repository_revision = max(revisions) if revisions else None
+        return self._active_repository_revision
+
+    def active_revision_candidate_eligible(self, ref: str) -> bool:
+        """Apply field-specific subject and repository revision contracts."""
+        resolved = self.resolve(str(ref))
+        if (
+            not resolved
+            or resolved not in self.nodes
+            or not self.evidence_eligible(resolved)
+        ):
+            return False
+        data = self.nodes[resolved].data
+        revision_status = data.get("revision_status")
+        if revision_status not in (None, ""):
+            if (
+                not isinstance(revision_status, str)
+                or revision_status.strip().lower() != "matched"
+            ):
+                return False
+
+        subject_revision = data.get("subject_revision")
+        if subject_revision not in (None, ""):
+            if not isinstance(subject_revision, str):
+                return False
+            manifest = (
+                self.raw_trace.get("manifest")
+                if isinstance(self.raw_trace.get("manifest"), Mapping)
+                else {}
+            )
+            active_subject_revision = manifest.get("subject_revision")
+            if (
+                isinstance(active_subject_revision, str)
+                and active_subject_revision.strip()
+                and subject_revision.strip() != active_subject_revision.strip()
+            ):
+                return False
+
+        repository_revision = data.get("repository_revision")
+        if repository_revision is not None:
+            if (
+                type(repository_revision) is not int
+                or repository_revision < 0
+            ):
+                return False
+            active_repository_revision = self.active_repository_revision()
+            if (
+                active_repository_revision is not None
+                and repository_revision != active_repository_revision
+            ):
+                return False
+        return True
+
     def filter_evidence_refs(self, refs: Iterable[Any]) -> List[str]:
         """Keep unresolved refs and refs to nodes allowed by the evidence policy."""
         output: List[str] = []
@@ -432,6 +504,11 @@ class TraceGraph:
                 continue
             resolved = self.resolve(ref)
             if resolved in self.nodes and not self.evidence_eligible(resolved):
+                continue
+            if (
+                resolved in self.nodes
+                and not self.active_revision_candidate_eligible(resolved)
+            ):
                 continue
             output.append(ref)
         return output
@@ -780,7 +857,10 @@ class TraceGraph:
         resolved = self.resolve(ref) or ref
         output: List[JsonDict] = []
         for upstream_ref in self.upstream_refs(resolved):
-            if not self.edge_endpoints_eligible(upstream_ref, resolved):
+            if (
+                not self.edge_endpoints_eligible(upstream_ref, resolved)
+                or not self.active_revision_candidate_eligible(upstream_ref)
+            ):
                 continue
             for edge in self.edge_context(upstream_ref, resolved):
                 if is_temporal_only_edge(edge) or not edge.get("eligible_for_attribution"):
@@ -813,6 +893,7 @@ class TraceGraph:
                 node.event_type == "progress.episode"
                 or self.position(node.ref) >= before_position
                 or not self.evidence_eligible(node.ref)
+                or not self.active_revision_candidate_eligible(node.ref)
             ):
                 continue
             tokens = set(re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower()))

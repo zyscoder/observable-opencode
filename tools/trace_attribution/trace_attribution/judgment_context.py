@@ -488,7 +488,11 @@ def build_active_defect_fingerprint(*, graph: TraceGraph, path: List[str], objec
         "scope": scope,
         "temporal_anchor": {
             "timestamp": observed.timestamp if observed else "",
-            "repository_revision": data.get("repository_revision") or "",
+            "repository_revision": (
+                ""
+                if data.get("repository_revision") is None
+                else data.get("repository_revision")
+            ),
             "status": observed.status if observed else "",
         },
     }

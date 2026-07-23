@@ -1309,12 +1309,12 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_schema_version_is_v4(self):
+    def test_global_schema_is_v4_and_capsule_schema_is_v5(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
             "global-candidate-judgment/v4",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v4")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v5")
 
     def test_v4_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()

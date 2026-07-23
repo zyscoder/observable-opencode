@@ -21,7 +21,7 @@ from trace_attribution.models import stable_json
 def sample_graph(
     *,
     decision_event_type: str = "decision",
-    decision_revision: str = "git:abc123",
+    decision_revision: int = 0,
 ) -> TraceGraph:
     return TraceGraph.from_trace(
         {
@@ -207,13 +207,13 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "candidate identity"):
                     CandidateEvidenceCapsule.from_dict(payload)
 
-    def test_capsule_v4_round_trip_rejects_stale_v3_identity(self):
+    def test_capsule_v5_round_trip_rejects_stale_v4_identity(self):
         payload = self._decision_capsule().to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v4")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v5")
         self.assertEqual(CandidateEvidenceCapsule.from_dict(payload).to_dict(), payload)
 
-        payload["schema_version"] = "candidate-evidence-capsule/v3"
+        payload["schema_version"] = "candidate-evidence-capsule/v4"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             CandidateEvidenceCapsule.from_dict(payload)
 
@@ -417,6 +417,10 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
 
     def test_action_group_excludes_ineligible_member_with_shared_call_identity(self):
         trace = copy.deepcopy(sample_graph().raw_trace)
+        trace["manifest"] = {"subject_revision": "git:active"}
+        next(
+            item for item in trace["records"] if item["record_id"] == "decision"
+        )["data"]["subject_revision"] = "git:active"
         trace["records"].append(
             {
                 "record_id": "audit_only_external",
@@ -438,7 +442,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 "event_type": "tool.result",
                 "data": {
                     "call_id": "call_1",
-                    "repository_revision": "git:stale",
+                    "subject_revision": "git:stale",
                     "output": "STALE_SHARED_CALL_MEMBER",
                 },
             }
@@ -483,9 +487,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 if item["record_id"] == "decision"
             )
             if revision is None:
-                decision["data"].pop("repository_revision", None)
+                decision["data"].pop("subject_revision", None)
             else:
-                decision["data"]["repository_revision"] = revision
+                decision["data"]["subject_revision"] = revision
             return TraceGraph.from_trace(trace)
 
         def capsules_for(graph, *, source, ref="record:decision"):
@@ -558,6 +562,121 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             (),
         )
 
+    def test_capsule_preserves_zero_and_filters_stale_generation_action_and_evidence_refs(self):
+        trace = copy.deepcopy(sample_graph(decision_revision=0).raw_trace)
+        trace["manifest"] = {"subject_revision": "git:active"}
+        decision = next(
+            item for item in trace["records"] if item["record_id"] == "decision"
+        )
+        decision["data"]["subject_revision"] = "git:active"
+        trace["records"].extend(
+            [
+                {
+                    "record_id": "stale_shared_member",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {
+                        "call_id": "call_1",
+                        "repository_revision": 1,
+                        "output": "STALE_GENERATION_ACTION",
+                    },
+                },
+                {
+                    "record_id": "active_shared_member",
+                    "component": "tool",
+                    "event_type": "tool.result",
+                    "data": {
+                        "call_id": "call_1",
+                        "repository_revision": 0,
+                        "output": "ACTIVE_GENERATION_ACTION",
+                    },
+                },
+                {
+                    "record_id": "stale_evidence",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "repository_revision": 1,
+                        "rationale": "STALE_GENERATION_EVIDENCE",
+                    },
+                },
+                {
+                    "record_id": "active_evidence",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "repository_revision": 0,
+                        "rationale": "ACTIVE_GENERATION_EVIDENCE",
+                    },
+                },
+                {
+                    "record_id": "current_claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "temporal_scope": "current_revision",
+                        "repository_revision": 0,
+                    },
+                },
+            ]
+        )
+        graph = TraceGraph.from_trace(trace)
+        candidate = self._decision_candidate(graph)
+        candidate = CausalCandidate(
+            ref=candidate.ref,
+            node=candidate.node,
+            source=candidate.source,
+            edge={
+                **candidate.edge,
+                "evidence_refs": [
+                    "record:stale_evidence",
+                    "record:active_evidence",
+                ],
+            },
+            score=candidate.score,
+            evidence_refs=(
+                "record:stale_evidence",
+                "record:active_evidence",
+            ),
+        )
+
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+        )[0].to_dict()
+
+        self.assertEqual(
+            capsule["candidate"]["active_graph_facts"]["repository_revision"],
+            "0",
+        )
+        self.assertIn("record:active_shared_member", str(capsule["action_group"]))
+        self.assertNotIn("record:stale_shared_member", str(capsule["action_group"]))
+        evidence_refs = {
+            item["raw_ref"]
+            for item in capsule["evidence_references"]
+        }
+        self.assertIn("record:active_evidence", evidence_refs)
+        self.assertNotIn("record:stale_evidence", evidence_refs)
+        self.assertNotIn(
+            "record:stale_evidence",
+            capsule["candidate"]["retrieval_edge"]["evidence_refs"],
+        )
+        self.assertNotIn("STALE_GENERATION_EVIDENCE", str(capsule))
+
     def test_synthetic_route_cannot_launder_itself_as_empty_recorded_source(self):
         graph, authoritative, capsule = self._synthetic_prompt_capsule()
         payload = capsule.to_dict()
@@ -600,7 +719,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         graph = sample_graph()
         payload = self._decision_capsule(graph).to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v4")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v5")
         self.assertEqual(
             set(payload["validation_source"]),
             {
@@ -690,7 +809,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
 
         for label, active_graph in (
             ("event type", sample_graph(decision_event_type="tool.result")),
-            ("revision", sample_graph(decision_revision="git:stale")),
+            ("revision", sample_graph(decision_revision=1)),
         ):
             with self.subTest(case=label):
                 with self.assertRaisesRegex(ValueError, "active graph"):
