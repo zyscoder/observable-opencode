@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .artifact_reader import VerifiedArtifactReader
-from .evaluation_facts import reconstruct_external_evaluation_record
+from .evaluation_facts import (
+    reconstruct_external_evaluation_record,
+    trace_execution_revision,
+)
 from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
@@ -431,20 +434,64 @@ class TraceGraph:
             return cached
         revisions: List[int] = []
         for node in self.nodes.values():
-            value = None
-            if node.event_type == "response.claim":
-                value = node.data.get("repository_revision")
-            elif (
-                node.event_type == "verification"
-                and node.data.get("effective_for_final_state") is True
-            ):
-                value = node.data.get("repository_revision")
-            elif node.event_type == "change":
-                value = node.data.get("revision_after")
-            if type(value) is int and value >= 0:
+            value = self._eligible_repository_revision_authority(node)
+            if value is not None:
                 revisions.append(value)
         self._active_repository_revision = max(revisions) if revisions else None
         return self._active_repository_revision
+
+    def _eligible_repository_revision_authority(
+        self,
+        node: TraceNode,
+    ) -> Optional[int]:
+        if not self.evidence_eligible(node.ref):
+            return None
+        data = node.data
+        if (
+            data.get("audit_only") is True
+            or data.get("offline_only") is True
+            or data.get("eligible_for_attribution") is False
+            or str(data.get("behavior_impact") or "").strip().lower()
+            in {"none", "none_offline_analysis_only"}
+        ):
+            return None
+        revision_status = data.get("revision_status")
+        if revision_status not in (None, "") and (
+            not isinstance(revision_status, str)
+            or revision_status.strip().lower() != "matched"
+        ):
+            return None
+        provenance_status = data.get("revision_provenance_status")
+        if provenance_status not in (None, "") and (
+            not isinstance(provenance_status, str)
+            or provenance_status.strip().lower() != "valid"
+        ):
+            return None
+        subject_revision = data.get("subject_revision")
+        if subject_revision not in (None, ""):
+            active_subject_revision, active_provenance_status = (
+                trace_execution_revision(self.raw_trace)
+            )
+            if (
+                not isinstance(subject_revision, str)
+                or active_provenance_status != "valid"
+                or subject_revision.strip()
+                != str(active_subject_revision or "").strip()
+            ):
+                return None
+        value = None
+        if node.event_type == "response.claim":
+            value = data.get("repository_revision")
+        elif (
+            node.event_type == "verification"
+            and data.get("effective_for_final_state") is True
+        ):
+            value = data.get("repository_revision")
+        elif node.event_type == "change":
+            value = data.get("revision_after")
+        if type(value) is not int or value < 0:
+            return None
+        return value
 
     def active_revision_evidence_eligible(self, ref: str) -> bool:
         """Require canonical evidence to satisfy active revision contracts."""

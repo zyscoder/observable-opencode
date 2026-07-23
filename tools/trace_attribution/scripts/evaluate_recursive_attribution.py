@@ -22,6 +22,9 @@ from trace_attribution.causal_state import (
 )
 from trace_attribution.graph import TraceGraph, collect_artifact_ids, resolve_edge_endpoint
 from trace_attribution.models import TraceNode, stable_json
+from trace_attribution.recursive_analyzer import (
+    validate_recursive_report_against_graph,
+)
 
 
 JsonDict = Dict[str, Any]
@@ -1008,6 +1011,16 @@ def _trace_backed_safety_violations(
         parsed = RecursiveAttributionReport.from_dict(dict(report))
     except (TypeError, ValueError) as exc:
         raise EvaluationSafetyError("strict_report_invalid:{0}".format(exc))
+    try:
+        validate_recursive_report_against_graph(
+            graph,
+            parsed,
+            label="evaluator report",
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvaluationSafetyError(
+            "strict_report_action_reconciliation:{0}".format(exc)
+        ) from exc
     if _without_projection_fields(report) != _without_projection_fields(parsed.to_dict()):
         violations.append("strict_report_canonical_schema_mismatch")
     if parsed.case_id != graph.case_id or parsed.case_id != labels["case_id"]:

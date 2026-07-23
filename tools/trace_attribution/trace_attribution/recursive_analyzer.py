@@ -6,6 +6,7 @@ import copy
 import hashlib
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -825,6 +826,17 @@ def _quarantine_stale_seed_report_payload(
             for item in metadata.get(key) or ()
             if keep_owned_local_state(item, label=key)
         ]
+    metadata["introduction_bindings"] = [
+        item
+        for item in metadata.get("introduction_bindings") or ()
+        if not isinstance(item, Mapping)
+        or str(
+            item.get("seed_key")
+            or item.get("seed_binding_identity")
+            or ""
+        )
+        not in stale_seed_keys
+    ]
     retained_global_passes = [
         item
         for item in payload["investigation_journal"]
@@ -844,6 +856,126 @@ def _quarantine_stale_seed_report_payload(
     }
     payload["metadata"] = metadata
     return payload
+
+
+def _canonical_multiset(values: Iterable[Any]) -> Counter:
+    return Counter(
+        stable_json(_checkpoint_json(value))
+        for value in values
+    )
+
+
+def _require_canonical_bijection(
+    authoritative: Iterable[Any],
+    derived: Iterable[Any],
+    *,
+    label: str,
+) -> None:
+    if _canonical_multiset(authoritative) != _canonical_multiset(derived):
+        raise ValueError(
+            "{0} owner/payload multiset must bijectively match "
+            "authoritative actions".format(label)
+        )
+
+
+def _completed_global_passes(
+    investigation_journal: Iterable[Any],
+) -> List[Mapping[str, Any]]:
+    return [
+        item
+        for item in investigation_journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+        and item.get("status") == "completed"
+    ]
+
+
+def _global_passes_by_owner(
+    investigation_journal: Iterable[Any],
+) -> Dict[str, Mapping[str, Any]]:
+    output = {}
+    for action in _completed_global_passes(investigation_journal):
+        owner = LocalStateOwner.from_dict(action.get("owner"))
+        key = stable_json(owner.to_dict())
+        if key in output:
+            raise ValueError(
+                "completed global pass actions contain a duplicate owner"
+            )
+        output[key] = action
+    return output
+
+
+def _owned_payload(value: Mapping[str, Any], owner: Any) -> JsonDict:
+    return {
+        **copy.deepcopy(dict(value)),
+        "owner": copy.deepcopy(owner),
+    }
+
+
+def _validate_global_pass_derivations(
+    investigation_journal: Iterable[Any],
+    metadata: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    journal = tuple(investigation_journal)
+    global_passes = [
+        item
+        for item in journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+    ]
+    completed_passes = _completed_global_passes(journal)
+    _global_passes_by_owner(completed_passes)
+    expected_judgments = [
+        _owned_payload(action["judgment"], action["owner"])
+        for action in completed_passes
+        if isinstance(action.get("judgment"), Mapping)
+    ]
+    expected_compression = [
+        _owned_payload(action["candidate_compression"], action["owner"])
+        for action in completed_passes
+        if isinstance(action.get("candidate_compression"), Mapping)
+    ]
+    expected_expansions = [
+        _owned_payload(expansion, action["owner"])
+        for action in completed_passes
+        if isinstance(action.get("judgment"), Mapping)
+        for expansion in action["judgment"].get("expansion_requests") or ()
+        if isinstance(expansion, Mapping)
+    ]
+    _require_canonical_bijection(
+        expected_judgments,
+        metadata.get("global_candidate_judgments") or (),
+        label="{0} global candidate judgments".format(label),
+    )
+    _require_canonical_bijection(
+        expected_compression,
+        metadata.get("candidate_compression") or (),
+        label="{0} candidate compression".format(label),
+    )
+    _require_canonical_bijection(
+        expected_expansions,
+        metadata.get("recursive_expansion_reasons") or (),
+        label="{0} expansion reasons".format(label),
+    )
+    expected_physical_requests = sum(
+        int(action.get("physical_request_delta") or 0)
+        for action in completed_passes
+    )
+    if (
+        int(metadata.get("global_candidate_pass_count") or 0)
+        != len(completed_passes)
+        or int(metadata.get("global_judge_physical_request_count") or 0)
+        != expected_physical_requests
+        or str(metadata.get("fusion_mode") or "")
+        != ("retrieval-global" if global_passes else "off")
+    ):
+        raise ValueError(
+            "{0} global pass metadata contradicts authoritative actions".format(
+                label
+            )
+        )
 
 
 def _validate_restored_report_local_state_owners(
@@ -884,6 +1016,10 @@ def _validate_restored_report_local_state_owners(
             copy.deepcopy(dict(item))
             for item in report.investigation_journal
         ],
+        introduction_bindings=copy.deepcopy(
+            list(metadata.get("introduction_bindings") or ())
+        ),
+        confirmations=list(report.confirmations),
         confirmation_queue=copy.deepcopy(
             list(metadata.get("confirmation_queue") or ())
         ),
@@ -904,108 +1040,22 @@ def _validate_restored_report_local_state_owners(
         for hypothesis in ledger.hypotheses_by_id().values()
     }
     state._validate_local_state_owners()
-
-    completed_passes = [
-        item
-        for item in state.investigation_journal
-        if isinstance(item, Mapping)
-        and item.get("kind") == "global_candidate_pass"
-        and item.get("status") == "completed"
-    ]
-    global_judgments = list(
-        metadata.get("global_candidate_judgments") or ()
+    _validate_global_pass_derivations(
+        state.investigation_journal,
+        metadata,
+        label="restored report",
     )
-    candidate_compression = list(
-        metadata.get("candidate_compression") or ()
-    )
-    expansion_reasons = list(
-        metadata.get("recursive_expansion_reasons") or ()
-    )
-    expected_expansion_count = sum(
-        len(
-            event["judgment"].get("expansion_requests") or ()
-            if isinstance(event.get("judgment"), Mapping)
-            else ()
-        )
-        for event in completed_passes
-    )
-    if (
-        len(global_judgments) != len(completed_passes)
-        or len(candidate_compression) != len(completed_passes)
-        or len(expansion_reasons) != expected_expansion_count
-        or int(metadata.get("global_candidate_pass_count") or 0)
-        != len(completed_passes)
-    ):
-        raise ValueError(
-            "restored report global candidate judgment owner coverage "
-            "contradicts global pass actions"
-        )
 
-    def derived_global_entry_matches(
-        entry: Mapping[str, Any],
-        *,
-        source_key: str,
-    ) -> bool:
-        owner = LocalStateOwner.from_dict(entry.get("owner"))
-        payload = {
-            key: copy.deepcopy(value)
-            for key, value in entry.items()
-            if key != "owner"
-        }
-        matches = [
-            event
-            for event in completed_passes
-            if LocalStateOwner.from_dict(event.get("owner")) == owner
-            and isinstance(event.get(source_key), Mapping)
-            and stable_json(_checkpoint_json(event[source_key]))
-            == stable_json(_checkpoint_json(payload))
-        ]
-        return len(matches) == 1
 
-    for label, key in (
-        ("global candidate judgment", "judgment"),
-        ("candidate compression", "candidate_compression"),
-    ):
-        for entry in (
-            global_judgments if key == "judgment" else candidate_compression
-        ):
-            if not isinstance(entry, Mapping) or not derived_global_entry_matches(
-                entry,
-                source_key=key,
-            ):
-                raise ValueError(
-                    "restored report {0} owner contradicts global pass".format(
-                        label
-                    )
-                )
-
-    for entry in expansion_reasons:
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                "restored report expansion owner entry must be an object"
-            )
-        owner = LocalStateOwner.from_dict(entry.get("owner"))
-        payload = {
-            key: copy.deepcopy(value)
-            for key, value in entry.items()
-            if key != "owner"
-        }
-        matches = [
-            event
-            for event in completed_passes
-            if LocalStateOwner.from_dict(event.get("owner")) == owner
-            and isinstance(event.get("judgment"), Mapping)
-            and stable_json(_checkpoint_json(payload))
-            in {
-                stable_json(_checkpoint_json(item))
-                for item in event["judgment"].get("expansion_requests") or ()
-                if isinstance(item, Mapping)
-            }
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                "restored report expansion owner contradicts global pass"
-            )
+def validate_recursive_report_against_graph(
+    graph: TraceGraph,
+    report: RecursiveAttributionReport,
+    *,
+    label: str,
+) -> None:
+    """Apply the analyzer's exact restore validation to a report."""
+    _assert_report_grounded_evidence(graph, report, label=label)
+    _validate_restored_report_local_state_owners(graph, report)
 
 
 def _assert_published_non_root_factors(
@@ -2133,7 +2183,299 @@ class RecursiveAnalysisState:
             output.append(evidence)
         return output
 
-    def _validate_local_state_owners(self) -> None:
+    def _validate_action_payload_reconciliation(
+        self,
+        action_records: Iterable[Any] = (),
+    ) -> None:
+        passes_by_owner = _global_passes_by_owner(
+            self.investigation_journal
+        )
+        matched_pass_owners = set()
+        expected_decisive_evidence: Dict[str, Dict[str, JsonDict]] = {
+            key: {} for key in self.seed_ledger
+        }
+        expected_candidate_refs: Dict[str, Set[str]] = {
+            key: set() for key in self.seed_ledger
+        }
+        for binding in self.introduction_bindings:
+            if not isinstance(binding, Mapping):
+                continue
+            seed_key = str(
+                binding.get("seed_key")
+                or binding.get("seed_binding_identity")
+                or ""
+            )
+            candidate_ref = str(binding.get("candidate_ref") or "")
+            if seed_key in expected_candidate_refs and candidate_ref:
+                expected_candidate_refs[seed_key].add(candidate_ref)
+        for builder in self.seed_ledger.values():
+            judgment = builder.global_judgment
+            expected_expansion = []
+            if judgment:
+                owner = LocalStateOwner.from_dict(judgment.get("owner"))
+                owner_key = stable_json(owner.to_dict())
+                action = passes_by_owner.get(owner_key)
+                if action is None:
+                    raise ValueError(
+                        "seed global judgment has no completed pass action"
+                    )
+                matched_pass_owners.add(owner_key)
+                persisted_judgment = {
+                    key: copy.deepcopy(value)
+                    for key, value in judgment.items()
+                    if key
+                    not in {
+                        "schema_version",
+                        "validation_envelope",
+                        "owner",
+                    }
+                }
+                if stable_json(_checkpoint_json(persisted_judgment)) != stable_json(
+                    _checkpoint_json(action.get("judgment"))
+                ):
+                    raise ValueError(
+                        "seed global judgment payload contradicts pass action"
+                    )
+                capsules = action.get("candidate_evidence_capsules")
+                compression = action.get("candidate_compression")
+                envelope = judgment.get("validation_envelope")
+                if (
+                    not isinstance(capsules, (list, tuple))
+                    or not isinstance(compression, Mapping)
+                    or not isinstance(envelope, Mapping)
+                ):
+                    raise ValueError(
+                        "completed global pass action payload is incomplete"
+                    )
+                expected_envelope = {
+                    "schema_version": envelope.get("schema_version"),
+                    "case_id": self.graph.case_id,
+                    "objective": self.objective,
+                    "analysis_perspective": self.analysis_perspective,
+                    "seed_ref": builder.start_ref,
+                    "active_defect": builder.defect_state.to_dict(),
+                    "active_focus_text": builder.defect_state.actual,
+                    "active_focus_text_hash": active_focus_text_sha256(
+                        builder.defect_state.actual
+                    ),
+                    "start_refs": [builder.start_ref],
+                    "trace_health": {
+                        "missing_artifact_count": sum(
+                            len(capsule.get("missing_evidence_refs") or ())
+                            for capsule in capsules
+                            if isinstance(capsule, Mapping)
+                        ),
+                        "candidate_compression": copy.deepcopy(
+                            dict(compression)
+                        ),
+                    },
+                    "candidate_evidence_capsules": copy.deepcopy(
+                        list(capsules)
+                    ),
+                }
+                if stable_json(_checkpoint_json(envelope)) != stable_json(
+                    _checkpoint_json(expected_envelope)
+                ):
+                    raise ValueError(
+                        "seed global judgment validation envelope "
+                        "contradicts pass action"
+                    )
+                expected_expansion = [
+                    _owned_payload(item, owner.to_dict())
+                    for item in (
+                        action.get("judgment", {}).get(
+                            "expansion_requests"
+                        )
+                        or ()
+                    )
+                    if isinstance(item, Mapping)
+                ]
+                expected_candidate_refs[builder.key].update(
+                    str(capsule.get("candidate_ref") or "")
+                    for capsule in capsules
+                    if isinstance(capsule, Mapping)
+                    and str(capsule.get("candidate_ref") or "")
+                )
+                for ref in (
+                    action.get("judgment", {}).get(
+                        "decisive_evidence_refs"
+                    )
+                    or ()
+                ):
+                    payload = {
+                        "ref": str(ref),
+                        "owner": owner.to_dict(),
+                    }
+                    expected_decisive_evidence[builder.key][
+                        stable_json(payload)
+                    ] = payload
+            _require_canonical_bijection(
+                expected_expansion,
+                builder.expansion_history,
+                label="seed expansion history",
+            )
+
+        if matched_pass_owners != set(passes_by_owner):
+            raise ValueError(
+                "completed global pass action has no unique seed judgment"
+            )
+
+        journal_entries = []
+        for item in self.confirmation_journal:
+            if not isinstance(item, Mapping):
+                continue
+            if isinstance(item.get("confirmation"), Mapping):
+                journal_entries.append(item)
+                continue
+            if item.get("status") or item.get("candidate_ref"):
+                raise ValueError(
+                    "confirmation journal action payload is incomplete"
+                )
+        journal_confirmations = []
+        journal_projection = []
+        projection_keys = (
+            "semantic_identity",
+            "candidate_ref",
+            "hypothesis_id",
+            "defect_fingerprint",
+            "seed_binding_identity",
+            "seed_key",
+            "owner",
+            "recursive_path",
+            "status",
+            "confirmation",
+        )
+        for entry in journal_entries:
+            confirmation = entry.get("confirmation")
+            owner = LocalStateOwner.from_dict(entry.get("owner"))
+            parsed = RootConfirmation.from_dict(dict(confirmation))
+            if (
+                str(entry.get("candidate_ref") or "")
+                != parsed.candidate_ref
+                or str(entry.get("hypothesis_id") or "")
+                != parsed.hypothesis_id
+                or str(entry.get("defect_fingerprint") or "")
+                != parsed.defect_fingerprint
+                or str(entry.get("seed_binding_identity") or "")
+                != parsed.seed_binding_identity
+                or str(entry.get("seed_key") or "")
+                != parsed.seed_binding_identity
+                or str(entry.get("status") or "") != parsed.status
+                or tuple(entry.get("recursive_path") or ())
+                != parsed.recursive_path
+                or owner.seed_binding_identity
+                != parsed.seed_binding_identity
+                or owner.hypothesis_id != parsed.hypothesis_id
+            ):
+                raise ValueError(
+                    "confirmation journal fields contradict action payload"
+                )
+            journal_confirmations.append(copy.deepcopy(dict(confirmation)))
+            journal_projection.append(
+                {
+                    key: copy.deepcopy(entry.get(key))
+                    for key in projection_keys
+                }
+            )
+            expected = expected_decisive_evidence.get(
+                parsed.seed_binding_identity
+            )
+            if expected is None:
+                raise ValueError(
+                    "confirmation action has no seed ledger owner"
+                )
+            expected_candidate_refs[
+                parsed.seed_binding_identity
+            ].add(parsed.candidate_ref)
+            for ref in parsed.evidence_refs:
+                payload = {
+                    "ref": ref,
+                    "owner": owner.to_dict(),
+                }
+                expected[stable_json(payload)] = payload
+
+        _require_canonical_bijection(
+            (item.to_dict() for item in self.confirmations),
+            journal_confirmations,
+            label="confirmation journal payloads",
+        )
+        _require_canonical_bijection(
+            journal_projection,
+            (
+                {
+                    key: copy.deepcopy(entry.get(key))
+                    for key in projection_keys
+                }
+                for entry in self.confirmation_queue
+                if isinstance(entry, Mapping)
+                and isinstance(entry.get("confirmation"), Mapping)
+            ),
+            label="confirmation queue actions",
+        )
+        completed_action_confirmations = [
+            copy.deepcopy(dict(item["payload"]["confirmation"]))
+            for item in action_records
+            if isinstance(item, Mapping)
+            and str(item.get("operation") or "")
+            in {"confirmation_completed", "confirmation_failed"}
+            and isinstance(item.get("payload"), Mapping)
+            and isinstance(item["payload"].get("confirmation"), Mapping)
+            and str(
+                item["payload"]["confirmation"].get(
+                    "seed_binding_identity"
+                )
+                or ""
+            )
+            in self.seed_ledger
+            and "start_ref_active_revision_ineligible"
+            not in self.seed_ledger[
+                str(
+                    item["payload"]["confirmation"].get(
+                        "seed_binding_identity"
+                    )
+                    or ""
+                )
+            ].blocking_reasons
+        ]
+        if completed_action_confirmations:
+            completed_identities = {
+                str(item.get("confirmation_identity") or "")
+                for item in completed_action_confirmations
+            }
+            _require_canonical_bijection(
+                (
+                    item
+                    for item in journal_confirmations
+                    if str(item.get("confirmation_identity") or "")
+                    in completed_identities
+                ),
+                completed_action_confirmations,
+                label="completed confirmation actions",
+            )
+        for builder in self.seed_ledger.values():
+            if expected_candidate_refs[builder.key] != builder.candidate_refs:
+                raise ValueError(
+                    "seed candidate refs contradict action payloads"
+                )
+            expected = tuple(
+                expected_decisive_evidence[builder.key].values()
+            )
+            _require_canonical_bijection(
+                expected,
+                builder.decisive_evidence,
+                label="seed decisive evidence",
+            )
+            if {item["ref"] for item in expected} != set(
+                builder.decisive_evidence_refs
+            ):
+                raise ValueError(
+                    "seed decisive evidence refs contradict action payloads"
+                )
+
+    def _validate_local_state_owners(
+        self,
+        action_records: Iterable[Any] = (),
+    ) -> None:
         items_by_visit = self._frontier_items_by_visit()
         for visit_key in (
             set(self.visit_evidence)
@@ -2335,6 +2677,7 @@ class RecursiveAnalysisState:
                         raise ValueError(
                             "{0} owner contradicts exact occurrence".format(label)
                         )
+        self._validate_action_payload_reconciliation(action_records)
 
     def seed_results(self) -> Tuple[SeedAttributionResult, ...]:
         return tuple(
@@ -3244,7 +3587,15 @@ class RecursiveAnalysisState:
             rejected_candidates=state.rejected_candidates,
             label="restored recursive state",
         )
-        state._validate_local_state_owners()
+        snapshot_transaction = int(
+            action_record.get("transaction_sequence") or 0
+        )
+        state._validate_local_state_owners(
+            item
+            for item in checkpoint.actions
+            if int(item.get("transaction_sequence") or 0)
+            <= snapshot_transaction
+        )
         return state
 
     def build_step_request(
@@ -4989,10 +5340,7 @@ class AgenticRecursiveAnalyzer:
                     allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(final_report)
-                _validate_restored_report_local_state_owners(
-                    analysis_graph, report
-                )
-                _assert_report_grounded_evidence(
+                validate_recursive_report_against_graph(
                     analysis_graph,
                     report,
                     label="restored completed report",
@@ -5036,10 +5384,7 @@ class AgenticRecursiveAnalyzer:
                     allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(pending_report)
-                _validate_restored_report_local_state_owners(
-                    analysis_graph, report
-                )
-                _assert_report_grounded_evidence(
+                validate_recursive_report_against_graph(
                     analysis_graph,
                     report,
                     label="restored pending report",

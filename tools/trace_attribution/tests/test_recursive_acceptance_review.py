@@ -666,6 +666,37 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             for confirmation in report["confirmations"]:
                 if confirmation["confirmation_identity"] == identity:
                     confirmation["evidence_refs"] = ["artifact:proof"]
+            journal_entry = next(
+                item
+                for item in report["metadata"]["confirmation_journal"]
+                if item["confirmation"]["confirmation_identity"] == identity
+            )
+            journal_entry["confirmation"]["evidence_refs"] = [
+                "artifact:proof"
+            ]
+            queue_entry = next(
+                item
+                for item in report["metadata"]["confirmation_queue"]
+                if item["confirmation"]["confirmation_identity"] == identity
+            )
+            queue_entry["confirmation"]["evidence_refs"] = ["artifact:proof"]
+            seed = next(
+                item
+                for item in report["seed_results"]
+                if identity in item["confirmation_identities"]
+            )
+            seed["decisive_evidence_refs"] = [
+                "artifact:proof"
+                if ref == root_item["node_ref"]
+                else ref
+                for ref in seed["decisive_evidence_refs"]
+            ]
+            for evidence in seed["decisive_evidence"]:
+                if (
+                    evidence["ref"] == root_item["node_ref"]
+                    and evidence["owner"] == journal_entry["owner"]
+                ):
+                    evidence["ref"] = "artifact:proof"
 
             self.assertTrue(compare_report(report, labels, None, graph=graph)["safety"]["passed"])
 

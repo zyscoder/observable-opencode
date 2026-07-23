@@ -203,7 +203,7 @@ def _build_external_evaluation_record(
     aliases: Dict[str, Set[str]],
 ) -> Tuple[JsonDict, List[Tuple[str, str]]]:
     record_id = _external_evaluation_record_id(payload)
-    trace_revision, revision_provenance_status = _trace_execution_revision(trace)
+    trace_revision, revision_provenance_status = trace_execution_revision(trace)
     revision_status = revision_provenance_status
     if trace_revision is not None:
         revision_status = (
@@ -376,7 +376,9 @@ def _validate_json_safe(value: Any) -> None:
     raise ValueError("unsupported value type {0}".format(type(value).__name__))
 
 
-def _trace_execution_revision(trace: JsonDict) -> Tuple[Optional[str], str]:
+def trace_execution_revision(
+    trace: JsonDict,
+) -> Tuple[Optional[str], str]:
     manifest = trace.get("manifest")
     if not isinstance(manifest, dict):
         return None, "missing"
@@ -403,6 +405,9 @@ def _trace_execution_revision(trace: JsonDict) -> Tuple[Optional[str], str]:
     ):
         return None, "unprovenanced"
     return revision, "valid"
+
+
+_trace_execution_revision = trace_execution_revision
 
 
 def _record_alias_index(records: Iterable[Any]) -> Dict[str, Set[str]]:
