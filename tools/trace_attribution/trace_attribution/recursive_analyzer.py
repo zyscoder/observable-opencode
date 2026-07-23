@@ -41,6 +41,7 @@ from .causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     confirmation_identity_for,
+    is_definitive_confirmation,
     seed_binding_identity_for,
     validate_confirmation_ownership,
 )
@@ -1034,8 +1035,15 @@ class SeedAttributionBuilder:
             )
             self.confirmed_root_refs.add(confirmation.candidate_ref)
             return
-        if confirmation.status == "unknown":
-            self.mark_unresolved("root_confirmation_unknown", confirmation.reason)
+        if not is_definitive_confirmation(confirmation):
+            self.mark_unresolved(
+                (
+                    "root_confirmation_unknown"
+                    if confirmation.status == "unknown"
+                    else "root_confirmation_unresolved"
+                ),
+                confirmation.reason,
+            )
 
     def to_result(self) -> SeedAttributionResult:
         if self.blocking_reasons or self.missing_evidence:
@@ -4321,7 +4329,10 @@ class AgenticRecursiveAnalyzer:
             ):
                 state._increment_budget("judge_requests")
             self._record_confirmation(state, queued, confirmation, physical_delta)
-            if confirmation.status == "rejected":
+            if (
+                confirmation.status == "rejected"
+                and is_definitive_confirmation(confirmation)
+            ):
                 backtrack_id = str(
                     state.confirmation_journal[-1].get(
                         "backtracked_to_hypothesis_id"
@@ -4418,7 +4429,7 @@ class AgenticRecursiveAnalyzer:
                 if target is None:
                     block(source_identity, "competitor_confirmation_missing")
                     continue
-                if target.status == "unknown":
+                if not is_definitive_confirmation(target):
                     block(source_identity, "competitor_confirmation_unresolved")
                     continue
                 if target.status == "rejected":
@@ -4793,6 +4804,28 @@ class AgenticRecursiveAnalyzer:
                 )
             )
             return
+        if not is_definitive_confirmation(confirmation):
+            state.unresolved_hypothesis_ids.add(hypothesis_id)
+            if confirmation.candidate_ref not in state.unresolved_refs:
+                state.unresolved_refs.append(confirmation.candidate_ref)
+            reason = (
+                "root_confirmation_unknown"
+                if confirmation.status == "unknown"
+                else "root_confirmation_unresolved"
+            )
+            state.unresolved_branches.append(
+                {
+                    "node_ref": confirmation.candidate_ref,
+                    "defect_state_id": "defect:{0}".format(
+                        confirmation.defect_fingerprint
+                    ),
+                    "hypothesis_id": hypothesis_id,
+                    "reason": reason,
+                    "details": confirmation.reason,
+                    "depth": max(0, len(confirmation.recursive_path) - 1),
+                }
+            )
+            return
         if confirmation.status == "rejected":
             state.introduction_hypothesis_ids.discard(hypothesis_id)
             state.unresolved_hypothesis_ids.discard(hypothesis_id)
@@ -4877,21 +4910,6 @@ class AgenticRecursiveAnalyzer:
                 else "no_queued_unresolved_alternative"
             )
             return
-
-        state.unresolved_hypothesis_ids.add(hypothesis_id)
-        state.unresolved_refs.append(confirmation.candidate_ref)
-        state.unresolved_branches.append(
-            {
-                "node_ref": confirmation.candidate_ref,
-                "defect_state_id": "defect:{0}".format(
-                    confirmation.defect_fingerprint
-                ),
-                "hypothesis_id": hypothesis_id,
-                "reason": "root_confirmation_unknown",
-                "details": confirmation.reason,
-                "depth": max(0, len(confirmation.recursive_path) - 1),
-            }
-        )
 
     def _rank_confirmed_roots(self, state: RecursiveAnalysisState) -> None:
         perspective = _perspective_tokens(state.analysis_perspective)

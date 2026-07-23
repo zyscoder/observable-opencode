@@ -30,6 +30,7 @@ from .causal_state import (
     semantic_occurrence_index,
     semantic_visit_key,
     confirmation_identity_for,
+    is_definitive_confirmation,
     seed_binding_identity_for,
 )
 from .checkpoint import (
@@ -118,6 +119,7 @@ __all__ = [
     "semantic_occurrence_index",
     "semantic_visit_key",
     "confirmation_identity_for",
+    "is_definitive_confirmation",
     "normalize_active_focus_text",
     "seed_binding_identity_for",
     "build_checkpoint_config",

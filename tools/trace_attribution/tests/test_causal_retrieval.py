@@ -370,8 +370,37 @@ class CausalRetrievalTest(unittest.TestCase):
         }
         self.assertEqual(taxonomy_derived, expected)
 
-        repository_extensions = {"case.quality_gap", "mcp.result"}
-        for event_type in sorted(expected | repository_extensions):
+        fixture_types = set()
+        fixture_root = Path(__file__).parent / "fixtures" / "recursive_cases"
+        for fixture_path in fixture_root.glob("*.json"):
+            fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+            fixture_types.update(
+                str(record.get("event_type") or "")
+                for record in fixture.get("records", [])
+                if record.get("event_type")
+            )
+        repository_types = formal_types | fixture_types | {"case.quality_gap", "mcp.result"}
+        repository_derived = {
+            event_type
+            for event_type in repository_types
+            if event_type.startswith("case.")
+            or event_type == "observation"
+            or event_type == "verification"
+            or event_type.endswith(
+                (
+                    ".observation",
+                    ".result",
+                    ".error",
+                    ".fact",
+                    "_fact",
+                    "support_assessment",
+                )
+            )
+        }
+        self.assertIn("subagent.result", repository_derived)
+        self.assertIn("case.observed_success", repository_derived)
+
+        for event_type in sorted(repository_derived):
             with self.subTest(event_type=event_type):
                 node = TraceGraph.from_trace(
                     {
@@ -386,6 +415,29 @@ class CausalRetrievalTest(unittest.TestCase):
                     }
                 ).nodes["record:candidate"]
                 self.assertFalse(root_candidate_eligible(node))
+
+        authored_types = {
+            "change",
+            "context.compaction",
+            "decision",
+            "prompt.assembly",
+        }
+        self.assertTrue(authored_types.issubset(repository_types))
+        for event_type in sorted(authored_types):
+            with self.subTest(authored_event_type=event_type):
+                node = TraceGraph.from_trace(
+                    {
+                        "case_id": "formal-authored-root-taxonomy",
+                        "records": [
+                            {
+                                "record_id": "candidate",
+                                "component": "processor",
+                                "event_type": event_type,
+                            }
+                        ],
+                    }
+                ).nodes["record:candidate"]
+                self.assertTrue(root_candidate_eligible(node))
 
     def test_canonical_root_contract_excludes_external_evaluation_facts(self):
         graph = TraceGraph.from_trace(

@@ -1139,6 +1139,43 @@ class SeedAttributionModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
             RecursiveAttributionReport.from_dict(payload)
 
+    def test_unknown_counterfactual_rejection_requires_blocking_owner_seed_semantics(self):
+        base_seed = seed_result("record:seed", "inconclusive")
+        confirmation = replace(
+            RootConfirmation(
+                candidate_ref="record:root",
+                status="rejected",
+                reason="The counterfactual evidence remains unresolved.",
+                counterfactual_status="unknown",
+                factor_role="unknown",
+            ),
+            hypothesis_id="hyp:rejected-unresolved",
+            hypothesis_semantic_hash="semantic:rejected-unresolved",
+            defect_fingerprint=base_seed.defect_fingerprint,
+            recursive_path=("record:root", base_seed.start_ref),
+            seed_binding_identity=seed_binding_identity_for(
+                base_seed.start_ref, base_seed.defect_fingerprint
+            ),
+        )
+        owner = replace(
+            base_seed,
+            outcome="no_defect",
+            confirmation_identities=(confirmation.confirmation_identity,),
+            missing_evidence=(),
+            blocking_reasons=(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
+            RecursiveAttributionReport(
+                case_id="unresolved-rejected-owner",
+                objective="Keep incomplete rejection evidence unresolved.",
+                start_refs=(owner.start_ref,),
+                seed_results=(owner,),
+                defect_states=(owner.defect_state,),
+                confirmations=(confirmation,),
+                unresolved_refs=(confirmation.candidate_ref,),
+            )
+
     def test_every_top_level_confirmation_status_requires_exact_seed_ownership(self):
         seed = seed_result("record:seed", "evidence_gap")
         for status in ("confirmed", "rejected", "unknown"):
@@ -1806,7 +1843,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={
-                "schema_version": "global-candidate-judgment/v2",
+                "schema_version": "global-candidate-judgment/v3",
                 "outcome": "inconclusive",
                 "reason": "No global candidates were available.",
                 "assessments": [],
@@ -1898,19 +1935,24 @@ class SeedAttributionModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-confirmed"):
             RecursiveAttributionReport.from_dict(non_confirmed)
 
-    def test_report_v3_round_trip_is_complete_and_v2_migration_is_conservative(self):
+    def test_report_v4_round_trip_rejects_v3_and_migrates_v2_conservatively(self):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v3")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v4")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
+
+        v3_payload = json.loads(json.dumps(payload))
+        v3_payload["schema_version"] = "recursive-attribution-report/v3"
+        with self.assertRaisesRegex(ValueError, "unsupported report schema_version"):
+            RecursiveAttributionReport.from_dict(v3_payload)
 
         v2_payload = json.loads(json.dumps(payload))
         v2_payload["schema_version"] = "recursive-attribution-report/v2"
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v3")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v4")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

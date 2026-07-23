@@ -30,7 +30,6 @@ CAUSAL_RELATIONS = frozenset(
 )
 HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded", "unresolved"})
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
-DEFINITIVE_CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected"})
 COUNTERFACTUAL_STATUSES = frozenset(
     {"supports_causality", "rejects_causality", "unknown"}
 )
@@ -51,15 +50,18 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v3"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v4"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v2"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v3"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v2+validation-envelope/v2"
+    "global-candidate-judgment/v3+validation-envelope/v3+capsule/v3"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v2"
+    "global-candidate-validation-envelope/v3"
+)
+ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
+    "recursive-root-confirmation/v7+resolution/v2"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -1578,6 +1580,16 @@ class RootConfirmation:
         return result
 
 
+def is_definitive_confirmation(confirmation: RootConfirmation) -> bool:
+    """Return whether validated status facts conclusively resolve the candidate."""
+    if confirmation.status == "confirmed":
+        return confirmation.counterfactual_status == "supports_causality"
+    return (
+        confirmation.status == "rejected"
+        and confirmation.counterfactual_status == "rejects_causality"
+    )
+
+
 @dataclass(frozen=True)
 class ConfirmedRoot:
     node_ref: str
@@ -1907,7 +1919,7 @@ def _validate_persisted_global_judgment(
         return
     if value.get("schema_version") != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
         raise ValueError(
-            "persisted global judgment requires v2 migration or rejudgment"
+            "persisted global judgment requires v3 migration or rejudgment"
         )
     required = {
         "schema_version",
@@ -1923,7 +1935,7 @@ def _validate_persisted_global_judgment(
         "validation_envelope",
     }
     if set(value) != required:
-        raise ValueError("persisted global judgment v2 schema is incomplete")
+        raise ValueError("persisted global judgment v3 schema is incomplete")
     from .global_judge import (
         global_candidate_request_from_validation_envelope,
         validate_global_candidate_payload,
@@ -1953,7 +1965,7 @@ def _validate_persisted_global_judgment(
             raise ValueError("decisive refs drift from persisted seed evidence")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
-            "persisted global judgment v2 semantic validation failed: {0}".format(
+            "persisted global judgment v3 semantic validation failed: {0}".format(
                 exc
             )
         ) from exc
@@ -2021,7 +2033,7 @@ def validate_confirmation_ownership(
                 "to exactly one confirmed_root seed".format(label)
             )
         owner = owners[0]
-        if confirmation.status not in DEFINITIVE_CONFIRMATION_STATUSES and (
+        if not is_definitive_confirmation(confirmation) and (
             owner.outcome not in {"evidence_gap", "inconclusive"}
             or not (owner.missing_evidence or owner.blocking_reasons)
         ):
@@ -2406,7 +2418,8 @@ class RecursiveAttributionReport:
                 confirmation = embedded_confirmation(factor.confirmation, role=role)
                 identity = confirmation.confirmation_identity
                 if (
-                    confirmation.status != "rejected"
+                    not is_definitive_confirmation(confirmation)
+                    or confirmation.status != "rejected"
                     or confirmation.factor_role != role
                     or factor.confirmation_status != "rejected"
                     or factor.node_ref != confirmation.candidate_ref
@@ -2431,7 +2444,8 @@ class RecursiveAttributionReport:
             )
             identity = confirmation.confirmation_identity
             if (
-                confirmation.status != "rejected"
+                not is_definitive_confirmation(confirmation)
+                or confirmation.status != "rejected"
                 or confirmation.factor_role not in {"unrelated", "unknown"}
                 or rejected.confirmation_status != "rejected"
                 or rejected.node_ref != confirmation.candidate_ref
@@ -2727,6 +2741,7 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "SeedAttributionResult",
+    "is_definitive_confirmation",
     "validate_confirmation_ownership",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
     "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",

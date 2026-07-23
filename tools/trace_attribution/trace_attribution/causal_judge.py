@@ -42,7 +42,7 @@ from .models import JsonDict, TraceNode, stable_json
 
 
 CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v8"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v6"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v7"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (

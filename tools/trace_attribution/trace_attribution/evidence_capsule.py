@@ -13,7 +13,7 @@ from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v2"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v3"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 def _thaw(value: Any) -> Any:

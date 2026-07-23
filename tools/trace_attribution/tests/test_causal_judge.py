@@ -2080,7 +2080,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v6")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v7")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):

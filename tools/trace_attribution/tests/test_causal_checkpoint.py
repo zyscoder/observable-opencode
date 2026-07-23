@@ -1156,7 +1156,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "assessments": [{"candidate_ref": "record:only"}],
             }
 
-            with self.assertRaisesRegex(ValueError, "global judgment.*v2"):
+            with self.assertRaisesRegex(ValueError, "global judgment.*v3"):
                 AgenticRecursiveAnalyzer(
                     judge=CountingOfflineJudge(),
                     checkpoint=InjectedRestoreCheckpoint(
@@ -1177,6 +1177,11 @@ class CausalCheckpointTest(unittest.TestCase):
             config["global_judgment_contract"],
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
+        self.assertEqual(
+            config["root_confirmation_contract"],
+            "recursive-root-confirmation/v7+resolution/v2",
+        )
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v4")
 
     def test_completed_report_rejects_v2_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -2358,6 +2363,84 @@ class CausalCheckpointTest(unittest.TestCase):
                             objective="Find the defect.",
                             analysis_perspective="Improve repository reasoning.",
                         )
+
+    def test_partial_and_completed_restore_reject_unblocked_unresolved_rejection(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "unresolved-rejection-owner.checkpoint"
+            config = sample_config()
+            AgenticRecursiveAnalyzer(
+                judge=UnknownConfirmationJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            partial_actions = json.loads(json.dumps(restored.actions))
+            snapshot = next(
+                item
+                for item in reversed(partial_actions)
+                if item["operation"] == "state_snapshot"
+                and item["payload"]["confirmations"]
+            )
+            snapshot["payload"]["confirmations"][0].update(
+                {
+                    "status": "rejected",
+                    "counterfactual_status": "unknown",
+                    "factor_role": "unknown",
+                }
+            )
+            snapshot["payload"]["seed_ledger"][0].update(
+                {
+                    "outcome": "no_defect",
+                    "missing_evidence": [],
+                    "blocking_reasons": [],
+                    "no_defect": True,
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(sample_trace()),
+                    checkpoint=replace(restored, actions=tuple(partial_actions)),
+                )
+
+            completed_actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            report_action["payload"]["report"]["confirmations"][0].update(
+                {
+                    "status": "rejected",
+                    "counterfactual_status": "unknown",
+                    "factor_role": "unknown",
+                }
+            )
+            report_action["payload"]["report"]["seed_results"][0].update(
+                {
+                    "outcome": "no_defect",
+                    "missing_evidence": [],
+                    "blocking_reasons": [],
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
+                AgenticRecursiveAnalyzer(
+                    judge=UnknownConfirmationJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(completed_actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(sample_trace()),
+                    start_refs=["record:only"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
 
     def test_signal_arriving_during_confirmation_writes_partial_resume_marker(self):
         with tempfile.TemporaryDirectory() as tempdir:

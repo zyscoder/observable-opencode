@@ -12,12 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .causal_state import GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION
+from .causal_state import (
+    GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
+    ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
+)
 from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
 
-CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v3"
+CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v4"
 OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v1"
 CHECKPOINT_CONFIG_KEYS = frozenset(
     {
@@ -33,6 +36,7 @@ CHECKPOINT_CONFIG_KEYS = frozenset(
         "runtime_identity",
         "evidence_eligibility_policy",
         "global_judgment_contract",
+        "root_confirmation_contract",
         "config_fingerprint",
     }
 )
@@ -213,6 +217,7 @@ def build_checkpoint_config(
         "runtime_identity": _validated_runtime(runtime_identity),
         "evidence_eligibility_policy": EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
         "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
+        "root_confirmation_contract": ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
     }
     return {**semantic, "config_fingerprint": _sha256(semantic)}
 
@@ -237,6 +242,7 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
         "cache_identity",
         "evidence_eligibility_policy",
         "global_judgment_contract",
+        "root_confirmation_contract",
         "config_fingerprint",
     ):
         if not isinstance(config[key], str):
@@ -248,6 +254,10 @@ def validate_checkpoint_config(value: Mapping[str, Any]) -> JsonDict:
     if config["global_judgment_contract"] != GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION:
         raise CheckpointCompatibilityError(
             "unsupported global judgment contract"
+        )
+    if config["root_confirmation_contract"] != ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION:
+        raise CheckpointCompatibilityError(
+            "unsupported root confirmation contract"
         )
     semantic = {key: config[key] for key in config if key != "config_fingerprint"}
     if config["config_fingerprint"] != _sha256(semantic):

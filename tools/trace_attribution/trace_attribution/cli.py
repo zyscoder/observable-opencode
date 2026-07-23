@@ -11,7 +11,11 @@ from typing import Any, Iterable, Mapping, Optional
 from .analyzer import BackwardTaintAnalyzer
 from .cache import JudgmentCache
 from .causal_judge import ClaudeCausalJudge
-from .causal_state import annotate_report_semantic_anchors
+from .causal_state import (
+    GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
+    ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
+    annotate_report_semantic_anchors,
+)
 from .checkpoint import (
     CheckpointBundle,
     build_checkpoint_config,
@@ -199,6 +203,8 @@ def main() -> int:
                 "max_tokens": transport.max_tokens,
                 "provider_error_threshold": transport.provider_error_threshold,
                 "fusion_mode": args.fusion_mode,
+                "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
+                "root_confirmation_contract": ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
             }
         )
         checkpoint_config = build_checkpoint_config(

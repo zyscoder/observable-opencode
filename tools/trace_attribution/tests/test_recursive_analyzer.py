@@ -2415,6 +2415,42 @@ class RecursiveRootRankingTest(unittest.TestCase):
         self.assertEqual(report.contributing_conditions, ())
         self.assertEqual(report.amplifying_factors, ())
 
+    def test_rejected_candidate_with_unknown_counterfactual_stays_unresolved(self):
+        judge = ConfirmingScriptedJudge(
+            {
+                "record:change": step(
+                    "record:change",
+                    predecessors=(
+                        relation("record:decision", "same_defect_propagation"),
+                    ),
+                ),
+                "record:decision": self._confirmation_step,
+            },
+            {
+                "record:decision": RootConfirmation(
+                    candidate_ref="record:decision",
+                    status="rejected",
+                    reason="The counterfactual evidence is incomplete.",
+                    counterfactual_status="unknown",
+                    factor_role="unknown",
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find why the implementation omitted the method.",
+        )
+
+        self.assertEqual(report.seed_results[0].outcome, "evidence_gap")
+        self.assertIn(
+            "root_confirmation_unresolved",
+            report.seed_results[0].blocking_reasons,
+        )
+        self.assertIn("record:decision", report.unresolved_refs)
+        self.assertEqual(report.rejected_candidates, ())
+
     def test_successful_no_defect_does_not_invoke_confirmation(self):
         judge = ConfirmingScriptedJudge(
             {"record:only": step("record:only", status="absent")}, {}

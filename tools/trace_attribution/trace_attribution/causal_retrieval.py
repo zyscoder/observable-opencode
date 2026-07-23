@@ -614,14 +614,36 @@ def is_navigation_node(node: TraceNode) -> bool:
 
 
 def root_candidate_eligible(node: TraceNode) -> bool:
+    event_type = node.event_type.strip().lower()
     return (
         not is_navigation_node(node)
-        and node.event_type not in ROOT_INELIGIBLE_EVENT_TYPES
+        and event_type not in ROOT_INELIGIBLE_EVENT_TYPES
+        and not is_evidence_only_event_type(event_type)
     )
 
 
 def is_evidence_only_node(node: TraceNode) -> bool:
-    return node.event_type in EVIDENCE_ONLY_EVENT_TYPES
+    return is_evidence_only_event_type(node.event_type)
+
+
+def is_evidence_only_event_type(event_type: str) -> bool:
+    value = str(event_type or "").strip().lower()
+    return (
+        value in EVIDENCE_ONLY_EVENT_TYPES
+        or value.startswith("case.")
+        or value == "observation"
+        or value == "verification"
+        or value.endswith(
+            (
+                ".observation",
+                ".result",
+                ".error",
+                ".fact",
+                "_fact",
+                "support_assessment",
+            )
+        )
+    )
 
 
 def is_interrupted_case_failure(graph: TraceGraph, node: TraceNode) -> bool:

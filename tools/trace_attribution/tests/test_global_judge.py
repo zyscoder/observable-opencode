@@ -11,7 +11,10 @@ from unittest.mock import patch
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import ClaudeCausalJudge
 from trace_attribution.causal_state import CausalCandidate, DefectState
-from trace_attribution.evidence_capsule import build_candidate_evidence_capsules
+from trace_attribution.evidence_capsule import (
+    CAPSULE_SCHEMA_VERSION,
+    build_candidate_evidence_capsules,
+)
 from trace_attribution.global_judge import (
     GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     GlobalCandidateJudgeRequest,
@@ -473,6 +476,22 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         ] = "record:verification"
 
         with self.assertRaisesRegex(ValueError, "candidate identity"):
+            global_candidate_request_from_validation_envelope(envelope)
+
+    def test_validation_envelope_v3_round_trip_rejects_stale_v2_identity(self):
+        request = sample_request()
+        envelope = request.validation_envelope()
+
+        self.assertEqual(
+            envelope["schema_version"],
+            "global-candidate-validation-envelope/v3",
+        )
+        self.assertEqual(
+            global_candidate_request_from_validation_envelope(envelope), request
+        )
+
+        envelope["schema_version"] = "global-candidate-validation-envelope/v2"
+        with self.assertRaisesRegex(ValueError, "schema mismatch"):
             global_candidate_request_from_validation_envelope(envelope)
 
     def test_counterfactual_consistency_applies_to_every_assessment(self):
@@ -1000,6 +1019,25 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "input defect not present"):
             validate_global_candidate_payload(value, request=request)
 
+    def test_accepts_root_with_unknown_input_and_present_output(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["input_defect_status"] = "unknown"
+
+        judgment = validate_global_candidate_payload(value, request=request)
+
+        self.assertEqual(judgment.selected_candidate_refs, ("record:decision",))
+        self.assertEqual(judgment.assessments[0].input_defect_status, "unknown")
+
+    def test_unknown_root_input_cannot_claim_certain_assessment(self):
+        request = sample_request()
+        value = payload(outcome="candidate_roots", request=request)
+        value["assessments"][0]["input_defect_status"] = "unknown"
+        value["assessments"][0]["confidence"] = 1.0
+
+        with self.assertRaisesRegex(ValueError, "unknown input defect"):
+            validate_global_candidate_payload(value, request=request)
+
     def test_rejects_counterfactual_with_missing_prediction(self):
         request = sample_request()
         value = payload(outcome="candidate_roots", request=request)
@@ -1039,11 +1077,12 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_schema_version_is_v2(self):
+    def test_schema_version_is_v3(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v2",
+            "global-candidate-judgment/v3",
         )
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v3")
 
     def test_v2_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()

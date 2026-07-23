@@ -13,7 +13,7 @@
     "schema_version": "recursive-attribution-labels/v3",
     "case_id": "subagent-warning-ignored",
     "roots": [{"node_ref": "record:main_agent_decision", "semantic_anchor_id": "semantic_anchor:v2:d4760866ad0034f3f277cff0", "semantic_occurrence_id": "semantic_occurrence:v1:fb2a9af8737c637df918eb78"}],
-    "conditions": [{"node_ref": "record:subagent_warning", "semantic_anchor_id": "semantic_anchor:v2:40b8bb6f149965887efa2cbb", "semantic_occurrence_id": "semantic_occurrence:v1:e5e2d2fec1a84c730698269b"}],
+    "conditions": [],
     "amplifiers": [],
     "forbidden_roots": [],
     "allowed_unresolved_outcomes": ["inconclusive", "partial_root_found"]

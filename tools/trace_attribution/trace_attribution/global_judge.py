@@ -482,6 +482,7 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
                 "First compare every offered candidate and return exactly one complete assessment per candidate; only after the comparison matrix is complete may selected_candidate_refs be chosen.",
                 "Judge only request.active_focus. Do not substitute another claim or defect from a shared response, neighboring capsule, or broader objective.",
                 "For each assessment, judge input_defect_status before the candidate and output_defect_status after it to determine whether the active defect is true; defect_status must equal output_defect_status and does not answer whether the record itself exists or contains defect-related words.",
+                "A root_candidate may use input_defect_status=unknown because unknown is not proof that the defect was present, but its reason and confidence must preserve that uncertainty; confidence cannot be 1.0.",
                 "causal_path_refs must be the supplied candidate-to-seed path when claiming a causal role, and counterfactual must make a decidable present-or-absent output prediction.",
                 "compared_candidate_refs must list every open authored root-eligible candidate, including the assessed candidate itself when eligible; retrieval order never changes this set.",
                 "When decisive counterevidence refutes a derived defect observation, mark that observation absent for the active defect even though its trace record exists.",
@@ -806,13 +807,20 @@ def _validate_assessment_counterfactual_consistency(
     )
     if assessment.causal_role == "root_candidate":
         if (
-            assessment.input_defect_status != "absent"
+            assessment.input_defect_status == "present"
             or assessment.output_defect_status != "present"
             or not assessment.causal_path_refs
         ):
             raise ValueError(
                 "root_candidate causal role requires input defect not present, "
                 "present output, and a causal path"
+            )
+        if (
+            assessment.input_defect_status == "unknown"
+            and assessment.confidence >= 1.0
+        ):
+            raise ValueError(
+                "root_candidate with unknown input defect cannot claim certain confidence"
             )
         expected_prevents = True
     else:
