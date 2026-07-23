@@ -12,6 +12,7 @@ from trace_attribution.causal_judge import (
     BoundedJudgeCallResult,
     BoundedJudgeCapability,
     OfflineJudgeCapability,
+    build_causal_step_prompt,
 )
 from trace_attribution.causal_state import (
     CausalStepJudgment,
@@ -95,29 +96,30 @@ class CountingAdjacency(dict):
 def episode_adjacency_graph(upstream_count: int, downstream_count: int):
     upstream_ids = ["up_{0:03d}".format(index) for index in range(upstream_count)]
     downstream_ids = ["down_{0:03d}".format(index) for index in range(downstream_count)]
+    episode_ids = [*upstream_ids, "anchor", *downstream_ids]
     records = [
         {
-            "record_id": record_id,
-            "component": "progress",
-            "event_type": "progress.episode",
-            "data": {"summary": record_id},
+            "record_id": "{0}_member".format(record_id),
+            "component": "agent",
+            "event_type": "decision",
+            "data": {
+                "repository_revision": 1,
+                "summary": "active member for {0}".format(record_id),
+            },
         }
-        for record_id in upstream_ids
-    ] + [
-        {
-            "record_id": "anchor",
-            "component": "progress",
-            "event_type": "progress.episode",
-            "data": {"summary": "anchor"},
-        }
+        for record_id in episode_ids
     ] + [
         {
             "record_id": record_id,
             "component": "progress",
             "event_type": "progress.episode",
-            "data": {"summary": record_id},
+            "data": {
+                "summary": record_id,
+                "member_refs": ["record:{0}_member".format(record_id)],
+                "chronology_index": index,
+            },
         }
-        for record_id in downstream_ids
+        for index, record_id in enumerate(episode_ids, start=1)
     ]
     edges = [
         {
@@ -1923,9 +1925,12 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.assertEqual(report.investigation_journal[0]["status"], "applied")
         self.assertEqual(len(report.hypotheses), 1)
 
-    def test_artifact_investigation_shares_the_analysis_byte_budget(self):
+    def test_truncated_preview_is_excluded_but_explicit_artifact_bytes_are_budgeted(self):
         root = Path(self.temp.name)
-        artifact_content = "x" * 33_000
+        preview_sentinel = "TRUNCATED_PREVIEW_MUST_NOT_REACH_JUDGE"
+        artifact_content = preview_sentinel + "x" * (
+            33_000 - len(preview_sentinel)
+        )
         (root / "artifacts" / "payload.txt").write_text(artifact_content, encoding="utf-8")
         graph = TraceGraph.from_trace(trace_with_artifact(artifact_content), artifact_root=root)
         judge = ScriptedInvestigatingJudge(
@@ -1952,12 +1957,13 @@ class AnalyzerInvestigationTest(unittest.TestCase):
             start_refs=["record:decision"],
             objective="Find the defect.",
         )
-        self.assertEqual(report.investigation_journal[0]["status"], "rejected")
-        self.assertEqual(
-            report.investigation_journal[0]["rejection_reason"],
-            "artifact_byte_budget_exhausted",
-        )
-        self.assertEqual(report.metadata["artifact_bytes"], 32_000)
+        self.assertEqual(report.investigation_journal[0]["status"], "success")
+        self.assertEqual(report.investigation_journal[0]["rejection_reason"], "")
+        self.assertEqual(report.metadata["artifact_bytes"], 4)
+        prompt = build_causal_step_prompt(judge.requests[0])
+        self.assertNotIn(preview_sentinel, prompt)
+        self.assertNotIn("truncated_artifact_ids", prompt)
+        self.assertNotIn("missing_artifact_ids", prompt)
 
 
 if __name__ == "__main__":

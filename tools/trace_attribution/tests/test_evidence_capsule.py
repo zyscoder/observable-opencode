@@ -208,13 +208,13 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "candidate identity"):
                     CandidateEvidenceCapsule.from_dict(payload)
 
-    def test_capsule_v5_round_trip_rejects_stale_v4_identity(self):
+    def test_capsule_v6_round_trip_rejects_stale_v5_identity(self):
         payload = self._decision_capsule().to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v5")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v6")
         self.assertEqual(CandidateEvidenceCapsule.from_dict(payload).to_dict(), payload)
 
-        payload["schema_version"] = "candidate-evidence-capsule/v4"
+        payload["schema_version"] = "candidate-evidence-capsule/v5"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             CandidateEvidenceCapsule.from_dict(payload)
 
@@ -720,7 +720,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         graph = sample_graph()
         payload = self._decision_capsule(graph).to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v5")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v6")
         self.assertEqual(
             set(payload["validation_source"]),
             {

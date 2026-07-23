@@ -14,6 +14,7 @@ from .graph import (
     is_temporal_only_edge,
 )
 from .models import JsonDict, stable_json
+from .progress import active_progress_episode_projection
 
 
 EVIDENCE_TOOLS = frozenset(
@@ -1077,9 +1078,28 @@ class CausalInvestigationTools:
             inspected_count += downstream_scan.inspected_count
             scan_truncated = scan_truncated or downstream_scan.scan_truncated
             truncated = truncated or downstream_scan.truncated
+        projection = active_progress_episode_projection(self.graph)
+        projected = projection["episodes"]
+
+        def episode_snapshot(ref: str) -> JsonDict:
+            snapshot = self.graph.sanitize_judge_node(
+                self.graph.nodes[ref]
+            ).compact(max_chars=16_000)
+            if ref in projected:
+                snapshot["data"] = self.graph.sanitize_judge_visible_payload(
+                    projected[ref]
+                )
+            return snapshot
+
+        episode_refs = [ref for ref in episode_refs if ref in projected]
         payload = {
-            "anchor": node.compact(),
-            "episodes": [self.graph.nodes[ref].compact(max_chars=16_000) for ref in episode_refs],
+            "anchor": (
+                episode_snapshot(resolved)
+                if node.event_type == "progress.episode"
+                and resolved in projected
+                else self.graph.sanitize_judge_node(node).compact()
+            ),
+            "episodes": [episode_snapshot(ref) for ref in episode_refs],
             "adjacency_scan": {
                 "inspected_count": inspected_count,
                 "scan_limit": total_scan_limit,

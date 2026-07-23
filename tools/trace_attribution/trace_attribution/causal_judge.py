@@ -41,8 +41,8 @@ from .global_judge import (
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v8"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v7"
+CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v9"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v8"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (
@@ -1435,7 +1435,13 @@ class _ConfirmationFactTreeValidator:
 
     def _register_hydration_manifest(self, value: Mapping[str, Any], *, path: str) -> None:
         missing_keys = _TASK2_MANIFEST_KEYS - set(value)
-        if missing_keys:
+        audit_keys = {
+            "referenced_artifact_ids",
+            "missing_artifact_ids",
+            "truncated_artifact_ids",
+        }
+        judge_visible_manifest = missing_keys == audit_keys
+        if missing_keys and not judge_visible_manifest:
             self._error(
                 path,
                 "Task 2 hydration manifest is missing {0}".format(
@@ -1443,24 +1449,33 @@ class _ConfirmationFactTreeValidator:
                 ),
             )
             return
-        referenced = self._artifact_id_list(
-            value.get("referenced_artifact_ids"),
-            path="{0}.referenced_artifact_ids".format(path),
-        )
-        missing = self._artifact_id_list(
-            value.get("missing_artifact_ids"),
-            path="{0}.missing_artifact_ids".format(path),
-        )
-        truncated = self._artifact_id_list(
-            value.get("truncated_artifact_ids"),
-            path="{0}.truncated_artifact_ids".format(path),
-        )
         hydrated_value = value.get("hydrated_artifacts")
         if not isinstance(hydrated_value, (list, tuple)) or any(
             not isinstance(item, Mapping) for item in hydrated_value
         ):
             self._error(path, "hydrated_artifacts must be a list of objects")
             return
+        if judge_visible_manifest:
+            referenced = {
+                _normalized_artifact_id(item.get("artifact_id"))
+                for item in hydrated_value
+                if isinstance(item, Mapping)
+            }
+            missing: Optional[Set[str]] = set()
+            truncated: Optional[Set[str]] = set()
+        else:
+            referenced = self._artifact_id_list(
+                value.get("referenced_artifact_ids"),
+                path="{0}.referenced_artifact_ids".format(path),
+            )
+            missing = self._artifact_id_list(
+                value.get("missing_artifact_ids"),
+                path="{0}.missing_artifact_ids".format(path),
+            )
+            truncated = self._artifact_id_list(
+                value.get("truncated_artifact_ids"),
+                path="{0}.truncated_artifact_ids".format(path),
+            )
         if referenced is None or missing is None or truncated is None:
             return
         node_ref = str(value.get("node_ref") or "").strip()

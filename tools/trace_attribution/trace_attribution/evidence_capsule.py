@@ -14,10 +14,11 @@ from .causal_retrieval import (
     root_candidate_eligible,
 )
 from .graph import TraceGraph
+from .judge_payload import strip_audit_only_payload
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v5"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v6"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
@@ -257,9 +258,7 @@ class CandidateEvidenceCapsule:
     def judge_dict(self) -> JsonDict:
         """Return only grounded evidence collections intended for a Judge."""
         value = self.to_dict()
-        value.pop("missing_evidence_refs", None)
-        value.pop("validation_source", None)
-        return value
+        return strip_audit_only_payload(value)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":
@@ -460,11 +459,14 @@ def _build_prompt_collections(
 ) -> JsonDict:
     ref = graph.resolve(candidate.ref) or candidate.ref
     node = graph.hydrate_node(ref)
-    artifact_hydration = graph.artifact_hydration_manifest(ref)
+    raw_artifact_hydration = graph.artifact_hydration_manifest(ref)
     missing = [
         "artifact:{0}".format(item)
-        for item in artifact_hydration.get("missing_artifact_ids") or []
+        for item in (
+            raw_artifact_hydration.get("missing_artifact_ids") or ()
+        )
     ]
+    artifact_hydration = raw_artifact_hydration
     retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
     causal_edges = tuple(
         causal_path_edges
@@ -1068,34 +1070,8 @@ def _action_revision_eligible(
 def _grounded_node_snapshot(
     graph: TraceGraph, node: TraceNode, *, max_chars: int
 ) -> JsonDict:
-    snapshot = node.compact(max_chars=max_chars)
-    snapshot["source_refs"] = graph.filter_evidence_refs(
-        snapshot.get("source_refs") or ()
-    )
-
-    def sanitize(value: Any, field_name: str = "") -> Any:
-        if isinstance(value, Mapping):
-            return {
-                str(key): sanitize(child, str(key))
-                for key, child in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            if field_name.endswith("_refs") or field_name in {
-                "artifact_refs",
-                "source_refs",
-            }:
-                return graph.filter_evidence_refs(value)
-            return [sanitize(child) for child in value]
-        if (
-            isinstance(value, str)
-            and field_name.endswith("_ref")
-            and (value.startswith("record:") or value.startswith("artifact:"))
-            and not graph.filter_evidence_refs([value])
-        ):
-            return ""
-        return value
-
-    snapshot["data"] = sanitize(snapshot.get("data") or {})
+    snapshot = graph.sanitize_judge_node(node).compact(max_chars=max_chars)
+    snapshot["source_refs"] = list(snapshot.get("source_refs") or ())
     return snapshot
 
 

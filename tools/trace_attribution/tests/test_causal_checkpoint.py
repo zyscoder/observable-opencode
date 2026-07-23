@@ -937,7 +937,7 @@ class CausalCheckpointTest(unittest.TestCase):
 
         self.assertEqual(
             config["evidence_eligibility_policy"],
-            "graph-external-evidence-eligibility/v1",
+            "graph-external-evidence-eligibility/v2",
         )
         semantic = {
             key: value for key, value in config.items() if key != "config_fingerprint"
@@ -1207,11 +1207,12 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v4+validation-envelope/v4+capsule/v5",
+            "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
+            "+evidence-policy/v2",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v7+resolution/v2",
+            "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2",
         )
         self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v5")
 

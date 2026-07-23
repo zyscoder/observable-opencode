@@ -16,7 +16,7 @@ from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
 
-EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v1"
+EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v2"
 RANKING_CONFIDENCE_EDGE_ORIGINS = frozenset(
     {
         "offline.global_candidate_retrieval",
@@ -454,7 +454,21 @@ class TraceGraph:
             or not self.evidence_eligible(resolved)
         ):
             return False
-        data = self.nodes[resolved].data
+        node = self.nodes[resolved]
+        data = node.data
+        if node.event_type == "progress.episode":
+            member_refs = [
+                self.resolve(str(item)) or str(item)
+                for item in data.get("member_refs") or ()
+                if str(item)
+            ]
+            if member_refs and not any(
+                member_ref != resolved
+                and member_ref in self.nodes
+                and self.active_revision_evidence_eligible(member_ref)
+                for member_ref in member_refs
+            ):
+                return False
         revision_status = data.get("revision_status")
         if revision_status not in (None, ""):
             if (
@@ -480,7 +494,6 @@ class TraceGraph:
             ):
                 return False
 
-        node = self.nodes[resolved]
         active_repository_revision = self.active_repository_revision()
         required_revision_field = ""
         if node.event_type == "response.claim":
@@ -511,6 +524,20 @@ class TraceGraph:
         elif required_revision_field and active_repository_revision is not None:
             return False
         return True
+
+    def sanitize_judge_visible_payload(self, value: Any) -> Any:
+        """Project arbitrary nested data to active, resolved Judge facts."""
+        from .judge_payload import sanitize_judge_visible_payload
+
+        return sanitize_judge_visible_payload(self, value)
+
+    def sanitize_judge_node(self, node: TraceNode) -> TraceNode:
+        """Return a node snapshot whose data is safe for Judge serialization."""
+        return replace(
+            node,
+            data=self.sanitize_judge_visible_payload(node.data),
+            source_refs=tuple(self.filter_evidence_refs(node.source_refs)),
+        )
 
     def filter_evidence_refs(self, refs: Iterable[Any]) -> List[str]:
         """Keep only resolved refs allowed to ground Judge-visible evidence."""

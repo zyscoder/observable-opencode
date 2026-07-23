@@ -606,6 +606,202 @@ def _assert_report_grounded_evidence(
     )
 
 
+def _quarantine_stale_seed_report_payload(
+    graph: TraceGraph, value: Mapping[str, Any]
+) -> JsonDict:
+    """Conservatively remove every conclusion owned by a stale report seed."""
+    payload = copy.deepcopy(dict(value))
+    seeds = [
+        item
+        for item in payload.get("seed_results") or ()
+        if isinstance(item, Mapping)
+    ]
+    stale_start_refs = {
+        graph.resolve(str(item.get("start_ref") or ""))
+        or str(item.get("start_ref") or "")
+        for item in seeds
+        if not graph.active_revision_evidence_eligible(
+            str(item.get("start_ref") or "")
+        )
+    }
+    if not stale_start_refs:
+        return payload
+    stale_seed_keys = {
+        seed_binding_identity_for(
+            str(item.get("start_ref") or ""),
+            str(item.get("defect_fingerprint") or ""),
+        )
+        for item in seeds
+        if (
+            graph.resolve(str(item.get("start_ref") or ""))
+            or str(item.get("start_ref") or "")
+        )
+        in stale_start_refs
+    }
+    stale_hypothesis_ids = {
+        str(item.get("hypothesis_id") or "")
+        for item in payload.get("hypotheses") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("seed_binding_identity") or "") in stale_seed_keys
+    }
+    stale_candidate_refs = {
+        str(item.get("candidate_root_ref") or "")
+        for item in payload.get("hypotheses") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("seed_binding_identity") or "") in stale_seed_keys
+    }
+    active_candidate_refs = {
+        str(item.get("candidate_root_ref") or "")
+        for item in payload.get("hypotheses") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("seed_binding_identity") or "")
+        not in stale_seed_keys
+    }
+
+    def seed_binding(item: Any) -> str:
+        if not isinstance(item, Mapping):
+            return ""
+        confirmation = item.get("confirmation")
+        source = confirmation if isinstance(confirmation, Mapping) else item
+        return str(source.get("seed_binding_identity") or "")
+
+    def keep_publication(item: Any) -> bool:
+        return seed_binding(item) not in stale_seed_keys
+
+    for name in (
+        "confirmations",
+        "confirmed_roots",
+        "co_roots",
+        "contributing_conditions",
+        "amplifying_factors",
+        "rejected_candidates",
+    ):
+        payload[name] = [
+            item for item in payload.get(name) or () if keep_publication(item)
+        ]
+    for name in ("hypotheses", "unresolved_hypotheses"):
+        payload[name] = [
+            item
+            for item in payload.get(name) or ()
+            if not isinstance(item, Mapping)
+            or str(item.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+        ]
+    payload["introduction_candidates"] = [
+        item
+        for item in payload.get("introduction_candidates") or ()
+        if not isinstance(item, Mapping)
+        or str(item.get("ref") or "") not in stale_candidate_refs
+        or str(item.get("ref") or "") in active_candidate_refs
+    ]
+    payload["causal_candidates"] = [
+        item
+        for item in payload.get("causal_candidates") or ()
+        if not isinstance(item, Mapping)
+        or str(item.get("ref") or "") not in stale_candidate_refs
+        or str(item.get("ref") or "") in active_candidate_refs
+    ]
+    payload["causal_relations"] = []
+    payload["step_judgments"] = []
+    payload["visited_order"] = []
+    payload["taint_paths"] = [
+        path
+        for path in payload.get("taint_paths") or ()
+        if not any(str(ref) in stale_start_refs for ref in path)
+    ]
+    payload["investigation_journal"] = [
+        item
+        for item in payload.get("investigation_journal") or ()
+        if not isinstance(item, Mapping)
+        or (
+            str(item.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+            and str(item.get("hypothesis_id") or "")
+            not in stale_hypothesis_ids
+            and str(item.get("seed_ref") or "") not in stale_start_refs
+        )
+    ]
+
+    migration_detail = (
+        "The restored analysis start is ineligible for the active repository "
+        "generation."
+    )
+    for seed in seeds:
+        start_ref = graph.resolve(str(seed.get("start_ref") or "")) or str(
+            seed.get("start_ref") or ""
+        )
+        if start_ref not in stale_start_refs:
+            continue
+        seed["outcome"] = "evidence_gap"
+        for key in (
+            "candidate_refs",
+            "selected_candidate_refs",
+            "confirmation_identities",
+            "confirmed_root_refs",
+            "decisive_evidence_refs",
+        ):
+            seed[key] = []
+        seed["global_judgment"] = {}
+        seed["expansion_history"] = []
+        seed["missing_evidence"] = sorted(
+            {
+                *(
+                    str(item)
+                    for item in seed.get("missing_evidence") or ()
+                    if str(item)
+                ),
+                migration_detail,
+            }
+        )
+        seed["blocking_reasons"] = sorted(
+            {
+                *(
+                    str(item)
+                    for item in seed.get("blocking_reasons") or ()
+                    if str(item)
+                ),
+                "start_ref_active_revision_ineligible",
+            }
+        )
+    payload["seed_results"] = seeds
+    outcomes = [str(item.get("outcome") or "") for item in seeds]
+    if outcomes and all(item == "no_defect" for item in outcomes):
+        payload["analysis_outcome"] = "no_defect"
+    elif outcomes and all(
+        item in {"confirmed_root", "no_defect"} for item in outcomes
+    ) and "confirmed_root" in outcomes:
+        payload["analysis_outcome"] = "confirmed_root"
+    elif outcomes and "inconclusive" not in outcomes and len(set(outcomes)) > 1:
+        payload["analysis_outcome"] = "partial"
+    else:
+        payload["analysis_outcome"] = "inconclusive"
+    payload["unresolved_refs"] = sorted(
+        {
+            *(str(item) for item in payload.get("unresolved_refs") or ()),
+            *stale_start_refs,
+        }
+    )
+    metadata = (
+        copy.deepcopy(payload.get("metadata"))
+        if isinstance(payload.get("metadata"), Mapping)
+        else {}
+    )
+    metadata["confirmation_queue"] = [
+        item
+        for item in metadata.get("confirmation_queue") or ()
+        if not isinstance(item, Mapping)
+        or str(item.get("seed_binding_identity") or "")
+        not in stale_seed_keys
+    ]
+    metadata["stale_seed_quarantine"] = {
+        "start_refs": sorted(stale_start_refs),
+        "blocking_reason": "start_ref_active_revision_ineligible",
+        "behavior_impact": "none_offline_analysis_only",
+    }
+    payload["metadata"] = metadata
+    return payload
+
+
 def _assert_published_non_root_factors(
     graph: TraceGraph,
     *,
@@ -961,7 +1157,7 @@ def _reference_envelope(ref: str, *, content: str = "", fact_kind: str = "") -> 
     return value
 
 
-def _node_semantic_content(node: TraceNode) -> str:
+def _node_semantic_content(graph: TraceGraph, node: TraceNode) -> str:
     def without_hydrated_artifacts(value: Any) -> Any:
         if isinstance(value, Mapping):
             return {
@@ -973,7 +1169,9 @@ def _node_semantic_content(node: TraceNode) -> str:
             return [without_hydrated_artifacts(child) for child in value]
         return copy.deepcopy(value)
 
-    data = without_hydrated_artifacts(node.data)
+    data = graph.sanitize_judge_visible_payload(
+        without_hydrated_artifacts(node.data)
+    )
     return stable_json(
         {
             "component": node.component,
@@ -1828,6 +2026,20 @@ class RecursiveAnalysisState:
         )
 
         ledger = HypothesisLedger.from_snapshot(hypothesis_payload["hypotheses"])
+        restored_hypotheses = ledger.hypotheses_by_id()
+        stale_owned_candidate_refs = {
+            hypothesis.candidate_root_ref
+            for hypothesis_id, hypothesis in restored_hypotheses.items()
+            if hypothesis_id in stale_hypothesis_ids
+        }
+        active_owned_candidate_refs = {
+            hypothesis.candidate_root_ref
+            for hypothesis_id, hypothesis in restored_hypotheses.items()
+            if hypothesis_id not in stale_hypothesis_ids
+        }
+        stale_only_candidate_refs = (
+            stale_owned_candidate_refs - active_owned_candidate_refs
+        )
         frontier = RecursiveFrontier.from_checkpoint(
             frontier_payload["frontier"],
             hypotheses_by_id=ledger.hypotheses_by_id(),
@@ -1870,9 +2082,24 @@ class RecursiveAnalysisState:
                 for item in action_payload["causal_candidates"]
             )
             if graph.active_revision_evidence_eligible(candidate.ref)
+            and candidate.ref not in stale_only_candidate_refs
         ]
-        state.causal_relations = [PredecessorAssessment.from_dict(item) for item in action_payload["causal_relations"]]
-        state.step_judgments = [CausalStepJudgment.from_dict(item) for item in action_payload["step_judgments"]]
+        state.causal_relations = [
+            relation
+            for relation in (
+                PredecessorAssessment.from_dict(item)
+                for item in action_payload["causal_relations"]
+            )
+            if relation.ref not in stale_only_candidate_refs
+        ]
+        state.step_judgments = [
+            judgment
+            for judgment in (
+                CausalStepJudgment.from_dict(item)
+                for item in action_payload["step_judgments"]
+            )
+            if judgment.current_node_ref not in stale_only_candidate_refs
+        ]
         state.introduction_candidates = [
             candidate
             for candidate in (
@@ -1880,8 +2107,20 @@ class RecursiveAnalysisState:
                 for item in action_payload["introduction_candidates"]
             )
             if authored_root_candidate_eligible(graph, candidate.ref)
+            and candidate.ref not in stale_only_candidate_refs
         ]
-        state.introduction_bindings = copy.deepcopy(action_payload["introduction_bindings"])
+        state.introduction_bindings = [
+            copy.deepcopy(item)
+            for item in action_payload["introduction_bindings"]
+            if not isinstance(item, Mapping)
+            or (
+                str(item.get("seed_binding_identity") or "")
+                not in stale_seed_keys
+                and str(item.get("seed_key") or "") not in stale_seed_keys
+                and str(item.get("hypothesis_id") or "")
+                not in stale_hypothesis_ids
+            )
+        ]
         state.introduction_binding_keys = {
             (
                 str(item.get("candidate_ref") or ""),
@@ -1891,11 +2130,55 @@ class RecursiveAnalysisState:
             )
             for item in state.introduction_bindings
         }
-        state.contributing_conditions = [CausalFactor.from_dict(item) for item in action_payload["contributing_conditions"]]
-        state.rejected_candidates = [RejectedCandidate.from_dict(item) for item in action_payload["rejected_candidates"]]
-        state.taint_paths = [tuple(str(ref) for ref in item) for item in action_payload["taint_paths"]]
-        state.visited_order = [str(item) for item in action_payload["visited_order"]]
-        state.unresolved_branches = copy.deepcopy(action_payload["unresolved_branches"])
+        state.contributing_conditions = [
+            factor
+            for factor in (
+                CausalFactor.from_dict(item)
+                for item in action_payload["contributing_conditions"]
+            )
+            if str(factor.confirmation.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+            and str(factor.confirmation.get("hypothesis_id") or "")
+            not in stale_hypothesis_ids
+        ]
+        state.rejected_candidates = [
+            rejected
+            for rejected in (
+                RejectedCandidate.from_dict(item)
+                for item in action_payload["rejected_candidates"]
+            )
+            if str(rejected.confirmation.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+            and str(rejected.confirmation.get("hypothesis_id") or "")
+            not in stale_hypothesis_ids
+        ]
+        state.taint_paths = [
+            path
+            for path in (
+                tuple(str(ref) for ref in item)
+                for item in action_payload["taint_paths"]
+            )
+            if not any(
+                ref in stale_start_refs or ref in stale_only_candidate_refs
+                for ref in path
+            )
+        ]
+        state.visited_order = [
+            str(item)
+            for item in action_payload["visited_order"]
+            if str(item) not in stale_only_candidate_refs
+        ]
+        state.unresolved_branches = [
+            copy.deepcopy(item)
+            for item in action_payload["unresolved_branches"]
+            if not isinstance(item, Mapping)
+            or (
+                str(item.get("hypothesis_id") or "")
+                not in stale_hypothesis_ids
+                and str(item.get("node_ref") or "")
+                not in stale_only_candidate_refs
+            )
+        ]
         state.unresolved_refs = [str(item) for item in action_payload["unresolved_refs"]]
         state.unresolved_hypothesis_ids = {str(item) for item in action_payload["unresolved_hypothesis_ids"]}
         state.introduction_hypothesis_ids = {str(item) for item in action_payload["introduction_hypothesis_ids"]}
@@ -1921,18 +2204,55 @@ class RecursiveAnalysisState:
         if requeued_inflight > state.processed_items:
             raise ValueError("checkpoint in-flight frontier count exceeds processed items")
         state.processed_items -= requeued_inflight
-        state.investigation_journal = _migrate_checkpoint_visit_references(
+        investigation_journal = _migrate_checkpoint_visit_references(
             action_payload["investigation_journal"], frontier
         )
+        stale_visit_keys = {
+            item.visit_key
+            for item in frontier.lifecycle_items()
+            if item.hypothesis_id in stale_hypothesis_ids
+        }
+
+        def journal_owned_by_stale_seed(item: Any) -> bool:
+            if not isinstance(item, Mapping):
+                return False
+            active_visit = item.get("active_visit")
+            arguments = item.get("arguments")
+            hypothesis_ids = {
+                str(item.get("hypothesis_id") or ""),
+                str(
+                    active_visit.get("hypothesis_id") or ""
+                    if isinstance(active_visit, Mapping)
+                    else ""
+                ),
+                str(
+                    arguments.get("hypothesis_id") or ""
+                    if isinstance(arguments, Mapping)
+                    else ""
+                ),
+            }
+            return bool(hypothesis_ids.intersection(stale_hypothesis_ids))
+
+        state.investigation_journal = [
+            item
+            for item in investigation_journal
+            if not journal_owned_by_stale_seed(item)
+        ]
         state.investigation_evidence = {
             frontier.migrated_visit_key(str(key)): copy.deepcopy(value)
             for key, value in dict(action_payload["investigation_evidence"]).items()
+            if frontier.migrated_visit_key(str(key)) not in stale_visit_keys
         }
         state.investigation_evidence_hashes = {
             frontier.migrated_visit_key(str(key)): {str(item) for item in values}
             for key, values in dict(action_payload["investigation_evidence_hashes"]).items()
+            if frontier.migrated_visit_key(str(key)) not in stale_visit_keys
         }
-        state.control_directive_ids = {str(item) for item in action_payload["control_directive_ids"]}
+        state.control_directive_ids = {
+            str(item.get("directive_id") or "")
+            for item in state.investigation_journal
+            if isinstance(item, Mapping) and item.get("directive_id")
+        }
         state.confirmation_queue = [
             copy.deepcopy(item)
             for item in action_payload["confirmation_queue"]
@@ -1998,10 +2318,21 @@ class RecursiveAnalysisState:
             raise ValueError(
                 "restored published root is ineligible for the active revision"
             )
-        state.confirmation_journal = copy.deepcopy(action_payload["confirmation_journal"])
+        state.confirmation_journal = [
+            copy.deepcopy(item)
+            for item in action_payload["confirmation_journal"]
+            if not isinstance(item, Mapping)
+            or (
+                str(item.get("seed_binding_identity") or "")
+                not in stale_seed_keys
+                and str(item.get("hypothesis_id") or "")
+                not in stale_hypothesis_ids
+            )
+        ]
         state.pending_rejudge_journal = {
             frontier.migrated_visit_key(str(key)): [int(item) for item in values]
             for key, values in dict(action_payload["pending_rejudge_journal"]).items()
+            if frontier.migrated_visit_key(str(key)) not in stale_visit_keys
         }
         state.seed_ledger = {
             builder.key: builder
@@ -2201,7 +2532,7 @@ class RecursiveAnalysisState:
         investigated = self.investigation_evidence.get(item.visit_key, [])
         if investigated:
             context["investigation_evidence"] = copy.deepcopy(investigated)
-        context = sanitize_judge_evidence_payload(graph, context)
+        context = graph.sanitize_judge_visible_payload(context)
         context["evidence_hash"] = hashlib.sha256(
             stable_json(context).encode("utf-8")
         ).hexdigest()
@@ -2221,9 +2552,27 @@ class RecursiveAnalysisState:
             }
         return CausalStepRequest(
             recursive_context=context,
-            current_node=graph.hydrate_node(item.node_ref),
+            current_node=graph.sanitize_judge_node(
+                graph.hydrate_node(item.node_ref)
+            ),
             defect_state=item.defect_state,
-            candidates=candidates,
+            candidates=tuple(
+                CausalCandidate(
+                    ref=candidate.ref,
+                    node=graph.sanitize_judge_node(
+                        graph.hydrate_node(candidate.ref)
+                    ),
+                    source=candidate.source,
+                    edge=graph.sanitize_judge_visible_payload(
+                        graph.sanitize_judge_edge_evidence(candidate.edge)
+                    ),
+                    score=candidate.score,
+                    evidence_refs=tuple(
+                        graph.filter_evidence_refs(candidate.evidence_refs)
+                    ),
+                )
+                for candidate in candidates
+            ),
         )
 
     def record_investigation_result(
@@ -3797,9 +4146,22 @@ class AgenticRecursiveAnalyzer:
             )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
+                final_report = _quarantine_stale_seed_report_payload(
+                    analysis_graph, final_report
+                )
+                stale_report_starts = {
+                    analysis_graph.resolve(str(item.get("start_ref") or ""))
+                    or str(item.get("start_ref") or "")
+                    for item in final_report.get("seed_results") or ()
+                    if isinstance(item, Mapping)
+                    and str(item.get("outcome") or "") == "evidence_gap"
+                    and "start_ref_active_revision_ineligible"
+                    in (item.get("blocking_reasons") or ())
+                }
                 analysis_graph.assert_evidence_eligible_references(
                     final_report,
                     label="restored completed report",
+                    allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(final_report)
                 _assert_report_grounded_evidence(
@@ -3828,9 +4190,22 @@ class AgenticRecursiveAnalyzer:
             if pending_report is not None and (
                 not pending_interrupted or self.checkpoint.output_commit_path.exists()
             ):
+                pending_report = _quarantine_stale_seed_report_payload(
+                    analysis_graph, pending_report
+                )
+                stale_report_starts = {
+                    analysis_graph.resolve(str(item.get("start_ref") or ""))
+                    or str(item.get("start_ref") or "")
+                    for item in pending_report.get("seed_results") or ()
+                    if isinstance(item, Mapping)
+                    and str(item.get("outcome") or "") == "evidence_gap"
+                    and "start_ref_active_revision_ineligible"
+                    in (item.get("blocking_reasons") or ())
+                }
                 analysis_graph.assert_evidence_eligible_references(
                     pending_report,
                     label="restored pending report",
+                    allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(pending_report)
                 _assert_report_grounded_evidence(
@@ -4902,7 +5277,9 @@ class AgenticRecursiveAnalyzer:
 
         candidate_reference = _reference_envelope(
             candidate_ref,
-            content=_node_semantic_content(state.graph.hydrate_node(candidate_ref)),
+            content=_node_semantic_content(
+                state.graph, state.graph.hydrate_node(candidate_ref)
+            ),
             fact_kind="candidate_fact",
         )
         candidate_reference["decisive"] = True
@@ -4928,7 +5305,9 @@ class AgenticRecursiveAnalyzer:
                 output.append(
                     _reference_envelope(
                         resolved,
-                        content=_node_semantic_content(state.graph.hydrate_node(resolved)),
+                        content=_node_semantic_content(
+                            state.graph, state.graph.hydrate_node(resolved)
+                        ),
                         fact_kind=fact_kind,
                     )
                 )
@@ -5002,7 +5381,8 @@ class AgenticRecursiveAnalyzer:
                             "evidence_reference": _reference_envelope(
                                 resolved_ref,
                                 content=_node_semantic_content(
-                                    state.graph.hydrate_node(resolved_ref)
+                                    state.graph,
+                                    state.graph.hydrate_node(resolved_ref),
                                 ),
                                 fact_kind=kind,
                             ),
@@ -5069,7 +5449,9 @@ class AgenticRecursiveAnalyzer:
                     "active_defect": competitor_defect.to_dict(),
                     "candidate_reference": _reference_envelope(
                         resolved,
-                        content=_node_semantic_content(state.graph.hydrate_node(resolved)),
+                        content=_node_semantic_content(
+                            state.graph, state.graph.hydrate_node(resolved)
+                        ),
                         fact_kind="competing_hypothesis_candidate",
                     ),
                     "supporting_evidence": competitor_evidence(
@@ -5109,18 +5491,36 @@ class AgenticRecursiveAnalyzer:
             if safe:
                 obligations.append(safe)
 
+        candidate_reference = state.graph.sanitize_judge_visible_payload(
+            candidate_reference
+        )
+        path_references = tuple(
+            state.graph.sanitize_judge_visible_payload(path_references)
+        )
+        supporting_evidence = tuple(
+            state.graph.sanitize_judge_visible_payload(
+                evidence_facts(supporting_refs, "supporting_evidence")
+            )
+        )
+        opposing_evidence = tuple(
+            state.graph.sanitize_judge_visible_payload(
+                evidence_facts(opposing_refs, "opposing_evidence")
+            )
+        )
+        competitors = list(
+            state.graph.sanitize_judge_visible_payload(competitors)
+        )
+        obligations = list(
+            state.graph.sanitize_judge_visible_payload(obligations)
+        )
         return RootConfirmationRequest(
             candidate_ref=candidate_ref,
             defect_state=defect_state,
             recursive_path=path,
             candidate_reference=candidate_reference,
             recursive_path_references=path_references,
-            supporting_evidence=evidence_facts(
-                supporting_refs, "supporting_evidence"
-            ),
-            opposing_evidence=evidence_facts(
-                opposing_refs, "opposing_evidence"
-            ),
+            supporting_evidence=supporting_evidence,
+            opposing_evidence=opposing_evidence,
             competing_hypotheses=tuple(competitors),
             task_obligations=tuple(obligations),
             analysis_perspective="",
@@ -5325,7 +5725,9 @@ class AgenticRecursiveAnalyzer:
 
         def rank(root: ConfirmedRoot) -> Tuple[int, float, int, int, str, str]:
             node = state.graph.nodes[root.node_ref]
-            semantic_tokens = _perspective_tokens(_node_semantic_content(node))
+            semantic_tokens = _perspective_tokens(
+                _node_semantic_content(state.graph, node)
+            )
             return (
                 -len(perspective.intersection(semantic_tokens)),
                 -root.confidence,

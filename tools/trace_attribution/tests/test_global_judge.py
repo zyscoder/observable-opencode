@@ -808,21 +808,26 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             value["missing_evidence"] = ["The action-group member needs context."]
             validate_global_candidate_payload(value, request=restored)
 
-    def test_validation_envelope_v4_round_trip_rejects_stale_v3_identity(self):
+    def test_validation_envelope_v5_round_trip_rejects_stale_identities(self):
         request = sample_request()
         envelope = request.validation_envelope()
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v4",
+            "global-candidate-validation-envelope/v5",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
         )
 
-        envelope["schema_version"] = "global-candidate-validation-envelope/v3"
-        with self.assertRaisesRegex(ValueError, "schema mismatch"):
-            global_candidate_request_from_validation_envelope(envelope)
+        for stale_identity in (
+            "global-candidate-validation-envelope/v4",
+            "global-candidate-validation-envelope/v3",
+        ):
+            with self.subTest(stale_identity=stale_identity):
+                envelope["schema_version"] = stale_identity
+                with self.assertRaisesRegex(ValueError, "schema mismatch"):
+                    global_candidate_request_from_validation_envelope(envelope)
 
     def test_counterfactual_consistency_applies_to_every_assessment(self):
         request = sample_request()
@@ -1423,12 +1428,12 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_global_schema_is_v4_and_capsule_schema_is_v5(self):
+    def test_global_schema_is_v5_and_capsule_schema_is_v6(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v4",
+            "global-candidate-judgment/v5",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v5")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v6")
 
     def test_v4_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()

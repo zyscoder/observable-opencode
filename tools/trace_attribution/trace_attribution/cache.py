@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
 
-JUDGMENT_CACHE_VERSION = "1.0"
+JUDGMENT_CACHE_VERSION = "2.0"
 
 
 def build_judge_cache_key(
@@ -23,6 +24,7 @@ def build_judge_cache_key(
     max_tokens: int,
     thinking_config: Optional[Dict[str, Any]],
     prompt_schema_version: str,
+    evidence_eligibility_policy: str = EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
 ) -> str:
     payload = {
         "cache_version": JUDGMENT_CACHE_VERSION,
@@ -33,6 +35,7 @@ def build_judge_cache_key(
         "max_tokens": max_tokens,
         "thinking_config": thinking_config,
         "prompt_schema_version": prompt_schema_version,
+        "evidence_eligibility_policy": evidence_eligibility_policy,
     }
     return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
 

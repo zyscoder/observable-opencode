@@ -11,7 +11,6 @@ from .models import JsonDict, NodeJudgment, TraceNode, stable_json
 from .progress import (
     active_progress_episode_data,
     active_progress_navigation_window,
-    progress_navigation_window,
 )
 
 
@@ -593,7 +592,7 @@ def active_path_outgoing_edges(graph: TraceGraph, current_ref: str, path: List[s
         return edges
     downstream = graph.nodes.get(downstream_ref)
     if downstream and downstream.event_type == "progress.episode":
-        window = progress_navigation_window(graph.nodes, downstream_ref)
+        window = active_progress_navigation_window(graph, downstream_ref)
         if current_ref in (window.get("member_refs") or []):
             evidence_refs = [
                 episode_ref

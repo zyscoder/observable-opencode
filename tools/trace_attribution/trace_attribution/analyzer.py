@@ -17,7 +17,7 @@ from .models import (
     TaintInfluence,
     TraceNode,
 )
-from .progress import progress_navigation_window
+from .progress import active_progress_navigation_window
 from .trace_improvement import build_trace_improvement_report
 
 
@@ -716,7 +716,9 @@ def semantic_episode_predecessors(
     if not current:
         return []
     if current.event_type == "progress.episode":
-        navigation_window = progress_navigation_window(graph.nodes, current_ref)
+        navigation_window = active_progress_navigation_window(
+            graph, current_ref
+        )
         member_refs = navigation_window.get("candidate_member_refs")
         if not isinstance(member_refs, list):
             return []

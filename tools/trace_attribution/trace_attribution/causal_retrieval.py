@@ -13,7 +13,7 @@ from .graph import (
     is_temporal_only_edge,
 )
 from .models import TraceNode, stable_json
-from .progress import progress_navigation_window
+from .progress import active_progress_navigation_window
 
 
 SIBLING_REFERENCE_KEYS = (
@@ -185,7 +185,7 @@ class SemanticPredecessorRetriever:
         source = "episode_candidate"
         terms: List[str] = []
         if current.event_type == "progress.episode":
-            window = progress_navigation_window(graph.nodes, node_ref)
+            window = active_progress_navigation_window(graph, node_ref)
             refs = [
                 str(item)
                 for item in (

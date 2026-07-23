@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -99,7 +100,11 @@ def observed_trace(*, branching: bool = False, artifact_content: str = "") -> di
         records[1]["data"]["hydrated_artifacts"] = [
             {
                 "artifact_id": "decision-context",
-                "hash": "artifact-hash",
+                "content_hash": "sha256:{0}".format(
+                    hashlib.sha256(
+                        artifact_content.encode("utf-8")
+                    ).hexdigest()
+                ),
                 "content": artifact_content,
             }
         ]
@@ -1871,7 +1876,9 @@ class RecursiveBudgetTest(unittest.TestCase):
     def test_duplicate_grounded_artifact_payload_is_counted_once(self):
         artifact = {
             "artifact_id": "artifact-1",
-            "hash": "sha256:artifact-1",
+            "content_hash": "sha256:{0}".format(
+                hashlib.sha256(b"abcdef").hexdigest()
+            ),
             "path": "artifacts/decision.txt",
             "content": "abcdef",
         }
