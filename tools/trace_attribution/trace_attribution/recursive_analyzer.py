@@ -846,6 +846,168 @@ def _quarantine_stale_seed_report_payload(
     return payload
 
 
+def _validate_restored_report_local_state_owners(
+    graph: TraceGraph,
+    report: RecursiveAttributionReport,
+) -> None:
+    metadata = report.to_dict()["metadata"]
+    frontier_payload = metadata.get("frontier_checkpoint")
+    hypothesis_payload = metadata.get("hypothesis_snapshot")
+    if not isinstance(frontier_payload, Mapping) or not isinstance(
+        hypothesis_payload, list
+    ):
+        raise ValueError(
+            "restored report owner validation requires frontier and ledger snapshots"
+        )
+    ledger = HypothesisLedger.from_snapshot(hypothesis_payload)
+    frontier = RecursiveFrontier.from_checkpoint(
+        frontier_payload,
+        hypotheses_by_id=ledger.hypotheses_by_id(),
+    )
+    state = RecursiveAnalysisState(
+        graph=graph,
+        start_refs=report.start_refs,
+        objective=report.objective,
+        analysis_perspective=report.analysis_perspective,
+        ledger=ledger,
+        frontier=frontier,
+        defect_states={
+            item.fingerprint: item for item in report.defect_states
+        },
+        causal_relations=list(report.causal_relations),
+        step_judgments=list(report.step_judgments),
+        visited_order=list(report.visited_order),
+        visited_entries=[
+            copy.deepcopy(dict(item)) for item in report.visited_entries
+        ],
+        investigation_journal=[
+            copy.deepcopy(dict(item))
+            for item in report.investigation_journal
+        ],
+        confirmation_queue=copy.deepcopy(
+            list(metadata.get("confirmation_queue") or ())
+        ),
+        confirmation_journal=copy.deepcopy(
+            list(metadata.get("confirmation_journal") or ())
+        ),
+    )
+    state.seed_ledger = {
+        builder.key: builder
+        for builder in (
+            SeedAttributionBuilder.from_dict(item.to_dict())
+            for item in report.seed_results
+        )
+    }
+    state.seed_count = len(state.seed_ledger)
+    state.hypothesis_seed_keys = {
+        hypothesis.hypothesis_id: hypothesis.seed_binding_identity
+        for hypothesis in ledger.hypotheses_by_id().values()
+    }
+    state._validate_local_state_owners()
+
+    completed_passes = [
+        item
+        for item in state.investigation_journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+        and item.get("status") == "completed"
+    ]
+    global_judgments = list(
+        metadata.get("global_candidate_judgments") or ()
+    )
+    candidate_compression = list(
+        metadata.get("candidate_compression") or ()
+    )
+    expansion_reasons = list(
+        metadata.get("recursive_expansion_reasons") or ()
+    )
+    expected_expansion_count = sum(
+        len(
+            event["judgment"].get("expansion_requests") or ()
+            if isinstance(event.get("judgment"), Mapping)
+            else ()
+        )
+        for event in completed_passes
+    )
+    if (
+        len(global_judgments) != len(completed_passes)
+        or len(candidate_compression) != len(completed_passes)
+        or len(expansion_reasons) != expected_expansion_count
+        or int(metadata.get("global_candidate_pass_count") or 0)
+        != len(completed_passes)
+    ):
+        raise ValueError(
+            "restored report global candidate judgment owner coverage "
+            "contradicts global pass actions"
+        )
+
+    def derived_global_entry_matches(
+        entry: Mapping[str, Any],
+        *,
+        source_key: str,
+    ) -> bool:
+        owner = LocalStateOwner.from_dict(entry.get("owner"))
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key != "owner"
+        }
+        matches = [
+            event
+            for event in completed_passes
+            if LocalStateOwner.from_dict(event.get("owner")) == owner
+            and isinstance(event.get(source_key), Mapping)
+            and stable_json(_checkpoint_json(event[source_key]))
+            == stable_json(_checkpoint_json(payload))
+        ]
+        return len(matches) == 1
+
+    for label, key in (
+        ("global candidate judgment", "judgment"),
+        ("candidate compression", "candidate_compression"),
+    ):
+        for entry in (
+            global_judgments if key == "judgment" else candidate_compression
+        ):
+            if not isinstance(entry, Mapping) or not derived_global_entry_matches(
+                entry,
+                source_key=key,
+            ):
+                raise ValueError(
+                    "restored report {0} owner contradicts global pass".format(
+                        label
+                    )
+                )
+
+    for entry in expansion_reasons:
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                "restored report expansion owner entry must be an object"
+            )
+        owner = LocalStateOwner.from_dict(entry.get("owner"))
+        payload = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key != "owner"
+        }
+        matches = [
+            event
+            for event in completed_passes
+            if LocalStateOwner.from_dict(event.get("owner")) == owner
+            and isinstance(event.get("judgment"), Mapping)
+            and stable_json(_checkpoint_json(payload))
+            in {
+                stable_json(_checkpoint_json(item))
+                for item in event["judgment"].get("expansion_requests") or ()
+                if isinstance(item, Mapping)
+            }
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "restored report expansion owner contradicts global pass"
+            )
+
+
 def _assert_published_non_root_factors(
     graph: TraceGraph,
     *,
@@ -1752,6 +1914,428 @@ class RecursiveAnalysisState:
         if builder is not None:
             self.hypothesis_seed_keys[hypothesis_id] = builder.key
 
+    def _frontier_items_by_visit(self) -> Dict[str, FrontierItem]:
+        return {
+            item.visit_key: item for item in self.frontier.lifecycle_items()
+        }
+
+    def _owner_item(
+        self,
+        owner: LocalStateOwner,
+        *,
+        label: str,
+        occurrence_key: str,
+    ) -> FrontierItem:
+        item = self._frontier_items_by_visit().get(owner.visit_key)
+        if item is None:
+            raise ValueError("{0} owner has no frontier visit".format(label))
+        expected = _owner_for_item(item, occurrence_key)
+        if owner != expected:
+            raise ValueError(
+                "{0} owner contradicts its exact frontier occurrence".format(
+                    label
+                )
+            )
+        try:
+            hypothesis = self.ledger.get(owner.hypothesis_id)
+        except KeyError:
+            raise ValueError("{0} owner has no ledger hypothesis".format(label))
+        if (
+            hypothesis.hypothesis_id != item.hypothesis_id
+            or hypothesis.semantic_hash != item.hypothesis_semantic_hash
+            or hypothesis.seed_binding_identity != owner.seed_binding_identity
+            or item.seed_binding_identity != owner.seed_binding_identity
+            or self.hypothesis_seed_keys.get(owner.hypothesis_id)
+            != owner.seed_binding_identity
+            or owner.seed_binding_identity not in self.seed_ledger
+        ):
+            raise ValueError(
+                "{0} owner contradicts ledger or seed routing".format(label)
+            )
+        return item
+
+    def _validate_step_judgment_owner(
+        self,
+        judgment: CausalStepJudgment,
+        *,
+        label: str,
+    ) -> FrontierItem:
+        if judgment.owner is None:
+            raise ValueError("{0} is ownerless".format(label))
+        item = self._owner_item(
+            judgment.owner,
+            label=label,
+            occurrence_key="step_judgment",
+        )
+        if item.node_ref != judgment.current_node_ref:
+            raise ValueError(
+                "{0} owner contradicts the judged node".format(label)
+            )
+        for index, assessment in enumerate(judgment.predecessors):
+            if assessment.owner is None:
+                raise ValueError("{0} predecessor is ownerless".format(label))
+            owned_item = self._owner_item(
+                assessment.owner,
+                label="{0} predecessor".format(label),
+                occurrence_key="step_predecessor:{0}:{1}".format(
+                    index, assessment.ref
+                ),
+            )
+            if owned_item != item:
+                raise ValueError(
+                    "{0} predecessor owner contradicts its judgment".format(
+                        label
+                    )
+                )
+        return item
+
+    def _validate_confirmation_action_owner(
+        self,
+        entry: Mapping[str, Any],
+        *,
+        label: str,
+    ) -> LocalStateOwner:
+        owner = LocalStateOwner.from_dict(entry.get("owner"))
+        item = self._frontier_items_by_visit().get(owner.visit_key)
+        if item is not None:
+            self._owner_item(
+                owner,
+                label=label,
+                occurrence_key="confirmation_queue",
+            )
+            if (
+                str(entry.get("hypothesis_id") or "") != item.hypothesis_id
+                or str(entry.get("seed_binding_identity") or "")
+                != item.seed_binding_identity
+            ):
+                raise ValueError(
+                    "{0} owner contradicts frontier action identity".format(
+                        label
+                    )
+                )
+            return owner
+
+        hypothesis_id = str(entry.get("hypothesis_id") or "")
+        seed_binding_identity = str(
+            entry.get("seed_binding_identity") or ""
+        )
+        candidate_ref = str(entry.get("candidate_ref") or "")
+        defect_fingerprint = str(entry.get("defect_fingerprint") or "")
+        try:
+            hypothesis = self.ledger.get(hypothesis_id)
+        except KeyError:
+            raise ValueError(
+                "{0} owner has no ledger hypothesis".format(label)
+            )
+        defect_state = self.defect_states.get(defect_fingerprint)
+        if (
+            defect_state is None
+            or hypothesis.candidate_root_ref != candidate_ref
+            or hypothesis.active_defect_fingerprint != defect_fingerprint
+            or hypothesis.seed_binding_identity != seed_binding_identity
+            or owner.hypothesis_id != hypothesis_id
+            or owner.seed_binding_identity != seed_binding_identity
+            or self.hypothesis_seed_keys.get(hypothesis_id)
+            != seed_binding_identity
+            or seed_binding_identity not in self.seed_ledger
+        ):
+            raise ValueError(
+                "{0} owner contradicts ledger or action entry".format(label)
+            )
+        visit_key = semantic_visit_key(
+            candidate_ref,
+            defect_state,
+            hypothesis.semantic_hash,
+            seed_binding_identity,
+        )
+        expected = LocalStateOwner.create(
+            seed_binding_identity=seed_binding_identity,
+            hypothesis_id=hypothesis_id,
+            visit_key=visit_key,
+            occurrence_key="confirmation_queue",
+        )
+        if owner != expected:
+            raise ValueError(
+                "{0} owner contradicts exact action occurrence".format(label)
+            )
+        return owner
+
+    def _owned_downstream_judgments(
+        self,
+        item: FrontierItem,
+    ) -> List[CausalStepJudgment]:
+        output = []
+        for judgment in self.step_judgments:
+            try:
+                owned_item = self._validate_step_judgment_owner(
+                    judgment,
+                    label="downstream judgment",
+                )
+            except ValueError:
+                continue
+            if (
+                owned_item.seed_binding_identity == item.seed_binding_identity
+                and judgment.current_node_ref in item.downstream_path
+            ):
+                output.append(judgment)
+        return output
+
+    def _owned_investigation_evidence(
+        self,
+        item: FrontierItem,
+    ) -> List[JsonDict]:
+        journal_results = []
+        for entry in self.investigation_journal:
+            if not isinstance(entry, Mapping):
+                continue
+            active_visit = entry.get("active_visit")
+            result = entry.get("result")
+            if (
+                isinstance(active_visit, Mapping)
+                and isinstance(result, Mapping)
+                and str(active_visit.get("visit_key") or "") == item.visit_key
+                and str(active_visit.get("hypothesis_id") or "")
+                == item.hypothesis_id
+                and str(active_visit.get("node_ref") or "") == item.node_ref
+            ):
+                journal_results.append(dict(result))
+
+        output = []
+        for value in self.investigation_evidence.get(item.visit_key, []):
+            if not isinstance(value, Mapping):
+                continue
+            evidence = copy.deepcopy(dict(value))
+            evidence_hash = str(evidence.get("evidence_hash") or "")
+            raw_owner = evidence.pop("owner", None)
+            if raw_owner is not None:
+                try:
+                    owner = LocalStateOwner.from_dict(raw_owner)
+                    self._owner_item(
+                        owner,
+                        label="investigation evidence",
+                        occurrence_key="investigation_evidence:{0}".format(
+                            evidence_hash
+                        ),
+                    )
+                except ValueError:
+                    continue
+                if owner.visit_key != item.visit_key:
+                    continue
+            elif not any(
+                stable_json(evidence) == stable_json(result)
+                for result in journal_results
+            ):
+                continue
+            evidence["owner"] = _owner_for_item(
+                item,
+                "investigation_evidence:{0}".format(evidence_hash),
+            ).to_dict()
+            output.append(evidence)
+        return output
+
+    def _validate_local_state_owners(self) -> None:
+        items_by_visit = self._frontier_items_by_visit()
+        for visit_key in (
+            set(self.visit_evidence)
+            | set(self.investigation_evidence)
+            | set(self.investigation_evidence_hashes)
+            | set(self.pending_rejudge_journal)
+        ):
+            if visit_key not in items_by_visit:
+                raise ValueError(
+                    "local visit state owner has no frontier action entry"
+                )
+
+        judgments_by_visit = {}
+        for index, judgment in enumerate(self.step_judgments):
+            item = self._validate_step_judgment_owner(
+                judgment,
+                label="step judgment[{0}]".format(index),
+            )
+            judgments_by_visit[item.visit_key] = judgment
+
+        for index, assessment in enumerate(self.causal_relations):
+            owner = assessment.owner
+            if owner is None:
+                raise ValueError(
+                    "causal relation[{0}] is ownerless".format(index)
+                )
+            source_judgment = judgments_by_visit.get(owner.visit_key)
+            if source_judgment is not None:
+                matches = [
+                    (position, predecessor)
+                    for position, predecessor in enumerate(
+                        source_judgment.predecessors
+                    )
+                    if predecessor == assessment
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "causal relation[{0}] owner contradicts step judgment".format(
+                            index
+                        )
+                    )
+                continue
+            builder = self.seed_ledger.get(owner.seed_binding_identity)
+            if builder is None:
+                raise ValueError(
+                    "causal relation[{0}] owner has no seed".format(index)
+                )
+            expected = _owner_for_seed_projection(
+                seed_binding_identity=builder.key,
+                node_ref=assessment.ref,
+                defect_state=builder.defect_state,
+                occurrence_key="initial_outcome_relation:{0}:{1}".format(
+                    builder.start_ref, assessment.ref
+                ),
+            )
+            if owner != expected:
+                raise ValueError(
+                    "causal relation[{0}] owner contradicts seed projection".format(
+                        index
+                    )
+                )
+
+        for index, entry in enumerate(self.visited_entries):
+            owner = LocalStateOwner.from_dict(entry.get("owner"))
+            item = self._owner_item(
+                owner,
+                label="visited entry[{0}]".format(index),
+                occurrence_key="visited_node",
+            )
+            if str(entry.get("node_ref") or "") != item.node_ref:
+                raise ValueError(
+                    "visited entry[{0}] owner contradicts node".format(index)
+                )
+
+        for label, entries in (
+            ("confirmation queue", self.confirmation_queue),
+            ("confirmation journal", self.confirmation_journal),
+        ):
+            for index, entry in enumerate(entries):
+                self._validate_confirmation_action_owner(
+                    entry,
+                    label="{0}[{1}]".format(label, index),
+                )
+
+        for index, entry in enumerate(self.investigation_journal):
+            if not isinstance(entry, Mapping):
+                raise ValueError("investigation journal entry must be an object")
+            if entry.get("kind") == "global_candidate_pass" and entry.get(
+                "seed_ref"
+            ):
+                owner = LocalStateOwner.from_dict(entry.get("owner"))
+                item = self._owner_item(
+                    owner,
+                    label="global candidate pass[{0}]".format(index),
+                    occurrence_key="global_candidate_pass",
+                )
+                if (
+                    str(entry.get("hypothesis_id") or "")
+                    not in {"", item.hypothesis_id}
+                    or str(entry.get("visit_key") or "")
+                    not in {"", item.visit_key}
+                    or str(entry.get("seed_ref") or "")
+                    != (
+                        item.downstream_path[-1]
+                        if item.downstream_path
+                        else item.node_ref
+                    )
+                ):
+                    raise ValueError(
+                        "global candidate pass owner contradicts action identity"
+                    )
+                continue
+            active_visit = entry.get("active_visit")
+            if not isinstance(active_visit, Mapping):
+                continue
+            visit_key = str(active_visit.get("visit_key") or "")
+            item = items_by_visit.get(visit_key)
+            if (
+                item is None
+                or str(active_visit.get("hypothesis_id") or "")
+                != item.hypothesis_id
+                or str(active_visit.get("node_ref") or "") != item.node_ref
+                or str(active_visit.get("defect_fingerprint") or "")
+                != item.defect_state.fingerprint
+            ):
+                raise ValueError(
+                    "investigation journal owner contradicts frontier action"
+                )
+
+        for visit_key, evidence in self.investigation_evidence.items():
+            item = items_by_visit[visit_key]
+            owned = self._owned_investigation_evidence(item)
+            if len(owned) != len(evidence):
+                raise ValueError(
+                    "investigation evidence owner is missing or inconsistent"
+                )
+            journal_results = [
+                entry.get("result")
+                for entry in self.investigation_journal
+                if isinstance(entry, Mapping)
+                and isinstance(entry.get("active_visit"), Mapping)
+                and str(entry["active_visit"].get("visit_key") or "")
+                == visit_key
+                and isinstance(entry.get("result"), Mapping)
+            ]
+            for value in evidence:
+                persisted = dict(value)
+                persisted.pop("owner", None)
+                if not any(
+                    stable_json(_checkpoint_json(persisted))
+                    == stable_json(_checkpoint_json(result))
+                    for result in journal_results
+                ):
+                    raise ValueError(
+                        "investigation evidence owner has no action entry"
+                    )
+
+        for builder in self.seed_ledger.values():
+            if builder.global_judgment:
+                owner = LocalStateOwner.from_dict(
+                    builder.global_judgment.get("owner")
+                )
+                self._owner_item(
+                    owner,
+                    label="seed global judgment",
+                    occurrence_key="global_candidate_pass",
+                )
+                if owner.seed_binding_identity != builder.key:
+                    raise ValueError(
+                        "seed global judgment owner contradicts seed ledger"
+                    )
+            for label, entries in (
+                ("decisive evidence", builder.decisive_evidence),
+                ("expansion history", builder.expansion_history),
+            ):
+                for entry in entries:
+                    owner = LocalStateOwner.from_dict(entry.get("owner"))
+                    item = items_by_visit.get(owner.visit_key)
+                    if owner.seed_binding_identity != builder.key:
+                        raise ValueError(
+                            "{0} owner contradicts seed ledger".format(label)
+                        )
+                    valid = bool(
+                        item is not None
+                        and owner
+                        == _owner_for_item(item, "global_candidate_pass")
+                    )
+                    if not valid:
+                        valid = any(
+                            LocalStateOwner.from_dict(action.get("owner"))
+                            == owner
+                            for action in (
+                                *self.confirmation_queue,
+                                *self.confirmation_journal,
+                            )
+                            if isinstance(action, Mapping)
+                        )
+                    if not valid:
+                        raise ValueError(
+                            "{0} owner contradicts exact occurrence".format(label)
+                        )
+
     def seed_results(self) -> Tuple[SeedAttributionResult, ...]:
         return tuple(
             self.seed_ledger[key].to_result() for key in sorted(self.seed_ledger)
@@ -1992,6 +2576,7 @@ class RecursiveAnalysisState:
         }
 
     def action_checkpoint_payload(self) -> JsonDict:
+        self._validate_local_state_owners()
         if any(item.owner is None for item in self.causal_relations):
             raise ValueError("action state cannot persist ownerless causal relations")
         if any(
@@ -2659,6 +3244,7 @@ class RecursiveAnalysisState:
             rejected_candidates=state.rejected_candidates,
             label="restored recursive state",
         )
+        state._validate_local_state_owners()
         return state
 
     def build_step_request(
@@ -2680,11 +3266,7 @@ class RecursiveAnalysisState:
         )
         hypothesis = self.ledger.get(item.hypothesis_id)
         chain = self.transformation_chains.get(item.defect_state.fingerprint, (item.defect_state,))
-        downstream_judgments = [
-            judgment
-            for judgment in self.step_judgments
-            if judgment.current_node_ref in item.downstream_path
-        ]
+        downstream_judgments = self._owned_downstream_judgments(item)
         context = build_recursive_judgment_context(
             graph=graph,
             node_ref=item.node_ref,
@@ -2716,8 +3298,8 @@ class RecursiveAnalysisState:
             "page_size": CAUSAL_STEP_CANDIDATE_LIMIT,
             "selection_method": "structural_provenance_ranked_shortlist_v1",
         }
-        investigated = self.investigation_evidence.get(item.visit_key, [])
-        if investigated:
+        investigated = self._owned_investigation_evidence(item)
+        if item.visit_key in self.investigation_evidence:
             context["investigation_evidence"] = copy.deepcopy(investigated)
         context = graph.sanitize_judge_visible_payload(context)
         context["evidence_hash"] = hashlib.sha256(
@@ -4407,6 +4989,9 @@ class AgenticRecursiveAnalyzer:
                     allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(final_report)
+                _validate_restored_report_local_state_owners(
+                    analysis_graph, report
+                )
                 _assert_report_grounded_evidence(
                     analysis_graph,
                     report,
@@ -4451,6 +5036,9 @@ class AgenticRecursiveAnalyzer:
                     allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(pending_report)
+                _validate_restored_report_local_state_owners(
+                    analysis_graph, report
+                )
                 _assert_report_grounded_evidence(
                     analysis_graph,
                     report,

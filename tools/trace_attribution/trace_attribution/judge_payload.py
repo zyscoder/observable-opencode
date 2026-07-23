@@ -72,13 +72,16 @@ ASSOCIATED_FACT_TOKENS = frozenset(
 )
 TYPED_MAPPING_KEYS = frozenset(
     {
+        "anchor_ref",
         "artifact_id",
+        "candidate_ref",
         "canonical_ref",
         "citation_ref",
         "citation_refs",
         "evidence_refs",
         "evidence_type",
         "from_ref",
+        "intervention_ref",
         "node_ref",
         "owner_reference",
         "provenance_class",
@@ -86,7 +89,10 @@ TYPED_MAPPING_KEYS = frozenset(
         "ref",
         "resolution_status",
         "resolved_ref",
+        "seed_ref",
+        "source_ref",
         "source_refs",
+        "target_ref",
         "to_ref",
     }
 )
@@ -178,9 +184,14 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
         fact_kind = mapping.get("fact_kind")
         if isinstance(fact_kind, str):
             shape_tokens.update(key_tokens(fact_kind))
+        present_shape_aliases = {
+            alias for alias in SHAPE_IDENTITY_ALIASES.values() if alias in keys
+        }
         for token, alias in SHAPE_IDENTITY_ALIASES.items():
             if token in shape_tokens and alias in keys:
                 identities.add(alias)
+        if len(present_shape_aliases) == 1:
+            identities.update(present_shape_aliases)
         return identities
 
     def resolve_reference(raw_value: Any, key: str) -> Any:

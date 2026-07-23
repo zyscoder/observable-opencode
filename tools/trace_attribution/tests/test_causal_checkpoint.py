@@ -745,9 +745,14 @@ class CausalCheckpointTest(unittest.TestCase):
             stable_json(context).encode("utf-8")
         ).hexdigest()
         context_hash = hashlib.sha256(stable_json(context).encode("utf-8")).hexdigest()
+        investigation_result = {
+            "active_visit_key": new_visit_key,
+            "journal_key": "investigation:{0}".format(new_visit_key),
+        }
         state.investigation_journal = [
             {
-                "active_visit": {"visit_key": new_visit_key},
+                "active_visit": state._active_visit_snapshot(item),
+                "result": copy.deepcopy(investigation_result),
                 "context_before": copy.deepcopy(context),
                 "context_before_hash": context_hash,
                 "context_after": copy.deepcopy(context),
@@ -761,12 +766,7 @@ class CausalCheckpointTest(unittest.TestCase):
             }
         ]
         state.investigation_evidence = {
-            new_visit_key: [
-                {
-                    "active_visit_key": new_visit_key,
-                    "journal_key": "investigation:{0}".format(new_visit_key),
-                }
-            ]
+            new_visit_key: [investigation_result]
         }
         state.investigation_evidence_hashes = {new_visit_key: {"evidence:one"}}
         state.pending_rejudge_journal = {new_visit_key: [0]}
@@ -774,11 +774,13 @@ class CausalCheckpointTest(unittest.TestCase):
             seed_binding_identity=seed.key,
             hypothesis_id=hypothesis.hypothesis_id,
             visit_key=new_visit_key,
-            occurrence_key="visit_key_migration_confirmation",
+            occurrence_key="confirmation_queue",
         )
         state.confirmation_journal = [
             {
                 "nested": {"active_visit_key": new_visit_key},
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "seed_binding_identity": seed.key,
                 "owner": confirmation_owner.to_dict(),
             }
         ]
