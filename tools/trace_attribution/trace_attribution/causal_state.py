@@ -50,15 +50,15 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v4"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v5"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v3"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v4"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v3+validation-envelope/v3+capsule/v3"
+    "global-candidate-judgment/v4+validation-envelope/v4+capsule/v4"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v3"
+    "global-candidate-validation-envelope/v4"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v7+resolution/v2"
@@ -1919,7 +1919,7 @@ def _validate_persisted_global_judgment(
         return
     if value.get("schema_version") != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
         raise ValueError(
-            "persisted global judgment requires v3 migration or rejudgment"
+            "persisted global judgment requires v4 migration or rejudgment"
         )
     required = {
         "schema_version",
@@ -1935,7 +1935,7 @@ def _validate_persisted_global_judgment(
         "validation_envelope",
     }
     if set(value) != required:
-        raise ValueError("persisted global judgment v3 schema is incomplete")
+        raise ValueError("persisted global judgment v4 schema is incomplete")
     from .global_judge import (
         global_candidate_request_from_validation_envelope,
         validate_global_candidate_payload,
@@ -1965,7 +1965,7 @@ def _validate_persisted_global_judgment(
             raise ValueError("decisive refs drift from persisted seed evidence")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
-            "persisted global judgment v3 semantic validation failed: {0}".format(
+            "persisted global judgment v4 semantic validation failed: {0}".format(
                 exc
             )
         ) from exc

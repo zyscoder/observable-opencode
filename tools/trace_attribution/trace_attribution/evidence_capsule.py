@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
@@ -13,9 +14,23 @@ from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v3"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v4"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
+MAX_VALIDATION_SOURCE_BYTES = 16384
+VALIDATION_SOURCE_KEYS = frozenset(
+    {
+        "candidate_ref",
+        "candidate_source",
+        "candidate_edge",
+        "candidate_evidence_refs",
+        "downstream_path",
+        "start_refs",
+        "prompt_collections_sha256",
+    }
+)
+
+
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}
@@ -58,6 +73,7 @@ class CandidateEvidenceCapsule:
     evidence_references: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     artifact_hydration: Mapping[str, Any] = field(default_factory=FrozenMapping)
     missing_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    validation_source: Mapping[str, Any] = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         candidate_ref = str(self.candidate_ref).strip()
@@ -89,6 +105,7 @@ class CandidateEvidenceCapsule:
         object.__setattr__(
             self, "missing_evidence_refs", _dedupe_strings(self.missing_evidence_refs)
         )
+        object.__setattr__(self, "validation_source", _freeze(self.validation_source))
         self.validate()
 
     def validate(self) -> None:
@@ -123,6 +140,7 @@ class CandidateEvidenceCapsule:
         self._validate_identity_mapping(node, label="embedded candidate node")
         if not self.downstream_path or self.downstream_path[0] != self.candidate_ref:
             raise ValueError("candidate identity must match downstream path start")
+        self._validate_validation_source()
         if len(self.downstream_path_references) != len(self.downstream_path):
             raise ValueError(
                 "candidate downstream path references must cover every path position"
@@ -152,6 +170,48 @@ class CandidateEvidenceCapsule:
                     raise ValueError(
                         "candidate identity must match embedded downstream path node"
                     )
+
+    def _validate_validation_source(self) -> None:
+        source = self.validation_source
+        if not isinstance(source, Mapping) or set(source) != VALIDATION_SOURCE_KEYS:
+            raise ValueError("candidate evidence capsule validation source schema mismatch")
+        if len(stable_json(_thaw(source)).encode("utf-8")) > MAX_VALIDATION_SOURCE_BYTES:
+            raise ValueError(
+                "candidate evidence capsule validation source must remain bounded"
+            )
+        if str(source.get("candidate_ref") or "") != self.candidate_ref:
+            raise ValueError("candidate evidence capsule validation source identity mismatch")
+        if str(source.get("candidate_source") or "") != str(
+            self.candidate.get("source") or ""
+        ):
+            raise ValueError("candidate evidence capsule validation source route mismatch")
+        if not isinstance(source.get("candidate_edge"), Mapping):
+            raise TypeError("candidate evidence capsule validation source edge must be an object")
+        for key in ("candidate_evidence_refs", "downstream_path", "start_refs"):
+            value = source.get(key)
+            if not isinstance(value, tuple) or any(
+                not isinstance(item, str) or not item for item in value
+            ):
+                raise TypeError(
+                    "candidate evidence capsule validation source {0} must be a string array".format(
+                        key
+                    )
+                )
+        if tuple(source.get("downstream_path") or ()) != self.downstream_path:
+            raise ValueError("candidate evidence capsule validation source path mismatch")
+        if tuple(source.get("start_refs") or ()) != self.start_refs:
+            raise ValueError("candidate evidence capsule validation source seed mismatch")
+        expected_hash = _prompt_collections_sha256(
+            retrieval_edge=self.candidate.get("retrieval_edge"),
+            action_group=self.action_group,
+            evidence_references=self.evidence_references,
+            artifact_hydration=self.artifact_hydration,
+            missing_evidence_refs=self.missing_evidence_refs,
+        )
+        if str(source.get("prompt_collections_sha256") or "") != expected_hash:
+            raise ValueError(
+                "candidate evidence capsule prompt-bearing collections do not match validation source"
+            )
 
     def _validate_identity_mapping(
         self, value: Mapping[str, Any], *, label: str
@@ -184,6 +244,7 @@ class CandidateEvidenceCapsule:
             "evidence_references": _thaw(self.evidence_references),
             "artifact_hydration": _thaw(self.artifact_hydration),
             "missing_evidence_refs": list(self.missing_evidence_refs),
+            "validation_source": _thaw(self.validation_source),
         }
 
     @classmethod
@@ -205,6 +266,7 @@ class CandidateEvidenceCapsule:
             "evidence_references",
             "artifact_hydration",
             "missing_evidence_refs",
+            "validation_source",
         }
         if set(value) != required or value.get("schema_version") != CAPSULE_SCHEMA_VERSION:
             raise ValueError("candidate evidence capsule schema mismatch")
@@ -245,6 +307,7 @@ class CandidateEvidenceCapsule:
             evidence_references=mappings("evidence_references"),
             artifact_hydration=mapping("artifact_hydration"),
             missing_evidence_refs=strings("missing_evidence_refs"),
+            validation_source=mapping("validation_source"),
         )
 
 
@@ -285,38 +348,27 @@ def build_candidate_evidence_capsules(
             path = (ref,)
         elif path[0] != ref:
             path = (ref, *path)
-        artifact_hydration = graph.artifact_hydration_manifest(ref)
-        missing = [
-            "artifact:{0}".format(item)
-            for item in artifact_hydration.get("missing_artifact_ids") or []
-        ]
-        retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
         causal_path_edges = tuple(_causal_path_edges(graph, path))
         incoming_edges = tuple(
             graph.sanitize_judge_edge_evidence(edge)
             for edge in graph.incoming_edge_context(ref)[:16]
         )
         outgoing_edges = tuple(_outgoing_edges(graph, ref, limit=16))
-        evidence_refs = _dedupe_strings(
-            graph.filter_evidence_refs(
-                [
-                    *candidate.evidence_refs,
-                    *(retrieval_edge.get("evidence_refs") or ()),
-                    *node.source_refs,
-                    *(
-                        evidence_ref
-                        for edge in (*causal_path_edges, *incoming_edges, *outgoing_edges)
-                        for evidence_ref in edge.get("evidence_refs") or ()
-                    ),
-                ]
-            )
+        prompt_collections = _build_prompt_collections(
+            graph=graph,
+            candidate=candidate,
+            path=path,
+            causal_path_edges=causal_path_edges,
+            incoming_edges=incoming_edges,
+            outgoing_edges=outgoing_edges,
         )
-        evidence_references = []
-        for evidence_ref in evidence_refs:
-            reference = _reference(graph, evidence_ref)
-            evidence_references.append(reference)
-            if reference.get("resolution_status") != "resolved":
-                missing.append(evidence_ref)
+        validation_source = _validation_source(
+            graph=graph,
+            candidate=candidate,
+            path=path,
+            start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
+            prompt_collections=prompt_collections,
+        )
         capsule = CandidateEvidenceCapsule(
             candidate_ref=ref,
             defect_state=defect_state,
@@ -327,23 +379,133 @@ def build_candidate_evidence_capsules(
                 "evidence_eligible": graph.evidence_eligible(ref),
                 "root_candidate_eligible": root_candidate_eligible(node),
                 "active_graph_facts": _active_candidate_graph_facts(graph, node),
-                "retrieval_edge": retrieval_edge,
+                "retrieval_edge": prompt_collections["retrieval_edge"],
                 "node": node.compact(max_chars=3200),
             },
             downstream_path=path,
             downstream_path_references=tuple(_reference(graph, item) for item in path),
             causal_path_edges=causal_path_edges,
             start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
-            action_group=_action_group(graph, node),
+            action_group=prompt_collections["action_group"],
             incoming_edges=incoming_edges,
             outgoing_edges=outgoing_edges,
-            evidence_references=tuple(evidence_references),
-            artifact_hydration=artifact_hydration,
-            missing_evidence_refs=tuple(missing),
+            evidence_references=tuple(prompt_collections["evidence_references"]),
+            artifact_hydration=prompt_collections["artifact_hydration"],
+            missing_evidence_refs=tuple(prompt_collections["missing_evidence_refs"]),
+            validation_source=validation_source,
         )
         validate_candidate_evidence_capsule_against_graph(graph, capsule)
         capsules.append(capsule)
     return tuple(capsules)
+
+
+def _build_prompt_collections(
+    *,
+    graph: TraceGraph,
+    candidate: CausalCandidate,
+    path: Tuple[str, ...],
+    causal_path_edges: Sequence[Mapping[str, Any]] | None = None,
+    incoming_edges: Sequence[Mapping[str, Any]] | None = None,
+    outgoing_edges: Sequence[Mapping[str, Any]] | None = None,
+) -> JsonDict:
+    ref = graph.resolve(candidate.ref) or candidate.ref
+    node = graph.hydrate_node(ref)
+    artifact_hydration = graph.artifact_hydration_manifest(ref)
+    missing = [
+        "artifact:{0}".format(item)
+        for item in artifact_hydration.get("missing_artifact_ids") or []
+    ]
+    retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
+    causal_edges = tuple(
+        causal_path_edges
+        if causal_path_edges is not None
+        else _causal_path_edges(graph, path)
+    )
+    incoming = tuple(
+        incoming_edges
+        if incoming_edges is not None
+        else (
+            graph.sanitize_judge_edge_evidence(edge)
+            for edge in graph.incoming_edge_context(ref)[:16]
+        )
+    )
+    outgoing = tuple(
+        outgoing_edges
+        if outgoing_edges is not None
+        else _outgoing_edges(graph, ref, limit=16)
+    )
+    evidence_refs = _dedupe_strings(
+        graph.filter_evidence_refs(
+            [
+                *candidate.evidence_refs,
+                *(retrieval_edge.get("evidence_refs") or ()),
+                *node.source_refs,
+                *(
+                    evidence_ref
+                    for edge in (*causal_edges, *incoming, *outgoing)
+                    for evidence_ref in edge.get("evidence_refs") or ()
+                ),
+            ]
+        )
+    )
+    evidence_references = []
+    for evidence_ref in evidence_refs:
+        reference = _reference(graph, evidence_ref)
+        evidence_references.append(reference)
+        if reference.get("resolution_status") != "resolved":
+            missing.append(evidence_ref)
+    return {
+        "retrieval_edge": retrieval_edge,
+        "action_group": _action_group(graph, node),
+        "evidence_references": evidence_references,
+        "artifact_hydration": artifact_hydration,
+        "missing_evidence_refs": list(_dedupe_strings(missing)),
+    }
+
+
+def _validation_source(
+    *,
+    graph: TraceGraph,
+    candidate: CausalCandidate,
+    path: Tuple[str, ...],
+    start_refs: Tuple[str, ...],
+    prompt_collections: Mapping[str, Any],
+) -> JsonDict:
+    return {
+        "candidate_ref": candidate.ref,
+        "candidate_source": candidate.source,
+        "candidate_edge": _thaw(prompt_collections["retrieval_edge"]),
+        "candidate_evidence_refs": list(
+            _dedupe_strings(graph.filter_evidence_refs(candidate.evidence_refs))
+        ),
+        "downstream_path": list(path),
+        "start_refs": list(start_refs),
+        "prompt_collections_sha256": _prompt_collections_sha256(
+            retrieval_edge=prompt_collections["retrieval_edge"],
+            action_group=prompt_collections["action_group"],
+            evidence_references=prompt_collections["evidence_references"],
+            artifact_hydration=prompt_collections["artifact_hydration"],
+            missing_evidence_refs=prompt_collections["missing_evidence_refs"],
+        ),
+    }
+
+
+def _prompt_collections_sha256(
+    *,
+    retrieval_edge: Any,
+    action_group: Any,
+    evidence_references: Any,
+    artifact_hydration: Any,
+    missing_evidence_refs: Any,
+) -> str:
+    value = {
+        "retrieval_edge": _thaw(retrieval_edge),
+        "action_group": _thaw(action_group),
+        "evidence_references": _thaw(evidence_references),
+        "artifact_hydration": _thaw(artifact_hydration),
+        "missing_evidence_refs": _thaw(missing_evidence_refs),
+    }
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
 def candidate_compression_metrics(
@@ -446,6 +608,34 @@ def validate_candidate_evidence_capsule_against_graph(
         raise ValueError("candidate evidence capsule is ineligible in active graph")
     if _thaw(capsule.candidate.get("node")) != node.compact(max_chars=3200):
         raise ValueError("candidate evidence capsule node does not match active graph")
+    source = capsule.validation_source
+    source_candidate = CausalCandidate(
+        ref=str(source.get("candidate_ref") or ""),
+        node=node,
+        source=str(source.get("candidate_source") or ""),
+        edge=_thaw(source.get("candidate_edge")),
+        evidence_refs=tuple(source.get("candidate_evidence_refs") or ()),
+    )
+    active_candidate = _reconcile_candidate_source(graph, source_candidate)
+    expected_prompt_collections = _build_prompt_collections(
+        graph=graph,
+        candidate=active_candidate,
+        path=capsule.downstream_path,
+    )
+    persisted_prompt_collections = {
+        "retrieval_edge": _thaw(capsule.candidate.get("retrieval_edge")),
+        "action_group": _thaw(capsule.action_group),
+        "evidence_references": _thaw(capsule.evidence_references),
+        "artifact_hydration": _thaw(capsule.artifact_hydration),
+        "missing_evidence_refs": list(capsule.missing_evidence_refs),
+    }
+    for label, expected in expected_prompt_collections.items():
+        if persisted_prompt_collections[label] != expected:
+            raise ValueError(
+                "candidate evidence capsule prompt-bearing {0} does not match active construction".format(
+                    label
+                )
+            )
     for path_ref, reference in zip(
         capsule.downstream_path, capsule.downstream_path_references
     ):
@@ -477,6 +667,47 @@ def validate_candidate_evidence_capsule_against_graph(
                     label
                 )
             )
+
+
+def _reconcile_candidate_source(
+    graph: TraceGraph, candidate: CausalCandidate
+) -> CausalCandidate:
+    edge = candidate.edge
+    if not edge:
+        return candidate
+    raw_from_ref = str(edge.get("from_ref") or "")
+    raw_to_ref = str(edge.get("to_ref") or "")
+    from_ref = graph.resolve(raw_from_ref)
+    to_ref = graph.resolve(raw_to_ref)
+    if raw_from_ref and from_ref != candidate.ref:
+        raise ValueError(
+            "candidate evidence capsule validation source edge starts at another candidate"
+        )
+    if raw_to_ref and not to_ref:
+        raise ValueError(
+            "candidate evidence capsule validation source edge target is unresolved"
+        )
+    requires_recorded_edge = candidate.source in {
+        "confirmed_edge",
+        "attribution_edge",
+    }
+    if not requires_recorded_edge:
+        return candidate
+    active = canonical_candidate_route(graph, candidate.ref, (candidate,))
+    if _thaw(active.edge) == _thaw(candidate.edge):
+        matching_edges = [
+            item
+            for item in graph.edge_context(candidate.ref, to_ref or "")
+            if str(item.get("relation") or "")
+            == str(candidate.edge.get("relation") or "")
+            and str(item.get("evidence_type") or "")
+            == str(candidate.edge.get("evidence_type") or "")
+        ]
+        if not matching_edges:
+            raise ValueError(
+                "candidate evidence capsule validation source edge is absent from active graph"
+            )
+    return active
 
 
 def validate_candidate_evidence_capsules_against_graph(
@@ -549,6 +780,7 @@ def _action_identity(node: TraceNode) -> str:
 
 __all__ = [
     "CAPSULE_SCHEMA_VERSION",
+    "MAX_VALIDATION_SOURCE_BYTES",
     "CandidateEvidenceCapsule",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",

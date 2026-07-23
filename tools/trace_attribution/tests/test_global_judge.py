@@ -478,19 +478,48 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate identity"):
             global_candidate_request_from_validation_envelope(envelope)
 
-    def test_validation_envelope_v3_round_trip_rejects_stale_v2_identity(self):
+    def test_judge_request_rejects_stale_prompt_bearing_capsule_collection(self):
+        envelope = sample_request().validation_envelope()
+        envelope["candidate_evidence_capsules"][0]["candidate"][
+            "retrieval_edge"
+        ]["relation"] = "forged_retrieval_relation"
+
+        with self.assertRaisesRegex(ValueError, "validation source"):
+            global_candidate_request_from_validation_envelope(envelope)
+
+    def test_substituted_action_group_member_cannot_become_expansion_anchor(self):
+        envelope = sample_request().validation_envelope()
+        envelope["candidate_evidence_capsules"][0]["action_group"]["members"][
+            0
+        ]["ref"] = "record:forged-expansion-anchor"
+
+        with self.assertRaisesRegex(ValueError, "validation source"):
+            restored = global_candidate_request_from_validation_envelope(envelope)
+            value = payload(outcome="inconclusive", request=restored)
+            value["outcome"] = "needs_expansion"
+            value["expansion_requests"] = [
+                {
+                    "anchor_ref": "record:forged-expansion-anchor",
+                    "context_kind": "action_group",
+                    "reason": "Inspect the substituted action-group member.",
+                }
+            ]
+            value["missing_evidence"] = ["The action-group member needs context."]
+            validate_global_candidate_payload(value, request=restored)
+
+    def test_validation_envelope_v4_round_trip_rejects_stale_v3_identity(self):
         request = sample_request()
         envelope = request.validation_envelope()
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v3",
+            "global-candidate-validation-envelope/v4",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
         )
 
-        envelope["schema_version"] = "global-candidate-validation-envelope/v2"
+        envelope["schema_version"] = "global-candidate-validation-envelope/v3"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             global_candidate_request_from_validation_envelope(envelope)
 
@@ -707,6 +736,14 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                         request.capsules[1].downstream_path_references[0],
                         request.capsules[0].downstream_path_references[-1],
                     ),
+                    validation_source={
+                        **request.capsules[0].validation_source,
+                        "downstream_path": (
+                            "record:decision",
+                            "record:verification",
+                            "record:defect",
+                        ),
+                    },
                 ),
                 request.capsules[1],
             ),
@@ -925,6 +962,14 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         capsule = replace(
             request.capsules[0],
             downstream_path=("record:decision", "record:action", "record:defect"),
+            validation_source={
+                **request.capsules[0].validation_source,
+                "downstream_path": (
+                    "record:decision",
+                    "record:action",
+                    "record:defect",
+                ),
+            },
             downstream_path_references=(
                 request.capsules[0].downstream_path_references[0],
                 {
@@ -1077,14 +1122,14 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_schema_version_is_v3(self):
+    def test_schema_version_is_v4(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v3",
+            "global-candidate-judgment/v4",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v3")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v4")
 
-    def test_v2_global_judgment_cache_hits_only_after_validated_write(self):
+    def test_v4_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()
 
         class Transport:
@@ -1296,7 +1341,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertEqual(result.value.outcome, "candidate_roots")
         self.assertIn("globally compare", transport.calls[0]["system"])
 
-    def test_claude_judge_fallback_is_a_valid_v2_bound_judgment(self):
+    def test_claude_judge_fallback_is_a_valid_v4_bound_judgment(self):
         class Transport:
             model = "test-model"
             max_tokens = 4096

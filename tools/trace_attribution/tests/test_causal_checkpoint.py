@@ -1127,7 +1127,7 @@ class CausalCheckpointTest(unittest.TestCase):
                     analysis_perspective="Improve repository reasoning.",
                 )
 
-    def test_checkpoint_report_restoration_rejects_pre_v2_global_judgment(self):
+    def test_checkpoint_report_restoration_rejects_unversioned_global_judgment(self):
         with tempfile.TemporaryDirectory() as tempdir:
             trace = sample_trace()
             root = Path(tempdir) / "case.checkpoint"
@@ -1156,7 +1156,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "assessments": [{"candidate_ref": "record:only"}],
             }
 
-            with self.assertRaisesRegex(ValueError, "global judgment.*v3"):
+            with self.assertRaisesRegex(ValueError, "global judgment.*v4"):
                 AgenticRecursiveAnalyzer(
                     judge=CountingOfflineJudge(),
                     checkpoint=InjectedRestoreCheckpoint(
@@ -1178,12 +1178,16 @@ class CausalCheckpointTest(unittest.TestCase):
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertEqual(
+            config["global_judgment_contract"],
+            "global-candidate-judgment/v4+validation-envelope/v4+capsule/v4",
+        )
+        self.assertEqual(
             config["root_confirmation_contract"],
             "recursive-root-confirmation/v7+resolution/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v4")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v5")
 
-    def test_completed_report_rejects_v2_global_judgment_with_unresolved_evidence(self):
+    def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
         start_refs = ["record:defect_one", "record:defect_two"]
         config = sample_config(
@@ -1235,7 +1239,7 @@ class CausalCheckpointTest(unittest.TestCase):
                     analysis_perspective="",
                 )
 
-    def test_partial_checkpoint_rejects_semantically_invalid_v2_matrix(self):
+    def test_partial_checkpoint_rejects_semantically_invalid_v4_matrix(self):
         trace = multi_seed_global_trace()
         start_refs = ["record:defect_one", "record:defect_two"]
         config = sample_config(
@@ -1283,7 +1287,7 @@ class CausalCheckpointTest(unittest.TestCase):
                     checkpoint=replace(restored, actions=tuple(actions)),
                 )
 
-    def test_completed_checkpoint_rejects_incomplete_v2_competitor_coverage(self):
+    def test_completed_checkpoint_rejects_incomplete_v4_competitor_coverage(self):
         trace = multi_seed_global_trace()
         start_refs = ["record:defect_one", "record:defect_two"]
         config = sample_config(
@@ -1324,6 +1328,100 @@ class CausalCheckpointTest(unittest.TestCase):
                     fusion_mode="retrieval-global",
                     checkpoint=InjectedRestoreCheckpoint(
                         replace(restored, actions=tuple(actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=start_refs,
+                    objective="Determine whether either observation is supported.",
+                    analysis_perspective="",
+                )
+
+    def test_partial_and_completed_restore_reject_stale_capsule_prompt_collections(self):
+        trace = multi_seed_global_trace()
+        start_refs = ["record:defect_one", "record:defect_two"]
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=start_refs,
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            partial_root = Path(tempdir) / "partial-stale-capsule.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingGlobalNoDefectJudge(interrupt_on_call=2),
+                    fusion_mode="retrieval-global",
+                    checkpoint=CheckpointBundle(partial_root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=start_refs,
+                    objective="Determine whether either observation is supported.",
+                    analysis_perspective="",
+                )
+            partial = CheckpointBundle(partial_root).restore(expected_config=config)
+            partial_actions = json.loads(json.dumps(partial.actions))
+            snapshot = next(
+                item
+                for item in reversed(partial_actions)
+                if item["operation"] == "state_snapshot"
+                and any(
+                    seed.get("global_judgment")
+                    for seed in item["payload"].get("seed_ledger", [])
+                )
+            )
+            partial_judgment = next(
+                seed["global_judgment"]
+                for seed in snapshot["payload"]["seed_ledger"]
+                if seed.get("global_judgment")
+            )
+            partial_judgment["validation_envelope"][
+                "candidate_evidence_capsules"
+            ][0]["action_group"]["members"][0]["ref"] = "record:defect_two"
+
+            with self.assertRaisesRegex(ValueError, "validation source|active"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(trace),
+                    checkpoint=replace(partial, actions=tuple(partial_actions)),
+                )
+
+            completed_root = Path(tempdir) / "completed-stale-capsule.checkpoint"
+            AgenticRecursiveAnalyzer(
+                judge=InterruptingGlobalNoDefectJudge(),
+                fusion_mode="retrieval-global",
+                checkpoint=CheckpointBundle(completed_root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=start_refs,
+                objective="Determine whether either observation is supported.",
+                analysis_perspective="",
+            )
+            completed = CheckpointBundle(completed_root).restore(
+                expected_config=config
+            )
+            completed_actions = json.loads(json.dumps(completed.actions))
+            report_action = next(
+                item
+                for item in reversed(completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            completed_capsule = report_action["payload"]["report"][
+                "seed_results"
+            ][0]["global_judgment"]["validation_envelope"][
+                "candidate_evidence_capsules"
+            ][0]
+            completed_capsule["artifact_hydration"][
+                "missing_artifact_ids"
+            ] = ["stale-artifact"]
+
+            with self.assertRaisesRegex(ValueError, "validation source|active"):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingGlobalNoDefectJudge(),
+                    fusion_mode="retrieval-global",
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(completed, actions=tuple(completed_actions)),
+                        completed_root,
                     ),
                     checkpoint_config=config,
                 ).analyze(

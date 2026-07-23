@@ -15,6 +15,7 @@ from trace_attribution.evidence_capsule import (
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
+from trace_attribution.models import stable_json
 
 
 def sample_graph(
@@ -161,15 +162,82 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "candidate identity"):
                     CandidateEvidenceCapsule.from_dict(payload)
 
-    def test_capsule_v3_round_trip_rejects_stale_v2_identity(self):
+    def test_capsule_v4_round_trip_rejects_stale_v3_identity(self):
         payload = self._decision_capsule().to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v3")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v4")
         self.assertEqual(CandidateEvidenceCapsule.from_dict(payload).to_dict(), payload)
 
-        payload["schema_version"] = "candidate-evidence-capsule/v2"
+        payload["schema_version"] = "candidate-evidence-capsule/v3"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_current_capsule_round_trip_keeps_validation_source_bounded(self):
+        graph = sample_graph()
+        payload = self._decision_capsule(graph).to_dict()
+
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v4")
+        self.assertEqual(
+            set(payload["validation_source"]),
+            {
+                "candidate_ref",
+                "candidate_source",
+                "candidate_edge",
+                "candidate_evidence_refs",
+                "downstream_path",
+                "start_refs",
+                "prompt_collections_sha256",
+            },
+        )
+        self.assertLessEqual(len(str(payload["validation_source"])), 12000)
+
+        restored = CandidateEvidenceCapsule.from_dict(payload)
+        evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+            graph, restored
+        )
+        self.assertEqual(restored.to_dict(), payload)
+
+    def test_capsule_rejects_oversized_validation_source(self):
+        payload = self._decision_capsule().to_dict()
+        payload["validation_source"]["candidate_evidence_refs"] = [
+            "record:oversized-{0}-{1}".format(index, "x" * 256)
+            for index in range(80)
+        ]
+
+        with self.assertRaisesRegex(ValueError, "validation source.*bounded"):
+            CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_active_validation_rejects_paired_unresolved_synthetic_route_substitution(self):
+        graph = sample_graph()
+        payload = self._decision_capsule(graph).to_dict()
+        forged_edge = {
+            "from_ref": "record:forged-route-source",
+            "to_ref": "record:observed_defect",
+            "relation": "semantic_predecessor_match",
+            "evidence_type": "semantic_inferred",
+            "eligible_for_attribution": False,
+            "retrieval_candidate": True,
+        }
+        payload["candidate"]["source"] = "semantic_fallback"
+        payload["candidate"]["retrieval_edge"] = copy.deepcopy(forged_edge)
+        payload["validation_source"]["candidate_source"] = "semantic_fallback"
+        payload["validation_source"]["candidate_edge"] = copy.deepcopy(forged_edge)
+        collections = {
+            "retrieval_edge": payload["candidate"]["retrieval_edge"],
+            "action_group": payload["action_group"],
+            "evidence_references": payload["evidence_references"],
+            "artifact_hydration": payload["artifact_hydration"],
+            "missing_evidence_refs": payload["missing_evidence_refs"],
+        }
+        payload["validation_source"]["prompt_collections_sha256"] = hashlib.sha256(
+            stable_json(collections).encode("utf-8")
+        ).hexdigest()
+        restored = CandidateEvidenceCapsule.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "source edge starts"):
+            evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                graph, restored
+            )
 
     def test_capsule_requires_boolean_candidate_eligibility_on_restore(self):
         original = self._decision_capsule().to_dict()
@@ -225,6 +293,66 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 payload[collection][0]["relation"] = "forged_persisted_relation"
                 restored = CandidateEvidenceCapsule.from_dict(payload)
                 with self.assertRaisesRegex(ValueError, "edge.*active graph"):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        graph, restored
+                    )
+
+    def test_every_prompt_bearing_collection_must_match_active_construction(self):
+        graph = sample_graph()
+        original = self._decision_capsule(graph).to_dict()
+
+        mutations = {}
+        retrieval_edge = copy.deepcopy(original)
+        retrieval_edge["candidate"]["retrieval_edge"]["relation"] = (
+            "forged_retrieval_relation"
+        )
+        mutations["retrieval edge"] = retrieval_edge
+
+        action_group = copy.deepcopy(original)
+        action_group["action_group"]["members"][0] = copy.deepcopy(
+            original["action_group"]["members"][1]
+        )
+        mutations["substituted action-group member"] = action_group
+
+        evidence_reference = copy.deepcopy(original)
+        evidence_reference["evidence_references"][0] = {
+            "raw_ref": "record:prompt",
+            "resolved_ref": "record:prompt",
+            "canonical_ref": "record:prompt",
+            "resolution_status": "resolved",
+            "provenance_class": "recorded_or_reconstructed_trace_fact",
+            "node": graph.hydrate_node("record:prompt").compact(max_chars=1800),
+        }
+        mutations["forged resolved evidence reference"] = evidence_reference
+
+        artifact_hydration = copy.deepcopy(original)
+        artifact_hydration["artifact_hydration"]["missing_artifact_ids"] = []
+        mutations["stale artifact hydration"] = artifact_hydration
+
+        removed_missing = copy.deepcopy(original)
+        removed_missing["missing_evidence_refs"] = []
+        mutations["removed missing-evidence ref"] = removed_missing
+
+        extra_missing = copy.deepcopy(original)
+        extra_missing["missing_evidence_refs"].append("record:prompt")
+        mutations["extra missing-evidence ref"] = extra_missing
+
+        for label, payload in mutations.items():
+            with self.subTest(case=label):
+                collections = {
+                    "retrieval_edge": payload["candidate"]["retrieval_edge"],
+                    "action_group": payload["action_group"],
+                    "evidence_references": payload["evidence_references"],
+                    "artifact_hydration": payload["artifact_hydration"],
+                    "missing_evidence_refs": payload["missing_evidence_refs"],
+                }
+                payload["validation_source"]["prompt_collections_sha256"] = (
+                    hashlib.sha256(
+                        stable_json(collections).encode("utf-8")
+                    ).hexdigest()
+                )
+                restored = CandidateEvidenceCapsule.from_dict(payload)
+                with self.assertRaisesRegex(ValueError, "prompt-bearing.*active"):
                     evidence_capsule.validate_candidate_evidence_capsule_against_graph(
                         graph, restored
                     )
@@ -497,12 +625,14 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         candidate = CausalCandidate(
             ref="record:decision",
             node=graph.nodes["record:decision"],
-            source="confirmed_edge",
+            source="semantic_fallback",
             edge={
                 "from_ref": "record:decision",
                 "to_ref": "record:decision",
                 "relation": "recorded_support",
                 "evidence_refs": list(all_refs),
+                "eligible_for_attribution": False,
+                "retrieval_candidate": True,
             },
             score=1.0,
             evidence_refs=all_refs,

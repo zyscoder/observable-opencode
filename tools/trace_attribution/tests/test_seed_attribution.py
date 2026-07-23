@@ -1843,7 +1843,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={
-                "schema_version": "global-candidate-judgment/v3",
+                "schema_version": "global-candidate-judgment/v4",
                 "outcome": "inconclusive",
                 "reason": "No global candidates were available.",
                 "assessments": [],
@@ -1935,24 +1935,24 @@ class SeedAttributionModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-confirmed"):
             RecursiveAttributionReport.from_dict(non_confirmed)
 
-    def test_report_v4_round_trip_rejects_v3_and_migrates_v2_conservatively(self):
+    def test_report_v5_round_trip_rejects_v4_and_migrates_v2_conservatively(self):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v4")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v5")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
-        v3_payload = json.loads(json.dumps(payload))
-        v3_payload["schema_version"] = "recursive-attribution-report/v3"
+        v4_payload = json.loads(json.dumps(payload))
+        v4_payload["schema_version"] = "recursive-attribution-report/v4"
         with self.assertRaisesRegex(ValueError, "unsupported report schema_version"):
-            RecursiveAttributionReport.from_dict(v3_payload)
+            RecursiveAttributionReport.from_dict(v4_payload)
 
         v2_payload = json.loads(json.dumps(payload))
         v2_payload["schema_version"] = "recursive-attribution-report/v2"
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v4")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v5")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),
