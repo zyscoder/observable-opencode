@@ -117,6 +117,10 @@ class CandidateEvidenceCapsule:
             raise ValueError("candidate root_candidate_eligible must be an exact boolean")
         if type(self.candidate.get("evidence_eligible")) is not bool:
             raise ValueError("candidate evidence_eligible must be an exact boolean")
+        if self.candidate.get("retrieval_is_not_causal_verdict") is not True:
+            raise ValueError(
+                "candidate retrieval_is_not_causal_verdict must be exact boolean true"
+            )
         graph_facts = self.candidate.get("active_graph_facts")
         if not isinstance(graph_facts, Mapping):
             raise ValueError("candidate active_graph_facts must be an object")
@@ -394,7 +398,9 @@ def build_candidate_evidence_capsules(
             missing_evidence_refs=tuple(prompt_collections["missing_evidence_refs"]),
             validation_source=validation_source,
         )
-        validate_candidate_evidence_capsule_against_graph(graph, capsule)
+        validate_candidate_evidence_capsule_against_graph(
+            graph, capsule, authoritative_candidates=candidates
+        )
         capsules.append(capsule)
     return tuple(capsules)
 
@@ -593,7 +599,10 @@ def _active_candidate_graph_facts(
 
 
 def validate_candidate_evidence_capsule_against_graph(
-    graph: TraceGraph, capsule: CandidateEvidenceCapsule
+    graph: TraceGraph,
+    capsule: CandidateEvidenceCapsule,
+    *,
+    authoritative_candidates: Sequence[CausalCandidate] = (),
 ) -> None:
     """Bind persisted candidate and path facts to the active graph."""
     capsule.validate()
@@ -616,7 +625,11 @@ def validate_candidate_evidence_capsule_against_graph(
         edge=_thaw(source.get("candidate_edge")),
         evidence_refs=tuple(source.get("candidate_evidence_refs") or ()),
     )
-    active_candidate = _reconcile_candidate_source(graph, source_candidate)
+    active_candidate = _reconcile_candidate_source(
+        graph,
+        source_candidate,
+        authoritative_candidates=authoritative_candidates,
+    )
     expected_prompt_collections = _build_prompt_collections(
         graph=graph,
         candidate=active_candidate,
@@ -670,11 +683,31 @@ def validate_candidate_evidence_capsule_against_graph(
 
 
 def _reconcile_candidate_source(
-    graph: TraceGraph, candidate: CausalCandidate
+    graph: TraceGraph,
+    candidate: CausalCandidate,
+    *,
+    authoritative_candidates: Sequence[CausalCandidate],
 ) -> CausalCandidate:
     edge = candidate.edge
+    requires_recorded_edge = candidate.source in {
+        "confirmed_edge",
+        "attribution_edge",
+    }
     if not edge:
-        return candidate
+        matching = [
+            route
+            for route in authoritative_candidates
+            if (graph.resolve(route.ref) or route.ref) == candidate.ref
+            and route.source == candidate.source
+            and not route.edge
+            and tuple(sorted(graph.filter_evidence_refs(route.evidence_refs)))
+            == tuple(sorted(candidate.evidence_refs))
+        ]
+        if matching:
+            return candidate
+        raise ValueError(
+            "candidate with no recorded edge requires an authoritative retrieval route"
+        )
     raw_from_ref = str(edge.get("from_ref") or "")
     raw_to_ref = str(edge.get("to_ref") or "")
     from_ref = graph.resolve(raw_from_ref)
@@ -687,11 +720,35 @@ def _reconcile_candidate_source(
         raise ValueError(
             "candidate evidence capsule validation source edge target is unresolved"
         )
-    requires_recorded_edge = candidate.source in {
-        "confirmed_edge",
-        "attribution_edge",
-    }
     if not requires_recorded_edge:
+        routes = [
+            route
+            for route in authoritative_candidates
+            if (graph.resolve(route.ref) or route.ref) == candidate.ref
+        ]
+        if not routes:
+            raise ValueError(
+                "synthetic candidate requires an authoritative retrieval route"
+            )
+        matching = [
+            route
+            for route in routes
+            if route.source == candidate.source
+            and _thaw(graph.sanitize_judge_edge_evidence(route.edge))
+            == _thaw(candidate.edge)
+            and tuple(
+                sorted(
+                    _dedupe_strings(
+                        graph.filter_evidence_refs(route.evidence_refs)
+                    )
+                )
+            )
+            == tuple(sorted(candidate.evidence_refs))
+        ]
+        if not matching:
+            raise ValueError(
+                "synthetic candidate does not match its authoritative retrieval route"
+            )
         return candidate
     active = canonical_candidate_route(graph, candidate.ref, (candidate,))
     if _thaw(active.edge) == _thaw(candidate.edge):
@@ -711,10 +768,17 @@ def _reconcile_candidate_source(
 
 
 def validate_candidate_evidence_capsules_against_graph(
-    graph: TraceGraph, capsules: Sequence[CandidateEvidenceCapsule]
+    graph: TraceGraph,
+    capsules: Sequence[CandidateEvidenceCapsule],
+    *,
+    authoritative_candidates: Sequence[CausalCandidate] = (),
 ) -> None:
     for capsule in capsules:
-        validate_candidate_evidence_capsule_against_graph(graph, capsule)
+        validate_candidate_evidence_capsule_against_graph(
+            graph,
+            capsule,
+            authoritative_candidates=authoritative_candidates,
+        )
 
 
 def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict]:

@@ -2389,7 +2389,13 @@ class RecursiveRootRankingTest(unittest.TestCase):
             },
             {
                 "record:context": RootConfirmation.rejected(
-                    "record:context", "The context did not introduce the defect."
+                    "record:context",
+                    "The context did not introduce the defect.",
+                    evidence_refs=[
+                        "record:context",
+                        "record:change",
+                        "record:observed_defect",
+                    ],
                 ),
                 "record:decision": RootConfirmation.confirmed(
                     "record:decision",
@@ -2414,6 +2420,71 @@ class RecursiveRootRankingTest(unittest.TestCase):
         )
         self.assertEqual(report.contributing_conditions, ())
         self.assertEqual(report.amplifying_factors, ())
+
+    def test_every_published_non_root_role_requires_an_active_causal_path(self):
+        for role in (
+            "contributing_condition",
+            "amplifying_factor",
+            "unrelated",
+        ):
+            with self.subTest(role=role):
+                judge = ConfirmingScriptedJudge(
+                    {
+                        "record:change": step(
+                            "record:change",
+                            predecessors=(
+                                relation(
+                                    "record:context", "same_defect_propagation"
+                                ),
+                            ),
+                        ),
+                        "record:context": self._confirmation_step,
+                    },
+                    {
+                        "record:context": RootConfirmation.rejected(
+                            "record:context",
+                            "The context is not a necessary root.",
+                            evidence_refs=[
+                                "record:context",
+                                "record:change",
+                                "record:observed_defect",
+                            ],
+                            factor_role=role,
+                        ),
+                    },
+                )
+                trace = observed_trace(branching=True)
+                report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:observed_defect"],
+                    objective="Find why the implementation omitted the method.",
+                )
+                for mutation in ("disconnected", "reversed", "temporal"):
+                    mutated_trace = copy.deepcopy(trace)
+                    context_edge = next(
+                        edge
+                        for edge in mutated_trace["dataflow_edges"]
+                        if edge["from"]["id"] == "context"
+                    )
+                    if mutation == "disconnected":
+                        mutated_trace["dataflow_edges"].remove(context_edge)
+                    elif mutation == "reversed":
+                        context_edge["from"], context_edge["to"] = (
+                            context_edge["to"],
+                            context_edge["from"],
+                        )
+                    else:
+                        context_edge["relation"] = "temporal_sequence"
+
+                    with self.subTest(role=role, mutation=mutation):
+                        with self.assertRaisesRegex(
+                            ValueError, "non-root.*causal edge|confirmation path"
+                        ):
+                            _assert_report_grounded_evidence(
+                                TraceGraph.from_trace(mutated_trace),
+                                report,
+                                label="published report",
+                            )
 
     def test_rejected_candidate_with_unknown_counterfactual_stays_unresolved(self):
         judge = ConfirmingScriptedJudge(

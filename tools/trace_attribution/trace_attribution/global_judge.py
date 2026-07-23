@@ -11,6 +11,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 from .causal_state import (
     GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
     GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
+    CausalCandidate,
     DefectState,
     FrozenMapping,
 )
@@ -277,6 +278,7 @@ def global_candidate_request_from_validation_envelope(
     value: Any,
     *,
     graph: Optional[TraceGraph] = None,
+    authoritative_candidates: Sequence[CausalCandidate] = (),
 ) -> GlobalCandidateJudgeRequest:
     if not isinstance(value, Mapping):
         raise TypeError("global candidate validation envelope must be an object")
@@ -329,7 +331,9 @@ def global_candidate_request_from_validation_envelope(
     )
     if graph is not None:
         validate_candidate_evidence_capsules_against_graph(
-            graph, request.capsules
+            graph,
+            request.capsules,
+            authoritative_candidates=authoritative_candidates,
         )
     return request
 

@@ -321,6 +321,34 @@ def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) 
     ]
 
 
+def forge_checkpoint_factor_path(payload: dict, recursive_path: list[str]) -> None:
+    factor = payload["contributing_conditions"][0]
+    old_identity = factor["confirmation"]["confirmation_identity"]
+    confirmation = next(
+        item
+        for item in payload["confirmations"]
+        if item["confirmation_identity"] == old_identity
+    )
+    confirmation["recursive_path"] = list(recursive_path)
+    confirmation["confirmation_identity"] = confirmation_identity_for(
+        hypothesis_id=confirmation["hypothesis_id"],
+        hypothesis_semantic_hash=confirmation["hypothesis_semantic_hash"],
+        candidate_ref=confirmation["candidate_ref"],
+        defect_fingerprint=confirmation["defect_fingerprint"],
+        recursive_path=confirmation["recursive_path"],
+        seed_binding_identity=confirmation["seed_binding_identity"],
+    )
+    factor["recursive_path"] = list(recursive_path)
+    factor["confirmation"] = copy.deepcopy(confirmation)
+    for seed in payload["seed_ledger"] if "seed_ledger" in payload else payload["seed_results"]:
+        seed["confirmation_identities"] = [
+            confirmation["confirmation_identity"]
+            if identity == old_identity
+            else identity
+            for identity in seed["confirmation_identities"]
+        ]
+
+
 class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapability):
     def __init__(self, *, interrupt_on_call=0):
         super().__init__()
@@ -1385,6 +1413,34 @@ class CausalCheckpointTest(unittest.TestCase):
                     checkpoint=replace(partial, actions=tuple(partial_actions)),
                 )
 
+            route_actions = json.loads(json.dumps(partial.actions))
+            route_snapshot = next(
+                item
+                for item in reversed(route_actions)
+                if item["operation"] == "state_snapshot"
+                and any(
+                    seed.get("global_judgment")
+                    for seed in item["payload"].get("seed_ledger", [])
+                )
+            )
+            route_judgment = next(
+                seed["global_judgment"]
+                for seed in route_snapshot["payload"]["seed_ledger"]
+                if seed.get("global_judgment")
+            )
+            route_capsule = route_judgment["validation_envelope"][
+                "candidate_evidence_capsules"
+            ][0]
+            route_capsule["candidate"]["source"] = "semantic_fallback"
+            route_capsule["validation_source"][
+                "candidate_source"
+            ] = "semantic_fallback"
+            with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(trace),
+                    checkpoint=replace(partial, actions=tuple(route_actions)),
+                )
+
             completed_root = Path(tempdir) / "completed-stale-capsule.checkpoint"
             AgenticRecursiveAnalyzer(
                 judge=InterruptingGlobalNoDefectJudge(),
@@ -1421,6 +1477,37 @@ class CausalCheckpointTest(unittest.TestCase):
                     fusion_mode="retrieval-global",
                     checkpoint=InjectedRestoreCheckpoint(
                         replace(completed, actions=tuple(completed_actions)),
+                        completed_root,
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=start_refs,
+                    objective="Determine whether either observation is supported.",
+                    analysis_perspective="",
+                )
+
+            route_completed_actions = json.loads(json.dumps(completed.actions))
+            route_report_action = next(
+                item
+                for item in reversed(route_completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            route_capsule = route_report_action["payload"]["report"][
+                "seed_results"
+            ][0]["global_judgment"]["validation_envelope"][
+                "candidate_evidence_capsules"
+            ][0]
+            route_capsule["candidate"]["source"] = "semantic_fallback"
+            route_capsule["validation_source"][
+                "candidate_source"
+            ] = "semantic_fallback"
+            with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingGlobalNoDefectJudge(),
+                    fusion_mode="retrieval-global",
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(completed, actions=tuple(route_completed_actions)),
                         completed_root,
                     ),
                     checkpoint_config=config,
@@ -1525,6 +1612,102 @@ class CausalCheckpointTest(unittest.TestCase):
                 ).analyze(
                     TraceGraph.from_trace(trace),
                     start_refs=["record:defect"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
+    def test_partial_and_completed_checkpoint_reject_disconnected_factor_path(self):
+        from tests.test_recursive_analyzer import (
+            ConfirmingScriptedJudge,
+            RecursiveRootRankingTest,
+            observed_trace,
+            relation,
+            step,
+        )
+
+        trace = observed_trace(branching=True)
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:observed_defect"],
+        )
+
+        def judge():
+            return ConfirmingScriptedJudge(
+                {
+                    "record:change": step(
+                        "record:change",
+                        predecessors=(
+                            relation("record:context", "same_defect_propagation"),
+                        ),
+                    ),
+                    "record:context": RecursiveRootRankingTest()._confirmation_step,
+                },
+                {
+                    "record:context": RootConfirmation.rejected(
+                        "record:context",
+                        "The context is a condition, not a necessary root.",
+                        evidence_refs=[
+                            "record:context",
+                            "record:change",
+                            "record:observed_defect",
+                        ],
+                        factor_role="contributing_condition",
+                    )
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "factor-path.checkpoint"
+            AgenticRecursiveAnalyzer(
+                judge=judge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            partial_actions = json.loads(json.dumps(restored.actions))
+            snapshot = next(
+                item
+                for item in reversed(partial_actions)
+                if item["operation"] == "state_snapshot"
+                and item["payload"]["contributing_conditions"]
+            )
+            forge_checkpoint_factor_path(
+                snapshot["payload"],
+                ["record:context", "record:decision", "record:observed_defect"],
+            )
+            with self.assertRaisesRegex(ValueError, "non-root.*causal edge"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(trace),
+                    checkpoint=replace(restored, actions=tuple(partial_actions)),
+                )
+
+            completed_actions = json.loads(json.dumps(restored.actions))
+            report_action = next(
+                item
+                for item in reversed(completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            forge_checkpoint_factor_path(
+                report_action["payload"]["report"],
+                ["record:context", "record:decision", "record:observed_defect"],
+            )
+            with self.assertRaisesRegex(ValueError, "non-root.*causal edge"):
+                AgenticRecursiveAnalyzer(
+                    judge=judge(),
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(restored, actions=tuple(completed_actions)), root
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:observed_defect"],
                     objective="Find the defect.",
                     analysis_perspective="Improve repository reasoning.",
                 )

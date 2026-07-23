@@ -471,6 +471,7 @@ def _assert_report_grounded_evidence(
             global_candidate_request_from_validation_envelope(
                 seed.to_dict()["global_judgment"].get("validation_envelope"),
                 graph=graph,
+                authoritative_candidates=report.causal_candidates,
             )
         refs.extend(judgment.get("decisive_evidence_refs") or ())
         identity_refs.extend(judgment.get("selected_candidate_refs") or ())
@@ -580,6 +581,115 @@ def _assert_report_grounded_evidence(
             seed_ref=owner.start_ref,
             label=label,
         )
+    _assert_published_non_root_factors(
+        graph,
+        confirmations=report.confirmations,
+        seed_results=report.seed_results,
+        defect_states=report.defect_states,
+        contributing_conditions=report.contributing_conditions,
+        amplifying_factors=report.amplifying_factors,
+        rejected_candidates=report.rejected_candidates,
+        label=label,
+    )
+
+
+def _assert_published_non_root_factors(
+    graph: TraceGraph,
+    *,
+    confirmations: Sequence[RootConfirmation],
+    seed_results: Sequence[SeedAttributionResult],
+    defect_states: Sequence[DefectState],
+    contributing_conditions: Sequence[CausalFactor],
+    amplifying_factors: Sequence[CausalFactor],
+    rejected_candidates: Sequence[RejectedCandidate],
+    label: str,
+) -> None:
+    confirmations = {
+        confirmation.confirmation_identity: confirmation
+        for confirmation in confirmations
+    }
+    seeds_by_binding = {
+        seed_binding_identity_for(seed.start_ref, seed.defect_fingerprint): seed
+        for seed in seed_results
+    }
+    publications = [
+        ("contributing_condition", item) for item in contributing_conditions
+    ]
+    publications.extend(
+        ("amplifying_factor", item) for item in amplifying_factors
+    )
+    publications.extend(
+        ("rejected_candidate", item) for item in rejected_candidates
+    )
+    for published_role, item in publications:
+        confirmation = RootConfirmation.from_dict(item.to_dict()["confirmation"])
+        canonical = confirmations.get(confirmation.confirmation_identity)
+        owner = seeds_by_binding.get(confirmation.seed_binding_identity)
+        if (
+            canonical != confirmation
+            or owner is None
+            or confirmation.confirmation_identity
+            not in owner.confirmation_identities
+            or confirmation.defect_fingerprint not in {
+                state.fingerprint
+                for state in defect_states
+            }
+            | {owner.defect_fingerprint}
+        ):
+            raise ValueError(
+                "{0} published non-root factor has no exact confirmation owner".format(
+                    label
+                )
+            )
+        if published_role != "rejected_candidate" and confirmation.factor_role != published_role:
+            raise ValueError(
+                "{0} published non-root factor role contradicts confirmation".format(
+                    label
+                )
+            )
+        if published_role == "rejected_candidate" and confirmation.factor_role not in {
+            "unrelated",
+            "unknown",
+        }:
+            raise ValueError(
+                "{0} rejected candidate role contradicts confirmation".format(label)
+            )
+        if not confirmation.evidence_refs:
+            raise ValueError(
+                "{0} published non-root factor requires grounded evidence".format(label)
+            )
+        graph.assert_resolved_evidence_references(
+            confirmation.evidence_refs,
+            label="{0} published non-root factor".format(label),
+        )
+        _assert_active_confirmation_path(
+            graph,
+            confirmation.recursive_path,
+            candidate_ref=confirmation.candidate_ref,
+            seed_ref=owner.start_ref,
+            label="{0} published non-root factor".format(label),
+        )
+        assessments = [
+            assessment
+            for assessment in owner.global_judgment.get("assessments") or ()
+            if isinstance(assessment, Mapping)
+            and str(assessment.get("candidate_ref") or "")
+            == confirmation.candidate_ref
+        ]
+        if assessments:
+            assessment = assessments[0]
+            if (
+                len(assessments) != 1
+                or tuple(assessment.get("causal_path_refs") or ())
+                != confirmation.recursive_path
+                or str(assessment.get("causal_role") or "")
+                != confirmation.factor_role
+            ):
+                raise ValueError(
+                    "{0} published non-root factor contradicts its global assessment facts".format(
+                        label
+                    )
+                )
 
 
 def _assert_active_confirmation_path(
@@ -1746,7 +1856,9 @@ class RecursiveAnalysisState:
             judgment = builder.global_judgment
             if judgment:
                 global_candidate_request_from_validation_envelope(
-                    judgment.get("validation_envelope"), graph=graph
+                    judgment.get("validation_envelope"),
+                    graph=graph,
+                    authoritative_candidates=state.causal_candidates,
                 )
         if len(state.seed_ledger) != len(action_payload["seed_ledger"]):
             raise ValueError("checkpoint contains duplicate per-seed attribution identity")
@@ -1816,6 +1928,16 @@ class RecursiveAnalysisState:
             )
         else:
             state.replay_actions = copy.deepcopy(checkpoint.latest_actions)
+        _assert_published_non_root_factors(
+            graph,
+            confirmations=state.confirmations,
+            seed_results=state.seed_results(),
+            defect_states=tuple(state.defect_states.values()),
+            contributing_conditions=state.contributing_conditions,
+            amplifying_factors=state.amplifying_factors,
+            rejected_candidates=state.rejected_candidates,
+            label="restored recursive state",
+        )
         return state
 
     def build_step_request(

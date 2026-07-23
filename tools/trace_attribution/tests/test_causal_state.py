@@ -184,6 +184,7 @@ def factor_bundle(*, role="contributing_condition"):
         hypothesis_id="hyp:factor",
         hypothesis_semantic_hash="semantic:factor",
         defect_fingerprint=sample_defect_state().fingerprint,
+        confidence=0.7,
         recursive_path=path,
         seed_binding_identity=seed_binding_identity_for(
             path[-1], sample_defect_state().fingerprint
@@ -318,7 +319,8 @@ class CausalStateTest(unittest.TestCase):
         confirmation, factor, rejected = factor_bundle()
 
         with self.assertRaisesRegex(
-            ValueError, "factor.*rejected|role conflict|inconsistent confirmation role"
+            ValueError,
+            "factor.*rejected|role conflict|confirmation role|grounded role",
         ):
             RecursiveAttributionReport(
                 case_id="factor-overlap",
@@ -348,6 +350,71 @@ class CausalStateTest(unittest.TestCase):
 
                 self.assertEqual(report.rejected_candidates, ())
                 self.assertEqual(report.analysis_outcome, "inconclusive")
+
+    def test_non_root_publications_must_equal_their_owning_confirmation(self):
+        for role in ("contributing_condition", "amplifying_factor"):
+            confirmation, factor, _ = factor_bundle(role=role)
+            mutations = {
+                "reason": replace(factor, reason="A different factor reason."),
+                "confidence": replace(factor, confidence=0.2),
+                "evidence citations": replace(
+                    factor, evidence_refs=(factor.node_ref,)
+                ),
+                "mechanism": replace(
+                    factor,
+                    mechanism={
+                        **dict(factor.mechanism),
+                        "target_ref": "record:unrelated",
+                    },
+                ),
+            }
+            for label, mutated in mutations.items():
+                with self.subTest(role=role, mutation=label):
+                    with self.assertRaisesRegex(
+                        ValueError, "confirmation facts|grounded role"
+                    ):
+                        RecursiveAttributionReport(
+                            case_id="factor-confirmation-drift",
+                            objective="Find roots.",
+                            **confirmation_seed_fields(confirmation),
+                            confirmations=[confirmation],
+                            contributing_conditions=(
+                                [mutated]
+                                if role == "contributing_condition"
+                                else []
+                            ),
+                            amplifying_factors=(
+                                [mutated] if role == "amplifying_factor" else []
+                            ),
+                        )
+
+        confirmation, _, rejected = factor_bundle()
+        unrelated = replace(confirmation, factor_role="unrelated")
+        rejected = replace(
+            rejected,
+            confirmation=unrelated.to_dict(),
+            reason=unrelated.reason,
+            evidence_refs=unrelated.evidence_refs,
+            confidence=unrelated.confidence,
+        )
+        for label, mutated in {
+            "reason": replace(rejected, reason="A different rejection reason."),
+            "confidence": replace(rejected, confidence=0.1),
+            "evidence citations": replace(
+                rejected, evidence_refs=(rejected.node_ref,)
+            ),
+        }.items():
+            with self.subTest(role="rejected_candidate", mutation=label):
+                with self.assertRaisesRegex(
+                    ValueError, "confirmation facts|confirmation role"
+                ):
+                    RecursiveAttributionReport(
+                        case_id="rejected-confirmation-drift",
+                        objective="Find roots.",
+                        **confirmation_seed_fields(unrelated),
+                        confirmations=[unrelated],
+                        rejected_candidates=[mutated],
+                    )
 
     def _modern_report_bundle(self):
         root = modern_root(
@@ -862,8 +929,8 @@ class CausalStateTest(unittest.TestCase):
         factor = CausalFactor(
             node_ref="record:prompt",
             relation="contributing_condition",
-            reason="The request omitted a compatibility hint.",
-            confidence=0.6,
+            reason=factor_confirmation.reason,
+            confidence=factor_confirmation.confidence,
             evidence_refs=["record:prompt", node.ref],
             recursive_path=factor_confirmation.recursive_path,
             confirmation_status="rejected",
@@ -1456,7 +1523,8 @@ class CausalStateTest(unittest.TestCase):
         factor = CausalFactor(
             node_ref="record:prompt",
             relation="contributing_condition",
-            reason="The prompt omitted a hint.",
+            reason=factor_confirmation.reason,
+            confidence=factor_confirmation.confidence,
             evidence_refs=["record:prompt", node.ref],
             recursive_path=factor_confirmation.recursive_path,
             confirmation_status="rejected",

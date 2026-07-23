@@ -33,7 +33,8 @@ def sample_request(
     *,
     decision_edge_fields: dict | None = None,
     include_decision_source_ref: bool = True,
-) -> GlobalCandidateJudgeRequest:
+    return_context: bool = False,
+):
     trace = {
         "case_id": "global-judge-case",
         "records": [
@@ -116,7 +117,7 @@ def sample_request(
         },
         start_refs=("record:defect",),
     )
-    return GlobalCandidateJudgeRequest(
+    request = GlobalCandidateJudgeRequest(
         case_id="global-judge-case",
         objective="Find the trace-visible root or determine that the observed defect is contradicted.",
         analysis_perspective="task quality",
@@ -127,6 +128,9 @@ def sample_request(
         start_refs=("record:defect",),
         capsules=capsules,
     )
+    if return_context:
+        return graph, tuple(candidates), request
+    return request
 
 
 def multi_root_request(*refs: str) -> GlobalCandidateJudgeRequest:
@@ -477,6 +481,34 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "candidate identity"):
             global_candidate_request_from_validation_envelope(envelope)
+
+    def test_synthetic_validation_envelope_binds_to_active_retrieval_output(self):
+        graph, candidates, request = sample_request(return_context=True)
+        envelope = request.validation_envelope()
+        capsule = envelope["candidate_evidence_capsules"][0]
+        capsule["candidate"]["source"] = "semantic_fallback"
+        capsule["validation_source"]["candidate_source"] = "semantic_fallback"
+
+        with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            global_candidate_request_from_validation_envelope(
+                envelope,
+                graph=graph,
+                authoritative_candidates=candidates,
+            )
+
+    def test_valid_synthetic_envelope_requires_active_routes_before_judge_or_anchors(self):
+        graph, candidates, request = sample_request(return_context=True)
+        envelope = request.validation_envelope()
+
+        with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            global_candidate_request_from_validation_envelope(envelope, graph=graph)
+
+        restored = global_candidate_request_from_validation_envelope(
+            envelope,
+            graph=graph,
+            authoritative_candidates=candidates,
+        )
+        self.assertEqual(restored.grounded_refs, request.grounded_refs)
 
     def test_judge_request_rejects_stale_prompt_bearing_capsule_collection(self):
         envelope = sample_request().validation_envelope()

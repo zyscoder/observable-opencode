@@ -104,6 +104,47 @@ def sample_graph(
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def _synthetic_prompt_capsule(self, graph: TraceGraph | None = None):
+        graph = graph or sample_graph()
+        candidate = CausalCandidate(
+            ref="record:prompt",
+            node=graph.nodes["record:prompt"],
+            source="semantic_fallback",
+            edge={
+                "from_ref": "record:prompt",
+                "to_ref": "record:observed_defect",
+                "relation": "semantic_predecessor_match",
+                "evidence_type": "semantic_inferred",
+                "evidence_refs": ["record:prompt"],
+                "eligible_for_attribution": False,
+                "retrieval_candidate": True,
+                "inference_method": "token_overlap_retrieval",
+                "edge_origin": "offline.semantic_retrieval",
+            },
+            score=0.6,
+            evidence_refs=("record:prompt",),
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:prompt": (
+                    "record:prompt",
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+        )[0]
+        return graph, candidate, capsule
+
     def _decision_capsule(
         self, graph: TraceGraph | None = None
     ) -> CandidateEvidenceCapsule:
@@ -115,6 +156,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     ref="record:decision",
                     node=graph.nodes["record:decision"],
                     source="confirmed_edge",
+                    edge=graph.edge_context(
+                        "record:decision", "record:observed_defect"
+                    )[0],
                     score=0.9,
                     evidence_refs=("record:decision",),
                 )
@@ -171,6 +215,112 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         payload["schema_version"] = "candidate-evidence-capsule/v3"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_synthetic_route_requires_exact_navigation_only_fact(self):
+        _, _, capsule = self._synthetic_prompt_capsule()
+        payload = capsule.to_dict()
+
+        for malformed in (False, "true", 1, None):
+            with self.subTest(value=malformed):
+                mutated = copy.deepcopy(payload)
+                mutated["candidate"]["retrieval_is_not_causal_verdict"] = malformed
+                with self.assertRaisesRegex(
+                    ValueError, "retrieval_is_not_causal_verdict"
+                ):
+                    CandidateEvidenceCapsule.from_dict(mutated)
+
+    def test_synthetic_route_cannot_self_authorize_unrelated_active_evidence(self):
+        graph, authoritative, capsule = self._synthetic_prompt_capsule()
+        payload = capsule.to_dict()
+        unrelated_ref = "record:tool_result"
+        forged_edge = copy.deepcopy(payload["candidate"]["retrieval_edge"])
+        forged_edge["evidence_refs"] = [
+            "record:prompt",
+            unrelated_ref,
+        ]
+        forged_candidate = CausalCandidate(
+            ref="record:prompt",
+            node=graph.nodes["record:prompt"],
+            source="sibling_context",
+            edge=forged_edge,
+            score=0.6,
+            evidence_refs=("record:prompt", unrelated_ref),
+        )
+        collections = evidence_capsule._build_prompt_collections(
+            graph=graph,
+            candidate=forged_candidate,
+            path=tuple(payload["downstream_path"]),
+        )
+        payload["candidate"]["source"] = forged_candidate.source
+        payload["candidate"]["retrieval_edge"] = collections["retrieval_edge"]
+        payload["action_group"] = collections["action_group"]
+        payload["evidence_references"] = collections["evidence_references"]
+        payload["artifact_hydration"] = collections["artifact_hydration"]
+        payload["missing_evidence_refs"] = collections["missing_evidence_refs"]
+        payload["validation_source"] = evidence_capsule._validation_source(
+            graph=graph,
+            candidate=forged_candidate,
+            path=tuple(payload["downstream_path"]),
+            start_refs=tuple(payload["start_refs"]),
+            prompt_collections=collections,
+        )
+        restored = CandidateEvidenceCapsule.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                graph,
+                restored,
+                authoritative_candidates=(authoritative,),
+            )
+
+    def test_valid_synthetic_route_round_trips_with_authoritative_source(self):
+        graph, authoritative, capsule = self._synthetic_prompt_capsule()
+        restored = CandidateEvidenceCapsule.from_dict(capsule.to_dict())
+
+        evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+            graph,
+            restored,
+            authoritative_candidates=(authoritative,),
+        )
+        self.assertEqual(restored.to_dict(), capsule.to_dict())
+
+    def test_synthetic_route_cannot_launder_itself_as_empty_recorded_source(self):
+        graph, authoritative, capsule = self._synthetic_prompt_capsule()
+        payload = capsule.to_dict()
+        forged_candidate = CausalCandidate(
+            ref="record:prompt",
+            node=graph.nodes["record:prompt"],
+            source="confirmed_edge",
+            edge={},
+            score=0.6,
+            evidence_refs=("record:prompt",),
+        )
+        collections = evidence_capsule._build_prompt_collections(
+            graph=graph,
+            candidate=forged_candidate,
+            path=tuple(payload["downstream_path"]),
+        )
+        payload["candidate"]["source"] = forged_candidate.source
+        payload["candidate"]["retrieval_edge"] = collections["retrieval_edge"]
+        payload["action_group"] = collections["action_group"]
+        payload["evidence_references"] = collections["evidence_references"]
+        payload["artifact_hydration"] = collections["artifact_hydration"]
+        payload["missing_evidence_refs"] = collections["missing_evidence_refs"]
+        payload["validation_source"] = evidence_capsule._validation_source(
+            graph=graph,
+            candidate=forged_candidate,
+            path=tuple(payload["downstream_path"]),
+            start_refs=tuple(payload["start_refs"]),
+            prompt_collections=collections,
+        )
+        restored = CandidateEvidenceCapsule.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                graph,
+                restored,
+                authoritative_candidates=(authoritative,),
+            )
 
     def test_current_capsule_round_trip_keeps_validation_source_bounded(self):
         graph = sample_graph()

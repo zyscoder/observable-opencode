@@ -2425,10 +2425,18 @@ class RecursiveAttributionReport:
                     or factor.node_ref != confirmation.candidate_ref
                     or factor.recursive_path != confirmation.recursive_path
                     or factor.relation != role
-                    or not factor.evidence_refs
-                    or not factor.mechanism
+                    or factor.reason != confirmation.reason
+                    or factor.confidence != confirmation.confidence
+                    or factor.evidence_refs != confirmation.evidence_refs
+                    or factor.mechanism != confirmation.factor_mechanism
+                    or not confirmation.evidence_refs
+                    or not confirmation.factor_mechanism
                 ):
-                    raise ValueError("{0} has an inconsistent grounded role".format(role))
+                    raise ValueError(
+                        "{0} has inconsistent confirmation facts or grounded role".format(
+                            role
+                        )
+                    )
                 if identity in factor_role_identities[role]:
                     raise ValueError("duplicate {0} confirmation identity".format(role))
                 factor_role_identities[role].add(identity)
@@ -2451,8 +2459,15 @@ class RecursiveAttributionReport:
                 or rejected.node_ref != confirmation.candidate_ref
                 or rejected.hypothesis_id != confirmation.hypothesis_id
                 or rejected.recursive_path != confirmation.recursive_path
+                or rejected.reason != confirmation.reason
+                or rejected.confidence != confirmation.confidence
+                or rejected.evidence_refs != confirmation.evidence_refs
+                or not confirmation.recursive_path
+                or not confirmation.evidence_refs
             ):
-                raise ValueError("rejected candidate has an inconsistent confirmation role")
+                raise ValueError(
+                    "rejected candidate has inconsistent confirmation facts or confirmation role"
+                )
             if identity in rejected_identities:
                 raise ValueError("duplicate rejected candidate confirmation identity")
             rejected_identities.add(identity)
