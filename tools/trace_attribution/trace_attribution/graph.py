@@ -447,6 +447,11 @@ class TraceGraph:
         if not self.evidence_eligible(node.ref):
             return None
         data = node.data
+        if not self._subject_provenance_binding_eligible(
+            node,
+            require_formal_binding=True,
+        ):
+            return None
         if (
             data.get("audit_only") is True
             or data.get("offline_only") is True
@@ -455,54 +460,12 @@ class TraceGraph:
             in {"none", "none_offline_analysis_only"}
         ):
             return None
-        manifest = (
-            self.raw_trace.get("manifest")
-            if isinstance(self.raw_trace.get("manifest"), Mapping)
-            else {}
-        )
-        manifest_declares_revision = manifest.get("subject_revision") not in (
-            None,
-            "",
-        )
-        active_subject_revision, active_provenance_status = (
-            trace_execution_revision(self.raw_trace)
-        )
-        if manifest_declares_revision:
-            if active_provenance_status != "valid":
-                return None
-            if (
-                not isinstance(data.get("subject_revision"), str)
-                or not data["subject_revision"].strip()
-                or data["subject_revision"].strip()
-                != str(active_subject_revision or "").strip()
-                or not isinstance(
-                    data.get("revision_provenance_status"), str
-                )
-                or data["revision_provenance_status"].strip().lower()
-                != "valid"
-            ):
-                return None
         revision_status = data.get("revision_status")
         if revision_status not in (None, "") and (
             not isinstance(revision_status, str)
             or revision_status.strip().lower() != "matched"
         ):
             return None
-        provenance_status = data.get("revision_provenance_status")
-        if provenance_status not in (None, "") and (
-            not isinstance(provenance_status, str)
-            or provenance_status.strip().lower() != "valid"
-        ):
-            return None
-        subject_revision = data.get("subject_revision")
-        if subject_revision not in (None, ""):
-            if (
-                not isinstance(subject_revision, str)
-                or active_provenance_status != "valid"
-                or subject_revision.strip()
-                != str(active_subject_revision or "").strip()
-            ):
-                return None
         value = None
         if node.event_type == "response.claim":
             value = data.get("repository_revision")
@@ -517,7 +480,75 @@ class TraceGraph:
             return None
         return value
 
-    def active_revision_evidence_eligible(self, ref: str) -> bool:
+    def _subject_provenance_binding_eligible(
+        self,
+        node: TraceNode,
+        *,
+        require_formal_binding: bool = False,
+    ) -> bool:
+        """Validate subject/provenance independently of event semantics."""
+        data = node.data
+        if "revision_provenance_status" in data and (
+            not isinstance(data.get("revision_provenance_status"), str)
+            or data["revision_provenance_status"].strip().lower() != "valid"
+        ):
+            return False
+        manifest = (
+            self.raw_trace.get("manifest")
+            if isinstance(self.raw_trace.get("manifest"), Mapping)
+            else {}
+        )
+        manifest_declares_revision = manifest.get("subject_revision") not in (
+            None,
+            "",
+        )
+        _, manifest_provenance_status = trace_execution_revision(self.raw_trace)
+        formal_manifest = manifest_provenance_status == "valid"
+        revision_bearing = any(
+            key in data
+            for key in (
+                "repository_revision",
+                "revision_before",
+                "revision_after",
+                "subject_revision",
+            )
+        )
+        binding_required = (
+            require_formal_binding and manifest_declares_revision
+        ) or (formal_manifest and revision_bearing)
+        if binding_required:
+            active_subject_revision, active_provenance_status = (
+                trace_execution_revision(self.raw_trace)
+            )
+            return bool(
+                active_provenance_status == "valid"
+                and isinstance(data.get("subject_revision"), str)
+                and data["subject_revision"].strip()
+                == str(active_subject_revision or "").strip()
+                and isinstance(
+                    data.get("revision_provenance_status"), str
+                )
+                and data["revision_provenance_status"].strip().lower()
+                == "valid"
+            )
+        subject_revision = data.get("subject_revision")
+        if subject_revision in (None, ""):
+            return True
+        if not isinstance(subject_revision, str):
+            return False
+        active_subject_revision = manifest.get("subject_revision")
+        return not (
+            isinstance(active_subject_revision, str)
+            and active_subject_revision.strip()
+            and subject_revision.strip() != active_subject_revision.strip()
+        )
+
+    def active_revision_evidence_eligible(
+        self,
+        ref: str,
+        *,
+        require_formal_binding: bool = False,
+    ) -> bool:
         """Require canonical evidence to satisfy active revision contracts."""
         resolved = self.resolve(str(ref))
         if (
@@ -528,15 +559,11 @@ class TraceGraph:
             return False
         node = self.nodes[resolved]
         data = node.data
-        manifest = (
-            self.raw_trace.get("manifest")
-            if isinstance(self.raw_trace.get("manifest"), Mapping)
-            else {}
-        )
-        manifest_declares_revision = manifest.get("subject_revision") not in (
-            None,
-            "",
-        )
+        if not self._subject_provenance_binding_eligible(
+            node,
+            require_formal_binding=require_formal_binding,
+        ):
+            return False
         authority_value = None
         if node.event_type == "response.claim":
             authority_value = data.get("repository_revision")
@@ -548,8 +575,7 @@ class TraceGraph:
         elif node.event_type == "change":
             authority_value = data.get("revision_after")
         if (
-            manifest_declares_revision
-            and authority_value is not None
+            authority_value is not None
             and self._eligible_repository_revision_authority(node) is None
         ):
             return False
@@ -571,23 +597,6 @@ class TraceGraph:
             if (
                 not isinstance(revision_status, str)
                 or revision_status.strip().lower() != "matched"
-            ):
-                return False
-
-        subject_revision = data.get("subject_revision")
-        if subject_revision not in (None, ""):
-            if not isinstance(subject_revision, str):
-                return False
-            manifest = (
-                self.raw_trace.get("manifest")
-                if isinstance(self.raw_trace.get("manifest"), Mapping)
-                else {}
-            )
-            active_subject_revision = manifest.get("subject_revision")
-            if (
-                isinstance(active_subject_revision, str)
-                and active_subject_revision.strip()
-                and subject_revision.strip() != active_subject_revision.strip()
             ):
                 return False
 
@@ -622,6 +631,13 @@ class TraceGraph:
             return False
         return True
 
+    def active_revision_start_eligible(self, ref: str) -> bool:
+        """Apply the additional formal binding required for analysis starts."""
+        return self.active_revision_evidence_eligible(
+            ref,
+            require_formal_binding=True,
+        )
+
     def sanitize_judge_visible_payload(self, value: Any) -> Any:
         """Project arbitrary nested data to active, resolved Judge facts."""
         from .judge_payload import sanitize_judge_visible_payload
@@ -643,17 +659,7 @@ class TraceGraph:
             ref = str(value or "")
             if not ref:
                 continue
-            resolved = self.resolve(ref)
-            if resolved in self.nodes:
-                if self.active_revision_evidence_eligible(resolved):
-                    output.append(ref)
-                continue
-            artifact = self.artifact_reference_status(ref)
-            if (
-                artifact is not None
-                and artifact.get("resolution_status") == "resolved"
-                and artifact.get("availability") == "available"
-            ):
+            if self.active_revision_evidence_reference_eligible(ref):
                 output.append(ref)
         return output
 
@@ -725,22 +731,23 @@ class TraceGraph:
     ) -> None:
         for value in refs:
             ref = str(value or "")
-            resolved = self.resolve(ref)
-            if (
-                resolved in self.nodes
-                and self.active_revision_evidence_eligible(resolved)
-            ):
-                continue
-            artifact = self.artifact_reference_status(ref)
-            if (
-                artifact is not None
-                and artifact.get("resolution_status") == "resolved"
-                and artifact.get("availability") == "available"
-            ):
+            if self.active_revision_evidence_reference_eligible(ref):
                 continue
             raise ValueError(
                 "{0} contains unresolved grounded evidence: {1}".format(label, ref)
             )
+
+    def active_revision_evidence_reference_eligible(self, ref: str) -> bool:
+        """Accept an active trace node or a complete verified manifest artifact."""
+        resolved = self.resolve(str(ref))
+        if resolved in self.nodes:
+            return self.active_revision_evidence_eligible(resolved)
+        artifact = self.artifact_reference_status(str(ref))
+        return bool(
+            artifact is not None
+            and artifact.get("resolution_status") == "resolved"
+            and artifact.get("availability") == "available"
+        )
 
     def assert_resolved_node_references(
         self, refs: Iterable[Any], *, label: str
@@ -1237,6 +1244,74 @@ class TraceGraph:
             "hash": artifact.get("hash"),
         }
 
+    def artifact_evidence_envelope(
+        self,
+        ref: str,
+        *,
+        fact_kind: str,
+    ) -> JsonDict:
+        """Build a complete Judge-visible envelope for verified artifact evidence."""
+        status = self.artifact_reference_status(ref)
+        if (
+            status is None
+            or status.get("resolution_status") != "resolved"
+            or status.get("availability") != "available"
+        ):
+            raise ValueError(
+                "artifact evidence is missing, truncated, or unresolved: {0}".format(
+                    ref
+                )
+            )
+        artifact_id = str(status["artifact_id"])
+        verified = self._artifact_reader.read(artifact_id)
+        if (
+            verified.content is None
+            or verified.content_bytes is None
+            or verified.truncated
+        ):
+            raise ValueError(
+                "artifact evidence is missing, truncated, or unresolved: {0}".format(
+                    ref
+                )
+            )
+        owners = sorted(
+            record_ref
+            for record_ref, record in self._artifact_records.items()
+            if artifact_id
+            in collect_artifact_ids(
+                dict(record),
+                (
+                    dict(record.get("data"))
+                    if isinstance(record.get("data"), Mapping)
+                    else {}
+                ),
+            )
+        )
+        owner_ref = owners[0] if owners else ""
+        return {
+            "artifact_id": artifact_id,
+            "raw_ref": str(ref),
+            "resolved_ref": "artifact:{0}".format(artifact_id),
+            "canonical_ref": "artifact:{0}".format(artifact_id),
+            "resolution_status": "resolved",
+            "provenance_class": "recorded",
+            "content": verified.content,
+            "content_hash": "sha256:{0}".format(
+                hashlib.sha256(verified.content_bytes).hexdigest()
+            ),
+            "byte_count": len(verified.content_bytes),
+            "byte_range": [0, len(verified.content_bytes)],
+            "owner_reference": {
+                "raw_ref": owner_ref,
+                "resolved_ref": owner_ref,
+                "resolution_status": "resolved",
+                "provenance_class": "recorded",
+            },
+            "missing": False,
+            "truncated": False,
+            "fact_kind": str(fact_kind),
+        }
+
     def incoming_edge_context(
         self,
         ref: str,
@@ -1391,7 +1466,7 @@ class TraceGraph:
             for ref, node in self.nodes.items()
             if node.event_type == "external.evaluation_fact"
             and self.analysis_start_eligible(ref)
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         if external_evaluation_starts:
             return dedupe(external_evaluation_starts)
@@ -1399,7 +1474,7 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type == "case.failed"
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         manifest = self.raw_trace.get("manifest") if isinstance(self.raw_trace.get("manifest"), dict) else {}
         interrupted = manifest.get("shutdown_disposition") == "interrupted_before_case_completion"
@@ -1414,7 +1489,7 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type in ("case.missing_semantic", "case.observed_defect", "case.quality_gap")
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         if offline_defect_starts:
             return dedupe(offline_defect_starts)
@@ -1426,7 +1501,7 @@ class TraceGraph:
             if node.event_type == "response.claim"
             and node.component == "result"
             and node.data.get("is_final_for_case") is not False
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         if final_claims:
             claim_kind_rank = {
@@ -1451,7 +1526,7 @@ class TraceGraph:
             for ref, node in self.nodes.items()
             if node.event_type == "response.output"
             and node.component == "result"
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         explicit_final_outputs = [
             ref for ref in response_outputs if self.nodes[ref].data.get("is_final_for_case") is True
@@ -1473,7 +1548,7 @@ class TraceGraph:
                 node.event_type == "response.claim"
                 and isinstance(flags, list)
                 and flags
-                and self.active_revision_evidence_eligible(ref)
+                and self.active_revision_start_eligible(ref)
             ):
                 starts.append(ref)
         if starts:
@@ -1482,13 +1557,13 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type in ("case.completed", "case.failed")
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         fallback_records = [
             ref
             for ref, node in self.nodes.items()
             if node.event_type != "external.evaluation_fact"
-            and self.active_revision_evidence_eligible(ref)
+            and self.active_revision_start_eligible(ref)
         ]
         return case_records[-1:] if case_records else fallback_records[-1:]
 

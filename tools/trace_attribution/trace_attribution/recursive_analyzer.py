@@ -634,6 +634,82 @@ def _assert_report_grounded_evidence(
     )
 
 
+def _investigation_owner_bindings(value: Any) -> Dict[str, Set[str]]:
+    """Extract structural owner identities from nested investigation state."""
+    output = {
+        "seed_binding_identities": set(),
+        "hypothesis_ids": set(),
+        "visit_keys": set(),
+        "start_refs": set(),
+    }
+    field_groups = {
+        "seed_binding_identity": "seed_binding_identities",
+        "seed_key": "seed_binding_identities",
+        "hypothesis_id": "hypothesis_ids",
+        "visit_key": "visit_keys",
+        "active_visit_key": "visit_keys",
+        "seed_ref": "start_refs",
+        "start_ref": "start_refs",
+    }
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for raw_key, child in item.items():
+                key = str(raw_key)
+                if key in {"ledger_before", "ledger_after"}:
+                    continue
+                group = field_groups.get(key)
+                if group is not None and isinstance(child, str) and child:
+                    output[group].add(child)
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child)
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return output
+
+
+def _investigation_owned_by_stale_seed(
+    value: Any,
+    *,
+    stale_seed_keys: Set[str],
+    stale_hypothesis_ids: Set[str],
+    stale_visit_keys: Set[str],
+    stale_start_refs: Set[str],
+) -> bool:
+    bindings = _investigation_owner_bindings(value)
+    return bool(
+        bindings["seed_binding_identities"].intersection(stale_seed_keys)
+        or bindings["hypothesis_ids"].intersection(stale_hypothesis_ids)
+        or bindings["visit_keys"].intersection(stale_visit_keys)
+        or bindings["start_refs"].intersection(stale_start_refs)
+    )
+
+
+def _investigation_journal_counters(
+    investigation_journal: Iterable[Any],
+) -> Tuple[int, int]:
+    entries = [
+        item
+        for item in investigation_journal
+        if isinstance(item, Mapping)
+        and item.get("directive_kind") == "evidence_investigation"
+    ]
+    return (
+        len(entries),
+        sum(
+            int(item["result"].get("byte_count") or 0)
+            for item in entries
+            if isinstance(item.get("result"), Mapping)
+            and type(item["result"].get("byte_count", 0)) is int
+            and item["result"].get("byte_count", 0) >= 0
+        ),
+    )
+
+
 def _quarantine_stale_seed_report_payload(
     graph: TraceGraph, value: Mapping[str, Any]
 ) -> JsonDict:
@@ -672,6 +748,29 @@ def _quarantine_stale_seed_report_payload(
         if isinstance(item, Mapping)
         and str(item.get("seed_binding_identity") or "") in stale_seed_keys
     }
+    source_metadata = (
+        payload.get("metadata")
+        if isinstance(payload.get("metadata"), Mapping)
+        else {}
+    )
+    stale_visit_keys = set()
+    frontier_checkpoint = source_metadata.get("frontier_checkpoint")
+    frontier_items = []
+    if isinstance(frontier_checkpoint, Mapping):
+        frontier_items.extend(frontier_checkpoint.get("queued") or ())
+        frontier_items.extend(frontier_checkpoint.get("in_flight") or ())
+        frontier_items.extend(
+            item.get("item")
+            for item in frontier_checkpoint.get("completed") or ()
+            if isinstance(item, Mapping)
+        )
+    for item in frontier_items:
+        bindings = _investigation_owner_bindings(item)
+        if (
+            bindings["seed_binding_identities"].intersection(stale_seed_keys)
+            or bindings["hypothesis_ids"].intersection(stale_hypothesis_ids)
+        ):
+            stale_visit_keys.update(bindings["visit_keys"])
     stale_candidate_refs = {
         str(item.get("candidate_root_ref") or "")
         for item in payload.get("hypotheses") or ()
@@ -764,13 +863,12 @@ def _quarantine_stale_seed_report_payload(
     payload["investigation_journal"] = [
         item
         for item in payload.get("investigation_journal") or ()
-        if not isinstance(item, Mapping)
-        or (
-            str(item.get("seed_binding_identity") or "")
-            not in stale_seed_keys
-            and str(item.get("hypothesis_id") or "")
-            not in stale_hypothesis_ids
-            and str(item.get("seed_ref") or "") not in stale_start_refs
+        if not _investigation_owned_by_stale_seed(
+            item,
+            stale_seed_keys=stale_seed_keys,
+            stale_hypothesis_ids=stale_hypothesis_ids,
+            stale_visit_keys=stale_visit_keys,
+            stale_start_refs=stale_start_refs,
         )
     ]
 
@@ -875,6 +973,10 @@ def _quarantine_stale_seed_report_payload(
         int(item.get("physical_request_delta") or 0)
         for item in retained_global_passes
     )
+    (
+        metadata["investigation_rounds"],
+        metadata["investigation_result_bytes"],
+    ) = _investigation_journal_counters(payload["investigation_journal"])
     metadata["stale_seed_quarantine"] = {
         "start_refs": sorted(stale_start_refs),
         "blocking_reason": "start_ref_active_revision_ineligible",
@@ -2038,7 +2140,7 @@ class RecursiveAnalysisState:
         ):
             return False
         if any(
-            not self.graph.active_revision_evidence_eligible(ref)
+            not self.graph.active_revision_evidence_reference_eligible(ref)
             for ref in checked_evidence_refs
         ):
             return False
@@ -2107,7 +2209,7 @@ class RecursiveAnalysisState:
                     "restored confirmation queue path contains evidence ineligible for the active revision"
                 )
             if any(
-                not self.graph.active_revision_evidence_eligible(ref)
+                not self.graph.active_revision_evidence_reference_eligible(ref)
                 for ref in checked_evidence_refs
             ):
                 raise ValueError(
@@ -2534,6 +2636,10 @@ class RecursiveAnalysisState:
             confirmation = entry.get("confirmation")
             owner = LocalStateOwner.from_dict(entry.get("owner"))
             parsed = RootConfirmation.from_dict(dict(confirmation))
+            self.graph.assert_resolved_evidence_references(
+                parsed.evidence_refs,
+                label="restored confirmation action",
+            )
             if (
                 str(entry.get("candidate_ref") or "")
                 != parsed.candidate_ref
@@ -2688,19 +2794,53 @@ class RecursiveAnalysisState:
                 )
 
         judgments_by_visit = {}
+        judgment_occurrences = set()
+        predecessor_occurrences = set()
+        expected_nested_relations = []
         for index, judgment in enumerate(self.step_judgments):
             item = self._validate_step_judgment_owner(
                 judgment,
                 label="step judgment[{0}]".format(index),
             )
+            if (
+                judgment.owner.occurrence_identity in judgment_occurrences
+                or item.visit_key in judgments_by_visit
+            ):
+                raise ValueError(
+                    "step judgments contain a duplicate local occurrence"
+                )
+            judgment_occurrences.add(judgment.owner.occurrence_identity)
             judgments_by_visit[item.visit_key] = judgment
+            for predecessor in judgment.predecessors:
+                if predecessor.owner is None:
+                    raise ValueError(
+                        "step judgment predecessor is ownerless"
+                    )
+                occurrence = predecessor.owner.occurrence_identity
+                if occurrence in predecessor_occurrences:
+                    raise ValueError(
+                        "step judgment predecessors contain a duplicate local occurrence"
+                    )
+                predecessor_occurrences.add(occurrence)
+                if not (
+                    judgment.current_defect_status == "absent"
+                    and predecessor.relation == "unknown"
+                ):
+                    expected_nested_relations.append(predecessor.to_dict())
 
+        relation_occurrences = set()
+        actual_nested_relations = []
         for index, assessment in enumerate(self.causal_relations):
             owner = assessment.owner
             if owner is None:
                 raise ValueError(
                     "causal relation[{0}] is ownerless".format(index)
                 )
+            if owner.occurrence_identity in relation_occurrences:
+                raise ValueError(
+                    "causal relations contain a duplicate local occurrence"
+                )
+            relation_occurrences.add(owner.occurrence_identity)
             source_judgment = judgments_by_visit.get(owner.visit_key)
             if source_judgment is not None:
                 matches = [
@@ -2716,6 +2856,7 @@ class RecursiveAnalysisState:
                             index
                         )
                     )
+                actual_nested_relations.append(assessment.to_dict())
                 continue
             builder = self.seed_ledger.get(owner.seed_binding_identity)
             if builder is None:
@@ -2736,6 +2877,11 @@ class RecursiveAnalysisState:
                         index
                     )
                 )
+        _require_canonical_bijection(
+            expected_nested_relations,
+            actual_nested_relations,
+            label="step predecessor causal relation",
+        )
 
         for index, entry in enumerate(self.visited_entries):
             owner = LocalStateOwner.from_dict(entry.get("owner"))
@@ -3524,37 +3670,27 @@ class RecursiveAnalysisState:
             if item.hypothesis_id in stale_hypothesis_ids
         }
 
-        def journal_owned_by_stale_seed(item: Any) -> bool:
-            if not isinstance(item, Mapping):
-                return False
-            if (
-                item.get("kind") == "global_candidate_pass"
-                and item.get("seed_ref")
-            ):
-                owner = LocalStateOwner.from_dict(item.get("owner"))
-                return owner.seed_binding_identity in stale_seed_keys
-            active_visit = item.get("active_visit")
-            arguments = item.get("arguments")
-            hypothesis_ids = {
-                str(item.get("hypothesis_id") or ""),
-                str(
-                    active_visit.get("hypothesis_id") or ""
-                    if isinstance(active_visit, Mapping)
-                    else ""
-                ),
-                str(
-                    arguments.get("hypothesis_id") or ""
-                    if isinstance(arguments, Mapping)
-                    else ""
-                ),
-            }
-            return bool(hypothesis_ids.intersection(stale_hypothesis_ids))
-
-        state.investigation_journal = [
+        retained_investigation_journal = [
             item
             for item in investigation_journal
-            if not journal_owned_by_stale_seed(item)
+            if not _investigation_owned_by_stale_seed(
+                item,
+                stale_seed_keys=stale_seed_keys,
+                stale_hypothesis_ids=stale_hypothesis_ids,
+                stale_visit_keys=stale_visit_keys,
+                stale_start_refs=stale_start_refs,
+            )
         ]
+        if len(retained_investigation_journal) != len(
+            investigation_journal
+        ):
+            (
+                state.investigation_rounds,
+                state.investigation_result_bytes,
+            ) = _investigation_journal_counters(
+                retained_investigation_journal
+            )
+        state.investigation_journal = retained_investigation_journal
         state.investigation_evidence = {
             frontier.migrated_visit_key(str(key)): copy.deepcopy(value)
             for key, value in dict(action_payload["investigation_evidence"]).items()
@@ -5443,7 +5579,7 @@ class AgenticRecursiveAnalyzer:
                     item.defect_state.fingerprint,
                     hypothesis.seed_binding_identity,
                 )
-                state.enqueue_confirmation(
+                enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis.hypothesis_id,
                         "candidate_ref": selected_ref,
@@ -5475,6 +5611,13 @@ class AgenticRecursiveAnalyzer:
                         ).to_dict(),
                     }
                 )
+                if not enqueued and seed_builder is not None:
+                    state._mark_seed_unresolved(
+                        selected_ref,
+                        "confirmation_enqueue_failed",
+                        "The selected candidate could not be queued for independent confirmation.",
+                        seed_key=seed_builder.key,
+                    )
 
         if judgment.outcome == "needs_expansion":
             for request in judgment.expansion_requests:
@@ -6773,20 +6916,37 @@ class AgenticRecursiveAnalyzer:
             output: List[JsonDict] = []
             for raw_ref in _dedupe_strings(refs):
                 resolved = state.graph.resolve(raw_ref)
-                if not resolved or resolved not in state.graph.nodes:
-                    raise ValueError("confirmation evidence ref is unresolved: {0}".format(raw_ref))
-                if not state.graph.active_revision_evidence_eligible(resolved):
+                if resolved in state.graph.nodes:
+                    if not state.graph.active_revision_evidence_eligible(
+                        resolved
+                    ):
+                        raise ValueError(
+                            "confirmation evidence ref is ineligible for the active revision: {0}".format(
+                                raw_ref
+                            )
+                        )
+                    output.append(
+                        _reference_envelope(
+                            resolved,
+                            content=_node_semantic_content(
+                                state.graph,
+                                state.graph.hydrate_node(resolved),
+                            ),
+                            fact_kind=fact_kind,
+                        )
+                    )
+                    continue
+                if not state.graph.active_revision_evidence_reference_eligible(
+                    raw_ref
+                ):
                     raise ValueError(
-                        "confirmation evidence ref is ineligible for the active revision: {0}".format(
+                        "confirmation evidence ref is unresolved or unavailable: {0}".format(
                             raw_ref
                         )
                     )
                 output.append(
-                    _reference_envelope(
-                        resolved,
-                        content=_node_semantic_content(
-                            state.graph, state.graph.hydrate_node(resolved)
-                        ),
+                    state.graph.artifact_evidence_envelope(
+                        raw_ref,
                         fact_kind=fact_kind,
                     )
                 )
@@ -7584,7 +7744,7 @@ class AgenticRecursiveAnalyzer:
                     defect_fingerprint,
                     hypothesis.seed_binding_identity,
                 )
-                state.enqueue_confirmation(
+                enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis_id,
                         "candidate_ref": candidate_ref,
@@ -7611,6 +7771,16 @@ class AgenticRecursiveAnalyzer:
                         ).to_dict(),
                     }
                 )
+                if not enqueued:
+                    state._mark_ref_unresolved(
+                        item.node_ref,
+                        item,
+                        "confirmation_enqueue_failed",
+                        "The active candidate could not be queued for independent confirmation.",
+                    )
+                    raise ValueError(
+                        "confirmation enqueue failed for the active seed"
+                    )
                 status = "deferred"
         except (KeyError, ValueError) as exc:
             status = "rejected"

@@ -4359,6 +4359,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             {
                 "subject_revision": "git:active",
                 "repository_revision": 1,
+                "revision_provenance_status": "valid",
             }
         )
         change = next(

@@ -580,7 +580,12 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )
-        decision["data"]["subject_revision"] = "git:active"
+        decision["data"].update(
+            {
+                "subject_revision": "git:active",
+                "revision_provenance_status": "valid",
+            }
+        )
         trace["records"].extend(
             [
                 {
@@ -590,6 +595,8 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "data": {
                         "call_id": "call_1",
                         "repository_revision": 1,
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                         "output": "STALE_GENERATION_ACTION",
                     },
                 },
@@ -600,6 +607,8 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "data": {
                         "call_id": "call_1",
                         "repository_revision": 0,
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                         "output": "ACTIVE_GENERATION_ACTION",
                     },
                 },
@@ -609,6 +618,8 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "event_type": "decision",
                     "data": {
                         "repository_revision": 1,
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                         "rationale": "STALE_GENERATION_EVIDENCE",
                     },
                 },
@@ -618,6 +629,8 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "event_type": "decision",
                     "data": {
                         "repository_revision": 0,
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                         "rationale": "ACTIVE_GENERATION_EVIDENCE",
                     },
                 },
