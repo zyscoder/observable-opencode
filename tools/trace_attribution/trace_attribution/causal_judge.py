@@ -1453,13 +1453,25 @@ class _ConfirmationFactTreeValidator:
                 self._error(item_path, "byte_range must contain two integers")
                 continue
             start, end = byte_range
-            if start < 0 or end < start or end > len(content_bytes):
+            if start < 0 or end < start:
                 self._error(item_path, "byte_range is out of bounds or reversed")
                 continue
-            try:
-                fragment = content_bytes[start:end].decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                self._error(item_path, "byte_range must align to UTF-8 boundaries")
+            if end <= len(content_bytes):
+                try:
+                    fragment = content_bytes[start:end].decode(
+                        "utf-8",
+                        errors="strict",
+                    )
+                except UnicodeDecodeError:
+                    self._error(
+                        item_path,
+                        "byte_range must align to UTF-8 boundaries",
+                    )
+                    continue
+            elif end - start == len(content_bytes):
+                fragment = content
+            else:
+                self._error(item_path, "byte_range is out of bounds or reversed")
                 continue
             owner = artifact.get("owner_reference")
             if not isinstance(owner, Mapping) or self._envelope_errors(owner):
