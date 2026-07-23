@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
-from .causal_retrieval import canonical_candidate_route, root_candidate_eligible
+from .causal_retrieval import (
+    active_revision_candidate_eligible,
+    canonical_candidate_route,
+    root_candidate_eligible,
+)
 from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
@@ -328,7 +332,7 @@ def build_candidate_evidence_capsules(
     order: List[str] = []
     for candidate in candidates:
         resolved = graph.resolve(candidate.ref) or candidate.ref
-        if resolved not in graph.nodes or not graph.evidence_eligible(resolved):
+        if not active_revision_candidate_eligible(graph, resolved):
             continue
         if resolved not in routes_by_ref:
             order.append(resolved)
@@ -625,6 +629,10 @@ def validate_candidate_evidence_capsule_against_graph(
     resolved = graph.resolve(capsule.candidate_ref)
     if resolved != capsule.candidate_ref or resolved not in graph.nodes:
         raise ValueError("candidate evidence capsule does not match active graph identity")
+    if not active_revision_candidate_eligible(graph, resolved):
+        raise ValueError(
+            "candidate evidence capsule candidate is ineligible for the active revision"
+        )
     node = graph.hydrate_node(resolved)
     expected_facts = _active_candidate_graph_facts(graph, node)
     if _thaw(capsule.candidate.get("active_graph_facts")) != expected_facts:
@@ -862,7 +870,7 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
             if (
                 resolved != node.ref
                 or resolved not in graph.nodes
-                or not graph.evidence_eligible(resolved)
+                or not active_revision_candidate_eligible(graph, resolved)
             ):
                 continue
             active_node = graph.hydrate_node(resolved)
@@ -872,7 +880,11 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
             ):
                 members.append(active_node.compact(max_chars=1800))
         members.sort(key=lambda item: graph.position(str(item.get("ref") or "")))
-    if not members:
+    if (
+        not members
+        and active_revision_candidate_eligible(graph, candidate.ref)
+        and root_candidate_eligible(candidate)
+    ):
         members = [candidate.compact(max_chars=1800)]
     return {
         "identity": identity or "node_ref:{0}".format(candidate.ref),

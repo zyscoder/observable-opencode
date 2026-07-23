@@ -465,6 +465,99 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         self.assertNotIn("record:stale_shared_member", str(capsule))
         self.assertNotIn("STALE_SHARED_CALL_MEMBER", str(capsule))
 
+    def test_candidate_revision_policy_applies_to_recorded_and_synthetic_routes(self):
+        defect = DefectState.create(
+            label="sigint_cleanup_interrupted",
+            expected="cleanup completes",
+            actual="cleanup interrupted",
+            mechanism="cancellation mismatch",
+            scope="task_quality",
+        )
+
+        def graph_for(revision):
+            trace = copy.deepcopy(sample_graph().raw_trace)
+            trace["manifest"] = {"subject_revision": "git:active"}
+            decision = next(
+                item
+                for item in trace["records"]
+                if item["record_id"] == "decision"
+            )
+            if revision is None:
+                decision["data"].pop("repository_revision", None)
+            else:
+                decision["data"]["repository_revision"] = revision
+            return TraceGraph.from_trace(trace)
+
+        def capsules_for(graph, *, source, ref="record:decision"):
+            edge = (
+                graph.edge_context("record:decision", "record:observed_defect")[
+                    -1
+                ]
+                if source == "confirmed_edge"
+                else {
+                    "from_ref": ref,
+                    "to_ref": "record:observed_defect",
+                    "relation": "semantic_predecessor_match",
+                    "evidence_type": "semantic_inferred",
+                    "evidence_refs": [ref],
+                    "eligible_for_attribution": False,
+                    "retrieval_candidate": True,
+                    "inference_method": "token_overlap_retrieval",
+                    "edge_origin": "offline.semantic_retrieval",
+                }
+            )
+            return build_candidate_evidence_capsules(
+                graph=graph,
+                candidates=(
+                    CausalCandidate(
+                        ref=ref,
+                        node=graph.nodes["record:decision"],
+                        source=source,
+                        edge=edge,
+                        score=0.9,
+                        evidence_refs=(ref,),
+                    ),
+                ),
+                defect_state=defect,
+                downstream_paths={
+                    "record:decision": (
+                        "record:decision",
+                        "record:observed_defect",
+                    )
+                },
+                start_refs=("record:observed_defect",),
+            )
+
+        stale_graph = graph_for("git:stale")
+        for source in ("confirmed_edge", "semantic_fallback"):
+            with self.subTest(route=source):
+                self.assertEqual(capsules_for(stale_graph, source=source), ())
+
+        active_graph = graph_for("git:active")
+        self.assertEqual(
+            [
+                capsule.candidate_ref
+                for capsule in capsules_for(
+                    active_graph,
+                    source="confirmed_edge",
+                    ref="decision:dec_1",
+                )
+            ],
+            ["record:decision"],
+        )
+        self.assertEqual(
+            len(capsules_for(graph_for(None), source="confirmed_edge")),
+            1,
+        )
+        explicit_missing_graph = graph_for(None)
+        explicit_missing_graph.nodes["record:decision"].data[
+            "revision_status"
+        ] = "missing"
+        self.assertEqual(
+            capsules_for(explicit_missing_graph, source="confirmed_edge"),
+            (),
+        )
+
     def test_synthetic_route_cannot_launder_itself_as_empty_recorded_source(self):
         graph, authoritative, capsule = self._synthetic_prompt_capsule()
         payload = capsule.to_dict()

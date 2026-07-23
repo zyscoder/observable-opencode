@@ -22,6 +22,7 @@ from .causal_judge import (
 )
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
+    active_revision_candidate_eligible,
     canonical_candidate_route,
     is_evidence_only_node,
     is_navigation_node,
@@ -62,6 +63,7 @@ from .global_judge import (
     active_focus_text_sha256,
     global_candidate_request_from_validation_envelope,
     validate_active_focus_binding,
+    validate_global_candidate_request_against_graph,
     validate_global_candidate_payload,
 )
 from .graph import TraceGraph
@@ -484,9 +486,14 @@ def _assert_report_grounded_evidence(
             refs.extend(assessment.get("causal_path_refs") or ())
     for confirmation in report.confirmations:
         candidate = graph.nodes.get(confirmation.candidate_ref)
-        if candidate is not None and not root_candidate_eligible(candidate):
+        if candidate is not None and (
+            not active_revision_candidate_eligible(
+                graph, confirmation.candidate_ref
+            )
+            or not root_candidate_eligible(candidate)
+        ):
             raise ValueError(
-                "{0} confirmation candidate is not authored-root eligible".format(
+                "{0} confirmation candidate is not authored-root eligible for the active revision".format(
                     label
                 )
             )
@@ -558,6 +565,15 @@ def _assert_report_grounded_evidence(
                     )
                 )
     for root in (*report.confirmed_roots, *report.co_roots):
+        if (
+            graph.resolve(root.node_ref) in graph.nodes
+            and not active_revision_candidate_eligible(graph, root.node_ref)
+        ):
+            raise ValueError(
+                "{0} published root candidate is ineligible for the active revision".format(
+                    label
+                )
+            )
         confirmation = RootConfirmation.from_dict(dict(root.confirmation))
         owner = next(
             (
@@ -623,6 +639,14 @@ def _assert_published_non_root_factors(
     )
     for published_role, item in publications:
         confirmation = RootConfirmation.from_dict(item.to_dict()["confirmation"])
+        if not active_revision_candidate_eligible(
+            graph, confirmation.candidate_ref
+        ):
+            raise ValueError(
+                "{0} published non-root factor candidate is ineligible for the active revision".format(
+                    label
+                )
+            )
         canonical = confirmations.get(confirmation.confirmation_identity)
         owner = seeds_by_binding.get(confirmation.seed_binding_identity)
         if (
@@ -1289,8 +1313,14 @@ class RecursiveAnalysisState:
             (candidate_ref, hypothesis_id, defect_fingerprint, seed_binding_identity)
         ):
             raise ValueError("confirmation queue entry requires exact semantic identity")
-        node = self.graph.nodes.get(candidate_ref)
-        if node is None or not root_candidate_eligible(node):
+        resolved = self.graph.resolve(candidate_ref)
+        node = self.graph.nodes.get(resolved or "")
+        if (
+            resolved != candidate_ref
+            or node is None
+            or not active_revision_candidate_eligible(self.graph, candidate_ref)
+            or not root_candidate_eligible(node)
+        ):
             return False
         queue_key = (
             hypothesis_id,
@@ -1324,9 +1354,15 @@ class RecursiveAnalysisState:
             if not seed_binding_identity or not candidate_ref:
                 raise ValueError("restored confirmation queue identity is incomplete")
             candidate = self.graph.nodes.get(candidate_ref)
-            if candidate is None or not root_candidate_eligible(candidate):
+            if (
+                candidate is None
+                or not active_revision_candidate_eligible(
+                    self.graph, candidate_ref
+                )
+                or not root_candidate_eligible(candidate)
+            ):
                 raise ValueError(
-                    "restored confirmation queue contains an ineligible root candidate"
+                    "restored confirmation queue contains a root candidate ineligible for the active revision"
                 )
             candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
             candidates.add(candidate_ref)
@@ -1753,8 +1789,7 @@ class RecursiveAnalysisState:
                 CausalCandidate.from_dict(item)
                 for item in action_payload["causal_candidates"]
             )
-            if graph.nodes.get(candidate.ref)
-            and graph.evidence_eligible(candidate.ref)
+            if active_revision_candidate_eligible(graph, candidate.ref)
         ]
         state.causal_relations = [PredecessorAssessment.from_dict(item) for item in action_payload["causal_relations"]]
         state.step_judgments = [CausalStepJudgment.from_dict(item) for item in action_payload["step_judgments"]]
@@ -1764,8 +1799,10 @@ class RecursiveAnalysisState:
                 CausalCandidate.from_dict(item)
                 for item in action_payload["introduction_candidates"]
             )
-            if graph.nodes.get(candidate.ref)
-            and root_candidate_eligible(graph.nodes[candidate.ref])
+            if active_revision_candidate_eligible(graph, candidate.ref)
+            and root_candidate_eligible(
+                graph.nodes[graph.resolve(candidate.ref) or candidate.ref]
+            )
         ]
         state.introduction_bindings = copy.deepcopy(action_payload["introduction_bindings"])
         state.introduction_binding_keys = {
@@ -1828,6 +1865,25 @@ class RecursiveAnalysisState:
         state.confirmed_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["confirmed_roots"]]
         state.co_roots = [ConfirmedRoot.from_dict(item) for item in action_payload["co_roots"]]
         state.amplifying_factors = [CausalFactor.from_dict(item) for item in action_payload["amplifying_factors"]]
+        for confirmation in state.confirmations:
+            node = graph.nodes.get(confirmation.candidate_ref)
+            if (
+                node is None
+                or not active_revision_candidate_eligible(
+                    graph, confirmation.candidate_ref
+                )
+                or not root_candidate_eligible(node)
+            ):
+                raise ValueError(
+                    "restored confirmation candidate is ineligible for the active revision"
+                )
+        if any(
+            not active_revision_candidate_eligible(graph, root.node_ref)
+            for root in (*state.confirmed_roots, *state.co_roots)
+        ):
+            raise ValueError(
+                "restored published root is ineligible for the active revision"
+            )
         state.confirmation_journal = copy.deepcopy(action_payload["confirmation_journal"])
         state.pending_rejudge_journal = {
             frontier.migrated_visit_key(str(key)): [int(item) for item in values]
@@ -1950,12 +2006,12 @@ class RecursiveAnalysisState:
         candidates = tuple(
             candidate
             for candidate in candidates
-            if graph.evidence_eligible(candidate.ref)
+            if active_revision_candidate_eligible(graph, candidate.ref)
         )
         retrieved_candidates = tuple(
             candidate
             for candidate in (retrieved_candidates or candidates)
-            if graph.evidence_eligible(candidate.ref)
+            if active_revision_candidate_eligible(graph, candidate.ref)
         )
         hypothesis = self.ledger.get(item.hypothesis_id)
         chain = self.transformation_chains.get(item.defect_state.fingerprint, (item.defect_state,))
@@ -2241,7 +2297,10 @@ class RecursiveAnalysisState:
             self.mark_unresolved(item, "judge_unknown", details)
         elif is_present and judgment.candidate_introduction:
             node = self.graph.nodes.get(item.node_ref)
-            if node is not None and not root_candidate_eligible(node):
+            if node is not None and (
+                not active_revision_candidate_eligible(self.graph, item.node_ref)
+                or not root_candidate_eligible(node)
+            ):
                 if not is_evidence_only_node(node):
                     self.mark_unresolved(
                         item,
@@ -2456,8 +2515,12 @@ class RecursiveAnalysisState:
         selected = [
             candidate
             for candidate in candidates
-            if candidate.ref in self.graph.nodes
-            and root_candidate_eligible(candidate.node)
+            if active_revision_candidate_eligible(self.graph, candidate.ref)
+            and root_candidate_eligible(
+                self.graph.nodes[
+                    self.graph.resolve(candidate.ref) or candidate.ref
+                ]
+            )
         ][:NAVIGATION_ROUTE_CANDIDATE_LIMIT]
         if not selected:
             self.complete_unresolved(
@@ -2787,11 +2850,12 @@ class RecursiveAnalysisState:
         edge: Mapping[str, Any],
         evidence_refs: Tuple[str, ...],
     ) -> Optional[CausalCandidate]:
-        node = self.graph.nodes.get(ref)
-        if node is None or not self.graph.evidence_eligible(ref):
+        resolved = self.graph.resolve(ref)
+        node = self.graph.nodes.get(resolved or "")
+        if node is None or not active_revision_candidate_eligible(self.graph, ref):
             return None
         return CausalCandidate(
-            ref=ref,
+            ref=resolved,
             node=node,
             source=source,
             edge=dict(edge),
@@ -2800,6 +2864,8 @@ class RecursiveAnalysisState:
         )
 
     def _remember_candidate(self, candidate: CausalCandidate) -> None:
+        if not active_revision_candidate_eligible(self.graph, candidate.ref):
+            return
         if any(existing == candidate for existing in self.causal_candidates):
             return
         self.causal_candidates.append(candidate)
@@ -3070,6 +3136,11 @@ class AgenticRecursiveAnalyzer:
                     "candidate_compression": metrics,
                 },
             )
+            validate_global_candidate_request_against_graph(
+                graph,
+                request,
+                authoritative_candidates=candidates,
+            )
             remaining = max(0, self.max_judge_requests - state.judge_requests)
             self._checkpoint_state(
                 state, "global:before:{0}".format(item.visit_key)
@@ -3189,8 +3260,7 @@ class AgenticRecursiveAnalyzer:
         for candidate in ordered:
             resolved = graph.resolve(candidate.ref) or candidate.ref
             if (
-                resolved not in graph.nodes
-                or not graph.evidence_eligible(resolved)
+                not active_revision_candidate_eligible(graph, resolved)
             ):
                 continue
             if resolved not in routes_by_ref:
@@ -3239,6 +3309,7 @@ class AgenticRecursiveAnalyzer:
             if (
                 node.ref in selected_refs
                 or node.event_type != "decision"
+                or not active_revision_candidate_eligible(graph, node.ref)
                 or not root_candidate_eligible(node)
             ):
                 continue
@@ -3305,7 +3376,9 @@ class AgenticRecursiveAnalyzer:
             position = graph.position(node.ref)
             if (
                 position >= boundary and not include_post_boundary_evidence
-            ) or node.event_type == "progress.episode" or not graph.evidence_eligible(node.ref):
+            ) or node.event_type == "progress.episode" or not active_revision_candidate_eligible(
+                graph, node.ref
+            ):
                 continue
             score = _global_evidence_score(node)
             if score <= 0.0:
@@ -3393,6 +3466,9 @@ class AgenticRecursiveAnalyzer:
                     node is None
                     or candidate is None
                     or capsule is None
+                    or not active_revision_candidate_eligible(
+                        state.graph, selected_ref
+                    )
                     or not root_candidate_eligible(node)
                 ):
                     continue
@@ -3734,7 +3810,9 @@ class AgenticRecursiveAnalyzer:
                 retrieved_candidates = [
                     candidate
                     for candidate in retrieved_candidates
-                    if analysis_graph.evidence_eligible(candidate.ref)
+                    if active_revision_candidate_eligible(
+                        analysis_graph, candidate.ref
+                    )
                 ]
                 candidates = retrieved_candidates[:CAUSAL_STEP_CANDIDATE_LIMIT]
             except Exception as exc:
@@ -4633,8 +4711,14 @@ class AgenticRecursiveAnalyzer:
         if defect_state is None:
             raise ValueError("queued confirmation defect state is unavailable")
         node = state.graph.nodes.get(candidate_ref)
-        if node is None:
-            raise ValueError("queued confirmation candidate is unresolved")
+        if (
+            node is None
+            or not active_revision_candidate_eligible(state.graph, candidate_ref)
+            or not root_candidate_eligible(node)
+        ):
+            raise ValueError(
+                "queued confirmation candidate is ineligible for the active revision"
+            )
         path = tuple(str(ref) for ref in queued.get("recursive_path") or ())
         if not path or path[0] != candidate_ref:
             raise ValueError("queued confirmation path is not candidate-rooted")
@@ -4770,6 +4854,9 @@ class AgenticRecursiveAnalyzer:
             if (
                 queued_competitor is None
                 or competitor_node is None
+                or not active_revision_candidate_eligible(
+                    state.graph, resolved
+                )
                 or not root_candidate_eligible(competitor_node)
             ):
                 continue
@@ -4869,6 +4956,17 @@ class AgenticRecursiveAnalyzer:
         confirmation: RootConfirmation,
         physical_request_delta: int,
     ) -> None:
+        node = state.graph.nodes.get(confirmation.candidate_ref)
+        if (
+            node is None
+            or not active_revision_candidate_eligible(
+                state.graph, confirmation.candidate_ref
+            )
+            or not root_candidate_eligible(node)
+        ):
+            raise ValueError(
+                "confirmation candidate is ineligible for the active revision"
+            )
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
         hypothesis_id = str(queued.get("hypothesis_id") or "")
@@ -4897,7 +4995,6 @@ class AgenticRecursiveAnalyzer:
         if confirmation.status == "confirmed":
             state.introduction_hypothesis_ids.discard(hypothesis_id)
             state.unresolved_hypothesis_ids.discard(hypothesis_id)
-            node = state.graph.nodes[confirmation.candidate_ref]
             defect_state = state.defect_states[confirmation.defect_fingerprint]
             state.confirmed_roots.append(
                 ConfirmedRoot(

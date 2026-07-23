@@ -1696,6 +1696,51 @@ class CausalCheckpointTest(unittest.TestCase):
                     analysis_perspective="Improve repository reasoning.",
                 )
 
+    def test_partial_and_completed_restore_reject_stale_revision_root_candidate(self):
+        trace = confirmed_root_trace()
+        trace["manifest"] = {"subject_revision": "git:active"}
+        trace["records"][0]["data"]["repository_revision"] = "git:active"
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:defect"],
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "stale-revision-root.checkpoint"
+            AgenticRecursiveAnalyzer(
+                judge=ConfirmedSingleNodeJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            stale_trace = copy.deepcopy(trace)
+            stale_trace["records"][0]["data"][
+                "repository_revision"
+            ] = "git:stale"
+
+            with self.assertRaisesRegex(ValueError, "active revision"):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(stale_trace),
+                    checkpoint=restored,
+                )
+
+            with self.assertRaisesRegex(ValueError, "active revision"):
+                AgenticRecursiveAnalyzer(
+                    judge=ConfirmedSingleNodeJudge(),
+                    checkpoint=InjectedRestoreCheckpoint(restored, root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(stale_trace),
+                    start_refs=["record:defect"],
+                    objective="Find the defect.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+
     def test_partial_and_completed_checkpoint_reject_disconnected_factor_path(self):
         from tests.test_recursive_analyzer import (
             ConfirmingScriptedJudge,

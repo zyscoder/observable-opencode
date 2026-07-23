@@ -4144,6 +4144,120 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         label="final attribution report",
                     )
 
+    def test_stale_revision_candidate_never_reaches_confirmation_or_root_publication(self):
+        trace = observed_trace()
+        trace["manifest"] = {"subject_revision": "git:active"}
+        decision = next(
+            item for item in trace["records"] if item["record_id"] == "decision"
+        )
+        decision["data"]["repository_revision"] = "git:stale"
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            selected_candidate_refs=("record:decision",),
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt="Implement only the methods found in the first search.",
+                    reason="The stale decision appears necessary under independent review.",
+                    counterfactual="A complete search prevents the omission.",
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        leaked_surfaces = []
+        requests = [
+            request
+            for request in judge.global_requests
+            if "record:decision" in request.offered_candidate_refs
+        ]
+        if requests:
+            request = requests[0]
+            capsule = next(
+                capsule
+                for capsule in request.capsules
+                if capsule.candidate_ref == "record:decision"
+            )
+            if "record:decision" in {
+                str(member.get("ref") or "")
+                for member in capsule.action_group.get("members") or ()
+            }:
+                leaked_surfaces.append("action_group")
+            if "record:decision" in request.grounded_refs:
+                leaked_surfaces.append("grounded_refs")
+        if any(
+            str(item.get("candidate_ref") or "") == "record:decision"
+            for item in report.metadata["confirmation_queue"]
+        ):
+            leaked_surfaces.append("confirmation_queue")
+        if any(
+            root.node_ref == "record:decision" for root in report.confirmed_roots
+        ):
+            leaked_surfaces.append("published_roots")
+
+        self.assertEqual(leaked_surfaces, [])
+
+    def test_confirmation_queue_revision_filter_preserves_other_seed_candidates(self):
+        graph = TraceGraph.from_trace(
+            {
+                "manifest": {"subject_revision": "git:active"},
+                "records": [
+                    {
+                        "record_id": "stale",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"repository_revision": "git:stale"},
+                    },
+                    {
+                        "record_id": "active",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {"repository_revision": "git:active"},
+                    },
+                ],
+            }
+        )
+        state = RecursiveAnalysisState(
+            graph=graph,
+            start_refs=("record:seed-one", "record:seed-two"),
+            objective="Keep confirmation candidates seed-local.",
+            analysis_perspective="task quality",
+        )
+
+        accepted = [
+            state.enqueue_confirmation(
+                {
+                    "candidate_ref": ref,
+                    "hypothesis_id": "hypothesis:{0}".format(ref),
+                    "defect_fingerprint": "defect:{0}".format(ref),
+                    "seed_binding_identity": seed,
+                }
+            )
+            for ref, seed in (
+                ("record:stale", "seed:one"),
+                ("record:active", "seed:two"),
+            )
+        ]
+
+        self.assertEqual(accepted, [False, True])
+        self.assertEqual(
+            [
+                str(item.get("candidate_ref") or "")
+                for item in state.confirmation_queue
+            ],
+            ["record:active"],
+        )
+
     def test_confirmation_queue_never_accepts_more_than_three_candidates_per_seed(self):
         refs = ("record:alpha", "record:bravo", "record:charlie", "record:delta")
         graph = TraceGraph.from_trace(

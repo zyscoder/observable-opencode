@@ -622,6 +622,34 @@ def root_candidate_eligible(node: TraceNode) -> bool:
     )
 
 
+def active_revision_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
+    """Require a canonical evidence candidate to agree with the active trace revision."""
+    resolved = graph.resolve(str(ref))
+    if (
+        not resolved
+        or resolved not in graph.nodes
+        or not graph.evidence_eligible(resolved)
+    ):
+        return False
+    node = graph.nodes[resolved]
+    data = node.data if isinstance(node.data, Mapping) else {}
+    revision_status = str(data.get("revision_status") or "").strip().lower()
+    if revision_status and revision_status != "matched":
+        return False
+    manifest = (
+        graph.raw_trace.get("manifest")
+        if isinstance(graph.raw_trace.get("manifest"), Mapping)
+        else {}
+    )
+    active_revision = str(manifest.get("subject_revision") or "").strip()
+    revisions = {
+        str(data.get(key) or "").strip()
+        for key in ("subject_revision", "repository_revision")
+        if str(data.get(key) or "").strip()
+    }
+    return not active_revision or not revisions or revisions == {active_revision}
+
+
 def is_evidence_only_node(node: TraceNode) -> bool:
     return is_evidence_only_event_type(node.event_type)
 

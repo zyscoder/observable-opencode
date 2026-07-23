@@ -15,6 +15,7 @@ from .causal_state import (
     DefectState,
     FrozenMapping,
 )
+from .causal_retrieval import active_revision_candidate_eligible
 from .confirmation_path import is_confirmation_causal_edge
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
@@ -330,12 +331,33 @@ def global_candidate_request_from_validation_envelope(
         trace_health=trace_health,
     )
     if graph is not None:
-        validate_candidate_evidence_capsules_against_graph(
+        validate_global_candidate_request_against_graph(
             graph,
-            request.capsules,
+            request,
             authoritative_candidates=authoritative_candidates,
         )
     return request
+
+
+def validate_global_candidate_request_against_graph(
+    graph: TraceGraph,
+    request: GlobalCandidateJudgeRequest,
+    *,
+    authoritative_candidates: Sequence[CausalCandidate] = (),
+) -> None:
+    request.validate()
+    validate_candidate_evidence_capsules_against_graph(
+        graph,
+        request.capsules,
+        authoritative_candidates=authoritative_candidates,
+    )
+    if any(
+        not active_revision_candidate_eligible(graph, capsule.candidate_ref)
+        for capsule in request.capsules
+    ):
+        raise ValueError(
+            "global candidate request contains a candidate ineligible for the active revision"
+        )
 
 
 @dataclass(frozen=True)
@@ -924,5 +946,6 @@ __all__ = [
     "global_candidate_judgment_from_payload",
     "normalize_active_focus_text",
     "validate_active_focus_binding",
+    "validate_global_candidate_request_against_graph",
     "validate_global_candidate_payload",
 ]
