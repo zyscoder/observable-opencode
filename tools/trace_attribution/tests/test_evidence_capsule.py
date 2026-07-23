@@ -103,8 +103,10 @@ def sample_graph(
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
-    def _decision_capsule(self) -> CandidateEvidenceCapsule:
-        graph = sample_graph()
+    def _decision_capsule(
+        self, graph: TraceGraph | None = None
+    ) -> CandidateEvidenceCapsule:
+        graph = graph or sample_graph()
         return build_candidate_evidence_capsules(
             graph=graph,
             candidates=[
@@ -202,6 +204,61 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     evidence_capsule.validate_candidate_evidence_capsule_against_graph(
                         sample_graph(), fabricated
                     )
+
+    def test_every_persisted_edge_collection_must_match_an_active_normalized_edge(self):
+        graph = sample_graph()
+        original = self._decision_capsule(graph).to_dict()
+
+        for collection in ("causal_path_edges", "incoming_edges", "outgoing_edges"):
+            with self.subTest(collection=collection):
+                payload = copy.deepcopy(original)
+                payload[collection][0]["relation"] = "forged_persisted_relation"
+                restored = CandidateEvidenceCapsule.from_dict(payload)
+                with self.assertRaisesRegex(ValueError, "edge.*active graph"):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        graph, restored
+                    )
+
+    def test_restored_capsule_rejects_removed_changed_temporal_and_revision_drifted_edges(self):
+        base_trace = copy.deepcopy(sample_graph().raw_trace)
+        for edge in base_trace["dataflow_edges"]:
+            edge["edge_id"] = "edge:{0}".format(edge["relation"])
+            edge["metadata"] = {"revision": 1}
+        capsule = self._decision_capsule(TraceGraph.from_trace(base_trace))
+
+        def mutate_removed(trace):
+            trace["dataflow_edges"] = trace["dataflow_edges"][:1]
+
+        def mutate_changed(trace):
+            trace["dataflow_edges"][1]["evidence_type"] = "content_matched"
+            trace["dataflow_edges"][1]["evidence_refs"] = ["record:prompt"]
+            trace["dataflow_edges"][1]["edge_origin"] = "changed.origin"
+            trace["dataflow_edges"][1]["inference_method"] = "changed_method"
+
+        def mutate_temporal(trace):
+            trace["dataflow_edges"][1]["relation"] = "temporal_adjacency"
+
+        def mutate_revision(trace):
+            trace["dataflow_edges"][1]["metadata"]["revision"] = 2
+
+        for label, mutate in (
+            ("removed", mutate_removed),
+            ("changed", mutate_changed),
+            ("temporalized", mutate_temporal),
+            ("revision", mutate_revision),
+        ):
+            with self.subTest(case=label):
+                active_trace = copy.deepcopy(base_trace)
+                mutate(active_trace)
+                with self.assertRaisesRegex(ValueError, "edge.*active graph"):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        TraceGraph.from_trace(active_trace), capsule
+                    )
+
+        restored = CandidateEvidenceCapsule.from_dict(capsule.to_dict())
+        evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+            TraceGraph.from_trace(base_trace), restored
+        )
 
     def test_duplicate_routes_preserve_recorded_provenance_independent_of_score(self):
         graph = sample_graph()

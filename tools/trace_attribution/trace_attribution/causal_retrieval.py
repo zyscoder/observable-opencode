@@ -34,23 +34,34 @@ PROVENANCE_ENVELOPE_EVENT_TYPES = frozenset(
         "task.loop",
     }
 )
-EVIDENCE_ONLY_EVENT_TYPES = frozenset(
+OBSERVATION_OUTCOME_EVENT_TYPES = frozenset(
     {
-        "claim.support_assessment",
-        "evidence.fact",
-        "evidence.semantic_fact",
-        "external.evaluation_fact",
+        "case.completed",
+        "case.failed",
+        "case.missing_semantic",
+        "case.observed_defect",
+        "case.quality_gap",
+        "execution.observation",
+        "mcp.result",
+        "observation",
         "tool.error",
         "tool.result",
         "verification",
     }
 )
+EVIDENCE_FACT_EVENT_TYPES = frozenset(
+    {
+        "claim.support_assessment",
+        "evidence.fact",
+        "evidence.semantic_fact",
+        "external.evaluation_fact",
+    }
+)
+EVIDENCE_ONLY_EVENT_TYPES = (
+    OBSERVATION_OUTCOME_EVENT_TYPES | EVIDENCE_FACT_EVENT_TYPES
+)
 ROOT_INELIGIBLE_EVENT_TYPES = EVIDENCE_ONLY_EVENT_TYPES | frozenset(
     {
-        "case.failed",
-        "case.observed_defect",
-        "case.quality_gap",
-        "case.missing_semantic",
         "context.pack",
         "run.start",
     }

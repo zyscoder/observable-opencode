@@ -457,6 +457,26 @@ def validate_candidate_evidence_capsule_against_graph(
             raise ValueError(
                 "candidate downstream path reference does not match active graph"
             )
+    expected_edges = {
+        "causal path": _causal_path_edges(graph, capsule.downstream_path),
+        "incoming": [
+            graph.sanitize_judge_edge_evidence(edge)
+            for edge in graph.incoming_edge_context(capsule.candidate_ref)[:16]
+        ],
+        "outgoing": _outgoing_edges(graph, capsule.candidate_ref, limit=16),
+    }
+    persisted_edges = {
+        "causal path": capsule.causal_path_edges,
+        "incoming": capsule.incoming_edges,
+        "outgoing": capsule.outgoing_edges,
+    }
+    for label, expected in expected_edges.items():
+        if _thaw(persisted_edges[label]) != expected:
+            raise ValueError(
+                "candidate evidence capsule {0} edges do not match active graph".format(
+                    label
+                )
+            )
 
 
 def validate_candidate_evidence_capsules_against_graph(

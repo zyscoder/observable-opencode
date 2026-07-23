@@ -30,6 +30,7 @@ CAUSAL_RELATIONS = frozenset(
 )
 HYPOTHESIS_STATUSES = frozenset({"active", "supported", "rejected", "superseded", "unresolved"})
 CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected", "unknown"})
+DEFINITIVE_CONFIRMATION_STATUSES = frozenset({"confirmed", "rejected"})
 COUNTERFACTUAL_STATUSES = frozenset(
     {"supports_causality", "rejects_causality", "unknown"}
 )
@@ -2018,6 +2019,17 @@ def validate_confirmation_ownership(
                 "{0} confirmation ownership is not bidirectional: confirmation identities "
                 "must individually bind to their seed; each published root must belong "
                 "to exactly one confirmed_root seed".format(label)
+            )
+        owner = owners[0]
+        if confirmation.status not in DEFINITIVE_CONFIRMATION_STATUSES and (
+            owner.outcome not in {"evidence_gap", "inconclusive"}
+            or not (owner.missing_evidence or owner.blocking_reasons)
+        ):
+            raise ValueError(
+                "{0} unresolved confirmation requires an evidence_gap or inconclusive "
+                "owning seed with concrete blocking or missing-evidence facts".format(
+                    label
+                )
             )
 
 

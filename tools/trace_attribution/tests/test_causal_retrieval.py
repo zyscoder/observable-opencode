@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -322,6 +323,70 @@ def trace_with_artifact_evidence():
 
 
 class CausalRetrievalTest(unittest.TestCase):
+    def test_formal_observation_outcome_and_evidence_types_are_never_authored_roots(self):
+        contract_path = (
+            Path(__file__).resolve().parents[3]
+            / "packages/opencode/src/observability/trace-semantic-contract.ts"
+        )
+        contract = contract_path.read_text(encoding="utf-8")
+        block = re.search(
+            r"FORMAL_RECORD_TYPES\s*=\s*\[(.*?)\]\s*as const",
+            contract,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(block)
+        formal_types = set(re.findall(r'"([^"]+)"', block.group(1)))
+        expected = {
+            "case.completed",
+            "case.failed",
+            "case.observed_defect",
+            "case.missing_semantic",
+            "external.evaluation_fact",
+            "tool.result",
+            "tool.error",
+            "observation",
+            "execution.observation",
+            "evidence.fact",
+            "evidence.semantic_fact",
+            "verification",
+            "claim.support_assessment",
+        }
+        taxonomy_derived = {
+            event_type
+            for event_type in formal_types
+            if event_type.startswith("case.")
+            or event_type == "observation"
+            or event_type == "verification"
+            or event_type.endswith(
+                (
+                    ".observation",
+                    ".result",
+                    ".error",
+                    ".fact",
+                    "_fact",
+                    "support_assessment",
+                )
+            )
+        }
+        self.assertEqual(taxonomy_derived, expected)
+
+        repository_extensions = {"case.quality_gap", "mcp.result"}
+        for event_type in sorted(expected | repository_extensions):
+            with self.subTest(event_type=event_type):
+                node = TraceGraph.from_trace(
+                    {
+                        "case_id": "formal-root-taxonomy",
+                        "records": [
+                            {
+                                "record_id": "candidate",
+                                "component": "evidence",
+                                "event_type": event_type,
+                            }
+                        ],
+                    }
+                ).nodes["record:candidate"]
+                self.assertFalse(root_candidate_eligible(node))
+
     def test_canonical_root_contract_excludes_external_evaluation_facts(self):
         graph = TraceGraph.from_trace(
             {

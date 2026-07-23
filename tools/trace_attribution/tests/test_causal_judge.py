@@ -288,8 +288,11 @@ class CausalJudgeValidationTest(unittest.TestCase):
     def test_evidence_only_nodes_cannot_be_recursive_introduction_candidates(self):
         base = sample_step_request()
         for event_type in (
+            "case.completed",
             "tool.error",
             "tool.result",
+            "observation",
+            "execution.observation",
             "verification",
             "evidence.fact",
             "evidence.semantic_fact",

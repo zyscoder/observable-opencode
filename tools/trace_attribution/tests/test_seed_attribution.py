@@ -1076,6 +1076,69 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_unresolved_confirmation_requires_blocking_owner_seed_semantics(self):
+        base_seed = seed_result("record:seed", "inconclusive")
+        raw = RootConfirmation.unknown(
+            "record:root", "The confirmation evidence is incomplete."
+        )
+        confirmation = replace(
+            raw,
+            hypothesis_id="hyp:unknown",
+            hypothesis_semantic_hash="semantic:unknown",
+            defect_fingerprint=base_seed.defect_fingerprint,
+            recursive_path=("record:root", base_seed.start_ref),
+            seed_binding_identity=seed_binding_identity_for(
+                base_seed.start_ref, base_seed.defect_fingerprint
+            ),
+        )
+
+        for outcome in ("no_defect", "inconclusive"):
+            with self.subTest(entry_point="construction", outcome=outcome):
+                owner = replace(
+                    base_seed,
+                    outcome=outcome,
+                    confirmation_identities=(confirmation.confirmation_identity,),
+                    missing_evidence=(),
+                    blocking_reasons=(),
+                )
+                with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
+                    RecursiveAttributionReport(
+                        case_id="unresolved-owner-{0}".format(outcome),
+                        objective="Bind unresolved confirmation to its owner outcome.",
+                        start_refs=(owner.start_ref,),
+                        seed_results=(owner,),
+                        defect_states=(owner.defect_state,),
+                        confirmations=(confirmation,),
+                        unresolved_refs=(confirmation.candidate_ref,),
+                    )
+
+        blocked_owner = replace(
+            base_seed,
+            outcome="evidence_gap",
+            confirmation_identities=(confirmation.confirmation_identity,),
+            missing_evidence=("Independent root confirmation remains incomplete.",),
+            blocking_reasons=("root_confirmation_unknown",),
+        )
+        report = RecursiveAttributionReport(
+            case_id="unresolved-owner-valid",
+            objective="Bind unresolved confirmation to its owner outcome.",
+            start_refs=(blocked_owner.start_ref,),
+            seed_results=(blocked_owner,),
+            defect_states=(blocked_owner.defect_state,),
+            confirmations=(confirmation,),
+            unresolved_refs=(confirmation.candidate_ref,),
+        )
+        payload = report.to_dict()
+        payload["seed_results"][0].update(
+            {
+                "outcome": "no_defect",
+                "missing_evidence": [],
+                "blocking_reasons": [],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
+            RecursiveAttributionReport.from_dict(payload)
+
     def test_every_top_level_confirmation_status_requires_exact_seed_ownership(self):
         seed = seed_result("record:seed", "evidence_gap")
         for status in ("confirmed", "rejected", "unknown"):

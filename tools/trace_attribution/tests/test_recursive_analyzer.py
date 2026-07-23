@@ -4083,8 +4083,11 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
     def test_evidence_only_nodes_fail_direct_live_and_restored_queue_guards(self):
         event_types = (
+            "case.completed",
             "tool.error",
             "tool.result",
+            "observation",
+            "execution.observation",
             "verification",
             "evidence.fact",
             "evidence.semantic_fact",
@@ -4127,6 +4130,40 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 state.confirmation_queue = [entry]
                 with self.assertRaisesRegex(ValueError, "ineligible"):
                     state.validate_confirmation_queue_bound()
+
+    def test_observation_and_outcome_nodes_never_reach_root_publication(self):
+        for event_type in ("case.completed", "observation", "execution.observation"):
+            with self.subTest(event_type=event_type):
+                trace = observed_trace()
+                decision = next(
+                    item
+                    for item in trace["records"]
+                    if item["record_id"] == "decision"
+                )
+                decision["event_type"] = event_type
+                report = AgenticRecursiveAnalyzer(
+                    judge=FusionScriptedJudge(
+                        global_outcome="candidate_roots",
+                        confirmations={
+                            "record:decision": RootConfirmation.confirmed(
+                                "record:decision",
+                                excerpt="The recorded outcome exposes the defect.",
+                                reason="Attempt to publish an outcome as the root.",
+                                counterfactual="Changing the outcome would hide the defect.",
+                                confidence=0.9,
+                                evidence_refs=["record:decision"],
+                            )
+                        },
+                    ),
+                    fusion_mode="retrieval-global",
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:observed_defect"],
+                    objective="Keep observed outcomes as evidence only.",
+                )
+
+                self.assertEqual(report.confirmed_roots, ())
+                self.assertEqual(report.co_roots, ())
 
     def test_conflicting_raw_provenance_never_publishes_global_root(self):
         trace = observed_trace()

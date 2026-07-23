@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections import defaultdict
@@ -262,6 +263,7 @@ class TraceGraph:
                             if key in metadata
                         },
                     },
+                    metadata=metadata,
                 )
                 upstream[target][source] = None
                 downstream[source][target] = None
@@ -1400,6 +1402,7 @@ def add_edge_context(
     source_container: str = "",
     edge_id: str = "",
     recorded_provenance: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
     edge = {
         "from_ref": from_ref,
@@ -1421,6 +1424,10 @@ def add_edge_context(
             str(key): dict(value) if isinstance(value, Mapping) else value
             for key, value in recorded_provenance.items()
         }
+    if metadata:
+        edge["metadata"] = {
+            str(key): copy.deepcopy(value) for key, value in metadata.items()
+        }
     bucket = index[(from_ref, to_ref)]
     signature = stable_edge_signature(edge)
     if any(stable_edge_signature(item) == signature for item in bucket):
@@ -1439,6 +1446,7 @@ def stable_edge_signature(edge: JsonDict) -> tuple:
         str(edge.get("edge_origin") or ""),
         str(edge.get("source_container") or ""),
         stable_json(edge.get("recorded_provenance") or {}),
+        stable_json(edge.get("metadata") or {}),
     )
 
 

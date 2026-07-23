@@ -383,8 +383,11 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
     def test_evidence_only_nodes_cannot_enter_global_root_selection(self):
         for event_type in (
+            "case.completed",
             "tool.error",
             "tool.result",
+            "observation",
+            "execution.observation",
             "verification",
             "evidence.fact",
             "evidence.semantic_fact",
