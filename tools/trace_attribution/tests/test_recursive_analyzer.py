@@ -21,6 +21,7 @@ from trace_attribution.causal_state import (
     CausalCandidate,
     CausalStepJudgment,
     DefectState,
+    LocalStateOwner,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -1764,12 +1765,10 @@ class RecursiveTraversalTest(unittest.TestCase):
 
         request = state.build_step_request(graph, item, [])
 
-        self.assertEqual(request.recursive_context["checked_evidence_refs"], ("record:observed_defect",))
-        self.assertEqual(
-            request.recursive_context["investigation_evidence"][0]["resolved_refs"],
-            ("record:change",),
-        )
+        self.assertNotIn("checked_evidence_refs", request.recursive_context)
+        self.assertEqual(request.recursive_context["investigation_evidence"], ())
         self.assertNotIn("record:forged_external", str(request.recursive_context))
+        self.assertNotIn("Restored local evidence.", str(request.recursive_context))
 
 
 class RecursiveBudgetTest(unittest.TestCase):
@@ -1873,7 +1872,7 @@ class RecursiveBudgetTest(unittest.TestCase):
         self.assertEqual(report.metadata["artifact_bytes"], 0)
         self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
 
-    def test_duplicate_grounded_artifact_payload_is_counted_once(self):
+    def test_duplicate_unindexed_artifact_payload_is_excluded_from_budget(self):
         artifact = {
             "artifact_id": "artifact-1",
             "content_hash": "sha256:{0}".format(
@@ -1893,7 +1892,7 @@ class RecursiveBudgetTest(unittest.TestCase):
         )
 
         self.assertEqual(len(judge.requests), 1)
-        self.assertEqual(report.metadata["artifact_bytes"], 6)
+        self.assertEqual(report.metadata["artifact_bytes"], 0)
         self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
 
     def test_one_physical_request_budget_allows_judgment_but_not_confirmation(self):
@@ -2054,7 +2053,7 @@ class RecursiveBudgetTest(unittest.TestCase):
         self.assertEqual(report.metadata["exhausted_budgets"]["hypotheses"], 1)
         self.assertIn("record:decision", report.unresolved_refs)
 
-    def test_artifact_byte_limit_stops_before_judge(self):
+    def test_unindexed_artifact_does_not_consume_byte_budget(self):
         judge = ScriptedCausalJudge({})
 
         report = AgenticRecursiveAnalyzer(judge=judge, max_artifact_bytes=8).analyze(
@@ -2063,9 +2062,9 @@ class RecursiveBudgetTest(unittest.TestCase):
             objective="Inspect the decision artifact.",
         )
 
-        self.assertEqual(judge.requests, [])
-        self.assertEqual(report.metadata["exhausted_budgets"]["artifact_bytes"], 1)
-        self.assertIn("record:decision", report.unresolved_refs)
+        self.assertEqual(len(judge.requests), 1)
+        self.assertEqual(report.metadata["artifact_bytes"], 0)
+        self.assertNotIn("artifact_bytes", report.metadata["exhausted_budgets"])
 
     def test_explicit_offline_judge_uses_no_physical_request_budget(self):
         judge = ScriptedCausalJudge({"record:change": step("record:change", introduction=True)})
@@ -2809,21 +2808,31 @@ class RecursiveRootRankingTest(unittest.TestCase):
             },
         )
 
-        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
-            TraceGraph.from_trace(
-                single_node_trace(
-                    hydrated_artifacts=[
-                        {
-                            "artifact_id": "decision-evidence",
-                            "hash": "sha256:decision-evidence",
-                            "content": artifact_text,
-                        }
-                    ]
-                )
-            ),
-            start_refs=["record:only"],
-            objective="Find the defect.",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            artifact_path = Path("artifacts/decision-evidence.txt")
+            target = artifact_root / artifact_path
+            target.parent.mkdir(parents=True)
+            target.write_text(artifact_text, encoding="utf-8")
+            digest = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+            trace = single_node_trace()
+            trace["artifacts"] = [
+                {
+                    "artifact_id": "decision-evidence",
+                    "kind": "text",
+                    "path": str(artifact_path),
+                    "content_hash": digest,
+                    "byte_length": len(artifact_text.encode("utf-8")),
+                }
+            ]
+            trace["records"][0]["artifact_refs"] = [
+                "artifact:decision-evidence"
+            ]
+            report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+                TraceGraph.from_trace(trace, artifact_root=artifact_root),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+            )
 
         self.assertEqual([item.node_ref for item in report.confirmed_roots], ["record:only"])
         manifest = judge.confirmation_requests[0].candidate_reference[
@@ -2831,7 +2840,6 @@ class RecursiveRootRankingTest(unittest.TestCase):
         ]
         hydrated = manifest["hydrated_artifacts"][0]
         self.assertEqual(hydrated["artifact_id"], "decision-evidence")
-        import hashlib
         self.assertEqual(
             hydrated["content_hash"],
             "sha256:" + hashlib.sha256(artifact_text.encode("utf-8")).hexdigest(),
@@ -4419,6 +4427,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "hypothesis_id": "hypothesis:{0}".format(ref),
                     "defect_fingerprint": "defect:{0}".format(ref),
                     "seed_binding_identity": seed,
+                    "owner": LocalStateOwner.create(
+                        seed_binding_identity=seed,
+                        hypothesis_id="hypothesis:{0}".format(ref),
+                        visit_key="visit:{0}".format(ref),
+                        occurrence_key="revision_filter:{0}".format(ref),
+                    ).to_dict(),
                 }
             )
             for ref, seed in (
@@ -4470,6 +4484,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "defect_fingerprint": "defect-fingerprint",
                         "seed_binding_identity": "seed-binding",
                         "status": "queued",
+                        "owner": LocalStateOwner.create(
+                            seed_binding_identity="seed-binding",
+                            hypothesis_id="hyp:{0}".format(index),
+                            visit_key="visit:{0}".format(index),
+                            occurrence_key="queue_bound:{0}".format(index),
+                        ).to_dict(),
                     }
                 )
             )
@@ -4524,6 +4544,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "defect_fingerprint": "defect-fingerprint",
                     "seed_binding_identity": "seed-binding",
                     "status": "queued",
+                    "owner": LocalStateOwner.create(
+                        seed_binding_identity="seed-binding",
+                        hypothesis_id="hyp:{0}".format(index),
+                        visit_key="visit:{0}".format(index),
+                        occurrence_key="evidence_only:{0}".format(index),
+                    ).to_dict(),
                 }
                 self.assertFalse(state.enqueue_confirmation(entry))
                 state.confirmation_queue = [entry]

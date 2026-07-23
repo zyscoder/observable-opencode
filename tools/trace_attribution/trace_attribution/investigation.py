@@ -1049,8 +1049,11 @@ class CausalInvestigationTools:
     def _inspect_episode(self, directive: InvestigationDirective) -> InvestigationResult:
         raw_ref = _required_text(directive.arguments, "ref")
         resolved, node = self._resolve_node(raw_ref)
+        projection = active_progress_episode_projection(self.graph)
+        projected = projection["episodes"]
+        allowed_episode_refs = tuple(projected)
         episode_refs = []
-        if node.event_type == "progress.episode":
+        if node.event_type == "progress.episode" and resolved in projected:
             episode_refs.append(resolved)
         remaining = MAX_EPISODE_REFS - len(episode_refs)
         total_scan_limit = MAX_EPISODE_REFS + 1
@@ -1060,6 +1063,7 @@ class CausalInvestigationTools:
             event_type="progress.episode",
             exclude=episode_refs,
             scan_limit=total_scan_limit,
+            allowed_refs=allowed_episode_refs,
         )
         episode_refs.extend(upstream_scan.refs)
         inspected_count = upstream_scan.inspected_count
@@ -1073,14 +1077,12 @@ class CausalInvestigationTools:
                 event_type="progress.episode",
                 exclude=episode_refs,
                 scan_limit=max(0, total_scan_limit - inspected_count),
+                allowed_refs=allowed_episode_refs,
             )
             episode_refs.extend(downstream_scan.refs)
             inspected_count += downstream_scan.inspected_count
             scan_truncated = scan_truncated or downstream_scan.scan_truncated
             truncated = truncated or downstream_scan.truncated
-        projection = active_progress_episode_projection(self.graph)
-        projected = projection["episodes"]
-
         def episode_snapshot(ref: str) -> JsonDict:
             snapshot = self.graph.sanitize_judge_node(
                 self.graph.nodes[ref]
@@ -1091,7 +1093,6 @@ class CausalInvestigationTools:
                 )
             return snapshot
 
-        episode_refs = [ref for ref in episode_refs if ref in projected]
         payload = {
             "anchor": (
                 episode_snapshot(resolved)

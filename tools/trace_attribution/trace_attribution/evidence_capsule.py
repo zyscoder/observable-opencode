@@ -6,7 +6,7 @@ import copy
 import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
 from .causal_retrieval import (
@@ -14,7 +14,6 @@ from .causal_retrieval import (
     root_candidate_eligible,
 )
 from .graph import TraceGraph
-from .judge_payload import strip_audit_only_payload
 from .models import JsonDict, TraceNode, stable_json
 
 
@@ -258,7 +257,27 @@ class CandidateEvidenceCapsule:
     def judge_dict(self) -> JsonDict:
         """Return only grounded evidence collections intended for a Judge."""
         value = self.to_dict()
-        return strip_audit_only_payload(value)
+        value.pop("missing_evidence_refs", None)
+        value.pop("validation_source", None)
+        hydration = value.get("artifact_hydration")
+        if isinstance(hydration, Mapping) and any(
+            hydration.get(key)
+            for key in (
+                "integrity_failures",
+                "missing_artifact_ids",
+                "truncated_artifact_ids",
+            )
+        ):
+            value.pop("artifact_hydration", None)
+        elif isinstance(hydration, dict):
+            for key in (
+                "referenced_artifact_ids",
+                "missing_artifact_ids",
+                "truncated_artifact_ids",
+                "integrity_failures",
+            ):
+                hydration.pop(key, None)
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":
@@ -332,6 +351,13 @@ def build_candidate_evidence_capsules(
     downstream_paths: Mapping[str, Sequence[str]],
     start_refs: Sequence[str],
 ) -> Tuple[CandidateEvidenceCapsule, ...]:
+    owner_refs = tuple(
+        dict.fromkeys(
+            graph.resolve(item) or str(item)
+            for item in start_refs
+            if str(item)
+        )
+    )
     selected: Dict[str, CausalCandidate] = {}
     routes_by_ref: Dict[str, List[CausalCandidate]] = {}
     order: List[str] = []
@@ -395,7 +421,15 @@ def build_candidate_evidence_capsules(
             graph.sanitize_judge_edge_evidence(edge)
             for edge in graph.incoming_edge_context(ref)[:16]
         )
-        outgoing_edges = tuple(_outgoing_edges(graph, ref, limit=16))
+        outgoing_edges = tuple(
+            _outgoing_edges(
+                graph,
+                ref,
+                path=path,
+                owner_refs=owner_refs,
+                limit=16,
+            )
+        )
         prompt_collections = _build_prompt_collections(
             graph=graph,
             candidate=candidate,
@@ -409,7 +443,7 @@ def build_candidate_evidence_capsules(
             graph=graph,
             candidate=candidate,
             path=path,
-            start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
+            start_refs=owner_refs,
             prompt_collections=prompt_collections,
             diagnostic_evidence_refs=raw_candidate_evidence_refs,
         )
@@ -431,7 +465,7 @@ def build_candidate_evidence_capsules(
             downstream_path=path,
             downstream_path_references=tuple(_reference(graph, item) for item in path),
             causal_path_edges=causal_path_edges,
-            start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
+            start_refs=owner_refs,
             action_group=prompt_collections["action_group"],
             incoming_edges=incoming_edges,
             outgoing_edges=outgoing_edges,
@@ -456,6 +490,7 @@ def _build_prompt_collections(
     incoming_edges: Sequence[Mapping[str, Any]] | None = None,
     outgoing_edges: Sequence[Mapping[str, Any]] | None = None,
     diagnostic_evidence_refs: Sequence[str] | None = None,
+    start_refs: Sequence[str] = (),
 ) -> JsonDict:
     ref = graph.resolve(candidate.ref) or candidate.ref
     node = graph.hydrate_node(ref)
@@ -484,7 +519,13 @@ def _build_prompt_collections(
     outgoing = tuple(
         outgoing_edges
         if outgoing_edges is not None
-        else _outgoing_edges(graph, ref, limit=16)
+        else _outgoing_edges(
+            graph,
+            ref,
+            path=path,
+            owner_refs=start_refs,
+            limit=16,
+        )
     )
     raw_evidence_refs = _dedupe_strings(
         [
@@ -763,6 +804,7 @@ def validate_candidate_evidence_capsule_against_graph(
         candidate=active_candidate,
         path=capsule.downstream_path,
         diagnostic_evidence_refs=diagnostic_evidence_refs,
+        start_refs=capsule.start_refs,
     )
     missing_artifact_refs = {
         "artifact:{0}".format(artifact_id)
@@ -827,7 +869,13 @@ def validate_candidate_evidence_capsule_against_graph(
             graph.sanitize_judge_edge_evidence(edge)
             for edge in graph.incoming_edge_context(capsule.candidate_ref)[:16]
         ],
-        "outgoing": _outgoing_edges(graph, capsule.candidate_ref, limit=16),
+        "outgoing": _outgoing_edges(
+            graph,
+            capsule.candidate_ref,
+            path=capsule.downstream_path,
+            owner_refs=capsule.start_refs,
+            limit=16,
+        ),
     }
     persisted_edges = {
         "causal path": capsule.causal_path_edges,
@@ -972,9 +1020,24 @@ def validate_candidate_evidence_capsules_against_graph(
         )
 
 
-def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict]:
+def _outgoing_edges(
+    graph: TraceGraph,
+    ref: str,
+    *,
+    path: Sequence[str],
+    owner_refs: Sequence[str] = (),
+    limit: int,
+) -> List[JsonDict]:
     output: List[JsonDict] = []
+    if not path or path[0] != ref:
+        return output
+    if len(path) > 1:
+        allowed_targets = {path[1]}
+    else:
+        allowed_targets = _owner_ancestor_refs(graph, owner_refs)
     for downstream in graph.downstream_refs(ref):
+        if downstream not in allowed_targets:
+            continue
         if not graph.edge_endpoints_eligible(ref, downstream):
             continue
         output.extend(
@@ -984,6 +1047,28 @@ def _outgoing_edges(graph: TraceGraph, ref: str, *, limit: int) -> List[JsonDict
         if len(output) >= limit:
             break
     return output[:limit]
+
+
+def _owner_ancestor_refs(
+    graph: TraceGraph,
+    owner_refs: Sequence[str],
+) -> Set[str]:
+    pending = [
+        graph.resolve(owner_ref) or str(owner_ref)
+        for owner_ref in owner_refs
+        if str(owner_ref)
+    ]
+    ancestors: Set[str] = set()
+    while pending:
+        current = pending.pop()
+        if (
+            current in ancestors
+            or not graph.active_revision_evidence_eligible(current)
+        ):
+            continue
+        ancestors.add(current)
+        pending.extend(graph.upstream_refs(current))
+    return ancestors
 
 
 def _causal_path_edges(graph: TraceGraph, path: Tuple[str, ...]) -> List[JsonDict]:

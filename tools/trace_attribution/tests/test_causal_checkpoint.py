@@ -29,6 +29,7 @@ from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
     FrontierItem,
+    LocalStateOwner,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -769,8 +770,17 @@ class CausalCheckpointTest(unittest.TestCase):
         }
         state.investigation_evidence_hashes = {new_visit_key: {"evidence:one"}}
         state.pending_rejudge_journal = {new_visit_key: [0]}
+        confirmation_owner = LocalStateOwner.create(
+            seed_binding_identity=seed.key,
+            hypothesis_id=hypothesis.hypothesis_id,
+            visit_key=new_visit_key,
+            occurrence_key="visit_key_migration_confirmation",
+        )
         state.confirmation_journal = [
-            {"nested": {"active_visit_key": new_visit_key}}
+            {
+                "nested": {"active_visit_key": new_visit_key},
+                "owner": confirmation_owner.to_dict(),
+            }
         ]
         state.provider_state = _provider_state_payload(
             CountingOfflineJudge(), state, cache_identity="cache:test"
@@ -1208,13 +1218,14 @@ class CausalCheckpointTest(unittest.TestCase):
         self.assertEqual(
             config["global_judgment_contract"],
             "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-            "+evidence-policy/v2",
+            "+evidence-policy/v2+local-state-owner/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2",
+            "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2"
+            "+local-state-owner/v1",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v5")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v6")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1246,6 +1257,12 @@ class CausalCheckpointTest(unittest.TestCase):
             )
             seed = report_action["payload"]["report"]["seed_results"][0]
             seed["decisive_evidence_refs"] = ["record:ghost"]
+            seed["decisive_evidence"] = [
+                {
+                    "ref": "record:ghost",
+                    "owner": seed["global_judgment"]["owner"],
+                }
+            ]
             seed["global_judgment"]["decisive_evidence_refs"] = ["record:ghost"]
             seed["global_judgment"]["assessments"][0]["evidence_refs"] = [
                 "record:ghost"

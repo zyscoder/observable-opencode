@@ -1355,10 +1355,10 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 start_refs=("record:decision",),
             )[0].to_dict()
 
-        hydrated = capsule["artifact_hydration"]["hydrated_artifacts"][0]
-        self.assertEqual(hydrated["source"], "embedded_semantic_slice")
-        self.assertEqual(hydrated["content"], content)
-        self.assertTrue(hydrated["truncated"])
+        self.assertEqual(
+            capsule["artifact_hydration"]["hydrated_artifacts"],
+            [],
+        )
         self.assertEqual(
             capsule["artifact_hydration"]["truncated_artifact_ids"],
             ["decision-rationale"],

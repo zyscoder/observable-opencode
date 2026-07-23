@@ -17,6 +17,7 @@ from trace_attribution.causal_state import (
     DefectState,
     FrontierItem,
     FrozenMapping,
+    LocalStateOwner,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -1736,6 +1737,12 @@ class SeedAttributionModelTests(unittest.TestCase):
             defect_state=defect("unresolved-confirmation"),
         )
         builder.mark_unresolved("judge_error", "The sibling branch failed.")
+        owner = LocalStateOwner.create(
+            seed_binding_identity=builder.key,
+            hypothesis_id="hyp:unresolved-confirmation",
+            visit_key="visit:unresolved-confirmation",
+            occurrence_key="unresolved_confirmation",
+        )
         builder.record_confirmation(
             RootConfirmation.confirmed(
                 "record:root",
@@ -1744,7 +1751,8 @@ class SeedAttributionModelTests(unittest.TestCase):
                 counterfactual="Avoiding the action prevents the defect.",
                 confidence=0.9,
                 evidence_refs=("record:root",),
-            )
+            ),
+            owner,
         )
 
         result = builder.to_result()
@@ -1835,6 +1843,14 @@ class SeedAttributionModelTests(unittest.TestCase):
             start_refs=("record:seed",),
             capsules=(),
         )
+        owner = LocalStateOwner.create(
+            seed_binding_identity=seed_binding_identity_for(
+                "record:seed", state.fingerprint
+            ),
+            hypothesis_id="hyp:immutable-seed-result",
+            visit_key="visit:immutable-seed-result",
+            occurrence_key="immutable_global_judgment",
+        )
         result = SeedAttributionResult(
             start_ref="record:seed",
             defect_fingerprint=state.fingerprint,
@@ -1858,8 +1874,15 @@ class SeedAttributionModelTests(unittest.TestCase):
                     "active_focus_text_hash": active_focus_text_sha256(state.actual),
                 },
                 "validation_envelope": request.validation_envelope(),
+                "owner": owner.to_dict(),
             },
-            expansion_history=[{"anchor_ref": "record:a", "refs": ["record:b"]}],
+            expansion_history=[
+                {
+                    "anchor_ref": "record:a",
+                    "refs": ["record:b"],
+                    "owner": owner.to_dict(),
+                }
+            ],
         )
 
         with self.assertRaises(FrozenInstanceError):
@@ -1879,6 +1902,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             set(payload),
             {
                 "start_ref",
+                "seed_binding_identity",
                 "defect_fingerprint",
                 "defect_state",
                 "outcome",
@@ -1887,6 +1911,7 @@ class SeedAttributionModelTests(unittest.TestCase):
                 "confirmation_identities",
                 "confirmed_root_refs",
                 "decisive_evidence_refs",
+                "decisive_evidence",
                 "missing_evidence",
                 "blocking_reasons",
                 "global_judgment",
@@ -1935,11 +1960,11 @@ class SeedAttributionModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-confirmed"):
             RecursiveAttributionReport.from_dict(non_confirmed)
 
-    def test_report_v5_round_trip_rejects_v4_and_migrates_v2_conservatively(self):
+    def test_report_v7_round_trip_rejects_v4_and_migrates_v2_conservatively(self):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v6")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v7")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v4_payload = json.loads(json.dumps(payload))
@@ -1952,7 +1977,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v6")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v7")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

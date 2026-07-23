@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import tempfile
@@ -290,6 +291,10 @@ def trace_with_artifact_evidence():
                 "artifact_id": "known_payload",
                 "kind": "text",
                 "path": "artifacts/known-payload.txt",
+                "content_hash": hashlib.sha256(
+                    b"artifact evidence"
+                ).hexdigest(),
+                "byte_length": len(b"artifact evidence"),
             },
             {
                 "artifact_id": "missing_payload",
@@ -904,7 +909,7 @@ class CausalRetrievalTest(unittest.TestCase):
             defect_state=defect_state,
             candidates=(),
         )
-        self.assertIn("record:forged_external", json.dumps(context))
+        self.assertNotIn("record:forged_external", json.dumps(context))
         self.assertNotIn(
             "record:forged_external",
             build_causal_step_prompt(request),
@@ -1522,10 +1527,10 @@ class CausalRetrievalTest(unittest.TestCase):
             defect_transformation_chain=[defect_state],
             hypothesis=hypothesis,
             candidates=candidates,
-            downstream_path=["record:observed", "record:decision"],
+            downstream_path=["record:decision"],
             downstream_judgments=[
                 CausalStepJudgment(
-                    current_node_ref="record:observed",
+                    current_node_ref="record:decision",
                     current_defect_status="present",
                     current_defect_reason="The final parser contract is incomplete.",
                 )
@@ -1537,15 +1542,18 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertEqual(context["defect_transformation_chain"], [defect_state.to_dict()])
         self.assertEqual(context["hypothesis"]["hypothesis_id"], hypothesis.hypothesis_id)
         self.assertEqual(context["candidate_predecessors"][0]["edge"]["relation"], "prompt_informed_decision")
-        self.assertEqual(context["downstream_path"], ["record:observed", "record:decision"])
-        self.assertEqual(context["downstream_judgments"][0]["current_node_ref"], "record:observed")
+        self.assertEqual(context["downstream_path"], ["record:decision"])
+        self.assertEqual(
+            context["downstream_judgments"][0]["current_node_ref"],
+            "record:decision",
+        )
         self.assertEqual(context["task_obligations"][0]["text"], "Recover all parser namespace compatibility behavior.")
         self.assertEqual(context["agent_scope"]["session_id"], "ses_1")
         self.assertIn("artifact_hydration", context)
         self.assertEqual(context["temporal_adjacency"][0]["from_ref"], "record:temporally_previous")
         self.assertNotIn("defect_status", context["candidate_predecessors"][0])
 
-    def test_recursive_context_grounds_unresolved_refs_and_candidate_artifacts(self):
+    def test_recursive_context_atomically_excludes_unresolved_refs_and_artifacts(self):
         defect_state = sample_defect_state()
         hypothesis = sample_hypothesis(defect_state).with_updates(
             supporting_evidence=(
@@ -1577,25 +1585,22 @@ class CausalRetrievalTest(unittest.TestCase):
             )
 
         candidate = context["candidate_predecessors"][0]
-        self.assertEqual(context["downstream_path_references"][0]["raw_ref"], "record:missing_downstream")
-        self.assertEqual(context["downstream_path_references"][0]["resolution_status"], "unresolved")
+        self.assertEqual(context["downstream_path"], ["record:decision"])
+        self.assertEqual(
+            context["downstream_path_references"][0]["raw_ref"],
+            "record:decision",
+        )
+        self.assertEqual(
+            context["downstream_path_references"][0]["resolution_status"],
+            "resolved",
+        )
         self.assertEqual(candidate["edge_evidence_references"], [])
         self.assertEqual(candidate["edge_endpoint_references"]["from"]["raw_ref"], "record:prompt")
         self.assertEqual(context["hypothesis_evidence_references"], [])
-        unresolved_refs = {
-            item["raw_ref"] for item in context["unresolved_references"]
-        }
-        self.assertEqual(
-            unresolved_refs,
-            {
-                "record:missing_downstream",
-                "record:missing_evidence",
-                "record:missing_hypothesis_evidence",
-            },
-        )
-        self.assertEqual(candidate["artifact_hydration"]["missing_artifact_ids"], ["missing_payload"])
-        self.assertEqual(context["context_manifest"]["unresolved_reference_count"], 3)
-        self.assertEqual(context["context_manifest"]["missing_artifact_count"], 1)
+        self.assertNotIn("unresolved_references", context)
+        self.assertNotIn("artifact_hydration", candidate)
+        self.assertEqual(context["context_manifest"]["unresolved_reference_count"], 0)
+        self.assertEqual(context["context_manifest"]["missing_artifact_count"], 0)
 
     def test_recursive_context_rebuilds_from_serialized_state_and_reloaded_graph(self):
         trace = trace_with_confirmed_and_inferred_predecessors()
@@ -1671,13 +1676,9 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertEqual(known["resolved_ref"], "artifact:known_payload")
         self.assertEqual(known["reference_kind"], "artifact")
         self.assertEqual(known["artifact_status"]["availability"], "available")
-        unresolved_refs = {
-            item["raw_ref"] for item in context["unresolved_references"]
-        }
-        self.assertEqual(
-            unresolved_refs,
-            {"artifact:missing_payload", "unknown_payload"},
-        )
+        self.assertNotIn("unresolved_references", context)
+        self.assertNotIn("artifact:missing_payload", json.dumps(context))
+        self.assertNotIn("unknown_payload", json.dumps(context))
         self.assertEqual(graph.artifact_reference_status("known_payload")["canonical_ref"], "artifact:known_payload")
 
     def test_unresolved_downstream_path_never_emits_an_eligible_causal_edge(self):
@@ -1692,10 +1693,9 @@ class CausalRetrievalTest(unittest.TestCase):
             downstream_path=["record:missing_downstream", "record:decision"],
         )
 
-        self.assertEqual(context["outgoing_edges_on_active_path"][0]["relation"], "unresolved_path_advisory")
-        self.assertFalse(context["outgoing_edges_on_active_path"][0]["eligible_for_attribution"])
-        self.assertEqual(context["outgoing_edges_on_active_path"][0]["confidence"], 0.0)
-        self.assertEqual(context["outgoing_edges_on_active_path"][0]["resolution_status"], "unresolved")
+        self.assertEqual(context["downstream_path"], ["record:decision"])
+        self.assertEqual(context["outgoing_edges_on_active_path"], [])
+        self.assertNotIn("record:missing_downstream", json.dumps(context))
 
 
 if __name__ == "__main__":

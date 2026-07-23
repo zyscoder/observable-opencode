@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -709,6 +710,7 @@ class TraceGraph:
         event_type: str = "",
         exclude: Iterable[str] = (),
         scan_limit: Optional[int] = None,
+        allowed_refs: Optional[Iterable[str]] = None,
     ) -> BoundedAdjacencyResult:
         return self._bounded_adjacent_refs(
             ref,
@@ -719,6 +721,7 @@ class TraceGraph:
             event_type=event_type,
             exclude=exclude,
             scan_limit=scan_limit,
+            allowed_refs=allowed_refs,
         )
 
     def bounded_downstream_refs(
@@ -730,6 +733,7 @@ class TraceGraph:
         event_type: str = "",
         exclude: Iterable[str] = (),
         scan_limit: Optional[int] = None,
+        allowed_refs: Optional[Iterable[str]] = None,
     ) -> BoundedAdjacencyResult:
         return self._bounded_adjacent_refs(
             ref,
@@ -740,6 +744,7 @@ class TraceGraph:
             event_type=event_type,
             exclude=exclude,
             scan_limit=scan_limit,
+            allowed_refs=allowed_refs,
         )
 
     def _bounded_adjacent_refs(
@@ -753,6 +758,7 @@ class TraceGraph:
         event_type: str,
         exclude: Iterable[str],
         scan_limit: Optional[int],
+        allowed_refs: Optional[Iterable[str]],
     ) -> BoundedAdjacencyResult:
         """Return deterministic adjacency under independent output and scan bounds."""
         resolved = self.resolve(ref) or ref
@@ -765,13 +771,27 @@ class TraceGraph:
         )
         relations = {str(item) for item in relation_filter if str(item)}
         excluded = {str(item) for item in exclude}
+        allowed = (
+            tuple(
+                dict.fromkeys(
+                    self.resolve(str(item)) or str(item)
+                    for item in allowed_refs
+                    if str(item)
+                )
+            )
+            if allowed_refs is not None
+            else None
+        )
         eligible: List[str] = []
         inspected = 0
         output_truncated = False
         adjacent_items = adjacency.get(resolved, {})
 
         def active_endpoints() -> Iterable[str]:
-            for adjacent in adjacent_items:
+            candidates = allowed if allowed is not None else adjacent_items
+            for adjacent in candidates:
+                if allowed is not None and adjacent not in adjacent_items:
+                    continue
                 source, target = (
                     (adjacent, resolved) if upstream else (resolved, adjacent)
                 )
@@ -780,7 +800,8 @@ class TraceGraph:
 
         active_adjacent_count = sum(
             1
-            for adjacent in adjacent_items.keys()
+            for adjacent in (allowed if allowed is not None else adjacent_items.keys())
+            if allowed is None or adjacent in adjacent_items
             if self.edge_endpoints_eligible(
                 adjacent if upstream else resolved,
                 resolved if upstream else adjacent,
@@ -1035,15 +1056,41 @@ class TraceGraph:
         node = self.hydrate_node(resolved)
         record = self._artifact_records.get(resolved) or {}
         artifact_ids = collect_artifact_ids(record, node.data)
-        hydrated = node.data.get("hydrated_artifacts")
-        hydrated_items = [dict(item) for item in hydrated if isinstance(item, dict)] if isinstance(hydrated, list) else []
-        hydrated_ids = {str(item.get("artifact_id") or "") for item in hydrated_items}
-        missing_ids = [artifact_id for artifact_id in artifact_ids if artifact_id not in hydrated_ids]
-        truncated_ids = [
-            str(item.get("artifact_id") or "")
-            for item in hydrated_items
-            if item.get("truncated") and item.get("artifact_id")
-        ]
+        hydrated_items: List[JsonDict] = []
+        missing_ids: List[str] = []
+        truncated_ids: List[str] = []
+        for artifact_id in artifact_ids:
+            verified = self._artifact_reader.read(artifact_id)
+            if verified.content is None or verified.content_bytes is None:
+                missing_ids.append(artifact_id)
+                continue
+            if verified.truncated:
+                truncated_ids.append(artifact_id)
+                continue
+            content_hash = "sha256:{0}".format(
+                hashlib.sha256(verified.content_bytes).hexdigest()
+            )
+            hydrated_items.append(
+                {
+                    "artifact_id": artifact_id,
+                    "raw_ref": "artifact:{0}".format(artifact_id),
+                    "resolved_ref": "artifact:{0}".format(artifact_id),
+                    "resolution_status": "resolved",
+                    "provenance_class": "recorded",
+                    "content": verified.content,
+                    "content_hash": content_hash,
+                    "byte_count": len(verified.content_bytes),
+                    "byte_range": [0, len(verified.content_bytes)],
+                    "owner_reference": {
+                        "raw_ref": resolved,
+                        "resolved_ref": resolved,
+                        "resolution_status": "resolved",
+                        "provenance_class": "recorded",
+                    },
+                    "missing": False,
+                    "truncated": False,
+                }
+            )
         integrity_failures = [
             dict(item)
             for item in self.artifact_hydration.get("integrity_failures") or []
@@ -1067,7 +1114,12 @@ class TraceGraph:
             return None
         path_value = artifact.get("path")
         verified = self._artifact_reader.read(artifact_id)
-        availability = "available" if verified.file_available else "missing"
+        if verified.content is None or verified.content_bytes is None:
+            availability = "missing"
+        elif verified.truncated:
+            availability = "truncated"
+        else:
+            availability = "available"
         hydration_status = "not_requested"
         for node in self.nodes.values():
             hydrated = node.data.get("hydrated_artifacts")

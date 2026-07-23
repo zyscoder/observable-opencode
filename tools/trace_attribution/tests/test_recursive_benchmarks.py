@@ -26,6 +26,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     annotate_report_semantic_anchors,
+    seed_binding_identity_for,
     semantic_anchor_id,
     semantic_anchor_index,
     semantic_occurrence_index,
@@ -669,11 +670,18 @@ class RecursiveMetricTest(unittest.TestCase):
         other_seed.update(
             {
                 "start_ref": other_seed_ref,
+                "seed_binding_identity": seed_binding_identity_for(
+                    other_seed_ref, other_seed["defect_fingerprint"]
+                ),
                 "outcome": "no_defect",
                 "confirmed_root_refs": [],
                 "confirmation_identities": [],
+                "decisive_evidence_refs": [],
+                "decisive_evidence": [],
                 "missing_evidence": [],
                 "blocking_reasons": [],
+                "global_judgment": {},
+                "expansion_history": [],
             }
         )
         report["start_refs"].append(other_seed_ref)

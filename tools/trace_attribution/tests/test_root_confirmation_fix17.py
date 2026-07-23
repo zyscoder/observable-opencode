@@ -620,21 +620,28 @@ class JudgePayloadGroundingTest(unittest.TestCase):
             downstream_path=["record:decision", "record:active_defect"],
             objective="Find the active root.",
         )
-        context["unresolved_references"].append(
-            {
-                "raw_ref": "record:diagnostic-only",
-                "resolved_ref": "record:diagnostic-only",
-                "resolution_status": "resolved",
-            }
-        )
-        context["candidate_predecessors"][0]["evidence_refs"].append(
-            "record:diagnostic-only"
+        self.assertNotIn("unresolved_references", context)
+        self.assertNotIn(
+            "record:diagnostic-only",
+            context["candidate_predecessors"][0]["evidence_refs"],
         )
         step_request = CausalStepRequest(
             recursive_context=context,
-            current_node=graph.nodes["record:decision"],
+            current_node=graph.sanitize_judge_node(
+                graph.nodes["record:decision"]
+            ),
             defect_state=defect,
-            candidates=(candidate,),
+            candidates=(
+                CausalCandidate(
+                    ref=candidate.ref,
+                    node=graph.sanitize_judge_node(candidate.node),
+                    source=candidate.source,
+                    edge=graph.sanitize_judge_edge_evidence(candidate.edge),
+                    evidence_refs=tuple(
+                        graph.filter_evidence_refs(candidate.evidence_refs)
+                    ),
+                ),
+            ),
         )
         step_payload = json.loads(build_causal_step_prompt(step_request))
         self.assertNotIn(

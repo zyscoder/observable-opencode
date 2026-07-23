@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from trace_attribution.causal_state import (
+    LocalStateOwner,
     RecursiveAttributionReport,
     confirmation_identity_for,
+    seed_binding_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
     validate_seed_outcome_payload,
@@ -25,7 +27,7 @@ from trace_attribution.models import TraceNode, stable_json
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v4"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v6"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v7"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -87,6 +89,7 @@ REPORT_KEYS = frozenset(
         "root_causes",
         "taint_paths",
         "visited_order",
+        "visited_entries",
         "unresolved_refs",
         "investigation_journal",
         "metadata",
@@ -95,6 +98,7 @@ REPORT_KEYS = frozenset(
 SEED_RESULT_KEYS = frozenset(
     {
         "start_ref",
+        "seed_binding_identity",
         "defect_fingerprint",
         "defect_state",
         "outcome",
@@ -103,6 +107,7 @@ SEED_RESULT_KEYS = frozenset(
         "confirmation_identities",
         "confirmed_root_refs",
         "decisive_evidence_refs",
+        "decisive_evidence",
         "missing_evidence",
         "blocking_reasons",
         "global_judgment",
@@ -319,13 +324,16 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         "contributing_conditions",
         "amplifying_factors",
         "confirmations",
+        "causal_relations",
         "step_judgments",
         "unresolved_hypotheses",
         "unresolved_refs",
         "investigation_journal",
+        "visited_entries",
     ):
         _list(report.get(key), "report.{0}".format(key))
     seed_identities: Set[Tuple[str, str]] = set()
+    seed_bindings: Set[str] = set()
     report_start_refs = {item for item in _list(report.get("start_refs"), "report.start_refs") if isinstance(item, str)}
     for index, raw in enumerate(report["seed_results"]):
         item = _mapping(raw, "report.seed_results[{0}]".format(index))
@@ -350,6 +358,12 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         if identity in seed_identities:
             raise EvaluationSchemaError("duplicate seed result identity")
         seed_identities.add(identity)
+        expected_seed_binding = seed_binding_identity_for(start_ref, fingerprint)
+        if item.get("seed_binding_identity") != expected_seed_binding:
+            raise EvaluationSchemaError(
+                "seed result seed_binding_identity is missing or inconsistent"
+            )
+        seed_bindings.add(expected_seed_binding)
         if item.get("outcome") not in {
             "confirmed_root",
             "no_defect",
@@ -365,11 +379,56 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
             "confirmation_identities",
             "confirmed_root_refs",
             "decisive_evidence_refs",
+            "decisive_evidence",
             "missing_evidence",
             "blocking_reasons",
             "expansion_history",
         ):
             _list(item.get(key), "seed result {0}".format(key))
+        decisive_refs = []
+        for evidence_index, evidence in enumerate(item["decisive_evidence"]):
+            evidence = _mapping(
+                evidence,
+                "seed result decisive_evidence[{0}]".format(evidence_index),
+            )
+            _exact_keys(
+                evidence,
+                {"ref", "owner"},
+                "seed result decisive_evidence[{0}]".format(evidence_index),
+            )
+            decisive_refs.append(str(evidence.get("ref") or ""))
+            _validate_local_owner(
+                evidence.get("owner"),
+                expected_seed_binding=expected_seed_binding,
+                label="seed result decisive_evidence[{0}]".format(
+                    evidence_index
+                ),
+            )
+        if sorted(set(decisive_refs)) != sorted(
+            set(item["decisive_evidence_refs"])
+        ):
+            raise EvaluationSchemaError(
+                "seed result decisive evidence aggregate is inconsistent"
+            )
+        global_judgment = item["global_judgment"]
+        if global_judgment:
+            _validate_local_owner(
+                global_judgment.get("owner"),
+                expected_seed_binding=expected_seed_binding,
+                label="seed result global_judgment",
+            )
+        for expansion_index, expansion in enumerate(item["expansion_history"]):
+            expansion = _mapping(
+                expansion,
+                "seed result expansion_history[{0}]".format(expansion_index),
+            )
+            _validate_local_owner(
+                expansion.get("owner"),
+                expected_seed_binding=expected_seed_binding,
+                label="seed result expansion_history[{0}]".format(
+                    expansion_index
+                ),
+            )
         try:
             validate_seed_outcome_payload(
                 outcome=str(item.get("outcome") or ""),
@@ -383,7 +442,79 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         raise EvaluationSchemaError(
             "v3 seed_results must cover exactly report.start_refs"
         )
-    _mapping(report.get("metadata"), "report.metadata")
+    for key in ("causal_relations", "step_judgments", "visited_entries"):
+        for index, raw in enumerate(report[key]):
+            item = _mapping(raw, "report.{0}[{1}]".format(key, index))
+            _validate_local_owner(
+                item.get("owner"),
+                valid_seed_bindings=seed_bindings,
+                label="report.{0}[{1}]".format(key, index),
+            )
+            if key == "step_judgments":
+                for predecessor_index, predecessor in enumerate(
+                    _list(
+                        item.get("predecessors"),
+                        "report.step_judgments[{0}].predecessors".format(index),
+                    )
+                ):
+                    predecessor = _mapping(
+                        predecessor,
+                        "report.step_judgments[{0}].predecessors[{1}]".format(
+                            index, predecessor_index
+                        ),
+                    )
+                    _validate_local_owner(
+                        predecessor.get("owner"),
+                        valid_seed_bindings=seed_bindings,
+                        label=(
+                            "report.step_judgments[{0}].predecessors[{1}]".format(
+                                index, predecessor_index
+                            )
+                        ),
+                    )
+    metadata = _mapping(report.get("metadata"), "report.metadata")
+    for key in (
+        "confirmation_queue",
+        "confirmation_journal",
+        "global_candidate_judgments",
+        "candidate_compression",
+        "recursive_expansion_reasons",
+    ):
+        for index, raw in enumerate(metadata.get(key) or ()):
+            item = _mapping(raw, "report.metadata.{0}[{1}]".format(key, index))
+            _validate_local_owner(
+                item.get("owner"),
+                valid_seed_bindings=seed_bindings,
+                label="report.metadata.{0}[{1}]".format(key, index),
+            )
+    for index, raw in enumerate(report["investigation_journal"]):
+        item = _mapping(raw, "report.investigation_journal[{0}]".format(index))
+        if item.get("kind") == "global_candidate_pass" and item.get("seed_ref"):
+            _validate_local_owner(
+                item.get("owner"),
+                valid_seed_bindings=seed_bindings,
+                label="report.investigation_journal[{0}]".format(index),
+            )
+
+
+def _validate_local_owner(
+    value: Any,
+    *,
+    label: str,
+    expected_seed_binding: str = "",
+    valid_seed_bindings: Optional[Set[str]] = None,
+) -> None:
+    try:
+        owner = LocalStateOwner.from_dict(value)
+    except (TypeError, ValueError) as exc:
+        raise EvaluationSchemaError("{0} owner is invalid: {1}".format(label, exc))
+    if expected_seed_binding and owner.seed_binding_identity != expected_seed_binding:
+        raise EvaluationSchemaError("{0} owner seed binding is inconsistent".format(label))
+    if (
+        valid_seed_bindings is not None
+        and owner.seed_binding_identity not in valid_seed_bindings
+    ):
+        raise EvaluationSchemaError("{0} owner has no report seed".format(label))
 
 
 def _without_projection_fields(value: Any) -> Any:

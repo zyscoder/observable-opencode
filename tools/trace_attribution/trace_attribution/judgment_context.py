@@ -16,19 +16,6 @@ from .progress import (
 
 JUDGMENT_CONTEXT_VERSION = "1.0"
 EPISODE_MEMBER_LIMIT = 16
-EVIDENCE_REF_LIST_FIELDS = frozenset(
-    {
-        "checked_evidence_refs",
-        "decisive_evidence_refs",
-        "evidence_refs",
-        "missing_evidence",
-        "opposing_evidence_refs",
-        "resolved_refs",
-        "source_refs",
-    }
-)
-
-
 def build_causal_judgment_context(
     *,
     graph: TraceGraph,
@@ -106,7 +93,15 @@ def build_recursive_judgment_context(
     candidates = [coerce_candidate(item) for item in values.get("candidates") or []]
     downstream_path_raw = [str(item) for item in values.get("downstream_path") or []]
     downstream_path = [graph.resolve(item) or item for item in downstream_path_raw]
-    if not downstream_path:
+    if (
+        not downstream_path
+        or any(
+            ref not in graph.nodes
+            or not graph.active_revision_evidence_eligible(ref)
+            for ref in downstream_path
+        )
+    ):
+        downstream_path_raw = [resolved]
         downstream_path = [resolved]
     downstream_judgments = [coerce_recursive_judgment(item) for item in values.get("downstream_judgments") or []]
     transformation_chain = normalize_defect_chain(
@@ -152,11 +147,15 @@ def build_recursive_judgment_context(
         "downstream_judgments": [compact_recursive_judgment(item) for item in downstream_judgments],
         "task_obligations": task_obligations(graph, objective),
         "agent_scope": agent_scope(graph.hydrate_node(resolved)),
-        "causal_episode": legacy_context["causal_episode"],
-        "progress_episode": legacy_context["progress_episode"],
-        "progress_navigation_window": legacy_context["progress_navigation_window"],
-        "incoming_edges": legacy_context["incoming_edges"],
-        "outgoing_edges_on_active_path": legacy_context["outgoing_edges_on_active_path"],
+        "causal_episode": legacy_context.get("causal_episode", {}),
+        "progress_episode": legacy_context.get("progress_episode", {}),
+        "progress_navigation_window": legacy_context.get(
+            "progress_navigation_window", {}
+        ),
+        "incoming_edges": legacy_context.get("incoming_edges", []),
+        "outgoing_edges_on_active_path": legacy_context.get(
+            "outgoing_edges_on_active_path", []
+        ),
         "temporal_adjacency": temporal_adjacency_context(graph, resolved),
         "artifact_hydration": dict(graph.artifact_hydration),
     }
@@ -185,7 +184,33 @@ def build_recursive_judgment_context(
         "truncated_artifact_count": len(truncated_artifacts),
         "legacy_context_manifest": legacy_context["context_manifest"],
     }
-    return sanitize_judge_evidence_payload(graph, context)
+    sanitized = sanitize_judge_evidence_payload(graph, context)
+    manifest = dict(sanitized.get("context_manifest") or {})
+    manifest.update(
+        {
+            "candidate_count": len(sanitized.get("candidate_predecessors") or ()),
+            "downstream_path_length": len(sanitized.get("downstream_path") or ()),
+            "downstream_judgment_count": len(
+                sanitized.get("downstream_judgments") or ()
+            ),
+            "hydrated_candidate_count": sum(
+                1
+                for item in sanitized.get("candidate_predecessors") or ()
+                if isinstance(item, Mapping) and item.get("artifact_hydration")
+            ),
+            "unresolved_reference_count": len(
+                sanitized.get("unresolved_references") or ()
+            ),
+            "missing_artifact_count": len(
+                sanitized.get("missing_artifacts") or ()
+            ),
+            "truncated_artifact_count": len(
+                sanitized.get("truncated_artifacts") or ()
+            ),
+        }
+    )
+    sanitized["context_manifest"] = manifest
+    return sanitized
 
 
 def sanitize_judge_evidence_payload(
@@ -194,34 +219,8 @@ def sanitize_judge_evidence_payload(
     *,
     field_name: str = "",
 ) -> Any:
-    if isinstance(value, Mapping):
-        value = (
-            graph.sanitize_judge_edge_evidence(value)
-            if "from_ref" in value and "to_ref" in value
-            else value
-        )
-        return {
-            str(key): sanitize_judge_evidence_payload(
-                graph,
-                child,
-                field_name=str(key),
-            )
-            for key, child in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        if field_name in EVIDENCE_REF_LIST_FIELDS:
-            return graph.filter_evidence_refs(value)
-        if field_name in {"supporting_evidence", "opposing_evidence"}:
-            return [
-                sanitize_judge_evidence_payload(graph, child)
-                for child in value
-                if not isinstance(child, Mapping)
-                or graph.filter_evidence_refs([child.get("ref")])
-            ]
-        return [
-            sanitize_judge_evidence_payload(graph, child) for child in value
-        ]
-    return value
+    del field_name
+    return graph.sanitize_judge_visible_payload(value)
 
 
 def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[DefectState]:

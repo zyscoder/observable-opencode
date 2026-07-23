@@ -1145,11 +1145,11 @@ class InvestigationToolTest(unittest.TestCase):
                 reason="Bound total episode-neighbor scanning.",
             )
         )
-        self.assertEqual(adjacency.visits, 65)
+        self.assertEqual(adjacency.visits, 0)
         self.assertEqual(result.payload["episodes"], ())
-        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 65)
-        self.assertTrue(result.payload["adjacency_scan"]["scan_truncated"])
-        self.assertTrue(result.truncated)
+        self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 0)
+        self.assertFalse(result.payload["adjacency_scan"]["scan_truncated"])
+        self.assertFalse(result.truncated)
 
     def test_episode_full_output_uses_last_physical_slot_to_probe_downstream(self):
         graph, upstream, downstream = episode_adjacency_graph(64, 1)
@@ -1161,7 +1161,7 @@ class InvestigationToolTest(unittest.TestCase):
                 reason="Use the final physical slot even though output is full.",
             )
         )
-        self.assertEqual((upstream.visits, downstream.visits), (64, 1))
+        self.assertEqual((upstream.visits, downstream.visits), (0, 0))
         self.assertEqual(len(result.payload["episodes"]), 64)
         self.assertTrue(result.truncated)
         self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 65)
@@ -1177,7 +1177,7 @@ class InvestigationToolTest(unittest.TestCase):
                 reason="Distinguish output truncation from complete adjacency scanning.",
             )
         )
-        self.assertEqual((upstream.visits, downstream.visits), (64, 0))
+        self.assertEqual((upstream.visits, downstream.visits), (0, 0))
         self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 64)
         self.assertFalse(result.payload["adjacency_scan"]["scan_truncated"])
         self.assertTrue(result.truncated)
@@ -1192,7 +1192,7 @@ class InvestigationToolTest(unittest.TestCase):
                 reason="Fill the final output slot from downstream adjacency.",
             )
         )
-        self.assertEqual((upstream.visits, downstream.visits), (62, 1))
+        self.assertEqual((upstream.visits, downstream.visits), (0, 0))
         self.assertEqual(len(result.payload["episodes"]), 64)
         self.assertIn("record:down_000", result.resolved_refs)
         self.assertFalse(result.truncated)
@@ -1208,7 +1208,7 @@ class InvestigationToolTest(unittest.TestCase):
                 reason="Stop after upstream physical scan exhaustion.",
             )
         )
-        self.assertEqual((upstream.visits, downstream.visits), (64, 0))
+        self.assertEqual((upstream.visits, downstream.visits), (0, 0))
         self.assertEqual(result.payload["adjacency_scan"]["inspected_count"], 64)
         self.assertTrue(result.payload["adjacency_scan"]["scan_truncated"])
         self.assertTrue(result.truncated)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -36,10 +35,12 @@ REFERENCE_LIST_KEYS = frozenset(
         "delivery_history_episode_refs",
         "downstream_path",
         "evidence_refs",
+        "citation_refs",
         "member_episode_refs",
         "member_refs",
         "opposing_evidence_refs",
         "previous_delivery_candidate_member_refs",
+        "referenced_artifact_ids",
         "recursive_path",
         "resolved_refs",
         "retrieval_candidate_member_refs",
@@ -50,8 +51,10 @@ REFERENCE_LIST_KEYS = frozenset(
 REFERENCE_SCALAR_KEYS = frozenset(
     {
         "anchor_ref",
+        "artifact_id",
         "candidate_ref",
         "canonical_ref",
+        "citation_ref",
         "from_ref",
         "intervention_ref",
         "node_ref",
@@ -65,7 +68,45 @@ REFERENCE_SCALAR_KEYS = frozenset(
     }
 )
 ASSOCIATED_FACT_TOKENS = frozenset(
-    {"artifact", "edge", "evidence", "fact", "reference"}
+    {"artifact", "citation", "edge", "evidence", "fact", "reference"}
+)
+TYPED_MAPPING_KEYS = frozenset(
+    {
+        "artifact_id",
+        "canonical_ref",
+        "citation_ref",
+        "citation_refs",
+        "evidence_refs",
+        "evidence_type",
+        "from_ref",
+        "node_ref",
+        "owner_reference",
+        "provenance_class",
+        "raw_ref",
+        "ref",
+        "resolution_status",
+        "resolved_ref",
+        "source_refs",
+        "to_ref",
+    }
+)
+SEMANTIC_TEXT_KEYS = frozenset(
+    {
+        "actual",
+        "body",
+        "content",
+        "description",
+        "excerpt",
+        "expected",
+        "label",
+        "mechanism",
+        "name",
+        "rationale",
+        "reason",
+        "summary",
+        "text",
+        "title",
+    }
 )
 
 
@@ -86,23 +127,16 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
         }
 
     def is_reference_list(key: str) -> bool:
-        return key in REFERENCE_LIST_KEYS or key.endswith("_refs")
+        return key in REFERENCE_LIST_KEYS
 
     def is_reference_scalar(key: str) -> bool:
-        return key in REFERENCE_SCALAR_KEYS or (
-            key.endswith("_ref") and key not in {"owner_reference"}
-        )
+        return key in REFERENCE_SCALAR_KEYS
 
     def associated_fact(mapping: Mapping[str, Any], parent_key: str) -> bool:
         tokens = key_tokens(parent_key)
         return bool(
             tokens.intersection(ASSOCIATED_FACT_TOKENS)
-            or {
-                "artifact_id",
-                "evidence_type",
-                "provenance_class",
-                "resolution_status",
-            }.intersection(mapping)
+            or TYPED_MAPPING_KEYS.intersection(str(key) for key in mapping)
         )
 
     def resolve_reference(raw_value: Any, key: str) -> Any:
@@ -132,30 +166,77 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
             )
         return omitted
 
-    def verified_embedded_artifact(mapping: Mapping[str, Any]) -> bool:
-        content = mapping.get("content")
-        content_hash = mapping.get("content_hash")
-        if not isinstance(content, str) or not isinstance(content_hash, str):
-            return False
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_hash):
-            return False
-        expected = "sha256:{0}".format(
-            hashlib.sha256(content.encode("utf-8")).hexdigest()
-        )
-        return content_hash == expected
-
-    def invalid_artifact(mapping: Mapping[str, Any]) -> bool:
+    def valid_artifact(mapping: Mapping[str, Any]) -> bool:
         if mapping.get("truncated") is True or mapping.get("missing") is True:
-            return True
+            return False
         artifact_id = mapping.get("artifact_id")
         if artifact_id in (None, ""):
+            return True
+        canonical_id = str(artifact_id).removeprefix("artifact:")
+        if canonical_id not in graph._artifact_index:
             return False
-        if resolve_reference(artifact_id, "artifact_id") is omitted:
-            if not verified_embedded_artifact(mapping):
-                return True
+        verified = graph._artifact_reader.read(canonical_id)
+        if verified.content is None or verified.content_bytes is None:
+            return False
         for key in ("hash_status", "file_hash_status", "slice_hash_status"):
             status = mapping.get(key)
-            if status not in (None, "", "verified", "matched"):
+            if status not in (
+                None,
+                "",
+                "verified",
+                "matched",
+                "not_used",
+            ):
+                return False
+        if "content" not in mapping:
+            return True
+        content = mapping.get("content")
+        if not isinstance(content, str):
+            return False
+        content_bytes = content.encode("utf-8")
+        if content_bytes != verified.content_bytes:
+            return False
+        expected_hash = "sha256:{0}".format(hashlib.sha256(content_bytes).hexdigest())
+        if mapping.get("content_hash") != expected_hash:
+            return False
+        if mapping.get("byte_count") != len(content_bytes):
+            return False
+        if list(mapping.get("byte_range") or ()) != [0, len(content_bytes)]:
+            return False
+        owner = mapping.get("owner_reference")
+        if not isinstance(owner, Mapping):
+            return False
+        owner_raw = owner.get("resolved_ref")
+        owner_resolved = graph.resolve(str(owner_raw or ""))
+        return bool(
+            owner.get("resolution_status") == "resolved"
+            and owner_resolved
+            and owner_resolved in graph.nodes
+            and graph.active_revision_evidence_eligible(owner_resolved)
+        )
+
+    def contains_unknown_graph_reference(
+        mapping: Mapping[str, Any],
+        *,
+        typed: bool,
+    ) -> bool:
+        if not typed:
+            return False
+        for raw_key, child in mapping.items():
+            key = str(raw_key)
+            if (
+                key in REFERENCE_SCALAR_KEYS
+                or key in REFERENCE_LIST_KEYS
+                or key in SEMANTIC_TEXT_KEYS
+                or key in AUDIT_ONLY_KEYS
+                or isinstance(child, (Mapping, list, tuple))
+                or not isinstance(child, str)
+            ):
+                continue
+            candidate = child.strip()
+            if candidate.startswith(("record:", "artifact:")):
+                return True
+            if candidate and graph.resolve(candidate) in graph.nodes:
                 return True
         return False
 
@@ -163,48 +244,60 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
         if isinstance(item, Mapping):
             if parent_key in AUDIT_ONLY_KEYS:
                 return omitted
+            typed = associated_fact(item, parent_key)
             if (
                 "resolution_status" in item
                 and item.get("resolution_status") != "resolved"
             ):
                 return omitted
-            if invalid_artifact(item):
+            if any(
+                item.get(key)
+                for key in (
+                    "integrity_failures",
+                    "missing_artifact_ids",
+                    "truncated_artifact_ids",
+                )
+            ):
                 return omitted
-            embedded_artifact = bool(
-                item.get("artifact_id")
-                and verified_embedded_artifact(item)
-            )
+            if "artifact_id" in item and not valid_artifact(item):
+                return omitted
+            if contains_unknown_graph_reference(item, typed=typed):
+                return omitted
 
             canonical_identities = set()
             invalid_identity = False
             for raw_key, child in item.items():
                 key = str(raw_key)
-                if not is_reference_scalar(key):
-                    continue
-                resolved = (
-                    str(child).removeprefix("artifact:")
-                    if key == "artifact_id" and embedded_artifact
-                    else resolve_reference(child, key)
-                )
-                if resolved is omitted:
-                    invalid_identity = True
-                    continue
-                canonical_identities.add(
-                    "artifact:{0}".format(resolved)
-                    if key == "artifact_id"
-                    else str(resolved)
-                )
+                if is_reference_scalar(key):
+                    resolved = resolve_reference(child, key)
+                    if resolved is omitted:
+                        invalid_identity = True
+                        continue
+                    if key in {"raw_ref", "resolved_ref", "canonical_ref"}:
+                        canonical_identities.add(
+                            "artifact:{0}".format(resolved)
+                            if key == "artifact_id"
+                            else str(resolved)
+                        )
+                elif is_reference_list(key):
+                    if not isinstance(child, (list, tuple)):
+                        invalid_identity = True
+                        continue
+                    scalar_key = (
+                        "artifact_id"
+                        if key in {"artifact_refs", "referenced_artifact_ids"}
+                        else "ref"
+                    )
+                    resolved_items = [
+                        resolve_reference(value, scalar_key) for value in child
+                    ]
+                    if any(value is omitted for value in resolved_items):
+                        invalid_identity = True
             if len(canonical_identities) > 1 and {
                 str(key) for key in item
             }.intersection({"raw_ref", "resolved_ref", "canonical_ref"}):
                 invalid_identity = True
-            if invalid_identity and (
-                associated_fact(item, parent_key)
-                or any(
-                    str(key) in {"ref", "candidate_ref", "node_ref"}
-                    for key in item
-                )
-            ):
+            if invalid_identity and typed:
                 return omitted
 
             output = {}
@@ -213,11 +306,9 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
                 if key in AUDIT_ONLY_KEYS:
                     continue
                 if is_reference_scalar(key):
-                    cleaned = (
-                        str(child).removeprefix("artifact:")
-                        if key == "artifact_id" and embedded_artifact
-                        else resolve_reference(child, key)
-                    )
+                    cleaned = resolve_reference(child, key)
+                elif is_reference_list(key):
+                    cleaned = sanitize(child, key)
                 else:
                     cleaned = sanitize(child, key)
                 if cleaned is not omitted:
@@ -230,12 +321,14 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
                 seen = set()
                 scalar_key = (
                     "artifact_id"
-                    if parent_key.endswith("artifact_ids")
+                    if parent_key in {"artifact_refs", "referenced_artifact_ids"}
                     else "ref"
                 )
                 for child in item:
                     cleaned = resolve_reference(child, scalar_key)
-                    if cleaned is omitted or cleaned in seen:
+                    if cleaned is omitted:
+                        return omitted
+                    if cleaned in seen:
                         continue
                     seen.add(cleaned)
                     output.append(cleaned)
@@ -264,42 +357,7 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
     return {} if result is omitted else result
 
 
-def strip_audit_only_payload(value: Any) -> Any:
-    """Remove persisted audit diagnostics from an already graph-sanitized value."""
-    omitted = object()
-
-    def strip(item: Any) -> Any:
-        if isinstance(item, Mapping):
-            if (
-                item.get("resolution_status") not in (None, "", "resolved")
-                or item.get("missing") is True
-                or item.get("truncated") is True
-            ):
-                return omitted
-            output = {}
-            for raw_key, child in item.items():
-                key = str(raw_key)
-                if key in AUDIT_ONLY_KEYS:
-                    continue
-                cleaned = strip(child)
-                if cleaned is not omitted:
-                    output[key] = cleaned
-            return output
-        if isinstance(item, (list, tuple)):
-            output = []
-            for child in item:
-                cleaned = strip(child)
-                if cleaned is not omitted:
-                    output.append(cleaned)
-            return output
-        return item
-
-    result = strip(value)
-    return {} if result is omitted else result
-
-
 __all__ = [
     "AUDIT_ONLY_KEYS",
     "sanitize_judge_visible_payload",
-    "strip_audit_only_payload",
 ]

@@ -11,6 +11,7 @@ from trace_attribution.causal_state import (
     DefectState,
     FrontierItem,
     HypothesisEvidence,
+    LocalStateOwner,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RejectedCandidate,
@@ -841,6 +842,22 @@ class CausalStateTest(unittest.TestCase):
             score=0.9,
             evidence_refs=["record:change"],
         )
+        evidence = HypothesisEvidence(
+            "record:decision", "The plan declared completion.", 0.8
+        )
+        hypothesis = AttributionHypothesis.create(
+            "Agent prematurely narrowed implementation.", node.ref, defect_state
+        )
+        hypothesis = hypothesis.with_updates(
+            supporting_evidence=[evidence],
+            unresolved_questions=["Were call sites searched?"],
+        )
+        visit_key = semantic_visit_key(
+            "record:change", defect_state, hypothesis.semantic_hash
+        )
+        seed_binding = seed_binding_identity_for(
+            "record:observed", defect_state.fingerprint
+        )
         assessment = PredecessorAssessment(
             ref=node.ref,
             relation="defect_transformation",
@@ -853,6 +870,12 @@ class CausalStateTest(unittest.TestCase):
                 transformation_reason="the plan controlled authored methods",
             ),
             evidence_refs=["record:change"],
+            owner=LocalStateOwner.create(
+                seed_binding_identity=seed_binding,
+                hypothesis_id=hypothesis.hypothesis_id,
+                visit_key=visit_key,
+                occurrence_key="round_trip_predecessor",
+            ),
         )
         judgment = CausalStepJudgment(
             current_node_ref="record:change",
@@ -860,14 +883,12 @@ class CausalStateTest(unittest.TestCase):
             current_defect_reason="The change omits the method.",
             predecessors=[assessment],
             confidence=0.9,
-        )
-        evidence = HypothesisEvidence("record:decision", "The plan declared completion.", 0.8)
-        hypothesis = AttributionHypothesis.create(
-            "Agent prematurely narrowed implementation.", node.ref, defect_state
-        )
-        hypothesis = hypothesis.with_updates(
-            supporting_evidence=[evidence],
-            unresolved_questions=["Were call sites searched?"],
+            owner=LocalStateOwner.create(
+                seed_binding_identity=seed_binding,
+                hypothesis_id=hypothesis.hypothesis_id,
+                visit_key=visit_key,
+                occurrence_key="round_trip_step",
+            ),
         )
         root_path = (node.ref, "record:change", "record:observed")
         confirmation = replace(
@@ -1000,6 +1021,23 @@ class CausalStateTest(unittest.TestCase):
             rejected_candidates=[rejected],
             taint_paths=[["record:observed", "record:change", node.ref]],
             visited_order=["record:observed", "record:change", node.ref],
+            visited_entries=[
+                {
+                    "node_ref": ref,
+                    "owner": LocalStateOwner.create(
+                        seed_binding_identity=seed_binding_identity_for(
+                            ref if ref in {"record:observed", node.ref} else "record:observed",
+                            defect_state.fingerprint,
+                        ),
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        visit_key=semantic_visit_key(
+                            ref, defect_state, hypothesis.semantic_hash
+                        ),
+                        occurrence_key="round_trip_visit:{0}".format(ref),
+                    ).to_dict(),
+                }
+                for ref in ("record:observed", "record:change", node.ref)
+            ],
             unresolved_refs=["record:prompt"],
             metadata={"offline_only": True},
         )

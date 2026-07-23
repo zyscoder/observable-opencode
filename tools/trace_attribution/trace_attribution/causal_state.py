@@ -50,24 +50,26 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v6"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v7"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v5"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-    "+evidence-policy/v2"
+    "+evidence-policy/v2+local-state-owner/v1"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v5"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2"
+    "+local-state-owner/v1"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_SCHEMA_VERSION = "semantic-occurrence/v1"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
+LOCAL_STATE_OCCURRENCE_PREFIX = "local_state_occurrence:v1:"
 
 _ANCHOR_VOLATILE_KEYS = frozenset(
     {
@@ -347,6 +349,84 @@ def _finite_float(value: Any, field_name: str, *, unit_interval: bool = False) -
     if unit_interval and not 0.0 <= result <= 1.0:
         raise ValueError("{0} must be between 0 and 1".format(field_name))
     return result
+
+
+@dataclass(frozen=True)
+class LocalStateOwner:
+    seed_binding_identity: str
+    hypothesis_id: str
+    visit_key: str
+    occurrence_identity: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "seed_binding_identity",
+            "hypothesis_id",
+            "visit_key",
+            "occurrence_identity",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("local state owner {0} is required".format(name))
+        if not re.fullmatch(
+            r"{0}[0-9a-f]{{64}}".format(re.escape(LOCAL_STATE_OCCURRENCE_PREFIX)),
+            self.occurrence_identity,
+        ):
+            raise ValueError("local state owner occurrence_identity is invalid")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        seed_binding_identity: str,
+        hypothesis_id: str,
+        visit_key: str,
+        occurrence_key: str,
+    ) -> "LocalStateOwner":
+        semantic = {
+            "seed_binding_identity": str(seed_binding_identity),
+            "hypothesis_id": str(hypothesis_id),
+            "visit_key": str(visit_key),
+            "occurrence_key": str(occurrence_key),
+        }
+        return cls(
+            seed_binding_identity=semantic["seed_binding_identity"],
+            hypothesis_id=semantic["hypothesis_id"],
+            visit_key=semantic["visit_key"],
+            occurrence_identity="{0}{1}".format(
+                LOCAL_STATE_OCCURRENCE_PREFIX,
+                hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest(),
+            ),
+        )
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "seed_binding_identity": self.seed_binding_identity,
+            "hypothesis_id": self.hypothesis_id,
+            "visit_key": self.visit_key,
+            "occurrence_identity": self.occurrence_identity,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "LocalStateOwner":
+        if not isinstance(value, Mapping):
+            raise ValueError("local state owner must be an object")
+        required = {
+            "seed_binding_identity",
+            "hypothesis_id",
+            "visit_key",
+            "occurrence_identity",
+        }
+        if set(value) != required:
+            raise ValueError("local state owner schema mismatch")
+        if any(not isinstance(value[field], str) for field in required):
+            raise ValueError("local state owner fields must be strings")
+        return cls(
+            seed_binding_identity=value["seed_binding_identity"],
+            hypothesis_id=value["hypothesis_id"],
+            visit_key=value["visit_key"],
+            occurrence_identity=value["occurrence_identity"],
+        )
 
 
 def _confidence(value: Any) -> float:
@@ -938,6 +1018,7 @@ class PredecessorAssessment:
     upstream_defect: Optional[DefectState] = None
     evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
+    owner: Optional[LocalStateOwner] = None
 
     def __post_init__(self) -> None:
         if self.relation not in CAUSAL_RELATIONS:
@@ -945,9 +1026,11 @@ class PredecessorAssessment:
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "evidence_refs", _frozen_strings(self.evidence_refs))
         object.__setattr__(self, "missing_evidence", _frozen_strings(self.missing_evidence))
+        if self.owner is not None and not isinstance(self.owner, LocalStateOwner):
+            raise TypeError("predecessor assessment owner must be LocalStateOwner")
 
     def to_dict(self) -> JsonDict:
-        return {
+        value = {
             "ref": self.ref,
             "relation": self.relation,
             "reason": self.reason,
@@ -957,6 +1040,9 @@ class PredecessorAssessment:
             "evidence_refs": list(self.evidence_refs),
             "missing_evidence": list(self.missing_evidence),
         }
+        if self.owner is not None:
+            value["owner"] = self.owner.to_dict()
+        return value
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "PredecessorAssessment":
@@ -970,6 +1056,11 @@ class PredecessorAssessment:
             upstream_defect=DefectState.from_dict(upstream) if isinstance(upstream, dict) else None,
             evidence_refs=_string_list(value.get("evidence_refs")),
             missing_evidence=_string_list(value.get("missing_evidence")),
+            owner=(
+                LocalStateOwner.from_dict(value.get("owner"))
+                if value.get("owner") is not None
+                else None
+            ),
         )
 
 
@@ -984,6 +1075,7 @@ class CausalStepJudgment:
     suggested_investigation: Optional[JsonDict] = None
     unselected_predecessor_refs: Tuple[str, ...] = field(default_factory=tuple)
     confidence: float = 0.0
+    owner: Optional[LocalStateOwner] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "confidence", _confidence(self.confidence))
@@ -998,9 +1090,11 @@ class CausalStepJudgment:
             object.__setattr__(
                 self, "suggested_investigation", FrozenMapping(_thaw(self.suggested_investigation))
             )
+        if self.owner is not None and not isinstance(self.owner, LocalStateOwner):
+            raise TypeError("causal step judgment owner must be LocalStateOwner")
 
     def to_dict(self) -> JsonDict:
-        return {
+        value = {
             "current_node_ref": self.current_node_ref,
             "current_defect_status": self.current_defect_status,
             "current_defect_reason": self.current_defect_reason,
@@ -1013,6 +1107,9 @@ class CausalStepJudgment:
             "unselected_predecessor_refs": list(self.unselected_predecessor_refs),
             "confidence": self.confidence,
         }
+        if self.owner is not None:
+            value["owner"] = self.owner.to_dict()
+        return value
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "CausalStepJudgment":
@@ -1033,6 +1130,11 @@ class CausalStepJudgment:
                 value.get("unselected_predecessor_refs")
             ),
             confidence=_confidence(value.get("confidence", 0.0)),
+            owner=(
+                LocalStateOwner.from_dict(value.get("owner"))
+                if value.get("owner") is not None
+                else None
+            ),
         )
 
 
@@ -1798,6 +1900,7 @@ class SeedAttributionResult:
     confirmation_identities: Tuple[str, ...] = field(default_factory=tuple)
     confirmed_root_refs: Tuple[str, ...] = field(default_factory=tuple)
     decisive_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
+    decisive_evidence: Tuple[JsonDict, ...] = field(default_factory=tuple)
     missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
     blocking_reasons: Tuple[str, ...] = field(default_factory=tuple)
     global_judgment: JsonDict = field(default_factory=FrozenMapping)
@@ -1843,6 +1946,11 @@ class SeedAttributionResult:
             "expansion_history",
             tuple(FrozenMapping(_thaw(item)) for item in self.expansion_history),
         )
+        object.__setattr__(
+            self,
+            "decisive_evidence",
+            tuple(FrozenMapping(_thaw(item)) for item in self.decisive_evidence),
+        )
         validate_seed_outcome_payload(
             outcome=self.outcome,
             confirmed_root_refs=self.confirmed_root_refs,
@@ -1850,10 +1958,15 @@ class SeedAttributionResult:
             blocking_reasons=self.blocking_reasons,
         )
 
+    @property
+    def seed_binding_identity(self) -> str:
+        return seed_binding_identity_for(self.start_ref, self.defect_fingerprint)
+
     def to_dict(self) -> JsonDict:
         return {
             "start_ref": self.start_ref,
             "defect_fingerprint": self.defect_fingerprint,
+            "seed_binding_identity": self.seed_binding_identity,
             "defect_state": self.defect_state.to_dict(),
             "outcome": self.outcome,
             "candidate_refs": list(self.candidate_refs),
@@ -1861,6 +1974,7 @@ class SeedAttributionResult:
             "confirmation_identities": list(self.confirmation_identities),
             "confirmed_root_refs": list(self.confirmed_root_refs),
             "decisive_evidence_refs": list(self.decisive_evidence_refs),
+            "decisive_evidence": [_thaw(item) for item in self.decisive_evidence],
             "missing_evidence": list(self.missing_evidence),
             "blocking_reasons": list(self.blocking_reasons),
             "global_judgment": _thaw(self.global_judgment),
@@ -1874,6 +1988,32 @@ class SeedAttributionResult:
         candidate_refs = _string_list(value.get("candidate_refs"))
         selected_candidate_refs = _string_list(value.get("selected_candidate_refs"))
         decisive_evidence_refs = _string_list(value.get("decisive_evidence_refs"))
+        expected_seed_binding = seed_binding_identity_for(
+            str(value.get("start_ref") or ""),
+            str(value.get("defect_fingerprint") or ""),
+        )
+        if value.get("seed_binding_identity") != expected_seed_binding:
+            raise ValueError("persisted seed binding identity is missing or inconsistent")
+        decisive_evidence = []
+        for item in value.get("decisive_evidence") or ():
+            if not isinstance(item, Mapping) or set(item) != {"ref", "owner"}:
+                raise ValueError("persisted decisive evidence owner schema mismatch")
+            owner = LocalStateOwner.from_dict(item.get("owner"))
+            if owner.seed_binding_identity != expected_seed_binding:
+                raise ValueError("persisted decisive evidence has the wrong seed owner")
+            decisive_evidence.append(
+                {"ref": str(item.get("ref") or ""), "owner": owner.to_dict()}
+            )
+        if {
+            str(item.get("ref") or "") for item in decisive_evidence
+        } != set(decisive_evidence_refs):
+            raise ValueError("persisted decisive evidence aggregate is inconsistent")
+        for item in value.get("expansion_history") or ():
+            if not isinstance(item, Mapping):
+                raise ValueError("persisted expansion history must contain objects")
+            owner = LocalStateOwner.from_dict(item.get("owner"))
+            if owner.seed_binding_identity != expected_seed_binding:
+                raise ValueError("persisted expansion history has the wrong seed owner")
         _validate_persisted_global_judgment(
             global_judgment,
             start_ref=str(value.get("start_ref") or ""),
@@ -1881,6 +2021,7 @@ class SeedAttributionResult:
             candidate_refs=candidate_refs,
             selected_candidate_refs=selected_candidate_refs,
             decisive_evidence_refs=decisive_evidence_refs,
+            seed_binding_identity=expected_seed_binding,
         )
         return cls(
             start_ref=str(value.get("start_ref") or ""),
@@ -1892,6 +2033,7 @@ class SeedAttributionResult:
             confirmation_identities=_string_list(value.get("confirmation_identities")),
             confirmed_root_refs=_string_list(value.get("confirmed_root_refs")),
             decisive_evidence_refs=decisive_evidence_refs,
+            decisive_evidence=tuple(decisive_evidence),
             missing_evidence=_seed_json_string_list(
                 value.get("missing_evidence"), "missing_evidence"
             ),
@@ -1915,6 +2057,7 @@ def _validate_persisted_global_judgment(
     candidate_refs: Iterable[str],
     selected_candidate_refs: Iterable[str],
     decisive_evidence_refs: Iterable[str],
+    seed_binding_identity: str,
 ) -> None:
     if not value:
         return
@@ -1934,9 +2077,13 @@ def _validate_persisted_global_judgment(
         "confidence",
         "active_focus_binding",
         "validation_envelope",
+        "owner",
     }
     if set(value) != required:
         raise ValueError("persisted global judgment v4 schema is incomplete")
+    owner = LocalStateOwner.from_dict(value.get("owner"))
+    if owner.seed_binding_identity != seed_binding_identity:
+        raise ValueError("persisted global judgment has the wrong seed owner")
     from .global_judge import (
         global_candidate_request_from_validation_envelope,
         validate_global_candidate_payload,
@@ -1952,7 +2099,7 @@ def _validate_persisted_global_judgment(
             {
                 key: copy.deepcopy(item)
                 for key, item in value.items()
-                if key not in {"schema_version", "validation_envelope"}
+                if key not in {"schema_version", "validation_envelope", "owner"}
             },
             request=request,
         )
@@ -2112,6 +2259,7 @@ class RecursiveAttributionReport:
     unresolved_hypotheses: Tuple[AttributionHypothesis, ...] = field(default_factory=tuple)
     taint_paths: Tuple[Tuple[str, ...], ...] = field(default_factory=tuple)
     visited_order: Tuple[str, ...] = field(default_factory=tuple)
+    visited_entries: Tuple[JsonDict, ...] = field(default_factory=tuple)
     unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
     investigation_journal: Tuple[JsonDict, ...] = field(default_factory=tuple)
     metadata: JsonDict = field(default_factory=FrozenMapping)
@@ -2166,6 +2314,40 @@ class RecursiveAttributionReport:
             )
         object.__setattr__(self, "taint_paths", tuple(_frozen_strings(path) for path in self.taint_paths))
         object.__setattr__(self, "visited_order", _frozen_strings(self.visited_order))
+        visited_entries = []
+        seen_occurrences = set()
+        for item in self.visited_entries:
+            if not isinstance(item, Mapping) or set(item) != {"node_ref", "owner"}:
+                raise ValueError("visited entry schema mismatch")
+            owner = LocalStateOwner.from_dict(item.get("owner"))
+            if owner.occurrence_identity in seen_occurrences:
+                raise ValueError("duplicate visited entry occurrence identity")
+            seen_occurrences.add(owner.occurrence_identity)
+            visited_entries.append(
+                FrozenMapping(
+                    {
+                        "node_ref": str(item.get("node_ref") or ""),
+                        "owner": owner.to_dict(),
+                    }
+                )
+            )
+        object.__setattr__(self, "visited_entries", tuple(visited_entries))
+        if visited_entries:
+            derived_visited_order = _frozen_strings(
+                tuple(
+                    dict.fromkeys(
+                        str(item["node_ref"]) for item in visited_entries
+                    )
+                )
+            )
+            if self.visited_order and self.visited_order != derived_visited_order:
+                raise ValueError(
+                    "visited_order does not match owned visited entries: "
+                    "{0!r} != {1!r}".format(
+                        self.visited_order, derived_visited_order
+                    )
+                )
+            object.__setattr__(self, "visited_order", derived_visited_order)
         object.__setattr__(self, "unresolved_refs", _frozen_strings(self.unresolved_refs))
         object.__setattr__(
             self,
@@ -2575,6 +2757,7 @@ class RecursiveAttributionReport:
             "root_causes": legacy_root_causes,
             "taint_paths": [list(path) for path in self.taint_paths],
             "visited_order": list(self.visited_order),
+            "visited_entries": [_thaw(item) for item in self.visited_entries],
             "unresolved_refs": list(self.unresolved_refs),
             "investigation_journal": [_thaw(item) for item in self.investigation_journal],
             "metadata": _thaw(self.metadata),
@@ -2636,14 +2819,26 @@ class RecursiveAttributionReport:
             )
         start_refs = _string_list(value.get("start_refs"))
         defect_states = items("defect_states", DefectState.from_dict)
-        seed_results = items(
-            "seed_results",
-            SeedAttributionResult.from_dict,
-            strict_objects=schema_version != PREVIOUS_REPORT_SCHEMA_VERSION,
+        seed_results = (
+            items(
+                "seed_results",
+                SeedAttributionResult.from_dict,
+                strict_objects=True,
+            )
+            if schema_version == MODERN_REPORT_SCHEMA_VERSION
+            else []
         )
         metadata = _json_dict(value.get("metadata"))
         unresolved_refs = _string_list(value.get("unresolved_refs"))
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
+            from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
+
+            source_evidence_policy_identity = (
+                "legacy-report-evidence-policy/unversioned"
+            )
+            target_evidence_policy_identity = (
+                EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
+            )
             migrated_confirmations = items(
                 "confirmations", RootConfirmation.from_dict
             )
@@ -2663,7 +2858,9 @@ class RecursiveAttributionReport:
                     defect_fingerprint=state.fingerprint,
                     defect_state=state,
                     outcome="inconclusive",
-                    blocking_reasons=("v2_seed_binding_unavailable",),
+                    blocking_reasons=(
+                        "evidence_policy_migration_required",
+                    ),
                 )
                 for start_ref, state in zip(start_refs, migrated_states)
             ]
@@ -2676,6 +2873,13 @@ class RecursiveAttributionReport:
                     "report_migration": {
                         "source_schema": PREVIOUS_REPORT_SCHEMA_VERSION,
                         "status": "per_seed_attribution_inconclusive",
+                        "source_evidence_policy_identity": (
+                            source_evidence_policy_identity
+                        ),
+                        "target_evidence_policy_identity": (
+                            target_evidence_policy_identity
+                        ),
+                        "blocking_reason": "evidence_policy_migration_required",
                         "unpublished_confirmed_roots": [
                             root.to_dict() for root in (*confirmed_roots, *co_roots)
                         ],
@@ -2693,7 +2897,13 @@ class RecursiveAttributionReport:
                     "confirmation_identity": RootConfirmation.from_dict(
                         dict(root.confirmation)
                     ).confirmation_identity,
-                    "reason": "v2_seed_binding_unavailable",
+                    "reason": "evidence_policy_migration_required",
+                    "source_evidence_policy_identity": (
+                        source_evidence_policy_identity
+                    ),
+                    "target_evidence_policy_identity": (
+                        target_evidence_policy_identity
+                    ),
                 }
                 for root in (*confirmed_roots, *co_roots)
             )
@@ -2708,7 +2918,100 @@ class RecursiveAttributionReport:
             )
             confirmed_roots = []
             co_roots = []
-            value = {**value, "confirmations": []}
+            for key in (
+                "causal_candidates",
+                "causal_relations",
+                "step_judgments",
+                "hypotheses",
+                "introduction_candidates",
+                "confirmations",
+                "contributing_conditions",
+                "amplifying_factors",
+                "rejected_candidates",
+                "unresolved_hypotheses",
+                "taint_paths",
+                "visited_order",
+                "visited_entries",
+                "investigation_journal",
+            ):
+                value = {**value, key: []}
+            for key in (
+                "confirmation_queue",
+                "confirmation_journal",
+                "global_candidate_judgments",
+                "candidate_compression",
+                "recursive_expansion_reasons",
+            ):
+                metadata[key] = []
+            metadata["global_candidate_pass_count"] = 0
+            metadata["global_judge_physical_request_count"] = 0
+        causal_relations = (
+            items("causal_relations", PredecessorAssessment.from_dict)
+            if schema_version == MODERN_REPORT_SCHEMA_VERSION
+            else []
+        )
+        step_judgments = (
+            items("step_judgments", CausalStepJudgment.from_dict)
+            if schema_version == MODERN_REPORT_SCHEMA_VERSION
+            else []
+        )
+        visited_entries = (
+            [
+                dict(item)
+                for item in value.get("visited_entries") or ()
+                if isinstance(item, Mapping)
+            ]
+            if schema_version == MODERN_REPORT_SCHEMA_VERSION
+            else []
+        )
+        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            if any(item.owner is None for item in causal_relations):
+                raise ValueError("modern report causal relation is ownerless")
+            if any(
+                item.owner is None
+                or any(predecessor.owner is None for predecessor in item.predecessors)
+                for item in step_judgments
+            ):
+                raise ValueError("modern report causal step judgment is ownerless")
+            if len(visited_entries) != len(value.get("visited_entries") or ()):
+                raise ValueError("modern report visited entries are malformed")
+            if value.get("visited_order") and not visited_entries:
+                raise ValueError("modern report visited state is ownerless")
+            valid_seed_bindings = {
+                seed_binding_identity_for(
+                    str(item.get("start_ref") or ""),
+                    str(item.get("defect_fingerprint") or ""),
+                )
+                for item in value.get("seed_results") or ()
+                if isinstance(item, Mapping)
+            }
+
+            def require_owned_items(items_value: Any, label: str) -> None:
+                for item in items_value or ():
+                    if not isinstance(item, Mapping):
+                        raise ValueError("{0} must contain objects".format(label))
+                    owner = LocalStateOwner.from_dict(item.get("owner"))
+                    if owner.seed_binding_identity not in valid_seed_bindings:
+                        raise ValueError("{0} has no active seed owner".format(label))
+
+            require_owned_items(
+                [
+                    item
+                    for item in value.get("investigation_journal") or ()
+                    if isinstance(item, Mapping)
+                    and item.get("kind") == "global_candidate_pass"
+                    and item.get("seed_ref")
+                ],
+                "global pass journal",
+            )
+            for key in (
+                "confirmation_queue",
+                "confirmation_journal",
+                "global_candidate_judgments",
+                "candidate_compression",
+                "recursive_expansion_reasons",
+            ):
+                require_owned_items(metadata.get(key), "report metadata {0}".format(key))
         return cls(
             case_id=str(value.get("case_id") or ""),
             objective=str(value.get("objective") or ""),
@@ -2719,8 +3022,8 @@ class RecursiveAttributionReport:
             analysis_perspective=str(value.get("analysis_perspective") or ""),
             defect_states=defect_states,
             causal_candidates=items("causal_candidates", CausalCandidate.from_dict),
-            causal_relations=items("causal_relations", PredecessorAssessment.from_dict),
-            step_judgments=items("step_judgments", CausalStepJudgment.from_dict),
+            causal_relations=causal_relations,
+            step_judgments=step_judgments,
             hypotheses=items("hypotheses", AttributionHypothesis.from_dict),
             introduction_candidates=items("introduction_candidates", CausalCandidate.from_dict),
             confirmations=items("confirmations", RootConfirmation.from_dict),
@@ -2732,6 +3035,7 @@ class RecursiveAttributionReport:
             unresolved_hypotheses=items("unresolved_hypotheses", AttributionHypothesis.from_dict),
             taint_paths=[_string_list(path) for path in value.get("taint_paths", []) if isinstance(path, list)],
             visited_order=_string_list(value.get("visited_order")),
+            visited_entries=visited_entries,
             unresolved_refs=unresolved_refs,
             investigation_journal=tuple(
                 item
@@ -2752,6 +3056,7 @@ __all__ = [
     "DefectState",
     "FrontierItem",
     "HypothesisEvidence",
+    "LocalStateOwner",
     "PredecessorAssessment",
     "RecursiveAttributionReport",
     "RejectedCandidate",
