@@ -34,7 +34,7 @@ from trace_attribution.errors import (
     TransportCallError,
     TransportCallResult,
 )
-from trace_attribution.models import NodeJudgment, TraceNode
+from trace_attribution.models import NodeJudgment, TraceNode, stable_json
 
 
 def sample_step_request(*, context_marker: str = "initial") -> CausalStepRequest:
@@ -239,21 +239,46 @@ def strict_manifest(content: str, *, owner_ref: str = "record:decision", start: 
     encoded = content.encode("utf-8")
     if end is None:
         end = len(encoded)
+    artifact_ref = "artifact:decision-payload"
+    owner_reference = reference_envelope(owner_ref)
+    content_hash = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    byte_range = [start, end]
+    owner_binding_identity = "artifact_owner:v1:{0}".format(
+        hashlib.sha256(
+            stable_json(
+                {
+                    "artifact_id": "decision-payload",
+                    "canonical_ref": artifact_ref,
+                    "content_hash": content_hash,
+                    "byte_range": byte_range,
+                    "owner_reference": owner_reference,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return {
         "node_ref": owner_ref,
         "referenced_artifact_ids": ["decision-payload"],
         "hydrated_artifacts": [{
             "artifact_id": "decision-payload",
+            "raw_ref": artifact_ref,
+            "resolved_ref": artifact_ref,
+            "canonical_ref": artifact_ref,
+            "resolution_status": "resolved",
+            "provenance_class": "recorded",
             "content": content,
-            "content_hash": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+            "content_hash": content_hash,
             "byte_count": len(encoded),
-            "byte_range": [start, end],
-            "owner_reference": reference_envelope(owner_ref),
+            "byte_range": byte_range,
+            "owner_reference": owner_reference,
+            "owner_binding_identity": owner_binding_identity,
             "missing": False,
             "truncated": False,
+            "fact_kind": "artifact_hydration",
         }],
         "missing_artifact_ids": [],
         "truncated_artifact_ids": [],
+        "ineligible_artifact_evidence": [],
     }
 
 

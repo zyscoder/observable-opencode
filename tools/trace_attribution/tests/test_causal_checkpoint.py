@@ -949,7 +949,7 @@ class CausalCheckpointTest(unittest.TestCase):
 
         self.assertEqual(
             config["evidence_eligibility_policy"],
-            "graph-external-evidence-eligibility/v4",
+            "graph-external-evidence-eligibility/v5",
         )
         semantic = {
             key: value for key, value in config.items() if key != "config_fingerprint"
@@ -1219,17 +1219,18 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-            "+evidence-policy/v4+local-state-owner/v1"
-            "+global-pass-identity/v1+failure-action/v1",
+            "global-candidate-judgment/v6+validation-envelope/v6+capsule/v7"
+            "+evidence-policy/v5+local-state-owner/v1"
+            "+global-pass-identity/v1+failure-action/v1"
+            "+failure-projection/v2",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v10+resolution/v2+evidence-policy/v4"
+            "recursive-root-confirmation/v11+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+local-state-owner/v1+action-projection/v1"
-            "+step-action-projection/v1",
+            "+step-action-projection/v1+confirmation-request-identity/v1",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v8")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v9")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()

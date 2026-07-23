@@ -48,6 +48,7 @@ from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
     _assert_report_grounded_evidence,
+    _confirmation_request_identity,
     _grounded_downstream_path,
 )
 
@@ -4471,9 +4472,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "hypothesis_id": "hypothesis:{0}".format(ref),
                     "defect_fingerprint": "defect:{0}".format(ref),
                     "seed_binding_identity": seed,
-                    "semantic_identity": "revision-filter:{0}:{1}".format(
-                        seed, ref
+                    "semantic_identity": _confirmation_request_identity(
+                        hypothesis_id="hypothesis:{0}".format(ref),
+                        candidate_ref=ref,
+                        defect_fingerprint="defect:{0}".format(ref),
+                        seed_binding_identity=seed,
                     ),
+                    "status": "queued",
                     "owner": LocalStateOwner.create(
                         seed_binding_identity=seed,
                         hypothesis_id="hypothesis:{0}".format(ref),
@@ -4530,7 +4535,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "candidate_ref": ref,
                         "defect_fingerprint": "defect-fingerprint",
                         "seed_binding_identity": "seed-binding",
-                        "semantic_identity": "queue-bound:{0}".format(index),
+                        "semantic_identity": _confirmation_request_identity(
+                            hypothesis_id="hyp:{0}".format(index),
+                            candidate_ref=ref,
+                            defect_fingerprint="defect-fingerprint",
+                            seed_binding_identity="seed-binding",
+                        ),
                         "status": "queued",
                         "owner": LocalStateOwner.create(
                             seed_binding_identity="seed-binding",

@@ -50,22 +50,22 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v9"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v10"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v5"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v6"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-    "+evidence-policy/v4+local-state-owner/v1+global-pass-identity/v1"
-    "+failure-action/v1"
+    "global-candidate-judgment/v6+validation-envelope/v6+capsule/v7"
+    "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
+    "+failure-action/v1+failure-projection/v2"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v5"
+    "global-candidate-validation-envelope/v6"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v10+resolution/v2+evidence-policy/v4"
+    "recursive-root-confirmation/v11+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+local-state-owner/v1+action-projection/v1"
-    "+step-action-projection/v1"
+    "+step-action-projection/v1+confirmation-request-identity/v1"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -1985,6 +1985,26 @@ class SeedAttributionResult:
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "SeedAttributionResult":
+        for field_name in (
+            "candidate_refs",
+            "selected_candidate_refs",
+            "confirmation_identities",
+            "confirmed_root_refs",
+            "decisive_evidence_refs",
+            "missing_evidence",
+            "blocking_reasons",
+        ):
+            raw_items = value.get(field_name)
+            if (
+                isinstance(raw_items, (list, tuple))
+                and all(isinstance(item, str) for item in raw_items)
+                and len(raw_items) != len(set(raw_items))
+            ):
+                raise ValueError(
+                    "persisted seed attribution {0} contains duplicates".format(
+                        field_name
+                    )
+                )
         defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
         global_judgment = _json_dict(value.get("global_judgment"))
         candidate_refs = _string_list(value.get("candidate_refs"))

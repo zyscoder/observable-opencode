@@ -102,7 +102,8 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v6"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v7"
+GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v2"
 CONFIRMATION_ACTION_OPERATIONS = frozenset(
     {"confirmation_completed", "confirmation_failed"}
 )
@@ -127,6 +128,31 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
         "physical_request_delta",
         "physical_request_exact",
         "confirmation",
+    }
+)
+PENDING_CONFIRMATION_REQUIRED_KEYS = frozenset(
+    {
+        "hypothesis_id",
+        "candidate_ref",
+        "defect_fingerprint",
+        "seed_binding_identity",
+        "semantic_identity",
+        "status",
+        "owner",
+    }
+)
+PENDING_CONFIRMATION_ALLOWED_KEYS = frozenset(
+    {
+        *PENDING_CONFIRMATION_REQUIRED_KEYS,
+        "hypothesis_semantic_hash",
+        "seed_key",
+        "requested_by_ref",
+        "recursive_path",
+        "checked_evidence_refs",
+        "task_obligations",
+        "analysis_perspective",
+        "origin",
+        "artifact_evidence_envelopes",
     }
 )
 STEP_ACTION_PROJECTION_SCHEMA = "step-action-projection/v1"
@@ -1053,6 +1079,43 @@ def _confirmation_request_identity(
     ).hexdigest()
 
 
+def _validate_pending_confirmation_identity(
+    value: Mapping[str, Any],
+) -> Tuple[str, str, str, str]:
+    actual_keys = {str(key) for key in value}
+    missing = PENDING_CONFIRMATION_REQUIRED_KEYS - actual_keys
+    extra = actual_keys - PENDING_CONFIRMATION_ALLOWED_KEYS
+    if missing or extra or value.get("status") != "queued":
+        raise ValueError(
+            "pending confirmation identity schema mismatch "
+            "(missing={0}, extra={1})".format(
+                sorted(missing),
+                sorted(extra),
+            )
+        )
+    queue_key = (
+        str(value.get("hypothesis_id") or ""),
+        str(value.get("candidate_ref") or ""),
+        str(value.get("defect_fingerprint") or ""),
+        str(value.get("seed_binding_identity") or ""),
+    )
+    if not all(queue_key):
+        raise ValueError(
+            "pending confirmation requires complete request identity fields"
+        )
+    expected = _confirmation_request_identity(
+        hypothesis_id=queue_key[0],
+        candidate_ref=queue_key[1],
+        defect_fingerprint=queue_key[2],
+        seed_binding_identity=queue_key[3],
+    )
+    if str(value.get("semantic_identity") or "") != expected:
+        raise ValueError(
+            "pending confirmation semantic identity is not canonical"
+        )
+    return queue_key
+
+
 def _confirmation_action_projection(
     *,
     operation: str,
@@ -1231,6 +1294,8 @@ def _global_passes_by_owner(
             raise ValueError(
                 "global pass action identity contradicts its seed binding"
             )
+        if action.get("status") == "failed":
+            _global_failure_projection_from_action(action)
         if key in output:
             raise ValueError(
                 "global pass actions contain a duplicate per-seed identity"
@@ -1280,20 +1345,7 @@ def _validate_global_pass_derivations(
         if isinstance(expansion, Mapping)
     ]
     expected_failures = [
-        {
-            key: copy.deepcopy(action.get(key))
-            for key in (
-                "pass_identity",
-                "seed_binding_identity",
-                "seed_ref",
-                "defect_fingerprint",
-                "owner",
-                "blocker",
-                "reason",
-                "missing_evidence",
-                "physical_request_delta",
-            )
-        }
+        _global_failure_projection_from_action(action)
         for action in terminal_passes
         if action.get("status") == "failed"
     ]
@@ -1836,8 +1888,7 @@ def _artifact_hydration_manifest(
     manifest = graph.artifact_hydration_manifest(node.ref)
     if not manifest.get("referenced_artifact_ids"):
         return None
-    sanitized = graph.sanitize_judge_visible_payload(manifest)
-    return dict(sanitized) if sanitized.get("hydrated_artifacts") else None
+    return copy.deepcopy(manifest) if manifest.get("hydrated_artifacts") else None
 
 
 def _perspective_tokens(value: str) -> Set[str]:
@@ -1974,6 +2025,93 @@ def _global_pass_owner(builder: "SeedAttributionBuilder") -> LocalStateOwner:
         defect_state=builder.defect_state,
         occurrence_key="global_candidate_pass",
     )
+
+
+def _global_failure_projection(
+    *,
+    builder: "SeedAttributionBuilder",
+    blocker: str,
+    detail: str,
+    physical_request_delta: int,
+) -> JsonDict:
+    if (
+        not isinstance(blocker, str)
+        or not blocker.strip()
+        or not isinstance(detail, str)
+        or not detail.strip()
+    ):
+        raise ValueError("global failure projection requires blocker and detail")
+    if (
+        isinstance(physical_request_delta, bool)
+        or not isinstance(physical_request_delta, int)
+        or physical_request_delta < 0
+    ):
+        raise ValueError(
+            "global failure projection physical request delta is invalid"
+        )
+    return {
+        "schema": GLOBAL_FAILURE_PROJECTION_SCHEMA,
+        "terminal_status": "failed",
+        "pass_identity": _global_pass_identity(builder.key),
+        "seed_binding_identity": builder.key,
+        "seed_ref": builder.start_ref,
+        "defect_fingerprint": builder.defect_state.fingerprint,
+        "blocker": blocker.strip(),
+        "reason": detail.strip(),
+        "detail": detail.strip(),
+        "missing_evidence": [detail.strip()],
+        "physical_request_delta": physical_request_delta,
+        "owner": _global_pass_owner(builder).to_dict(),
+    }
+
+
+def _global_failure_projection_from_action(
+    action: Mapping[str, Any],
+) -> JsonDict:
+    projection = {
+        "schema": GLOBAL_FAILURE_PROJECTION_SCHEMA,
+        "terminal_status": str(action.get("status") or ""),
+        "pass_identity": str(action.get("pass_identity") or ""),
+        "seed_binding_identity": str(
+            action.get("seed_binding_identity") or ""
+        ),
+        "seed_ref": str(action.get("seed_ref") or ""),
+        "defect_fingerprint": str(
+            action.get("defect_fingerprint") or ""
+        ),
+        "blocker": str(action.get("blocker") or ""),
+        "reason": str(action.get("reason") or ""),
+        "detail": str(action.get("reason") or ""),
+        "missing_evidence": copy.deepcopy(
+            list(action.get("missing_evidence") or ())
+        ),
+        "physical_request_delta": action.get("physical_request_delta"),
+        "owner": copy.deepcopy(action.get("owner")),
+    }
+    if (
+        projection["terminal_status"] != "failed"
+        or projection["pass_identity"]
+        != _global_pass_identity(projection["seed_binding_identity"])
+        or not projection["seed_ref"]
+        or not projection["defect_fingerprint"]
+        or not projection["blocker"]
+        or not projection["reason"]
+        or projection["missing_evidence"] != [projection["detail"]]
+        or isinstance(projection["physical_request_delta"], bool)
+        or not isinstance(projection["physical_request_delta"], int)
+        or projection["physical_request_delta"] < 0
+    ):
+        raise ValueError(
+            "failed global action does not define a canonical failure projection"
+        )
+    LocalStateOwner.from_dict(projection["owner"])
+    if stable_json(_checkpoint_json(action.get("failure_projection"))) != stable_json(
+        _checkpoint_json(projection)
+    ):
+        raise ValueError(
+            "failed global action contradicts its canonical failure projection"
+        )
+    return projection
 
 
 def _owned_step_judgment(
@@ -2381,6 +2519,21 @@ class RecursiveAnalysisState:
     def _confirmation_queue_key(
         value: Mapping[str, Any],
     ) -> Tuple[str, str, str, str]:
+        expected = _confirmation_request_identity(
+            hypothesis_id=str(value.get("hypothesis_id") or ""),
+            candidate_ref=str(value.get("candidate_ref") or ""),
+            defect_fingerprint=str(
+                value.get("defect_fingerprint") or ""
+            ),
+            seed_binding_identity=str(
+                value.get("seed_binding_identity") or ""
+            ),
+        )
+        actual = str(value.get("semantic_identity") or "")
+        if not actual or actual != expected:
+            raise ValueError(
+                "confirmation queue semantic identity is not canonical"
+            )
         return (
             str(value.get("hypothesis_id") or ""),
             str(value.get("candidate_ref") or ""),
@@ -2456,19 +2609,10 @@ class RecursiveAnalysisState:
         hypothesis_id = str(value.get("hypothesis_id") or "")
         defect_fingerprint = str(value.get("defect_fingerprint") or "")
         seed_binding_identity = str(value.get("seed_binding_identity") or "")
-        try:
-            owner = LocalStateOwner.from_dict(value.get("owner"))
-        except (TypeError, ValueError):
-            return False
         if not all(
             (candidate_ref, hypothesis_id, defect_fingerprint, seed_binding_identity)
         ):
             raise ValueError("confirmation queue entry requires exact semantic identity")
-        if (
-            owner.seed_binding_identity != seed_binding_identity
-            or owner.hypothesis_id != hypothesis_id
-        ):
-            raise ValueError("confirmation queue owner contradicts semantic identity")
         resolved = self.graph.resolve(candidate_ref)
         node = self.graph.nodes.get(resolved or "")
         if (
@@ -2477,6 +2621,16 @@ class RecursiveAnalysisState:
             or not authored_root_candidate_eligible(self.graph, candidate_ref)
         ):
             return False
+        _validate_pending_confirmation_identity(value)
+        try:
+            owner = LocalStateOwner.from_dict(value.get("owner"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            owner.seed_binding_identity != seed_binding_identity
+            or owner.hypothesis_id != hypothesis_id
+        ):
+            raise ValueError("confirmation queue owner contradicts semantic identity")
         recursive_path = tuple(
             str(ref) for ref in value.get("recursive_path") or ()
         )
@@ -2499,10 +2653,6 @@ class RecursiveAnalysisState:
         if queue_key in self.confirmation_queue_keys:
             return False
         semantic_identity = str(value.get("semantic_identity") or "")
-        if not semantic_identity:
-            raise ValueError(
-                "confirmation queue semantic identity is required"
-            )
         if any(
             str(item.get("semantic_identity") or "") == semantic_identity
             for item in self.confirmation_queue
@@ -2556,6 +2706,8 @@ class RecursiveAnalysisState:
                 raise ValueError(
                     "restored confirmation queue contains a root candidate ineligible for the active revision"
                 )
+            if item.get("status") == "queued":
+                _validate_pending_confirmation_identity(item)
             recursive_path = tuple(
                 str(ref) for ref in item.get("recursive_path") or ()
             )
@@ -2591,16 +2743,23 @@ class RecursiveAnalysisState:
                     "confirmation queue artifact owner envelope contradicts "
                     "the active graph"
                 )
-            semantic_identity = str(
-                item.get("semantic_identity") or ""
+            semantic_identity = str(item.get("semantic_identity") or "")
+            expected_semantic_identity = _confirmation_request_identity(
+                hypothesis_id=str(item.get("hypothesis_id") or ""),
+                candidate_ref=candidate_ref,
+                defect_fingerprint=str(
+                    item.get("defect_fingerprint") or ""
+                ),
+                seed_binding_identity=seed_binding_identity,
             )
             if (
                 not semantic_identity
+                or semantic_identity != expected_semantic_identity
                 or semantic_identity in semantic_identities
             ):
                 raise ValueError(
-                    "confirmation queue contains a missing or duplicate "
-                    "semantic identity"
+                    "confirmation queue contains a missing, duplicate, or "
+                    "non-canonical semantic identity"
                 )
             semantic_identities.add(semantic_identity)
             canonical_keys.append(self._confirmation_queue_key(item))
@@ -3025,16 +3184,35 @@ class RecursiveAnalysisState:
                 _global_pass_identity(builder.key)
             )
             if failure is not None and failure.get("status") == "failed":
-                blocker = str(failure.get("blocker") or "")
+                projection = _global_failure_projection_from_action(failure)
+                episodes = [
+                    branch
+                    for branch in self.unresolved_branches
+                    if isinstance(branch, Mapping)
+                    and branch.get("failure_projection")
+                    == projection
+                ]
                 if (
-                    blocker not in builder.blocking_reasons
-                    or not any(
-                        isinstance(branch, Mapping)
-                        and branch.get("global_pass_identity")
-                        == failure.get("pass_identity")
-                        and branch.get("reason") == blocker
-                        for branch in self.unresolved_branches
-                    )
+                    len(episodes) != 1
+                    or projection["seed_binding_identity"] != builder.key
+                    or projection["seed_ref"] != builder.start_ref
+                    or projection["defect_fingerprint"]
+                    != builder.defect_state.fingerprint
+                    or LocalStateOwner.from_dict(projection["owner"])
+                    != _global_pass_owner(builder)
+                    or episodes[0].get("global_pass_identity")
+                    != projection["pass_identity"]
+                    or episodes[0].get("reason")
+                    != projection["blocker"]
+                    or episodes[0].get("details")
+                    != projection["detail"]
+                    or episodes[0].get("owner") != projection["owner"]
+                    or episodes[0].get("node_ref")
+                    != projection["seed_ref"]
+                    or set(builder.blocking_reasons)
+                    != {projection["blocker"]}
+                    or set(builder.missing_evidence)
+                    != set(projection["missing_evidence"])
                 ):
                     raise ValueError(
                         "failed global pass action has no bijective unresolved episode"
@@ -3043,6 +3221,22 @@ class RecursiveAnalysisState:
                     str(failure.get("pass_identity") or "")
                 )
 
+        failure_projections = [
+            _global_failure_projection_from_action(action)
+            for action in passes_by_owner.values()
+            if action.get("status") == "failed"
+        ]
+        episode_projections = [
+            copy.deepcopy(branch.get("failure_projection"))
+            for branch in self.unresolved_branches
+            if isinstance(branch, Mapping)
+            and branch.get("failure_projection") is not None
+        ]
+        _require_canonical_bijection(
+            failure_projections,
+            episode_projections,
+            label="global failure episodes",
+        )
         if matched_pass_owners != set(passes_by_owner):
             raise ValueError(
                 "global pass action has no unique seed judgment or failure episode"
@@ -5341,20 +5535,7 @@ class RecursiveAnalysisState:
             ],
             "recursive_expansion_reasons": expansion_reasons,
             "global_candidate_failures": [
-                {
-                    key: copy.deepcopy(item.get(key))
-                    for key in (
-                        "pass_identity",
-                        "seed_binding_identity",
-                        "seed_ref",
-                        "defect_fingerprint",
-                        "owner",
-                        "blocker",
-                        "reason",
-                        "missing_evidence",
-                        "physical_request_delta",
-                    )
-                }
+                _global_failure_projection_from_action(item)
                 for item in failed_global_passes
             ],
             "global_judge_physical_request_count": sum(
@@ -5699,6 +5880,12 @@ class AgenticRecursiveAnalyzer:
         ) -> None:
             pass_identity = _global_pass_identity(builder.key)
             owner = _global_pass_owner(builder)
+            failure_projection = _global_failure_projection(
+                builder=builder,
+                blocker=blocker,
+                detail=detail,
+                physical_request_delta=physical_request_delta,
+            )
             event = {
                 "kind": "global_candidate_pass",
                 "status": "failed",
@@ -5718,6 +5905,7 @@ class AgenticRecursiveAnalyzer:
                 "candidate_compression": copy.deepcopy(
                     dict(candidate_compression or {})
                 ),
+                "failure_projection": copy.deepcopy(failure_projection),
                 "behavior_impact": "none_offline_analysis_only",
             }
             state.investigation_journal.append(event)
@@ -5733,6 +5921,9 @@ class AgenticRecursiveAnalyzer:
                     "depth": 0,
                     "global_pass_identity": pass_identity,
                     "owner": owner.to_dict(),
+                    "failure_projection": copy.deepcopy(
+                        failure_projection
+                    ),
                 }
             )
             for failed_item in items:
@@ -6258,12 +6449,6 @@ class AgenticRecursiveAnalyzer:
                     state.introduction_candidates.append(candidate)
                     state._remember_candidate(candidate)
                 state.introduction_hypothesis_ids.add(hypothesis.hypothesis_id)
-                queue_key = (
-                    hypothesis.hypothesis_id,
-                    selected_ref,
-                    item.defect_state.fingerprint,
-                    hypothesis.seed_binding_identity,
-                )
                 enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis.hypothesis_id,
@@ -6277,9 +6462,16 @@ class AgenticRecursiveAnalyzer:
                             state.graph, state.objective
                         ),
                         "analysis_perspective": state.analysis_perspective,
-                        "semantic_identity": hashlib.sha256(
-                            stable_json(queue_key).encode("utf-8")
-                        ).hexdigest(),
+                        "semantic_identity": _confirmation_request_identity(
+                            hypothesis_id=hypothesis.hypothesis_id,
+                            candidate_ref=selected_ref,
+                            defect_fingerprint=(
+                                item.defect_state.fingerprint
+                            ),
+                            seed_binding_identity=(
+                                hypothesis.seed_binding_identity
+                            ),
+                        ),
                         "status": "queued",
                         "origin": "global_candidate_judgment",
                         "seed_key": seed_builder.key if seed_builder else "",
@@ -7115,19 +7307,7 @@ class AgenticRecursiveAnalyzer:
             if self.stop_requested():
                 break
             queued = pending_confirmations.pop(0)
-            queued["semantic_identity"] = str(
-                queued.get("semantic_identity")
-                or _confirmation_request_identity(
-                    hypothesis_id=str(queued.get("hypothesis_id") or ""),
-                    candidate_ref=str(queued.get("candidate_ref") or ""),
-                    defect_fingerprint=str(
-                        queued.get("defect_fingerprint") or ""
-                    ),
-                    seed_binding_identity=str(
-                        queued.get("seed_binding_identity") or ""
-                    ),
-                )
-            )
+            state._confirmation_queue_key(queued)
             try:
                 request = self._build_confirmation_request(state, queued)
                 preflight_root_confirmation_request(request)
@@ -7623,8 +7803,6 @@ class AgenticRecursiveAnalyzer:
             state.graph,
             state.graph.hydrate_node(candidate_ref),
         )
-        if artifact_manifest is not None:
-            candidate_reference["artifact_hydration"] = artifact_manifest
         path_references = tuple(_reference_envelope(ref) for ref in path)
         queued_artifact_envelopes = {
             str(item.get("canonical_ref") or ""): copy.deepcopy(dict(item))
@@ -7870,6 +8048,8 @@ class AgenticRecursiveAnalyzer:
         candidate_reference = state.graph.sanitize_judge_visible_payload(
             candidate_reference
         )
+        if artifact_manifest is not None:
+            candidate_reference["artifact_hydration"] = artifact_manifest
         path_references = tuple(
             state.graph.sanitize_judge_visible_payload(path_references)
         )
@@ -8480,12 +8660,6 @@ class AgenticRecursiveAnalyzer:
                 )
                 if not binding_exists:
                     raise ValueError("confirmation requires an existing introduction binding")
-                queue_key = (
-                    hypothesis_id,
-                    candidate_ref,
-                    defect_fingerprint,
-                    hypothesis.seed_binding_identity,
-                )
                 enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis_id,
@@ -8501,9 +8675,14 @@ class AgenticRecursiveAnalyzer:
                             list(request.recursive_context.get("task_obligations") or [])
                         ),
                         "analysis_perspective": state.analysis_perspective,
-                        "semantic_identity": hashlib.sha256(
-                            stable_json(queue_key).encode("utf-8")
-                        ).hexdigest(),
+                        "semantic_identity": _confirmation_request_identity(
+                            hypothesis_id=hypothesis_id,
+                            candidate_ref=candidate_ref,
+                            defect_fingerprint=defect_fingerprint,
+                            seed_binding_identity=(
+                                hypothesis.seed_binding_identity
+                            ),
+                        ),
                         "status": "queued",
                         "seed_key": state.hypothesis_seed_keys.get(
                             hypothesis_id, ""

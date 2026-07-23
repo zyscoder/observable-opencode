@@ -20,7 +20,7 @@ from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
 
-EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v4"
+EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v5"
 RANKING_CONFIDENCE_EDGE_ORIGINS = frozenset(
     {
         "offline.global_candidate_retrieval",
@@ -1164,6 +1164,7 @@ class TraceGraph:
         hydrated_items: List[JsonDict] = []
         missing_ids: List[str] = []
         truncated_ids: List[str] = []
+        ineligible_artifact_evidence: List[JsonDict] = []
         for artifact_id in artifact_ids:
             verified = self._artifact_reader.read(artifact_id)
             if verified.content is None or verified.content_bytes is None:
@@ -1172,30 +1173,26 @@ class TraceGraph:
             if verified.truncated:
                 truncated_ids.append(artifact_id)
                 continue
-            content_hash = "sha256:{0}".format(
-                hashlib.sha256(verified.content_bytes).hexdigest()
-            )
-            hydrated_items.append(
-                {
-                    "artifact_id": artifact_id,
-                    "raw_ref": "artifact:{0}".format(artifact_id),
-                    "resolved_ref": "artifact:{0}".format(artifact_id),
-                    "resolution_status": "resolved",
-                    "provenance_class": "recorded",
-                    "content": verified.content,
-                    "content_hash": content_hash,
-                    "byte_count": len(verified.content_bytes),
-                    "byte_range": [0, len(verified.content_bytes)],
-                    "owner_reference": {
-                        "raw_ref": resolved,
-                        "resolved_ref": resolved,
-                        "resolution_status": "resolved",
-                        "provenance_class": "recorded",
-                    },
-                    "missing": False,
-                    "truncated": False,
-                }
-            )
+            artifact_ref = "artifact:{0}".format(artifact_id)
+            try:
+                hydrated_items.append(
+                    self.artifact_evidence_envelope(
+                        artifact_ref,
+                        fact_kind="artifact_hydration",
+                        expected_owner_ref=resolved,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                missing_ids.append(artifact_id)
+                ineligible_artifact_evidence.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "raw_ref": artifact_ref,
+                        "owner_ref": resolved,
+                        "status": "owner_ineligible",
+                        "reason": str(exc),
+                    }
+                )
         integrity_failures = [
             dict(item)
             for item in self.artifact_hydration.get("integrity_failures") or []
@@ -1208,6 +1205,7 @@ class TraceGraph:
             "missing_artifact_ids": missing_ids,
             "truncated_artifact_ids": truncated_ids,
             "integrity_failures": integrity_failures,
+            "ineligible_artifact_evidence": ineligible_artifact_evidence,
         }
 
     def artifact_reference_status(self, ref: str) -> Optional[JsonDict]:

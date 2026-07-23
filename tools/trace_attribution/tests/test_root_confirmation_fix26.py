@@ -35,6 +35,7 @@ from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     FrontierItem,
     RecursiveAnalysisState,
+    _confirmation_request_identity,
     validate_recursive_report_against_graph,
 )
 from tools.trace_attribution.tests.test_root_confirmation_fix21 import (
@@ -1026,7 +1027,7 @@ class ConfirmationQueueKeyBijectionTest(unittest.TestCase):
             analysis_perspective="",
         )
         seed = state.seed_results()[0]
-        semantic_identity = "fix26-duplicate-semantic"
+        first_semantic_identity = ""
         for candidate_ref in (
             "record:candidate_one",
             "record:candidate_two",
@@ -1054,6 +1055,12 @@ class ConfirmationQueueKeyBijectionTest(unittest.TestCase):
                 checked_evidence_refs=(candidate_ref,),
                 graph_position=graph.position(candidate_ref),
             )
+            canonical_identity = _confirmation_request_identity(
+                hypothesis_id=hypothesis.hypothesis_id,
+                candidate_ref=candidate_ref,
+                defect_fingerprint=seed.defect_fingerprint,
+                seed_binding_identity=seed.seed_binding_identity,
+            )
             entry = {
                 "hypothesis_id": hypothesis.hypothesis_id,
                 "hypothesis_semantic_hash": hypothesis.semantic_hash,
@@ -1066,7 +1073,11 @@ class ConfirmationQueueKeyBijectionTest(unittest.TestCase):
                 "checked_evidence_refs": [candidate_ref],
                 "task_obligations": [],
                 "analysis_perspective": "",
-                "semantic_identity": semantic_identity,
+                "semantic_identity": (
+                    canonical_identity
+                    if candidate_ref == "record:candidate_one"
+                    else first_semantic_identity
+                ),
                 "status": "queued",
                 "owner": LocalStateOwner.create(
                     seed_binding_identity=seed.seed_binding_identity,
@@ -1076,6 +1087,7 @@ class ConfirmationQueueKeyBijectionTest(unittest.TestCase):
                 ).to_dict(),
             }
             if candidate_ref == "record:candidate_one":
+                first_semantic_identity = canonical_identity
                 self.assertTrue(state.enqueue_confirmation(entry))
             else:
                 with self.assertRaisesRegex(
@@ -1140,20 +1152,20 @@ class Fix26VersionIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v9",
+            "recursive-attribution-report/v10",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v8",
+            "recursive-attribution-checkpoint/v9",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v6",
+            "recursive-analysis-actions/v7",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
-            "graph-external-evidence-eligibility/v4",
+            "graph-external-evidence-eligibility/v5",
         )
         self.assertIn(
             "global-pass-identity/v1",

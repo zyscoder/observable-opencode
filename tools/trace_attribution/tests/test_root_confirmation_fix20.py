@@ -485,6 +485,7 @@ class VerifiedArtifactSubrangeTest(unittest.TestCase):
             ],
             "missing_artifact_ids": [],
             "truncated_artifact_ids": [],
+            "ineligible_artifact_evidence": [],
         }
         candidate_fact = {
             **reference_envelope("record:decision"),

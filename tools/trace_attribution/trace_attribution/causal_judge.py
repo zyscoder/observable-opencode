@@ -827,6 +827,7 @@ _TASK2_MANIFEST_KEYS = {
     "hydrated_artifacts",
     "missing_artifact_ids",
     "truncated_artifact_ids",
+    "ineligible_artifact_evidence",
 }
 _TASK2_ARTIFACT_STATUS_KEYS = {
     "raw_ref",
@@ -1354,6 +1355,7 @@ class _ConfirmationFactTreeValidator:
             "referenced_artifact_ids",
             "missing_artifact_ids",
             "truncated_artifact_ids",
+            "ineligible_artifact_evidence",
         }
         judge_visible_manifest = missing_keys == audit_keys
         if missing_keys and not judge_visible_manifest:
@@ -2502,48 +2504,9 @@ class ClaudeCausalJudge(BoundedJudgeCapability, GlobalJudgeCapability):
         detail = "global_judge_{0}: {1}".format(
             outcome.error_kind or "error", outcome.error_detail
         )
-        fallback_payload = {
-            "outcome": "inconclusive",
-            "reason": "The global candidate Judge could not produce a validated result: {0}".format(
-                detail
-            ),
-            "assessments": [
-                {
-                    "candidate_ref": capsule.candidate_ref,
-                    "defect_status": "unknown",
-                    "input_defect_status": "unknown",
-                    "output_defect_status": "unknown",
-                    "causal_path_refs": [],
-                    "counterfactual": {
-                        "intervention_ref": capsule.candidate_ref,
-                        "intervention_kind": "replace_with_semantically_correct_behavior",
-                        "predicted_defect_status": "present",
-                        "causal_effect": "does_not_prevent_defect",
-                    },
-                    "compared_candidate_refs": list(
-                        request.open_authored_root_candidate_refs
-                    ),
-                    "causal_role": "unknown",
-                    "reason": "Global candidate judgment is unavailable.",
-                    "evidence_refs": [],
-                    "confidence": 0.0,
-                }
-                for capsule in request.capsules
-            ],
-            "selected_candidate_refs": [],
-            "expansion_requests": [],
-            "decisive_evidence_refs": [],
-            "missing_evidence": [detail],
-            "confidence": 0.0,
-            "active_focus_binding": {
-                "seed_ref": request.seed_ref,
-                "defect_fingerprint": request.active_defect.fingerprint,
-                "active_focus_text_hash": request.active_focus_text_hash,
-            },
-        }
-        return BoundedJudgeCallResult(
-            validate_global_candidate_payload(fallback_payload, request=request),
-            outcome.physical_requests,
+        raise BoundedJudgeCallError(
+            detail,
+            physical_requests=outcome.physical_requests,
         )
 
     def judge_step(self, request: CausalStepRequest) -> CausalStepJudgment:

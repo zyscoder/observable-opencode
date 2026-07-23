@@ -468,12 +468,15 @@ class DeepJudgeSanitizerTest(unittest.TestCase):
             evidence_refs=("record:decision", "record:defect"),
         )
 
-    def assert_no_leaks(self, payload):
+    def assert_no_leaks(self, payload, *, allow_missing_artifact_gap=False):
         encoded = json.dumps(payload, sort_keys=True)
         self.assertNotIn("STALE_NESTED_FACT", encoded)
         self.assertNotIn("MISSING_ARTIFACT_EXCERPT", encoded)
         self.assertNotIn("stale_change", encoded)
-        self.assertNotIn("missing-artifact", encoded)
+        if allow_missing_artifact_gap:
+            self.assertIn("missing-artifact", encoded)
+        else:
+            self.assertNotIn("missing-artifact", encoded)
 
     def test_global_final_json_is_deep_sanitized(self):
         capsules = build_candidate_evidence_capsules(
@@ -496,7 +499,10 @@ class DeepJudgeSanitizerTest(unittest.TestCase):
             start_refs=("record:defect",),
             capsules=capsules,
         )
-        self.assert_no_leaks(json.loads(build_global_candidate_prompt(global_request)))
+        self.assert_no_leaks(
+            json.loads(build_global_candidate_prompt(global_request)),
+            allow_missing_artifact_gap=True,
+        )
 
     def test_recursive_step_final_json_is_deep_sanitized(self):
         state = RecursiveAnalysisState.create(
@@ -773,16 +779,16 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
     def test_current_policy_versions_every_reusable_conclusion_identity(self):
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
-            "graph-external-evidence-eligibility/v4",
+            "graph-external-evidence-eligibility/v5",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v6")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
         self.assertEqual(
             GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
-            "global-candidate-judgment/v5",
+            "global-candidate-judgment/v6",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
-            "global-candidate-validation-envelope/v5",
+            "global-candidate-validation-envelope/v6",
         )
         self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v9")
         self.assertEqual(
@@ -851,7 +857,7 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
             CandidateEvidenceCapsule.from_dict(capsule.to_dict()), capsule
         )
         old_capsule = capsule.to_dict()
-        old_capsule["schema_version"] = "candidate-evidence-capsule/v5"
+        old_capsule["schema_version"] = "candidate-evidence-capsule/v6"
         with self.assertRaises(ValueError):
             CandidateEvidenceCapsule.from_dict(old_capsule)
 

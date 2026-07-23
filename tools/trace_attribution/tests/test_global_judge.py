@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution import evidence_capsule
-from trace_attribution.causal_judge import ClaudeCausalJudge
+from trace_attribution.causal_judge import BoundedJudgeCallError, ClaudeCausalJudge
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution.evidence_capsule import (
     CAPSULE_SCHEMA_VERSION,
@@ -822,19 +822,20 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             value["missing_evidence"] = ["The action-group member needs context."]
             validate_global_candidate_payload(value, request=restored)
 
-    def test_validation_envelope_v5_round_trip_rejects_stale_identities(self):
+    def test_validation_envelope_v6_round_trip_rejects_stale_identities(self):
         request = sample_request()
         envelope = request.validation_envelope()
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v5",
+            "global-candidate-validation-envelope/v6",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
         )
 
         for stale_identity in (
+            "global-candidate-validation-envelope/v5",
             "global-candidate-validation-envelope/v4",
             "global-candidate-validation-envelope/v3",
         ):
@@ -1442,12 +1443,12 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_global_schema_is_v5_and_capsule_schema_is_v6(self):
+    def test_global_schema_is_v6_and_capsule_schema_is_v7(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v5",
+            "global-candidate-judgment/v6",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v6")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
 
     def test_v4_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()
@@ -1661,7 +1662,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertEqual(result.value.outcome, "candidate_roots")
         self.assertIn("globally compare", transport.calls[0]["system"])
 
-    def test_claude_judge_fallback_is_a_valid_v4_bound_judgment(self):
+    def test_claude_judge_invalid_output_is_a_typed_bounded_failure(self):
         class Transport:
             model = "test-model"
             max_tokens = 4096
@@ -1682,21 +1683,16 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         with patch(
             "trace_attribution.causal_judge.validate_global_candidate_payload",
             side_effect=record_validation,
-        ):
-            result = ClaudeCausalJudge(
+        ), self.assertRaises(BoundedJudgeCallError) as raised:
+            ClaudeCausalJudge(
                 transport=Transport(), cache=JudgmentCache()
             ).judge_candidates_bounded(request, max_physical_requests=1)
 
-        self.assertEqual(result.value.outcome, "inconclusive")
-        self.assertIn(
+        self.assertEqual(raised.exception.physical_requests, 1)
+        self.assertIn("request_budget_exhausted", str(raised.exception))
+        self.assertNotIn(
             "inconclusive",
             [item.get("outcome") for item in payloads if isinstance(item, dict)],
-        )
-        self.assertEqual(
-            validate_global_candidate_payload(
-                result.value.to_dict(), request=request
-            ),
-            result.value,
         )
 
 

@@ -17,7 +17,7 @@ from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v6"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v7"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
@@ -260,10 +260,59 @@ class CandidateEvidenceCapsule:
         value.pop("missing_evidence_refs", None)
         value.pop("validation_source", None)
         hydration = value.get("artifact_hydration")
+        artifact_evidence_gaps = []
+        if isinstance(hydration, Mapping):
+            artifact_evidence_gaps.extend(
+                copy.deepcopy(dict(item))
+                for item in hydration.get("ineligible_artifact_evidence") or ()
+                if isinstance(item, Mapping)
+            )
+            artifact_evidence_gaps.extend(
+                {
+                    "artifact_id": str(artifact_id),
+                    "raw_ref": "artifact:{0}".format(artifact_id),
+                    "owner_ref": self.candidate_ref,
+                    "status": status,
+                    "reason": reason,
+                }
+                for status, reason, artifact_ids in (
+                    (
+                        "missing",
+                        "Artifact content is unavailable.",
+                        hydration.get("missing_artifact_ids") or (),
+                    ),
+                    (
+                        "truncated",
+                        "Artifact content is incomplete.",
+                        hydration.get("truncated_artifact_ids") or (),
+                    ),
+                )
+                for artifact_id in artifact_ids
+                if not any(
+                    str(item.get("artifact_id") or "") == str(artifact_id)
+                    for item in artifact_evidence_gaps
+                )
+            )
+            artifact_evidence_gaps.extend(
+                {
+                    "artifact_id": str(item.get("artifact_id") or ""),
+                    "raw_ref": "artifact:{0}".format(
+                        item.get("artifact_id") or ""
+                    ),
+                    "owner_ref": self.candidate_ref,
+                    "status": "integrity_failure",
+                    "reason": str(item.get("status") or "integrity failure"),
+                }
+                for item in hydration.get("integrity_failures") or ()
+                if isinstance(item, Mapping)
+            )
+        if artifact_evidence_gaps:
+            value["artifact_evidence_gaps"] = artifact_evidence_gaps
         if isinstance(hydration, Mapping) and any(
             hydration.get(key)
             for key in (
                 "integrity_failures",
+                "ineligible_artifact_evidence",
                 "missing_artifact_ids",
                 "truncated_artifact_ids",
             )
@@ -275,6 +324,7 @@ class CandidateEvidenceCapsule:
                 "missing_artifact_ids",
                 "truncated_artifact_ids",
                 "integrity_failures",
+                "ineligible_artifact_evidence",
             ):
                 hydration.pop(key, None)
         return value
@@ -501,6 +551,13 @@ def _build_prompt_collections(
             raw_artifact_hydration.get("missing_artifact_ids") or ()
         )
     ]
+    missing.extend(
+        str(item.get("raw_ref") or "")
+        for item in (
+            raw_artifact_hydration.get("ineligible_artifact_evidence") or ()
+        )
+        if isinstance(item, Mapping) and str(item.get("raw_ref") or "")
+    )
     artifact_hydration = raw_artifact_hydration
     retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
     causal_edges = tuple(
