@@ -4240,9 +4240,25 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         def analyze(*, stale_intermediate):
             trace = observed_trace()
-            trace["manifest"] = {"subject_revision": "git:active"}
+            trace["manifest"] = {
+                "case_id": trace["case_id"],
+                "run_id": "stale-intermediate-analysis-run",
+                "subject_revision": "git:active",
+                "subject_revision_provenance": {
+                    "method": "case_trace_config",
+                    "source": "CaseTraceConfig.subjectRevision",
+                    "bound_at": "case_start",
+                    "case_id": trace["case_id"],
+                    "run_id": "stale-intermediate-analysis-run",
+                },
+            }
             for record in trace["records"]:
-                record.setdefault("data", {})["subject_revision"] = "git:active"
+                record.setdefault("data", {}).update(
+                    {
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
+                    }
+                )
             if stale_intermediate:
                 change = next(
                     item
@@ -4385,6 +4401,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 },
             }
         )
+        for record in trace["records"]:
+            record.setdefault("data", {}).setdefault(
+                "subject_revision", "git:active"
+            )
+            record["data"].setdefault(
+                "revision_provenance_status", "valid"
+            )
         judge = FusionScriptedJudge(
             global_outcome="candidate_roots",
             selected_candidate_refs=("record:decision",),
@@ -4448,6 +4471,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "hypothesis_id": "hypothesis:{0}".format(ref),
                     "defect_fingerprint": "defect:{0}".format(ref),
                     "seed_binding_identity": seed,
+                    "semantic_identity": "revision-filter:{0}:{1}".format(
+                        seed, ref
+                    ),
                     "owner": LocalStateOwner.create(
                         seed_binding_identity=seed,
                         hypothesis_id="hypothesis:{0}".format(ref),
@@ -4504,6 +4530,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "candidate_ref": ref,
                         "defect_fingerprint": "defect-fingerprint",
                         "seed_binding_identity": "seed-binding",
+                        "semantic_identity": "queue-bound:{0}".format(index),
                         "status": "queued",
                         "owner": LocalStateOwner.create(
                             seed_binding_identity="seed-binding",

@@ -20,7 +20,7 @@ from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
 
-EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v3"
+EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v4"
 RANKING_CONFIDENCE_EDGE_ORIGINS = frozenset(
     {
         "offline.global_candidate_retrieval",
@@ -742,12 +742,14 @@ class TraceGraph:
         resolved = self.resolve(str(ref))
         if resolved in self.nodes:
             return self.active_revision_evidence_eligible(resolved)
-        artifact = self.artifact_reference_status(str(ref))
-        return bool(
-            artifact is not None
-            and artifact.get("resolution_status") == "resolved"
-            and artifact.get("availability") == "available"
-        )
+        try:
+            self.artifact_evidence_envelope(
+                str(ref),
+                fact_kind="eligibility_probe",
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def assert_resolved_node_references(
         self, refs: Iterable[Any], *, label: str
@@ -1249,6 +1251,7 @@ class TraceGraph:
         ref: str,
         *,
         fact_kind: str,
+        expected_owner_ref: Optional[str] = None,
     ) -> JsonDict:
         """Build a complete Judge-visible envelope for verified artifact evidence."""
         status = self.artifact_reference_status(ref)
@@ -1287,7 +1290,69 @@ class TraceGraph:
                 ),
             )
         )
-        owner_ref = owners[0] if owners else ""
+        active_owners = [
+            owner_ref
+            for owner_ref in owners
+            if self.active_revision_start_eligible(owner_ref)
+        ]
+        if expected_owner_ref is not None:
+            resolved_expected_owner = (
+                self.resolve(str(expected_owner_ref))
+                or str(expected_owner_ref)
+            )
+            if resolved_expected_owner not in active_owners:
+                raise ValueError(
+                    "artifact evidence expected owner is absent, stale, "
+                    "unbound, or does not reference the artifact: {0}".format(
+                        expected_owner_ref
+                    )
+                )
+            owner_ref = resolved_expected_owner
+        elif len(active_owners) == 1:
+            owner_ref = active_owners[0]
+        elif not active_owners:
+            raise ValueError(
+                "artifact evidence has no active formally bound record owner: "
+                "{0}".format(ref)
+            )
+        else:
+            raise ValueError(
+                "artifact evidence has ambiguous active record owners: {0}".format(
+                    ", ".join(active_owners)
+                )
+            )
+        owner_node = self.nodes[owner_ref]
+        content_hash = "sha256:{0}".format(
+            hashlib.sha256(verified.content_bytes).hexdigest()
+        )
+        byte_range = [0, len(verified.content_bytes)]
+        owner_reference = {
+            "raw_ref": owner_ref,
+            "resolved_ref": owner_ref,
+            "resolution_status": "resolved",
+            "provenance_class": "recorded",
+            "component": owner_node.component,
+            "event_type": owner_node.event_type,
+            "subject_revision": owner_node.data.get("subject_revision"),
+            "revision_provenance_status": owner_node.data.get(
+                "revision_provenance_status"
+            ),
+            "active_revision_eligible": True,
+            "artifact_path": status.get("path"),
+        }
+        owner_binding_identity = "artifact_owner:v1:{0}".format(
+            hashlib.sha256(
+                stable_json(
+                    {
+                        "artifact_id": artifact_id,
+                        "canonical_ref": "artifact:{0}".format(artifact_id),
+                        "content_hash": content_hash,
+                        "byte_range": byte_range,
+                        "owner_reference": owner_reference,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         return {
             "artifact_id": artifact_id,
             "raw_ref": str(ref),
@@ -1296,21 +1361,59 @@ class TraceGraph:
             "resolution_status": "resolved",
             "provenance_class": "recorded",
             "content": verified.content,
-            "content_hash": "sha256:{0}".format(
-                hashlib.sha256(verified.content_bytes).hexdigest()
-            ),
+            "content_hash": content_hash,
             "byte_count": len(verified.content_bytes),
-            "byte_range": [0, len(verified.content_bytes)],
-            "owner_reference": {
-                "raw_ref": owner_ref,
-                "resolved_ref": owner_ref,
-                "resolution_status": "resolved",
-                "provenance_class": "recorded",
-            },
+            "byte_range": byte_range,
+            "owner_reference": owner_reference,
+            "owner_binding_identity": owner_binding_identity,
             "missing": False,
             "truncated": False,
             "fact_kind": str(fact_kind),
         }
+
+    def artifact_active_owner_refs(self, ref: str) -> Tuple[str, ...]:
+        """Return every active, strictly provenance-bound record owner."""
+        status = self.artifact_reference_status(ref)
+        if status is None:
+            return ()
+        artifact_id = str(status["artifact_id"])
+        return tuple(
+            sorted(
+                record_ref
+                for record_ref, record in self._artifact_records.items()
+                if artifact_id
+                in collect_artifact_ids(
+                    dict(record),
+                    (
+                        dict(record.get("data"))
+                        if isinstance(record.get("data"), Mapping)
+                        else {}
+                    ),
+                )
+                and self.active_revision_start_eligible(record_ref)
+            )
+        )
+
+    def validate_artifact_evidence_envelope(
+        self,
+        value: Any,
+        *,
+        expected_owner_ref: Optional[str] = None,
+    ) -> JsonDict:
+        """Rebuild an artifact/owner envelope and require exact equality."""
+        if not isinstance(value, Mapping):
+            raise ValueError("artifact evidence envelope must be an object")
+        canonical = self.artifact_evidence_envelope(
+            str(value.get("canonical_ref") or value.get("raw_ref") or ""),
+            fact_kind=str(value.get("fact_kind") or ""),
+            expected_owner_ref=expected_owner_ref,
+        )
+        if stable_json(dict(value)) != stable_json(canonical):
+            raise ValueError(
+                "artifact evidence envelope owner, provenance, path, hash, "
+                "or byte range contradicts the active graph"
+            )
+        return canonical
 
     def incoming_edge_context(
         self,

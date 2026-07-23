@@ -296,6 +296,7 @@ class VerifiedArtifactConfirmationEvidenceTest(unittest.TestCase):
                 "byte_count",
                 "byte_range",
                 "owner_reference",
+                "owner_binding_identity",
                 "missing",
                 "truncated",
                 "fact_kind",

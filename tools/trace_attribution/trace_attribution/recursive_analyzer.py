@@ -102,7 +102,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v5"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v6"
 CONFIRMATION_ACTION_OPERATIONS = frozenset(
     {"confirmation_completed", "confirmation_failed"}
 )
@@ -122,10 +122,29 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
         "seed_key",
         "recursive_path",
         "evidence_refs",
+        "artifact_evidence_envelopes",
         "physical_requests_reserved",
         "physical_request_delta",
         "physical_request_exact",
         "confirmation",
+    }
+)
+STEP_ACTION_PROJECTION_SCHEMA = "step-action-projection/v1"
+STEP_ACTION_PROJECTION_KEYS = frozenset(
+    {
+        "schema",
+        "semantic_key",
+        "call_kind",
+        "seed_binding_identity",
+        "hypothesis_id",
+        "visit_key",
+        "owner",
+        "physical_requests_reserved",
+        "physical_request_delta",
+        "physical_request_exact",
+        "provider_judgment",
+        "step_judgment",
+        "causal_relations",
     }
 )
 PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
@@ -724,7 +743,7 @@ def _quarantine_stale_seed_report_payload(
         graph.resolve(str(item.get("start_ref") or ""))
         or str(item.get("start_ref") or "")
         for item in seeds
-        if not graph.active_revision_evidence_eligible(
+        if not graph.active_revision_start_eligible(
             str(item.get("start_ref") or "")
         )
     }
@@ -941,7 +960,9 @@ def _quarantine_stale_seed_report_payload(
         "confirmation_queue",
         "confirmation_journal",
         "confirmation_action_projection",
+        "step_action_projection",
         "global_candidate_judgments",
+        "global_candidate_failures",
         "candidate_compression",
         "recursive_expansion_reasons",
     ):
@@ -961,12 +982,19 @@ def _quarantine_stale_seed_report_payload(
         )
         not in stale_seed_keys
     ]
+    metadata["confirmation_queue_keys"] = [
+        list(
+            RecursiveAnalysisState._confirmation_queue_key(item)
+        )
+        for item in metadata.get("confirmation_queue") or ()
+        if isinstance(item, Mapping)
+    ]
     retained_global_passes = [
         item
         for item in payload["investigation_journal"]
         if isinstance(item, Mapping)
         and item.get("kind") == "global_candidate_pass"
-        and item.get("status") == "completed"
+        and item.get("status") in {"completed", "failed"}
     ]
     metadata["global_candidate_pass_count"] = len(retained_global_passes)
     metadata["global_judge_physical_request_count"] = sum(
@@ -1036,6 +1064,7 @@ def _confirmation_action_projection(
     physical_requests_reserved: int,
     physical_request_delta: int,
     physical_request_exact: bool,
+    artifact_evidence_envelopes: Sequence[Mapping[str, Any]] = (),
 ) -> JsonDict:
     if operation not in CONFIRMATION_ACTION_OPERATIONS:
         raise ValueError("confirmation action operation is invalid")
@@ -1085,6 +1114,9 @@ def _confirmation_action_projection(
         "seed_key": seed_key,
         "recursive_path": list(confirmation.recursive_path),
         "evidence_refs": list(confirmation.evidence_refs),
+        "artifact_evidence_envelopes": copy.deepcopy(
+            list(artifact_evidence_envelopes)
+        ),
         "physical_requests_reserved": physical_requests_reserved,
         "physical_request_delta": physical_request_delta,
         "physical_request_exact": physical_request_exact,
@@ -1113,6 +1145,10 @@ def _validated_confirmation_action_projection(value: Any) -> JsonDict:
         physical_requests_reserved=value.get("physical_requests_reserved"),
         physical_request_delta=value.get("physical_request_delta"),
         physical_request_exact=value.get("physical_request_exact"),
+        artifact_evidence_envelopes=value.get(
+            "artifact_evidence_envelopes"
+        )
+        or (),
     )
     if stable_json(_checkpoint_json(value)) != stable_json(
         _checkpoint_json(expected)
@@ -1166,16 +1202,38 @@ def _completed_global_passes(
     ]
 
 
+def _terminal_global_passes(
+    investigation_journal: Iterable[Any],
+) -> List[Mapping[str, Any]]:
+    return [
+        item
+        for item in investigation_journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+        and item.get("status") in {"completed", "failed"}
+    ]
+
+
 def _global_passes_by_owner(
     investigation_journal: Iterable[Any],
 ) -> Dict[str, Mapping[str, Any]]:
     output = {}
-    for action in _completed_global_passes(investigation_journal):
-        owner = LocalStateOwner.from_dict(action.get("owner"))
-        key = stable_json(owner.to_dict())
+    for action in _terminal_global_passes(investigation_journal):
+        LocalStateOwner.from_dict(action.get("owner"))
+        key = str(action.get("pass_identity") or "")
+        seed_binding_identity = str(
+            action.get("seed_binding_identity") or ""
+        )
+        if (
+            not key
+            or key != _global_pass_identity(seed_binding_identity)
+        ):
+            raise ValueError(
+                "global pass action identity contradicts its seed binding"
+            )
         if key in output:
             raise ValueError(
-                "completed global pass actions contain a duplicate owner"
+                "global pass actions contain a duplicate per-seed identity"
             )
         output[key] = action
     return output
@@ -1202,7 +1260,8 @@ def _validate_global_pass_derivations(
         and item.get("kind") == "global_candidate_pass"
     ]
     completed_passes = _completed_global_passes(journal)
-    _global_passes_by_owner(completed_passes)
+    terminal_passes = _terminal_global_passes(journal)
+    _global_passes_by_owner(terminal_passes)
     expected_judgments = [
         _owned_payload(action["judgment"], action["owner"])
         for action in completed_passes
@@ -1220,6 +1279,24 @@ def _validate_global_pass_derivations(
         for expansion in action["judgment"].get("expansion_requests") or ()
         if isinstance(expansion, Mapping)
     ]
+    expected_failures = [
+        {
+            key: copy.deepcopy(action.get(key))
+            for key in (
+                "pass_identity",
+                "seed_binding_identity",
+                "seed_ref",
+                "defect_fingerprint",
+                "owner",
+                "blocker",
+                "reason",
+                "missing_evidence",
+                "physical_request_delta",
+            )
+        }
+        for action in terminal_passes
+        if action.get("status") == "failed"
+    ]
     _require_canonical_bijection(
         expected_judgments,
         metadata.get("global_candidate_judgments") or (),
@@ -1235,13 +1312,18 @@ def _validate_global_pass_derivations(
         metadata.get("recursive_expansion_reasons") or (),
         label="{0} expansion reasons".format(label),
     )
+    _require_canonical_bijection(
+        expected_failures,
+        metadata.get("global_candidate_failures") or (),
+        label="{0} global candidate failures".format(label),
+    )
     expected_physical_requests = sum(
         int(action.get("physical_request_delta") or 0)
-        for action in completed_passes
+        for action in terminal_passes
     )
     if (
         int(metadata.get("global_candidate_pass_count") or 0)
-        != len(completed_passes)
+        != len(terminal_passes)
         or int(metadata.get("global_judge_physical_request_count") or 0)
         != expected_physical_requests
         or str(metadata.get("fusion_mode") or "")
@@ -1286,10 +1368,16 @@ def _validate_restored_report_local_state_owners(
         },
         causal_relations=list(report.causal_relations),
         step_judgments=list(report.step_judgments),
+        step_action_projection=copy.deepcopy(
+            list(metadata.get("step_action_projection") or ())
+        ),
         visited_order=list(report.visited_order),
         visited_entries=[
             copy.deepcopy(dict(item)) for item in report.visited_entries
         ],
+        unresolved_branches=copy.deepcopy(
+            list(metadata.get("unresolved_branches") or ())
+        ),
         investigation_journal=[
             copy.deepcopy(dict(item))
             for item in report.investigation_journal
@@ -1301,6 +1389,11 @@ def _validate_restored_report_local_state_owners(
         confirmation_queue=copy.deepcopy(
             list(metadata.get("confirmation_queue") or ())
         ),
+        confirmation_queue_keys={
+            tuple(str(part) for part in item)
+            for item in metadata.get("confirmation_queue_keys") or ()
+            if isinstance(item, (list, tuple))
+        },
         confirmation_journal=copy.deepcopy(
             list(metadata.get("confirmation_journal") or ())
         ),
@@ -1320,6 +1413,7 @@ def _validate_restored_report_local_state_owners(
         hypothesis.hypothesis_id: hypothesis.seed_binding_identity
         for hypothesis in ledger.hypotheses_by_id().values()
     }
+    state.validate_confirmation_queue_bound()
     state._validate_local_state_owners(action_records)
     _validate_global_pass_derivations(
         state.investigation_journal,
@@ -1336,6 +1430,17 @@ def validate_recursive_report_against_graph(
     action_records: Optional[Iterable[Any]] = None,
 ) -> None:
     """Apply the analyzer's exact restore validation to a report."""
+    formal_unbound_starts = [
+        ref
+        for ref in report.start_refs
+        if graph.active_revision_evidence_eligible(ref)
+        and not graph.active_revision_start_eligible(ref)
+    ]
+    if formal_unbound_starts:
+        raise ValueError(
+            "{0} contains an analysis start without strict active-start "
+            "provenance: {1}".format(label, sorted(formal_unbound_starts))
+        )
     _assert_report_grounded_evidence(graph, report, label=label)
     _validate_restored_report_local_state_owners(
         graph,
@@ -1849,6 +1954,178 @@ def _owner_for_seed_projection(
     )
 
 
+def _global_pass_identity(seed_binding_identity: str) -> str:
+    return "global_pass:v1:{0}".format(
+        hashlib.sha256(
+            stable_json(
+                {
+                    "schema": "global-pass-identity/v1",
+                    "seed_binding_identity": str(seed_binding_identity),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def _global_pass_owner(builder: "SeedAttributionBuilder") -> LocalStateOwner:
+    return _owner_for_seed_projection(
+        seed_binding_identity=builder.key,
+        node_ref=builder.start_ref,
+        defect_state=builder.defect_state,
+        occurrence_key="global_candidate_pass",
+    )
+
+
+def _owned_step_judgment(
+    item: FrontierItem,
+    judgment: CausalStepJudgment,
+    semantic_key: str,
+) -> CausalStepJudgment:
+    predecessors = tuple(
+        replace(
+            assessment,
+            owner=_owner_for_item(
+                item,
+                "step_predecessor:{0}:{1}:{2}".format(
+                    semantic_key, index, assessment.ref
+                ),
+            ),
+        )
+        for index, assessment in enumerate(judgment.predecessors)
+    )
+    return replace(
+        judgment,
+        predecessors=predecessors,
+        owner=_owner_for_item(
+            item, "step_judgment:{0}".format(semantic_key)
+        ),
+    )
+
+
+def _step_action_projection(
+    *,
+    item: FrontierItem,
+    semantic_key: str,
+    provider_judgment: CausalStepJudgment,
+    physical_requests_reserved: int,
+    physical_request_delta: int,
+    physical_request_exact: bool,
+) -> JsonDict:
+    if (
+        not semantic_key.startswith("step:{0}:".format(item.visit_key))
+        or provider_judgment.current_node_ref != item.node_ref
+    ):
+        raise ValueError(
+            "completed step Provider action contradicts its frontier visit"
+        )
+    for label, amount in (
+        ("physical_requests_reserved", physical_requests_reserved),
+        ("physical_request_delta", physical_request_delta),
+    ):
+        if type(amount) is not int or amount < 0:
+            raise ValueError(
+                "step action {0} must be a nonnegative integer".format(
+                    label
+                )
+            )
+    if type(physical_request_exact) is not bool:
+        raise ValueError(
+            "step action physical_request_exact must be boolean"
+        )
+    owned = _owned_step_judgment(
+        item, provider_judgment, semantic_key
+    )
+    relations = [
+        predecessor.to_dict()
+        for predecessor in owned.predecessors
+        if not (
+            owned.current_defect_status == "absent"
+            and predecessor.relation == "unknown"
+        )
+    ]
+    return {
+        "schema": STEP_ACTION_PROJECTION_SCHEMA,
+        "semantic_key": semantic_key,
+        "call_kind": "step",
+        "seed_binding_identity": item.seed_binding_identity,
+        "hypothesis_id": item.hypothesis_id,
+        "visit_key": item.visit_key,
+        "owner": owned.owner.to_dict(),
+        "physical_requests_reserved": physical_requests_reserved,
+        "physical_request_delta": physical_request_delta,
+        "physical_request_exact": physical_request_exact,
+        "provider_judgment": provider_judgment.to_dict(),
+        "step_judgment": owned.to_dict(),
+        "causal_relations": relations,
+    }
+
+
+def _step_action_projection_from_record(
+    record: Mapping[str, Any],
+    *,
+    item: FrontierItem,
+) -> JsonDict:
+    payload = record.get("payload")
+    if (
+        record.get("operation") != "provider_call_completed"
+        or not isinstance(payload, Mapping)
+        or payload.get("call_kind") != "step"
+        or payload.get("status") != "completed"
+    ):
+        raise ValueError(
+            "completed step Provider action is malformed or incomplete"
+        )
+    provider_judgment = CausalStepJudgment.from_dict(
+        dict(payload.get("judgment") or {})
+    )
+    return _step_action_projection(
+        item=item,
+        semantic_key=str(record.get("semantic_key") or ""),
+        provider_judgment=provider_judgment,
+        physical_requests_reserved=payload.get(
+            "physical_requests_reserved"
+        ),
+        physical_request_delta=payload.get("physical_request_delta"),
+        physical_request_exact=payload.get("physical_request_exact"),
+    )
+
+
+def _validated_step_action_projection(
+    value: Any,
+    *,
+    item: FrontierItem,
+) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("step action projection must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(STEP_ACTION_PROJECTION_KEYS),
+        "step action projection",
+    )
+    if value.get("schema") != STEP_ACTION_PROJECTION_SCHEMA:
+        raise ValueError("unsupported step action projection schema")
+    expected = _step_action_projection(
+        item=item,
+        semantic_key=str(value.get("semantic_key") or ""),
+        provider_judgment=CausalStepJudgment.from_dict(
+            dict(value.get("provider_judgment") or {})
+        ),
+        physical_requests_reserved=value.get(
+            "physical_requests_reserved"
+        ),
+        physical_request_delta=value.get("physical_request_delta"),
+        physical_request_exact=value.get("physical_request_exact"),
+    )
+    if stable_json(_checkpoint_json(value)) != stable_json(
+        _checkpoint_json(expected)
+    ):
+        raise ValueError(
+            "step action projection contradicts its canonical owner-bound "
+            "judgment"
+        )
+    return expected
+
+
 @dataclass
 class SeedAttributionBuilder:
     start_ref: str
@@ -2041,6 +2318,7 @@ class RecursiveAnalysisState:
     causal_candidates: List[CausalCandidate] = field(default_factory=list)
     causal_relations: List[PredecessorAssessment] = field(default_factory=list)
     step_judgments: List[CausalStepJudgment] = field(default_factory=list)
+    step_action_projection: List[JsonDict] = field(default_factory=list)
     introduction_candidates: List[CausalCandidate] = field(default_factory=list)
     introduction_bindings: List[JsonDict] = field(default_factory=list)
     introduction_binding_keys: Set[Tuple[str, str, str, str]] = field(default_factory=set)
@@ -2099,7 +2377,81 @@ class RecursiveAnalysisState:
             self.seed_count = len(self.seed_ledger)
         return builder
 
+    @staticmethod
+    def _confirmation_queue_key(
+        value: Mapping[str, Any],
+    ) -> Tuple[str, str, str, str]:
+        return (
+            str(value.get("hypothesis_id") or ""),
+            str(value.get("candidate_ref") or ""),
+            str(value.get("defect_fingerprint") or ""),
+            str(value.get("seed_binding_identity") or ""),
+        )
+
+    def _confirmation_artifact_envelopes(
+        self,
+        value: Mapping[str, Any],
+    ) -> List[JsonDict]:
+        candidate_ref = str(value.get("candidate_ref") or "")
+        path = tuple(
+            str(ref) for ref in value.get("recursive_path") or ()
+        )
+        path_refs = set(path)
+        output: List[JsonDict] = []
+        candidate_artifacts = self.graph.artifact_hydration_manifest(
+            candidate_ref
+        ).get("referenced_artifact_ids") or ()
+        for ref in _dedupe_strings(
+            [
+                *(value.get("checked_evidence_refs") or ()),
+                *(
+                    "artifact:{0}".format(artifact_id)
+                    for artifact_id in candidate_artifacts
+                ),
+            ]
+        ):
+            if self.graph.resolve(ref) in self.graph.nodes:
+                if not self.graph.active_revision_evidence_eligible(ref):
+                    raise ValueError(
+                        "confirmation evidence is ineligible for the active "
+                        "revision: {0}".format(ref)
+                    )
+                continue
+            if self.graph.artifact_reference_status(ref) is None:
+                raise ValueError(
+                    "confirmation artifact evidence is unresolved: {0}".format(
+                        ref
+                    )
+                )
+            active_owners = self.graph.artifact_active_owner_refs(ref)
+            path_owners = [
+                owner for owner in active_owners if owner in path_refs
+            ]
+            if candidate_ref in path_owners:
+                expected_owner_ref = candidate_ref
+            elif len(path_owners) == 1:
+                expected_owner_ref = path_owners[0]
+            elif not path_owners:
+                raise ValueError(
+                    "confirmation artifact evidence has no active owner on "
+                    "the candidate path: {0}".format(ref)
+                )
+            else:
+                raise ValueError(
+                    "confirmation artifact evidence has ambiguous owners on "
+                    "the candidate path: {0}".format(ref)
+                )
+            output.append(
+                self.graph.artifact_evidence_envelope(
+                    ref,
+                    fact_kind="supporting_evidence",
+                    expected_owner_ref=expected_owner_ref,
+                )
+            )
+        return output
+
     def enqueue_confirmation(self, value: Mapping[str, Any]) -> bool:
+        self.validate_confirmation_queue_bound()
         candidate_ref = str(value.get("candidate_ref") or "")
         hypothesis_id = str(value.get("hypothesis_id") or "")
         defect_fingerprint = str(value.get("defect_fingerprint") or "")
@@ -2139,19 +2491,25 @@ class RecursiveAnalysisState:
             )
         ):
             return False
-        if any(
-            not self.graph.active_revision_evidence_reference_eligible(ref)
-            for ref in checked_evidence_refs
-        ):
+        try:
+            self._confirmation_artifact_envelopes(value)
+        except ValueError:
             return False
-        queue_key = (
-            hypothesis_id,
-            candidate_ref,
-            defect_fingerprint,
-            seed_binding_identity,
-        )
+        queue_key = self._confirmation_queue_key(value)
         if queue_key in self.confirmation_queue_keys:
             return False
+        semantic_identity = str(value.get("semantic_identity") or "")
+        if not semantic_identity:
+            raise ValueError(
+                "confirmation queue semantic identity is required"
+            )
+        if any(
+            str(item.get("semantic_identity") or "") == semantic_identity
+            for item in self.confirmation_queue
+        ):
+            raise ValueError(
+                "confirmation queue contains a duplicate semantic identity"
+            )
         same_seed_candidates = {
             str(item.get("candidate_ref") or "")
             for item in self.confirmation_queue
@@ -2162,12 +2520,18 @@ class RecursiveAnalysisState:
             return False
         if len(same_seed_candidates) >= MAX_ROOT_CONFIRMATION_CANDIDATES:
             return False
+        queued = copy.deepcopy(dict(value))
+        queued["artifact_evidence_envelopes"] = (
+            self._confirmation_artifact_envelopes(queued)
+        )
         self.confirmation_queue_keys.add(queue_key)
-        self.confirmation_queue.append(copy.deepcopy(dict(value)))
+        self.confirmation_queue.append(queued)
         return True
 
     def validate_confirmation_queue_bound(self) -> None:
         candidates_by_seed: Dict[str, Set[str]] = {}
+        canonical_keys: List[Tuple[str, str, str, str]] = []
+        semantic_identities: Set[str] = set()
         for item in self.confirmation_queue:
             seed_binding_identity = str(
                 item.get("seed_binding_identity") or ""
@@ -2209,18 +2573,56 @@ class RecursiveAnalysisState:
                     "restored confirmation queue path contains evidence ineligible for the active revision"
                 )
             if any(
-                not self.graph.active_revision_evidence_reference_eligible(ref)
+                self.graph.resolve(ref) in self.graph.nodes
+                and not self.graph.active_revision_evidence_eligible(ref)
                 for ref in checked_evidence_refs
             ):
                 raise ValueError(
                     "restored confirmation queue contains evidence ineligible for the active revision"
                 )
+            expected_artifacts = self._confirmation_artifact_envelopes(item)
+            actual_artifacts = item.get("artifact_evidence_envelopes")
+            if (
+                not isinstance(actual_artifacts, list)
+                or stable_json(_checkpoint_json(actual_artifacts))
+                != stable_json(_checkpoint_json(expected_artifacts))
+            ):
+                raise ValueError(
+                    "confirmation queue artifact owner envelope contradicts "
+                    "the active graph"
+                )
+            semantic_identity = str(
+                item.get("semantic_identity") or ""
+            )
+            if (
+                not semantic_identity
+                or semantic_identity in semantic_identities
+            ):
+                raise ValueError(
+                    "confirmation queue contains a missing or duplicate "
+                    "semantic identity"
+                )
+            semantic_identities.add(semantic_identity)
+            canonical_keys.append(self._confirmation_queue_key(item))
             candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
+            if candidate_ref in candidates:
+                raise ValueError(
+                    "confirmation queue contains a duplicate candidate for "
+                    "one seed"
+                )
             candidates.add(candidate_ref)
             if len(candidates) > MAX_ROOT_CONFIRMATION_CANDIDATES:
                 raise ValueError(
                     "restored confirmation queue exceeds three candidates per seed"
                 )
+        if (
+            len(canonical_keys) != len(set(canonical_keys))
+            or set(canonical_keys) != self.confirmation_queue_keys
+        ):
+            raise ValueError(
+                "confirmation queue entries and persisted key set must "
+                "bijectively match"
+            )
 
     def _seed_builder_for_item(
         self, item: FrontierItem
@@ -2299,10 +2701,23 @@ class RecursiveAnalysisState:
     ) -> FrontierItem:
         if judgment.owner is None:
             raise ValueError("{0} is ownerless".format(label))
+        semantic_keys = [
+            str(projection.get("semantic_key") or "")
+            for projection in self.step_action_projection
+            if isinstance(projection, Mapping)
+            and projection.get("owner") == judgment.owner.to_dict()
+        ]
+        if len(semantic_keys) != 1 or not semantic_keys[0]:
+            raise ValueError(
+                "{0} has no unique completed Provider action owner".format(
+                    label
+                )
+            )
+        semantic_key = semantic_keys[0]
         item = self._owner_item(
             judgment.owner,
             label=label,
-            occurrence_key="step_judgment",
+            occurrence_key="step_judgment:{0}".format(semantic_key),
         )
         if item.node_ref != judgment.current_node_ref:
             raise ValueError(
@@ -2314,8 +2729,8 @@ class RecursiveAnalysisState:
             owned_item = self._owner_item(
                 assessment.owner,
                 label="{0} predecessor".format(label),
-                occurrence_key="step_predecessor:{0}:{1}".format(
-                    index, assessment.ref
+                occurrence_key="step_predecessor:{0}:{1}:{2}".format(
+                    semantic_key, index, assessment.ref
                 ),
             )
             if owned_item != item:
@@ -2500,13 +2915,17 @@ class RecursiveAnalysisState:
             expected_expansion = []
             if judgment:
                 owner = LocalStateOwner.from_dict(judgment.get("owner"))
-                owner_key = stable_json(owner.to_dict())
-                action = passes_by_owner.get(owner_key)
-                if action is None:
+                pass_identity = _global_pass_identity(builder.key)
+                action = passes_by_owner.get(pass_identity)
+                if action is None or action.get("status") != "completed":
                     raise ValueError(
                         "seed global judgment has no completed pass action"
                     )
-                matched_pass_owners.add(owner_key)
+                if owner != _global_pass_owner(builder):
+                    raise ValueError(
+                        "seed global judgment owner contradicts canonical pass"
+                    )
+                matched_pass_owners.add(pass_identity)
                 persisted_judgment = {
                     key: copy.deepcopy(value)
                     for key, value in judgment.items()
@@ -2602,9 +3021,31 @@ class RecursiveAnalysisState:
                 label="seed expansion history",
             )
 
+            failure = passes_by_owner.get(
+                _global_pass_identity(builder.key)
+            )
+            if failure is not None and failure.get("status") == "failed":
+                blocker = str(failure.get("blocker") or "")
+                if (
+                    blocker not in builder.blocking_reasons
+                    or not any(
+                        isinstance(branch, Mapping)
+                        and branch.get("global_pass_identity")
+                        == failure.get("pass_identity")
+                        and branch.get("reason") == blocker
+                        for branch in self.unresolved_branches
+                    )
+                ):
+                    raise ValueError(
+                        "failed global pass action has no bijective unresolved episode"
+                    )
+                matched_pass_owners.add(
+                    str(failure.get("pass_identity") or "")
+                )
+
         if matched_pass_owners != set(passes_by_owner):
             raise ValueError(
-                "completed global pass action has no unique seed judgment"
+                "global pass action has no unique seed judgment or failure episode"
             )
 
         journal_entries = []
@@ -2630,6 +3071,7 @@ class RecursiveAnalysisState:
             "owner",
             "recursive_path",
             "status",
+            "artifact_evidence_envelopes",
             "confirmation",
         )
         for entry in journal_entries:
@@ -2679,6 +3121,10 @@ class RecursiveAnalysisState:
                     physical_request_exact=entry.get(
                         "physical_request_exact"
                     ),
+                    artifact_evidence_envelopes=entry.get(
+                        "artifact_evidence_envelopes"
+                    )
+                    or (),
                 )
             )
             expected = expected_decisive_evidence.get(
@@ -2781,6 +3227,8 @@ class RecursiveAnalysisState:
         self,
         action_records: Optional[Iterable[Any]] = None,
     ) -> None:
+        if action_records is not None:
+            action_records = tuple(action_records)
         items_by_visit = self._frontier_items_by_visit()
         for visit_key in (
             set(self.visit_evidence)
@@ -2793,24 +3241,20 @@ class RecursiveAnalysisState:
                     "local visit state owner has no frontier action entry"
                 )
 
-        judgments_by_visit = {}
         judgment_occurrences = set()
         predecessor_occurrences = set()
+        predecessors_by_occurrence = {}
         expected_nested_relations = []
         for index, judgment in enumerate(self.step_judgments):
             item = self._validate_step_judgment_owner(
                 judgment,
                 label="step judgment[{0}]".format(index),
             )
-            if (
-                judgment.owner.occurrence_identity in judgment_occurrences
-                or item.visit_key in judgments_by_visit
-            ):
+            if judgment.owner.occurrence_identity in judgment_occurrences:
                 raise ValueError(
                     "step judgments contain a duplicate local occurrence"
                 )
             judgment_occurrences.add(judgment.owner.occurrence_identity)
-            judgments_by_visit[item.visit_key] = judgment
             for predecessor in judgment.predecessors:
                 if predecessor.owner is None:
                     raise ValueError(
@@ -2822,6 +3266,7 @@ class RecursiveAnalysisState:
                         "step judgment predecessors contain a duplicate local occurrence"
                     )
                 predecessor_occurrences.add(occurrence)
+                predecessors_by_occurrence[occurrence] = predecessor
                 if not (
                     judgment.current_defect_status == "absent"
                     and predecessor.relation == "unknown"
@@ -2841,16 +3286,11 @@ class RecursiveAnalysisState:
                     "causal relations contain a duplicate local occurrence"
                 )
             relation_occurrences.add(owner.occurrence_identity)
-            source_judgment = judgments_by_visit.get(owner.visit_key)
-            if source_judgment is not None:
-                matches = [
-                    (position, predecessor)
-                    for position, predecessor in enumerate(
-                        source_judgment.predecessors
-                    )
-                    if predecessor == assessment
-                ]
-                if len(matches) != 1:
+            source_predecessor = predecessors_by_occurrence.get(
+                owner.occurrence_identity
+            )
+            if source_predecessor is not None:
+                if source_predecessor != assessment:
                     raise ValueError(
                         "causal relation[{0}] owner contradicts step judgment".format(
                             index
@@ -2883,6 +3323,77 @@ class RecursiveAnalysisState:
             label="step predecessor causal relation",
         )
 
+        canonical_step_projections = []
+        for value in self.step_action_projection:
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    "step action projection entry must be an object"
+                )
+            item = items_by_visit.get(str(value.get("visit_key") or ""))
+            if item is None:
+                raise ValueError(
+                    "step action projection has no frontier visit"
+                )
+            canonical_step_projections.append(
+                _validated_step_action_projection(value, item=item)
+            )
+        _require_canonical_bijection(
+            (
+                projection["step_judgment"]
+                for projection in canonical_step_projections
+            ),
+            (judgment.to_dict() for judgment in self.step_judgments),
+            label="step judgments from completed Provider actions",
+        )
+        _require_canonical_bijection(
+            (
+                relation
+                for projection in canonical_step_projections
+                for relation in projection["causal_relations"]
+            ),
+            actual_nested_relations,
+            label="step causal relations from completed Provider actions",
+        )
+        if action_records is not None:
+            authoritative_step_projections = []
+            for record in action_records:
+                if (
+                    not isinstance(record, Mapping)
+                    or record.get("operation")
+                    != "provider_call_completed"
+                    or not isinstance(record.get("payload"), Mapping)
+                    or record["payload"].get("call_kind") != "step"
+                ):
+                    continue
+                visit_key = str(
+                    record["payload"].get("visit_key") or ""
+                )
+                item = items_by_visit.get(visit_key)
+                if item is None:
+                    raise ValueError(
+                        "completed step Provider action has no frontier visit"
+                    )
+                builder = self.seed_ledger.get(
+                    item.seed_binding_identity
+                )
+                if (
+                    builder is not None
+                    and "start_ref_active_revision_ineligible"
+                    in builder.blocking_reasons
+                ):
+                    continue
+                authoritative_step_projections.append(
+                    _step_action_projection_from_record(
+                        record,
+                        item=item,
+                    )
+                )
+            _require_canonical_bijection(
+                authoritative_step_projections,
+                canonical_step_projections,
+                label="completed step Provider actions",
+            )
+
         for index, entry in enumerate(self.visited_entries):
             owner = LocalStateOwner.from_dict(entry.get("owner"))
             item = self._owner_item(
@@ -2912,22 +3423,19 @@ class RecursiveAnalysisState:
                 "seed_ref"
             ):
                 owner = LocalStateOwner.from_dict(entry.get("owner"))
-                item = self._owner_item(
-                    owner,
-                    label="global candidate pass[{0}]".format(index),
-                    occurrence_key="global_candidate_pass",
+                seed_binding_identity = str(
+                    entry.get("seed_binding_identity") or ""
                 )
+                builder = self.seed_ledger.get(seed_binding_identity)
                 if (
-                    str(entry.get("hypothesis_id") or "")
-                    not in {"", item.hypothesis_id}
-                    or str(entry.get("visit_key") or "")
-                    not in {"", item.visit_key}
+                    builder is None
+                    or owner != _global_pass_owner(builder)
                     or str(entry.get("seed_ref") or "")
-                    != (
-                        item.downstream_path[-1]
-                        if item.downstream_path
-                        else item.node_ref
-                    )
+                    != builder.start_ref
+                    or str(entry.get("defect_fingerprint") or "")
+                    != builder.defect_state.fingerprint
+                    or str(entry.get("pass_identity") or "")
+                    != _global_pass_identity(builder.key)
                 ):
                     raise ValueError(
                         "global candidate pass owner contradicts action identity"
@@ -2983,12 +3491,7 @@ class RecursiveAnalysisState:
                 owner = LocalStateOwner.from_dict(
                     builder.global_judgment.get("owner")
                 )
-                self._owner_item(
-                    owner,
-                    label="seed global judgment",
-                    occurrence_key="global_candidate_pass",
-                )
-                if owner.seed_binding_identity != builder.key:
+                if owner != _global_pass_owner(builder):
                     raise ValueError(
                         "seed global judgment owner contradicts seed ledger"
                     )
@@ -3003,11 +3506,7 @@ class RecursiveAnalysisState:
                         raise ValueError(
                             "{0} owner contradicts seed ledger".format(label)
                         )
-                    valid = bool(
-                        item is not None
-                        and owner
-                        == _owner_for_item(item, "global_candidate_pass")
-                    )
+                    valid = owner == _global_pass_owner(builder)
                     if not valid:
                         valid = any(
                             LocalStateOwner.from_dict(action.get("owner"))
@@ -3039,7 +3538,15 @@ class RecursiveAnalysisState:
         analysis_perspective: str,
         max_hypotheses: int = 24,
     ) -> "RecursiveAnalysisState":
-        resolved_starts = _dedupe_strings(graph.resolve(ref) or ref for ref in start_refs)
+        resolved_starts = _dedupe_strings(
+            resolved
+            for ref in start_refs
+            for resolved in (graph.resolve(ref) or str(ref),)
+            if (
+                graph.active_revision_start_eligible(resolved)
+                or not graph.active_revision_evidence_eligible(resolved)
+            )
+        )
         state = cls(
             graph=graph,
             start_refs=resolved_starts,
@@ -3076,7 +3583,7 @@ class RecursiveAnalysisState:
                     seed_key=builder.key,
                 )
                 continue
-            if not graph.active_revision_evidence_eligible(start_ref):
+            if not graph.active_revision_start_eligible(start_ref):
                 state._mark_seed_unresolved(
                     start_ref,
                     "start_ref_active_revision_ineligible",
@@ -3304,6 +3811,9 @@ class RecursiveAnalysisState:
             "causal_candidates": [item.to_dict() for item in self.causal_candidates],
             "causal_relations": [item.to_dict() for item in self.causal_relations],
             "step_judgments": [item.to_dict() for item in self.step_judgments],
+            "step_action_projection": _checkpoint_json(
+                self.step_action_projection
+            ),
             "introduction_candidates": [item.to_dict() for item in self.introduction_candidates],
             "introduction_bindings": _checkpoint_json(self.introduction_bindings),
             "contributing_conditions": [item.to_dict() for item in self.contributing_conditions],
@@ -3410,10 +3920,23 @@ class RecursiveAnalysisState:
             raise ValueError("unsupported recursive hypothesis state schema")
         if action_payload["schema"] != ACTION_STATE_SCHEMA:
             raise ValueError("unsupported recursive action state schema")
+        formal_unbound_start_refs = {
+            graph.resolve(str(ref)) or str(ref)
+            for ref in action_payload["start_refs"]
+            if graph.active_revision_evidence_eligible(str(ref))
+            and not graph.active_revision_start_eligible(str(ref))
+        }
+        if formal_unbound_start_refs:
+            raise ValueError(
+                "checkpoint contains an analysis start without strict "
+                "active-start provenance: {0}".format(
+                    sorted(formal_unbound_start_refs)
+                )
+            )
         stale_start_refs = {
             graph.resolve(str(ref)) or str(ref)
             for ref in action_payload["start_refs"]
-            if not graph.active_revision_evidence_eligible(str(ref))
+            if not graph.active_revision_start_eligible(str(ref))
         }
         stale_seed_keys = {
             _seed_ledger_key(
@@ -3536,6 +4059,26 @@ class RecursiveAnalysisState:
             if judgment.owner is not None
             and judgment.owner.seed_binding_identity not in stale_seed_keys
         ]
+        state.step_action_projection = []
+        items_by_visit = state._frontier_items_by_visit()
+        for value in action_payload["step_action_projection"]:
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    "restored step action projection must be an object"
+                )
+            seed_binding_identity = str(
+                value.get("seed_binding_identity") or ""
+            )
+            if seed_binding_identity in stale_seed_keys:
+                continue
+            item = items_by_visit.get(str(value.get("visit_key") or ""))
+            if item is None:
+                raise ValueError(
+                    "restored step action projection has no frontier visit"
+                )
+            state.step_action_projection.append(
+                _validated_step_action_projection(value, item=item)
+            )
         state.introduction_candidates = [
             candidate
             for candidate in (
@@ -4149,6 +4692,33 @@ class RecursiveAnalysisState:
             stable_json(judgment.to_dict()).encode("utf-8")
         ).hexdigest()
 
+    def record_completed_step_projection(
+        self,
+        item: FrontierItem,
+        projection: Mapping[str, Any],
+    ) -> None:
+        canonical = _validated_step_action_projection(
+            projection,
+            item=item,
+        )
+        if any(
+            existing.get("semantic_key") == canonical["semantic_key"]
+            for existing in self.step_action_projection
+            if isinstance(existing, Mapping)
+        ):
+            raise ValueError(
+                "completed step Provider action has duplicate semantic key"
+            )
+        judgment = CausalStepJudgment.from_dict(
+            canonical["step_judgment"]
+        )
+        self.step_action_projection.append(canonical)
+        self.step_judgments.append(judgment)
+        self.causal_relations.extend(
+            PredecessorAssessment.from_dict(relation)
+            for relation in canonical["causal_relations"]
+        )
+
     def complete_rejudge(
         self,
         item: FrontierItem,
@@ -4219,6 +4789,7 @@ class RecursiveAnalysisState:
         item: FrontierItem,
         judgment: CausalStepJudgment,
         *,
+        provider_action_key: str,
         graph_position: Any,
         max_hypotheses: int,
     ) -> None:
@@ -4235,22 +4806,16 @@ class RecursiveAnalysisState:
                 item, "discarded:{0}".format(hypothesis.status)
             )
             return
-        owned_predecessors = tuple(
-            replace(
-                assessment,
-                owner=_owner_for_item(
-                    item,
-                    "step_predecessor:{0}:{1}".format(index, assessment.ref),
-                ),
+        judgment = _owned_step_judgment(
+            item, judgment, provider_action_key
+        )
+        if not any(
+            existing == judgment for existing in self.step_judgments
+        ):
+            raise ValueError(
+                "step state transition has no completed Provider action "
+                "projection"
             )
-            for index, assessment in enumerate(judgment.predecessors)
-        )
-        judgment = replace(
-            judgment,
-            predecessors=owned_predecessors,
-            owner=_owner_for_item(item, "step_judgment"),
-        )
-        self.step_judgments.append(judgment)
         self.visited_order.append(item.node_ref)
         self.visited_entries.append(
             {
@@ -4334,11 +4899,6 @@ class RecursiveAnalysisState:
 
         declared_recursive = False
         for assessment in judgment.predecessors:
-            if not (
-                judgment.current_defect_status == "absent"
-                and assessment.relation == "unknown"
-            ):
-                self.causal_relations.append(assessment)
             if assessment.relation == "contributing_condition" and not assessment.recurse:
                 continue
             if assessment.relation in {"unrelated", "unknown"}:
@@ -4647,6 +5207,8 @@ class RecursiveAnalysisState:
 
     def build_report(self, *, judge: CausalJudge) -> RecursiveAttributionReport:
         self.finalize_pending_rejudges()
+        self.validate_confirmation_queue_bound()
+        self._validate_local_state_owners()
         self._suppress_roots_for_conservative_seed_outcomes()
         hypotheses = [AttributionHypothesis.from_dict(item) for item in self.ledger.snapshot()]
         by_id = {item.hypothesis_id: item for item in hypotheses}
@@ -4701,6 +5263,9 @@ class RecursiveAnalysisState:
         completed_global_passes = [
             item for item in global_passes if item.get("status") == "completed"
         ]
+        failed_global_passes = [
+            item for item in global_passes if item.get("status") == "failed"
+        ]
         expansion_reasons = []
         for item in completed_global_passes:
             judgment = item.get("judgment")
@@ -4742,13 +5307,22 @@ class RecursiveAnalysisState:
             "provider_circuit": provider,
             "independent_confirmation": "completed",
             "confirmation_queue": list(self.confirmation_queue),
+            "confirmation_queue_keys": [
+                list(item)
+                for item in sorted(self.confirmation_queue_keys)
+            ],
             "confirmation_journal": list(self.confirmation_journal),
             "confirmation_action_projection": copy.deepcopy(
                 self.confirmation_action_projection
             ),
+            "step_action_projection": copy.deepcopy(
+                self.step_action_projection
+            ),
             "logical_confirmation_call_count": self.logical_confirmation_calls,
             "fusion_mode": "retrieval-global" if global_passes else "off",
-            "global_candidate_pass_count": len(completed_global_passes),
+            "global_candidate_pass_count": len(
+                completed_global_passes
+            ) + len(failed_global_passes),
             "global_candidate_judgments": [
                 {
                     **copy.deepcopy(item.get("judgment")),
@@ -4766,9 +5340,29 @@ class RecursiveAnalysisState:
                 if isinstance(item.get("candidate_compression"), Mapping)
             ],
             "recursive_expansion_reasons": expansion_reasons,
+            "global_candidate_failures": [
+                {
+                    key: copy.deepcopy(item.get(key))
+                    for key in (
+                        "pass_identity",
+                        "seed_binding_identity",
+                        "seed_ref",
+                        "defect_fingerprint",
+                        "owner",
+                        "blocker",
+                        "reason",
+                        "missing_evidence",
+                        "physical_request_delta",
+                    )
+                }
+                for item in failed_global_passes
+            ],
             "global_judge_physical_request_count": sum(
                 int(item.get("physical_request_delta") or 0)
-                for item in completed_global_passes
+                for item in (
+                    *completed_global_passes,
+                    *failed_global_passes,
+                )
             ),
         }
         return RecursiveAttributionReport(
@@ -5009,6 +5603,10 @@ class AgenticRecursiveAnalyzer:
             physical_requests_reserved=physical_requests_reserved,
             physical_request_delta=physical_request_delta,
             physical_request_exact=physical_request_exact,
+            artifact_evidence_envelopes=queued.get(
+                "artifact_evidence_envelopes"
+            )
+            or (),
         )
         payload = {
             "status": confirmation.status,
@@ -5074,51 +5672,122 @@ class AgenticRecursiveAnalyzer:
     ) -> None:
         if self.fusion_mode != "retrieval-global":
             return
-        if not isinstance(self.judge, GlobalJudgeCapability):
-            state.investigation_journal.append(
-                {
-                    "kind": "global_candidate_pass",
-                    "status": "fallback_recursive",
-                    "reason": "judge_missing_global_capability",
-                    "behavior_impact": "none_offline_analysis_only",
-                }
-            )
-            return
-
-        completed_seed_visits = {
-            (
-                str(event.get("hypothesis_id") or ""),
-                str(event.get("defect_fingerprint") or ""),
-            )
+        terminal_pass_identities = {
+            str(event.get("pass_identity") or "")
             for event in state.investigation_journal
             if isinstance(event, Mapping)
             and event.get("kind") == "global_candidate_pass"
-            and event.get("status") == "completed"
+            and event.get("status") in {"completed", "failed"}
         }
-
         queued_items = [
             FrontierItem.from_dict(item) for item in state.frontier.snapshot()
         ]
+        items_by_seed: Dict[str, List[FrontierItem]] = {}
         for item in queued_items:
-            seed_visit = (item.hypothesis_id, item.defect_state.fingerprint)
-            if seed_visit in completed_seed_visits:
+            builder = state._seed_builder_for_item(item)
+            if builder is not None:
+                items_by_seed.setdefault(builder.key, []).append(item)
+
+        def fail_seed(
+            *,
+            builder: SeedAttributionBuilder,
+            items: Sequence[FrontierItem],
+            blocker: str,
+            detail: str,
+            physical_request_delta: int = 0,
+            candidate_compression: Optional[Mapping[str, Any]] = None,
+        ) -> None:
+            pass_identity = _global_pass_identity(builder.key)
+            owner = _global_pass_owner(builder)
+            event = {
+                "kind": "global_candidate_pass",
+                "status": "failed",
+                "pass_identity": pass_identity,
+                "seed_binding_identity": builder.key,
+                "seed_ref": builder.start_ref,
+                "defect_fingerprint": builder.defect_state.fingerprint,
+                "hypothesis_id": (
+                    items[0].hypothesis_id if items else ""
+                ),
+                "visit_key": items[0].visit_key if items else "",
+                "owner": owner.to_dict(),
+                "blocker": blocker,
+                "reason": detail,
+                "missing_evidence": [detail],
+                "physical_request_delta": physical_request_delta,
+                "candidate_compression": copy.deepcopy(
+                    dict(candidate_compression or {})
+                ),
+                "behavior_impact": "none_offline_analysis_only",
+            }
+            state.investigation_journal.append(event)
+            builder.mark_unresolved(blocker, detail)
+            state.unresolved_refs.append(builder.start_ref)
+            state.unresolved_branches.append(
+                {
+                    "node_ref": builder.start_ref,
+                    "defect_state_id": builder.defect_state.defect_state_id,
+                    "hypothesis_id": "",
+                    "reason": blocker,
+                    "details": detail,
+                    "depth": 0,
+                    "global_pass_identity": pass_identity,
+                    "owner": owner.to_dict(),
+                }
+            )
+            for failed_item in items:
+                hypothesis = state.ledger.get(failed_item.hypothesis_id)
+                if hypothesis.status in {"active", "supported"}:
+                    state.ledger.reject_with_frontier(
+                        hypothesis.hypothesis_id,
+                        detail,
+                        opposing_refs=(),
+                        frontier=state.frontier,
+                        evidence_hash=pass_identity,
+                    )
+                state.unresolved_hypothesis_ids.add(
+                    failed_item.hypothesis_id
+                )
+
+        for seed_key, seed_items in items_by_seed.items():
+            builder = state.seed_ledger[seed_key]
+            pass_identity = _global_pass_identity(seed_key)
+            if pass_identity in terminal_pass_identities:
+                continue
+            item = seed_items[0]
+            active_seed_ref = builder.start_ref
+            if not isinstance(self.judge, GlobalJudgeCapability):
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_judge_capability_missing",
+                    detail=(
+                        "retrieval-global is enabled but the Judge exposes no "
+                        "global candidate capability."
+                    ),
+                )
+                terminal_pass_identities.add(pass_identity)
                 continue
             node = graph.nodes.get(item.node_ref)
-            active_seed_ref = (
-                graph.resolve(item.downstream_path[-1])
-                or item.downstream_path[-1]
-            )
             if (
                 node is None
-                or not graph.analysis_start_eligible(item.node_ref)
                 or not graph.active_revision_evidence_eligible(item.node_ref)
-                or not graph.active_revision_evidence_eligible(active_seed_ref)
+                or not graph.active_revision_start_eligible(active_seed_ref)
             ):
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_seed_active_start_ineligible",
+                    detail=(
+                        "The enabled global pass seed lacks strict active-start "
+                        "provenance."
+                    ),
+                )
+                terminal_pass_identities.add(pass_identity)
                 continue
             hypothesis = state.ledger.get(item.hypothesis_id)
             if hypothesis.status not in {"active", "supported"}:
                 continue
-            local_owner = _owner_for_item(item, "global_candidate_pass")
             try:
                 candidates, paths = self._global_candidate_pool(
                     state, graph, item
@@ -5130,70 +5799,97 @@ class AgenticRecursiveAnalyzer:
                     downstream_paths=paths,
                     start_refs=(active_seed_ref,),
                 )
+                if not capsules:
+                    raise ValueError("candidate evidence capsules are empty")
             except Exception as exc:
-                state.investigation_journal.append(
-                    {
-                        "kind": "global_candidate_pass",
-                        "status": "fallback_recursive",
-                        "seed_ref": active_seed_ref,
-                        "owner": local_owner.to_dict(),
-                        "reason": "capsule_build_error: {0}: {1}".format(
-                            type(exc).__name__, exc
-                        ),
-                        "behavior_impact": "none_offline_analysis_only",
-                    }
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_candidate_capsule_failure",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
                 )
-                continue
-            if not capsules:
-                state.investigation_journal.append(
-                    {
-                        "kind": "global_candidate_pass",
-                        "status": "fallback_recursive",
-                        "seed_ref": active_seed_ref,
-                        "owner": local_owner.to_dict(),
-                        "reason": "candidate_evidence_capsules_empty",
-                        "behavior_impact": "none_offline_analysis_only",
-                    }
-                )
+                terminal_pass_identities.add(pass_identity)
                 continue
             for candidate in candidates:
                 state._remember_candidate(candidate)
             metrics = candidate_compression_metrics(graph, capsules)
-            request = GlobalCandidateJudgeRequest(
-                case_id=graph.case_id,
-                objective=state.objective,
-                analysis_perspective=state.analysis_perspective,
-                seed_ref=active_seed_ref,
-                active_defect=item.defect_state,
-                active_focus_text=item.defect_state.actual,
-                active_focus_text_hash=active_focus_text_sha256(
-                    item.defect_state.actual
-                ),
-                start_refs=(active_seed_ref,),
-                capsules=capsules,
-                trace_health={
-                    "missing_artifact_count": sum(
-                        len(capsule.missing_evidence_refs) for capsule in capsules
+            try:
+                request = GlobalCandidateJudgeRequest(
+                    case_id=graph.case_id,
+                    objective=state.objective,
+                    analysis_perspective=state.analysis_perspective,
+                    seed_ref=active_seed_ref,
+                    active_defect=builder.defect_state,
+                    active_focus_text=builder.defect_state.actual,
+                    active_focus_text_hash=active_focus_text_sha256(
+                        builder.defect_state.actual
                     ),
-                    "candidate_compression": metrics,
-                },
+                    start_refs=(active_seed_ref,),
+                    capsules=capsules,
+                    trace_health={
+                        "missing_artifact_count": sum(
+                            len(capsule.missing_evidence_refs)
+                            for capsule in capsules
+                        ),
+                        "candidate_compression": metrics,
+                    },
+                )
+                validate_global_candidate_request_against_graph(
+                    graph,
+                    request,
+                    authoritative_candidates=candidates,
+                )
+            except Exception as exc:
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_request_validation_failure",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    candidate_compression=metrics,
+                )
+                terminal_pass_identities.add(pass_identity)
+                continue
+            remaining = max(
+                0, self.max_judge_requests - state.judge_requests
             )
-            validate_global_candidate_request_against_graph(
-                graph,
-                request,
-                authoritative_candidates=candidates,
-            )
-            remaining = max(0, self.max_judge_requests - state.judge_requests)
             self._checkpoint_state(
-                state, "global:before:{0}".format(item.visit_key)
+                state, "global:before:{0}".format(pass_identity)
             )
+            state.logical_judge_calls += 1
             try:
                 result = self.judge.judge_candidates_bounded(
                     request, max_physical_requests=remaining
                 )
+            except BoundedJudgeCallError as exc:
+                state.judge_requests += exc.physical_requests
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_judge_bounded_failure",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_delta=exc.physical_requests,
+                    candidate_compression=metrics,
+                )
+                terminal_pass_identities.add(pass_identity)
+                continue
+            except Exception as exc:
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_judge_bounded_failure",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    candidate_compression=metrics,
+                )
+                terminal_pass_identities.add(pass_identity)
+                continue
+            try:
                 if not isinstance(result, BoundedJudgeCallResult):
                     raise TypeError(
                         "global Judge must return BoundedJudgeCallResult"
+                    )
+                if result.physical_requests > remaining:
+                    raise ValueError(
+                        "global Judge exceeded its physical request allowance"
                     )
                 judgment = result.value
                 if not isinstance(judgment, GlobalCandidateJudgment):
@@ -5204,47 +5900,35 @@ class AgenticRecursiveAnalyzer:
                 judgment = validate_global_candidate_payload(
                     judgment.to_dict(), request=request
                 )
-                state.logical_judge_calls += 1
-                state.judge_requests += result.physical_requests
-            except BoundedJudgeCallError as exc:
-                state.judge_requests += exc.physical_requests
-                state.investigation_journal.append(
-                    {
-                        "kind": "global_candidate_pass",
-                        "status": "fallback_recursive",
-                        "seed_ref": active_seed_ref,
-                        "owner": local_owner.to_dict(),
-                        "reason": "global_judge_error: {0}".format(exc),
-                        "physical_request_delta": exc.physical_requests,
-                        "candidate_compression": metrics,
-                        "behavior_impact": "none_offline_analysis_only",
-                    }
-                )
-                continue
             except Exception as exc:
-                state.investigation_journal.append(
-                    {
-                        "kind": "global_candidate_pass",
-                        "status": "fallback_recursive",
-                        "seed_ref": active_seed_ref,
-                        "owner": local_owner.to_dict(),
-                        "reason": "global_judge_error: {0}: {1}".format(
-                            type(exc).__name__, exc
-                        ),
-                        "physical_request_delta": 0,
-                        "candidate_compression": metrics,
-                        "behavior_impact": "none_offline_analysis_only",
-                    }
+                physical_delta = (
+                    result.physical_requests
+                    if isinstance(result, BoundedJudgeCallResult)
+                    else 0
                 )
+                state.judge_requests += physical_delta
+                fail_seed(
+                    builder=builder,
+                    items=seed_items,
+                    blocker="global_judge_output_invalid",
+                    detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_delta=physical_delta,
+                    candidate_compression=metrics,
+                )
+                terminal_pass_identities.add(pass_identity)
                 continue
+            state.judge_requests += result.physical_requests
+            owner = _global_pass_owner(builder)
             event = {
                 "kind": "global_candidate_pass",
                 "status": "completed",
+                "pass_identity": pass_identity,
+                "seed_binding_identity": builder.key,
                 "seed_ref": active_seed_ref,
+                "defect_fingerprint": builder.defect_state.fingerprint,
                 "hypothesis_id": item.hypothesis_id,
-                "defect_fingerprint": item.defect_state.fingerprint,
                 "visit_key": item.visit_key,
-                "owner": local_owner.to_dict(),
+                "owner": owner.to_dict(),
                 "physical_request_delta": result.physical_requests,
                 "candidate_compression": metrics,
                 "candidate_evidence_capsules": [
@@ -5254,6 +5938,7 @@ class AgenticRecursiveAnalyzer:
                 "behavior_impact": "none_offline_analysis_only",
             }
             state.investigation_journal.append(event)
+            terminal_pass_identities.add(pass_identity)
             self._apply_global_candidate_judgment(
                 state=state,
                 item=item,
@@ -5263,7 +5948,7 @@ class AgenticRecursiveAnalyzer:
                 request=request,
             )
             self._checkpoint_state(
-                state, "global:after:{0}".format(item.visit_key)
+                state, "global:after:{0}".format(pass_identity)
             )
 
     def _global_candidate_pool(
@@ -5480,7 +6165,7 @@ class AgenticRecursiveAnalyzer:
                 judgment,
                 (candidate.ref for candidate in candidates),
                 request,
-                _owner_for_item(item, "global_candidate_pass"),
+                _global_pass_owner(seed_builder),
             )
         if judgment.outcome == "no_defect":
             hypothesis = state.ledger.get(item.hypothesis_id)
@@ -6266,22 +6951,40 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             if replayed_judgment is None:
+                completed_provider_payload = {
+                    "call_kind": "step",
+                    "visit_key": item.visit_key,
+                    "status": "completed",
+                    "physical_requests_reserved": reserved_requests,
+                    "physical_request_delta": physical_delta,
+                    "physical_request_exact": True,
+                    "judgment": judgment.to_dict(),
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
                 self._checkpoint_action(
                     "provider_call_completed",
                     provider_action_key,
-                    {
-                        "call_kind": "step",
-                        "visit_key": item.visit_key,
-                        "status": "completed",
-                        "physical_requests_reserved": reserved_requests,
-                        "physical_request_delta": physical_delta,
-                        "physical_request_exact": True,
-                        "judgment": judgment.to_dict(),
-                        "provider_state": self._capture_provider_result_state(state),
-                    },
+                    completed_provider_payload,
                 )
+                completed_provider_record = {
+                    "operation": "provider_call_completed",
+                    "semantic_key": provider_action_key,
+                    "payload": completed_provider_payload,
+                }
             elif replay_action is not None:
                 self._apply_provider_result_state(state, replay_action["payload"])
+                completed_provider_record = replay_action
+            else:
+                raise ValueError(
+                    "completed step judgment has no Provider action"
+                )
+            step_projection = _step_action_projection_from_record(
+                completed_provider_record,
+                item=item,
+            )
+            state.record_completed_step_projection(item, step_projection)
             state.complete_rejudge(
                 item,
                 terminal_state=_rejudge_success_terminal_state(
@@ -6308,6 +7011,7 @@ class AgenticRecursiveAnalyzer:
                     state.apply_step(
                         item,
                         judgment,
+                        provider_action_key=provider_action_key,
                         graph_position=analysis_graph.position,
                         max_hypotheses=self.max_hypotheses,
                     )
@@ -6327,6 +7031,7 @@ class AgenticRecursiveAnalyzer:
             state.apply_step(
                 item,
                 judgment,
+                provider_action_key=provider_action_key,
                 graph_position=analysis_graph.position,
                 max_hypotheses=self.max_hypotheses,
             )
@@ -6834,6 +7539,16 @@ class AgenticRecursiveAnalyzer:
     def _build_confirmation_request(
         self, state: RecursiveAnalysisState, queued: Mapping[str, Any]
     ) -> RootConfirmationRequest:
+        if "artifact_evidence_envelopes" not in queued:
+            queue_key = state._confirmation_queue_key(queued)
+            stored = [
+                item
+                for item in state.confirmation_queue
+                if isinstance(item, Mapping)
+                and state._confirmation_queue_key(item) == queue_key
+            ]
+            if len(stored) == 1:
+                queued = stored[0]
         hypothesis_id = str(queued.get("hypothesis_id") or "")
         candidate_ref = str(queued.get("candidate_ref") or "")
         fingerprint = str(queued.get("defect_fingerprint") or "")
@@ -6911,6 +7626,11 @@ class AgenticRecursiveAnalyzer:
         if artifact_manifest is not None:
             candidate_reference["artifact_hydration"] = artifact_manifest
         path_references = tuple(_reference_envelope(ref) for ref in path)
+        queued_artifact_envelopes = {
+            str(item.get("canonical_ref") or ""): copy.deepcopy(dict(item))
+            for item in queued.get("artifact_evidence_envelopes") or ()
+            if isinstance(item, Mapping)
+        }
 
         def evidence_facts(refs: Iterable[str], fact_kind: str) -> Tuple[JsonDict, ...]:
             output: List[JsonDict] = []
@@ -6936,20 +7656,37 @@ class AgenticRecursiveAnalyzer:
                         )
                     )
                     continue
-                if not state.graph.active_revision_evidence_reference_eligible(
-                    raw_ref
-                ):
+                canonical_ref = "artifact:{0}".format(
+                    raw_ref.removeprefix("artifact:")
+                )
+                envelope = queued_artifact_envelopes.get(canonical_ref)
+                if envelope is None:
                     raise ValueError(
-                        "confirmation evidence ref is unresolved or unavailable: {0}".format(
+                        "confirmation artifact evidence has no persisted "
+                        "owner envelope: {0}".format(
                             raw_ref
                         )
                     )
-                output.append(
-                    state.graph.artifact_evidence_envelope(
+                owner_ref = str(
+                    envelope.get("owner_reference", {}).get(
+                        "resolved_ref"
+                    )
+                    if isinstance(
+                        envelope.get("owner_reference"), Mapping
+                    )
+                    else ""
+                )
+                canonical = state.graph.validate_artifact_evidence_envelope(
+                    envelope,
+                    expected_owner_ref=owner_ref,
+                )
+                if canonical.get("fact_kind") != fact_kind:
+                    canonical = state.graph.artifact_evidence_envelope(
                         raw_ref,
                         fact_kind=fact_kind,
+                        expected_owner_ref=owner_ref,
                     )
-                )
+                output.append(canonical)
             return tuple(output)
 
         supporting_refs = [candidate_ref]
@@ -7215,6 +7952,8 @@ class AgenticRecursiveAnalyzer:
             or projection["confirmation"] != confirmation.to_dict()
             or projection["request_identity"]
             != str(queued.get("semantic_identity") or "")
+            or projection["artifact_evidence_envelopes"]
+            != list(queued.get("artifact_evidence_envelopes") or ())
         ):
             raise ValueError("confirmation owner contradicts confirmed identity")
         if seed_builder is not None:
@@ -7243,6 +7982,9 @@ class AgenticRecursiveAnalyzer:
                 "physical_request_exact": projection[
                     "physical_request_exact"
                 ],
+                "artifact_evidence_envelopes": copy.deepcopy(
+                    projection["artifact_evidence_envelopes"]
+                ),
                 "confirmation": confirmation.to_dict(),
             }
         )

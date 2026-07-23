@@ -31,6 +31,7 @@ from trace_attribution.investigation import (
 from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
+    _step_action_projection,
 )
 
 
@@ -64,6 +65,26 @@ def judgment(
         suggested_investigation=suggested,
         confidence=0.3 if status == "unknown" else 0.9,
     )
+
+
+def authorize_completed_step(
+    state: RecursiveAnalysisState,
+    item: FrontierItem,
+    step_judgment: CausalStepJudgment,
+) -> str:
+    semantic_key = "step:{0}:test-provider-action".format(item.visit_key)
+    state.record_completed_step_projection(
+        item,
+        _step_action_projection(
+            item=item,
+            semantic_key=semantic_key,
+            provider_judgment=step_judgment,
+            physical_requests_reserved=0,
+            physical_request_delta=0,
+            physical_request_exact=True,
+        ),
+    )
+    return semantic_key
 
 
 class ScriptedInvestigatingJudge(OfflineJudgeCapability):
@@ -1305,8 +1326,18 @@ class AnalyzerInvestigationTest(unittest.TestCase):
             ["inspect_artifact"],
         )
         self.assertEqual(len(judge.requests), 2)
-        self.assertEqual(len(report.step_judgments), 1)
-        self.assertEqual(report.step_judgments[0].current_defect_status, "present")
+        self.assertEqual(len(report.step_judgments), 2)
+        self.assertEqual(
+            [
+                item.current_defect_status
+                for item in report.step_judgments
+            ],
+            ["unknown", "present"],
+        )
+        self.assertEqual(
+            len(report.metadata["step_action_projection"]),
+            2,
+        )
         self.assertEqual(
             report.investigation_journal[0]["judgment_before_investigation"][
                 "current_defect_status"
@@ -1536,7 +1567,11 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         )
         self.assertEqual(report.investigation_journal[0]["status"], "applied")
         self.assertEqual(report.introduction_candidates, ())
-        self.assertEqual(report.step_judgments, ())
+        self.assertEqual(len(report.step_judgments), 1)
+        self.assertEqual(
+            len(report.metadata["step_action_projection"]),
+            1,
+        )
         self.assertEqual(report.hypotheses[0].status, "rejected")
 
     def test_reject_mismatched_hypothesis_changes_neither_branch(self):
@@ -1579,9 +1614,13 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         self.assertEqual(result, "rejected")
         self.assertTrue(all(value["status"] == "active" for value in state.ledger.snapshot()))
         self.assertEqual(len(state.frontier.in_flight_items()), 1)
+        provider_action_key = authorize_completed_step(
+            state, item, current_judgment
+        )
         state.apply_step(
             item,
             current_judgment,
+            provider_action_key=provider_action_key,
             graph_position=self.graph.position,
             max_hypotheses=4,
         )
@@ -1646,18 +1685,24 @@ class AnalyzerInvestigationTest(unittest.TestCase):
         )
         item = state.frontier.pop()
         state.ledger.reject(item.hypothesis_id, "Rejected before stale work returned.")
+        current_judgment = judgment(
+            item.node_ref,
+            status="present",
+            introduction=True,
+            missing=(),
+        )
+        provider_action_key = authorize_completed_step(
+            state, item, current_judgment
+        )
         state.apply_step(
             item,
-            judgment(
-                item.node_ref,
-                status="present",
-                introduction=True,
-                missing=(),
-            ),
+            current_judgment,
+            provider_action_key=provider_action_key,
             graph_position=self.graph.position,
             max_hypotheses=4,
         )
-        self.assertEqual(state.step_judgments, [])
+        self.assertEqual(len(state.step_judgments), 1)
+        self.assertEqual(len(state.step_action_projection), 1)
         self.assertEqual(state.introduction_candidates, [])
         self.assertEqual(state.frontier.in_flight_items(), [])
 

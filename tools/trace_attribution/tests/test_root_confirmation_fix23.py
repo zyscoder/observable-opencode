@@ -130,6 +130,7 @@ class DurableConfirmationActionProjectionTest(unittest.TestCase):
                     "seed_key",
                     "recursive_path",
                     "evidence_refs",
+                    "artifact_evidence_envelopes",
                     "physical_requests_reserved",
                     "physical_request_delta",
                     "physical_request_exact",
@@ -448,18 +449,18 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
     def test_all_affected_persisted_identities_are_bumped(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v8",
+            "recursive-attribution-report/v9",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v7",
+            "recursive-attribution-checkpoint/v8",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
             "recursive-attribution-output/v2",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v5")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v6")
         self.assertEqual(
             COMPARISON_SCHEMA_VERSION,
             "recursive-attribution-comparison/v5",
@@ -467,18 +468,20 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
         self.assertEqual(JUDGMENT_CACHE_VERSION, "3.0")
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
-            "graph-external-evidence-eligibility/v3",
+            "graph-external-evidence-eligibility/v4",
         )
         self.assertEqual(
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
-            "recursive-root-confirmation/v9+resolution/v2"
-            "+evidence-policy/v3+local-state-owner/v1"
-            "+action-projection/v1",
+            "recursive-root-confirmation/v10+resolution/v2"
+            "+evidence-policy/v4+artifact-owner/v1"
+            "+local-state-owner/v1+action-projection/v1"
+            "+step-action-projection/v1",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
             "global-candidate-judgment/v5+validation-envelope/v5"
-            "+capsule/v6+evidence-policy/v3+local-state-owner/v1",
+            "+capsule/v6+evidence-policy/v4+local-state-owner/v1"
+            "+global-pass-identity/v1+failure-action/v1",
         )
 
 

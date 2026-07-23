@@ -680,7 +680,18 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
     def test_direct_global_validation_rejects_stale_intermediate_path(self):
         trace = {
             "case_id": "stale-intermediate-global-validation",
-            "manifest": {"subject_revision": "git:active"},
+            "manifest": {
+                "case_id": "stale-intermediate-global-validation",
+                "run_id": "stale-intermediate-global-run",
+                "subject_revision": "git:active",
+                "subject_revision_provenance": {
+                    "method": "case_trace_config",
+                    "source": "CaseTraceConfig.subjectRevision",
+                    "bound_at": "case_start",
+                    "case_id": "stale-intermediate-global-validation",
+                    "run_id": "stale-intermediate-global-run",
+                },
+            },
             "records": [
                 {
                     "record_id": "decision",
@@ -689,6 +700,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                     "data": {
                         "rationale": "Use the incomplete implementation.",
                         "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                     },
                 },
                 {
@@ -698,6 +710,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                     "data": {
                         "summary": "The implementation remains incomplete.",
                         "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                     },
                 },
                 {
@@ -707,6 +720,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                     "data": {
                         "actual": "The implementation is incomplete.",
                         "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                     },
                 },
             ],

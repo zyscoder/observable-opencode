@@ -691,6 +691,20 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             action_projection["confirmation"]["evidence_refs"] = [
                 "artifact:proof"
             ]
+            artifact_envelope = graph.artifact_evidence_envelope(
+                "artifact:proof",
+                fact_kind="supporting_evidence",
+                expected_owner_ref="record:decision",
+            )
+            queue_entry["artifact_evidence_envelopes"] = [
+                copy.deepcopy(artifact_envelope)
+            ]
+            journal_entry["artifact_evidence_envelopes"] = [
+                copy.deepcopy(artifact_envelope)
+            ]
+            action_projection["artifact_evidence_envelopes"] = [
+                copy.deepcopy(artifact_envelope)
+            ]
             seed = next(
                 item
                 for item in report["seed_results"]
@@ -708,6 +722,23 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
                     and evidence["owner"] == journal_entry["owner"]
                 ):
                     evidence["ref"] = "artifact:proof"
+
+            graph.hydrate_node("record:decision")
+            report = annotate_report_semantic_anchors(
+                graph.case_id, graph.nodes, report, graph=graph
+            )
+            anchors = semantic_anchor_index(graph.case_id, graph)
+            occurrences = semantic_occurrence_index(graph.case_id, graph)
+            for role in (
+                "roots",
+                "conditions",
+                "amplifiers",
+                "forbidden_roots",
+            ):
+                for label in labels[role]:
+                    ref = str(label.get("node_ref") or "")
+                    label["semantic_anchor_id"] = anchors[ref]
+                    label["semantic_occurrence_id"] = occurrences[ref]
 
             self.assertTrue(compare_report(report, labels, None, graph=graph)["safety"]["passed"])
 

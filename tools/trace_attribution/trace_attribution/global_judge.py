@@ -356,11 +356,13 @@ def validate_global_candidate_request_against_graph(
             if (
                 not resolved
                 or resolved not in graph.nodes
-                or not graph.active_revision_evidence_eligible(resolved)
+                or not graph.active_revision_start_eligible(resolved)
             ):
                 raise ValueError(
-                    "global candidate request {0} ref is unresolved or ineligible "
-                    "for the active revision: {1}".format(label, ref)
+                    "global candidate request {0} ref is unresolved or "
+                    "ineligible for strict active-start provenance: {1}".format(
+                        label, ref
+                    )
                 )
     validate_candidate_evidence_capsules_against_graph(
         graph,

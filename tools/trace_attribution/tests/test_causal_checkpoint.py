@@ -949,7 +949,7 @@ class CausalCheckpointTest(unittest.TestCase):
 
         self.assertEqual(
             config["evidence_eligibility_policy"],
-            "graph-external-evidence-eligibility/v3",
+            "graph-external-evidence-eligibility/v4",
         )
         semantic = {
             key: value for key, value in config.items() if key != "config_fingerprint"
@@ -1220,14 +1220,16 @@ class CausalCheckpointTest(unittest.TestCase):
         self.assertEqual(
             config["global_judgment_contract"],
             "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-            "+evidence-policy/v3+local-state-owner/v1",
+            "+evidence-policy/v4+local-state-owner/v1"
+            "+global-pass-identity/v1+failure-action/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v9+resolution/v2+evidence-policy/v3"
-            "+local-state-owner/v1+action-projection/v1",
+            "recursive-root-confirmation/v10+resolution/v2+evidence-policy/v4"
+            "+artifact-owner/v1+local-state-owner/v1+action-projection/v1"
+            "+step-action-projection/v1",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v7")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v8")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1787,9 +1789,25 @@ class CausalCheckpointTest(unittest.TestCase):
             replace_identities(value)
 
         stale_trace = copy.deepcopy(trace)
-        stale_trace["manifest"] = {"subject_revision": "git:active"}
+        stale_trace["manifest"] = {
+            "case_id": stale_trace["case_id"],
+            "run_id": "stale-intermediate-root-run",
+            "subject_revision": "git:active",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": stale_trace["case_id"],
+                "run_id": "stale-intermediate-root-run",
+            },
+        }
         for record in stale_trace["records"]:
-            record["data"]["subject_revision"] = "git:active"
+            record["data"].update(
+                {
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
+                }
+            )
         stale_trace["records"].insert(
             1,
             {
@@ -1799,6 +1817,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "data": {
                     "text": "This fact belongs to an older subject revision.",
                     "subject_revision": "git:stale",
+                    "revision_provenance_status": "valid",
                 },
             },
         )
@@ -1872,13 +1891,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "run_id": "stale-revision-root-run",
             },
         }
-        trace["records"][0]["data"].update(
-            {
-                "subject_revision": "git:active",
-                "repository_revision": 0,
-                "revision_provenance_status": "valid",
-            }
-        )
+        trace["records"][0]["data"]["repository_revision"] = 0
         trace["records"].append(
             {
                 "record_id": "current_claim",
@@ -1892,6 +1905,13 @@ class CausalCheckpointTest(unittest.TestCase):
                 },
             }
         )
+        for record in trace["records"]:
+            record["data"].update(
+                {
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
+                }
+            )
         config = sample_config(
             trace=trace,
             case_id=trace["case_id"],
@@ -1945,9 +1965,25 @@ class CausalCheckpointTest(unittest.TestCase):
         )
 
         trace = observed_trace(branching=True)
-        trace["manifest"] = {"subject_revision": "git:active"}
+        trace["manifest"] = {
+            "case_id": trace["case_id"],
+            "run_id": "stale-intermediate-factor-run",
+            "subject_revision": "git:active",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": trace["case_id"],
+                "run_id": "stale-intermediate-factor-run",
+            },
+        }
         for record in trace["records"]:
-            record.setdefault("data", {})["subject_revision"] = "git:active"
+            record.setdefault("data", {}).update(
+                {
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
+                }
+            )
         config = sample_config(
             trace=trace,
             case_id=trace["case_id"],
