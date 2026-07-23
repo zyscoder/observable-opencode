@@ -781,19 +781,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         )
         stale_fact["data"]["subject_revision"] = "git:stale"
         stale_graph = TraceGraph.from_trace(stale_trace)
-        stale_capsule = replace(
-            capsule,
-            downstream_path_references=tuple(
-                evidence_capsule._reference(stale_graph, ref)
-                for ref in capsule.downstream_path
-            ),
-        )
-        stale_request = replace(request, capsules=(stale_capsule,))
-
         with self.assertRaisesRegex(ValueError, "active revision"):
             validate_global_candidate_request_against_graph(
                 stale_graph,
-                stale_request,
+                request,
                 authoritative_candidates=(candidate,),
             )
 

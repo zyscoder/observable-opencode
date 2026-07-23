@@ -2471,6 +2471,129 @@ class CausalCheckpointTest(unittest.TestCase):
                 )
             )
 
+    def test_resume_quarantines_a_stale_start_without_invoking_judge(self):
+        trace = {
+            "case_id": "checkpoint-stale-start",
+            "records": [
+                {
+                    "record_id": "claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "repository_revision": 0,
+                        "is_final_for_case": True,
+                        "claim": "Generation zero claim.",
+                    },
+                }
+            ],
+        }
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:claim"],
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "stale-start.checkpoint"
+            with self.assertRaises(KeyboardInterrupt):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingOfflineJudge(),
+                    checkpoint=CheckpointBundle(root),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=["record:claim"],
+                    objective="Assess the claim.",
+                    analysis_perspective="Improve repository reasoning.",
+                )
+            checkpoint = CheckpointBundle(root).restore(expected_config=config)
+            active_trace = copy.deepcopy(trace)
+            active_trace["records"].append(
+                {
+                    "record_id": "active_claim",
+                    "component": "result",
+                    "event_type": "response.claim",
+                    "data": {
+                        "repository_revision": 1,
+                        "is_final_for_case": True,
+                        "claim": "Generation one claim.",
+                    },
+                }
+            )
+            graph = TraceGraph.from_trace(active_trace)
+
+            restored = RecursiveAnalysisState.from_checkpoint(
+                graph=graph,
+                checkpoint=checkpoint,
+            )
+            self.assertFalse(restored.frontier)
+            result = restored.seed_results()[0]
+            self.assertEqual(result.outcome, "evidence_gap")
+            self.assertIn(
+                "start_ref_active_revision_ineligible",
+                result.blocking_reasons,
+            )
+
+            resumed_judge = CountingOfflineJudge()
+            report = AgenticRecursiveAnalyzer(
+                judge=resumed_judge,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                graph,
+                start_refs=["record:claim"],
+                objective="Assess the claim.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(resumed_judge.step_calls, 0)
+            self.assertEqual(report.seed_results[0].outcome, "evidence_gap")
+
+    def test_completed_restore_removes_publication_owned_by_a_stale_start(self):
+        trace = confirmed_root_trace()
+        trace["records"][1]["data"]["repository_revision"] = 0
+        trace["records"].append(
+            {
+                "record_id": "claim",
+                "component": "result",
+                "event_type": "response.claim",
+                "data": {
+                    "repository_revision": 0,
+                    "is_final_for_case": True,
+                    "claim": "Generation zero is authoritative.",
+                },
+            }
+        )
+        config = sample_config(
+            trace=trace,
+            case_id=trace["case_id"],
+            start_refs=["record:defect"],
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "completed-stale-start.checkpoint"
+            report = AgenticRecursiveAnalyzer(
+                judge=ConfirmedSingleNodeJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:defect"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            self.assertEqual(report.seed_results[0].outcome, "confirmed_root")
+            checkpoint = CheckpointBundle(root).restore(expected_config=config)
+            stale_trace = copy.deepcopy(trace)
+            stale_trace["records"][1]["data"]["repository_revision"] = 1
+
+            restored = RecursiveAnalysisState.from_checkpoint(
+                graph=TraceGraph.from_trace(stale_trace),
+                checkpoint=checkpoint,
+            )
+
+            self.assertEqual(restored.seed_results()[0].outcome, "evidence_gap")
+            self.assertEqual(restored.confirmations, [])
+            self.assertEqual(restored.confirmed_roots, [])
+            self.assertEqual(restored.co_roots, [])
+
     def test_inflight_bounded_call_conservatively_keeps_max_one_budget_debited(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"

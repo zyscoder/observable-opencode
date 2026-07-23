@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -1209,12 +1210,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             start_refs=("record:decision",),
         )[0].to_dict()
 
-        expected_refs = {
-            passed_ref,
-            "record:decision",
-            "artifact:raw-proof",
-            "raw:unresolved-proof",
-        }
+        expected_refs = {passed_ref, "record:decision"}
         self.assertEqual(
             {item["raw_ref"] for item in capsule["evidence_references"]},
             expected_refs,
@@ -1223,7 +1219,18 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             set(capsule["candidate"]["retrieval_edge"]["evidence_refs"]),
             expected_refs,
         )
-        self.assertNotIn("record:forged_external", str(capsule))
+        self.assertEqual(
+            set(capsule["missing_evidence_refs"]),
+            {
+                "record:forged_external",
+                "artifact:raw-proof",
+                "raw:unresolved-proof",
+            },
+        )
+        judge_payload = CandidateEvidenceCapsule.from_dict(capsule).judge_dict()
+        self.assertNotIn("record:forged_external", json.dumps(judge_payload))
+        self.assertNotIn("artifact:raw-proof", json.dumps(judge_payload))
+        self.assertNotIn("raw:unresolved-proof", json.dumps(judge_payload))
         self.assertNotIn("FORGED_AUDIT_ONLY_PAYLOAD", str(capsule))
 
     def test_capsule_closes_candidate_path_action_group_and_missing_artifacts(self):

@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Tuple
 
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
 from .causal_retrieval import (
-    active_revision_candidate_eligible,
     canonical_candidate_route,
     root_candidate_eligible,
 )
@@ -255,6 +254,13 @@ class CandidateEvidenceCapsule:
             "validation_source": _thaw(self.validation_source),
         }
 
+    def judge_dict(self) -> JsonDict:
+        """Return only grounded evidence collections intended for a Judge."""
+        value = self.to_dict()
+        value.pop("missing_evidence_refs", None)
+        value.pop("validation_source", None)
+        return value
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":
         if not isinstance(value, Mapping):
@@ -332,7 +338,7 @@ def build_candidate_evidence_capsules(
     order: List[str] = []
     for candidate in candidates:
         resolved = graph.resolve(candidate.ref) or candidate.ref
-        if not active_revision_candidate_eligible(graph, resolved):
+        if not graph.active_revision_evidence_eligible(resolved):
             continue
         if resolved not in routes_by_ref:
             order.append(resolved)
@@ -346,6 +352,12 @@ def build_candidate_evidence_capsules(
     capsules: List[CandidateEvidenceCapsule] = []
     for ref in order:
         candidate = selected[ref]
+        raw_candidate_evidence_refs = _dedupe_strings(
+            [
+                *candidate.evidence_refs,
+                *(candidate.edge.get("evidence_refs") or ()),
+            ]
+        )
         if candidate.source in {"confirmed_edge", "attribution_edge"} and candidate.edge:
             candidate = CausalCandidate(
                 ref=candidate.ref,
@@ -392,6 +404,7 @@ def build_candidate_evidence_capsules(
             causal_path_edges=causal_path_edges,
             incoming_edges=incoming_edges,
             outgoing_edges=outgoing_edges,
+            diagnostic_evidence_refs=raw_candidate_evidence_refs,
         )
         validation_source = _validation_source(
             graph=graph,
@@ -399,6 +412,7 @@ def build_candidate_evidence_capsules(
             path=path,
             start_refs=tuple(graph.resolve(item) or str(item) for item in start_refs),
             prompt_collections=prompt_collections,
+            diagnostic_evidence_refs=raw_candidate_evidence_refs,
         )
         capsule = CandidateEvidenceCapsule(
             candidate_ref=ref,
@@ -411,7 +425,9 @@ def build_candidate_evidence_capsules(
                 "root_candidate_eligible": root_candidate_eligible(node),
                 "active_graph_facts": _active_candidate_graph_facts(graph, node),
                 "retrieval_edge": prompt_collections["retrieval_edge"],
-                "node": node.compact(max_chars=3200),
+                "node": _grounded_node_snapshot(
+                    graph, node, max_chars=3200
+                ),
             },
             downstream_path=path,
             downstream_path_references=tuple(_reference(graph, item) for item in path),
@@ -440,6 +456,7 @@ def _build_prompt_collections(
     causal_path_edges: Sequence[Mapping[str, Any]] | None = None,
     incoming_edges: Sequence[Mapping[str, Any]] | None = None,
     outgoing_edges: Sequence[Mapping[str, Any]] | None = None,
+    diagnostic_evidence_refs: Sequence[str] | None = None,
 ) -> JsonDict:
     ref = graph.resolve(candidate.ref) or candidate.ref
     node = graph.hydrate_node(ref)
@@ -467,26 +484,35 @@ def _build_prompt_collections(
         if outgoing_edges is not None
         else _outgoing_edges(graph, ref, limit=16)
     )
-    evidence_refs = _dedupe_strings(
-        graph.filter_evidence_refs(
-            [
-                *candidate.evidence_refs,
-                *(retrieval_edge.get("evidence_refs") or ()),
-                *node.source_refs,
-                *(
-                    evidence_ref
-                    for edge in (*causal_edges, *incoming, *outgoing)
-                    for evidence_ref in edge.get("evidence_refs") or ()
-                ),
-            ]
-        )
+    raw_evidence_refs = _dedupe_strings(
+        [
+            *(diagnostic_evidence_refs or candidate.evidence_refs),
+            *(retrieval_edge.get("evidence_refs") or ()),
+            *node.source_refs,
+            *(
+                evidence_ref
+                for edge in (*causal_edges, *incoming, *outgoing)
+                for evidence_ref in graph.unresolved_edge_evidence_refs(
+                    str(edge.get("from_ref") or ""),
+                    str(edge.get("to_ref") or ""),
+                )
+            ),
+            *(
+                evidence_ref
+                for edge in (*causal_edges, *incoming, *outgoing)
+                for evidence_ref in edge.get("evidence_refs") or ()
+            ),
+        ]
+    )
+    evidence_refs = _dedupe_strings(graph.filter_evidence_refs(raw_evidence_refs))
+    grounded_raw_refs = set(evidence_refs)
+    missing.extend(
+        ref for ref in raw_evidence_refs if ref not in grounded_raw_refs
     )
     evidence_references = []
     for evidence_ref in evidence_refs:
         reference = _reference(graph, evidence_ref)
         evidence_references.append(reference)
-        if reference.get("resolution_status") != "resolved":
-            missing.append(evidence_ref)
     return {
         "retrieval_edge": retrieval_edge,
         "action_group": _action_group(graph, node),
@@ -503,13 +529,18 @@ def _validation_source(
     path: Tuple[str, ...],
     start_refs: Tuple[str, ...],
     prompt_collections: Mapping[str, Any],
+    diagnostic_evidence_refs: Sequence[str] | None = None,
 ) -> JsonDict:
     return {
         "candidate_ref": candidate.ref,
         "candidate_source": candidate.source,
         "candidate_edge": _thaw(prompt_collections["retrieval_edge"]),
         "candidate_evidence_refs": list(
-            _dedupe_strings(graph.filter_evidence_refs(candidate.evidence_refs))
+            _dedupe_strings(
+                graph.filter_evidence_refs(
+                    diagnostic_evidence_refs or candidate.evidence_refs
+                )
+            )
         ),
         "downstream_path": list(path),
         "start_refs": list(start_refs),
@@ -567,14 +598,20 @@ def candidate_compression_metrics(
 
 def _reference(graph: TraceGraph, raw_ref: str) -> JsonDict:
     resolved = graph.resolve(str(raw_ref))
-    if resolved and resolved in graph.nodes:
+    if (
+        resolved
+        and resolved in graph.nodes
+        and graph.active_revision_evidence_eligible(resolved)
+    ):
         return {
             "raw_ref": str(raw_ref),
             "resolved_ref": resolved,
             "canonical_ref": resolved,
             "resolution_status": "resolved",
             "provenance_class": "recorded_or_reconstructed_trace_fact",
-            "node": graph.hydrate_node(resolved).compact(max_chars=1800),
+            "node": _grounded_node_snapshot(
+                graph, graph.hydrate_node(resolved), max_chars=1800
+            ),
         }
     artifact = graph.artifact_reference_status(str(raw_ref))
     if artifact is not None:
@@ -646,7 +683,7 @@ def validate_candidate_evidence_capsule_against_graph(
     resolved = graph.resolve(capsule.candidate_ref)
     if resolved != capsule.candidate_ref or resolved not in graph.nodes:
         raise ValueError("candidate evidence capsule does not match active graph identity")
-    if not active_revision_candidate_eligible(graph, resolved):
+    if not graph.active_revision_evidence_eligible(resolved):
         raise ValueError(
             "candidate evidence capsule candidate is ineligible for the active revision"
         )
@@ -656,26 +693,107 @@ def validate_candidate_evidence_capsule_against_graph(
         raise ValueError("candidate evidence capsule facts do not match active graph")
     if capsule.candidate.get("evidence_eligible") is not True:
         raise ValueError("candidate evidence capsule is ineligible in active graph")
-    if _thaw(capsule.candidate.get("node")) != node.compact(max_chars=3200):
+    if _thaw(capsule.candidate.get("node")) != _grounded_node_snapshot(
+        graph, node, max_chars=3200
+    ):
         raise ValueError("candidate evidence capsule node does not match active graph")
     source = capsule.validation_source
+    source_evidence_refs = tuple(source.get("candidate_evidence_refs") or ())
     source_candidate = CausalCandidate(
         ref=str(source.get("candidate_ref") or ""),
         node=node,
         source=str(source.get("candidate_source") or ""),
         edge=_thaw(source.get("candidate_edge")),
-        evidence_refs=tuple(source.get("candidate_evidence_refs") or ()),
+        evidence_refs=tuple(graph.filter_evidence_refs(source_evidence_refs)),
     )
     active_candidate = _reconcile_candidate_source(
         graph,
         source_candidate,
         authoritative_candidates=authoritative_candidates,
     )
+    source_edge = _thaw(
+        graph.sanitize_judge_edge_evidence(source_candidate.edge)
+    )
+    recorded_source = active_candidate.source in {
+        "confirmed_edge",
+        "attribution_edge",
+    }
+    active_routes = tuple(
+        route
+        for route in authoritative_candidates
+        if (graph.resolve(route.ref) or route.ref) == active_candidate.ref
+        and (
+            (
+                recorded_source
+                and graph.resolve(str(route.edge.get("to_ref") or ""))
+                == graph.resolve(str(source_edge.get("to_ref") or ""))
+                and str(route.edge.get("relation") or "")
+                == str(source_edge.get("relation") or "")
+                and str(route.edge.get("evidence_type") or "")
+                == str(source_edge.get("evidence_type") or "")
+            )
+            or (
+                not recorded_source
+                and route.source == source_candidate.source
+                and _thaw(graph.sanitize_judge_edge_evidence(route.edge))
+                == source_edge
+            )
+        )
+    )
+    diagnostic_candidate = (
+        canonical_candidate_route(
+            graph,
+            active_candidate.ref,
+            active_routes,
+        )
+        if active_routes
+        else active_candidate
+    )
+    diagnostic_evidence_refs = _dedupe_strings(
+        [
+            *source_evidence_refs,
+            *diagnostic_candidate.evidence_refs,
+            *(diagnostic_candidate.edge.get("evidence_refs") or ()),
+        ]
+    )
     expected_prompt_collections = _build_prompt_collections(
         graph=graph,
         candidate=active_candidate,
         path=capsule.downstream_path,
+        diagnostic_evidence_refs=diagnostic_evidence_refs,
     )
+    missing_artifact_refs = {
+        "artifact:{0}".format(artifact_id)
+        for artifact_id in (
+            *(
+                expected_prompt_collections["artifact_hydration"].get(
+                    "missing_artifact_ids"
+                )
+                or ()
+            ),
+            *(
+                expected_prompt_collections["artifact_hydration"].get(
+                    "truncated_artifact_ids"
+                )
+                or ()
+            ),
+            *(
+                expected_prompt_collections["artifact_hydration"].get(
+                    "integrity_failures"
+                )
+                or ()
+            ),
+        )
+    }
+    invalid_diagnostics = [
+        ref
+        for ref in capsule.missing_evidence_refs
+        if graph.filter_evidence_refs([ref]) and ref not in missing_artifact_refs
+    ]
+    if invalid_diagnostics:
+        raise ValueError(
+            "candidate evidence capsule prompt-bearing missing refs do not match active diagnostics"
+        )
     persisted_prompt_collections = {
         "retrieval_edge": _thaw(capsule.candidate.get("retrieval_edge")),
         "action_group": _thaw(capsule.action_group),
@@ -899,14 +1017,20 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
                 _action_identity(active_node) == identity
                 and _action_revision_eligible(graph, candidate, active_node)
             ):
-                members.append(active_node.compact(max_chars=1800))
+                members.append(
+                    _grounded_node_snapshot(
+                        graph, active_node, max_chars=1800
+                    )
+                )
         members.sort(key=lambda item: graph.position(str(item.get("ref") or "")))
     if (
         not members
         and graph.active_revision_evidence_eligible(candidate.ref)
         and root_candidate_eligible(candidate)
     ):
-        members = [candidate.compact(max_chars=1800)]
+        members = [
+            _grounded_node_snapshot(graph, candidate, max_chars=1800)
+        ]
     return {
         "identity": identity or "node_ref:{0}".format(candidate.ref),
         "identity_source": "recorded_action_group_or_call_id" if identity else "candidate_ref_fallback",
@@ -939,6 +1063,40 @@ def _action_revision_eligible(
         graph.active_revision_evidence_eligible(candidate.ref)
         and graph.active_revision_evidence_eligible(member.ref)
     )
+
+
+def _grounded_node_snapshot(
+    graph: TraceGraph, node: TraceNode, *, max_chars: int
+) -> JsonDict:
+    snapshot = node.compact(max_chars=max_chars)
+    snapshot["source_refs"] = graph.filter_evidence_refs(
+        snapshot.get("source_refs") or ()
+    )
+
+    def sanitize(value: Any, field_name: str = "") -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): sanitize(child, str(key))
+                for key, child in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            if field_name.endswith("_refs") or field_name in {
+                "artifact_refs",
+                "source_refs",
+            }:
+                return graph.filter_evidence_refs(value)
+            return [sanitize(child) for child in value]
+        if (
+            isinstance(value, str)
+            and field_name.endswith("_ref")
+            and (value.startswith("record:") or value.startswith("artifact:"))
+            and not graph.filter_evidence_refs([value])
+        ):
+            return ""
+        return value
+
+    snapshot["data"] = sanitize(snapshot.get("data") or {})
+    return snapshot
 
 
 __all__ = [

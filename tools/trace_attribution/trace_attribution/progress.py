@@ -364,6 +364,171 @@ def progress_navigation_window(nodes: Dict[str, TraceNode], current_ref: str) ->
     }
 
 
+def active_progress_episode_data(graph: object, episode_ref: str) -> JsonDict:
+    """Rebuild one progress aggregate from active-revision members only."""
+    nodes = graph.nodes
+    episode = nodes.get(episode_ref)
+    if not episode or episode.event_type != "progress.episode":
+        return {}
+    raw_member_refs = [
+        str(ref)
+        for ref in episode.data.get("member_refs") or []
+        if str(ref) in nodes
+    ]
+    member_refs = [
+        ref
+        for ref in raw_member_refs
+        if graph.active_revision_evidence_eligible(ref)
+    ]
+    counts = progress_counts(nodes, member_refs)
+    candidate_member_refs = (
+        select_candidate_member_refs(nodes, member_refs) if member_refs else []
+    )
+    return {
+        **dict(episode.data),
+        "member_refs": member_refs,
+        "member_summaries": [
+            progress_member_summary(nodes[ref]) for ref in member_refs
+        ],
+        "candidate_member_refs": candidate_member_refs,
+        "excluded_member_refs": [
+            ref for ref in member_refs if ref not in candidate_member_refs
+        ],
+        "stale_member_refs": [
+            ref for ref in raw_member_refs if ref not in member_refs
+        ],
+        "member_count": len(member_refs),
+        **counts,
+        "phase": progress_phase(counts),
+        "no_delivery_progress": not (
+            counts["mutation_count"] or counts["verification_count"]
+        ),
+        "start_position": (
+            min(graph.position(ref) for ref in member_refs)
+            if member_refs
+            else None
+        ),
+        "end_position": (
+            max(graph.position(ref) for ref in member_refs)
+            if member_refs
+            else None
+        ),
+        "start_timestamp": first_member_timestamp(nodes, member_refs),
+        "end_timestamp": last_member_timestamp(nodes, member_refs),
+    }
+
+
+def active_progress_navigation_window(graph: object, current_ref: str) -> JsonDict:
+    """Build a delivery window whose members and signals are all active."""
+    nodes = graph.nodes
+    current = nodes.get(current_ref)
+    if not current or current.event_type != "progress.episode":
+        return {}
+    active_data: Dict[str, JsonDict] = {}
+
+    def data(ref: str) -> JsonDict:
+        if ref not in active_data:
+            active_data[ref] = active_progress_episode_data(graph, ref)
+        return active_data[ref]
+
+    episode_refs: List[str] = []
+    cursor = current
+    previous_delivery_ref = ""
+    while cursor and cursor.event_type == "progress.episode":
+        episode_refs.append(cursor.ref)
+        previous_ref = str(cursor.data.get("previous_episode_ref") or "")
+        previous = nodes.get(previous_ref)
+        if not previous or previous.event_type != "progress.episode":
+            break
+        previous_data = data(previous.ref)
+        if (
+            previous_data.get("mutation_count")
+            or previous_data.get("verification_count")
+        ):
+            previous_delivery_ref = previous.ref
+            break
+        cursor = previous
+
+    chronological_refs = list(reversed(episode_refs))
+    previous_delivery_candidate_refs = (
+        list(data(previous_delivery_ref).get("candidate_member_refs") or [])
+        if previous_delivery_ref
+        else []
+    )
+    delivery_history_refs: List[str] = []
+    history_cursor_ref = previous_delivery_ref
+    while (
+        history_cursor_ref
+        and len(delivery_history_refs) < PROGRESS_DELIVERY_HISTORY_LIMIT
+    ):
+        history_cursor = nodes.get(history_cursor_ref)
+        if not history_cursor or history_cursor.event_type != "progress.episode":
+            break
+        history_data = data(history_cursor_ref)
+        if (
+            history_data.get("mutation_count")
+            or history_data.get("verification_count")
+        ):
+            delivery_history_refs.append(history_cursor_ref)
+        history_cursor_ref = str(
+            history_cursor.data.get("previous_episode_ref") or ""
+        )
+    delivery_history_refs.reverse()
+    delivery_history_candidate_refs = dedupe_progress_refs(
+        str(ref)
+        for episode_ref in delivery_history_refs
+        for ref in data(episode_ref).get("candidate_member_refs") or []
+    )
+    candidate_member_refs = dedupe_progress_refs(
+        [
+            *previous_delivery_candidate_refs,
+            *(
+                str(ref)
+                for episode_ref in chronological_refs
+                for ref in data(episode_ref).get("candidate_member_refs") or []
+            ),
+        ]
+    )
+    retrieval_candidate_member_refs = dedupe_progress_refs(
+        [*delivery_history_candidate_refs, *candidate_member_refs]
+    )
+    member_refs = dedupe_progress_refs(
+        str(ref)
+        for episode_ref in chronological_refs
+        for ref in data(episode_ref).get("member_refs") or []
+    )
+    stale_member_refs = dedupe_progress_refs(
+        str(ref)
+        for episode_ref in chronological_refs
+        for ref in data(episode_ref).get("stale_member_refs") or []
+    )
+    return {
+        "anchor_episode_ref": current_ref,
+        "member_episode_refs": chronological_refs,
+        "member_refs": member_refs,
+        "candidate_member_refs": candidate_member_refs,
+        "retrieval_candidate_member_refs": retrieval_candidate_member_refs,
+        "previous_delivery_episode_ref": previous_delivery_ref,
+        "previous_delivery_candidate_member_refs": previous_delivery_candidate_refs,
+        "delivery_history_episode_refs": delivery_history_refs,
+        "delivery_history_candidate_member_refs": delivery_history_candidate_refs,
+        "delivery_history_limit": PROGRESS_DELIVERY_HISTORY_LIMIT,
+        "navigation_method": "bounded_delivery_history_progress_window_v4",
+        "episode_count": len(chronological_refs),
+        "candidate_count": len(candidate_member_refs),
+        "retrieval_candidate_count": len(retrieval_candidate_member_refs),
+        "no_delivery_episode_count": sum(
+            bool(data(ref).get("no_delivery_progress"))
+            for ref in chronological_refs
+        ),
+        "start_chronology_index": data(chronological_refs[0]).get(
+            "chronology_index"
+        ),
+        "end_chronology_index": data(current_ref).get("chronology_index"),
+        "stale_member_refs": stale_member_refs,
+    }
+
+
 def progress_episode_has_delivery(node: TraceNode) -> bool:
     return bool(
         int(node.data.get("mutation_count") or 0)

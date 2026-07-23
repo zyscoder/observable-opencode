@@ -8,7 +8,11 @@ from .causal_state import AttributionHypothesis, CausalCandidate, CausalStepJudg
 from .episodes import CausalEpisodeIndex
 from .graph import TraceGraph
 from .models import JsonDict, NodeJudgment, TraceNode, stable_json
-from .progress import progress_navigation_window
+from .progress import (
+    active_progress_episode_data,
+    active_progress_navigation_window,
+    progress_navigation_window,
+)
 
 
 JUDGMENT_CONTEXT_VERSION = "1.0"
@@ -115,6 +119,14 @@ def build_recursive_judgment_context(
     candidate_context = [recursive_candidate_context(graph, item) for item in candidates]
     downstream_path_references = [ground_reference(graph, item, "recorded") for item in downstream_path_raw]
     hypothesis_evidence_references = grounded_hypothesis_evidence(graph, hypothesis)
+    hypothesis_unresolved_references = [
+        ground_reference(graph, evidence.ref, "recorded")
+        for evidence in (
+            *hypothesis.supporting_evidence,
+            *hypothesis.opposing_evidence,
+        )
+        if not graph.filter_evidence_refs([evidence.ref])
+    ]
     legacy_judgments = {
         item.node_ref: item for item in downstream_judgments if isinstance(item, NodeJudgment)
     }
@@ -150,7 +162,12 @@ def build_recursive_judgment_context(
         "artifact_hydration": dict(graph.artifact_hydration),
     }
     unresolved_references = unresolved_context_references(
-        downstream_path_references, candidate_context, hypothesis_evidence_references
+        downstream_path_references,
+        candidate_context,
+        [
+            *hypothesis_evidence_references,
+            *hypothesis_unresolved_references,
+        ],
     )
     missing_artifacts, truncated_artifacts = artifact_context_gaps(candidate_context)
     context["unresolved_references"] = unresolved_references
@@ -217,27 +234,62 @@ def normalize_defect_chain(value: Iterable[Any], active: DefectState) -> List[De
 
 def recursive_candidate_context(graph: TraceGraph, candidate: CausalCandidate) -> JsonDict:
     hydrated = graph.hydrate_node(candidate.ref)
+    raw_edge = candidate.edge
     edge = graph.sanitize_judge_edge_evidence(candidate.edge)
     candidate_evidence_refs = graph.filter_evidence_refs(candidate.evidence_refs)
-    edge_evidence_references = [
-        ground_reference(graph, ref, edge_provenance_class(edge))
-        for ref in dedupe_raw_refs(
-            list(edge.get("evidence_refs") or []) + candidate_evidence_refs
+    raw_evidence_refs = dedupe_raw_refs(
+        list(raw_edge.get("evidence_refs") or [])
+        + list(candidate.evidence_refs)
+        + graph.unresolved_edge_evidence_refs(
+            str(raw_edge.get("from_ref") or candidate.ref),
+            str(raw_edge.get("to_ref") or ""),
         )
+    )
+    all_edge_evidence_references = [
+        ground_reference(graph, ref, edge_provenance_class(edge))
+        for ref in raw_evidence_refs
     ]
+    edge_evidence_references = [
+        item
+        for item in all_edge_evidence_references
+        if item.get("resolution_status") == "resolved"
+    ]
+    endpoint_references = {
+        "from": ground_reference(
+            graph,
+            raw_edge.get("from_ref") or candidate.ref,
+            edge_provenance_class(edge),
+        ),
+        "to": ground_reference(
+            graph, raw_edge.get("to_ref"), edge_provenance_class(edge)
+        ),
+    }
     return {
         "ref": candidate.ref,
         "reference": ground_reference(graph, candidate.ref, edge_provenance_class(edge)),
         "source": candidate.source,
         "edge": edge,
         "edge_endpoint_references": {
-            "from": ground_reference(graph, edge.get("from_ref") or candidate.ref, edge_provenance_class(edge)),
-            "to": ground_reference(graph, edge.get("to_ref"), edge_provenance_class(edge)),
+            key: value
+            for key, value in endpoint_references.items()
+            if value.get("resolution_status") == "resolved"
         },
         "evidence_refs": candidate_evidence_refs,
         "edge_evidence_references": edge_evidence_references,
         "artifact_hydration": graph.artifact_hydration_manifest(candidate.ref),
         "node": hydrated.compact(),
+        "unresolved_references": [
+            *(
+                item
+                for item in endpoint_references.values()
+                if item.get("resolution_status") != "resolved"
+            ),
+            *(
+                item
+                for item in all_edge_evidence_references
+                if item.get("resolution_status") != "resolved"
+            ),
+        ],
     }
 
 
@@ -289,7 +341,10 @@ def coerce_recursive_judgment(value: Any) -> Any:
 def ground_reference(graph: TraceGraph, raw_ref: Any, provenance_class: str) -> JsonDict:
     raw = str(raw_ref or "")
     resolved = graph.resolve(raw)
-    if resolved in graph.nodes:
+    if (
+        resolved in graph.nodes
+        and graph.active_revision_evidence_eligible(resolved)
+    ):
         return {
             "raw_ref": raw,
             "resolved_ref": resolved,
@@ -302,7 +357,11 @@ def ground_reference(graph: TraceGraph, raw_ref: Any, provenance_class: str) -> 
             "raw_ref": raw,
             "resolved_ref": artifact_status["canonical_ref"],
             "provenance_class": "recorded",
-            "resolution_status": "resolved",
+            "resolution_status": (
+                "resolved"
+                if artifact_status.get("availability") == "available"
+                else "unresolved"
+            ),
             "reference_kind": "artifact",
             "artifact_status": artifact_status,
         }
@@ -366,6 +425,7 @@ def unresolved_context_references(
         item for item in hypothesis_evidence_references if item["resolution_status"] != "resolved"
     )
     for candidate in candidate_context:
+        output.extend(candidate.get("unresolved_references") or ())
         output.extend(
             item
             for item in candidate["edge_endpoint_references"].values()
@@ -609,7 +669,11 @@ def causal_episode_context(
     node_ref: str,
 ) -> JsonDict:
     episode = episode_index.episode_for(node_ref)
-    refs = episode.member_refs[:EPISODE_MEMBER_LIMIT]
+    refs = [
+        ref
+        for ref in episode.member_refs
+        if graph.active_revision_evidence_eligible(ref)
+    ][:EPISODE_MEMBER_LIMIT]
     return {
         "episode_id": episode.episode_id,
         "member_refs": refs,
@@ -628,12 +692,14 @@ def progress_episode_context(graph: TraceGraph, node_ref: str) -> JsonDict:
     if not candidates:
         return {}
     episode = max(candidates, key=lambda item: graph.position(item.ref))
-    data = episode.data
+    data = active_progress_episode_data(graph, episode.ref)
     keys = (
         "phase",
         "member_refs",
         "candidate_member_refs",
         "excluded_member_refs",
+        "member_count",
+        "member_summaries",
         "candidate_selection_method",
         "previous_episode_ref",
         "reasoning_count",
@@ -672,7 +738,7 @@ def progress_navigation_context(*, graph: TraceGraph, current_ref: str, path: Li
                 break
     if not anchor_ref:
         return {}
-    return progress_navigation_window(graph.nodes, anchor_ref)
+    return active_progress_navigation_window(graph, anchor_ref)
 
 
 def compact_node_summary(node: TraceNode) -> JsonDict:

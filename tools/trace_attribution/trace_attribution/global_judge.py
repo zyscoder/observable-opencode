@@ -15,7 +15,6 @@ from .causal_state import (
     DefectState,
     FrozenMapping,
 )
-from .causal_retrieval import active_revision_candidate_eligible
 from .confirmation_path import is_confirmation_causal_edge
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
@@ -253,7 +252,9 @@ class GlobalCandidateJudgeRequest:
             ),
             "retrieval_is_not_causal_verdict": True,
             "grounded_refs": list(self.grounded_refs),
-            "candidate_evidence_capsules": [item.to_dict() for item in self.capsules],
+            "candidate_evidence_capsules": [
+                item.judge_dict() for item in self.capsules
+            ],
         }
 
     def validation_envelope(self) -> JsonDict:
@@ -346,13 +347,28 @@ def validate_global_candidate_request_against_graph(
     authoritative_candidates: Sequence[CausalCandidate] = (),
 ) -> None:
     request.validate()
+    for label, refs in (
+        ("seed", (request.seed_ref,)),
+        ("start", request.start_refs),
+    ):
+        for ref in refs:
+            resolved = graph.resolve(ref)
+            if (
+                not resolved
+                or resolved not in graph.nodes
+                or not graph.active_revision_evidence_eligible(resolved)
+            ):
+                raise ValueError(
+                    "global candidate request {0} ref is unresolved or ineligible "
+                    "for the active revision: {1}".format(label, ref)
+                )
     validate_candidate_evidence_capsules_against_graph(
         graph,
         request.capsules,
         authoritative_candidates=authoritative_candidates,
     )
     if any(
-        not active_revision_candidate_eligible(graph, capsule.candidate_ref)
+        not graph.active_revision_evidence_eligible(capsule.candidate_ref)
         for capsule in request.capsules
     ):
         raise ValueError(

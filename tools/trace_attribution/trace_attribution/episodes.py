@@ -38,6 +38,11 @@ class CausalEpisodeIndex:
     def from_graph(cls, graph: TraceGraph) -> "CausalEpisodeIndex":
         index = cls(graph)
         for left_ref, right_ref in confirmed_episode_pairs(graph):
+            if not (
+                graph.active_revision_evidence_eligible(left_ref)
+                and graph.active_revision_evidence_eligible(right_ref)
+            ):
+                continue
             index.union(left_ref, right_ref)
         index.freeze()
         return index
@@ -64,6 +69,8 @@ class CausalEpisodeIndex:
     def freeze(self) -> "CausalEpisodeIndex":
         members: Dict[str, List[str]] = defaultdict(list)
         for ref in self.graph.nodes:
+            if not self.graph.active_revision_evidence_eligible(ref):
+                continue
             members[self.find(ref)].append(ref)
         for refs in members.values():
             refs.sort(key=self.graph.position)
@@ -74,6 +81,11 @@ class CausalEpisodeIndex:
 
     def episode_for(self, ref: str) -> CausalEpisode:
         resolved = self.graph.resolve(ref) or ref
+        if not self.graph.active_revision_evidence_eligible(resolved):
+            return CausalEpisode(
+                episode_id=stable_episode_id([]),
+                member_refs=[],
+            )
         return self.episodes_by_ref.get(
             resolved,
             CausalEpisode(episode_id=stable_episode_id([resolved]), member_refs=[resolved]),
@@ -136,7 +148,10 @@ def add_identity_pairs(graph: TraceGraph, pairs: Set[Tuple[str, str]], *, identi
     groups: Dict[str, List[str]] = defaultdict(list)
     raw_by_ref = raw_records_by_ref(graph)
     for ref, node in graph.nodes.items():
-        if node.event_type not in EPISODE_EVENT_TYPES:
+        if (
+            node.event_type not in EPISODE_EVENT_TYPES
+            or not graph.active_revision_evidence_eligible(ref)
+        ):
             continue
         identity = (
             node_call_id(graph.hydrate_node(ref))

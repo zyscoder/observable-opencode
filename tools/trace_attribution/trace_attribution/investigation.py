@@ -1274,18 +1274,23 @@ class CausalInvestigationTools:
         before_position = self.graph.position(resolved_before)
         scored: List[JsonDict] = []
         scanned = 0
-        scan_truncated = False
+        eligible_count = sum(
+            1
+            for node in self.graph.nodes.values()
+            if node.event_type != "progress.episode"
+            and self.graph.position(node.ref) < before_position
+            and self.graph.active_revision_evidence_eligible(node.ref)
+        )
         for node in self.graph.nodes.values():
-            if scanned >= scan_limit:
-                scan_truncated = True
-                break
-            scanned += 1
             if (
                 node.event_type == "progress.episode"
                 or self.graph.position(node.ref) >= before_position
                 or not self.graph.active_revision_evidence_eligible(node.ref)
             ):
                 continue
+            if scanned >= scan_limit:
+                break
+            scanned += 1
             tokens = set(
                 re.findall(r"[a-zA-Z0-9_]{3,}", stable_json(node.compact()).lower())
             )
@@ -1298,6 +1303,7 @@ class CausalInvestigationTools:
                         "evidence_type": "semantic_inferred",
                     }
                 )
+        scan_truncated = scanned < eligible_count
         scored.sort(
             key=lambda item: (
                 -float(item["score"]),

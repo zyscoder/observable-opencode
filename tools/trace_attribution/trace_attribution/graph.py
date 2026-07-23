@@ -480,41 +480,57 @@ class TraceGraph:
             ):
                 return False
 
-        repository_revision = data.get("repository_revision")
-        if repository_revision is not None:
+        node = self.nodes[resolved]
+        active_repository_revision = self.active_repository_revision()
+        required_revision_field = ""
+        if node.event_type == "response.claim":
+            required_revision_field = "repository_revision"
+        elif (
+            node.event_type == "verification"
+            and data.get("effective_for_final_state") is True
+        ):
+            required_revision_field = "repository_revision"
+        elif node.event_type == "change":
+            required_revision_field = "revision_after"
+
+        revision_field = required_revision_field
+        if not revision_field and data.get("repository_revision") is not None:
+            revision_field = "repository_revision"
+        revision_value = data.get(revision_field) if revision_field else None
+        if revision_value is not None:
             if (
-                type(repository_revision) is not int
-                or repository_revision < 0
+                type(revision_value) is not int
+                or revision_value < 0
             ):
                 return False
-            active_repository_revision = self.active_repository_revision()
             if (
                 active_repository_revision is not None
-                and repository_revision != active_repository_revision
+                and revision_value != active_repository_revision
             ):
                 return False
+        elif required_revision_field and active_repository_revision is not None:
+            return False
         return True
 
-    def active_revision_candidate_eligible(self, ref: str) -> bool:
-        """Compatibility alias for the graph-level active evidence policy."""
-        return self.active_revision_evidence_eligible(ref)
-
     def filter_evidence_refs(self, refs: Iterable[Any]) -> List[str]:
-        """Keep unresolved refs and refs to nodes allowed by the evidence policy."""
+        """Keep only resolved refs allowed to ground Judge-visible evidence."""
         output: List[str] = []
         for value in refs:
             ref = str(value or "")
             if not ref:
                 continue
             resolved = self.resolve(ref)
-            if resolved in self.nodes and not self.evidence_eligible(resolved):
+            if resolved in self.nodes:
+                if self.active_revision_evidence_eligible(resolved):
+                    output.append(ref)
                 continue
+            artifact = self.artifact_reference_status(ref)
             if (
-                resolved in self.nodes
-                and not self.active_revision_evidence_eligible(resolved)
+                artifact is not None
+                and artifact.get("resolution_status") == "resolved"
+                and artifact.get("availability") == "available"
             ):
-                continue
-            output.append(ref)
+                output.append(ref)
         return output
 
     def sanitize_edge_evidence(self, edge: Mapping[str, Any]) -> JsonDict:
@@ -541,21 +557,39 @@ class TraceGraph:
         return output
 
     def assert_evidence_eligible_references(
-        self, value: Any, *, label: str
+        self,
+        value: Any,
+        *,
+        label: str,
+        allowed_ineligible_refs: Iterable[str] = (),
     ) -> None:
+        allowed = {
+            self.resolve(str(ref)) or str(ref)
+            for ref in allowed_ineligible_refs
+            if str(ref)
+        }
         if isinstance(value, Mapping):
             for child in value.values():
-                self.assert_evidence_eligible_references(child, label=label)
+                self.assert_evidence_eligible_references(
+                    child,
+                    label=label,
+                    allowed_ineligible_refs=allowed,
+                )
             return
         if isinstance(value, (list, tuple, set, frozenset)):
             for child in value:
-                self.assert_evidence_eligible_references(child, label=label)
+                self.assert_evidence_eligible_references(
+                    child,
+                    label=label,
+                    allowed_ineligible_refs=allowed,
+                )
             return
         if not isinstance(value, str):
             return
         resolved = self.resolve(value)
         if (
             resolved in self.nodes
+            and resolved not in allowed
             and not self.active_revision_evidence_eligible(resolved)
         ):
             raise ValueError(
@@ -574,7 +608,11 @@ class TraceGraph:
             ):
                 continue
             artifact = self.artifact_reference_status(ref)
-            if artifact is not None and artifact.get("resolution_status") == "resolved":
+            if (
+                artifact is not None
+                and artifact.get("resolution_status") == "resolved"
+                and artifact.get("availability") == "available"
+            ):
                 continue
             raise ValueError(
                 "{0} contains unresolved grounded evidence: {1}".format(label, ref)
@@ -704,16 +742,28 @@ class TraceGraph:
         inspected = 0
         output_truncated = False
         adjacent_items = adjacency.get(resolved, {})
-        for adjacent in islice(adjacent_items, physical_limit):
+
+        def active_endpoints() -> Iterable[str]:
+            for adjacent in adjacent_items:
+                source, target = (
+                    (adjacent, resolved) if upstream else (resolved, adjacent)
+                )
+                if self.edge_endpoints_eligible(source, target):
+                    yield adjacent
+
+        active_adjacent_count = sum(
+            1
+            for adjacent in adjacent_items.keys()
+            if self.edge_endpoints_eligible(
+                adjacent if upstream else resolved,
+                resolved if upstream else adjacent,
+            )
+        )
+        for adjacent in islice(active_endpoints(), physical_limit):
             inspected += 1
             if adjacent in excluded:
                 continue
             node = self.nodes.get(adjacent)
-            source, target = (
-                (adjacent, resolved) if upstream else (resolved, adjacent)
-            )
-            if not self.edge_endpoints_eligible(source, target):
-                continue
             if event_type and (node is None or node.event_type != event_type):
                 continue
             if relations:
@@ -728,7 +778,7 @@ class TraceGraph:
                 eligible.append(adjacent)
             else:
                 output_truncated = True
-        scan_truncated = inspected < len(adjacent_items)
+        scan_truncated = inspected < active_adjacent_count
         return BoundedAdjacencyResult(
             refs=tuple(eligible),
             truncated=output_truncated or scan_truncated,
@@ -744,6 +794,34 @@ class TraceGraph:
             self.sanitize_edge_evidence(item)
             for item in self._edge_context_index.get((source, target), [])
         ]
+
+    def unresolved_edge_evidence_refs(
+        self, from_ref: str, to_ref: str
+    ) -> List[str]:
+        """Return non-groundable edge refs for audit diagnostics only."""
+        source = self.resolve(from_ref) or from_ref
+        target = self.resolve(to_ref) or to_ref
+        output: List[str] = []
+        seen = set()
+        for edge in self._edge_context_index.get((source, target), []):
+            refs = edge.get("evidence_refs") or ()
+            grounded = set(
+                self.filter_evidence_refs(
+                    refs
+                    if isinstance(refs, (list, tuple))
+                    else string_list(refs)
+                )
+            )
+            for value in (
+                refs
+                if isinstance(refs, (list, tuple))
+                else string_list(refs)
+            ):
+                ref = str(value or "")
+                if ref and ref not in grounded and ref not in seen:
+                    seen.add(ref)
+                    output.append(ref)
+        return output
 
     def temporal_adjacency_edges(self, ref: str) -> List[JsonDict]:
         """Return advisory temporal edges whose endpoints are valid evidence."""
@@ -1138,10 +1216,16 @@ class TraceGraph:
             for ref, node in self.nodes.items()
             if node.event_type == "external.evaluation_fact"
             and self.analysis_start_eligible(ref)
+            and self.active_revision_evidence_eligible(ref)
         ]
         if external_evaluation_starts:
             return dedupe(external_evaluation_starts)
-        failed_cases = [ref for ref, node in self.nodes.items() if node.event_type == "case.failed"]
+        failed_cases = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type == "case.failed"
+            and self.active_revision_evidence_eligible(ref)
+        ]
         manifest = self.raw_trace.get("manifest") if isinstance(self.raw_trace.get("manifest"), dict) else {}
         interrupted = manifest.get("shutdown_disposition") == "interrupted_before_case_completion"
         if not interrupted:
@@ -1155,6 +1239,7 @@ class TraceGraph:
             ref
             for ref, node in self.nodes.items()
             if node.event_type in ("case.missing_semantic", "case.observed_defect", "case.quality_gap")
+            and self.active_revision_evidence_eligible(ref)
         ]
         if offline_defect_starts:
             return dedupe(offline_defect_starts)
@@ -1166,6 +1251,7 @@ class TraceGraph:
             if node.event_type == "response.claim"
             and node.component == "result"
             and node.data.get("is_final_for_case") is not False
+            and self.active_revision_evidence_eligible(ref)
         ]
         if final_claims:
             claim_kind_rank = {

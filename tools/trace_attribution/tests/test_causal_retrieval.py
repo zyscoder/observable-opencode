@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 
 from trace_attribution.causal_state import AttributionHypothesis, CausalStepJudgment, DefectState, HypothesisEvidence
+from trace_attribution.causal_judge import CausalStepRequest, build_causal_step_prompt
 from trace_attribution.causal_retrieval import (
     SemanticPredecessorRetriever,
-    active_revision_candidate_eligible,
+    authored_root_candidate_eligible,
     root_candidate_eligible,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
@@ -892,12 +893,22 @@ class CausalRetrievalTest(unittest.TestCase):
             for item in context["temporal_adjacency"]
             if item["from_ref"] == "record:temporal_true"
         )
-        self.assertEqual(temporal["evidence_refs"], expected_refs)
+        self.assertEqual(temporal["evidence_refs"], expected_refs[:2])
         self.assertEqual(
             [item["ref"] for item in context["hypothesis"]["supporting_evidence"]],
             [passed_ref],
         )
-        self.assertNotIn("record:forged_external", json.dumps(context))
+        request = CausalStepRequest(
+            recursive_context=context,
+            current_node=graph.nodes["record:decision"],
+            defect_state=defect_state,
+            candidates=(),
+        )
+        self.assertIn("record:forged_external", json.dumps(context))
+        self.assertNotIn(
+            "record:forged_external",
+            build_causal_step_prompt(request),
+        )
         self.assertNotIn("FORGED_AUDIT_ONLY_PAYLOAD", json.dumps(context))
 
     def test_sibling_retrieval_accepts_every_concrete_recorded_node_type(self):
@@ -1233,7 +1244,7 @@ class CausalRetrievalTest(unittest.TestCase):
                     "records": records,
                 }
             )
-            return active_revision_candidate_eligible(graph, "record:candidate")
+            return graph.active_revision_evidence_eligible("record:candidate")
 
         cases = (
             ("legacy missing", {}, None, True),
@@ -1568,10 +1579,20 @@ class CausalRetrievalTest(unittest.TestCase):
         candidate = context["candidate_predecessors"][0]
         self.assertEqual(context["downstream_path_references"][0]["raw_ref"], "record:missing_downstream")
         self.assertEqual(context["downstream_path_references"][0]["resolution_status"], "unresolved")
-        self.assertEqual(candidate["edge_evidence_references"][0]["raw_ref"], "record:missing_evidence")
-        self.assertEqual(candidate["edge_evidence_references"][0]["resolution_status"], "unresolved")
+        self.assertEqual(candidate["edge_evidence_references"], [])
         self.assertEqual(candidate["edge_endpoint_references"]["from"]["raw_ref"], "record:prompt")
-        self.assertEqual(context["hypothesis_evidence_references"][0]["raw_ref"], "record:missing_hypothesis_evidence")
+        self.assertEqual(context["hypothesis_evidence_references"], [])
+        unresolved_refs = {
+            item["raw_ref"] for item in context["unresolved_references"]
+        }
+        self.assertEqual(
+            unresolved_refs,
+            {
+                "record:missing_downstream",
+                "record:missing_evidence",
+                "record:missing_hypothesis_evidence",
+            },
+        )
         self.assertEqual(candidate["artifact_hydration"]["missing_artifact_ids"], ["missing_payload"])
         self.assertEqual(context["context_manifest"]["unresolved_reference_count"], 3)
         self.assertEqual(context["context_manifest"]["missing_artifact_count"], 1)
@@ -1645,15 +1666,18 @@ class CausalRetrievalTest(unittest.TestCase):
                 downstream_path=["record:decision"],
             )
 
-        known, missing, unknown = context["candidate_predecessors"][0]["edge_evidence_references"]
+        (known,) = context["candidate_predecessors"][0]["edge_evidence_references"]
         self.assertEqual(known["raw_ref"], "artifact:known_payload")
         self.assertEqual(known["resolved_ref"], "artifact:known_payload")
         self.assertEqual(known["reference_kind"], "artifact")
         self.assertEqual(known["artifact_status"]["availability"], "available")
-        self.assertEqual(missing["resolved_ref"], "artifact:missing_payload")
-        self.assertEqual(missing["artifact_status"]["availability"], "missing")
-        self.assertEqual(unknown["raw_ref"], "unknown_payload")
-        self.assertEqual(unknown["resolution_status"], "unresolved")
+        unresolved_refs = {
+            item["raw_ref"] for item in context["unresolved_references"]
+        }
+        self.assertEqual(
+            unresolved_refs,
+            {"artifact:missing_payload", "unknown_payload"},
+        )
         self.assertEqual(graph.artifact_reference_status("known_payload")["canonical_ref"], "artifact:known_payload")
 
     def test_unresolved_downstream_path_never_emits_an_eligible_causal_edge(self):

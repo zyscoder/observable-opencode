@@ -136,12 +136,12 @@ class CausalStepRequest:
         object.__setattr__(self, "candidates", tuple(self.candidates))
 
     def to_dict(self) -> JsonDict:
-        return {
+        return _judge_visible_grounded_payload({
             "recursive_context": _thaw_json(self.recursive_context),
             "current_node": _node_to_dict(self.current_node),
             "defect_state": self.defect_state.to_dict(),
             "candidates": [item.to_dict() for item in self.candidates],
-        }
+        })
 
 
 @dataclass(frozen=True)
@@ -287,9 +287,10 @@ class OfflineCausalJudgeAdapter(OfflineJudgeCapability):
 
 
 def build_causal_step_prompt(request: CausalStepRequest) -> str:
+    judge_request = _judge_visible_grounded_payload(request.to_dict())
     return stable_json(
         {
-            "request": request.to_dict(),
+            "request": judge_request,
             "rules": [
                 TEMPORAL_CAUSALITY_RULE,
                 "Judge semantics and evidence, not component labels; any component can be causal.",
@@ -363,9 +364,10 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
 
 
 def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str:
+    judge_request = _judge_visible_grounded_payload(request.factual_dict())
     return stable_json(
         {
-            "request": request.factual_dict(),
+            "request": judge_request,
             "falsification_checks": [
                 "The candidate directly contains the tracked defect or a causally explanatory upstream defect.",
                 "The candidate precedes the downstream result.",
@@ -438,6 +440,91 @@ def build_recursive_confirmation_prompt(request: RootConfirmationRequest) -> str
             },
         }
     )
+
+
+def _judge_visible_grounded_payload(value: Any) -> Any:
+    """Remove unresolved audit references from exact serialized Judge input."""
+    audit_keys = {
+        "missing_evidence_refs",
+        "unresolved_references",
+        "stale_member_refs",
+        "validation_source",
+    }
+    grounded = set()
+
+    def collect(item: Any, field_name: str = "") -> None:
+        if isinstance(item, Mapping):
+            if field_name in audit_keys:
+                return
+            if item.get("resolution_status") == "resolved":
+                for key in ("raw_ref", "resolved_ref", "canonical_ref"):
+                    ref = str(item.get(key) or "")
+                    if ref:
+                        grounded.add(ref)
+            for key, child in item.items():
+                collect(child, str(key))
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child, field_name)
+
+    collect(value)
+    reference_list_fields = {
+        "artifact_refs",
+        "candidate_evidence_refs",
+        "checked_evidence_refs",
+        "decisive_evidence_refs",
+        "evidence_refs",
+        "member_refs",
+        "candidate_member_refs",
+        "retrieval_candidate_member_refs",
+        "opposing_evidence_refs",
+        "resolved_refs",
+        "recursive_path",
+        "source_refs",
+        "downstream_path",
+    }
+    omitted = object()
+
+    def sanitize(item: Any, field_name: str = "") -> Any:
+        if isinstance(item, Mapping):
+            if (
+                "resolution_status" in item
+                and item.get("resolution_status") != "resolved"
+            ):
+                return omitted
+            output = {}
+            for key, child in item.items():
+                name = str(key)
+                if name in audit_keys:
+                    continue
+                cleaned = sanitize(child, name)
+                if cleaned is not omitted:
+                    output[name] = cleaned
+            return output
+        if isinstance(item, (list, tuple)):
+            if field_name in reference_list_fields or field_name.endswith("_refs"):
+                return [
+                    str(ref)
+                    for ref in item
+                    if isinstance(ref, str) and ref in grounded
+                ]
+            output = []
+            for child in item:
+                cleaned = sanitize(child)
+                if cleaned is not omitted:
+                    output.append(cleaned)
+            return output
+        if (
+            isinstance(item, str)
+            and field_name in {"ref", "candidate_ref"}
+            and (item.startswith("record:") or item.startswith("artifact:"))
+            and item not in grounded
+        ):
+            return omitted
+        return item
+
+    sanitized = sanitize(value)
+    return {} if sanitized is omitted else sanitized
 
 
 def _number(value: Any, field_name: str) -> float:

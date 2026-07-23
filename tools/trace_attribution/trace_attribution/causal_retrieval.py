@@ -93,8 +93,8 @@ class SemanticPredecessorRetriever:
                         [
                             candidate
                             for candidate in self._direct_candidates(graph, resolved)
-                            if active_revision_candidate_eligible(
-                                graph, candidate.ref
+                            if graph.active_revision_evidence_eligible(
+                                candidate.ref
                             )
                         ]
                     ],
@@ -125,7 +125,7 @@ class SemanticPredecessorRetriever:
             [
                 candidate
                 for candidate in layer
-                if active_revision_candidate_eligible(graph, candidate.ref)
+                if graph.active_revision_evidence_eligible(candidate.ref)
             ]
             for layer in layers
         ]
@@ -156,7 +156,7 @@ class SemanticPredecessorRetriever:
                 not node
                 or is_navigation_node(node)
                 or is_temporal_only_edge(edge)
-                or not active_revision_candidate_eligible(graph, ref)
+                or not graph.active_revision_evidence_eligible(ref)
             ):
                 continue
             evidence_type = str(edge.get("evidence_type") or "")
@@ -212,7 +212,7 @@ class SemanticPredecessorRetriever:
             (
                 ref
                 for ref in refs
-                if active_revision_candidate_eligible(graph, ref)
+                if graph.active_revision_evidence_eligible(ref)
             ),
         ):
             node = graph.nodes.get(ref)
@@ -263,7 +263,7 @@ class SemanticPredecessorRetriever:
             (
                 ref
                 for ref in refs
-                if active_revision_candidate_eligible(graph, ref)
+                if graph.active_revision_evidence_eligible(ref)
             ),
         ):
             node = graph.nodes.get(ref)
@@ -308,7 +308,7 @@ class SemanticPredecessorRetriever:
         ):
             ref = str(match["ref"])
             node = graph.nodes.get(ref)
-            if not node or not active_revision_candidate_eligible(graph, ref):
+            if not node or not graph.active_revision_evidence_eligible(ref):
                 continue
             score = float(match["score"])
             candidates.append(
@@ -345,7 +345,7 @@ def merge_ranked_candidates(
     routes: List[Tuple[int, int, CausalCandidate]] = []
     for layer_index, layer in enumerate(layers):
         for ordinal, candidate in enumerate(layer):
-            if not active_revision_candidate_eligible(graph, candidate.ref):
+            if not graph.active_revision_evidence_eligible(candidate.ref):
                 continue
             routes.append((layer_index, ordinal, candidate))
     grouped: dict[str, List[Tuple[int, int, CausalCandidate]]] = {}
@@ -383,7 +383,7 @@ def canonicalize_ranked_candidates(
     routes_by_ref: dict[str, List[CausalCandidate]] = {}
     order: List[str] = []
     for candidate in candidates:
-        if not active_revision_candidate_eligible(graph, candidate.ref):
+        if not graph.active_revision_evidence_eligible(candidate.ref):
             continue
         resolved = graph.resolve(candidate.ref) or candidate.ref
         if resolved not in routes_by_ref:
@@ -490,7 +490,7 @@ def bound_provenance_envelopes(
     ranked_envelopes: dict[str, List[Tuple[float, int, CausalCandidate]]] = {}
     concrete: List[Tuple[int, CausalCandidate]] = []
     for index, candidate in enumerate(candidates):
-        if not active_revision_candidate_eligible(graph, candidate.ref):
+        if not graph.active_revision_evidence_eligible(candidate.ref):
             continue
         if candidate.node.event_type not in PROVENANCE_ENVELOPE_EVENT_TYPES:
             concrete.append((index, candidate))
@@ -649,9 +649,16 @@ def root_candidate_eligible(node: TraceNode) -> bool:
     )
 
 
-def active_revision_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
-    """Require a canonical evidence candidate to match active revision identities."""
-    return graph.active_revision_evidence_eligible(ref)
+def authored_root_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
+    """Require active evidence plus an authored event type eligible to be a root."""
+    resolved = graph.resolve(ref)
+    node = graph.nodes.get(resolved or "")
+    return bool(
+        resolved
+        and node is not None
+        and graph.active_revision_evidence_eligible(resolved)
+        and root_candidate_eligible(node)
+    )
 
 
 def is_evidence_only_node(node: TraceNode) -> bool:

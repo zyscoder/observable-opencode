@@ -4335,6 +4335,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 "repository_revision": 1,
             }
         )
+        next(
+            item for item in trace["records"] if item["record_id"] == "change"
+        )["data"]["revision_after"] = 1
         trace["records"].append(
             {
                 "record_id": "current_claim",
