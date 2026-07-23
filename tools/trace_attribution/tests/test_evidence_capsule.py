@@ -145,24 +145,25 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         )[0]
         return graph, candidate, capsule
 
+    def _decision_candidate(self, graph: TraceGraph) -> CausalCandidate:
+        return CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+            edge=graph.edge_context(
+                "record:decision", "record:observed_defect"
+            )[0],
+            score=0.9,
+            evidence_refs=("record:decision",),
+        )
+
     def _decision_capsule(
         self, graph: TraceGraph | None = None
     ) -> CandidateEvidenceCapsule:
         graph = graph or sample_graph()
         return build_candidate_evidence_capsules(
             graph=graph,
-            candidates=[
-                CausalCandidate(
-                    ref="record:decision",
-                    node=graph.nodes["record:decision"],
-                    source="confirmed_edge",
-                    edge=graph.edge_context(
-                        "record:decision", "record:observed_defect"
-                    )[0],
-                    score=0.9,
-                    evidence_refs=("record:decision",),
-                )
-            ],
+            candidates=[self._decision_candidate(graph)],
             defect_state=DefectState.create(
                 label="sigint_cleanup_interrupted",
                 expected="cleanup completes",
@@ -284,6 +285,186 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         )
         self.assertEqual(restored.to_dict(), capsule.to_dict())
 
+    def test_recorded_route_membership_is_rebuilt_from_active_authoritative_sources(self):
+        graph = sample_graph()
+        edge = graph.edge_context(
+            "record:decision", "record:observed_defect"
+        )[1]
+        authoritative = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+            edge=edge,
+            score=0.9,
+            evidence_refs=("record:decision", "record:prompt"),
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=(authoritative,),
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+        )[0]
+        original = capsule.to_dict()
+        expected_refs = tuple(
+            original["validation_source"]["candidate_evidence_refs"]
+        )
+
+        def forged_capsule(*, source=None, evidence_refs=None, mutate_edge=None):
+            forged = copy.deepcopy(original)
+            candidate_source = source or forged["candidate"]["source"]
+            candidate_edge = copy.deepcopy(
+                forged["validation_source"]["candidate_edge"]
+            )
+            if mutate_edge is not None:
+                mutate_edge(candidate_edge)
+            refs = tuple(
+                evidence_refs
+                if evidence_refs is not None
+                else forged["validation_source"]["candidate_evidence_refs"]
+            )
+            forged_candidate = CausalCandidate(
+                ref="record:decision",
+                node=graph.nodes["record:decision"],
+                source=candidate_source,
+                edge=candidate_edge,
+                score=0.9,
+                evidence_refs=refs,
+            )
+            collections = evidence_capsule._build_prompt_collections(
+                graph=graph,
+                candidate=forged_candidate,
+                path=tuple(forged["downstream_path"]),
+            )
+            forged["candidate"]["source"] = candidate_source
+            forged["candidate"]["retrieval_edge"] = collections[
+                "retrieval_edge"
+            ]
+            forged["action_group"] = collections["action_group"]
+            forged["evidence_references"] = collections[
+                "evidence_references"
+            ]
+            forged["artifact_hydration"] = collections[
+                "artifact_hydration"
+            ]
+            forged["missing_evidence_refs"] = collections[
+                "missing_evidence_refs"
+            ]
+            forged["validation_source"] = evidence_capsule._validation_source(
+                graph=graph,
+                candidate=forged_candidate,
+                path=tuple(forged["downstream_path"]),
+                start_refs=tuple(forged["start_refs"]),
+                prompt_collections=collections,
+            )
+            return CandidateEvidenceCapsule.from_dict(forged)
+
+        duplicated = copy.deepcopy(original)
+        duplicated["validation_source"]["candidate_evidence_refs"].append(
+            expected_refs[0]
+        )
+        mutations = {
+            "unrelated active ref": forged_capsule(
+                evidence_refs=(*expected_refs, "record:tool_result")
+            ),
+            "removed ref": forged_capsule(
+                evidence_refs=expected_refs[:-1]
+            ),
+            "reordered membership": forged_capsule(
+                evidence_refs=tuple(reversed(expected_refs))
+            ),
+            "duplicated membership": CandidateEvidenceCapsule.from_dict(
+                duplicated
+            ),
+            "source-family change": forged_capsule(
+                source="attribution_edge"
+            ),
+            "source-edge metadata change": forged_capsule(
+                mutate_edge=lambda value: value.update(
+                    {"metadata": {"revision": "forged"}}
+                )
+            ),
+        }
+        for label, restored in mutations.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(
+                    ValueError, "authoritative recorded route"
+                ):
+                    evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+                        graph,
+                        restored,
+                        authoritative_candidates=(authoritative,),
+                    )
+
+        restored = CandidateEvidenceCapsule.from_dict(original)
+        evidence_capsule.validate_candidate_evidence_capsule_against_graph(
+            graph,
+            restored,
+            authoritative_candidates=(authoritative,),
+        )
+        self.assertEqual(restored.to_dict(), original)
+
+    def test_action_group_excludes_ineligible_member_with_shared_call_identity(self):
+        trace = copy.deepcopy(sample_graph().raw_trace)
+        trace["records"].append(
+            {
+                "record_id": "audit_only_external",
+                "component": "evaluation",
+                "event_type": "external.evaluation_fact",
+                "data": {
+                    "call_id": "call_1",
+                    "status": "failed",
+                    "subject_revision": "git:stale",
+                    "revision_status": "mismatched",
+                    "observation": "AUDIT_ONLY_SHARED_CALL_MEMBER",
+                },
+            }
+        )
+        trace["records"].append(
+            {
+                "record_id": "stale_shared_member",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {
+                    "call_id": "call_1",
+                    "repository_revision": "git:stale",
+                    "output": "STALE_SHARED_CALL_MEMBER",
+                },
+            }
+        )
+        graph = TraceGraph.from_trace(trace)
+
+        capsule = self._decision_capsule(graph).to_dict()
+
+        self.assertFalse(graph.evidence_eligible("record:audit_only_external"))
+        self.assertTrue(graph.evidence_eligible("record:stale_shared_member"))
+        self.assertEqual(
+            [
+                "record:decision",
+                "record:tool_call",
+                "record:tool_result",
+            ],
+            [
+                member["ref"]
+                for member in capsule["action_group"]["members"]
+            ],
+        )
+        self.assertNotIn("record:audit_only_external", str(capsule))
+        self.assertNotIn("AUDIT_ONLY_SHARED_CALL_MEMBER", str(capsule))
+        self.assertNotIn("record:stale_shared_member", str(capsule))
+        self.assertNotIn("STALE_SHARED_CALL_MEMBER", str(capsule))
+
     def test_synthetic_route_cannot_launder_itself_as_empty_recorded_source(self):
         graph, authoritative, capsule = self._synthetic_prompt_capsule()
         payload = capsule.to_dict()
@@ -343,7 +524,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
 
         restored = CandidateEvidenceCapsule.from_dict(payload)
         evidence_capsule.validate_candidate_evidence_capsule_against_graph(
-            graph, restored
+            graph,
+            restored,
+            authoritative_candidates=(self._decision_candidate(graph),),
         )
         self.assertEqual(restored.to_dict(), payload)
 
@@ -444,7 +627,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 restored = CandidateEvidenceCapsule.from_dict(payload)
                 with self.assertRaisesRegex(ValueError, "edge.*active graph"):
                     evidence_capsule.validate_candidate_evidence_capsule_against_graph(
-                        graph, restored
+                        graph,
+                        restored,
+                        authoritative_candidates=(self._decision_candidate(graph),),
                     )
 
     def test_every_prompt_bearing_collection_must_match_active_construction(self):
@@ -504,7 +689,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 restored = CandidateEvidenceCapsule.from_dict(payload)
                 with self.assertRaisesRegex(ValueError, "prompt-bearing.*active"):
                     evidence_capsule.validate_candidate_evidence_capsule_against_graph(
-                        graph, restored
+                        graph,
+                        restored,
+                        authoritative_candidates=(self._decision_candidate(graph),),
                     )
 
     def test_restored_capsule_rejects_removed_changed_temporal_and_revision_drifted_edges(self):
@@ -512,7 +699,9 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         for edge in base_trace["dataflow_edges"]:
             edge["edge_id"] = "edge:{0}".format(edge["relation"])
             edge["metadata"] = {"revision": 1}
-        capsule = self._decision_capsule(TraceGraph.from_trace(base_trace))
+        base_graph = TraceGraph.from_trace(base_trace)
+        authoritative = self._decision_candidate(base_graph)
+        capsule = self._decision_capsule(base_graph)
 
         def mutate_removed(trace):
             trace["dataflow_edges"] = trace["dataflow_edges"][:1]
@@ -538,14 +727,20 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             with self.subTest(case=label):
                 active_trace = copy.deepcopy(base_trace)
                 mutate(active_trace)
-                with self.assertRaisesRegex(ValueError, "edge.*active graph"):
+                with self.assertRaisesRegex(
+                    ValueError, "edge.*active graph|authoritative recorded route"
+                ):
                     evidence_capsule.validate_candidate_evidence_capsule_against_graph(
-                        TraceGraph.from_trace(active_trace), capsule
+                        TraceGraph.from_trace(active_trace),
+                        capsule,
+                        authoritative_candidates=(authoritative,),
                     )
 
         restored = CandidateEvidenceCapsule.from_dict(capsule.to_dict())
         evidence_capsule.validate_candidate_evidence_capsule_against_graph(
-            TraceGraph.from_trace(base_trace), restored
+            TraceGraph.from_trace(base_trace),
+            restored,
+            authoritative_candidates=(authoritative,),
         )
 
     def test_duplicate_routes_preserve_recorded_provenance_independent_of_score(self):

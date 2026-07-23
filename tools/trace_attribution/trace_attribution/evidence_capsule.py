@@ -342,6 +342,22 @@ def build_candidate_evidence_capsules(
     capsules: List[CandidateEvidenceCapsule] = []
     for ref in order:
         candidate = selected[ref]
+        if candidate.source in {"confirmed_edge", "attribution_edge"} and candidate.edge:
+            candidate = CausalCandidate(
+                ref=candidate.ref,
+                node=candidate.node,
+                source=candidate.source,
+                edge=graph.sanitize_judge_edge_evidence(candidate.edge),
+                score=candidate.score,
+                evidence_refs=_dedupe_strings(
+                    graph.filter_evidence_refs(candidate.evidence_refs)
+                ),
+            )
+            candidate = _reconcile_candidate_source(
+                graph,
+                candidate,
+                authoritative_candidates=candidates,
+            )
         node = graph.hydrate_node(ref)
         path = tuple(
             graph.resolve(item) or str(item)
@@ -750,21 +766,51 @@ def _reconcile_candidate_source(
                 "synthetic candidate does not match its authoritative retrieval route"
             )
         return candidate
-    active = canonical_candidate_route(graph, candidate.ref, (candidate,))
-    if _thaw(active.edge) == _thaw(candidate.edge):
-        matching_edges = [
-            item
-            for item in graph.edge_context(candidate.ref, to_ref or "")
-            if str(item.get("relation") or "")
-            == str(candidate.edge.get("relation") or "")
-            and str(item.get("evidence_type") or "")
-            == str(candidate.edge.get("evidence_type") or "")
-        ]
-        if not matching_edges:
-            raise ValueError(
-                "candidate evidence capsule validation source edge is absent from active graph"
-            )
-    return active
+    routes = [
+        route
+        for route in authoritative_candidates
+        if (graph.resolve(route.ref) or route.ref) == candidate.ref
+        and graph.resolve(str(route.edge.get("to_ref") or "")) == to_ref
+        and str(route.edge.get("relation") or "")
+        == str(candidate.edge.get("relation") or "")
+        and str(route.edge.get("evidence_type") or "")
+        == str(candidate.edge.get("evidence_type") or "")
+    ]
+    if not routes:
+        raise ValueError(
+            "recorded candidate requires an authoritative recorded route"
+        )
+    active = canonical_candidate_route(graph, candidate.ref, routes)
+    active_edge = graph.sanitize_judge_edge_evidence(active.edge)
+    active_evidence_refs = _dedupe_strings(
+        graph.filter_evidence_refs(active.evidence_refs)
+    )
+    active_to_ref = graph.resolve(str(active_edge.get("to_ref") or ""))
+    matching_active_edges = [
+        graph.sanitize_judge_edge_evidence(item)
+        for item in graph.edge_context(candidate.ref, active_to_ref or "")
+        if str(item.get("relation") or "")
+        == str(active_edge.get("relation") or "")
+        and str(item.get("evidence_type") or "")
+        == str(active_edge.get("evidence_type") or "")
+    ]
+    if (
+        active_edge not in matching_active_edges
+        or active.source != candidate.source
+        or _thaw(active_edge) != _thaw(candidate.edge)
+        or active_evidence_refs != tuple(candidate.evidence_refs)
+    ):
+        raise ValueError(
+            "candidate does not match its authoritative recorded route"
+        )
+    return CausalCandidate(
+        ref=candidate.ref,
+        node=active.node,
+        source=active.source,
+        edge=active_edge,
+        score=active.score,
+        evidence_refs=active_evidence_refs,
+    )
 
 
 def validate_candidate_evidence_capsules_against_graph(
@@ -812,8 +858,19 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
     members = []
     if identity:
         for node in graph.nodes.values():
-            if _action_identity(node) == identity:
-                members.append(graph.hydrate_node(node.ref).compact(max_chars=1800))
+            resolved = graph.resolve(node.ref)
+            if (
+                resolved != node.ref
+                or resolved not in graph.nodes
+                or not graph.evidence_eligible(resolved)
+            ):
+                continue
+            active_node = graph.hydrate_node(resolved)
+            if (
+                _action_identity(active_node) == identity
+                and _action_revision_eligible(graph, candidate, active_node)
+            ):
+                members.append(active_node.compact(max_chars=1800))
         members.sort(key=lambda item: graph.position(str(item.get("ref") or "")))
     if not members:
         members = [candidate.compact(max_chars=1800)]
@@ -840,6 +897,39 @@ def _action_identity(node: TraceNode) -> str:
             if value:
                 return "call_id:{0}".format(value)
     return ""
+
+
+def _action_revision_eligible(
+    graph: TraceGraph, candidate: TraceNode, member: TraceNode
+) -> bool:
+    candidate_data = (
+        candidate.data if isinstance(candidate.data, Mapping) else {}
+    )
+    member_data = member.data if isinstance(member.data, Mapping) else {}
+    revision_status = str(member_data.get("revision_status") or "")
+    if revision_status and revision_status != "matched":
+        return False
+    manifest = (
+        graph.raw_trace.get("manifest")
+        if isinstance(graph.raw_trace.get("manifest"), Mapping)
+        else {}
+    )
+    active_revision = str(
+        manifest.get("subject_revision")
+        or candidate_data.get("repository_revision")
+        or candidate_data.get("subject_revision")
+        or ""
+    )
+    member_revision = str(
+        member_data.get("repository_revision")
+        or member_data.get("subject_revision")
+        or ""
+    )
+    return not (
+        active_revision
+        and member_revision
+        and member_revision != active_revision
+    )
 
 
 __all__ = [

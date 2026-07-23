@@ -1441,6 +1441,43 @@ class CausalCheckpointTest(unittest.TestCase):
                     checkpoint=replace(partial, actions=tuple(route_actions)),
                 )
 
+            membership_actions = json.loads(json.dumps(partial.actions))
+            membership_snapshot = next(
+                item
+                for item in reversed(membership_actions)
+                if item["operation"] == "state_snapshot"
+                and any(
+                    seed.get("global_judgment")
+                    for seed in item["payload"].get("seed_ledger", [])
+                )
+            )
+            membership_judgment = next(
+                seed["global_judgment"]
+                for seed in membership_snapshot["payload"]["seed_ledger"]
+                if seed.get("global_judgment")
+            )
+            membership_capsule = next(
+                capsule
+                for capsule in membership_judgment["validation_envelope"][
+                    "candidate_evidence_capsules"
+                ]
+                if capsule["candidate"]["source"]
+                in {"confirmed_edge", "attribution_edge"}
+            )
+            membership_source = membership_capsule["validation_source"]
+            membership_source["candidate_evidence_refs"].append(
+                membership_source["candidate_evidence_refs"][0]
+            )
+            with self.assertRaisesRegex(
+                ValueError, "authoritative recorded route"
+            ):
+                RecursiveAnalysisState.from_checkpoint(
+                    graph=TraceGraph.from_trace(trace),
+                    checkpoint=replace(
+                        partial, actions=tuple(membership_actions)
+                    ),
+                )
+
             completed_root = Path(tempdir) / "completed-stale-capsule.checkpoint"
             AgenticRecursiveAnalyzer(
                 judge=InterruptingGlobalNoDefectJudge(),
@@ -1508,6 +1545,49 @@ class CausalCheckpointTest(unittest.TestCase):
                     fusion_mode="retrieval-global",
                     checkpoint=InjectedRestoreCheckpoint(
                         replace(completed, actions=tuple(route_completed_actions)),
+                        completed_root,
+                    ),
+                    checkpoint_config=config,
+                ).analyze(
+                    TraceGraph.from_trace(trace),
+                    start_refs=start_refs,
+                    objective="Determine whether either observation is supported.",
+                    analysis_perspective="",
+                )
+
+            membership_completed_actions = json.loads(
+                json.dumps(completed.actions)
+            )
+            membership_report_action = next(
+                item
+                for item in reversed(membership_completed_actions)
+                if item["operation"] == "analysis_ready"
+            )
+            membership_capsule = next(
+                capsule
+                for capsule in membership_report_action["payload"]["report"][
+                    "seed_results"
+                ][0]["global_judgment"]["validation_envelope"][
+                    "candidate_evidence_capsules"
+                ]
+                if capsule["candidate"]["source"]
+                in {"confirmed_edge", "attribution_edge"}
+            )
+            membership_source = membership_capsule["validation_source"]
+            membership_source["candidate_evidence_refs"].append(
+                membership_source["candidate_evidence_refs"][0]
+            )
+            with self.assertRaisesRegex(
+                ValueError, "authoritative recorded route"
+            ):
+                AgenticRecursiveAnalyzer(
+                    judge=InterruptingGlobalNoDefectJudge(),
+                    fusion_mode="retrieval-global",
+                    checkpoint=InjectedRestoreCheckpoint(
+                        replace(
+                            completed,
+                            actions=tuple(membership_completed_actions),
+                        ),
                         completed_root,
                     ),
                     checkpoint_config=config,

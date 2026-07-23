@@ -510,6 +510,161 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         )
         self.assertEqual(restored.grounded_refs, request.grounded_refs)
 
+    def test_recorded_envelope_rejects_persisted_evidence_membership_drift(self):
+        graph, _, request = sample_request(return_context=True)
+        candidates = tuple(
+            CausalCandidate(
+                ref=ref,
+                node=graph.nodes[ref],
+                source="confirmed_edge",
+                edge=graph.edge_context(ref, "record:defect")[-1],
+                score=1.0,
+                evidence_refs=(ref, "record:defect"),
+            )
+            for ref in ("record:decision", "record:verification")
+        )
+        capsules = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=candidates,
+            defect_state=request.active_defect,
+            downstream_paths={
+                ref: (ref, "record:defect")
+                for ref in ("record:decision", "record:verification")
+            },
+            start_refs=("record:defect",),
+        )
+        recorded_request = replace(request, capsules=capsules)
+        envelope = recorded_request.validation_envelope()
+        envelope["candidate_evidence_capsules"][0]["validation_source"][
+            "candidate_evidence_refs"
+        ].append("record:decision")
+
+        with self.assertRaisesRegex(ValueError, "authoritative recorded route"):
+            global_candidate_request_from_validation_envelope(
+                envelope,
+                graph=graph,
+                authoritative_candidates=candidates,
+            )
+
+        restored = global_candidate_request_from_validation_envelope(
+            recorded_request.validation_envelope(),
+            graph=graph,
+            authoritative_candidates=candidates,
+        )
+        self.assertEqual(restored, recorded_request)
+        self.assertEqual(restored.grounded_refs, recorded_request.grounded_refs)
+
+    def test_ineligible_action_member_never_reaches_judge_grounding_or_anchors(self):
+        trace = {
+            "case_id": "action-group-evidence-policy",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "processor",
+                    "event_type": "decision",
+                    "data": {
+                        "call_id": "shared-call",
+                        "rationale": "Use the recorded implementation plan.",
+                    },
+                },
+                {
+                    "record_id": "audit_only_external",
+                    "component": "evaluation",
+                    "event_type": "external.evaluation_fact",
+                    "data": {
+                        "call_id": "shared-call",
+                        "status": "failed",
+                        "subject_revision": "git:stale",
+                        "revision_status": "mismatched",
+                        "observation": "AUDIT_ONLY_SHARED_CALL_MEMBER",
+                    },
+                },
+                {
+                    "record_id": "defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:decision"],
+                    "data": {"actual": "The active defect is present."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "defect"},
+                    "relation": "decision_exposed_by_evaluation",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                }
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        defect = DefectState.create(
+            label="active_defect",
+            expected="The active defect is absent.",
+            actual="The active defect is present.",
+            mechanism="The recorded decision introduced the defect.",
+            scope="task_quality",
+        )
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+            edge=graph.edge_context("record:decision", "record:defect")[-1],
+            score=1.0,
+            evidence_refs=("record:decision",),
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=(candidate,),
+            defect_state=defect,
+            downstream_paths={
+                "record:decision": ("record:decision", "record:defect")
+            },
+            start_refs=("record:defect",),
+        )[0]
+        request = GlobalCandidateJudgeRequest(
+            case_id=trace["case_id"],
+            objective="Judge the active candidate.",
+            analysis_perspective="task quality",
+            seed_ref="record:defect",
+            active_defect=defect,
+            active_focus_text=defect.actual,
+            active_focus_text_hash=active_focus_text_sha256(defect.actual),
+            start_refs=("record:defect",),
+            capsules=(capsule,),
+        )
+
+        self.assertNotIn("record:audit_only_external", request.grounded_refs)
+        self.assertNotIn("AUDIT_ONLY_SHARED_CALL_MEMBER", str(request.to_dict()))
+        restored = global_candidate_request_from_validation_envelope(
+            request.validation_envelope(),
+            graph=graph,
+            authoritative_candidates=(candidate,),
+        )
+        self.assertEqual(restored, request)
+
+        decisive = multi_root_payload(request, ["record:decision"])
+        decisive["decisive_evidence_refs"] = [
+            "record:audit_only_external"
+        ]
+        with self.assertRaisesRegex(ValueError, "grounded"):
+            validate_global_candidate_payload(decisive, request=request)
+
+        expansion = multi_root_payload(request, [])
+        expansion["outcome"] = "needs_expansion"
+        expansion["selected_candidate_refs"] = []
+        expansion["decisive_evidence_refs"] = []
+        expansion["expansion_requests"] = [
+            {
+                "anchor_ref": "record:audit_only_external",
+                "context_kind": "action_group",
+                "reason": "Inspect the shared-call member.",
+            }
+        ]
+        expansion["missing_evidence"] = ["Shared-call context is missing."]
+        with self.assertRaisesRegex(ValueError, "grounded anchor"):
+            validate_global_candidate_payload(expansion, request=request)
+
     def test_judge_request_rejects_stale_prompt_bearing_capsule_collection(self):
         envelope = sample_request().validation_envelope()
         envelope["candidate_evidence_capsules"][0]["candidate"][
