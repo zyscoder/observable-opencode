@@ -393,7 +393,7 @@ evidence ref, and artifact against source facts. Artifact checks include canonic
 owner, path containment, byte range, and actual content. Directed causal paths may contain
 only attribution-eligible non-temporal hops.
 
-The `recursive-attribution-comparison/v4` schema reports occurrence-level confirmed-root
+The `recursive-attribution-comparison/v5` schema reports occurrence-level confirmed-root
 recall/precision separately from
 introduction-candidate recall/precision, Top-1 (`null` for empty expected roots), explicit
 negative-control correctness, signed physical Judge request reduction, request ratio and

@@ -50,20 +50,20 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v7"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v8"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v5"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-    "+evidence-policy/v2+local-state-owner/v1"
+    "+evidence-policy/v3+local-state-owner/v1"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v5"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2"
-    "+local-state-owner/v1"
+    "recursive-root-confirmation/v9+resolution/v2+evidence-policy/v3"
+    "+local-state-owner/v1+action-projection/v1"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -2699,6 +2699,7 @@ class RecursiveAttributionReport:
         )
 
         metadata = _thaw(self.metadata)
+        metadata.setdefault("confirmation_action_projection", [])
         summary = {}
         for node_ref in sorted(node_statuses):
             statuses = node_statuses[node_ref]
@@ -2938,6 +2939,7 @@ class RecursiveAttributionReport:
             for key in (
                 "confirmation_queue",
                 "confirmation_journal",
+                "confirmation_action_projection",
                 "global_candidate_judgments",
                 "candidate_compression",
                 "recursive_expansion_reasons",
@@ -2965,6 +2967,12 @@ class RecursiveAttributionReport:
             else []
         )
         if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            if not isinstance(
+                metadata.get("confirmation_action_projection"), list
+            ):
+                raise ValueError(
+                    "modern report confirmation action projection is required"
+                )
             if any(item.owner is None for item in causal_relations):
                 raise ValueError("modern report causal relation is ownerless")
             if any(
@@ -3007,6 +3015,7 @@ class RecursiveAttributionReport:
             for key in (
                 "confirmation_queue",
                 "confirmation_journal",
+                "confirmation_action_projection",
                 "global_candidate_judgments",
                 "candidate_compression",
                 "recursive_expansion_reasons",

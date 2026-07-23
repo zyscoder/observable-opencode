@@ -12,7 +12,7 @@ from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
 
-JUDGMENT_CACHE_VERSION = "2.0"
+JUDGMENT_CACHE_VERSION = "3.0"
 
 
 def build_judge_cache_key(

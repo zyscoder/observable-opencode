@@ -29,8 +29,8 @@ from trace_attribution.recursive_analyzer import (
 
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
-COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v4"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v7"
+COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v8"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -476,9 +476,14 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
                         ),
                     )
     metadata = _mapping(report.get("metadata"), "report.metadata")
+    _list(
+        metadata.get("confirmation_action_projection"),
+        "report.metadata.confirmation_action_projection",
+    )
     for key in (
         "confirmation_queue",
         "confirmation_journal",
+        "confirmation_action_projection",
         "global_candidate_judgments",
         "candidate_compression",
         "recursive_expansion_reasons",

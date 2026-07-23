@@ -565,7 +565,18 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
 
     def test_capsule_preserves_zero_and_filters_stale_generation_action_and_evidence_refs(self):
         trace = copy.deepcopy(sample_graph(decision_revision=0).raw_trace)
-        trace["manifest"] = {"subject_revision": "git:active"}
+        trace["manifest"] = {
+            "case_id": trace["case_id"],
+            "run_id": "capsule-generation-run",
+            "subject_revision": "git:active",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": trace["case_id"],
+                "run_id": "capsule-generation-run",
+            },
+        }
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )
@@ -617,6 +628,8 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                     "data": {
                         "temporal_scope": "current_revision",
                         "repository_revision": 0,
+                        "subject_revision": "git:active",
+                        "revision_provenance_status": "valid",
                     },
                 },
             ]

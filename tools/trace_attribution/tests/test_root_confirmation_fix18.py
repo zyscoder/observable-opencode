@@ -770,10 +770,10 @@ class ActiveProgressProjectionTest(unittest.TestCase):
 
 
 class EvidencePolicyCompatibilityTest(unittest.TestCase):
-    def test_policy_v2_versions_every_reusable_conclusion_identity(self):
+    def test_current_policy_versions_every_reusable_conclusion_identity(self):
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
-            "graph-external-evidence-eligibility/v2",
+            "graph-external-evidence-eligibility/v3",
         )
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v6")
         self.assertEqual(

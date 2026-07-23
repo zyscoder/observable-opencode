@@ -487,7 +487,7 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
 
         result = compare_report(report, labels, None, graph=graph)
 
-        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v4")
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v5")
         self.assertEqual(result["metrics"]["confirmed_root_recall"], 0.5)
         self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
         self.assertTrue(result["metrics"]["top1_match"])
@@ -680,6 +680,17 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
                 if item["confirmation"]["confirmation_identity"] == identity
             )
             queue_entry["confirmation"]["evidence_refs"] = ["artifact:proof"]
+            action_projection = next(
+                item
+                for item in report["metadata"][
+                    "confirmation_action_projection"
+                ]
+                if item["response_identity"] == identity
+            )
+            action_projection["evidence_refs"] = ["artifact:proof"]
+            action_projection["confirmation"]["evidence_refs"] = [
+                "artifact:proof"
+            ]
             seed = next(
                 item
                 for item in report["seed_results"]

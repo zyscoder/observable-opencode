@@ -1240,12 +1240,26 @@ class CausalRetrievalTest(unittest.TestCase):
                         "data": {
                             "temporal_scope": "current_revision",
                             "repository_revision": active_generation,
+                            "subject_revision": manifest_revision,
+                            "revision_provenance_status": "valid",
                         },
                     }
                 )
             graph = TraceGraph.from_trace(
                 {
-                    "manifest": {"subject_revision": manifest_revision},
+                    "case_id": "revision-contract",
+                    "manifest": {
+                        "case_id": "revision-contract",
+                        "run_id": "revision-contract-run",
+                        "subject_revision": manifest_revision,
+                        "subject_revision_provenance": {
+                            "method": "case_trace_config",
+                            "source": "CaseTraceConfig.subjectRevision",
+                            "bound_at": "case_start",
+                            "case_id": "revision-contract",
+                            "run_id": "revision-contract-run",
+                        },
+                    },
                     "records": records,
                 }
             )
@@ -1300,6 +1314,8 @@ class CausalRetrievalTest(unittest.TestCase):
                 {
                     "temporal_scope": "current_revision",
                     "repository_revision": 0,
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
                 },
                 active_generation=0,
                 candidate_event_type="response.claim",

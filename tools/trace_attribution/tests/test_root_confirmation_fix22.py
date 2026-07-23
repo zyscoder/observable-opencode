@@ -271,6 +271,7 @@ def revision_authority_trace() -> dict:
                     "revision_after": 2,
                     "subject_revision": "git:active",
                     "revision_status": "matched",
+                    "revision_provenance_status": "valid",
                 },
             },
             {
@@ -382,6 +383,7 @@ class EligibleRevisionAuthorityTest(unittest.TestCase):
                     "revision_after": 0,
                     "subject_revision": "git:active",
                     "revision_status": "matched",
+                    "revision_provenance_status": "valid",
                 },
             },
             {
@@ -393,6 +395,7 @@ class EligibleRevisionAuthorityTest(unittest.TestCase):
                     "effective_for_final_state": True,
                     "subject_revision": "git:active",
                     "revision_status": "matched",
+                    "revision_provenance_status": "valid",
                 },
             },
         ]

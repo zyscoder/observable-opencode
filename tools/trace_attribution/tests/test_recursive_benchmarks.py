@@ -577,7 +577,7 @@ class RecursiveMetricTest(unittest.TestCase):
             graph=graph,
         )
 
-        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v4")
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v5")
         self.assertEqual(
             set(result),
             {

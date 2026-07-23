@@ -20,7 +20,7 @@ from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
 
 
-EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v2"
+EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v3"
 RANKING_CONFIDENCE_EDGE_ORIGINS = frozenset(
     {
         "offline.global_candidate_retrieval",
@@ -455,6 +455,33 @@ class TraceGraph:
             in {"none", "none_offline_analysis_only"}
         ):
             return None
+        manifest = (
+            self.raw_trace.get("manifest")
+            if isinstance(self.raw_trace.get("manifest"), Mapping)
+            else {}
+        )
+        manifest_declares_revision = manifest.get("subject_revision") not in (
+            None,
+            "",
+        )
+        active_subject_revision, active_provenance_status = (
+            trace_execution_revision(self.raw_trace)
+        )
+        if manifest_declares_revision:
+            if active_provenance_status != "valid":
+                return None
+            if (
+                not isinstance(data.get("subject_revision"), str)
+                or not data["subject_revision"].strip()
+                or data["subject_revision"].strip()
+                != str(active_subject_revision or "").strip()
+                or not isinstance(
+                    data.get("revision_provenance_status"), str
+                )
+                or data["revision_provenance_status"].strip().lower()
+                != "valid"
+            ):
+                return None
         revision_status = data.get("revision_status")
         if revision_status not in (None, "") and (
             not isinstance(revision_status, str)
@@ -469,9 +496,6 @@ class TraceGraph:
             return None
         subject_revision = data.get("subject_revision")
         if subject_revision not in (None, ""):
-            active_subject_revision, active_provenance_status = (
-                trace_execution_revision(self.raw_trace)
-            )
             if (
                 not isinstance(subject_revision, str)
                 or active_provenance_status != "valid"
@@ -504,6 +528,31 @@ class TraceGraph:
             return False
         node = self.nodes[resolved]
         data = node.data
+        manifest = (
+            self.raw_trace.get("manifest")
+            if isinstance(self.raw_trace.get("manifest"), Mapping)
+            else {}
+        )
+        manifest_declares_revision = manifest.get("subject_revision") not in (
+            None,
+            "",
+        )
+        authority_value = None
+        if node.event_type == "response.claim":
+            authority_value = data.get("repository_revision")
+        elif (
+            node.event_type == "verification"
+            and data.get("effective_for_final_state") is True
+        ):
+            authority_value = data.get("repository_revision")
+        elif node.event_type == "change":
+            authority_value = data.get("revision_after")
+        if (
+            manifest_declares_revision
+            and authority_value is not None
+            and self._eligible_repository_revision_authority(node) is None
+        ):
+            return False
         if node.event_type == "progress.episode":
             member_refs = [
                 self.resolve(str(item)) or str(item)

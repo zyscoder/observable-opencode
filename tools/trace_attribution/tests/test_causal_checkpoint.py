@@ -949,7 +949,7 @@ class CausalCheckpointTest(unittest.TestCase):
 
         self.assertEqual(
             config["evidence_eligibility_policy"],
-            "graph-external-evidence-eligibility/v2",
+            "graph-external-evidence-eligibility/v3",
         )
         semantic = {
             key: value for key, value in config.items() if key != "config_fingerprint"
@@ -1220,14 +1220,14 @@ class CausalCheckpointTest(unittest.TestCase):
         self.assertEqual(
             config["global_judgment_contract"],
             "global-candidate-judgment/v5+validation-envelope/v5+capsule/v6"
-            "+evidence-policy/v2+local-state-owner/v1",
+            "+evidence-policy/v3+local-state-owner/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v8+resolution/v2+evidence-policy/v2"
-            "+local-state-owner/v1",
+            "recursive-root-confirmation/v9+resolution/v2+evidence-policy/v3"
+            "+local-state-owner/v1+action-projection/v1",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v6")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v7")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1860,11 +1860,23 @@ class CausalCheckpointTest(unittest.TestCase):
 
     def test_partial_and_completed_restore_reject_stale_repository_generation_root_candidate(self):
         trace = confirmed_root_trace()
-        trace["manifest"] = {"subject_revision": "git:active"}
+        trace["manifest"] = {
+            "case_id": trace["case_id"],
+            "run_id": "stale-revision-root-run",
+            "subject_revision": "git:active",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": trace["case_id"],
+                "run_id": "stale-revision-root-run",
+            },
+        }
         trace["records"][0]["data"].update(
             {
                 "subject_revision": "git:active",
                 "repository_revision": 0,
+                "revision_provenance_status": "valid",
             }
         )
         trace["records"].append(
@@ -1875,6 +1887,8 @@ class CausalCheckpointTest(unittest.TestCase):
                 "data": {
                     "temporal_scope": "current_revision",
                     "repository_revision": 0,
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
                 },
             }
         )
@@ -2850,6 +2864,15 @@ class CausalCheckpointTest(unittest.TestCase):
                 )
             self.assertEqual(first_judge.step_calls, 1)
             self.assertEqual(first_judge.confirmation_calls, 1)
+            started_reservation = next(
+                item["payload"]["physical_requests_reserved"]
+                for item in reversed(
+                    CheckpointBundle(root).restore(
+                        expected_config=config
+                    ).actions
+                )
+                if item["operation"] == "confirmation_started"
+            )
 
             resumed_judge = InterruptingConfirmationJudge(interrupt=False)
             report = AgenticRecursiveAnalyzer(
@@ -2870,6 +2893,14 @@ class CausalCheckpointTest(unittest.TestCase):
                     item.reason.startswith("confirmation_interrupted")
                     for item in report.confirmations
                 )
+            )
+            projection = report.metadata["confirmation_action_projection"]
+            self.assertEqual(len(projection), 1)
+            self.assertEqual(projection[0]["operation"], "confirmation_failed")
+            self.assertFalse(projection[0]["physical_request_exact"])
+            self.assertEqual(
+                projection[0]["physical_requests_reserved"],
+                started_reservation,
             )
 
     def test_resume_restores_provider_circuit_state_before_traversal(self):

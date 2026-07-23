@@ -4340,7 +4340,18 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
     def test_current_numeric_repository_generation_can_reach_root_publication(self):
         trace = observed_trace()
-        trace["manifest"] = {"subject_revision": "git:active"}
+        trace["manifest"] = {
+            "case_id": trace["case_id"],
+            "run_id": "current-generation-run",
+            "subject_revision": "git:active",
+            "subject_revision_provenance": {
+                "method": "case_trace_config",
+                "source": "CaseTraceConfig.subjectRevision",
+                "bound_at": "case_start",
+                "case_id": trace["case_id"],
+                "run_id": "current-generation-run",
+            },
+        }
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )
@@ -4350,9 +4361,16 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 "repository_revision": 1,
             }
         )
-        next(
+        change = next(
             item for item in trace["records"] if item["record_id"] == "change"
-        )["data"]["revision_after"] = 1
+        )
+        change["data"].update(
+            {
+                "revision_after": 1,
+                "subject_revision": "git:active",
+                "revision_provenance_status": "valid",
+            }
+        )
         trace["records"].append(
             {
                 "record_id": "current_claim",
@@ -4361,6 +4379,8 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 "data": {
                     "temporal_scope": "current_revision",
                     "repository_revision": 1,
+                    "subject_revision": "git:active",
+                    "revision_provenance_status": "valid",
                 },
             }
         )
