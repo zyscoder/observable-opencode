@@ -1319,6 +1319,8 @@ def _validate_confirmation_request_projection_binding(
     *,
     defect_state: DefectState,
     analysis_perspective: str,
+    ledger: HypothesisLedger,
+    frontier: RecursiveFrontier,
     confirmation: Optional[RootConfirmation] = None,
     action_projection: Optional[Mapping[str, Any]] = None,
     label: str,
@@ -1396,6 +1398,82 @@ def _validate_confirmation_request_projection_binding(
                 label
             )
         )
+
+    try:
+        hypothesis = ledger.get(outer_binding[3])
+    except KeyError:
+        raise ValueError(
+            "{0} hypothesis authority is missing from the ledger".format(
+                label
+            )
+        )
+    ledger_binding = (
+        hypothesis.hypothesis_id,
+        hypothesis.semantic_hash,
+        hypothesis.candidate_root_ref,
+        hypothesis.active_defect_fingerprint,
+        hypothesis.seed_binding_identity,
+    )
+    expected_authority = (
+        outer_binding[3],
+        outer_binding[4],
+        outer_binding[0],
+        defect_state.fingerprint,
+        outer_binding[5],
+    )
+    if ledger_binding != expected_authority:
+        raise ValueError(
+            "{0} hypothesis authority contradicts the ledger".format(label)
+        )
+
+    frontier_items = [
+        item
+        for item in frontier.lifecycle_items()
+        if item.visit_key == owner.visit_key
+    ]
+    if len(frontier_items) > 1:
+        raise ValueError(
+            "{0} hypothesis authority has an ambiguous frontier visit".format(
+                label
+            )
+        )
+    if frontier_items:
+        item = frontier_items[0]
+        frontier_binding = (
+            item.hypothesis_id,
+            item.hypothesis_semantic_hash,
+            item.node_ref,
+            item.defect_state.fingerprint,
+            item.seed_binding_identity,
+        )
+        expected_owner = _owner_for_item(item, "confirmation_queue")
+        if (
+            frontier_binding != expected_authority
+            or owner != expected_owner
+        ):
+            raise ValueError(
+                "{0} hypothesis authority contradicts the frontier".format(
+                    label
+                )
+            )
+    else:
+        expected_owner = LocalStateOwner.create(
+            seed_binding_identity=outer_binding[5],
+            hypothesis_id=outer_binding[3],
+            visit_key=semantic_visit_key(
+                outer_binding[0],
+                defect_state,
+                hypothesis.semantic_hash,
+                outer_binding[5],
+            ),
+            occurrence_key="confirmation_queue",
+        )
+        if owner != expected_owner:
+            raise ValueError(
+                "{0} hypothesis authority contradicts the ledger owner".format(
+                    label
+                )
+            )
 
     if confirmation is not None:
         confirmation_binding = (
@@ -4047,6 +4125,8 @@ class RecursiveAnalysisState:
                 item,
                 defect_state=defect_state,
                 analysis_perspective=self.analysis_perspective,
+                ledger=self.ledger,
+                frontier=self.frontier,
                 confirmation=terminal_confirmation,
                 label="confirmation queue",
             )
@@ -7243,6 +7323,8 @@ class AgenticRecursiveAnalyzer:
             queued,
             defect_state=defect_state,
             analysis_perspective=state.analysis_perspective,
+            ledger=state.ledger,
+            frontier=state.frontier,
             confirmation=confirmation,
             action_projection=action_projection,
             label=label,
@@ -9058,6 +9140,13 @@ class AgenticRecursiveAnalyzer:
                 replay_payload = replay_action["payload"]
                 replayed_confirmation = RootConfirmation.from_dict(
                     dict(replay_payload.get("confirmation") or {})
+                )
+                self._validate_terminal_confirmation_for_action(
+                    state,
+                    queued,
+                    replayed_confirmation,
+                    projection,
+                    label="completed confirmation replay",
                 )
                 replayed_physical_delta = int(
                     replay_payload.get("physical_request_delta") or 0

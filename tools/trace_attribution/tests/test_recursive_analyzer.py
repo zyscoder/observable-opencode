@@ -26,6 +26,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     confirmation_identity_for,
+    semantic_visit_key,
 )
 from trace_attribution.errors import (
     JudgeProviderUnavailable,
@@ -4548,8 +4549,17 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                             if ref == "record:active"
                             else "hypothesis:stale"
                         ),
-                        visit_key="visit:{0}".format(ref),
-                        occurrence_key="revision_filter:{0}".format(ref),
+                        visit_key=(
+                            semantic_visit_key(
+                                ref,
+                                defect_state,
+                                hypothesis.semantic_hash,
+                                seed,
+                            )
+                            if ref == "record:active"
+                            else "visit:record:stale"
+                        ),
+                        occurrence_key="confirmation_queue",
                     ).to_dict(),
                 }
             )
@@ -4601,7 +4611,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         state.defect_states[defect_state.fingerprint] = defect_state
 
         accepted = []
-        for index, ref in enumerate(refs):
+        for ref in refs:
             hypothesis = state.ledger.create(
                 "Candidate {0} introduced the defect.".format(ref),
                 ref,
@@ -4633,8 +4643,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "owner": LocalStateOwner.create(
                             seed_binding_identity="seed-binding",
                             hypothesis_id=hypothesis.hypothesis_id,
-                            visit_key="visit:{0}".format(index),
-                            occurrence_key="queue_bound:{0}".format(index),
+                            visit_key=semantic_visit_key(
+                                ref,
+                                defect_state,
+                                hypothesis.semantic_hash,
+                                "seed-binding",
+                            ),
+                            occurrence_key="confirmation_queue",
                         ).to_dict(),
                     }
                 )
