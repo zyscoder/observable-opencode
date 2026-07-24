@@ -30,7 +30,7 @@ from trace_attribution.recursive_analyzer import (
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v12"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v13"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -685,6 +685,90 @@ def _validate_path(graph: TraceGraph, path: Any, *, label: str) -> List[str]:
     return violations
 
 
+def _rejected_snapshot_artifact_ids(
+    report: Mapping[str, Any],
+) -> Set[str]:
+    metadata = (
+        report.get("metadata")
+        if isinstance(report.get("metadata"), Mapping)
+        else {}
+    )
+    rejected: Set[str] = set()
+    for projection in metadata.get("confirmation_action_projection") or ():
+        if not isinstance(projection, Mapping):
+            continue
+        disposition = projection.get("evidence_disposition")
+        if (
+            not isinstance(disposition, Mapping)
+            or disposition.get("state") != "rejected_snapshot"
+        ):
+            continue
+        rejected.update(
+            str(envelope.get("canonical_ref") or "")
+            .removeprefix("artifact:")
+            for envelope in projection.get(
+                "artifact_evidence_envelopes"
+            )
+            or ()
+            if isinstance(envelope, Mapping)
+            and str(envelope.get("canonical_ref") or "").startswith(
+                "artifact:"
+            )
+        )
+
+    supported: Set[str] = set()
+
+    def remember_refs(values: Any) -> None:
+        for ref in values or ():
+            text = str(ref or "")
+            if text.startswith("artifact:"):
+                supported.add(text.removeprefix("artifact:"))
+
+    for seed in report.get("seed_results") or ():
+        if not isinstance(seed, Mapping):
+            continue
+        remember_refs(seed.get("decisive_evidence_refs"))
+        judgment = seed.get("global_judgment")
+        if not isinstance(judgment, Mapping):
+            continue
+        remember_refs(judgment.get("decisive_evidence_refs"))
+        for assessment in judgment.get("assessments") or ():
+            if isinstance(assessment, Mapping):
+                remember_refs(assessment.get("evidence_refs"))
+    for section in (
+        "causal_candidates",
+        "introduction_candidates",
+        "causal_relations",
+        "step_judgments",
+        "hypotheses",
+        "unresolved_hypotheses",
+        "confirmations",
+        "confirmed_roots",
+        "co_roots",
+        "contributing_conditions",
+        "amplifying_factors",
+        "rejected_candidates",
+    ):
+        for item in report.get(section) or ():
+            if not isinstance(item, Mapping):
+                continue
+            remember_refs(item.get("evidence_refs"))
+            remember_refs(item.get("decisive_evidence_refs"))
+            for evidence_key in (
+                "supporting_evidence",
+                "opposing_evidence",
+                "predecessors",
+            ):
+                for evidence in item.get(evidence_key) or ():
+                    if not isinstance(evidence, Mapping):
+                        continue
+                    ref = str(evidence.get("ref") or "")
+                    if ref.startswith("artifact:"):
+                        supported.add(ref.removeprefix("artifact:"))
+                    remember_refs(evidence.get("evidence_refs"))
+    return rejected - supported
+
+
 def _duplicate_full_identities(report: Mapping[str, Any]) -> List[str]:
     violations: List[str] = []
     for section in (
@@ -793,7 +877,11 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
     return violations
 
 
-def _source_trace_violations(graph: TraceGraph) -> List[str]:
+def _source_trace_violations(
+    graph: TraceGraph,
+    *,
+    rejected_snapshot_artifact_ids: Set[str] = frozenset(),
+) -> List[str]:
     violations: List[str] = []
     records = graph.raw_trace.get("records")
     if not isinstance(records, list):
@@ -850,6 +938,8 @@ def _source_trace_violations(graph: TraceGraph) -> List[str]:
     ):
         violations.append("source_trace_artifact_identity_invalid_or_duplicate")
     for artifact_id in artifact_ids:
+        if artifact_id in rejected_snapshot_artifact_ids:
+            continue
         violations.extend(_validate_artifact(graph, artifact_id, owner_ref=""))
     return sorted(set(violations))
 
@@ -860,6 +950,7 @@ def _validate_candidate(
     anchors: Mapping[str, str],
     *,
     section: str,
+    rejected_snapshot_artifact_ids: Set[str] = frozenset(),
 ) -> List[str]:
     violations: List[str] = []
     ref = str(candidate.get("ref") or "")
@@ -874,15 +965,51 @@ def _validate_candidate(
         base_payload = _source_node_payload(graph, ref)
         source_node = graph.hydrate_node(ref)
         hydrated_payload = _node_payload(source_node)
-        if dict(embedded) not in (base_payload, hydrated_payload):
+        embedded_payload = dict(embedded)
+        embedded_data = (
+            dict(embedded_payload.get("data"))
+            if isinstance(embedded_payload.get("data"), Mapping)
+            else {}
+        )
+        embedded_hydrated_ids = {
+            str(item.get("artifact_id") or "").removeprefix(
+                "artifact:"
+            )
+            for item in _items(embedded_data.get("hydrated_artifacts"))
+        }
+        audit_only_hydration = bool(
+            embedded_hydrated_ids
+            and embedded_hydrated_ids.issubset(
+                rejected_snapshot_artifact_ids
+            )
+        )
+        if audit_only_hydration:
+            embedded_data.pop("hydrated_artifacts", None)
+            embedded_payload["data"] = embedded_data
+        if (
+            embedded_payload
+            if audit_only_hydration
+            else dict(embedded)
+        ) not in (base_payload, hydrated_payload):
             violations.append("{0}_node_snapshot_mismatch:{1}".format(section, ref))
         hydrated = embedded.get("data", {}).get("hydrated_artifacts") if isinstance(embedded.get("data"), Mapping) else None
         for artifact in _items(hydrated):
             artifact_id = str(artifact.get("artifact_id") or "")
+            if (
+                artifact_id.removeprefix("artifact:")
+                in rejected_snapshot_artifact_ids
+            ):
+                continue
             violations.extend(
                 _validate_artifact(graph, artifact_id, owner_ref=ref, envelope=artifact)
             )
     for evidence_ref in candidate.get("evidence_refs") or []:
+        if (
+            str(evidence_ref).removeprefix("artifact:")
+            in rejected_snapshot_artifact_ids
+            and str(evidence_ref).startswith("artifact:")
+        ):
+            continue
         violations.extend(_validate_ref(graph, evidence_ref, owner_ref=ref))
     edge = candidate.get("edge")
     if isinstance(edge, Mapping):
@@ -1030,7 +1157,17 @@ def _trace_backed_safety_violations(
         violations.append("strict_report_canonical_schema_mismatch")
     if parsed.case_id != graph.case_id or parsed.case_id != labels["case_id"]:
         violations.append("case_id_mismatch")
-    violations.extend(_source_trace_violations(graph))
+    rejected_snapshot_artifact_ids = (
+        _rejected_snapshot_artifact_ids(report)
+    )
+    violations.extend(
+        _source_trace_violations(
+            graph,
+            rejected_snapshot_artifact_ids=(
+                rejected_snapshot_artifact_ids
+            ),
+        )
+    )
     if report.get("analysis_outcome") != parsed.analysis_outcome:
         violations.append("analysis_outcome_state_machine_mismatch")
     if parsed.analysis_outcome in {"inconclusive", "partial"}:
@@ -1148,7 +1285,15 @@ def _trace_backed_safety_violations(
     for section in ("causal_candidates", "introduction_candidates"):
         for candidate in _items(report.get(section)):
             violations.extend(
-                _validate_candidate(graph, candidate, anchors, section=section)
+                _validate_candidate(
+                    graph,
+                    candidate,
+                    anchors,
+                    section=section,
+                    rejected_snapshot_artifact_ids=(
+                        rejected_snapshot_artifact_ids
+                    ),
+                )
             )
 
     for judgment in _items(report.get("step_judgments")):

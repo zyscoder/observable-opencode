@@ -371,18 +371,11 @@ class CanonicalGlobalTerminalClassifierTest(unittest.TestCase):
                 "status": "failed",
             }
         )
-        restored = RecursiveAttributionReport.from_dict(payload)
-
         with self.assertRaisesRegex(
             ValueError,
             "global|episode|marker|schema",
         ):
-            validate_recursive_report_against_graph(
-                self.graph,
-                restored,
-                label="fix29 kind-only global episode",
-                action_records=self.checkpoint.actions,
-            )
+            RecursiveAttributionReport.from_dict(payload)
         with self.assertRaises(EvaluationSafetyError):
             compare_report(
                 payload,
@@ -664,7 +657,7 @@ class ExplicitArtifactOwnerTerminalValidationTest(unittest.TestCase):
                 )
                 self.assertTrue(
                     any(
-                        "terminal_artifact_evidence_invalid"
+                        "terminal_artifact_preflight_rejected"
                         in item
                         for item in seed.missing_evidence
                     )
@@ -749,21 +742,21 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "terminal-record-schema/v2",
+            "terminal-record-schema/v3",
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "terminal-evidence/v1",
+            "terminal-evidence/v2",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertEqual(
             GLOBAL_FAILURE_PROJECTION_SCHEMA,
             "global-candidate-failure-projection/v4",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v9")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v10")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v12",
+            "recursive-attribution-report/v13",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -771,7 +764,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v11",
+            "recursive-attribution-checkpoint/v12",
         )
 
     def test_old_global_envelope_and_report_are_rejected(self):

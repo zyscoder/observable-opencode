@@ -50,22 +50,22 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v12"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v13"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
-    "+failure-action/v3+failure-projection/v4+terminal-record-schema/v2"
+    "+failure-action/v3+failure-projection/v4+terminal-record-schema/v3"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v7"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v13+resolution/v2+evidence-policy/v5"
-    "+artifact-owner/v1+terminal-evidence/v1+local-state-owner/v1"
-    "+action-projection/v3"
+    "recursive-root-confirmation/v14+resolution/v2+evidence-policy/v5"
+    "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
+    "+action-projection/v4"
     "+step-action-projection/v1+confirmation-request-identity/v2"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
@@ -2865,6 +2865,24 @@ class RecursiveAttributionReport:
         )
         metadata = _json_dict(value.get("metadata"))
         unresolved_refs = _string_list(value.get("unresolved_refs"))
+        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            from .recursive_analyzer import (
+                _classify_global_failure_episodes,
+                _classify_global_pass_records,
+                _seed_authority_from_records,
+            )
+
+            report_seed_authority = _seed_authority_from_records(
+                value.get("seed_results") or ()
+            )
+            _classify_global_pass_records(
+                value.get("investigation_journal") or (),
+                seed_authority=report_seed_authority,
+            )
+            _classify_global_failure_episodes(
+                metadata.get("unresolved_branches") or (),
+                seed_authority=report_seed_authority,
+            )
         if schema_version == PREVIOUS_REPORT_SCHEMA_VERSION:
             from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 

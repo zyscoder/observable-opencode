@@ -507,17 +507,11 @@ class ExactGlobalTerminalRecordClassificationTest(unittest.TestCase):
         )
         episode.pop("failure_projection")
         payload["metadata"]["unresolved_branches"].append(episode)
-        restored = RecursiveAttributionReport.from_dict(payload)
         with self.assertRaisesRegex(
             ValueError,
             "global|failure|episode|schema|projection",
         ):
-            validate_recursive_report_against_graph(
-                self.graph,
-                restored,
-                label="fix28 unprojected global failure episode",
-                action_records=self.checkpoint.actions,
-            )
+            RecursiveAttributionReport.from_dict(payload)
         with self.assertRaises(EvaluationSafetyError):
             compare_report(
                 payload,

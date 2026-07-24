@@ -105,7 +105,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v9"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v10"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -213,6 +213,7 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
         "recursive_path",
         "evidence_refs",
         "artifact_evidence_envelopes",
+        "evidence_disposition",
         "physical_requests_reserved",
         "physical_request_delta",
         "physical_request_exact",
@@ -246,10 +247,42 @@ PENDING_CONFIRMATION_ALLOWED_KEYS = frozenset(
     }
 )
 TERMINAL_CONFIRMATION_REQUIRED_KEYS = frozenset(
-    {*PENDING_CONFIRMATION_REQUIRED_KEYS, "confirmation"}
+    {
+        *PENDING_CONFIRMATION_REQUIRED_KEYS,
+        "confirmation",
+        "evidence_disposition",
+    }
 )
 TERMINAL_CONFIRMATION_ALLOWED_KEYS = frozenset(
-    {*PENDING_CONFIRMATION_ALLOWED_KEYS, "confirmation"}
+    {
+        *PENDING_CONFIRMATION_ALLOWED_KEYS,
+        "confirmation",
+        "evidence_disposition",
+    }
+)
+TERMINAL_EVIDENCE_DISPOSITION_SCHEMA = (
+    "root-confirmation-terminal-evidence-disposition/v1"
+)
+TERMINAL_EVIDENCE_DISPOSITION_KEYS = frozenset(
+    {
+        "schema",
+        "state",
+        "snapshot_identity",
+        "rejection_reason",
+        "graph_comparison_facts",
+    }
+)
+ARTIFACT_EVIDENCE_COMPARISON_KEYS = frozenset(
+    {
+        "schema",
+        "canonical_ref",
+        "expected_owner_ref",
+        "artifact_reference_status",
+        "active_owner_refs",
+        "file_verification",
+        "validation_status",
+        "rejection_reason",
+    }
 )
 STEP_ACTION_PROJECTION_SCHEMA = "step-action-projection/v1"
 STEP_ACTION_PROJECTION_KEYS = frozenset(
@@ -696,14 +729,23 @@ def _assert_report_grounded_evidence(
             projection = _validated_confirmation_action_projection(
                 matching_projections[0]
             )
-            _validate_terminal_confirmation_evidence(
-                graph,
+            disposition = _validated_terminal_evidence_disposition(
+                projection["evidence_disposition"],
                 confirmation=confirmation,
                 artifact_evidence_envelopes=projection[
                     "artifact_evidence_envelopes"
                 ],
-                label="{0} confirmation".format(label),
+                operation=projection["operation"],
             )
+            if disposition["state"] == "validated":
+                _validate_terminal_confirmation_evidence(
+                    graph,
+                    confirmation=confirmation,
+                    artifact_evidence_envelopes=projection[
+                        "artifact_evidence_envelopes"
+                    ],
+                    label="{0} confirmation".format(label),
+                )
         for competitor in confirmation.competitor_comparisons:
             if not isinstance(competitor, Mapping):
                 continue
@@ -904,17 +946,20 @@ def _quarantine_stale_seed_report_payload(
         if isinstance(payload.get("metadata"), Mapping)
         else {}
     )
-    _classify_global_pass_records(
-        payload.get("investigation_journal") or ()
-    )
-    _classify_global_failure_episodes(
-        source_metadata.get("unresolved_branches") or ()
-    )
     seeds = [
         item
         for item in payload.get("seed_results") or ()
         if isinstance(item, Mapping)
     ]
+    seed_authority = _seed_authority_from_records(seeds)
+    _classify_global_pass_records(
+        payload.get("investigation_journal") or (),
+        seed_authority=seed_authority,
+    )
+    _classify_global_failure_episodes(
+        source_metadata.get("unresolved_branches") or (),
+        seed_authority=seed_authority,
+    )
     stale_start_refs = {
         graph.resolve(str(item.get("start_ref") or ""))
         or str(item.get("start_ref") or "")
@@ -1266,6 +1311,231 @@ def _validate_terminal_confirmation_identity(
         )
 
 
+def _terminal_evidence_snapshot_identity(
+    artifact_evidence_envelopes: Any,
+) -> str:
+    if not isinstance(artifact_evidence_envelopes, (list, tuple)):
+        raise ValueError(
+            "terminal artifact evidence snapshot must be an array"
+        )
+    return "terminal_evidence_snapshot:v1:{0}".format(
+        hashlib.sha256(
+            stable_json(
+                _checkpoint_json(list(artifact_evidence_envelopes))
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def _build_terminal_evidence_disposition(
+    graph: TraceGraph,
+    artifact_evidence_envelopes: Any,
+) -> JsonDict:
+    if not isinstance(artifact_evidence_envelopes, (list, tuple)):
+        raise ValueError(
+            "terminal artifact evidence snapshot must be an array"
+        )
+    snapshot = copy.deepcopy(list(artifact_evidence_envelopes))
+    comparison_facts = []
+    for value in snapshot:
+        owner_reference = (
+            value.get("owner_reference")
+            if isinstance(value, Mapping)
+            else None
+        )
+        expected_owner_ref = (
+            str(owner_reference.get("resolved_ref") or "")
+            if isinstance(owner_reference, Mapping)
+            else ""
+        )
+        comparison_facts.append(
+            graph.artifact_evidence_comparison_facts(
+                value,
+                expected_owner_ref=expected_owner_ref,
+            )
+        )
+    rejected = [
+        "{0}: {1}".format(
+            str(item.get("canonical_ref") or "<unknown>"),
+            str(item.get("rejection_reason") or "artifact snapshot rejected"),
+        )
+        for item in comparison_facts
+        if item.get("validation_status") == "rejected"
+    ]
+    return {
+        "schema": TERMINAL_EVIDENCE_DISPOSITION_SCHEMA,
+        "state": "rejected_snapshot" if rejected else "validated",
+        "snapshot_identity": _terminal_evidence_snapshot_identity(snapshot),
+        "rejection_reason": "; ".join(rejected),
+        "graph_comparison_facts": comparison_facts,
+    }
+
+
+def _reject_terminal_evidence_disposition(
+    disposition: Mapping[str, Any],
+    *,
+    reason: str,
+) -> JsonDict:
+    rejected = copy.deepcopy(dict(disposition))
+    facts = rejected.get("graph_comparison_facts")
+    if not isinstance(facts, list) or not facts:
+        raise ValueError(
+            "artifact snapshot rejection requires comparison facts"
+        )
+    facts[0]["validation_status"] = "rejected"
+    facts[0]["rejection_reason"] = str(reason or "").strip()
+    if not facts[0]["rejection_reason"]:
+        raise ValueError("artifact snapshot rejection reason is required")
+    rejection_reasons = [
+        "{0}: {1}".format(
+            str(item.get("canonical_ref") or "<unknown>"),
+            str(item.get("rejection_reason") or ""),
+        )
+        for item in facts
+        if item.get("validation_status") == "rejected"
+    ]
+    rejected["state"] = "rejected_snapshot"
+    rejected["rejection_reason"] = "; ".join(rejection_reasons)
+    return rejected
+
+
+def _validated_terminal_evidence_disposition(
+    value: Any,
+    *,
+    artifact_evidence_envelopes: Any,
+    confirmation: Optional[RootConfirmation] = None,
+    operation: str = "",
+) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("terminal evidence disposition must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(TERMINAL_EVIDENCE_DISPOSITION_KEYS),
+        "terminal evidence disposition",
+    )
+    disposition = _checkpoint_json(value)
+    state = str(disposition.get("state") or "")
+    facts = disposition.get("graph_comparison_facts")
+    if (
+        disposition.get("schema")
+        != TERMINAL_EVIDENCE_DISPOSITION_SCHEMA
+        or state not in {"validated", "rejected_snapshot"}
+        or not isinstance(facts, list)
+        or disposition.get("snapshot_identity")
+        != _terminal_evidence_snapshot_identity(
+            artifact_evidence_envelopes
+        )
+    ):
+        raise ValueError("terminal evidence disposition is non-canonical")
+    snapshot = list(artifact_evidence_envelopes)
+    if len(facts) != len(snapshot):
+        raise ValueError(
+            "terminal evidence disposition does not cover its audit snapshot"
+        )
+    rejection_reasons = []
+    for index, (fact, envelope) in enumerate(zip(facts, snapshot)):
+        if not isinstance(fact, Mapping):
+            raise ValueError(
+                "terminal evidence comparison fact[{0}] is invalid".format(
+                    index
+                )
+            )
+        _require_exact_checkpoint_keys(
+            fact,
+            set(ARTIFACT_EVIDENCE_COMPARISON_KEYS),
+            "terminal evidence comparison fact[{0}]".format(index),
+        )
+        owner_reference = (
+            envelope.get("owner_reference")
+            if isinstance(envelope, Mapping)
+            else None
+        )
+        expected_owner_ref = (
+            str(owner_reference.get("resolved_ref") or "")
+            if isinstance(owner_reference, Mapping)
+            else ""
+        )
+        canonical_ref = (
+            str(envelope.get("canonical_ref") or "")
+            if isinstance(envelope, Mapping)
+            else ""
+        )
+        validation_status = str(
+            fact.get("validation_status") or ""
+        )
+        if (
+            fact.get("schema") != "artifact-evidence-comparison/v1"
+            or str(fact.get("canonical_ref") or "") != canonical_ref
+            or str(fact.get("expected_owner_ref") or "")
+            != expected_owner_ref
+            or validation_status not in {"validated", "rejected"}
+            or not isinstance(fact.get("active_owner_refs"), list)
+            or not isinstance(fact.get("file_verification"), Mapping)
+        ):
+            raise ValueError(
+                "terminal evidence comparison fact[{0}] contradicts its "
+                "audit snapshot".format(index)
+            )
+        rejection_reason = str(fact.get("rejection_reason") or "")
+        if (
+            validation_status == "validated" and rejection_reason
+        ) or (
+            validation_status == "rejected" and not rejection_reason
+        ):
+            raise ValueError(
+                "terminal evidence comparison fact[{0}] has inconsistent "
+                "validation facts".format(index)
+            )
+        if validation_status == "rejected":
+            rejection_reasons.append(
+                "{0}: {1}".format(
+                    canonical_ref or "<unknown>",
+                    rejection_reason,
+                )
+            )
+    expected_rejection = "; ".join(rejection_reasons)
+    if (
+        state == "validated"
+        and (
+            rejection_reasons
+            or str(disposition.get("rejection_reason") or "")
+        )
+    ) or (
+        state == "rejected_snapshot"
+        and (
+            not rejection_reasons
+            or str(disposition.get("rejection_reason") or "")
+            != expected_rejection
+        )
+    ):
+        raise ValueError(
+            "terminal evidence disposition state contradicts comparison facts"
+        )
+    if confirmation is not None:
+        if state == "rejected_snapshot":
+            expected_reason = "terminal_artifact_preflight_rejected: {0}".format(
+                expected_rejection
+            )
+            if (
+                operation != "confirmation_failed"
+                or confirmation.status != "unknown"
+                or confirmation.evidence_refs
+                or confirmation.reason != expected_reason
+            ):
+                raise ValueError(
+                    "rejected artifact snapshot may terminate only as a "
+                    "no-evidence unknown confirmation"
+                )
+        elif (
+            confirmation.status in {"confirmed", "rejected"}
+            and state != "validated"
+        ):
+            raise ValueError(
+                "substantive confirmation requires validated terminal evidence"
+            )
+    return copy.deepcopy(disposition)
+
+
 def _confirmation_action_projection(
     *,
     operation: str,
@@ -1278,6 +1548,7 @@ def _confirmation_action_projection(
     physical_request_delta: int,
     physical_request_exact: bool,
     artifact_evidence_envelopes: Sequence[Mapping[str, Any]] = (),
+    evidence_disposition: Optional[Mapping[str, Any]] = None,
 ) -> JsonDict:
     if operation not in CONFIRMATION_ACTION_OPERATIONS:
         raise ValueError("confirmation action operation is invalid")
@@ -1308,6 +1579,12 @@ def _confirmation_action_projection(
             )
     if type(physical_request_exact) is not bool:
         raise ValueError("confirmation action physical_request_exact must be boolean")
+    validated_disposition = _validated_terminal_evidence_disposition(
+        evidence_disposition,
+        artifact_evidence_envelopes=artifact_evidence_envelopes,
+        confirmation=confirmation,
+        operation=operation,
+    )
     return {
         "operation": operation,
         "semantic_key": semantic_key,
@@ -1326,6 +1603,7 @@ def _confirmation_action_projection(
         "artifact_evidence_envelopes": copy.deepcopy(
             list(artifact_evidence_envelopes)
         ),
+        "evidence_disposition": validated_disposition,
         "physical_requests_reserved": physical_requests_reserved,
         "physical_request_delta": physical_request_delta,
         "physical_request_exact": physical_request_exact,
@@ -1434,6 +1712,7 @@ def _validated_confirmation_action_projection(value: Any) -> JsonDict:
             "artifact_evidence_envelopes"
         )
         or (),
+        evidence_disposition=value.get("evidence_disposition"),
     )
     if stable_json(_checkpoint_json(value)) != stable_json(
         _checkpoint_json(expected)
@@ -1510,24 +1789,230 @@ def _validated_confirmation_started_action(
     return copy.deepcopy(dict(payload))
 
 
-def _carries_global_terminal_marker(value: Any) -> bool:
+def _seed_authority_from_records(
+    records: Iterable[Any],
+) -> Dict[str, JsonDict]:
+    authority: Dict[str, JsonDict] = {}
+    for index, item in enumerate(records):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                "seed authority record[{0}] must be an object".format(index)
+            )
+        seed_ref = str(item.get("start_ref") or item.get("seed_ref") or "")
+        defect_state = item.get("defect_state")
+        defect_fingerprint = str(
+            item.get("defect_fingerprint")
+            or (
+                defect_state.get("fingerprint")
+                if isinstance(defect_state, Mapping)
+                else ""
+            )
+            or ""
+        )
+        if not seed_ref or not defect_fingerprint:
+            raise ValueError(
+                "seed authority record[{0}] is incomplete".format(index)
+            )
+        binding, _, _ = _canonical_global_pass_facts(
+            seed_ref=seed_ref,
+            defect_fingerprint=defect_fingerprint,
+        )
+        if binding in authority:
+            raise ValueError("seed authority contains a duplicate binding")
+        authority[binding] = {
+            "seed_ref": seed_ref,
+            "defect_fingerprint": defect_fingerprint,
+            "defect_state_id": "defect:{0}".format(defect_fingerprint),
+        }
+    return authority
+
+
+def _normalized_seed_authority(
+    seed_authority: Optional[Mapping[str, Any]],
+) -> Dict[str, JsonDict]:
+    output: Dict[str, JsonDict] = {}
+    for raw_binding, raw_facts in (seed_authority or {}).items():
+        if not isinstance(raw_facts, Mapping):
+            raise ValueError("global terminal seed authority must contain objects")
+        seed_ref = str(raw_facts.get("seed_ref") or "")
+        defect_fingerprint = str(
+            raw_facts.get("defect_fingerprint") or ""
+        )
+        expected_binding, expected_pass, expected_owner = (
+            _canonical_global_pass_facts(
+                seed_ref=seed_ref,
+                defect_fingerprint=defect_fingerprint,
+            )
+        )
+        binding = str(raw_binding or "")
+        if binding != expected_binding or binding in output:
+            raise ValueError(
+                "global terminal seed authority binding is non-canonical"
+            )
+        defect_state_id = str(
+            raw_facts.get("defect_state_id")
+            or "defect:{0}".format(defect_fingerprint)
+        )
+        if defect_state_id != "defect:{0}".format(defect_fingerprint):
+            raise ValueError(
+                "global terminal seed authority defect state is non-canonical"
+            )
+        output[binding] = {
+            "seed_ref": seed_ref,
+            "defect_fingerprint": defect_fingerprint,
+            "defect_state_id": defect_state_id,
+            "pass_identity": expected_pass,
+            "owner": expected_owner.to_dict(),
+        }
+    return output
+
+
+def _owner_partially_claims_global_pass(
+    value: Any,
+    authority: Mapping[str, JsonDict],
+) -> bool:
     if not isinstance(value, Mapping):
         return False
-    return (
-        value.get("kind") == "global_candidate_pass"
-        or any(key in value for key in GLOBAL_TERMINAL_MARKER_KEYS)
+    owner_keys = {
+        "seed_binding_identity",
+        "hypothesis_id",
+        "visit_key",
+        "occurrence_identity",
+    }
+    present = owner_keys.intersection(str(key) for key in value)
+    if not present:
+        return False
+    for binding, facts in authority.items():
+        canonical = facts["owner"]
+        matching = {
+            key
+            for key in present
+            if value.get(key) == canonical.get(key)
+        }
+        if matching == present and (
+            "occurrence_identity" in matching
+            or (
+                "seed_binding_identity" in matching
+                and len(matching) >= 2
+            )
+            or len(matching) >= 2
+        ):
+            return True
+        if (
+            value.get("seed_binding_identity") == binding
+            and {
+                "hypothesis_id",
+                "visit_key",
+                "occurrence_identity",
+            }.intersection(matching)
+        ):
+            return True
+    return False
+
+
+def _global_terminal_residual_signature(
+    value: Any,
+    *,
+    seed_authority: Optional[Mapping[str, Any]],
+    allowed_kinds: Set[str],
+) -> bool:
+    """Recognize explicit or ledger-bound residual global terminal state."""
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("kind") == "global_candidate_pass" or any(
+        key in value for key in GLOBAL_TERMINAL_MARKER_KEYS
+    ):
+        return True
+    authority = _normalized_seed_authority(seed_authority)
+    owner = value.get("owner")
+    if _owner_partially_claims_global_pass(owner, authority):
+        return True
+
+    keys = {str(key) for key in value}
+    status = str(value.get("status") or "")
+    seed_ref = str(value.get("seed_ref") or "")
+    defect_fingerprint = str(value.get("defect_fingerprint") or "")
+    seed_binding = str(value.get("seed_binding_identity") or "")
+    matching_pass_authority = [
+        (binding, facts)
+        for binding, facts in authority.items()
+        if (
+            seed_binding == binding
+            or (
+                seed_ref == facts["seed_ref"]
+                and defect_fingerprint == facts["defect_fingerprint"]
+            )
+        )
+    ]
+    pass_action_shape = bool(
+        isinstance(value.get("candidate_compression"), Mapping)
+        and isinstance(owner, Mapping)
+        and status in {"completed", "failed"}
+        and (
+            {
+                "physical_request_delta",
+                "behavior_impact",
+            }.issubset(keys)
+            or bool(
+                {
+                    "candidate_evidence_capsules",
+                    "judgment",
+                    "blocker",
+                    "missing_evidence",
+                    "physical_request_exact",
+                }.intersection(keys)
+            )
+        )
+    )
+    if (
+        "pass" in allowed_kinds
+        and matching_pass_authority
+        and pass_action_shape
+    ):
+        return True
+
+    node_ref = str(value.get("node_ref") or "")
+    defect_state_id = str(value.get("defect_state_id") or "")
+    matching_episode_authority = any(
+        node_ref == facts["seed_ref"]
+        and defect_state_id == facts["defect_state_id"]
+        for facts in authority.values()
+    )
+    episode_shape = bool(
+        isinstance(owner, Mapping)
+        and {
+            "node_ref",
+            "defect_state_id",
+            "hypothesis_id",
+            "reason",
+            "details",
+            "depth",
+        }.issubset(keys)
+        and type(value.get("depth")) is int
+    )
+    return bool(
+        "episode" in allowed_kinds
+        and matching_episode_authority
+        and episode_shape
     )
 
 
 def _classify_global_pass_records(
     investigation_journal: Iterable[Any],
+    *,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[Mapping[str, Any]], List[Mapping[str, Any]]]:
     completed: List[Mapping[str, Any]] = []
     failed: List[Mapping[str, Any]] = []
+    authority = _normalized_seed_authority(seed_authority)
     for index, item in enumerate(investigation_journal):
         if not isinstance(item, Mapping):
             continue
-        if not _carries_global_terminal_marker(item):
+        if not _global_terminal_residual_signature(
+            item,
+            seed_authority=authority,
+            allowed_kinds={"pass"},
+        ):
             continue
         status = str(item.get("status") or "")
         expected_keys = (
@@ -1563,6 +2048,10 @@ def _classify_global_pass_records(
         physical_request_delta = item.get("physical_request_delta")
         if (
             seed_binding_identity != expected_seed_binding
+            or (
+                authority
+                and expected_seed_binding not in authority
+            )
             or str(item.get("pass_identity") or "")
             != expected_pass_identity
             or owner != expected_owner
@@ -1613,12 +2102,19 @@ def _classify_global_pass_records(
 
 def _classify_global_failure_episodes(
     unresolved_branches: Iterable[Any],
+    *,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> List[Mapping[str, Any]]:
     episodes: List[Mapping[str, Any]] = []
+    authority = _normalized_seed_authority(seed_authority)
     for index, item in enumerate(unresolved_branches):
         if not isinstance(item, Mapping):
             continue
-        if not _carries_global_terminal_marker(item):
+        if not _global_terminal_residual_signature(
+            item,
+            seed_authority=authority,
+            allowed_kinds={"episode"},
+        ):
             continue
         if {str(key) for key in item} != set(FAILED_GLOBAL_EPISODE_KEYS):
             raise ValueError(
@@ -1628,6 +2124,15 @@ def _classify_global_failure_episodes(
         projection = _validated_global_failure_projection(
             item.get("failure_projection")
         )
+        if (
+            authority
+            and projection["seed_binding_identity"] not in authority
+        ):
+            raise ValueError(
+                "global failure episode[{0}] has no seed authority".format(
+                    index
+                )
+            )
         if (
             str(item.get("global_pass_identity") or "")
             != projection["pass_identity"]
@@ -1648,24 +2153,37 @@ def _classify_global_failure_episodes(
 
 def _completed_global_passes(
     investigation_journal: Iterable[Any],
+    *,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> List[Mapping[str, Any]]:
-    return _classify_global_pass_records(investigation_journal)[0]
+    return _classify_global_pass_records(
+        investigation_journal,
+        seed_authority=seed_authority,
+    )[0]
 
 
 def _terminal_global_passes(
     investigation_journal: Iterable[Any],
+    *,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> List[Mapping[str, Any]]:
     completed, failed = _classify_global_pass_records(
-        investigation_journal
+        investigation_journal,
+        seed_authority=seed_authority,
     )
     return [*completed, *failed]
 
 
 def _global_passes_by_owner(
     investigation_journal: Iterable[Any],
+    *,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Mapping[str, Any]]:
     output = {}
-    for action in _terminal_global_passes(investigation_journal):
+    for action in _terminal_global_passes(
+        investigation_journal,
+        seed_authority=seed_authority,
+    ):
         LocalStateOwner.from_dict(action.get("owner"))
         key = str(action.get("pass_identity") or "")
         expected_seed_binding, expected_pass_identity, expected_owner = (
@@ -1709,11 +2227,18 @@ def _validate_global_pass_derivations(
     metadata: Mapping[str, Any],
     *,
     label: str,
+    seed_authority: Optional[Mapping[str, Any]] = None,
 ) -> None:
     journal = tuple(investigation_journal)
-    completed_passes, failed_passes = _classify_global_pass_records(journal)
+    completed_passes, failed_passes = _classify_global_pass_records(
+        journal,
+        seed_authority=seed_authority,
+    )
     terminal_passes = [*completed_passes, *failed_passes]
-    _global_passes_by_owner(terminal_passes)
+    _global_passes_by_owner(
+        terminal_passes,
+        seed_authority=seed_authority,
+    )
     expected_judgments = [
         _owned_payload(action["judgment"], action["owner"])
         for action in completed_passes
@@ -1858,6 +2383,9 @@ def _validate_restored_report_local_state_owners(
         state.investigation_journal,
         metadata,
         label="restored report",
+        seed_authority=_seed_authority_from_records(
+            builder.to_dict() for builder in state.seed_ledger.values()
+        ),
     )
 
 
@@ -3237,8 +3765,33 @@ class RecursiveAnalysisState:
             is_pending = item.get("status") == "queued"
             if is_pending:
                 _validate_pending_confirmation_identity(item)
+                terminal_disposition = None
             else:
                 _validate_terminal_confirmation_identity(item)
+                terminal_confirmation = RootConfirmation.from_dict(
+                    dict(item.get("confirmation") or {})
+                )
+                raw_disposition = item.get("evidence_disposition")
+                raw_disposition_state = (
+                    str(raw_disposition.get("state") or "")
+                    if isinstance(raw_disposition, Mapping)
+                    else ""
+                )
+                terminal_disposition = (
+                    _validated_terminal_evidence_disposition(
+                        raw_disposition,
+                        artifact_evidence_envelopes=item.get(
+                            "artifact_evidence_envelopes"
+                        ),
+                        confirmation=terminal_confirmation,
+                        operation=(
+                            "confirmation_failed"
+                            if raw_disposition_state
+                            == "rejected_snapshot"
+                            else ""
+                        ),
+                    )
+                )
             recursive_path = tuple(
                 str(ref) for ref in item.get("recursive_path") or ()
             )
@@ -3263,43 +3816,65 @@ class RecursiveAnalysisState:
                 raise ValueError(
                     "restored confirmation queue contains evidence ineligible for the active revision"
                 )
-            expected_artifacts = self._confirmation_artifact_envelopes(item)
             actual_artifacts = item.get("artifact_evidence_envelopes")
-            if (
-                not isinstance(actual_artifacts, list)
-                or stable_json(_checkpoint_json(actual_artifacts))
-                != stable_json(_checkpoint_json(expected_artifacts))
-            ):
+            if not isinstance(actual_artifacts, list):
                 raise ValueError(
-                    "confirmation queue artifact owner envelope contradicts "
-                    "the active graph"
+                    "confirmation queue artifact owner envelope must be an array"
                 )
+            rejected_snapshot = bool(
+                terminal_disposition is not None
+                and terminal_disposition["state"]
+                == "rejected_snapshot"
+            )
+            if not rejected_snapshot:
+                expected_artifacts = self._confirmation_artifact_envelopes(
+                    item
+                )
+                if stable_json(
+                    _checkpoint_json(actual_artifacts)
+                ) != stable_json(_checkpoint_json(expected_artifacts)):
+                    raise ValueError(
+                        "confirmation queue artifact owner envelope "
+                        "contradicts the active graph"
+                    )
             stored_projection = item.get("factual_request_projection")
             if not isinstance(stored_projection, Mapping):
                 raise ValueError(
                     "confirmation queue factual request projection is missing"
                 )
-            current_request = AgenticRecursiveAnalyzer._build_confirmation_request(
-                self, item
-            )
-            expected_projection = root_confirmation_request_projection(
-                current_request
-            )
-            if stable_json(_checkpoint_json(stored_projection)) != stable_json(
-                _checkpoint_json(expected_projection)
-            ):
-                raise ValueError(
-                    "confirmation queue factual request projection changed"
-                )
             semantic_identity = str(item.get("semantic_identity") or "")
-            expected_semantic_identity = _confirmation_request_identity(
-                current_request
-            )
-            if (
-                not semantic_identity
-                or semantic_identity != expected_semantic_identity
-                or semantic_identity in semantic_identities
-            ):
+            if rejected_snapshot:
+                if not semantic_identity.startswith(
+                    ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
+                ):
+                    raise ValueError(
+                        "rejected confirmation snapshot has a non-canonical "
+                        "request identity"
+                    )
+            else:
+                current_request = (
+                    AgenticRecursiveAnalyzer._build_confirmation_request(
+                        self, item
+                    )
+                )
+                expected_projection = root_confirmation_request_projection(
+                    current_request
+                )
+                if stable_json(
+                    _checkpoint_json(stored_projection)
+                ) != stable_json(_checkpoint_json(expected_projection)):
+                    raise ValueError(
+                        "confirmation queue factual request projection changed"
+                    )
+                expected_semantic_identity = (
+                    _confirmation_request_identity(current_request)
+                )
+                if semantic_identity != expected_semantic_identity:
+                    raise ValueError(
+                        "confirmation queue contains a non-canonical semantic "
+                        "identity"
+                    )
+            if not semantic_identity or semantic_identity in semantic_identities:
                 raise ValueError(
                     "confirmation queue contains a missing, duplicate, or "
                     "non-canonical semantic identity"
@@ -3591,11 +4166,16 @@ class RecursiveAnalysisState:
         self,
         action_records: Optional[Iterable[Any]] = None,
     ) -> None:
+        seed_authority = _seed_authority_from_records(
+            builder.to_dict() for builder in self.seed_ledger.values()
+        )
         global_failure_episodes = _classify_global_failure_episodes(
-            self.unresolved_branches
+            self.unresolved_branches,
+            seed_authority=seed_authority,
         )
         passes_by_owner = _global_passes_by_owner(
-            self.investigation_journal
+            self.investigation_journal,
+            seed_authority=seed_authority,
         )
         matched_pass_owners = set()
         expected_decisive_evidence: Dict[str, Dict[str, JsonDict]] = {
@@ -3808,6 +4388,7 @@ class RecursiveAnalysisState:
             "recursive_path",
             "status",
             "artifact_evidence_envelopes",
+            "evidence_disposition",
             "confirmation",
         )
         for entry in journal_entries:
@@ -3836,15 +4417,27 @@ class RecursiveAnalysisState:
                     "artifact_evidence_envelopes"
                 )
                 or (),
+                evidence_disposition=entry.get(
+                    "evidence_disposition"
+                ),
             )
-            _validate_terminal_confirmation_evidence(
-                self.graph,
-                confirmation=parsed,
+            disposition = _validated_terminal_evidence_disposition(
+                canonical_projection["evidence_disposition"],
                 artifact_evidence_envelopes=canonical_projection[
                     "artifact_evidence_envelopes"
                 ],
-                label="restored confirmation action",
+                confirmation=parsed,
+                operation=canonical_projection["operation"],
             )
+            if disposition["state"] == "validated":
+                _validate_terminal_confirmation_evidence(
+                    self.graph,
+                    confirmation=parsed,
+                    artifact_evidence_envelopes=canonical_projection[
+                        "artifact_evidence_envelopes"
+                    ],
+                    label="restored confirmation action",
+                )
             if (
                 str(entry.get("candidate_ref") or "")
                 != parsed.candidate_ref
@@ -3862,6 +4455,8 @@ class RecursiveAnalysisState:
                 or owner.seed_binding_identity
                 != parsed.seed_binding_identity
                 or owner.hypothesis_id != parsed.hypothesis_id
+                or entry.get("evidence_disposition")
+                != canonical_projection["evidence_disposition"]
             ):
                 raise ValueError(
                     "confirmation journal fields contradict action payload"
@@ -4661,11 +5256,16 @@ class RecursiveAnalysisState:
             raise ValueError("unsupported recursive hypothesis state schema")
         if action_payload["schema"] != ACTION_STATE_SCHEMA:
             raise ValueError("unsupported recursive action state schema")
+        checkpoint_seed_authority = _seed_authority_from_records(
+            action_payload["seed_ledger"]
+        )
         _classify_global_pass_records(
-            action_payload["investigation_journal"]
+            action_payload["investigation_journal"],
+            seed_authority=checkpoint_seed_authority,
         )
         _classify_global_failure_episodes(
-            action_payload["unresolved_branches"]
+            action_payload["unresolved_branches"],
+            seed_authority=checkpoint_seed_authority,
         )
         formal_unbound_start_refs = {
             graph.resolve(str(ref)) or str(ref)
@@ -4954,9 +5554,13 @@ class RecursiveAnalysisState:
         investigation_journal = _migrate_checkpoint_visit_references(
             action_payload["investigation_journal"], frontier
         )
-        _classify_global_pass_records(investigation_journal)
+        _classify_global_pass_records(
+            investigation_journal,
+            seed_authority=checkpoint_seed_authority,
+        )
         _classify_global_failure_episodes(
-            action_payload["unresolved_branches"]
+            action_payload["unresolved_branches"],
+            seed_authority=checkpoint_seed_authority,
         )
         stale_visit_keys = {
             item.visit_key
@@ -6005,10 +6609,16 @@ class RecursiveAnalysisState:
             if len(refs) > 1
         }
         provider = _provider_circuit(judge)
+        seed_authority = _seed_authority_from_records(
+            builder.to_dict() for builder in self.seed_ledger.values()
+        )
         (
             completed_global_passes,
             failed_global_passes,
-        ) = _classify_global_pass_records(self.investigation_journal)
+        ) = _classify_global_pass_records(
+            self.investigation_journal,
+            seed_authority=seed_authority,
+        )
         global_passes = [
             *completed_global_passes,
             *failed_global_passes,
@@ -6320,11 +6930,20 @@ class AgenticRecursiveAnalyzer:
         physical_request_delta: int,
         physical_request_exact: bool,
         provider_state: Optional[Mapping[str, Any]] = None,
+        evidence_disposition: Optional[Mapping[str, Any]] = None,
     ) -> None:
         request_identity = str(queued.get("semantic_identity") or "")
         semantic_key = "confirmation:{0}".format(request_identity)
         artifact_evidence_envelopes = copy.deepcopy(
             list(queued.get("artifact_evidence_envelopes") or ())
+        )
+        terminal_disposition = (
+            copy.deepcopy(dict(evidence_disposition))
+            if isinstance(evidence_disposition, Mapping)
+            else _build_terminal_evidence_disposition(
+                state.graph,
+                artifact_evidence_envelopes,
+            )
         )
         projection = _confirmation_action_projection(
             operation=operation,
@@ -6341,6 +6960,7 @@ class AgenticRecursiveAnalyzer:
             physical_request_delta=physical_request_delta,
             physical_request_exact=physical_request_exact,
             artifact_evidence_envelopes=artifact_evidence_envelopes,
+            evidence_disposition=terminal_disposition,
         )
         self._validate_terminal_confirmation_for_action(
             state,
@@ -6394,14 +7014,23 @@ class AgenticRecursiveAnalyzer:
         projection = _validated_confirmation_action_projection(
             action_projection
         )
-        _validate_terminal_confirmation_evidence(
-            state.graph,
-            confirmation=confirmation,
+        disposition = _validated_terminal_evidence_disposition(
+            projection["evidence_disposition"],
             artifact_evidence_envelopes=projection[
                 "artifact_evidence_envelopes"
             ],
-            label=label,
+            confirmation=confirmation,
+            operation=projection["operation"],
         )
+        if disposition["state"] == "validated":
+            _validate_terminal_confirmation_evidence(
+                state.graph,
+                confirmation=confirmation,
+                artifact_evidence_envelopes=projection[
+                    "artifact_evidence_envelopes"
+                ],
+                label=label,
+            )
         hypothesis_id = str(queued.get("hypothesis_id") or "")
         seed_key = str(
             queued.get("seed_key")
@@ -6419,6 +7048,11 @@ class AgenticRecursiveAnalyzer:
             != str(queued.get("semantic_identity") or "")
             or projection["artifact_evidence_envelopes"]
             != list(queued.get("artifact_evidence_envelopes") or ())
+            or (
+                queued.get("evidence_disposition") is not None
+                and projection["evidence_disposition"]
+                != queued.get("evidence_disposition")
+            )
         ):
             raise ValueError(
                 "{0} owner contradicts confirmed identity".format(label)
@@ -6476,10 +7110,14 @@ class AgenticRecursiveAnalyzer:
     ) -> None:
         if self.fusion_mode != "retrieval-global":
             return
+        seed_authority = _seed_authority_from_records(
+            builder.to_dict() for builder in state.seed_ledger.values()
+        )
         terminal_pass_identities = {
             str(event.get("pass_identity") or "")
             for event in _terminal_global_passes(
-                state.investigation_journal
+                state.investigation_journal,
+                seed_authority=seed_authority,
             )
         }
         queued_items = [
@@ -7929,6 +8567,86 @@ class AgenticRecursiveAnalyzer:
                 break
             queued = pending_confirmations.pop(0)
             state._confirmation_queue_key(queued)
+            queued_identity = str(queued.get("semantic_identity") or "")
+            confirmation_action_key = "confirmation:{0}".format(
+                queued_identity
+            )
+            replay_action = self._replay_action(
+                state, confirmation_action_key
+            )
+            if (
+                replay_action is not None
+                and replay_action.get("operation") == "confirmation_failed"
+            ):
+                replay_projection = (
+                    _confirmation_action_projection_from_record(
+                        replay_action
+                    )
+                )
+                if (
+                    replay_projection["request_identity"]
+                    != queued_identity
+                ):
+                    raise ValueError(
+                        "failed confirmation replay factual request identity "
+                        "does not match the queued request"
+                    )
+                if (
+                    replay_projection["evidence_disposition"]["state"]
+                    == "rejected_snapshot"
+                ):
+                    confirmation = RootConfirmation.from_dict(
+                        dict(replay_projection["confirmation"])
+                    )
+                    self._record_confirmation(
+                        state,
+                        queued,
+                        confirmation,
+                        replay_projection,
+                    )
+                    continue
+            terminal_artifact_envelopes = copy.deepcopy(
+                list(queued.get("artifact_evidence_envelopes") or ())
+            )
+            terminal_disposition = _build_terminal_evidence_disposition(
+                state.graph,
+                terminal_artifact_envelopes,
+            )
+            if terminal_disposition["state"] == "rejected_snapshot":
+                confirmation = RootConfirmation(
+                    candidate_ref=str(queued.get("candidate_ref") or ""),
+                    status="unknown",
+                    reason=(
+                        "terminal_artifact_preflight_rejected: {0}"
+                    ).format(
+                        terminal_disposition["rejection_reason"]
+                    ),
+                    counterfactual_status="unknown",
+                    hypothesis_id=str(queued.get("hypothesis_id") or ""),
+                    hypothesis_semantic_hash=str(
+                        queued.get("hypothesis_semantic_hash") or ""
+                    ),
+                    defect_fingerprint=str(
+                        queued.get("defect_fingerprint") or ""
+                    ),
+                    recursive_path=tuple(
+                        queued.get("recursive_path") or ()
+                    ),
+                    seed_binding_identity=str(
+                        queued.get("seed_binding_identity") or ""
+                    ),
+                )
+                self._persist_confirmation_action(
+                    state,
+                    queued,
+                    confirmation,
+                    operation="confirmation_failed",
+                    physical_requests_reserved=0,
+                    physical_request_delta=0,
+                    physical_request_exact=True,
+                    evidence_disposition=terminal_disposition,
+                )
+                continue
             try:
                 request = self._build_confirmation_request(state, queued)
                 self._validate_confirmation_request_graph_eligibility(
@@ -7952,12 +8670,6 @@ class AgenticRecursiveAnalyzer:
                     raise ValueError(
                         "queued confirmation factual request identity changed"
                     )
-                terminal_artifact_envelopes = copy.deepcopy(
-                    list(
-                        queued.get("artifact_evidence_envelopes")
-                        or ()
-                    )
-                )
             except (KeyError, TypeError, ValueError) as exc:
                 confirmation = RootConfirmation(
                     candidate_ref=str(queued.get("candidate_ref") or ""),
@@ -7984,6 +8696,7 @@ class AgenticRecursiveAnalyzer:
                     physical_requests_reserved=0,
                     physical_request_delta=0,
                     physical_request_exact=True,
+                    evidence_disposition=terminal_disposition,
                 )
                 continue
 
@@ -8009,14 +8722,11 @@ class AgenticRecursiveAnalyzer:
                     physical_requests_reserved=0,
                     physical_request_delta=0,
                     physical_request_exact=True,
+                    evidence_disposition=terminal_disposition,
                 )
                 continue
 
             remaining = max(0, self.max_judge_requests - state.judge_requests)
-            confirmation_action_key = "confirmation:{0}".format(
-                request_identity
-            )
-            replay_action = self._replay_action(state, confirmation_action_key)
             replayed_confirmation: Optional[RootConfirmation] = None
             replayed_physical_delta = 0
             replayed_physical_exact = True
@@ -8074,6 +8784,7 @@ class AgenticRecursiveAnalyzer:
                     physical_requests_reserved=reserved_requests,
                     physical_request_delta=0,
                     physical_request_exact=False,
+                    evidence_disposition=terminal_disposition,
                 )
                 self._checkpoint_state(state, confirmation_action_key)
                 continue
@@ -8191,26 +8902,80 @@ class AgenticRecursiveAnalyzer:
             else:
                 state.judge_request_uncertainty_count += 1
             terminal_operation = "confirmation_completed"
+            final_disposition = terminal_disposition
             if replayed_confirmation is None:
+                final_disposition = _build_terminal_evidence_disposition(
+                    state.graph,
+                    terminal_artifact_envelopes,
+                )
+                if stable_json(
+                    _checkpoint_json(
+                        queued.get("artifact_evidence_envelopes") or ()
+                    )
+                ) != stable_json(
+                    _checkpoint_json(terminal_artifact_envelopes)
+                ):
+                    final_disposition = (
+                        _reject_terminal_evidence_disposition(
+                            final_disposition,
+                            reason=(
+                                "queued artifact audit snapshot changed "
+                                "after confirmation preflight"
+                            ),
+                        )
+                    )
+                queued["artifact_evidence_envelopes"] = copy.deepcopy(
+                    terminal_artifact_envelopes
+                )
                 try:
-                    _validate_terminal_confirmation_evidence(
-                        state.graph,
-                        confirmation=confirmation,
-                        artifact_evidence_envelopes=queued.get(
-                            "artifact_evidence_envelopes"
-                        ),
-                        label="provider terminal confirmation",
-                    )
+                    if final_disposition["state"] == "validated":
+                        _validate_terminal_confirmation_evidence(
+                            state.graph,
+                            confirmation=confirmation,
+                            artifact_evidence_envelopes=(
+                                terminal_artifact_envelopes
+                            ),
+                            label="provider terminal confirmation",
+                        )
                 except (TypeError, ValueError) as exc:
-                    queued["artifact_evidence_envelopes"] = copy.deepcopy(
-                        terminal_artifact_envelopes
-                    )
+                    if terminal_artifact_envelopes:
+                        final_disposition = (
+                            _reject_terminal_evidence_disposition(
+                                final_disposition,
+                                reason="{0}: {1}".format(
+                                    type(exc).__name__, exc
+                                ),
+                            )
+                        )
+                    else:
+                        confirmation = RootConfirmation(
+                            candidate_ref=request.candidate_ref,
+                            status="unknown",
+                            reason=(
+                                "terminal_confirmation_evidence_invalid: "
+                                "{0}: {1}"
+                            ).format(type(exc).__name__, exc),
+                            counterfactual_status="unknown",
+                            hypothesis_id=request.hypothesis_id,
+                            hypothesis_semantic_hash=(
+                                request.hypothesis_semantic_hash
+                            ),
+                            defect_fingerprint=(
+                                request.defect_state.fingerprint
+                            ),
+                            recursive_path=request.recursive_path,
+                            seed_binding_identity=(
+                                request.seed_binding_identity
+                            ),
+                        )
+                        terminal_operation = "confirmation_failed"
+                if final_disposition["state"] == "rejected_snapshot":
                     confirmation = RootConfirmation(
                         candidate_ref=request.candidate_ref,
                         status="unknown",
                         reason=(
-                            "terminal_artifact_evidence_invalid: {0}: {1}"
-                        ).format(type(exc).__name__, exc),
+                            "terminal_artifact_preflight_rejected: {0}"
+                        ).format(final_disposition["rejection_reason"]),
                         counterfactual_status="unknown",
                         hypothesis_id=request.hypothesis_id,
                         hypothesis_semantic_hash=(
@@ -8235,6 +9000,7 @@ class AgenticRecursiveAnalyzer:
                     physical_request_delta=physical_delta,
                     physical_request_exact=physical_exact,
                     provider_state=self._capture_provider_result_state(state),
+                    evidence_disposition=final_disposition,
                 )
             elif replay_action is not None:
                 self._apply_provider_result_state(state, replay_action["payload"])
@@ -8854,6 +9620,9 @@ class AgenticRecursiveAnalyzer:
         node = state.graph.nodes[confirmation.candidate_ref]
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
+        queued["evidence_disposition"] = copy.deepcopy(
+            projection["evidence_disposition"]
+        )
         hypothesis_id = str(queued.get("hypothesis_id") or "")
         seed_key = str(
             queued.get("seed_key")
@@ -8889,6 +9658,9 @@ class AgenticRecursiveAnalyzer:
                 ],
                 "artifact_evidence_envelopes": copy.deepcopy(
                     projection["artifact_evidence_envelopes"]
+                ),
+                "evidence_disposition": copy.deepcopy(
+                    projection["evidence_disposition"]
                 ),
                 "confirmation": confirmation.to_dict(),
             }

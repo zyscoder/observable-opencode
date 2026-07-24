@@ -1413,6 +1413,59 @@ class TraceGraph:
             )
         return canonical
 
+    def artifact_evidence_comparison_facts(
+        self,
+        value: Any,
+        *,
+        expected_owner_ref: str,
+    ) -> JsonDict:
+        """Compare one audit snapshot to freshly read local graph facts."""
+        envelope = dict(value) if isinstance(value, Mapping) else {}
+        canonical_ref = str(
+            envelope.get("canonical_ref")
+            or envelope.get("raw_ref")
+            or ""
+        )
+        artifact_id = canonical_ref.removeprefix("artifact:")
+        verified = self._artifact_reader.read(
+            artifact_id,
+            refresh=True,
+        )
+        status = self.artifact_reference_status(canonical_ref)
+        try:
+            self.validate_artifact_evidence_envelope(
+                envelope,
+                expected_owner_ref=expected_owner_ref,
+            )
+        except (TypeError, ValueError) as exc:
+            validation_status = "rejected"
+            rejection_reason = "{0}: {1}".format(type(exc).__name__, exc)
+        else:
+            validation_status = "validated"
+            rejection_reason = ""
+        return {
+            "schema": "artifact-evidence-comparison/v1",
+            "canonical_ref": canonical_ref,
+            "expected_owner_ref": str(expected_owner_ref or ""),
+            "artifact_reference_status": (
+                copy.deepcopy(status) if status is not None else None
+            ),
+            "active_owner_refs": list(
+                self.artifact_active_owner_refs(canonical_ref)
+            ),
+            "file_verification": {
+                "source": verified.source,
+                "truncated": verified.truncated,
+                "file_hash_status": verified.file_hash_status,
+                "slice_hash_status": verified.slice_hash_status,
+                "failures": list(verified.failures),
+                "hash_mismatch": verified.hash_mismatch,
+                "file_available": verified.file_available,
+            },
+            "validation_status": validation_status,
+            "rejection_reason": rejection_reason,
+        }
+
     def incoming_edge_context(
         self,
         ref: str,

@@ -990,13 +990,13 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "confirmation-request-identity/v2",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v12")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v13")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v11",
+            "recursive-attribution-checkpoint/v12",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v9")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v10")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

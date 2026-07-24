@@ -79,6 +79,12 @@ def unknown_seed_terminal_action(action):
             "physical_request_delta"
         ],
         physical_request_exact=output["payload"]["physical_request_exact"],
+        artifact_evidence_envelopes=output["payload"][
+            "action_projection"
+        ]["artifact_evidence_envelopes"],
+        evidence_disposition=output["payload"]["action_projection"][
+            "evidence_disposition"
+        ],
     )
     output["semantic_key"] = semantic_key
     output["payload"]["confirmation"] = confirmation.to_dict()
