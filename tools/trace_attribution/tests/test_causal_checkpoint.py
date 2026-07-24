@@ -305,6 +305,7 @@ def refresh_checkpoint_confirmation_response_identity(
             confirmation["competitor_comparisons"]
         ),
         factor_mechanism=confirmation["factor_mechanism"],
+        analysis_perspective=confirmation.get("analysis_perspective", ""),
     )
 
 
@@ -1284,12 +1285,13 @@ class CausalCheckpointTest(unittest.TestCase):
             "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
             "+action-projection/v7+response-identity/v1+counterfactual/v1"
-            "+queue-response-identity/v1+published-root-projection/v2"
-            "+causal-publication/v2"
+            "+queue-response-identity/v1+published-root-projection/v3"
+            "+causal-publication/v3"
+            "+perspective-binding/v1"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v16")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v17")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()

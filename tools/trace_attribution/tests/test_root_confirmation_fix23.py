@@ -451,18 +451,18 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
     def test_all_affected_persisted_identities_are_bumped(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v17",
+            "recursive-attribution-report/v18",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v16",
+            "recursive-attribution-checkpoint/v17",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v5",
+            "recursive-attribution-output/v6",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v14")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
         self.assertEqual(
             COMPARISON_SCHEMA_VERSION,
             "recursive-attribution-comparison/v5",
@@ -478,8 +478,9 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
             "+evidence-policy/v5+artifact-owner/v1+terminal-evidence/v2"
             "+local-state-owner/v1+action-projection/v7"
             "+response-identity/v1+counterfactual/v1"
-            "+queue-response-identity/v1+published-root-projection/v2"
-            "+causal-publication/v2"
+            "+queue-response-identity/v1+published-root-projection/v3"
+            "+causal-publication/v3"
+            "+perspective-binding/v1"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )

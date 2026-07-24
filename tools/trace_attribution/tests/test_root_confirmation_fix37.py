@@ -161,6 +161,7 @@ def _response_identity(payload):
         factor_role=payload["factor_role"],
         competitor_comparisons=tuple(payload["competitor_comparisons"]),
         factor_mechanism=payload["factor_mechanism"],
+        analysis_perspective=payload.get("analysis_perspective", ""),
     )
 
 
@@ -550,7 +551,7 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
     def test_changed_persistence_contracts_are_explicitly_versioned(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v17",
+            "recursive-attribution-report/v18",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",
@@ -565,7 +566,7 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "published-root-projection/v2",
+            "published-root-projection/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
@@ -574,15 +575,15 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v16",
+            "recursive-attribution-checkpoint/v17",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v5",
+            "recursive-attribution-output/v6",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v14",
+            "recursive-analysis-actions/v15",
         )
 
 

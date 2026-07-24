@@ -242,6 +242,7 @@ def refresh_confirmation_response_identity(confirmation: dict) -> None:
             confirmation["competitor_comparisons"]
         ),
         factor_mechanism=confirmation["factor_mechanism"],
+        analysis_perspective=confirmation.get("analysis_perspective", ""),
     )
 
 

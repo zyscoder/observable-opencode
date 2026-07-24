@@ -103,27 +103,29 @@ roots or field drift remain hand-built mutations.
 Changed semantic boundaries are explicitly versioned:
 
 ```text
-causal-publication/v2
-published-root-projection/v2
-recursive-attribution-report/v17
-recursive-attribution-checkpoint/v16
-recursive-attribution-output/v5
-recursive-analysis-actions/v14
+causal-publication/v3
+published-root-projection/v3
+perspective-binding/v1
+recursive-attribution-report/v18
+recursive-attribution-checkpoint/v17
+recursive-attribution-output/v6
+recursive-analysis-actions/v15
 ```
 
-The root-confirmation persistence contract now includes both
-`published-root-projection/v2` and `causal-publication/v2`. Older envelopes
-are not silently accepted as current publications.
+The root-confirmation persistence contract now includes
+`published-root-projection/v3`, `causal-publication/v3`, and
+`perspective-binding/v1`. Older envelopes are not silently accepted as
+current publications.
 
 ## Verification
 
 ```text
-Focused Fix39:
-Ran 10 tests in 1.142s
+Focused Fix39 after review closure:
+Ran 15 tests in 1.512s
 OK
 
 Fix17-Fix39:
-Ran 280 tests
+Ran 285 tests
 OK
 
 Affected seed/report/evaluator/checkpoint/analyzer/benchmark/CLI suites:
@@ -135,7 +137,7 @@ Ran 34 tests in 0.021s
 OK
 
 Full discovery:
-Ran 1013 tests in 22.050s
+Ran 1018 tests in 25.093s
 OK
 ```
 
@@ -164,3 +166,36 @@ projection/provenance, persistence versions, evaluator seed-aware occurrence
 identity, and directly affected fixtures. It adds no Task 3 behavior,
 dependency, Agent feedback, graph mutation, or behavioral feedback into the
 analyzed agent. Existing unrelated untracked files were not modified.
+
+## Independent Review Closure
+
+The first cumulative review found two Important gaps:
+
+- report restore accepted a same-seed primary/co-root swap and cross-seed
+  primary order drift;
+- checkpoint restore accepted cross-seed co-root roles and forged root
+  component/provenance fields.
+
+The first follow-up introduced one canonical per-seed rank shared by live
+publication, report restore, graph/evaluator validation, and checkpoint
+restore. It also reconstructs each checkpoint root from its exact
+confirmation, seed, defect state, and active graph node before accepting it.
+
+The second review found that a mutable top-level analysis perspective and raw
+candidate/hydrated data could still influence the rank. The final design:
+
+- binds `analysis_perspective` into every `RootConfirmation` response
+  identity and confirmation request/action projection;
+- requires report and checkpoint perspective to equal the bound confirmation
+  perspective;
+- ranks only on the bound perspective and canonical root response fields
+  (`component`, `event_type`, `excerpt`, `reason`, confidence, path, and
+  identity);
+- excludes candidate `data`, hydrated artifacts, and revision snapshots from
+  primary/co-root ranking.
+
+Negative tests now cover role swaps, ordering drift, coordinated perspective
+drift, hydrated artifact ranking influence, and checkpoint role/field/
+provenance tampering. A fresh final reviewer reported no Critical or Important
+findings. The remaining trust boundary is explicit: these are recomputable
+content-integrity hashes, not external digital signatures.

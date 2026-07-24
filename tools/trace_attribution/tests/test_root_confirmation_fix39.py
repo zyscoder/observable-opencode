@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from tools.trace_attribution.scripts.evaluate_recursive_attribution import (
@@ -226,6 +228,42 @@ def _coordinated_root_mutation(
     return result
 
 
+def _legacy_root_projection(root: dict) -> dict:
+    return {
+        key: copy.deepcopy(root[key])
+        for key in (
+            "node_ref",
+            "component",
+            "event_type",
+            "defect_type",
+            "reason",
+            "confidence",
+            "causal_role",
+            "episode_id",
+            "episode_member_refs",
+            "observed_defect_refs",
+        )
+    }
+
+
+def _refresh_legacy_root_order(payload: dict) -> None:
+    payload["root_causes"] = [
+        _legacy_root_projection(root)
+        for root in (
+            *payload["confirmed_roots"],
+            *payload["co_roots"],
+        )
+    ]
+
+
+def _latest_state_snapshot(actions: list[dict]) -> dict:
+    return next(
+        item["payload"]
+        for item in reversed(actions)
+        if item["operation"] == "state_snapshot"
+    )
+
+
 class PerSeedRootPublicationTest(unittest.TestCase):
     def test_independent_seeds_publish_independent_primary_roots(self):
         _, _, report = _run_shared_root()
@@ -375,6 +413,126 @@ class PerSeedRootPublicationTest(unittest.TestCase):
         with self.assertRaises(EvaluationSafetyError):
             _evaluate(graph, tampered)
 
+    def test_restore_and_evaluator_reject_same_seed_primary_co_root_swap(self):
+        _, graph, report = _run_co_roots()
+        tampered = report.to_dict()
+        tampered["confirmed_roots"], tampered["co_roots"] = (
+            tampered["co_roots"],
+            tampered["confirmed_roots"],
+        )
+        _refresh_legacy_root_order(tampered)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical|primary|rank|order|perspective|response projection",
+        ):
+            RecursiveAttributionReport.from_dict(tampered)
+        with self.assertRaises(EvaluationSafetyError):
+            _evaluate(graph, tampered)
+
+    def test_restore_and_evaluator_reject_cross_seed_primary_order_drift(self):
+        _, graph, report = _run_shared_root()
+        tampered = report.to_dict()
+        tampered["confirmed_roots"].reverse()
+        _refresh_legacy_root_order(tampered)
+
+        with self.assertRaisesRegex(ValueError, "canonical|primary|rank|order"):
+            RecursiveAttributionReport.from_dict(tampered)
+        with self.assertRaises(EvaluationSafetyError):
+            _evaluate(graph, tampered)
+
+    def test_restore_rejects_coordinated_perspective_and_role_drift(self):
+        _, _, report = _run_co_roots()
+        tampered = report.to_dict()
+        tampered["analysis_perspective"] = "compatibility"
+        tampered["confirmed_roots"], tampered["co_roots"] = (
+            tampered["co_roots"],
+            tampered["confirmed_roots"],
+        )
+        _refresh_legacy_root_order(tampered)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical|primary|rank|order|perspective|response projection",
+        ):
+            RecursiveAttributionReport.from_dict(tampered)
+
+    def test_hydrated_artifact_content_cannot_change_primary_role(self):
+        _, _, report = _run_co_roots()
+        payload = report.to_dict()
+        artifact = {
+            "artifact_id": "untrusted-ranking-context",
+            "content_hash": "sha256:{0}".format(
+                hashlib.sha256(PERSPECTIVE.encode("utf-8")).hexdigest()
+            ),
+            "content": PERSPECTIVE,
+        }
+        for section in ("causal_candidates", "introduction_candidates"):
+            for candidate in payload[section]:
+                if candidate["ref"] == "record:context":
+                    candidate["node"]["data"]["hydrated_artifacts"] = [
+                        copy.deepcopy(artifact)
+                    ]
+        restored = RecursiveAttributionReport.from_dict(payload)
+        self.assertEqual(
+            [root.node_ref for root in restored.confirmed_roots],
+            ["record:decision"],
+        )
+        self.assertEqual(
+            [root.node_ref for root in restored.co_roots],
+            ["record:context"],
+        )
+
+    def test_checkpoint_restore_rejects_cross_seed_role_and_root_field_drift(self):
+        trace = shared_root_trace()
+        graph = TraceGraph.from_trace(trace)
+        start_refs = ("record:seed_one", "record:seed_two")
+        objective = "Confirm each identical claim independently."
+        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fix39-checkpoint-tamper"
+            _run_shared_root(
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+            )
+            checkpoint = CheckpointBundle(root).restore(
+                expected_config=config
+            )
+
+            for label, mutate in (
+                (
+                    "cross-seed role",
+                    lambda payload: payload["co_roots"].append(
+                        payload["confirmed_roots"].pop()
+                    ),
+                ),
+                (
+                    "component",
+                    lambda payload: payload["confirmed_roots"][0].__setitem__(
+                        "component", "forged.component"
+                    ),
+                ),
+                (
+                    "provenance",
+                    lambda payload: payload["confirmed_roots"][0].__setitem__(
+                        "provenance",
+                        {"publication_contract": "forged"},
+                    ),
+                ),
+            ):
+                with self.subTest(label=label):
+                    actions = copy.deepcopy(list(checkpoint.actions))
+                    mutate(_latest_state_snapshot(actions))
+                    tampered = replace(checkpoint, actions=tuple(actions))
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "canonical|primary|co-root|publication|provenance|component|seed",
+                    ):
+                        RecursiveAnalysisState.from_checkpoint(
+                            graph=graph,
+                            checkpoint=tampered,
+                        )
+
 
 class CanonicalPublicationProjectionTest(unittest.TestCase):
     def test_root_fields_are_canonical_under_coordinated_modern_legacy_edits(self):
@@ -520,10 +678,10 @@ class Fix39PersistenceVersionTest(unittest.TestCase):
     def test_publication_contract_and_persisted_envelopes_are_versioned(self):
         self.assertEqual(
             CAUSAL_PUBLICATION_CONTRACT_VERSION,
-            "causal-publication/v2",
+            "causal-publication/v3",
         )
         self.assertIn(
-            "published-root-projection/v2",
+            "published-root-projection/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
@@ -532,20 +690,20 @@ class Fix39PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v17",
+            "recursive-attribution-report/v18",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v16",
+            "recursive-attribution-checkpoint/v17",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v5",
+            "recursive-attribution-output/v6",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v14",
+            "recursive-analysis-actions/v15",
         )
 
 

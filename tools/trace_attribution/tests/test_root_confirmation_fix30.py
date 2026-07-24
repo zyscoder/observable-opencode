@@ -776,10 +776,10 @@ class RejectedSnapshotTerminalDispositionTest(unittest.TestCase):
 
 class Fix30PersistenceVersionTest(unittest.TestCase):
     def test_versions_name_changed_terminal_persistence_contracts(self):
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v14")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v17",
+            "recursive-attribution-report/v18",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -787,7 +787,7 @@ class Fix30PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v16",
+            "recursive-attribution-checkpoint/v17",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",

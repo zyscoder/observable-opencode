@@ -148,6 +148,7 @@ def drift_terminal_path(action):
             confirmation["competitor_comparisons"]
         ),
         factor_mechanism=confirmation["factor_mechanism"],
+        analysis_perspective=confirmation.get("analysis_perspective", ""),
     )
     projection["recursive_path"] = copy.deepcopy(
         confirmation["recursive_path"]

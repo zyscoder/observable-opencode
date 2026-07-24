@@ -55,6 +55,7 @@ def _refresh_response_identity(confirmation):
             confirmation["competitor_comparisons"]
         ),
         factor_mechanism=confirmation["factor_mechanism"],
+        analysis_perspective=confirmation.get("analysis_perspective", ""),
     )
     return confirmation
 

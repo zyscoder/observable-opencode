@@ -19,6 +19,7 @@ from trace_attribution.causal_state import (
     SeedAttributionResult,
     canonical_causal_factor_publication,
     canonical_confirmed_root_publication,
+    canonical_ranked_root_publications,
     canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     seed_binding_identity_for,
@@ -297,41 +298,55 @@ def reciprocal_root_pair(*, identical_legacy_projection):
     return first, second, first_confirmation, second_confirmation
 
 
+def ranked_root_pair(first, second):
+    return canonical_ranked_root_publications(
+        (first, second),
+    )
+
+
 class CausalStateTest(unittest.TestCase):
     def test_legacy_projection_deduplicates_identical_visible_roots(self):
         first, second, first_confirmation, second_confirmation = reciprocal_root_pair(
             identical_legacy_projection=True
         )
+        primary_roots, co_roots = ranked_root_pair(first, second)
         report = RecursiveAttributionReport(
             case_id="legacy-dedup",
             objective="Find roots.",
             **root_seed_fields(first, second),
             confirmations=[first_confirmation, second_confirmation],
-            confirmed_roots=[first],
-            co_roots=[second],
+            confirmed_roots=primary_roots,
+            co_roots=co_roots,
         )
 
         payload = report.to_dict()
         self.assertEqual(len(payload["confirmed_roots"]), 1)
         self.assertEqual(len(payload["co_roots"]), 1)
-        self.assertEqual(payload["root_causes"], [first.to_legacy_root_cause()])
+        self.assertEqual(
+            payload["root_causes"],
+            [primary_roots[0].to_legacy_root_cause()],
+        )
 
     def test_legacy_projection_preserves_distinct_objects_primary_first(self):
         first, second, first_confirmation, second_confirmation = reciprocal_root_pair(
             identical_legacy_projection=False
         )
+        primary_roots, co_roots = ranked_root_pair(first, second)
         report = RecursiveAttributionReport(
             case_id="legacy-order",
             objective="Find roots.",
             **root_seed_fields(first, second),
             confirmations=[first_confirmation, second_confirmation],
-            confirmed_roots=[first],
-            co_roots=[second],
+            confirmed_roots=primary_roots,
+            co_roots=co_roots,
         )
 
         self.assertEqual(
             report.to_dict()["root_causes"],
-            [first.to_legacy_root_cause(), second.to_legacy_root_cause()],
+            [
+                primary_roots[0].to_legacy_root_cause(),
+                co_roots[0].to_legacy_root_cause(),
+            ],
         )
 
     def test_factor_identity_cannot_also_be_a_rejected_candidate(self):
@@ -942,6 +957,7 @@ class CausalStateTest(unittest.TestCase):
             seed_binding_identity=seed_binding_identity_for(
                 root_path[-1], defect_state.fingerprint
             ),
+            analysis_perspective="Improve Agent repository reasoning.",
         )
         root = canonical_confirmed_root_publication(
             confirmation=confirmation,
@@ -963,6 +979,7 @@ class CausalStateTest(unittest.TestCase):
             seed_binding_identity=seed_binding_identity_for(
                 node.ref, defect_state.fingerprint
             ),
+            analysis_perspective="Improve Agent repository reasoning.",
             factor_mechanism={
                 "mechanism_type": "enabling_condition",
                 "source_ref": "record:prompt",
@@ -987,6 +1004,7 @@ class CausalStateTest(unittest.TestCase):
             seed_binding_identity=seed_binding_identity_for(
                 node.ref, defect_state.fingerprint
             ),
+            analysis_perspective="Improve Agent repository reasoning.",
         )
         rejected = canonical_rejected_candidate_publication(
             rejected_confirmation

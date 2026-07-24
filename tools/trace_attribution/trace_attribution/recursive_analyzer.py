@@ -50,6 +50,7 @@ from .causal_state import (
     SeedAttributionResult,
     canonical_causal_factor_publication,
     canonical_confirmed_root_publication,
+    canonical_ranked_root_publications,
     canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     confirmation_identity_for,
@@ -112,7 +113,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v14"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v15"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -898,6 +899,15 @@ def _assert_report_grounded_evidence(
             seed_ref=owner.start_ref,
             label=label,
         )
+    _assert_canonical_published_roots(
+        graph,
+        confirmations=report.confirmations,
+        seed_results=report.seed_results,
+        confirmed_roots=report.confirmed_roots,
+        co_roots=report.co_roots,
+        analysis_perspective=report.analysis_perspective,
+        label=label,
+    )
     _assert_published_non_root_factors(
         graph,
         confirmations=report.confirmations,
@@ -1376,6 +1386,7 @@ def _synthetic_unknown_confirmation(
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
         seed_binding_identity=request.seed_binding_identity,
+        analysis_perspective=request.analysis_perspective,
         competitor_comparisons=competitor_comparisons,
     )
 
@@ -1615,6 +1626,7 @@ def _validate_confirmation_request_projection_binding(
             confirmation.hypothesis_id,
             confirmation.hypothesis_semantic_hash,
             confirmation.seed_binding_identity,
+            confirmation.analysis_perspective,
         )
         expected_confirmation_binding = (
             facts["candidate_ref"],
@@ -1623,6 +1635,7 @@ def _validate_confirmation_request_projection_binding(
             facts["hypothesis_id"],
             facts["hypothesis_semantic_hash"],
             facts["seed_binding_identity"],
+            facts["analysis_perspective"],
         )
         if confirmation_binding != expected_confirmation_binding:
             raise ValueError(
@@ -2950,6 +2963,120 @@ def _assert_published_non_root_factors(
                         label
                     )
                 )
+
+
+def _assert_canonical_published_roots(
+    graph: TraceGraph,
+    *,
+    confirmations: Sequence[RootConfirmation],
+    seed_results: Sequence[SeedAttributionResult],
+    confirmed_roots: Sequence[ConfirmedRoot],
+    co_roots: Sequence[ConfirmedRoot],
+    analysis_perspective: str,
+    label: str,
+) -> None:
+    confirmation_by_identity: Dict[str, RootConfirmation] = {}
+    for confirmation in confirmations:
+        if confirmation.confirmation_identity in confirmation_by_identity:
+            raise ValueError(
+                "{0} contains a duplicate confirmation identity".format(label)
+            )
+        confirmation_by_identity[
+            confirmation.confirmation_identity
+        ] = confirmation
+
+    seeds_by_binding: Dict[str, SeedAttributionResult] = {}
+    for seed in seed_results:
+        binding = seed_binding_identity_for(
+            seed.start_ref,
+            seed.defect_fingerprint,
+        )
+        if binding in seeds_by_binding:
+            raise ValueError(
+                "{0} contains a duplicate seed binding".format(label)
+            )
+        seeds_by_binding[binding] = seed
+
+    roots_by_seed: Dict[str, Set[str]] = {}
+    for root in (*confirmed_roots, *co_roots):
+        embedded = RootConfirmation.from_dict(dict(root.confirmation))
+        canonical = confirmation_by_identity.get(
+            embedded.confirmation_identity
+        )
+        owner = seeds_by_binding.get(embedded.seed_binding_identity)
+        candidate_node = graph.nodes.get(graph.resolve(root.node_ref) or "")
+        if (
+            canonical != embedded
+            or owner is None
+            or candidate_node is None
+            or embedded.status != "confirmed"
+            or embedded.factor_role != "necessary_cause"
+            or embedded.analysis_perspective != analysis_perspective
+            or embedded.candidate_ref != root.node_ref
+            or embedded.defect_fingerprint != root.defect_state.fingerprint
+            or not embedded.recursive_path
+            or embedded.recursive_path[-1] != owner.start_ref
+        ):
+            raise ValueError(
+                "{0} root has no exact confirmation, seed, defect, or graph owner".format(
+                    label
+                )
+            )
+        expected = canonical_confirmed_root_publication(
+            confirmation=embedded,
+            defect_state=root.defect_state,
+            candidate_node=candidate_node,
+            seed_start_ref=owner.start_ref,
+        )
+        if root != expected:
+            raise ValueError(
+                "{0} root contradicts canonical publication fields".format(
+                    label
+                )
+            )
+        roots_by_seed.setdefault(embedded.seed_binding_identity, set()).add(
+            embedded.confirmation_identity
+        )
+
+    expected_primary, expected_co_roots = canonical_ranked_root_publications(
+        (*confirmed_roots, *co_roots),
+    )
+    if (
+        tuple(confirmed_roots) != expected_primary
+        or tuple(co_roots) != expected_co_roots
+    ):
+        raise ValueError(
+            "{0} primary/co-root roles or order contradict canonical ranking".format(
+                label
+            )
+        )
+
+    for binding, seed in seeds_by_binding.items():
+        expected_identities = {
+            identity
+            for identity in seed.confirmation_identities
+            if identity in confirmation_by_identity
+            and confirmation_by_identity[identity].status == "confirmed"
+        }
+        published_identities = roots_by_seed.get(binding, set())
+        if seed.outcome == "confirmed_root":
+            published_refs = {
+                confirmation_by_identity[identity].candidate_ref
+                for identity in published_identities
+            }
+            if (
+                published_identities != expected_identities
+                or published_refs != set(seed.confirmed_root_refs)
+            ):
+                raise ValueError(
+                    "{0} confirmed seed root publication is incomplete".format(
+                        label
+                    )
+                )
+        elif published_identities:
+            raise ValueError(
+                "{0} non-confirmed seed owns a published root".format(label)
+            )
 
 
 def _assert_active_confirmation_path(
@@ -6337,6 +6464,15 @@ class RecursiveAnalysisState:
             )
         else:
             state.replay_actions = copy.deepcopy(checkpoint.latest_actions)
+        _assert_canonical_published_roots(
+            graph,
+            confirmations=state.confirmations,
+            seed_results=state.seed_results(),
+            confirmed_roots=state.confirmed_roots,
+            co_roots=state.co_roots,
+            analysis_perspective=state.analysis_perspective,
+            label="restored recursive state",
+        )
         _assert_published_non_root_factors(
             graph,
             confirmations=state.confirmations,
@@ -9230,6 +9366,9 @@ class AgenticRecursiveAnalyzer:
                     seed_binding_identity=str(
                         queued.get("seed_binding_identity") or ""
                     ),
+                    analysis_perspective=str(
+                        queued.get("analysis_perspective") or ""
+                    ),
                 )
                 self._persist_confirmation_action(
                     state,
@@ -9284,6 +9423,9 @@ class AgenticRecursiveAnalyzer:
                     recursive_path=tuple(queued.get("recursive_path") or ()),
                     seed_binding_identity=str(
                         queued.get("seed_binding_identity") or ""
+                    ),
+                    analysis_perspective=str(
+                        queued.get("analysis_perspective") or ""
                     ),
                 )
                 self._persist_confirmation_action(
@@ -10338,43 +10480,12 @@ class AgenticRecursiveAnalyzer:
             return
 
     def _rank_confirmed_roots(self, state: RecursiveAnalysisState) -> None:
-        perspective = _perspective_tokens(state.analysis_perspective)
-
-        def rank(root: ConfirmedRoot) -> Tuple[int, float, int, int, str, str]:
-            node = state.graph.nodes[root.node_ref]
-            semantic_tokens = _perspective_tokens(
-                _node_semantic_content(state.graph, node)
-            )
-            return (
-                -len(perspective.intersection(semantic_tokens)),
-                -root.confidence,
-                len(root.recursive_path),
-                state.graph.position(root.node_ref),
-                root.node_ref,
-                root.hypothesis_id,
-            )
-
-        roots_by_seed: Dict[str, Dict[str, ConfirmedRoot]] = {}
-        for root in (*state.confirmed_roots, *state.co_roots):
-            confirmation = RootConfirmation.from_dict(dict(root.confirmation))
-            roots_by_seed.setdefault(
-                confirmation.seed_binding_identity,
-                {},
-            )[confirmation.confirmation_identity] = root
-
-        primary_roots: List[ConfirmedRoot] = []
-        co_roots: List[ConfirmedRoot] = []
-        for seed_binding_identity in sorted(roots_by_seed):
-            ordered = sorted(
-                roots_by_seed[seed_binding_identity].values(),
-                key=rank,
-            )
-            if not ordered:
-                continue
-            primary_roots.append(ordered[0])
-            co_roots.extend(ordered[1:])
-        state.confirmed_roots = primary_roots
-        state.co_roots = co_roots
+        roots = (*state.confirmed_roots, *state.co_roots)
+        primary_roots, co_roots = canonical_ranked_root_publications(
+            roots,
+        )
+        state.confirmed_roots = list(primary_roots)
+        state.co_roots = list(co_roots)
 
     def _handle_investigation(
         self,

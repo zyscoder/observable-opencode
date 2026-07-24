@@ -2432,6 +2432,7 @@ def validate_recursive_confirmation(
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
         seed_binding_identity=request.seed_binding_identity,
+        analysis_perspective=request.analysis_perspective,
         factor_role=factor_role,
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
@@ -2477,6 +2478,13 @@ def bind_root_confirmation(
         and confirmation.seed_binding_identity != request.seed_binding_identity
     ):
         raise ValueError("confirmation is cross-bound to another seed")
+    if (
+        confirmation.analysis_perspective
+        and confirmation.analysis_perspective != request.analysis_perspective
+    ):
+        raise ValueError(
+            "confirmation is cross-bound to another analysis perspective"
+        )
     validate_root_confirmation_substantive_invariants(
         confirmation,
         require_canonical_counterfactual=True,
@@ -2538,6 +2546,7 @@ def bind_root_confirmation(
         defect_fingerprint=request.defect_state.fingerprint,
         recursive_path=request.recursive_path,
         seed_binding_identity=request.seed_binding_identity,
+        analysis_perspective=request.analysis_perspective,
         factor_role=confirmation.factor_role,
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,

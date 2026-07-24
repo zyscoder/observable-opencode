@@ -51,10 +51,10 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v17"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v18"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
-CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v2"
+CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v3"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
@@ -68,8 +68,9 @@ ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
     "+action-projection/v7+response-identity/v1+counterfactual/v1"
-    "+queue-response-identity/v1+published-root-projection/v2"
-    "+causal-publication/v2"
+    "+queue-response-identity/v1+published-root-projection/v3"
+    "+causal-publication/v3"
+    "+perspective-binding/v1"
     "+step-action-projection/v1+confirmation-request-identity/v3"
     "+confirmation-request-projection/v2"
 )
@@ -307,6 +308,7 @@ def confirmation_response_identity_for(
     factor_role: str,
     competitor_comparisons: Tuple[JsonDict, ...],
     factor_mechanism: JsonDict,
+    analysis_perspective: str = "",
 ) -> str:
     semantic = {
         "confirmation_identity": confirmation_identity,
@@ -322,6 +324,7 @@ def confirmation_response_identity_for(
             _thaw(item) for item in competitor_comparisons
         ],
         "factor_mechanism": _thaw(factor_mechanism),
+        "analysis_perspective": analysis_perspective,
     }
     return "response:{0}".format(
         hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
@@ -1636,6 +1639,7 @@ class RootConfirmation:
     defect_fingerprint: str = ""
     recursive_path: Tuple[str, ...] = field(default_factory=tuple)
     seed_binding_identity: str = ""
+    analysis_perspective: str = ""
     factor_role: str = "unknown"
     competitor_comparisons: Tuple[JsonDict, ...] = field(default_factory=tuple)
     factor_mechanism: JsonDict = field(default_factory=FrozenMapping)
@@ -1702,6 +1706,7 @@ class RootConfirmation:
             factor_role=self.factor_role,
             competitor_comparisons=self.competitor_comparisons,
             factor_mechanism=self.factor_mechanism,
+            analysis_perspective=self.analysis_perspective,
         )
 
     @classmethod
@@ -1781,6 +1786,7 @@ class RootConfirmation:
             "defect_fingerprint": self.defect_fingerprint,
             "recursive_path": list(self.recursive_path),
             "seed_binding_identity": self.seed_binding_identity,
+            "analysis_perspective": self.analysis_perspective,
             "factor_role": self.factor_role,
             "competitor_comparisons": [_thaw(item) for item in self.competitor_comparisons],
             "factor_mechanism": _thaw(self.factor_mechanism),
@@ -1820,6 +1826,7 @@ class RootConfirmation:
             defect_fingerprint=str(value.get("defect_fingerprint") or ""),
             recursive_path=_string_list(value.get("recursive_path")),
             seed_binding_identity=str(value.get("seed_binding_identity") or ""),
+            analysis_perspective=str(value.get("analysis_perspective") or ""),
             factor_role=str(
                 value.get("factor_role")
                 or {
@@ -2137,6 +2144,7 @@ def canonical_confirmation_publication_provenance(
         "response_identity": confirmation.response_identity,
         "defect_fingerprint": confirmation.defect_fingerprint,
         "seed_binding_identity": confirmation.seed_binding_identity,
+        "analysis_perspective": confirmation.analysis_perspective,
     }
 
 
@@ -2183,6 +2191,121 @@ def canonical_confirmed_root_publication(
         provenance=canonical_confirmation_publication_provenance(confirmation),
         confirmation=confirmation.to_dict(),
     )
+
+
+def _canonical_publication_tokens(value: str) -> Set[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    output: Set[str] = set()
+    word: List[str] = []
+    cjk_run: List[str] = []
+
+    def flush_word() -> None:
+        if word:
+            token = "".join(word)
+            if len(token) >= 2:
+                output.add(token)
+            word.clear()
+
+    def flush_cjk() -> None:
+        if not cjk_run:
+            return
+        output.update(cjk_run)
+        output.update(
+            "".join(cjk_run[index : index + size])
+            for size in (2, 3, 4)
+            for index in range(max(0, len(cjk_run) - size + 1))
+        )
+        cjk_run.clear()
+
+    for char in normalized:
+        if "\u3400" <= char <= "\u9fff":
+            flush_word()
+            cjk_run.append(char)
+        else:
+            flush_cjk()
+            if char.isalnum() or char == "_":
+                word.append(char)
+            else:
+                flush_word()
+    flush_word()
+    flush_cjk()
+    return output
+
+
+def canonical_confirmed_root_rank(
+    root: ConfirmedRoot,
+) -> Tuple[int, float, int, str, str]:
+    """Rank by perspective-bound facts in the confirmed response projection."""
+    confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+    perspective = _canonical_publication_tokens(
+        confirmation.analysis_perspective
+    )
+    semantic = _canonical_publication_tokens(
+        stable_json(
+            {
+                "component": root.component,
+                "event_type": root.event_type,
+                "excerpt": root.excerpt,
+                "reason": root.reason,
+            }
+        )
+    )
+    return (
+        -len(perspective.intersection(semantic)),
+        -root.confidence,
+        len(root.recursive_path),
+        root.node_ref,
+        root.hypothesis_id,
+    )
+
+
+def canonical_ranked_root_publications(
+    roots: Iterable[ConfirmedRoot],
+) -> Tuple[Tuple[ConfirmedRoot, ...], Tuple[ConfirmedRoot, ...]]:
+    """Partition and order roots with exactly one deterministic primary per seed."""
+    roots_by_seed: Dict[str, Dict[str, ConfirmedRoot]] = {}
+    for root in roots:
+        confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+        if not confirmation.seed_binding_identity:
+            raise ValueError("canonical root ranking requires a seed binding")
+        by_identity = roots_by_seed.setdefault(
+            confirmation.seed_binding_identity,
+            {},
+        )
+        prior = by_identity.get(confirmation.confirmation_identity)
+        if prior is not None:
+            raise ValueError(
+                "canonical root ranking received a duplicate confirmation identity"
+            )
+        by_identity[confirmation.confirmation_identity] = root
+        if any(
+            existing_confirmation.analysis_perspective
+            != confirmation.analysis_perspective
+            for existing_root in by_identity.values()
+            for existing_confirmation in (
+                RootConfirmation.from_dict(dict(existing_root.confirmation)),
+            )
+        ):
+            raise ValueError(
+                "canonical root ranking requires one bound perspective per seed"
+            )
+
+    primary_roots: List[ConfirmedRoot] = []
+    co_roots: List[ConfirmedRoot] = []
+    for seed_binding_identity in sorted(roots_by_seed):
+        ranked = []
+        for root in roots_by_seed[seed_binding_identity].values():
+            ranked.append(
+                (
+                    canonical_confirmed_root_rank(root),
+                    root,
+                )
+            )
+        ordered = [root for _, root in sorted(ranked, key=lambda item: item[0])]
+        if ordered:
+            primary_roots.append(ordered[0])
+            co_roots.extend(ordered[1:])
+    return tuple(primary_roots), tuple(co_roots)
 
 
 def canonical_causal_factor_publication(
@@ -2775,6 +2898,8 @@ class RecursiveAttributionReport:
                 or confirmation.hypothesis_id != root.hypothesis_id
                 or confirmation.defect_fingerprint != root.defect_state.fingerprint
                 or confirmation.recursive_path != root.recursive_path
+                or confirmation.analysis_perspective
+                != self.analysis_perspective
                 or root.reason != confirmation.reason
                 or root.counterfactual != confirmation.counterfactual
                 or root.confidence != confirmation.confidence
@@ -2997,6 +3122,19 @@ class RecursiveAttributionReport:
                     raise ValueError(
                         "published root confirmation graph is not reciprocal and non-dominated"
                     )
+        expected_primary_roots, expected_co_roots = (
+            canonical_ranked_root_publications(
+                (*self.confirmed_roots, *self.co_roots),
+            )
+        )
+        if (
+            self.confirmed_roots != expected_primary_roots
+            or self.co_roots != expected_co_roots
+        ):
+            raise ValueError(
+                "published primary and co-root roles or order contradict "
+                "canonical per-seed ranking"
+            )
 
         factor_role_identities: Dict[str, Set[str]] = {
             "contributing_condition": set(),
@@ -3013,6 +3151,8 @@ class RecursiveAttributionReport:
                     not is_definitive_confirmation(confirmation)
                     or confirmation.status != "rejected"
                     or confirmation.factor_role != role
+                    or confirmation.analysis_perspective
+                    != self.analysis_perspective
                     or factor.confirmation_status != "rejected"
                     or factor.node_ref != confirmation.candidate_ref
                     or factor.recursive_path != confirmation.recursive_path
@@ -3052,6 +3192,8 @@ class RecursiveAttributionReport:
                 not is_definitive_confirmation(confirmation)
                 or confirmation.status != "rejected"
                 or confirmation.factor_role not in {"unrelated", "unknown"}
+                or confirmation.analysis_perspective
+                != self.analysis_perspective
                 or rejected.confirmation_status != "rejected"
                 or rejected.node_ref != confirmation.candidate_ref
                 or rejected.hypothesis_id != confirmation.hypothesis_id
@@ -3569,7 +3711,9 @@ __all__ = [
     "canonical_causal_factor_publication",
     "canonical_confirmation_publication_provenance",
     "canonical_confirmed_root_publication",
+    "canonical_confirmed_root_rank",
     "canonical_factor_label",
+    "canonical_ranked_root_publications",
     "canonical_rejected_candidate_publication",
     "is_definitive_confirmation",
     "validate_confirmation_ownership",
