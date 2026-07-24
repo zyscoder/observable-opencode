@@ -532,7 +532,8 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
                 "When decisive counterevidence refutes a derived defect observation, mark that observation absent for the active defect even though its trace record exists.",
                 "Choose candidate_roots only for defective authored nodes that may introduce the active defect.",
                 "Never select a candidate with root_candidate_eligible=false as a root; treat tool results, verification, and evidence facts as evidence instead.",
-                "Choose no_defect only when decisive grounded evidence contradicts the observed defect.",
+                "Choose no_defect only when decisive grounded evidence contradicts the observed defect and every open authored root-eligible candidate has exactly one conclusive assessment that rules it out.",
+                "For no_defect, every open authored root-eligible candidate must have known input and output status, absent output, a known causal role, a complete grounded candidate-to-seed path, and a decidable counterfactual; uncertainty requires needs_expansion or inconclusive with concrete missing_evidence.",
                 "Choose needs_expansion only when a specific grounded anchor needs more upstream, downstream, artifact, action_group, or full_node context and the missing content would change the current judgment.",
                 "An unavailable or truncated artifact is not automatically blocking when recorded structured facts or previews already decide the objective; explain any actual semantic gap instead of expanding by default.",
                 "Outcome evidence and successful verification can expose or contradict a defect but are not root causes merely because they are adjacent.",
@@ -702,6 +703,38 @@ def validate_global_candidate_payload(
             raise ValueError("no_defect requires decisive evidence")
         if missing:
             raise ValueError("no_defect cannot retain missing evidence")
+        open_authored_refs = tuple(request.open_authored_root_candidate_refs)
+        open_authored_ref_set = set(open_authored_refs)
+        open_assessments = [
+            item
+            for item in assessments
+            if item.candidate_ref in open_authored_ref_set
+        ]
+        if (
+            len(open_assessments) != len(open_authored_refs)
+            or {item.candidate_ref for item in open_assessments}
+            != open_authored_ref_set
+        ):
+            raise ValueError(
+                "no_defect must assess every open authored root-eligible "
+                "candidate exactly once"
+            )
+        for item in open_assessments:
+            if (
+                item.defect_status != "absent"
+                or item.input_defect_status == "unknown"
+                or item.output_defect_status != "absent"
+                or item.causal_role == "unknown"
+                or not item.causal_path_refs
+                or item.counterfactual.get("predicted_defect_status")
+                not in {"present", "absent"}
+            ):
+                raise ValueError(
+                    "no_defect requires every open authored root-eligible "
+                    "candidate to have known status, absent output, a known "
+                    "role, a resolved causal path, and a conclusive "
+                    "counterfactual"
+                )
         causal_roles = {
             "root_candidate",
             "contributing_condition",

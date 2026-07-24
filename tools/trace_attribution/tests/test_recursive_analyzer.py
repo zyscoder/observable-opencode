@@ -393,6 +393,11 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
         assessments = []
         for capsule in request.capsules:
             is_selected = capsule.candidate_ref in selected
+            is_open_no_defect = (
+                self.global_outcome == "no_defect"
+                and capsule.candidate_ref
+                in request.open_authored_root_candidate_refs
+            )
             assessments.append(
                 GlobalCandidateAssessment(
                     candidate_ref=capsule.candidate_ref,
@@ -405,7 +410,11 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                             else "absent"
                         )
                     ),
-                    input_defect_status="absent" if is_selected else "unknown",
+                    input_defect_status=(
+                        "absent"
+                        if is_selected or is_open_no_defect
+                        else "unknown"
+                    ),
                     output_defect_status=(
                         "present"
                         if is_selected
@@ -416,7 +425,9 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                         )
                     ),
                     causal_path_refs=(
-                        tuple(capsule.downstream_path) if is_selected else ()
+                        tuple(capsule.downstream_path)
+                        if is_selected or is_open_no_defect
+                        else ()
                     ),
                     counterfactual={
                         "intervention_ref": capsule.candidate_ref,
@@ -3727,12 +3738,18 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
     def test_global_no_defect_terminates_without_recursive_step_calls(self):
         judge = FusionScriptedJudge(global_outcome="no_defect")
+        trace = observed_trace()
+        trace["records"] = [
+            item
+            for item in trace["records"]
+            if item["record_id"] != "prompt"
+        ]
 
         report = AgenticRecursiveAnalyzer(
             judge=judge,
             fusion_mode="retrieval-global",
         ).analyze(
-            TraceGraph.from_trace(observed_trace()),
+            TraceGraph.from_trace(trace),
             start_refs=["record:observed_defect"],
             objective="Determine whether the observed defect is supported.",
         )
@@ -4130,6 +4147,11 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
     def test_publication_audit_rejects_capsule_drift_from_active_graph(self):
         trace = observed_trace()
+        trace["records"] = [
+            item
+            for item in trace["records"]
+            if item["record_id"] != "prompt"
+        ]
         decision = next(
             item for item in trace["records"] if item["record_id"] == "decision"
         )

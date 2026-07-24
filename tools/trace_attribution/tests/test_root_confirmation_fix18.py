@@ -784,11 +784,11 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
         self.assertEqual(
             GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
-            "global-candidate-judgment/v6",
+            "global-candidate-judgment/v7",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
-            "global-candidate-validation-envelope/v6",
+            "global-candidate-validation-envelope/v7",
         )
         self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v9")
         self.assertEqual(

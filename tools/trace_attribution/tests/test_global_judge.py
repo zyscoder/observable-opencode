@@ -376,9 +376,18 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
     }
     for item, capsule in zip(value["assessments"], request.capsules):
         is_root = item["causal_role"] == "root_candidate"
+        is_open_no_defect = (
+            outcome == "no_defect"
+            and item["candidate_ref"]
+            in request.open_authored_root_candidate_refs
+        )
         item.update(
             {
-                "input_defect_status": "absent" if is_root else "unknown",
+                "input_defect_status": (
+                    "absent"
+                    if is_root or is_open_no_defect
+                    else "unknown"
+                ),
                 "output_defect_status": item["defect_status"],
                 "causal_path_refs": list(capsule.downstream_path),
                 "counterfactual": counterfactual(
@@ -822,19 +831,20 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             value["missing_evidence"] = ["The action-group member needs context."]
             validate_global_candidate_payload(value, request=restored)
 
-    def test_validation_envelope_v6_round_trip_rejects_stale_identities(self):
+    def test_validation_envelope_v7_round_trip_rejects_stale_identities(self):
         request = sample_request()
         envelope = request.validation_envelope()
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v6",
+            "global-candidate-validation-envelope/v7",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
         )
 
         for stale_identity in (
+            "global-candidate-validation-envelope/v6",
             "global-candidate-validation-envelope/v5",
             "global-candidate-validation-envelope/v4",
             "global-candidate-validation-envelope/v3",
@@ -1443,10 +1453,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_global_schema_is_v6_and_capsule_schema_is_v7(self):
+    def test_global_schema_is_v7_and_capsule_schema_is_v7(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v6",
+            "global-candidate-judgment/v7",
         )
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
 
@@ -1540,19 +1550,21 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
     def test_no_defect_allows_a_recorded_observation_refuted_by_counterevidence(self):
         request = sample_request()
         value = payload(outcome="no_defect", request=request)
-        value["assessments"][0].update(
+        value["assessments"][0]["causal_role"] = "exculpatory_evidence"
+        value["assessments"][1].update(
             {
                 "defect_status": "present",
                 "output_defect_status": "present",
                 "causal_role": "outcome_evidence",
             }
         )
+        value["decisive_evidence_refs"] = ["record:decision"]
 
         judgment = validate_global_candidate_payload(value, request=request)
 
         self.assertEqual(judgment.outcome, "no_defect")
 
-        value["assessments"][0]["causal_role"] = "contributing_condition"
+        value["assessments"][1]["causal_role"] = "contributing_condition"
         with self.assertRaisesRegex(ValueError, "causal candidate"):
             validate_global_candidate_payload(value, request=request)
 

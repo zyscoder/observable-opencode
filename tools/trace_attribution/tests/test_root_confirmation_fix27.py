@@ -179,7 +179,9 @@ def no_defect_payload_from_prompt(prompt: str) -> dict:
             {
                 "candidate_ref": candidate_ref,
                 "defect_status": "absent",
-                "input_defect_status": "unknown",
+                "input_defect_status": (
+                    "absent" if candidate_ref in eligible else "unknown"
+                ),
                 "output_defect_status": "absent",
                 "causal_path_refs": capsule["downstream_path"],
                 "counterfactual": {
@@ -974,27 +976,27 @@ class Fix27VersionIdentityTest(unittest.TestCase):
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v6",
+            "global-candidate-judgment/v7",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
             "graph-external-evidence-eligibility/v5",
         )
         self.assertIn(
-            "failure-projection/v3",
+            "failure-projection/v4",
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
             "confirmation-request-identity/v2",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v11")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v12")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v10",
+            "recursive-attribution-checkpoint/v11",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v8")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v9")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

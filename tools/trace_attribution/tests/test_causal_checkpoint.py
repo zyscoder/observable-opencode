@@ -364,9 +364,19 @@ class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapabilit
             GlobalCandidateAssessment(
                 candidate_ref=capsule.candidate_ref,
                 defect_status="absent",
-                input_defect_status="unknown",
+                input_defect_status=(
+                    "absent"
+                    if capsule.candidate_ref
+                    in request.open_authored_root_candidate_refs
+                    else "unknown"
+                ),
                 output_defect_status="absent",
-                causal_path_refs=(),
+                causal_path_refs=(
+                    tuple(capsule.downstream_path)
+                    if capsule.candidate_ref
+                    in request.open_authored_root_candidate_refs
+                    else ()
+                ),
                 counterfactual={
                     "intervention_ref": capsule.candidate_ref,
                     "intervention_kind": "replace_with_semantically_correct_behavior",
@@ -1196,7 +1206,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "assessments": [{"candidate_ref": "record:only"}],
             }
 
-            with self.assertRaisesRegex(ValueError, "global judgment.*v4"):
+            with self.assertRaisesRegex(ValueError, "current migration"):
                 AgenticRecursiveAnalyzer(
                     judge=CountingOfflineJudge(),
                     checkpoint=InjectedRestoreCheckpoint(
@@ -1219,18 +1229,19 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v6+validation-envelope/v6+capsule/v7"
+            "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
             "+evidence-policy/v5+local-state-owner/v1"
-            "+global-pass-identity/v1+failure-action/v2"
-            "+failure-projection/v3+terminal-record-schema/v1",
+            "+global-pass-identity/v1+failure-action/v3"
+            "+failure-projection/v4+terminal-record-schema/v2",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v12+resolution/v2+evidence-policy/v5"
-            "+artifact-owner/v1+local-state-owner/v1+action-projection/v2"
+            "recursive-root-confirmation/v13+resolution/v2+evidence-policy/v5"
+            "+artifact-owner/v1+terminal-evidence/v1+local-state-owner/v1"
+            "+action-projection/v3"
             "+step-action-projection/v1+confirmation-request-identity/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v10")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v11")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()

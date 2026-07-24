@@ -50,21 +50,22 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v11"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v12"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v6"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v6+validation-envelope/v6+capsule/v7"
+    "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
-    "+failure-action/v2+failure-projection/v3+terminal-record-schema/v1"
+    "+failure-action/v3+failure-projection/v4+terminal-record-schema/v2"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v6"
+    "global-candidate-validation-envelope/v7"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v12+resolution/v2+evidence-policy/v5"
-    "+artifact-owner/v1+local-state-owner/v1+action-projection/v2"
+    "recursive-root-confirmation/v13+resolution/v2+evidence-policy/v5"
+    "+artifact-owner/v1+terminal-evidence/v1+local-state-owner/v1"
+    "+action-projection/v3"
     "+step-action-projection/v1+confirmation-request-identity/v2"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
@@ -2085,7 +2086,7 @@ def _validate_persisted_global_judgment(
         return
     if value.get("schema_version") != GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION:
         raise ValueError(
-            "persisted global judgment requires v4 migration or rejudgment"
+            "persisted global judgment requires current migration or rejudgment"
         )
     required = {
         "schema_version",
@@ -2102,7 +2103,7 @@ def _validate_persisted_global_judgment(
         "owner",
     }
     if set(value) != required:
-        raise ValueError("persisted global judgment v4 schema is incomplete")
+        raise ValueError("persisted global judgment schema is incomplete")
     owner = LocalStateOwner.from_dict(value.get("owner"))
     if owner.seed_binding_identity != seed_binding_identity:
         raise ValueError("persisted global judgment has the wrong seed owner")
