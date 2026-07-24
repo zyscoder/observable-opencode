@@ -1207,7 +1207,10 @@ class SeedAttributionModelTests(unittest.TestCase):
                         "record:root",
                         excerpt="The candidate contains the defect.",
                         reason="The candidate remains a possible root.",
-                        counterfactual="Correcting it prevents the defect.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:root",
+                            "confirmed",
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:root"],
                     )
@@ -1773,7 +1776,10 @@ class SeedAttributionModelTests(unittest.TestCase):
                 "record:root",
                 excerpt="The local action introduced the defect.",
                 reason="Independent confirmation succeeded before the sibling failed.",
-                counterfactual="Avoiding the action prevents the defect.",
+                counterfactual=confirmation_counterfactual_for(
+                    "record:root",
+                    "confirmed",
+                ),
                 confidence=0.9,
                 evidence_refs=("record:root",),
             ),

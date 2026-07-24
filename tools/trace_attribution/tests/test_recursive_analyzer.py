@@ -247,6 +247,11 @@ def refresh_confirmation_response_identity(confirmation: dict) -> None:
 def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     confirmation = report_payload["confirmations"][0]
     confirmation["candidate_ref"] = ghost_ref
+    confirmation["counterfactual"] = confirmation_counterfactual_for(
+        ghost_ref,
+        confirmation["status"],
+        counterfactual_status=confirmation["counterfactual_status"],
+    )
     recursive_path = [
         ghost_ref,
         *confirmation["recursive_path"][1:],
@@ -267,6 +272,7 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     root = report_payload["confirmed_roots"][0]
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
+    root["counterfactual"] = confirmation["counterfactual"]
     root["confirmation"] = copy.deepcopy(confirmation)
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed = report_payload["seed_results"][0]

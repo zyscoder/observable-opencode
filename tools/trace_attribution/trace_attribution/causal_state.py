@@ -1840,7 +1840,10 @@ class RootConfirmation:
                 "root confirmation response_identity projection does not "
                 "match substantive fields"
             )
-        validate_root_confirmation_substantive_invariants(result)
+        validate_root_confirmation_substantive_invariants(
+            result,
+            require_canonical_counterfactual=True,
+        )
         return result
 
 

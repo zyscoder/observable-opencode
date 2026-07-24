@@ -385,6 +385,25 @@ class RequestAwareRestoreTest(unittest.TestCase):
                     tampered = copy.deepcopy(control)
                     confirmation = _mutated_confirmation(valid, **changes)
                     _rewrite_report(tampered, confirmation)
+                    if label == "malformed counterfactual":
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "counterfactual",
+                        ):
+                            RecursiveAttributionReport.from_dict(tampered)
+                        with self.assertRaises(EvaluationSafetyError):
+                            compare_report(
+                                annotate_report_semantic_anchors(
+                                    graph.case_id,
+                                    graph.nodes,
+                                    tampered,
+                                    graph=graph,
+                                ),
+                                permissive_labels(graph.case_id),
+                                None,
+                                graph=graph,
+                            )
+                        continue
                     parsed = RecursiveAttributionReport.from_dict(tampered)
                     with self.assertRaisesRegex(
                         ValueError,

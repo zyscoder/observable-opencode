@@ -311,6 +311,11 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     confirmation = report_payload["confirmations"][0]
     seed = report_payload["seed_results"][0]
     confirmation["candidate_ref"] = ghost_ref
+    confirmation["counterfactual"] = confirmation_counterfactual_for(
+        ghost_ref,
+        confirmation["status"],
+        counterfactual_status=confirmation["counterfactual_status"],
+    )
     confirmation["recursive_path"] = [ghost_ref, seed["start_ref"]]
     confirmation["confirmation_identity"] = confirmation_identity_for(
         hypothesis_id=confirmation["hypothesis_id"],
@@ -324,6 +329,7 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     root = report_payload["confirmed_roots"][0]
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
+    root["counterfactual"] = confirmation["counterfactual"]
     root["confirmation"] = copy.deepcopy(confirmation)
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed["confirmed_root_refs"] = [ghost_ref]
