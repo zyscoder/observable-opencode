@@ -488,6 +488,16 @@ class CompletedReplayValidationOrderTest(unittest.TestCase):
 
             completed = _completed_action(root)
             _, replay_state, _, replay_queue = artifact_state(root)
+            completed_accounting = completed["payload"]["provider_state"][
+                "accounting"
+            ]
+            for field in (
+                "logical_judge_calls",
+                "logical_confirmation_calls",
+                "investigation_rounds",
+                "artifact_bytes",
+            ):
+                setattr(replay_state, field, completed_accounting[field])
             self.assertTrue(replay_state.enqueue_confirmation(replay_queue))
             replay_state.replay_actions = {
                 completed["semantic_key"]: completed

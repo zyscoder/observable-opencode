@@ -328,6 +328,29 @@ PROVIDER_ACCOUNTING_KEYS = {
     "investigation_rounds",
     "artifact_bytes",
 }
+PROVIDER_CACHE_STATS_KEYS = {
+    "enabled",
+    "path",
+    "loaded_entries",
+    "hits",
+    "misses",
+    "writes",
+    "invalid_entries",
+    "corrupt_entries",
+    "write_error_count",
+    "write_errors",
+}
+PROVIDER_CACHE_COUNT_KEYS = {
+    "loaded_entries",
+    "hits",
+    "misses",
+    "writes",
+    "invalid_entries",
+    "corrupt_entries",
+    "write_error_count",
+}
+
+
 def _require_exact_checkpoint_keys(
     value: Mapping[str, Any], expected: Set[str], label: str
 ) -> None:
@@ -2987,6 +3010,44 @@ def _provider_state_payload(
     }
 
 
+def _validate_provider_cache_stats(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("provider cache stats must be an object")
+    if any(type(key) is not str for key in value):
+        raise ValueError("provider cache stats keys must be strings")
+    if set(value) == {"enabled"}:
+        if value["enabled"] is not False:
+            raise ValueError("minimal provider cache stats must be disabled")
+        return {"enabled": False}
+    _require_exact_checkpoint_keys(
+        value,
+        PROVIDER_CACHE_STATS_KEYS,
+        "provider cache stats",
+    )
+    cache_stats = dict(value)
+    if type(cache_stats["enabled"]) is not bool:
+        raise ValueError("provider cache enabled flag is invalid")
+    if type(cache_stats["path"]) is not str:
+        raise ValueError("provider cache path is invalid")
+    for key in PROVIDER_CACHE_COUNT_KEYS:
+        if type(cache_stats[key]) is not int or cache_stats[key] < 0:
+            raise ValueError(
+                "provider cache counter is invalid: {0}".format(key)
+            )
+    write_errors = cache_stats["write_errors"]
+    if type(write_errors) is not list or any(
+        type(item) is not str for item in write_errors
+    ):
+        raise ValueError("provider cache write errors are invalid")
+    if cache_stats["write_error_count"] != len(write_errors):
+        raise ValueError("provider cache write error count is inconsistent")
+    if cache_stats["enabled"] != bool(cache_stats["path"]):
+        raise ValueError(
+            "provider cache enabled flag does not match its path"
+        )
+    return copy.deepcopy(cache_stats)
+
+
 def _validate_provider_state(
     value: Any,
     state: "RecursiveAnalysisState",
@@ -3013,8 +3074,9 @@ def _validate_provider_state(
         raise ValueError("provider error threshold must be positive")
     if provider["cache_identity"] != cache_identity:
         raise ValueError("provider cache identity does not match checkpoint config")
-    if not isinstance(provider["cache_stats"], Mapping):
-        raise ValueError("provider cache stats must be an object")
+    provider["cache_stats"] = _validate_provider_cache_stats(
+        provider["cache_stats"]
+    )
     accounting = provider["accounting"]
     _require_exact_checkpoint_keys(
         accounting, PROVIDER_ACCOUNTING_KEYS, "provider accounting"
@@ -7473,19 +7535,7 @@ class AgenticRecursiveAnalyzer:
             cache_identity=str(
                 self.checkpoint_config.get("cache_identity") or ""
             ),
-            require_accounting_match=False,
         )
-        accounting = provider["accounting"]
-        if (
-            accounting["judge_requests"]
-            != projected_state.judge_requests
-            or accounting["judge_request_uncertainty_count"]
-            != projected_state.judge_request_uncertainty_count
-        ):
-            raise ValueError(
-                "completed confirmation replay physical accounting "
-                "does not match recursive state"
-            )
         return provider
 
     @staticmethod
