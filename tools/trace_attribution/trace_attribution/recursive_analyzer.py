@@ -1314,6 +1314,168 @@ def _validate_terminal_confirmation_identity(
         )
 
 
+def _validate_confirmation_request_projection_binding(
+    value: Mapping[str, Any],
+    *,
+    defect_state: DefectState,
+    analysis_perspective: str,
+    confirmation: Optional[RootConfirmation] = None,
+    action_projection: Optional[Mapping[str, Any]] = None,
+    label: str,
+) -> JsonDict:
+    """Bind canonical persisted request facts to graph-independent outer state."""
+    if not isinstance(value, Mapping):
+        raise ValueError("{0} outer request must be an object".format(label))
+    canonical = validate_root_confirmation_request_projection(
+        value.get("factual_request_projection")
+    )
+    semantic_identity = str(value.get("semantic_identity") or "")
+    request_identity = str(value.get("request_identity") or "")
+    if (
+        semantic_identity
+        and request_identity
+        and semantic_identity != request_identity
+    ):
+        raise ValueError(
+            "{0} projection binding contradicts outer request identity".format(
+                label
+            )
+        )
+    outer_request_identity = semantic_identity or request_identity
+    if (
+        not outer_request_identity
+        or root_confirmation_request_projection_identity(canonical)
+        != outer_request_identity
+    ):
+        raise ValueError(
+            "{0} projection binding contradicts outer request identity".format(
+                label
+            )
+        )
+
+    outer_perspective = (
+        str(value.get("analysis_perspective") or "")
+        if "analysis_perspective" in value
+        else str(analysis_perspective)
+    )
+    facts = canonical["facts"]
+    projected_binding = (
+        facts["candidate_ref"],
+        stable_json(facts["defect_state"]),
+        tuple(facts["recursive_path"]),
+        facts["hypothesis_id"],
+        facts["hypothesis_semantic_hash"],
+        facts["seed_binding_identity"],
+        facts["analysis_perspective"],
+    )
+    outer_binding = (
+        str(value.get("candidate_ref") or ""),
+        stable_json(defect_state.to_dict()),
+        tuple(str(item) for item in value.get("recursive_path") or ()),
+        str(value.get("hypothesis_id") or ""),
+        str(value.get("hypothesis_semantic_hash") or ""),
+        str(value.get("seed_binding_identity") or ""),
+        outer_perspective,
+    )
+    if (
+        projected_binding != outer_binding
+        or outer_perspective != str(analysis_perspective)
+    ):
+        raise ValueError(
+            "{0} factual projection binding contradicts outer request "
+            "semantics".format(label)
+        )
+
+    owner = LocalStateOwner.from_dict(value.get("owner"))
+    if (
+        owner.hypothesis_id != outer_binding[3]
+        or owner.seed_binding_identity != outer_binding[5]
+    ):
+        raise ValueError(
+            "{0} projection binding contradicts outer request owner".format(
+                label
+            )
+        )
+
+    if confirmation is not None:
+        confirmation_binding = (
+            confirmation.candidate_ref,
+            confirmation.defect_fingerprint,
+            confirmation.recursive_path,
+            confirmation.hypothesis_id,
+            confirmation.hypothesis_semantic_hash,
+            confirmation.seed_binding_identity,
+        )
+        expected_confirmation_binding = (
+            facts["candidate_ref"],
+            defect_state.fingerprint,
+            tuple(facts["recursive_path"]),
+            facts["hypothesis_id"],
+            facts["hypothesis_semantic_hash"],
+            facts["seed_binding_identity"],
+        )
+        if confirmation_binding != expected_confirmation_binding:
+            raise ValueError(
+                "{0} terminal confirmation contradicts factual projection "
+                "binding".format(label)
+            )
+
+    if action_projection is not None:
+        if not isinstance(action_projection, Mapping):
+            raise ValueError(
+                "{0} terminal action projection must be an object".format(
+                    label
+                )
+            )
+        action_confirmation = RootConfirmation.from_dict(
+            _checkpoint_json(action_projection.get("confirmation") or {})
+        )
+        action_owner = LocalStateOwner.from_dict(
+            action_projection.get("owner")
+        )
+        action_binding = (
+            str(action_projection.get("candidate_ref") or ""),
+            str(action_projection.get("defect_fingerprint") or ""),
+            tuple(
+                str(item)
+                for item in action_projection.get("recursive_path") or ()
+            ),
+            str(action_projection.get("hypothesis_id") or ""),
+            str(action_projection.get("hypothesis_semantic_hash") or ""),
+            str(action_projection.get("seed_binding_identity") or ""),
+            str(action_projection.get("request_identity") or ""),
+        )
+        expected_action_binding = (
+            facts["candidate_ref"],
+            defect_state.fingerprint,
+            tuple(facts["recursive_path"]),
+            facts["hypothesis_id"],
+            facts["hypothesis_semantic_hash"],
+            facts["seed_binding_identity"],
+            outer_request_identity,
+        )
+        action_request_projection = (
+            validate_root_confirmation_request_projection(
+                action_projection.get("factual_request_projection")
+            )
+        )
+        if (
+            action_binding != expected_action_binding
+            or action_owner != owner
+            or (
+                confirmation is not None
+                and action_confirmation != confirmation
+            )
+            or stable_json(action_request_projection)
+            != stable_json(canonical)
+        ):
+            raise ValueError(
+                "{0} terminal action contradicts factual projection "
+                "binding".format(label)
+            )
+    return canonical
+
+
 def _terminal_evidence_snapshot_identity(
     artifact_evidence_envelopes: Any,
 ) -> str:
@@ -3809,6 +3971,7 @@ class RecursiveAnalysisState:
                     "restored confirmation queue contains a root candidate ineligible for the active revision"
                 )
             is_pending = item.get("status") == "queued"
+            terminal_confirmation = None
             if is_pending:
                 _validate_pending_confirmation_identity(item)
                 terminal_disposition = None
@@ -3871,6 +4034,21 @@ class RecursiveAnalysisState:
                 terminal_disposition is not None
                 and terminal_disposition["state"]
                 == "rejected_snapshot"
+            )
+            defect_state = self.defect_states.get(
+                str(item.get("defect_fingerprint") or "")
+            )
+            if defect_state is None:
+                raise ValueError(
+                    "confirmation queue projection binding has no canonical "
+                    "defect state"
+                )
+            _validate_confirmation_request_projection_binding(
+                item,
+                defect_state=defect_state,
+                analysis_perspective=self.analysis_perspective,
+                confirmation=terminal_confirmation,
+                label="confirmation queue",
             )
             if not rejected_snapshot:
                 expected_artifacts = self._confirmation_artifact_envelopes(
@@ -7052,6 +7230,23 @@ class AgenticRecursiveAnalyzer:
         *,
         label: str,
     ) -> JsonDict:
+        defect_state = state.defect_states.get(
+            str(queued.get("defect_fingerprint") or "")
+        )
+        if defect_state is None:
+            raise ValueError(
+                "{0} projection binding has no canonical defect state".format(
+                    label
+                )
+            )
+        _validate_confirmation_request_projection_binding(
+            queued,
+            defect_state=defect_state,
+            analysis_perspective=state.analysis_perspective,
+            confirmation=confirmation,
+            action_projection=action_projection,
+            label=label,
+        )
         node = state.graph.nodes.get(confirmation.candidate_ref)
         if (
             node is None
