@@ -27,6 +27,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     semantic_anchor_id,
     semantic_anchor_index,
@@ -866,7 +867,10 @@ class DeterministicRuleSemanticJudge(OfflineJudgeCapability):
                 request.candidate_ref,
                 excerpt=str(request.candidate_reference.get("content") or ""),
                 reason="The candidate semantic action independently introduces the mismatch.",
-                counterfactual="Replacing the action removes the mismatch while holding downstream execution fixed.",
+                counterfactual=confirmation_counterfactual_for(
+                    request.candidate_ref,
+                    "confirmed",
+                ),
                 confidence=0.85,
                 evidence_refs=[request.candidate_ref],
             )

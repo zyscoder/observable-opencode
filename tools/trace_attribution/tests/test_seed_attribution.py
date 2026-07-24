@@ -23,6 +23,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     seed_binding_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
@@ -100,7 +101,10 @@ class MultiSeedJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="All focused tests passed.",
             reason="The unsupported test claim is the confirmed local root.",
-            counterfactual="Reporting the observed test result avoids the unsupported claim.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -168,7 +172,10 @@ class TransformingRootJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="Search only the first matching implementation.",
             reason="The decision independently introduced the incomplete discovery defect.",
-            counterfactual="Inspecting every implementation prevents the downstream omission.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -244,7 +251,10 @@ class TwoHopSharedRootJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="The root decision introduced an unsupported claim.",
             reason="The shared root independently introduced this seed's defect.",
-            counterfactual="Grounding the root decision prevents this unsupported claim.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -330,7 +340,10 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
             request.candidate_ref,
             excerpt="The shared root decision omitted required evidence.",
             reason="The shared decision independently caused this seed's defect.",
-            counterfactual="A grounded decision prevents the unsupported claim.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -444,7 +457,10 @@ class DivergentSharedRootFusionJudge(SharedRootFusionJudge):
             request.candidate_ref,
             excerpt="The shared root decision omitted required evidence.",
             reason="The shared decision independently caused the first seed's defect.",
-            counterfactual="A grounded decision prevents the unsupported claim.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -1314,6 +1330,9 @@ class SeedAttributionModelTests(unittest.TestCase):
         payload["confirmed_roots"][0]["observed_defect_refs"] = list(
             mixed_root.observed_defect_refs
         )
+        payload["root_causes"][0]["observed_defect_refs"] = list(
+            mixed_root.observed_defect_refs
+        )
         with self.assertRaisesRegex(ValueError, "observed_defect_refs.*owning seed"):
             RecursiveAttributionReport.from_dict(payload)
 
@@ -1970,7 +1989,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v15")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v16")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -1983,7 +2002,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v15")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v16")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

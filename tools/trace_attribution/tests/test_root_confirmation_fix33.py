@@ -13,6 +13,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     confirmation_response_identity_for,
 )
@@ -347,7 +348,10 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="validated terminal remains unknown",
-                counterfactual="The counterfactual outcome remains unknown.",
+                counterfactual=confirmation_counterfactual_for(
+                    stored["candidate_ref"],
+                    "unknown",
+                ),
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=semantic_hash,
@@ -389,7 +393,10 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="valid no-frontier terminal",
-                counterfactual="The counterfactual outcome remains unknown.",
+                counterfactual=confirmation_counterfactual_for(
+                    stored["candidate_ref"],
+                    "unknown",
+                ),
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=stored[
@@ -432,7 +439,10 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="drifted no-frontier terminal",
-                counterfactual="The counterfactual outcome remains unknown.",
+                counterfactual=confirmation_counterfactual_for(
+                    stored["candidate_ref"],
+                    "unknown",
+                ),
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=semantic_hash,

@@ -19,6 +19,7 @@ from .causal_state import (
     FrozenMapping,
     PredecessorAssessment,
     RootConfirmation,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     validate_root_confirmation_substantive_invariants,
 )
@@ -43,7 +44,7 @@ from .models import JsonDict, TraceNode, stable_json
 
 
 CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v9"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v9"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v10"
 ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA = (
     "root-confirmation-request-projection/v2"
 )
@@ -2401,10 +2402,11 @@ def validate_recursive_confirmation(
         request=request,
         evidence_refs=evidence_refs,
     )
-    counterfactual = (
-        "replace_with_semantically_correct_behavior({0}) predicts defect_status={1}; "
-        "causal_effect={2}"
-    ).format(intervention_ref, predicted_status, causal_effect)
+    counterfactual = confirmation_counterfactual_for(
+        intervention_ref,
+        status,
+        counterfactual_status=counterfactual_status,
+    )
     if status == "confirmed":
         if not evidence_refs:
             raise ValueError("confirmed root requires grounded evidence refs")
@@ -2434,7 +2436,10 @@ def validate_recursive_confirmation(
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
     )
-    return validate_root_confirmation_substantive_invariants(confirmation)
+    return validate_root_confirmation_substantive_invariants(
+        confirmation,
+        require_canonical_counterfactual=True,
+    )
 
 
 def preflight_root_confirmation_request(
@@ -2472,7 +2477,10 @@ def bind_root_confirmation(
         and confirmation.seed_binding_identity != request.seed_binding_identity
     ):
         raise ValueError("confirmation is cross-bound to another seed")
-    validate_root_confirmation_substantive_invariants(confirmation)
+    validate_root_confirmation_substantive_invariants(
+        confirmation,
+        require_canonical_counterfactual=True,
+    )
     allowed_factor_roles = {
         "confirmed": {"necessary_cause"},
         "rejected": {
@@ -2534,7 +2542,10 @@ def bind_root_confirmation(
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
     )
-    return validate_root_confirmation_substantive_invariants(result)
+    return validate_root_confirmation_substantive_invariants(
+        result,
+        require_canonical_counterfactual=True,
+    )
 
 
 def root_confirmation_from_payload(

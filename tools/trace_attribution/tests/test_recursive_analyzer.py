@@ -25,6 +25,7 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     confirmation_response_identity_for,
     semantic_visit_key,
@@ -267,6 +268,7 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["confirmation"] = copy.deepcopy(confirmation)
+    report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed = report_payload["seed_results"][0]
     seed["confirmed_root_refs"] = [ghost_ref]
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
@@ -553,7 +555,9 @@ class BoundedConfirmingJudge(BoundedJudgeCapability):
                 request.candidate_ref,
                 excerpt=excerpt,
                 reason="The candidate contains the tracked defect.",
-                counterfactual="Correcting the candidate prevents the defect.",
+                counterfactual=confirmation_counterfactual_for(
+                    request.candidate_ref, "confirmed"
+                ),
                 confidence=0.9,
                 evidence_refs=[request.candidate_ref],
             ),
@@ -590,7 +594,9 @@ class CounterlessBoundedConfirmingJudge(BoundedJudgeCapability):
                 request.candidate_ref,
                 excerpt="The decision is incomplete.",
                 reason="The candidate contains the tracked defect.",
-                counterfactual="Correcting it prevents the defect.",
+                counterfactual=confirmation_counterfactual_for(
+                    request.candidate_ref, "confirmed"
+                ),
                 confidence=0.9,
                 evidence_refs=[request.candidate_ref],
             ),
@@ -2207,7 +2213,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="The decision omitted required search coverage.",
                     reason="The decision is a necessary local root.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -2246,7 +2254,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="The decision omitted required search coverage.",
                     reason="The decision is a necessary local root.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -2289,7 +2299,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="The decision omitted required search coverage.",
                     reason="The decision is a necessary local root.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -2327,7 +2339,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="The decision omitted required search coverage.",
                     reason="The decision is a necessary local root.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -2369,7 +2383,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision stopped repository discovery.",
-                    counterfactual="A complete search would prevent the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.91,
                     evidence_refs=["record:decision"],
                 ),
@@ -2440,7 +2456,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision stopped repository discovery.",
-                    counterfactual="A complete search would prevent the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.91,
                     evidence_refs=["record:decision"],
                 ),
@@ -2541,9 +2559,10 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     candidate_ref="record:decision",
                     status="rejected",
                     reason="The counterfactual evidence is incomplete.",
-                    counterfactual=(
-                        "Replacing the decision has an unknown effect on "
-                        "the defect."
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision",
+                        "rejected",
+                        counterfactual_status="unknown",
                     ),
                     confidence=0.5,
                     counterfactual_status="unknown",
@@ -2643,7 +2662,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision was independently necessary.",
-                    counterfactual="Correcting it prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 ),
@@ -2651,7 +2672,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:context",
                     excerpt="The complete compatibility contract is documented here.",
                     reason="The context defect was independently necessary.",
-                    counterfactual="Correcting it prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:context", "confirmed"
+                    ),
                     confidence=0.8,
                     evidence_refs=["record:context"],
                 ),
@@ -2696,7 +2719,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision requires its co-root alternative.",
-                    counterfactual="Correcting both prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 ),
@@ -2786,7 +2811,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision was independently necessary.",
-                    counterfactual="Correcting it prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 ),
@@ -2794,7 +2821,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:context",
                     excerpt="The complete compatibility contract is documented here.",
                     reason="The context was independently necessary.",
-                    counterfactual="Correcting it prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:context", "confirmed"
+                    ),
                     confidence=0.8,
                     evidence_refs=["record:context"],
                 ),
@@ -2807,7 +2836,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                 "record:only",
                 excerpt="The decision is incomplete.",
                 reason="A forged confirmation attempts to cross-bind another branch.",
-                counterfactual="Correcting it prevents the defect.",
+                counterfactual=confirmation_counterfactual_for(
+                    "record:only", "confirmed"
+                ),
                 confidence=0.9,
                 evidence_refs=["record:only"],
             ),
@@ -2839,7 +2870,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     "record:only",
                     excerpt=artifact_text,
                     reason="The hydrated candidate artifact contains the stopping decision.",
-                    counterfactual="Continuing the search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:only", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:only"],
                 )
@@ -2909,7 +2942,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                         "record:decision",
                         excerpt="任务编排策略提前结束代码搜索。",
                         reason="Independent task-orchestration cause.",
-                        counterfactual="Correct orchestration prevents the defect.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     ),
@@ -2917,7 +2952,9 @@ class RecursiveRootRankingTest(unittest.TestCase):
                         "record:context",
                         excerpt="需求描述质量存在歧义。",
                         reason="Independent requirement-quality cause.",
-                        counterfactual="Clear requirements prevent the defect.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:context", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:context"],
                     ),
@@ -3084,7 +3121,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="Implement only the methods found in the first search.",
                         reason="The decision is the necessary local root.",
-                        counterfactual="Searching all methods prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     )
@@ -3207,7 +3246,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="Search only the first matching implementation.",
                         reason="The decision is the necessary local root.",
-                        counterfactual="Inspecting every implementation prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     )
@@ -3335,7 +3376,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:route_a",
                         excerpt="The implementation search was incomplete.",
                         reason="The authentic route carries the omitted-search defect.",
-                        counterfactual="Inspecting every implementation prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:route_a", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:route_a"],
                     )
@@ -3421,7 +3464,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="The decision omitted required search coverage.",
                         reason="The decision is the necessary local root.",
-                        counterfactual="Searching all call sites prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     )
@@ -3493,7 +3538,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         ref,
                         excerpt="The decision omitted required search coverage.",
                         reason="The decision is a necessary local root.",
-                        counterfactual="Searching all call sites prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            ref, "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=[ref],
                     )
@@ -3971,7 +4018,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The global candidate remains necessary under independent review.",
-                    counterfactual="Searching the complete contract prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -4019,7 +4068,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The global candidate remains necessary under independent review.",
-                    counterfactual="Searching the complete contract prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -4095,7 +4146,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="Implement only the methods found in the first search.",
                         reason="The decision remains necessary under independent review.",
-                        counterfactual="Searching the complete contract prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     )
@@ -4141,7 +4194,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="Implement only the methods found in the first search.",
                         reason="The decision remains necessary under independent review.",
-                        counterfactual="Searching the complete contract prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision"],
                     )
@@ -4234,7 +4289,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The stale decision appears necessary under independent review.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -4334,7 +4391,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                         "record:decision",
                         excerpt="Implement only the methods found in the first search.",
                         reason="The active decision appears necessary under independent review.",
-                        counterfactual="A complete search prevents the omission.",
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision", "confirmed"
+                        ),
                         confidence=0.9,
                         evidence_refs=["record:decision", "record:change"],
                     )
@@ -4476,7 +4535,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The current decision remains necessary under independent review.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -4761,7 +4822,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                                 "record:decision",
                                 excerpt="The recorded outcome exposes the defect.",
                                 reason="Attempt to publish an outcome as the root.",
-                                counterfactual="Changing the outcome would hide the defect.",
+                                counterfactual=confirmation_counterfactual_for(
+                                    "record:decision", "confirmed"
+                                ),
                                 confidence=0.9,
                                 evidence_refs=["record:decision"],
                             )
@@ -4792,7 +4855,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision remains necessary under independent review.",
-                    counterfactual="Searching the complete contract prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=["record:decision"],
                 )
@@ -4881,7 +4946,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The local decision introduced the observed omission.",
-                    counterfactual="Searching every implementation avoids the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=("record:decision",),
                 )
@@ -4929,7 +4996,9 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The branch-local counterfactual holds.",
-                    counterfactual="Searching every implementation avoids the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
                     confidence=0.9,
                     evidence_refs=("record:decision",),
                 )

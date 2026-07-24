@@ -109,7 +109,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v12"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v13"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -255,6 +255,7 @@ TERMINAL_CONFIRMATION_REQUIRED_KEYS = frozenset(
     {
         *PENDING_CONFIRMATION_REQUIRED_KEYS,
         "confirmation",
+        "response_identity",
         "evidence_disposition",
     }
 )
@@ -262,6 +263,7 @@ TERMINAL_CONFIRMATION_ALLOWED_KEYS = frozenset(
     {
         *PENDING_CONFIRMATION_ALLOWED_KEYS,
         "confirmation",
+        "response_identity",
         "evidence_disposition",
     }
 )
@@ -1255,6 +1257,23 @@ def _quarantine_stale_seed_report_payload(
         "behavior_impact": "none_offline_analysis_only",
     }
     payload["metadata"] = metadata
+    legacy_root_causes = []
+    seen_legacy_root_causes = set()
+    for item in (
+        *payload.get("confirmed_roots", ()),
+        *payload.get("co_roots", ()),
+    ):
+        if not isinstance(item, Mapping):
+            continue
+        projection = ConfirmedRoot.from_dict(
+            copy.deepcopy(dict(item))
+        ).to_legacy_root_cause()
+        identity = stable_json(projection)
+        if identity in seen_legacy_root_causes:
+            continue
+        seen_legacy_root_causes.add(identity)
+        legacy_root_causes.append(projection)
+    payload["root_causes"] = legacy_root_causes
     return payload
 
 
@@ -1282,6 +1301,62 @@ def _confirmation_request_identity(
     request: RootConfirmationRequest,
 ) -> str:
     return root_confirmation_request_identity(request)
+
+
+def _synthetic_unknown_confirmation(
+    request: RootConfirmationRequest,
+    *,
+    reason: str,
+) -> RootConfirmation:
+    competitor_comparisons = tuple(
+        {
+            "hypothesis_id": str(item.get("hypothesis_id") or ""),
+            "hypothesis_semantic_hash": str(
+                item.get("hypothesis_semantic_hash") or ""
+            ),
+            "candidate_ref": str(
+                item.get("candidate_reference", {}).get(
+                    "resolved_ref"
+                )
+                or ""
+            ),
+            "defect_fingerprint": str(
+                item.get("active_defect", {}).get("fingerprint") or ""
+            ),
+            "confirmation_identity": str(
+                item.get("confirmation_identity") or ""
+            ),
+            "recursive_path": list(item.get("recursive_path") or ()),
+            "requires_independent_confirmation": item.get(
+                "requires_independent_confirmation"
+            ),
+            "status": "unresolved",
+            "reason": (
+                "The synthetic unknown outcome does not resolve this "
+                "offered competitor."
+            ),
+            "evidence_refs": [],
+        }
+        for item in request.competing_hypotheses
+        if str(item.get("status") or "").strip().lower()
+        in {"active", "supported", "unresolved"}
+    )
+    return RootConfirmation(
+        candidate_ref=request.candidate_ref,
+        status="unknown",
+        counterfactual=confirmation_counterfactual_for(
+            request.candidate_ref,
+            "unknown",
+        ),
+        reason=reason,
+        counterfactual_status="unknown",
+        hypothesis_id=request.hypothesis_id,
+        hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+        defect_fingerprint=request.defect_state.fingerprint,
+        recursive_path=request.recursive_path,
+        seed_binding_identity=request.seed_binding_identity,
+        competitor_comparisons=competitor_comparisons,
+    )
 
 
 def _validate_pending_confirmation_identity(
@@ -1336,6 +1411,17 @@ def _validate_terminal_confirmation_identity(
                 sorted(missing),
                 sorted(extra),
             )
+        )
+    confirmation = RootConfirmation.from_dict(
+        dict(value.get("confirmation") or {})
+    )
+    if (
+        str(value.get("response_identity") or "")
+        != confirmation.response_identity
+    ):
+        raise ValueError(
+            "terminal confirmation queue response_identity contradicts its "
+            "confirmation response"
         )
 
 
@@ -4250,6 +4336,16 @@ class RecursiveAnalysisState:
                         "confirmation queue contains a non-canonical semantic "
                         "identity"
                     )
+                if terminal_confirmation is not None:
+                    rebound_confirmation = bind_root_confirmation(
+                        terminal_confirmation,
+                        request=current_request,
+                    )
+                    if rebound_confirmation != terminal_confirmation:
+                        raise ValueError(
+                            "confirmation queue response does not exactly "
+                            "rebind to its current factual request"
+                        )
             if not semantic_identity or semantic_identity in semantic_identities:
                 raise ValueError(
                     "confirmation queue contains a missing, duplicate, or "
@@ -4763,6 +4859,7 @@ class RecursiveAnalysisState:
             "owner",
             "recursive_path",
             "status",
+            "response_identity",
             "artifact_evidence_envelopes",
             "evidence_disposition",
             "factual_request_projection",
@@ -4830,6 +4927,10 @@ class RecursiveAnalysisState:
                 or str(entry.get("seed_key") or "")
                 != parsed.seed_binding_identity
                 or str(entry.get("status") or "") != parsed.status
+                or str(entry.get("response_identity") or "")
+                != parsed.response_identity
+                or str(entry.get("response_identity") or "")
+                != canonical_projection["response_identity"]
                 or tuple(entry.get("recursive_path") or ())
                 != parsed.recursive_path
                 or owner.seed_binding_identity
@@ -7435,6 +7536,19 @@ class AgenticRecursiveAnalyzer:
                 ],
                 label=label,
             )
+            current_request = self._build_confirmation_request(
+                state,
+                queued,
+            )
+            rebound_confirmation = bind_root_confirmation(
+                confirmation,
+                request=current_request,
+            )
+            if rebound_confirmation != confirmation:
+                raise ValueError(
+                    "{0} response does not exactly rebind to its current "
+                    "factual request".format(label)
+                )
         hypothesis_id = str(queued.get("hypothesis_id") or "")
         seed_key = str(
             queued.get("seed_key")
@@ -9151,19 +9265,9 @@ class AgenticRecursiveAnalyzer:
             bounded_judge = isinstance(self.judge, BoundedJudgeCapability)
             offline_judge = isinstance(self.judge, OfflineJudgeCapability)
             if not bounded_judge and not offline_judge:
-                confirmation = RootConfirmation(
-                    candidate_ref=request.candidate_ref,
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        request.candidate_ref, "unknown"
-                    ),
+                confirmation = _synthetic_unknown_confirmation(
+                    request,
                     reason="confirmation_budget_unenforceable: Judge has no explicit bounded or offline capability",
-                    counterfactual_status="unknown",
-                    hypothesis_id=request.hypothesis_id,
-                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
-                    defect_fingerprint=request.defect_state.fingerprint,
-                    recursive_path=request.recursive_path,
-                    seed_binding_identity=request.seed_binding_identity,
                 )
                 self._persist_confirmation_action(
                     state,
@@ -9218,19 +9322,9 @@ class AgenticRecursiveAnalyzer:
                 state.judge_request_uncertainty_count += 1
                 if state.judge_requests >= self.max_judge_requests:
                     state._increment_budget("judge_requests")
-                confirmation = RootConfirmation(
-                    candidate_ref=request.candidate_ref,
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        request.candidate_ref, "unknown"
-                    ),
+                confirmation = _synthetic_unknown_confirmation(
+                    request,
                     reason="confirmation_interrupted: the prior in-flight confirmation is not repeated",
-                    counterfactual_status="unknown",
-                    hypothesis_id=request.hypothesis_id,
-                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
-                    defect_fingerprint=request.defect_state.fingerprint,
-                    recursive_path=request.recursive_path,
-                    seed_binding_identity=request.seed_binding_identity,
                 )
                 self._persist_confirmation_action(
                     state,
@@ -9331,51 +9425,21 @@ class AgenticRecursiveAnalyzer:
             except BoundedJudgeCallError as exc:
                 physical_delta = exc.physical_requests
                 physical_exact = True
-                confirmation = RootConfirmation(
-                    candidate_ref=request.candidate_ref,
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        request.candidate_ref, "unknown"
-                    ),
+                confirmation = _synthetic_unknown_confirmation(
+                    request,
                     reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
-                    counterfactual_status="unknown",
-                    hypothesis_id=request.hypothesis_id,
-                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
-                    defect_fingerprint=request.defect_state.fingerprint,
-                    recursive_path=request.recursive_path,
-                    seed_binding_identity=request.seed_binding_identity,
                 )
             except (JudgeProviderError, JudgeProviderUnavailable, TypeError, ValueError) as exc:
-                confirmation = RootConfirmation(
-                    candidate_ref=request.candidate_ref,
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        request.candidate_ref, "unknown"
-                    ),
+                confirmation = _synthetic_unknown_confirmation(
+                    request,
                     reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
-                    counterfactual_status="unknown",
-                    hypothesis_id=request.hypothesis_id,
-                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
-                    defect_fingerprint=request.defect_state.fingerprint,
-                    recursive_path=request.recursive_path,
-                    seed_binding_identity=request.seed_binding_identity,
                 )
             except Exception as exc:
-                confirmation = RootConfirmation(
-                    candidate_ref=request.candidate_ref,
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        request.candidate_ref, "unknown"
-                    ),
+                confirmation = _synthetic_unknown_confirmation(
+                    request,
                     reason="confirmation_capability_error: {0}: {1}".format(
                         type(exc).__name__, exc
                     ),
-                    counterfactual_status="unknown",
-                    hypothesis_id=request.hypothesis_id,
-                    hypothesis_semantic_hash=request.hypothesis_semantic_hash,
-                    defect_fingerprint=request.defect_state.fingerprint,
-                    recursive_path=request.recursive_path,
-                    seed_binding_identity=request.seed_binding_identity,
                 )
             if physical_exact:
                 state.judge_requests += physical_delta - reserved_requests
@@ -9428,52 +9492,20 @@ class AgenticRecursiveAnalyzer:
                             )
                         )
                     else:
-                        confirmation = RootConfirmation(
-                            candidate_ref=request.candidate_ref,
-                            status="unknown",
-                            counterfactual=confirmation_counterfactual_for(
-                                request.candidate_ref, "unknown"
-                            ),
+                        confirmation = _synthetic_unknown_confirmation(
+                            request,
                             reason=(
                                 "terminal_confirmation_evidence_invalid: "
                                 "{0}: {1}"
                             ).format(type(exc).__name__, exc),
-                            counterfactual_status="unknown",
-                            hypothesis_id=request.hypothesis_id,
-                            hypothesis_semantic_hash=(
-                                request.hypothesis_semantic_hash
-                            ),
-                            defect_fingerprint=(
-                                request.defect_state.fingerprint
-                            ),
-                            recursive_path=request.recursive_path,
-                            seed_binding_identity=(
-                                request.seed_binding_identity
-                            ),
                         )
                         terminal_operation = "confirmation_failed"
                 if final_disposition["state"] == "rejected_snapshot":
-                    confirmation = RootConfirmation(
-                        candidate_ref=request.candidate_ref,
-                        status="unknown",
-                        counterfactual=confirmation_counterfactual_for(
-                            request.candidate_ref, "unknown"
-                        ),
+                    confirmation = _synthetic_unknown_confirmation(
+                        request,
                         reason=(
                             "terminal_artifact_preflight_rejected: {0}"
                         ).format(final_disposition["rejection_reason"]),
-                        counterfactual_status="unknown",
-                        hypothesis_id=request.hypothesis_id,
-                        hypothesis_semantic_hash=(
-                            request.hypothesis_semantic_hash
-                        ),
-                        defect_fingerprint=(
-                            request.defect_state.fingerprint
-                        ),
-                        recursive_path=request.recursive_path,
-                        seed_binding_identity=(
-                            request.seed_binding_identity
-                        ),
                     )
                     terminal_operation = "confirmation_failed"
             if replayed_confirmation is None:
@@ -10126,6 +10158,7 @@ class AgenticRecursiveAnalyzer:
         node = state.graph.nodes[confirmation.candidate_ref]
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
+        queued["response_identity"] = confirmation.response_identity
         queued["evidence_disposition"] = copy.deepcopy(
             projection["evidence_disposition"]
         )

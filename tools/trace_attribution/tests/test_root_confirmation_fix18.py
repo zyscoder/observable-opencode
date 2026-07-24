@@ -25,6 +25,7 @@ from trace_attribution.causal_state import (
     DefectState,
     PredecessorAssessment,
     RootConfirmation,
+    confirmation_counterfactual_for,
 )
 from trace_attribution.checkpoint import (
     CheckpointBundle,
@@ -217,9 +218,9 @@ class MixedPublicationJudge(OfflineJudgeCapability):
                 candidate_ref=request.candidate_ref,
                 status="rejected",
                 reason="The stale decision is a condition rather than a necessary root.",
-                counterfactual=(
-                    "Replacing the stale decision leaves the active defect "
-                    "present."
+                counterfactual=confirmation_counterfactual_for(
+                    request.candidate_ref,
+                    "rejected",
                 ),
                 confidence=0.9,
                 counterfactual_status="rejects_causality",
@@ -239,7 +240,10 @@ class MixedPublicationJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="The decision introduced the defect.",
             reason="The active decision is the necessary root.",
-            counterfactual="Correcting the decision prevents the defect.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.9,
             evidence_refs=[request.candidate_ref],
         )
@@ -798,7 +802,7 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
         self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v9")
         self.assertEqual(
             ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
-            "recursive-root-confirmation-v9",
+            "recursive-root-confirmation-v10",
         )
 
         common = {

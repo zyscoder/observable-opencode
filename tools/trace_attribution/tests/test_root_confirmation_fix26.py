@@ -23,6 +23,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     seed_binding_identity_for,
 )
 from trace_attribution.checkpoint import (
@@ -276,7 +277,10 @@ class RecursiveFallbackRootJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="The authored decision introduced the defect.",
             reason="The recursive fallback confirms the root.",
-            counterfactual="Correcting the decision prevents the defect.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=(request.candidate_ref,),
         )
@@ -1084,16 +1088,16 @@ class Fix26VersionIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v15",
+            "recursive-attribution-report/v16",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v14",
+            "recursive-attribution-checkpoint/v15",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v12",
+            "recursive-analysis-actions/v13",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,

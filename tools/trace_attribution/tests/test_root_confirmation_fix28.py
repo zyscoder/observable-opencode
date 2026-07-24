@@ -19,6 +19,7 @@ from trace_attribution.causal_judge import (
 from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
+    confirmation_counterfactual_for,
 )
 from trace_attribution.checkpoint import CheckpointBundle
 from trace_attribution.graph import TraceGraph
@@ -248,7 +249,10 @@ class FullFactualConfirmationRequestIdentityTest(unittest.TestCase):
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
                     reason="The decision stopped repository discovery.",
-                    counterfactual="A complete search prevents the omission.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision",
+                        "confirmed",
+                    ),
                     confidence=0.91,
                     evidence_refs=("record:decision",),
                 ),

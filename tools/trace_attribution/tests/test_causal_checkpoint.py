@@ -33,6 +33,7 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     confirmation_response_identity_for,
     seed_binding_identity_for,
@@ -277,7 +278,10 @@ class ConfirmedSingleNodeJudge(CountingOfflineJudge):
             request.candidate_ref,
             excerpt="The decision introduced the defect.",
             reason="The only candidate is a necessary root.",
-            counterfactual="Correcting the only node prevents the defect.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.9,
             evidence_refs=[request.candidate_ref],
         )
@@ -321,6 +325,7 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["confirmation"] = copy.deepcopy(confirmation)
+    report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed["confirmed_root_refs"] = [ghost_ref]
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
 
@@ -1260,13 +1265,14 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v16+resolution/v2+evidence-policy/v5"
+            "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-            "+action-projection/v6+response-identity/v1"
+            "+action-projection/v7+response-identity/v1+counterfactual/v1"
+            "+queue-response-identity/v1+published-root-projection/v1"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v14")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v15")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()

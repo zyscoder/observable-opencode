@@ -98,6 +98,11 @@ def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:
     )
     return replace(
         root,
+        reason=confirmation.reason,
+        counterfactual=confirmation.counterfactual,
+        confidence=confirmation.confidence,
+        evidence_refs=confirmation.evidence_refs,
+        excerpt=confirmation.excerpt,
         hypothesis_id=hypothesis_id,
         recursive_path=path,
         observed_defect_refs=(seed_ref,),
@@ -109,6 +114,11 @@ def confirmation_for(root):
     if not root.confirmation:
         bound = modern_root(root)
         for name in (
+            "reason",
+            "counterfactual",
+            "confidence",
+            "evidence_refs",
+            "excerpt",
             "hypothesis_id",
             "recursive_path",
             "observed_defect_refs",
@@ -607,6 +617,8 @@ class CausalStateTest(unittest.TestCase):
             reason=confirmed.reason,
             counterfactual=confirmed.counterfactual,
             confidence=confirmed.confidence,
+            evidence_refs=confirmed.evidence_refs,
+            excerpt=confirmed.excerpt,
             hypothesis_id="hyp:first",
             recursive_path=path,
             observed_defect_refs=(path[-1],),
@@ -674,14 +686,18 @@ class CausalStateTest(unittest.TestCase):
         root = ConfirmedRoot(
             node_ref=confirmation.candidate_ref,
             defect_state=sample_defect_state(),
-            reason="Candidate is causal.",
-            counterfactual="Correcting it prevents the defect.",
-            confidence=0.9,
+            reason=confirmation.reason,
+            counterfactual=confirmation.counterfactual,
+            confidence=confirmation.confidence,
+            evidence_refs=confirmation.evidence_refs,
+            excerpt=confirmation.excerpt,
             hypothesis_id="hyp:foreign",
             recursive_path=confirmation.recursive_path,
             confirmation=confirmation.to_dict(),
         )
-        with self.assertRaisesRegex(ValueError, "root confirmation identity"):
+        with self.assertRaisesRegex(
+            ValueError, "root confirmation (identity|response projection)"
+        ):
             RecursiveAttributionReport(
                 case_id="forged-root",
                 objective="Find roots.",
@@ -916,6 +932,7 @@ class CausalStateTest(unittest.TestCase):
             counterfactual=confirmation.counterfactual,
             confidence=confirmation.confidence,
             evidence_refs=confirmation.evidence_refs,
+            excerpt=confirmation.excerpt,
             component=node.component,
             event_type=node.event_type,
             defect_type=defect_state.label,

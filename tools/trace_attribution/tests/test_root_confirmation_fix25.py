@@ -17,6 +17,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     seed_binding_identity_for,
 )
 from trace_attribution.causal_judge import OfflineJudgeCapability
@@ -397,7 +398,10 @@ class ArtifactConfirmationJudge(OfflineJudgeCapability):
             request.candidate_ref,
             excerpt="verified proof",
             reason="The complete verified artifact confirms the defect.",
-            counterfactual="Removing the defective decision prevents it.",
+            counterfactual=confirmation_counterfactual_for(
+                request.candidate_ref,
+                "confirmed",
+            ),
             confidence=0.95,
             evidence_refs=["artifact:proof"],
         )

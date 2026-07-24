@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import ntpath
 import posixpath
@@ -50,7 +51,7 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v15"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v16"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
@@ -63,11 +64,15 @@ GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v7"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v16+resolution/v2+evidence-policy/v5"
+    "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-    "+action-projection/v6+response-identity/v1"
+    "+action-projection/v7+response-identity/v1+counterfactual/v1"
+    "+queue-response-identity/v1+published-root-projection/v1"
     "+step-action-projection/v1+confirmation-request-identity/v3"
     "+confirmation-request-projection/v2"
+)
+ROOT_CONFIRMATION_COUNTERFACTUAL_SCHEMA = (
+    "root-confirmation-counterfactual/v1"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
@@ -321,20 +326,84 @@ def confirmation_response_identity_for(
     )
 
 
-def confirmation_counterfactual_for(candidate_ref: str, status: str) -> str:
+def confirmation_counterfactual_for(
+    candidate_ref: str,
+    status: str,
+    *,
+    counterfactual_status: str = "",
+) -> str:
+    resolved_counterfactual_status = counterfactual_status or {
+        "confirmed": "supports_causality",
+        "rejected": "rejects_causality",
+        "unknown": "unknown",
+    }.get(status, "")
     prediction = {
-        "confirmed": ("absent", "prevents_defect"),
-        "rejected": ("present", "does_not_prevent_defect"),
-        "unknown": ("unknown", "unknown"),
-    }.get(status)
-    if prediction is None:
+        ("confirmed", "supports_causality"): (
+            "absent",
+            "prevents_defect",
+        ),
+        ("rejected", "rejects_causality"): (
+            "present",
+            "does_not_prevent_defect",
+        ),
+        ("rejected", "unknown"): ("unknown", "unknown"),
+        ("unknown", "unknown"): ("unknown", "unknown"),
+    }.get((status, resolved_counterfactual_status))
+    if prediction is None or not str(candidate_ref):
         raise ValueError(
-            "unsupported root confirmation status: {0}".format(status)
+            "unsupported root confirmation counterfactual combination: "
+            "status={0}, counterfactual_status={1}".format(
+                status,
+                resolved_counterfactual_status,
+            )
         )
-    return (
-        "replace_with_semantically_correct_behavior({0}) predicts "
-        "defect_status={1}; causal_effect={2}"
-    ).format(candidate_ref, prediction[0], prediction[1])
+    return stable_json(
+        {
+            "schema": ROOT_CONFIRMATION_COUNTERFACTUAL_SCHEMA,
+            "intervention_ref": str(candidate_ref),
+            "intervention_kind": (
+                "replace_with_semantically_correct_behavior"
+            ),
+            "predicted_defect_status": prediction[0],
+            "causal_effect": prediction[1],
+        }
+    )
+
+
+def validate_root_confirmation_counterfactual(
+    confirmation: Any,
+) -> str:
+    expected = confirmation_counterfactual_for(
+        confirmation.candidate_ref,
+        confirmation.status,
+        counterfactual_status=confirmation.counterfactual_status,
+    )
+    raw = str(confirmation.counterfactual or "")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "root confirmation counterfactual must be canonical structured "
+            "facts"
+        ) from exc
+    if (
+        not isinstance(parsed, Mapping)
+        or set(parsed)
+        != {
+            "schema",
+            "intervention_ref",
+            "intervention_kind",
+            "predicted_defect_status",
+            "causal_effect",
+        }
+        or stable_json(parsed) != raw
+        or raw != expected
+    ):
+        raise ValueError(
+            "root confirmation counterfactual contradicts candidate, "
+            "prediction, causal effect, status, or canonical encoding"
+        )
+    return raw
 
 
 def _has_blocking_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -1777,6 +1846,8 @@ class RootConfirmation:
 
 def validate_root_confirmation_substantive_invariants(
     confirmation: RootConfirmation,
+    *,
+    require_canonical_counterfactual: bool = False,
 ) -> RootConfirmation:
     if not isinstance(confirmation, RootConfirmation):
         raise TypeError("root confirmation must be a RootConfirmation")
@@ -1793,6 +1864,8 @@ def validate_root_confirmation_substantive_invariants(
         raise ValueError(
             "root confirmation counterfactual must be non-empty"
         )
+    if require_canonical_counterfactual:
+        validate_root_confirmation_counterfactual(confirmation)
     allowed_counterfactuals = {
         "confirmed": {"supports_causality"},
         "rejected": {"rejects_causality", "unknown"},
@@ -2566,8 +2639,16 @@ class RecursiveAttributionReport:
                 or confirmation.hypothesis_id != root.hypothesis_id
                 or confirmation.defect_fingerprint != root.defect_state.fingerprint
                 or confirmation.recursive_path != root.recursive_path
+                or root.reason != confirmation.reason
+                or root.counterfactual != confirmation.counterfactual
+                or root.confidence != confirmation.confidence
+                or root.evidence_refs != confirmation.evidence_refs
+                or root.excerpt != confirmation.excerpt
             ):
-                raise ValueError("root confirmation identity contradicts root semantic fields")
+                raise ValueError(
+                    "root confirmation response projection contradicts root "
+                    "semantic fields"
+                )
             return confirmation.confirmation_identity
 
         primary_identities = [
@@ -2998,6 +3079,41 @@ class RecursiveAttributionReport:
             raise ValueError(
                 "legacy root_causes require schema migration with independent confirmation"
             )
+        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            legacy_roots = value.get("root_causes")
+            if not isinstance(legacy_roots, list):
+                raise ValueError(
+                    "modern report root_causes projection must be an array"
+                )
+            expected_legacy_roots = []
+            seen_legacy_roots = set()
+            for root in (*confirmed_roots, *co_roots):
+                projection = root.to_legacy_root_cause()
+                projection_key = stable_json(projection)
+                if projection_key in seen_legacy_roots:
+                    continue
+                seen_legacy_roots.add(projection_key)
+                expected_legacy_roots.append(projection)
+            canonical_legacy_roots = [
+                {
+                    str(key): item
+                    for key, item in root.items()
+                    if str(key)
+                    not in {
+                        "semantic_anchor_id",
+                        "semantic_occurrence_id",
+                    }
+                }
+                if isinstance(root, Mapping)
+                else root
+                for root in legacy_roots
+            ]
+            if stable_json(canonical_legacy_roots) != stable_json(
+                expected_legacy_roots
+            ):
+                raise ValueError(
+                    "modern root_causes must exactly project published roots"
+                )
         start_refs = _string_list(value.get("start_refs"))
         defect_states = items("defect_states", DefectState.from_dict)
         seed_results = (

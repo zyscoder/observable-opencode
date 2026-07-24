@@ -26,6 +26,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     annotate_report_semantic_anchors,
+    confirmation_counterfactual_for,
     seed_binding_identity_for,
     semantic_anchor_id,
     semantic_anchor_index,
@@ -149,7 +150,10 @@ class FixtureJudge(OfflineJudgeCapability):
                 request.candidate_ref,
                 excerpt=excerpt,
                 reason="The candidate independently introduces the scripted fixture defect.",
-                counterfactual="Replacing this behavior prevents the fixture defect.",
+                counterfactual=confirmation_counterfactual_for(
+                    request.candidate_ref,
+                    "confirmed",
+                ),
                 confidence=value["confidence"],
                 evidence_refs=[request.candidate_ref],
             )
@@ -688,6 +692,9 @@ class RecursiveMetricTest(unittest.TestCase):
         report["seed_results"].append(other_seed)
         root["observed_defect_refs"].extend(
             ["record:distinguishable-provenance", other_seed_ref]
+        )
+        report["root_causes"][0]["observed_defect_refs"] = list(
+            root["observed_defect_refs"]
         )
 
         with self.assertRaisesRegex(

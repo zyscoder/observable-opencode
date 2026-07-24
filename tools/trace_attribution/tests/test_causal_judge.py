@@ -25,6 +25,7 @@ from trace_attribution.causal_judge import (
 from trace_attribution.causal_state import (
     CausalCandidate,
     DefectState,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
 )
 from trace_attribution.claude import ClaudeJudgeClient
@@ -2030,9 +2031,14 @@ class RootConfirmationValidationTest(unittest.TestCase):
                         self.assertEqual(result.status, status)
                         self.assertEqual(
                             result.counterfactual,
-                            "replace_with_semantically_correct_behavior(record:decision) "
-                            "predicts defect_status={0}; causal_effect={1}".format(
-                                predicted, effect
+                            confirmation_counterfactual_for(
+                                "record:decision",
+                                status,
+                                counterfactual_status={
+                                    "prevents_defect": "supports_causality",
+                                    "does_not_prevent_defect": "rejects_causality",
+                                    "unknown": "unknown",
+                                }[effect],
                             ),
                         )
                         continue
@@ -2108,7 +2114,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v9")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v10")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):
