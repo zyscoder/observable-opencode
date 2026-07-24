@@ -23,6 +23,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     SeedAttributionResult,
     annotate_report_semantic_anchors,
+    canonical_confirmed_root_publication,
     confirmation_counterfactual_for,
     seed_binding_identity_for,
     semantic_anchor_index,
@@ -662,10 +663,19 @@ def same_start_ref_sibling_mutation(
         confirmation,
         defect_fingerprint=root_defect.fingerprint,
     )
-    updated_root = replace(
-        root,
+    candidate_node = next(
+        candidate.node
+        for candidate in (
+            *report.causal_candidates,
+            *report.introduction_candidates,
+        )
+        if candidate.ref == root.node_ref
+    )
+    updated_root = canonical_confirmed_root_publication(
+        confirmation=root_confirmation,
         defect_state=root_defect,
-        confirmation=root_confirmation.to_dict(),
+        candidate_node=candidate_node,
+        seed_start_ref=owner.start_ref,
     )
     updated_owner = replace(
         owner,
@@ -1280,6 +1290,13 @@ class SeedAttributionModelTests(unittest.TestCase):
                         for key, value in mutation.items()
                     }
                 )
+                payload["root_causes"] = [
+                    root.to_legacy_root_cause()
+                    for root in (
+                        *mutation["confirmed_roots"],
+                        *report.co_roots,
+                    )
+                ]
                 with self.assertRaisesRegex(ValueError, "composite.*owner"):
                     RecursiveAttributionReport.from_dict(payload)
 
@@ -1995,7 +2012,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v16")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v17")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -2008,7 +2025,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v16")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v17")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

@@ -30,7 +30,7 @@ from trace_attribution.recursive_analyzer import (
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v16"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v17"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -849,25 +849,40 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
         )
     duplicates("step_judgments", judgment_identities)
 
+    def publication_identity(item: Mapping[str, Any]) -> str:
+        confirmation = (
+            item.get("confirmation")
+            if isinstance(item.get("confirmation"), Mapping)
+            else {}
+        )
+        return stable_json(
+            {
+                "occurrence": item.get("semantic_occurrence_id"),
+                "seed_binding_identity": confirmation.get(
+                    "seed_binding_identity"
+                ),
+            }
+        )
+
     role_occurrences: Dict[str, List[str]] = {
         "roots": [
-            str(item.get("semantic_occurrence_id") or "")
+            publication_identity(item)
             for item in [
                 *_items(report.get("confirmed_roots")),
                 *_items(report.get("co_roots")),
             ]
         ],
         "conditions": [
-            str(item.get("semantic_occurrence_id") or "")
+            publication_identity(item)
             for item in _items(report.get("contributing_conditions"))
         ],
         "amplifiers": [
-            str(item.get("semantic_occurrence_id") or "")
+            publication_identity(item)
             for item in _items(report.get("amplifying_factors"))
         ],
     }
-    for role, occurrences in role_occurrences.items():
-        duplicates(role, occurrences)
+    for role, identities in role_occurrences.items():
+        duplicates(role, identities)
     role_sets = {
         role: set(occurrences) for role, occurrences in role_occurrences.items()
     }

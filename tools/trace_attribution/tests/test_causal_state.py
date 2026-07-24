@@ -17,6 +17,9 @@ from trace_attribution.causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
+    canonical_causal_factor_publication,
+    canonical_confirmed_root_publication,
+    canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     seed_binding_identity_for,
     semantic_visit_key,
@@ -72,6 +75,30 @@ def report_seed(
     )
 
 
+def root_candidate(root):
+    return CausalCandidate(
+        ref=root.node_ref,
+        node=TraceNode(
+            ref=root.node_ref,
+            record_id=root.node_ref.removeprefix("record:"),
+            component=root.component,
+            event_type=root.event_type,
+        ),
+        source="canonical-test-fixture",
+        evidence_refs=root.evidence_refs,
+    )
+
+
+def canonical_test_root(root, confirmation):
+    seed_ref = confirmation.recursive_path[-1]
+    return canonical_confirmed_root_publication(
+        confirmation=confirmation,
+        defect_state=root.defect_state,
+        candidate_node=root_candidate(root).node,
+        seed_start_ref=seed_ref,
+    )
+
+
 def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:test-root"):
     seed_ref = (
         root.observed_defect_refs[0]
@@ -100,42 +127,24 @@ def modern_root(root, *, hypothesis_id="hyp:test-root", semantic_hash="semantic:
             seed_ref, root.defect_state.fingerprint
         ),
     )
-    return replace(
-        root,
-        reason=confirmation.reason,
-        counterfactual=confirmation.counterfactual,
-        confidence=confirmation.confidence,
-        evidence_refs=confirmation.evidence_refs,
-        excerpt=confirmation.excerpt,
-        hypothesis_id=hypothesis_id,
-        recursive_path=path,
-        observed_defect_refs=(seed_ref,),
-        confirmation=confirmation.to_dict(),
-    )
+    return canonical_test_root(root, confirmation)
 
 
 def confirmation_for(root):
     if not root.confirmation:
         bound = modern_root(root)
-        for name in (
-            "reason",
-            "counterfactual",
-            "confidence",
-            "evidence_refs",
-            "excerpt",
-            "hypothesis_id",
-            "recursive_path",
-            "observed_defect_refs",
-            "confirmation",
-        ):
+        for name in root.__dataclass_fields__:
             object.__setattr__(root, name, getattr(bound, name))
     return RootConfirmation.from_dict(dict(root.confirmation))
 
 
 def root_seed_fields(*roots):
     grouped = {}
+    candidates = {}
     for root in roots:
         confirmation = confirmation_for(root)
+        candidate = root_candidate(root)
+        candidates.setdefault(candidate.ref, candidate)
         seed_ref = root.recursive_path[-1]
         key = (seed_ref, root.defect_state.fingerprint)
         entry = grouped.setdefault(
@@ -152,6 +161,9 @@ def root_seed_fields(*roots):
         )
     return {
         "start_refs": tuple(sorted({key[0] for key in grouped})),
+        "causal_candidates": tuple(
+            candidates[ref] for ref in sorted(candidates)
+        ),
         "seed_results": tuple(
             report_seed(
                 "confirmed_root",
@@ -213,17 +225,9 @@ def factor_bundle(*, role="contributing_condition"):
             "effect": "The candidate changes the downstream defect conditions.",
         },
     )
-    factor = CausalFactor(
-        node_ref=node_ref,
-        relation=role,
-        reason=confirmation.reason,
-        confidence=0.7,
-        evidence_refs=confirmation.evidence_refs,
-        recursive_path=path,
-        factor_label=role,
-        confirmation_status="rejected",
-        confirmation=confirmation.to_dict(),
-        mechanism=dict(confirmation.factor_mechanism),
+    factor = canonical_causal_factor_publication(
+        confirmation=confirmation,
+        analysis_perspective="",
     )
     rejected = RejectedCandidate(
         node_ref=node_ref,
@@ -288,8 +292,8 @@ def reciprocal_root_pair(*, identical_legacy_projection):
         second_confirmation,
         competitor_comparisons=(comparison(first_confirmation),),
     )
-    first = replace(first, confirmation=first_confirmation.to_dict())
-    second = replace(second, confirmation=second_confirmation.to_dict())
+    first = canonical_test_root(first, first_confirmation)
+    second = canonical_test_root(second, second_confirmation)
     return first, second, first_confirmation, second_confirmation
 
 
@@ -405,13 +409,7 @@ class CausalStateTest(unittest.TestCase):
 
         confirmation, _, rejected = factor_bundle()
         unrelated = replace(confirmation, factor_role="unrelated")
-        rejected = replace(
-            rejected,
-            confirmation=unrelated.to_dict(),
-            reason=unrelated.reason,
-            evidence_refs=unrelated.evidence_refs,
-            confidence=unrelated.confidence,
-        )
+        rejected = canonical_rejected_candidate_publication(unrelated)
         for label, mutated in {
             "reason": replace(rejected, reason="A different rejection reason."),
             "confidence": replace(rejected, confidence=0.1),
@@ -618,7 +616,7 @@ class CausalStateTest(unittest.TestCase):
                 path[-1], defect.fingerprint
             ),
         )
-        root = ConfirmedRoot(
+        root = canonical_test_root(ConfirmedRoot(
             node_ref="record:decision",
             defect_state=defect,
             reason=confirmed.reason,
@@ -630,7 +628,7 @@ class CausalStateTest(unittest.TestCase):
             recursive_path=path,
             observed_defect_refs=(path[-1],),
             confirmation=confirmed.to_dict(),
-        )
+        ), confirmed)
 
         report = RecursiveAttributionReport(
             case_id="multi-identity",
@@ -650,6 +648,7 @@ class CausalStateTest(unittest.TestCase):
             ],
             confirmations=[confirmed, rejected],
             confirmed_roots=[root],
+            causal_candidates=[root_candidate(root)],
         )
 
         self.assertEqual(report.analysis_outcome, "confirmed_root")
@@ -944,23 +943,11 @@ class CausalStateTest(unittest.TestCase):
                 root_path[-1], defect_state.fingerprint
             ),
         )
-        root = ConfirmedRoot(
-            node_ref=node.ref,
+        root = canonical_confirmed_root_publication(
+            confirmation=confirmation,
             defect_state=defect_state,
-            reason=confirmation.reason,
-            counterfactual=confirmation.counterfactual,
-            confidence=confirmation.confidence,
-            evidence_refs=confirmation.evidence_refs,
-            excerpt=confirmation.excerpt,
-            component=node.component,
-            event_type=node.event_type,
-            defect_type=defect_state.label,
-            episode_id="episode:decision",
-            episode_member_refs=[node.ref],
-            observed_defect_refs=["record:observed"],
-            hypothesis_id=hypothesis.hypothesis_id,
-            recursive_path=root_path,
-            confirmation=confirmation.to_dict(),
+            candidate_node=node,
+            seed_start_ref="record:observed",
         )
         factor_confirmation = replace(
             RootConfirmation.rejected(
@@ -983,16 +970,9 @@ class CausalStateTest(unittest.TestCase):
                 "effect": "The missing hint enabled the incomplete search.",
             },
         )
-        factor = CausalFactor(
-            node_ref="record:prompt",
-            relation="contributing_condition",
-            reason=factor_confirmation.reason,
-            confidence=factor_confirmation.confidence,
-            evidence_refs=["record:prompt", node.ref],
-            recursive_path=factor_confirmation.recursive_path,
-            confirmation_status="rejected",
-            confirmation=factor_confirmation.to_dict(),
-            mechanism=dict(factor_confirmation.factor_mechanism),
+        factor = canonical_causal_factor_publication(
+            confirmation=factor_confirmation,
+            analysis_perspective="Improve Agent repository reasoning.",
         )
         rejected_confirmation = replace(
             RootConfirmation.rejected(
@@ -1008,15 +988,8 @@ class CausalStateTest(unittest.TestCase):
                 node.ref, defect_state.fingerprint
             ),
         )
-        rejected = RejectedCandidate(
-            node_ref="record:prompt",
-            reason="Repository search could still satisfy the task.",
-            evidence_refs=["record:decision"],
-            hypothesis_id=rejected_confirmation.hypothesis_id,
-            recursive_path=rejected_confirmation.recursive_path,
-            confirmation_status="rejected",
-            confidence=rejected_confirmation.confidence,
-            confirmation=rejected_confirmation.to_dict(),
+        rejected = canonical_rejected_candidate_publication(
+            rejected_confirmation
         )
         report = RecursiveAttributionReport(
             case_id="case-1",
@@ -1116,14 +1089,14 @@ class CausalStateTest(unittest.TestCase):
             PredecessorAssessment(ref="record:prompt", relation="caused_by")
 
     def test_report_outcome_preserves_partial_roots_and_keeps_pure_inconclusive_root_free(self):
-        root = ConfirmedRoot(
+        root = modern_root(ConfirmedRoot(
             node_ref="record:decision",
             defect_state=sample_defect_state(),
             reason="The decision stopped discovery.",
             counterfactual="Searching call sites would reveal the contract.",
             confidence=0.9,
             observed_defect_refs=["record:observed"],
-        )
+        ))
         partial = RecursiveAttributionReport(
             case_id="partial",
             objective="Find the root.",
@@ -1139,6 +1112,7 @@ class CausalStateTest(unittest.TestCase):
                 report_seed("evidence_gap", start_ref="record:prompt"),
             ],
             confirmed_roots=[root],
+            causal_candidates=[root_candidate(root)],
             confirmations=[confirmation_for(root)],
             unresolved_refs=["record:prompt"],
         )
@@ -1225,6 +1199,7 @@ class CausalStateTest(unittest.TestCase):
                 ),
             ],
             confirmed_roots=[root],
+            causal_candidates=[root_candidate(root)],
             confirmations=[
                 confirmation_for(root),
                 unknown,
@@ -1307,6 +1282,7 @@ class CausalStateTest(unittest.TestCase):
                 objective="Find the root.",
                 start_refs=["record:observed", "record:prompt"],
                 confirmed_roots=[root],
+                causal_candidates=[root_candidate(root)],
                 seed_results=[
                     report_seed(
                         "confirmed_root",
@@ -1375,13 +1351,13 @@ class CausalStateTest(unittest.TestCase):
         ):
             self.assertEqual(report.analysis_outcome, "inconclusive")
 
-        root = ConfirmedRoot(
+        root = modern_root(ConfirmedRoot(
             node_ref="record:decision",
             defect_state=sample_defect_state(),
             reason="The decision stopped discovery.",
             counterfactual="Searching call sites would reveal the contract.",
             confidence=0.9,
-        )
+        ))
         partial = RecursiveAttributionReport(
             case_id="root-plus-unknown-step",
             objective="Find root.",
@@ -1398,6 +1374,7 @@ class CausalStateTest(unittest.TestCase):
                 report_seed("evidence_gap", start_ref="record:change"),
             ],
             confirmed_roots=[root],
+            causal_candidates=[root_candidate(root)],
             confirmations=[confirmation_for(root)],
             step_judgments=[unknown_status],
         )
@@ -1440,13 +1417,13 @@ class CausalStateTest(unittest.TestCase):
         self.assertEqual(report.analysis_outcome, "no_defect")
 
     def test_report_outcome_is_derived_from_roots_and_blocking_facts(self):
-        root = ConfirmedRoot(
+        root = modern_root(ConfirmedRoot(
             node_ref="record:decision",
             defect_state=sample_defect_state(),
             reason="The decision stopped discovery.",
             counterfactual="Searching call sites would reveal the contract.",
             confidence=0.9,
-        )
+        ))
         self.assertEqual(
             RecursiveAttributionReport(
                 case_id="root-overrides-caller",
@@ -1464,6 +1441,7 @@ class CausalStateTest(unittest.TestCase):
                     )
                 ],
                 confirmed_roots=[root],
+                causal_candidates=[root_candidate(root)],
                 confirmations=[confirmation_for(root)],
             ).analysis_outcome,
             "confirmed_root",
@@ -1526,6 +1504,7 @@ class CausalStateTest(unittest.TestCase):
                     report_seed("evidence_gap", start_ref="record:provider"),
                 ],
                 confirmed_roots=[root],
+                causal_candidates=[root_candidate(root)],
                 confirmations=[confirmation_for(root)],
                 metadata={"provider_unavailable": True},
             ).analysis_outcome,
@@ -1595,16 +1574,9 @@ class CausalStateTest(unittest.TestCase):
                 "effect": "The omitted hint enabled the incomplete decision.",
             },
         )
-        factor = CausalFactor(
-            node_ref="record:prompt",
-            relation="contributing_condition",
-            reason=factor_confirmation.reason,
-            confidence=factor_confirmation.confidence,
-            evidence_refs=["record:prompt", node.ref],
-            recursive_path=factor_confirmation.recursive_path,
-            confirmation_status="rejected",
-            confirmation=factor_confirmation.to_dict(),
-            mechanism=dict(factor_confirmation.factor_mechanism),
+        factor = canonical_causal_factor_publication(
+            confirmation=factor_confirmation,
+            analysis_perspective="",
         )
         report = RecursiveAttributionReport(
             case_id="immutable",

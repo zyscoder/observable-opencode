@@ -404,16 +404,20 @@ class RequestAwareRestoreTest(unittest.TestCase):
                                 graph=graph,
                             )
                         continue
-                    parsed = RecursiveAttributionReport.from_dict(tampered)
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "counterfactual|excerpt|grounded|binding",
-                    ):
-                        validate_recursive_report_against_graph(
-                            graph,
-                            parsed,
-                            label="Fix37 tampered report",
-                        )
+                    try:
+                        parsed = RecursiveAttributionReport.from_dict(tampered)
+                    except ValueError:
+                        parsed = None
+                    if parsed is not None:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "counterfactual|excerpt|grounded|binding",
+                        ):
+                            validate_recursive_report_against_graph(
+                                graph,
+                                parsed,
+                                label="Fix37 tampered report",
+                            )
                     with self.assertRaises(EvaluationSafetyError):
                         compare_report(
                             annotate_report_semantic_anchors(
@@ -546,7 +550,7 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
     def test_changed_persistence_contracts_are_explicitly_versioned(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v16",
+            "recursive-attribution-report/v17",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",
@@ -561,7 +565,7 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "published-root-projection/v1",
+            "published-root-projection/v2",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
@@ -570,15 +574,15 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v15",
+            "recursive-attribution-checkpoint/v16",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v4",
+            "recursive-attribution-output/v5",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v13",
+            "recursive-analysis-actions/v14",
         )
 
 

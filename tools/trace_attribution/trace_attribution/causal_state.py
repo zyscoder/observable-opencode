@@ -51,9 +51,10 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v16"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v17"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
+CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v2"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
@@ -67,7 +68,8 @@ ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
     "+action-projection/v7+response-identity/v1+counterfactual/v1"
-    "+queue-response-identity/v1+published-root-projection/v1"
+    "+queue-response-identity/v1+published-root-projection/v2"
+    "+causal-publication/v2"
     "+step-action-projection/v1+confirmation-request-identity/v3"
     "+confirmation-request-projection/v2"
 )
@@ -1918,6 +1920,11 @@ def is_definitive_confirmation(confirmation: RootConfirmation) -> bool:
     )
 
 
+def _canonical_persisted_confirmation(value: Any) -> JsonDict:
+    raw = _json_dict(value)
+    return RootConfirmation.from_dict(raw).to_dict() if raw else {}
+
+
 @dataclass(frozen=True)
 class ConfirmedRoot:
     node_ref: str
@@ -2007,7 +2014,9 @@ class ConfirmedRoot:
             excerpt=str(value.get("excerpt") or ""),
             confirmation_status=str(value.get("confirmation_status") or "confirmed"),
             provenance=_json_dict(value.get("provenance")),
-            confirmation=_json_dict(value.get("confirmation")),
+            confirmation=_canonical_persisted_confirmation(
+                value.get("confirmation")
+            ),
         )
 
 
@@ -2061,7 +2070,9 @@ class CausalFactor:
             recursive_path=_string_list(value.get("recursive_path")),
             factor_label=str(value.get("factor_label") or ""),
             confirmation_status=str(value.get("confirmation_status") or ""),
-            confirmation=_json_dict(value.get("confirmation")),
+            confirmation=_canonical_persisted_confirmation(
+                value.get("confirmation")
+            ),
             provenance=_json_dict(value.get("provenance")),
             mechanism=_json_dict(value.get("mechanism")),
         )
@@ -2109,9 +2120,117 @@ class RejectedCandidate:
             recursive_path=_string_list(value.get("recursive_path")),
             confirmation_status=str(value.get("confirmation_status") or ""),
             confidence=_confidence(value.get("confidence", 0.0)),
-            confirmation=_json_dict(value.get("confirmation")),
+            confirmation=_canonical_persisted_confirmation(
+                value.get("confirmation")
+            ),
             provenance=_json_dict(value.get("provenance")),
         )
+
+
+def canonical_confirmation_publication_provenance(
+    confirmation: RootConfirmation,
+) -> JsonDict:
+    """Return the immutable provenance shared by every confirmation publication."""
+    return {
+        "publication_contract": CAUSAL_PUBLICATION_CONTRACT_VERSION,
+        "confirmation_identity": confirmation.confirmation_identity,
+        "response_identity": confirmation.response_identity,
+        "defect_fingerprint": confirmation.defect_fingerprint,
+        "seed_binding_identity": confirmation.seed_binding_identity,
+    }
+
+
+def canonical_factor_label(
+    factor_role: str,
+    analysis_perspective: str,
+) -> str:
+    return "{0} for {1}".format(
+        factor_role.replace("_", " "),
+        analysis_perspective,
+    )
+
+
+def canonical_confirmed_root_publication(
+    *,
+    confirmation: RootConfirmation,
+    defect_state: DefectState,
+    candidate_node: TraceNode,
+    seed_start_ref: str,
+) -> ConfirmedRoot:
+    """Project one confirmed response into its sole authoritative root form."""
+    if confirmation.status != "confirmed":
+        raise ValueError("canonical root publication requires confirmed status")
+    if not seed_start_ref:
+        raise ValueError("canonical root publication requires an owning seed")
+    return ConfirmedRoot(
+        node_ref=confirmation.candidate_ref,
+        defect_state=defect_state,
+        reason=confirmation.reason,
+        counterfactual=confirmation.counterfactual,
+        confidence=confirmation.confidence,
+        evidence_refs=confirmation.evidence_refs,
+        component=candidate_node.component,
+        event_type=candidate_node.event_type,
+        defect_type=defect_state.label,
+        causal_role="defect_introduction",
+        episode_id="",
+        episode_member_refs=(),
+        observed_defect_refs=(seed_start_ref,),
+        hypothesis_id=confirmation.hypothesis_id,
+        recursive_path=confirmation.recursive_path,
+        excerpt=confirmation.excerpt,
+        confirmation_status="confirmed",
+        provenance=canonical_confirmation_publication_provenance(confirmation),
+        confirmation=confirmation.to_dict(),
+    )
+
+
+def canonical_causal_factor_publication(
+    *,
+    confirmation: RootConfirmation,
+    analysis_perspective: str,
+) -> CausalFactor:
+    if confirmation.factor_role not in {
+        "contributing_condition",
+        "amplifying_factor",
+    }:
+        raise ValueError("canonical factor publication requires a factor role")
+    return CausalFactor(
+        node_ref=confirmation.candidate_ref,
+        relation=confirmation.factor_role,
+        reason=confirmation.reason,
+        confidence=confirmation.confidence,
+        evidence_refs=confirmation.evidence_refs,
+        recursive_path=confirmation.recursive_path,
+        factor_label=canonical_factor_label(
+            confirmation.factor_role,
+            analysis_perspective,
+        ),
+        confirmation_status="rejected",
+        confirmation=confirmation.to_dict(),
+        provenance=canonical_confirmation_publication_provenance(confirmation),
+        mechanism=dict(confirmation.factor_mechanism),
+    )
+
+
+def canonical_rejected_candidate_publication(
+    confirmation: RootConfirmation,
+) -> RejectedCandidate:
+    if confirmation.factor_role not in {"unrelated", "unknown"}:
+        raise ValueError(
+            "canonical rejected publication requires an unrelated or unknown role"
+        )
+    return RejectedCandidate(
+        node_ref=confirmation.candidate_ref,
+        reason=confirmation.reason,
+        evidence_refs=confirmation.evidence_refs,
+        hypothesis_id=confirmation.hypothesis_id,
+        recursive_path=confirmation.recursive_path,
+        confirmation_status="rejected",
+        confidence=confirmation.confidence,
+        confirmation=confirmation.to_dict(),
+        provenance=canonical_confirmation_publication_provenance(confirmation),
+    )
 
 
 @dataclass(frozen=True)
@@ -2628,6 +2747,20 @@ class RecursiveAttributionReport:
                 )
             return confirmation
 
+        canonical_candidate_nodes: Dict[str, TraceNode] = {}
+        for candidate in (
+            *self.causal_candidates,
+            *self.introduction_candidates,
+        ):
+            prior_node = canonical_candidate_nodes.setdefault(
+                candidate.ref,
+                candidate.node,
+            )
+            if prior_node != candidate.node:
+                raise ValueError(
+                    "candidate publications disagree on canonical graph node"
+                )
+
         def root_identity(root: ConfirmedRoot, *, role: str) -> str:
             if not root.hypothesis_id or not root.recursive_path or not root.confirmation:
                 raise ValueError(
@@ -2666,6 +2799,8 @@ class RecursiveAttributionReport:
             raise ValueError("duplicate root role confirmation identity")
         if set(primary_identities).intersection(co_root_identities):
             raise ValueError("primary and co-root roles share a confirmation identity")
+        primary_identity_set = set(primary_identities)
+        co_root_identity_set = set(co_root_identities)
         root_identities = set(primary_identities).union(co_root_identities)
         root_by_identity = {
             root_identity(root, role=role): root
@@ -2704,7 +2839,6 @@ class RecursiveAttributionReport:
             return False
 
         root_owner_counts = {identity: 0 for identity in root_identities}
-        report_seed_refs = {seed.start_ref for seed in self.seed_results}
 
         def has_unambiguous_composite_owner(
             root: ConfirmedRoot,
@@ -2771,9 +2905,18 @@ class RecursiveAttributionReport:
                 for identity, confirmation in seed_confirmations.items()
                 if confirmation.status == "confirmed" and identity in root_by_identity
             }
+            primary_seed_identities = set(confirmed_seed_roots).intersection(
+                primary_identity_set
+            )
+            co_root_seed_identities = set(confirmed_seed_roots).intersection(
+                co_root_identity_set
+            )
             if (
                 not seed.confirmation_identities
                 or not seed.confirmed_root_refs
+                or len(primary_seed_identities) != 1
+                or primary_seed_identities.union(co_root_seed_identities)
+                != set(confirmed_seed_roots)
                 or set(confirmed_seed_roots) != {
                     identity
                     for identity, confirmation in seed_confirmations.items()
@@ -2784,12 +2927,7 @@ class RecursiveAttributionReport:
                 }
                 != set(seed.confirmed_root_refs)
                 or any(
-                    {
-                        ref
-                        for ref in root.observed_defect_refs
-                        if ref in report_seed_refs
-                    }
-                    != {seed.start_ref}
+                    root.observed_defect_refs != (seed.start_ref,)
                     or not has_unambiguous_composite_owner(
                         root,
                         seed,
@@ -2799,10 +2937,28 @@ class RecursiveAttributionReport:
                 )
             ):
                 raise ValueError(
-                    "confirmed_root seed is not bound to top-level confirmed roots or "
-                    "observed_defect_refs owning seed projection or composite owner"
+                    "confirmed_root seed must own exactly one primary and only "
+                    "same-seed co-roots with exact observed_defect_refs owning "
+                    "seed projection and an unambiguous composite owner"
                 )
             for identity in confirmed_seed_roots:
+                root = confirmed_seed_roots[identity]
+                candidate_node = canonical_candidate_nodes.get(root.node_ref)
+                if candidate_node is None:
+                    raise ValueError(
+                        "published root has no canonical candidate node"
+                    )
+                expected_root = canonical_confirmed_root_publication(
+                    confirmation=confirmation_by_identity[identity],
+                    defect_state=root.defect_state,
+                    candidate_node=candidate_node,
+                    seed_start_ref=seed.start_ref,
+                )
+                if root != expected_root:
+                    raise ValueError(
+                        "published root does not match canonical publication "
+                        "projection"
+                    )
                 root_owner_counts[identity] += 1
         if any(count != 1 for count in root_owner_counts.values()):
             raise ValueError(
@@ -2865,6 +3021,11 @@ class RecursiveAttributionReport:
                     or factor.confidence != confirmation.confidence
                     or factor.evidence_refs != confirmation.evidence_refs
                     or factor.mechanism != confirmation.factor_mechanism
+                    or factor
+                    != canonical_causal_factor_publication(
+                        confirmation=confirmation,
+                        analysis_perspective=self.analysis_perspective,
+                    )
                     or not confirmation.evidence_refs
                     or not confirmation.factor_mechanism
                 ):
@@ -2898,6 +3059,8 @@ class RecursiveAttributionReport:
                 or rejected.reason != confirmation.reason
                 or rejected.confidence != confirmation.confidence
                 or rejected.evidence_refs != confirmation.evidence_refs
+                or rejected
+                != canonical_rejected_candidate_publication(confirmation)
                 or not confirmation.recursive_path
                 or not confirmation.evidence_refs
             ):
@@ -3387,6 +3550,7 @@ class RecursiveAttributionReport:
 
 
 __all__ = [
+    "CAUSAL_PUBLICATION_CONTRACT_VERSION",
     "CAUSAL_RELATIONS",
     "AttributionHypothesis",
     "CausalCandidate",
@@ -3402,6 +3566,11 @@ __all__ = [
     "RejectedCandidate",
     "RootConfirmation",
     "SeedAttributionResult",
+    "canonical_causal_factor_publication",
+    "canonical_confirmation_publication_provenance",
+    "canonical_confirmed_root_publication",
+    "canonical_factor_label",
+    "canonical_rejected_candidate_publication",
     "is_definitive_confirmation",
     "validate_confirmation_ownership",
     "validate_root_confirmation_substantive_invariants",

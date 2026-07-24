@@ -514,7 +514,7 @@ class ConfirmationContractVersionTest(unittest.TestCase):
     def test_changed_persistence_contracts_are_explicitly_versioned(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v16",
+            "recursive-attribution-report/v17",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",
@@ -530,15 +530,15 @@ class ConfirmationContractVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v15",
+            "recursive-attribution-checkpoint/v16",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v4",
+            "recursive-attribution-output/v5",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v13",
+            "recursive-analysis-actions/v14",
         )
 
 

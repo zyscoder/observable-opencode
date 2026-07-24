@@ -33,6 +33,7 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
+    canonical_confirmation_publication_provenance,
     confirmation_counterfactual_for,
     confirmation_identity_for,
     confirmation_response_identity_for,
@@ -331,6 +332,9 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["counterfactual"] = confirmation["counterfactual"]
     root["confirmation"] = copy.deepcopy(confirmation)
+    root["provenance"] = canonical_confirmation_publication_provenance(
+        RootConfirmation.from_dict(confirmation)
+    )
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed["confirmed_root_refs"] = [ghost_ref]
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
@@ -351,6 +355,9 @@ def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) 
     root = report_payload["confirmed_roots"][0]
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
+    root["provenance"] = canonical_confirmation_publication_provenance(
+        RootConfirmation.from_dict(confirmation)
+    )
     report_payload["seed_results"][0]["confirmation_identities"] = [
         confirmation["confirmation_identity"]
     ]
@@ -376,6 +383,9 @@ def forge_checkpoint_factor_path(payload: dict, recursive_path: list[str]) -> No
     refresh_checkpoint_confirmation_response_identity(confirmation)
     factor["recursive_path"] = list(recursive_path)
     factor["confirmation"] = copy.deepcopy(confirmation)
+    factor["provenance"] = canonical_confirmation_publication_provenance(
+        RootConfirmation.from_dict(confirmation)
+    )
     for seed in payload["seed_ledger"] if "seed_ledger" in payload else payload["seed_results"]:
         seed["confirmation_identities"] = [
             confirmation["confirmation_identity"]
@@ -1274,11 +1284,12 @@ class CausalCheckpointTest(unittest.TestCase):
             "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
             "+action-projection/v7+response-identity/v1+counterfactual/v1"
-            "+queue-response-identity/v1+published-root-projection/v1"
+            "+queue-response-identity/v1+published-root-projection/v2"
+            "+causal-publication/v2"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v15")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v16")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1704,7 +1715,8 @@ class CausalCheckpointTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(
-                ValueError, "publication identity.*record:ghost"
+                ValueError,
+                "publication identity.*record:ghost|canonical candidate node",
             ):
                 AgenticRecursiveAnalyzer(
                     judge=ConfirmedSingleNodeJudge(),

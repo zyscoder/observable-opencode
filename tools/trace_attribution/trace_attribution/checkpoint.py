@@ -20,8 +20,8 @@ from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
 
-CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v15"
-OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v4"
+CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v16"
+OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v5"
 CHECKPOINT_CONFIG_KEYS = frozenset(
     {
         "schema_version",

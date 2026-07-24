@@ -25,6 +25,7 @@ from trace_attribution.causal_state import (
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
+    canonical_confirmation_publication_provenance,
     confirmation_counterfactual_for,
     confirmation_identity_for,
     confirmation_response_identity_for,
@@ -274,6 +275,9 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["counterfactual"] = confirmation["counterfactual"]
     root["confirmation"] = copy.deepcopy(confirmation)
+    root["provenance"] = canonical_confirmation_publication_provenance(
+        RootConfirmation.from_dict(confirmation)
+    )
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed = report_payload["seed_results"][0]
     seed["confirmed_root_refs"] = [ghost_ref]
@@ -295,6 +299,9 @@ def forge_published_root_path(report_payload: dict, recursive_path: list[str]) -
     root = report_payload["confirmed_roots"][0]
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
+    root["provenance"] = canonical_confirmation_publication_provenance(
+        RootConfirmation.from_dict(confirmation)
+    )
     report_payload["seed_results"][0]["confirmation_identities"] = [
         confirmation["confirmation_identity"]
     ]
@@ -4168,11 +4175,12 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         )
         forged = report.to_dict()
         forge_published_root_identity(forged, "record:ghost")
-        forged_report = RecursiveAttributionReport.from_dict(forged)
 
         with self.assertRaisesRegex(
-            ValueError, "publication identity.*record:ghost"
+            ValueError,
+            "publication identity.*record:ghost|canonical candidate node",
         ):
+            forged_report = RecursiveAttributionReport.from_dict(forged)
             _assert_report_grounded_evidence(
                 TraceGraph.from_trace(observed_trace()),
                 forged_report,

@@ -48,6 +48,9 @@ from .causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
+    canonical_causal_factor_publication,
+    canonical_confirmed_root_publication,
+    canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     confirmation_identity_for,
     is_definitive_confirmation,
@@ -109,7 +112,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v13"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v14"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -871,6 +874,23 @@ def _assert_report_grounded_evidence(
         )
         if owner is None:
             raise ValueError("{0} root path has no seed owner".format(label))
+        candidate_node = graph.nodes.get(graph.resolve(root.node_ref) or "")
+        if candidate_node is None:
+            raise ValueError(
+                "{0} root has no canonical graph candidate".format(label)
+            )
+        expected_root = canonical_confirmed_root_publication(
+            confirmation=confirmation,
+            defect_state=root.defect_state,
+            candidate_node=candidate_node,
+            seed_start_ref=owner.start_ref,
+        )
+        if root != expected_root:
+            raise ValueError(
+                "{0} root contradicts canonical graph publication".format(
+                    label
+                )
+            )
         _assert_active_confirmation_path(
             graph,
             root.recursive_path,
@@ -886,6 +906,7 @@ def _assert_report_grounded_evidence(
         contributing_conditions=report.contributing_conditions,
         amplifying_factors=report.amplifying_factors,
         rejected_candidates=report.rejected_candidates,
+        analysis_perspective=report.analysis_perspective,
         label=label,
     )
 
@@ -2823,6 +2844,7 @@ def _assert_published_non_root_factors(
     contributing_conditions: Sequence[CausalFactor],
     amplifying_factors: Sequence[CausalFactor],
     rejected_candidates: Sequence[RejectedCandidate],
+    analysis_perspective: str,
     label: str,
 ) -> None:
     confirmations = {
@@ -2882,6 +2904,19 @@ def _assert_published_non_root_factors(
         }:
             raise ValueError(
                 "{0} rejected candidate role contradicts confirmation".format(label)
+            )
+        expected_publication = (
+            canonical_rejected_candidate_publication(confirmation)
+            if published_role == "rejected_candidate"
+            else canonical_causal_factor_publication(
+                confirmation=confirmation,
+                analysis_perspective=analysis_perspective,
+            )
+        )
+        if item != expected_publication:
+            raise ValueError(
+                "{0} published non-root factor contradicts canonical "
+                "publication".format(label)
             )
         if not confirmation.evidence_refs:
             raise ValueError(
@@ -6310,6 +6345,7 @@ class RecursiveAnalysisState:
             contributing_conditions=state.contributing_conditions,
             amplifying_factors=state.amplifying_factors,
             rejected_candidates=state.rejected_candidates,
+            analysis_perspective=state.analysis_perspective,
             label="restored recursive state",
         )
         snapshot_transaction = int(
@@ -10212,30 +10248,16 @@ class AgenticRecursiveAnalyzer:
             state.introduction_hypothesis_ids.discard(hypothesis_id)
             state.unresolved_hypothesis_ids.discard(hypothesis_id)
             defect_state = state.defect_states[confirmation.defect_fingerprint]
+            if seed_builder is None:
+                raise ValueError(
+                    "confirmed root publication has no owning seed builder"
+                )
             state.confirmed_roots.append(
-                ConfirmedRoot(
-                    node_ref=confirmation.candidate_ref,
+                canonical_confirmed_root_publication(
+                    confirmation=confirmation,
                     defect_state=defect_state,
-                    reason=confirmation.reason,
-                    counterfactual=confirmation.counterfactual,
-                    confidence=confirmation.confidence,
-                    evidence_refs=confirmation.evidence_refs,
-                    component=node.component,
-                    event_type=node.event_type,
-                    defect_type=defect_state.label,
-                    observed_defect_refs=(
-                        (seed_builder.start_ref,)
-                        if seed_builder is not None
-                        else state.start_refs
-                    ),
-                    hypothesis_id=hypothesis_id,
-                    recursive_path=confirmation.recursive_path,
-                    excerpt=confirmation.excerpt,
-                    provenance={
-                        "confirmation_semantic_identity": queued.get("semantic_identity"),
-                        "defect_fingerprint": confirmation.defect_fingerprint,
-                    },
-                    confirmation=confirmation.to_dict(),
+                    candidate_node=node,
+                    seed_start_ref=seed_builder.start_ref,
                 )
             )
             state.refresh_pending_confirmation_request_identities()
@@ -10273,28 +10295,9 @@ class AgenticRecursiveAnalyzer:
                 "contributing_condition",
                 "amplifying_factor",
             }:
-                factor = CausalFactor(
-                    node_ref=confirmation.candidate_ref,
-                    relation=(
-                        "amplifying_factor"
-                        if confirmation.factor_role == "amplifying_factor"
-                        else "contributing_condition"
-                    ),
-                    reason=confirmation.reason,
-                    confidence=confirmation.confidence,
-                    evidence_refs=confirmation.evidence_refs,
-                    recursive_path=confirmation.recursive_path,
-                    factor_label="{0} for {1}".format(
-                        confirmation.factor_role.replace("_", " "),
-                        state.analysis_perspective,
-                    ),
-                    confirmation_status="rejected",
-                    confirmation=confirmation.to_dict(),
-                    provenance={
-                        "confirmation_semantic_identity": queued.get("semantic_identity"),
-                        "defect_fingerprint": confirmation.defect_fingerprint,
-                    },
-                    mechanism=dict(confirmation.factor_mechanism),
+                factor = canonical_causal_factor_publication(
+                    confirmation=confirmation,
+                    analysis_perspective=state.analysis_perspective,
                 )
                 if confirmation.factor_role == "amplifying_factor":
                     state.amplifying_factors.append(factor)
@@ -10302,22 +10305,7 @@ class AgenticRecursiveAnalyzer:
                     state.contributing_conditions.append(factor)
             else:
                 state.rejected_candidates.append(
-                    RejectedCandidate(
-                        confirmation.candidate_ref,
-                        confirmation.reason,
-                        confirmation.evidence_refs,
-                        hypothesis_id=hypothesis_id,
-                        recursive_path=confirmation.recursive_path,
-                        confirmation_status="rejected",
-                        confidence=confirmation.confidence,
-                        confirmation=confirmation.to_dict(),
-                        provenance={
-                            "confirmation_semantic_identity": queued.get(
-                                "semantic_identity"
-                            ),
-                            "defect_fingerprint": confirmation.defect_fingerprint,
-                        },
-                    )
+                    canonical_rejected_candidate_publication(confirmation)
                 )
             pending_alternatives = [
                 item
@@ -10366,9 +10354,27 @@ class AgenticRecursiveAnalyzer:
                 root.hypothesis_id,
             )
 
-        ordered = sorted(state.confirmed_roots, key=rank)
-        state.confirmed_roots = ordered[:1]
-        state.co_roots = ordered[1:]
+        roots_by_seed: Dict[str, Dict[str, ConfirmedRoot]] = {}
+        for root in (*state.confirmed_roots, *state.co_roots):
+            confirmation = RootConfirmation.from_dict(dict(root.confirmation))
+            roots_by_seed.setdefault(
+                confirmation.seed_binding_identity,
+                {},
+            )[confirmation.confirmation_identity] = root
+
+        primary_roots: List[ConfirmedRoot] = []
+        co_roots: List[ConfirmedRoot] = []
+        for seed_binding_identity in sorted(roots_by_seed):
+            ordered = sorted(
+                roots_by_seed[seed_binding_identity].values(),
+                key=rank,
+            )
+            if not ordered:
+                continue
+            primary_roots.append(ordered[0])
+            co_roots.extend(ordered[1:])
+        state.confirmed_roots = primary_roots
+        state.co_roots = co_roots
 
     def _handle_investigation(
         self,
