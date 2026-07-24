@@ -35,7 +35,6 @@ from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     FrontierItem,
     RecursiveAnalysisState,
-    _confirmation_request_identity,
     validate_recursive_report_against_graph,
 )
 from tools.trace_attribution.tests.test_root_confirmation_fix21 import (
@@ -1007,94 +1006,27 @@ class ConfirmationQueueKeyBijectionTest(unittest.TestCase):
             state.enqueue_confirmation(queued)
 
     def test_duplicate_semantic_identity_is_rejected(self):
-        trace = {
-            "case_id": "fix26-queue-semantic",
-            "records": [
-                {
-                    "record_id": ref,
-                    "component": "agent",
-                    "event_type": "decision",
-                    "data": {"summary": ref},
-                }
-                for ref in ("seed", "candidate_one", "candidate_two")
-            ],
-        }
-        graph = TraceGraph.from_trace(trace)
-        state = RecursiveAnalysisState.create(
-            graph=graph,
-            start_refs=("record:seed",),
-            objective=OBJECTIVE,
-            analysis_perspective="",
+        tempdir, _, _, checkpoint, report = checkpoint_for(
+            shared_root_trace(),
+            SharedRootFusionJudge(),
+            fusion_mode="retrieval-global",
+            name="duplicate-request-identity",
         )
-        seed = state.seed_results()[0]
-        first_semantic_identity = ""
-        for candidate_ref in (
-            "record:candidate_one",
-            "record:candidate_two",
+        self.addCleanup(tempdir.cleanup)
+        payload = report.to_dict()
+        queue = payload["metadata"]["confirmation_queue"]
+        queue[1]["semantic_identity"] = queue[0]["semantic_identity"]
+        restored = RecursiveAttributionReport.from_dict(payload)
+        with self.assertRaisesRegex(
+            ValueError,
+            "semantic|request|identity|canonical|duplicate",
         ):
-            hypothesis = state.ledger.create(
-                "Confirm {0}".format(candidate_ref),
-                candidate_ref,
-                seed.defect_state,
-                seed_binding_identity=seed.seed_binding_identity,
+            validate_recursive_report_against_graph(
+                TraceGraph.from_trace(shared_root_trace()),
+                restored,
+                label="duplicate full confirmation request identity",
+                action_records=checkpoint.actions,
             )
-            state._bind_hypothesis_to_seed(
-                hypothesis.hypothesis_id,
-                state.seed_ledger[seed.seed_binding_identity],
-            )
-            item = FrontierItem.create(
-                node_ref=candidate_ref,
-                defect_state=seed.defect_state,
-                downstream_path=(candidate_ref, seed.start_ref),
-                hypothesis_id=hypothesis.hypothesis_id,
-                hypothesis_semantic_hash=hypothesis.semantic_hash,
-                seed_binding_identity=seed.seed_binding_identity,
-                depth=1,
-                candidate_source="fix26-queue",
-                priority=1.0,
-                checked_evidence_refs=(candidate_ref,),
-                graph_position=graph.position(candidate_ref),
-            )
-            canonical_identity = _confirmation_request_identity(
-                hypothesis_id=hypothesis.hypothesis_id,
-                candidate_ref=candidate_ref,
-                defect_fingerprint=seed.defect_fingerprint,
-                seed_binding_identity=seed.seed_binding_identity,
-            )
-            entry = {
-                "hypothesis_id": hypothesis.hypothesis_id,
-                "hypothesis_semantic_hash": hypothesis.semantic_hash,
-                "candidate_ref": candidate_ref,
-                "defect_fingerprint": seed.defect_fingerprint,
-                "seed_binding_identity": seed.seed_binding_identity,
-                "seed_key": seed.seed_binding_identity,
-                "requested_by_ref": seed.start_ref,
-                "recursive_path": [candidate_ref, seed.start_ref],
-                "checked_evidence_refs": [candidate_ref],
-                "task_obligations": [],
-                "analysis_perspective": "",
-                "semantic_identity": (
-                    canonical_identity
-                    if candidate_ref == "record:candidate_one"
-                    else first_semantic_identity
-                ),
-                "status": "queued",
-                "owner": LocalStateOwner.create(
-                    seed_binding_identity=seed.seed_binding_identity,
-                    hypothesis_id=hypothesis.hypothesis_id,
-                    visit_key=item.visit_key,
-                    occurrence_key="confirmation_queue",
-                ).to_dict(),
-            }
-            if candidate_ref == "record:candidate_one":
-                first_semantic_identity = canonical_identity
-                self.assertTrue(state.enqueue_confirmation(entry))
-            else:
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "semantic|queue|duplicate",
-                ):
-                    state.enqueue_confirmation(entry)
 
     def test_checkpoint_and_report_reject_queue_key_mismatch(self):
         tempdir, _, _, checkpoint, report = checkpoint_for(
@@ -1152,16 +1084,16 @@ class Fix26VersionIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v10",
+            "recursive-attribution-report/v11",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v9",
+            "recursive-attribution-checkpoint/v10",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v7",
+            "recursive-analysis-actions/v8",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,

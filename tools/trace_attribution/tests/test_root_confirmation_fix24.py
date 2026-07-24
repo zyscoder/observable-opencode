@@ -21,7 +21,6 @@ from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
     _confirmation_action_projection,
-    _confirmation_request_identity,
 )
 from tools.trace_attribution.tests.test_root_confirmation_fix17 import (
     CountingJudge,
@@ -64,12 +63,7 @@ def unknown_seed_terminal_action(action):
         ],
         occurrence_key="global_candidate_pass",
     )
-    request_identity = _confirmation_request_identity(
-        hypothesis_id=confirmation.hypothesis_id,
-        candidate_ref=confirmation.candidate_ref,
-        defect_fingerprint=confirmation.defect_fingerprint,
-        seed_binding_identity=unknown_seed,
-    )
+    request_identity = "confirmation_request:v2:{0}".format("0" * 64)
     semantic_key = "confirmation:{0}".format(request_identity)
     projection = _confirmation_action_projection(
         operation=output["operation"],

@@ -793,7 +793,7 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
         self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v9")
         self.assertEqual(
             ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
-            "recursive-root-confirmation-v8",
+            "recursive-root-confirmation-v9",
         )
 
         common = {

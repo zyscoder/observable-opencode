@@ -48,7 +48,6 @@ from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
     _assert_report_grounded_evidence,
-    _confirmation_request_identity,
     _grounded_downstream_path,
 )
 
@@ -2849,7 +2848,7 @@ class RecursiveRootRankingTest(unittest.TestCase):
             hydrated["byte_range"], (0, len(artifact_text.encode("utf-8")))
         )
 
-    def test_chinese_perspective_changes_only_post_confirmation_ranking(self):
+    def test_chinese_perspective_participates_in_confirmation_identity_and_ranking(self):
         trace = observed_trace(branching=True)
         trace["records"][1]["data"]["rationale"] = "任务编排策略提前结束代码搜索。"
         trace["records"][2]["data"]["text"] = "需求描述质量存在歧义。"
@@ -2899,8 +2898,19 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
         self.assertEqual(requirement.confirmed_roots[0].node_ref, "record:context")
         self.assertEqual(orchestration.confirmed_roots[0].node_ref, "record:decision")
-        self.assertTrue(all(not item.analysis_perspective for item in requirement_judge.confirmation_requests))
-        self.assertEqual(
+        self.assertTrue(
+            all(
+                item.analysis_perspective == "重点评估需求描述质量"
+                for item in requirement_judge.confirmation_requests
+            )
+        )
+        self.assertTrue(
+            all(
+                item.analysis_perspective == "重点评估任务编排策略"
+                for item in orchestration_judge.confirmation_requests
+            )
+        )
+        self.assertNotEqual(
             [item.factual_dict() for item in requirement_judge.confirmation_requests],
             [item.factual_dict() for item in orchestration_judge.confirmation_requests],
         )
@@ -4464,24 +4474,58 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             objective="Keep confirmation candidates seed-local.",
             analysis_perspective="task quality",
         )
+        defect_state = DefectState.create(
+            "queue filter",
+            "Only active-revision candidates are queued.",
+            "A stale candidate was offered.",
+            "revision eligibility",
+            "confirmation queue",
+        )
+        state.defect_states[defect_state.fingerprint] = defect_state
+        hypothesis = state.ledger.create(
+            "The active record introduced the defect.",
+            "record:active",
+            defect_state,
+            seed_binding_identity="seed:two",
+        )
+        state.introduction_bindings.append(
+            {
+                "candidate_ref": "record:active",
+                "defect_fingerprint": defect_state.fingerprint,
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                "seed_binding_identity": "seed:two",
+            }
+        )
 
         accepted = [
             state.enqueue_confirmation(
                 {
                     "candidate_ref": ref,
-                    "hypothesis_id": "hypothesis:{0}".format(ref),
-                    "defect_fingerprint": "defect:{0}".format(ref),
-                    "seed_binding_identity": seed,
-                    "semantic_identity": _confirmation_request_identity(
-                        hypothesis_id="hypothesis:{0}".format(ref),
-                        candidate_ref=ref,
-                        defect_fingerprint="defect:{0}".format(ref),
-                        seed_binding_identity=seed,
+                    "hypothesis_id": (
+                        hypothesis.hypothesis_id
+                        if ref == "record:active"
+                        else "hypothesis:stale"
                     ),
+                    "hypothesis_semantic_hash": (
+                        hypothesis.semantic_hash
+                        if ref == "record:active"
+                        else "sha256:stale"
+                    ),
+                    "defect_fingerprint": defect_state.fingerprint,
+                    "seed_binding_identity": seed,
+                    "recursive_path": [ref],
+                    "checked_evidence_refs": [],
+                    "task_obligations": [],
+                    "analysis_perspective": "task quality",
                     "status": "queued",
                     "owner": LocalStateOwner.create(
                         seed_binding_identity=seed,
-                        hypothesis_id="hypothesis:{0}".format(ref),
+                        hypothesis_id=(
+                            hypothesis.hypothesis_id
+                            if ref == "record:active"
+                            else "hypothesis:stale"
+                        ),
                         visit_key="visit:{0}".format(ref),
                         occurrence_key="revision_filter:{0}".format(ref),
                     ).to_dict(),
@@ -4525,26 +4569,48 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             objective="Bound independent confirmation.",
             analysis_perspective="task quality",
         )
+        defect_state = DefectState.create(
+            "queue bound",
+            "At most three roots are independently confirmed per seed.",
+            "Four candidate roots were offered.",
+            "bounded confirmation",
+            "confirmation queue",
+        )
+        state.defect_states[defect_state.fingerprint] = defect_state
 
         accepted = []
         for index, ref in enumerate(refs):
+            hypothesis = state.ledger.create(
+                "Candidate {0} introduced the defect.".format(ref),
+                ref,
+                defect_state,
+                seed_binding_identity="seed-binding",
+            )
+            state.introduction_bindings.append(
+                {
+                    "candidate_ref": ref,
+                    "defect_fingerprint": defect_state.fingerprint,
+                    "hypothesis_id": hypothesis.hypothesis_id,
+                    "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                    "seed_binding_identity": "seed-binding",
+                }
+            )
             accepted.append(
                 state.enqueue_confirmation(
                     {
-                        "hypothesis_id": "hyp:{0}".format(index),
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "hypothesis_semantic_hash": hypothesis.semantic_hash,
                         "candidate_ref": ref,
-                        "defect_fingerprint": "defect-fingerprint",
+                        "defect_fingerprint": defect_state.fingerprint,
                         "seed_binding_identity": "seed-binding",
-                        "semantic_identity": _confirmation_request_identity(
-                            hypothesis_id="hyp:{0}".format(index),
-                            candidate_ref=ref,
-                            defect_fingerprint="defect-fingerprint",
-                            seed_binding_identity="seed-binding",
-                        ),
+                        "recursive_path": [ref],
+                        "checked_evidence_refs": [],
+                        "task_obligations": [],
+                        "analysis_perspective": "task quality",
                         "status": "queued",
                         "owner": LocalStateOwner.create(
                             seed_binding_identity="seed-binding",
-                            hypothesis_id="hyp:{0}".format(index),
+                            hypothesis_id=hypothesis.hypothesis_id,
                             visit_key="visit:{0}".format(index),
                             occurrence_key="queue_bound:{0}".format(index),
                         ).to_dict(),

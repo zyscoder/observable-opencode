@@ -17,9 +17,12 @@ from .causal_judge import (
     CausalJudge,
     CausalStepRequest,
     OfflineJudgeCapability,
+    ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
     RootConfirmationRequest,
     bind_root_confirmation,
     preflight_root_confirmation_request,
+    root_confirmation_request_identity,
+    root_confirmation_request_projection,
 )
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
@@ -102,10 +105,91 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v7"
-GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v2"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v8"
+GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v3"
+GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
+    {
+        "schema",
+        "terminal_status",
+        "pass_identity",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "blocker",
+        "reason",
+        "detail",
+        "missing_evidence",
+        "physical_request_delta",
+        "physical_request_exact",
+        "owner",
+    }
+)
+COMPLETED_GLOBAL_PASS_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "pass_identity",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "hypothesis_id",
+        "visit_key",
+        "owner",
+        "physical_request_delta",
+        "candidate_compression",
+        "candidate_evidence_capsules",
+        "judgment",
+        "behavior_impact",
+    }
+)
+FAILED_GLOBAL_PASS_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "pass_identity",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "hypothesis_id",
+        "visit_key",
+        "owner",
+        "blocker",
+        "reason",
+        "missing_evidence",
+        "physical_request_delta",
+        "physical_request_exact",
+        "candidate_compression",
+        "failure_projection",
+        "behavior_impact",
+    }
+)
+FAILED_GLOBAL_EPISODE_KEYS = frozenset(
+    {
+        "node_ref",
+        "defect_state_id",
+        "hypothesis_id",
+        "reason",
+        "details",
+        "depth",
+        "global_pass_identity",
+        "owner",
+        "failure_projection",
+    }
+)
+GLOBAL_TERMINAL_MARKER_KEYS = frozenset(
+    {"global_pass_identity", "pass_identity", "failure_projection"}
+)
 CONFIRMATION_ACTION_OPERATIONS = frozenset(
     {"confirmation_completed", "confirmation_failed"}
+)
+CONFIRMATION_STARTED_PAYLOAD_KEYS = frozenset(
+    {
+        "status",
+        "candidate_ref",
+        "hypothesis_id",
+        "request_identity",
+        "physical_requests_reserved",
+    }
 )
 CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
     {
@@ -133,27 +217,34 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
 PENDING_CONFIRMATION_REQUIRED_KEYS = frozenset(
     {
         "hypothesis_id",
+        "hypothesis_semantic_hash",
         "candidate_ref",
         "defect_fingerprint",
         "seed_binding_identity",
         "semantic_identity",
         "status",
         "owner",
+        "analysis_perspective",
+        "artifact_evidence_envelopes",
+        "factual_request_projection",
     }
 )
 PENDING_CONFIRMATION_ALLOWED_KEYS = frozenset(
     {
         *PENDING_CONFIRMATION_REQUIRED_KEYS,
-        "hypothesis_semantic_hash",
         "seed_key",
         "requested_by_ref",
         "recursive_path",
         "checked_evidence_refs",
         "task_obligations",
-        "analysis_perspective",
         "origin",
-        "artifact_evidence_envelopes",
     }
+)
+TERMINAL_CONFIRMATION_REQUIRED_KEYS = frozenset(
+    {*PENDING_CONFIRMATION_REQUIRED_KEYS, "confirmation"}
+)
+TERMINAL_CONFIRMATION_ALLOWED_KEYS = frozenset(
+    {*PENDING_CONFIRMATION_ALLOWED_KEYS, "confirmation"}
 )
 STEP_ACTION_PROJECTION_SCHEMA = "step-action-projection/v1"
 STEP_ACTION_PROJECTION_KEYS = frozenset(
@@ -760,6 +851,17 @@ def _quarantine_stale_seed_report_payload(
 ) -> JsonDict:
     """Conservatively remove every conclusion owned by a stale report seed."""
     payload = copy.deepcopy(dict(value))
+    source_metadata = (
+        payload.get("metadata")
+        if isinstance(payload.get("metadata"), Mapping)
+        else {}
+    )
+    _classify_global_pass_records(
+        payload.get("investigation_journal") or ()
+    )
+    _classify_global_failure_episodes(
+        source_metadata.get("unresolved_branches") or ()
+    )
     seeds = [
         item
         for item in payload.get("seed_results") or ()
@@ -793,11 +895,6 @@ def _quarantine_stale_seed_report_payload(
         if isinstance(item, Mapping)
         and str(item.get("seed_binding_identity") or "") in stale_seed_keys
     }
-    source_metadata = (
-        payload.get("metadata")
-        if isinstance(payload.get("metadata"), Mapping)
-        else {}
-    )
     stale_visit_keys = set()
     frontier_checkpoint = source_metadata.get("frontier_checkpoint")
     frontier_items = []
@@ -1061,22 +1158,9 @@ def _require_canonical_bijection(
 
 
 def _confirmation_request_identity(
-    *,
-    hypothesis_id: str,
-    candidate_ref: str,
-    defect_fingerprint: str,
-    seed_binding_identity: str,
+    request: RootConfirmationRequest,
 ) -> str:
-    return hashlib.sha256(
-        stable_json(
-            (
-                hypothesis_id,
-                candidate_ref,
-                defect_fingerprint,
-                seed_binding_identity,
-            )
-        ).encode("utf-8")
-    ).hexdigest()
+    return root_confirmation_request_identity(request)
 
 
 def _validate_pending_confirmation_identity(
@@ -1103,17 +1187,35 @@ def _validate_pending_confirmation_identity(
         raise ValueError(
             "pending confirmation requires complete request identity fields"
         )
-    expected = _confirmation_request_identity(
-        hypothesis_id=queue_key[0],
-        candidate_ref=queue_key[1],
-        defect_fingerprint=queue_key[2],
-        seed_binding_identity=queue_key[3],
-    )
-    if str(value.get("semantic_identity") or "") != expected:
+    if not str(value.get("semantic_identity") or "").startswith(
+        ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
+    ):
         raise ValueError(
-            "pending confirmation semantic identity is not canonical"
+            "pending confirmation semantic identity is not a canonical "
+            "versioned request hash"
         )
     return queue_key
+
+
+def _validate_terminal_confirmation_identity(
+    value: Mapping[str, Any],
+) -> None:
+    actual_keys = {str(key) for key in value}
+    missing = TERMINAL_CONFIRMATION_REQUIRED_KEYS - actual_keys
+    extra = actual_keys - TERMINAL_CONFIRMATION_ALLOWED_KEYS
+    if (
+        missing
+        or extra
+        or value.get("status") not in {"confirmed", "rejected", "unknown"}
+        or not isinstance(value.get("confirmation"), Mapping)
+    ):
+        raise ValueError(
+            "terminal confirmation identity schema mismatch "
+            "(missing={0}, extra={1})".format(
+                sorted(missing),
+                sorted(extra),
+            )
+        )
 
 
 def _confirmation_action_projection(
@@ -1132,15 +1234,11 @@ def _confirmation_action_projection(
     if operation not in CONFIRMATION_ACTION_OPERATIONS:
         raise ValueError("confirmation action operation is invalid")
     parsed_owner = LocalStateOwner.from_dict(owner)
-    expected_request_identity = _confirmation_request_identity(
-        hypothesis_id=confirmation.hypothesis_id,
-        candidate_ref=confirmation.candidate_ref,
-        defect_fingerprint=confirmation.defect_fingerprint,
-        seed_binding_identity=confirmation.seed_binding_identity,
-    )
     if (
         not request_identity
-        or request_identity != expected_request_identity
+        or not request_identity.startswith(
+            ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
+        )
         or semantic_key != "confirmation:{0}".format(request_identity)
         or parsed_owner.seed_binding_identity
         != confirmation.seed_binding_identity
@@ -1253,28 +1351,177 @@ def _confirmation_action_projection_from_record(
     return projection
 
 
+def _validated_confirmation_started_action(
+    record: Mapping[str, Any],
+    *,
+    request: RootConfirmationRequest,
+    request_identity: str,
+) -> JsonDict:
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("started confirmation action payload is invalid")
+    _require_exact_checkpoint_keys(
+        payload,
+        set(CONFIRMATION_STARTED_PAYLOAD_KEYS),
+        "started confirmation action payload",
+    )
+    reserved = payload.get("physical_requests_reserved")
+    if (
+        record.get("operation") != "confirmation_started"
+        or str(record.get("semantic_key") or "")
+        != "confirmation:{0}".format(request_identity)
+        or payload.get("status") != "in_flight"
+        or str(payload.get("candidate_ref") or "")
+        != request.candidate_ref
+        or str(payload.get("hypothesis_id") or "")
+        != request.hypothesis_id
+        or str(payload.get("request_identity") or "")
+        != request_identity
+        or type(reserved) is not int
+        or reserved < 0
+    ):
+        raise ValueError(
+            "started confirmation action contradicts its factual request"
+        )
+    return copy.deepcopy(dict(payload))
+
+
+def _classify_global_pass_records(
+    investigation_journal: Iterable[Any],
+) -> Tuple[List[Mapping[str, Any]], List[Mapping[str, Any]]]:
+    completed: List[Mapping[str, Any]] = []
+    failed: List[Mapping[str, Any]] = []
+    for index, item in enumerate(investigation_journal):
+        if not isinstance(item, Mapping):
+            continue
+        carries_marker = (
+            item.get("kind") == "global_candidate_pass"
+            or any(key in item for key in GLOBAL_TERMINAL_MARKER_KEYS)
+        )
+        if not carries_marker:
+            continue
+        status = str(item.get("status") or "")
+        expected_keys = (
+            COMPLETED_GLOBAL_PASS_KEYS
+            if status == "completed"
+            else FAILED_GLOBAL_PASS_KEYS
+            if status == "failed"
+            else frozenset()
+        )
+        if (
+            item.get("kind") != "global_candidate_pass"
+            or not expected_keys
+            or {str(key) for key in item} != set(expected_keys)
+        ):
+            raise ValueError(
+                "global pass record[{0}] has unknown status, marker, or "
+                "exact schema".format(index)
+            )
+        seed_binding_identity = str(
+            item.get("seed_binding_identity") or ""
+        )
+        owner = LocalStateOwner.from_dict(item.get("owner"))
+        physical_request_delta = item.get("physical_request_delta")
+        if (
+            not seed_binding_identity
+            or str(item.get("pass_identity") or "")
+            != _global_pass_identity(seed_binding_identity)
+            or not str(item.get("seed_ref") or "")
+            or not str(item.get("defect_fingerprint") or "")
+            or owner.seed_binding_identity != seed_binding_identity
+            or type(physical_request_delta) is not int
+            or physical_request_delta < 0
+            or (
+                status == "failed"
+                and type(item.get("physical_request_exact")) is not bool
+            )
+            or item.get("behavior_impact")
+            != "none_offline_analysis_only"
+            or not isinstance(item.get("candidate_compression"), Mapping)
+        ):
+            raise ValueError(
+                "global pass record[{0}] has malformed identity, owner, "
+                "accounting, or policy fields".format(index)
+            )
+        if status == "completed":
+            if (
+                not isinstance(
+                    item.get("candidate_evidence_capsules"),
+                    (list, tuple),
+                )
+                or not isinstance(item.get("judgment"), Mapping)
+            ):
+                raise ValueError(
+                    "completed global pass record[{0}] is malformed".format(
+                        index
+                    )
+                )
+            completed.append(item)
+            continue
+        projection = _global_failure_projection_from_action(item)
+        if (
+            list(item.get("missing_evidence") or ())
+            != projection["missing_evidence"]
+            or str(item.get("blocker") or "") != projection["blocker"]
+            or str(item.get("reason") or "") != projection["detail"]
+        ):
+            raise ValueError(
+                "failed global pass record[{0}] contradicts its projection".format(
+                    index
+                )
+            )
+        failed.append(item)
+    return completed, failed
+
+
+def _classify_global_failure_episodes(
+    unresolved_branches: Iterable[Any],
+) -> List[Mapping[str, Any]]:
+    episodes: List[Mapping[str, Any]] = []
+    for index, item in enumerate(unresolved_branches):
+        if not isinstance(item, Mapping):
+            continue
+        if not any(key in item for key in GLOBAL_TERMINAL_MARKER_KEYS):
+            continue
+        if {str(key) for key in item} != set(FAILED_GLOBAL_EPISODE_KEYS):
+            raise ValueError(
+                "global failure episode[{0}] has an unknown marker or exact "
+                "schema".format(index)
+            )
+        projection = _validated_global_failure_projection(
+            item.get("failure_projection")
+        )
+        if (
+            str(item.get("global_pass_identity") or "")
+            != projection["pass_identity"]
+            or str(item.get("node_ref") or "") != projection["seed_ref"]
+            or str(item.get("reason") or "") != projection["blocker"]
+            or str(item.get("details") or "") != projection["detail"]
+            or item.get("owner") != projection["owner"]
+            or type(item.get("depth")) is not int
+            or item.get("depth") < 0
+        ):
+            raise ValueError(
+                "global failure episode[{0}] contradicts its canonical "
+                "projection".format(index)
+            )
+        episodes.append(item)
+    return episodes
+
+
 def _completed_global_passes(
     investigation_journal: Iterable[Any],
 ) -> List[Mapping[str, Any]]:
-    return [
-        item
-        for item in investigation_journal
-        if isinstance(item, Mapping)
-        and item.get("kind") == "global_candidate_pass"
-        and item.get("status") == "completed"
-    ]
+    return _classify_global_pass_records(investigation_journal)[0]
 
 
 def _terminal_global_passes(
     investigation_journal: Iterable[Any],
 ) -> List[Mapping[str, Any]]:
-    return [
-        item
-        for item in investigation_journal
-        if isinstance(item, Mapping)
-        and item.get("kind") == "global_candidate_pass"
-        and item.get("status") in {"completed", "failed"}
-    ]
+    completed, failed = _classify_global_pass_records(
+        investigation_journal
+    )
+    return [*completed, *failed]
 
 
 def _global_passes_by_owner(
@@ -1318,14 +1565,8 @@ def _validate_global_pass_derivations(
     label: str,
 ) -> None:
     journal = tuple(investigation_journal)
-    global_passes = [
-        item
-        for item in journal
-        if isinstance(item, Mapping)
-        and item.get("kind") == "global_candidate_pass"
-    ]
-    completed_passes = _completed_global_passes(journal)
-    terminal_passes = _terminal_global_passes(journal)
+    completed_passes, failed_passes = _classify_global_pass_records(journal)
+    terminal_passes = [*completed_passes, *failed_passes]
     _global_passes_by_owner(terminal_passes)
     expected_judgments = [
         _owned_payload(action["judgment"], action["owner"])
@@ -1379,7 +1620,7 @@ def _validate_global_pass_derivations(
         or int(metadata.get("global_judge_physical_request_count") or 0)
         != expected_physical_requests
         or str(metadata.get("fusion_mode") or "")
-        != ("retrieval-global" if global_passes else "off")
+        != ("retrieval-global" if terminal_passes else "off")
     ):
         raise ValueError(
             "{0} global pass metadata contradicts authoritative actions".format(
@@ -2033,6 +2274,7 @@ def _global_failure_projection(
     blocker: str,
     detail: str,
     physical_request_delta: int,
+    physical_request_exact: bool,
 ) -> JsonDict:
     if (
         not isinstance(blocker, str)
@@ -2049,6 +2291,10 @@ def _global_failure_projection(
         raise ValueError(
             "global failure projection physical request delta is invalid"
         )
+    if type(physical_request_exact) is not bool:
+        raise ValueError(
+            "global failure projection physical request exactness is invalid"
+        )
     return {
         "schema": GLOBAL_FAILURE_PROJECTION_SCHEMA,
         "terminal_status": "failed",
@@ -2061,8 +2307,45 @@ def _global_failure_projection(
         "detail": detail.strip(),
         "missing_evidence": [detail.strip()],
         "physical_request_delta": physical_request_delta,
+        "physical_request_exact": physical_request_exact,
         "owner": _global_pass_owner(builder).to_dict(),
     }
+
+
+def _validated_global_failure_projection(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("global failure projection must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(GLOBAL_FAILURE_PROJECTION_KEYS),
+        "global failure projection",
+    )
+    projection = copy.deepcopy(dict(value))
+    seed_binding_identity = str(
+        projection.get("seed_binding_identity") or ""
+    )
+    if (
+        projection.get("schema") != GLOBAL_FAILURE_PROJECTION_SCHEMA
+        or projection.get("terminal_status") != "failed"
+        or str(projection.get("pass_identity") or "")
+        != _global_pass_identity(seed_binding_identity)
+        or not seed_binding_identity
+        or not str(projection.get("seed_ref") or "")
+        or not str(projection.get("defect_fingerprint") or "")
+        or not str(projection.get("blocker") or "")
+        or not str(projection.get("reason") or "")
+        or projection.get("reason") != projection.get("detail")
+        or list(projection.get("missing_evidence") or ())
+        != [projection.get("detail")]
+        or type(projection.get("physical_request_delta")) is not int
+        or projection["physical_request_delta"] < 0
+        or type(projection.get("physical_request_exact")) is not bool
+    ):
+        raise ValueError("global failure projection is not canonical")
+    owner = LocalStateOwner.from_dict(projection.get("owner"))
+    if owner.seed_binding_identity != seed_binding_identity:
+        raise ValueError("global failure projection owner is malformed")
+    return projection
 
 
 def _global_failure_projection_from_action(
@@ -2086,6 +2369,7 @@ def _global_failure_projection_from_action(
             list(action.get("missing_evidence") or ())
         ),
         "physical_request_delta": action.get("physical_request_delta"),
+        "physical_request_exact": action.get("physical_request_exact"),
         "owner": copy.deepcopy(action.get("owner")),
     }
     if (
@@ -2100,12 +2384,15 @@ def _global_failure_projection_from_action(
         or isinstance(projection["physical_request_delta"], bool)
         or not isinstance(projection["physical_request_delta"], int)
         or projection["physical_request_delta"] < 0
+        or type(projection["physical_request_exact"]) is not bool
     ):
         raise ValueError(
             "failed global action does not define a canonical failure projection"
         )
-    LocalStateOwner.from_dict(projection["owner"])
-    if stable_json(_checkpoint_json(action.get("failure_projection"))) != stable_json(
+    persisted = _validated_global_failure_projection(
+        action.get("failure_projection")
+    )
+    if stable_json(_checkpoint_json(persisted)) != stable_json(
         _checkpoint_json(projection)
     ):
         raise ValueError(
@@ -2519,27 +2806,15 @@ class RecursiveAnalysisState:
     def _confirmation_queue_key(
         value: Mapping[str, Any],
     ) -> Tuple[str, str, str, str]:
-        expected = _confirmation_request_identity(
-            hypothesis_id=str(value.get("hypothesis_id") or ""),
-            candidate_ref=str(value.get("candidate_ref") or ""),
-            defect_fingerprint=str(
-                value.get("defect_fingerprint") or ""
-            ),
-            seed_binding_identity=str(
-                value.get("seed_binding_identity") or ""
-            ),
-        )
-        actual = str(value.get("semantic_identity") or "")
-        if not actual or actual != expected:
-            raise ValueError(
-                "confirmation queue semantic identity is not canonical"
-            )
-        return (
+        locator = (
             str(value.get("hypothesis_id") or ""),
             str(value.get("candidate_ref") or ""),
             str(value.get("defect_fingerprint") or ""),
             str(value.get("seed_binding_identity") or ""),
         )
+        if not all(locator):
+            raise ValueError("confirmation queue locator is incomplete")
+        return locator
 
     def _confirmation_artifact_envelopes(
         self,
@@ -2606,6 +2881,33 @@ class RecursiveAnalysisState:
     def enqueue_confirmation(self, value: Mapping[str, Any]) -> bool:
         self.validate_confirmation_queue_bound()
         candidate_ref = str(value.get("candidate_ref") or "")
+        resolved = self.graph.resolve(candidate_ref)
+        node = self.graph.nodes.get(resolved or "")
+        if candidate_ref and (
+            resolved != candidate_ref
+            or node is None
+            or not authored_root_candidate_eligible(self.graph, candidate_ref)
+        ):
+            return False
+        actual_keys = {str(key) for key in value}
+        missing = (
+            PENDING_CONFIRMATION_REQUIRED_KEYS
+            - {
+                "semantic_identity",
+                "artifact_evidence_envelopes",
+                "factual_request_projection",
+            }
+            - actual_keys
+        )
+        extra = actual_keys - PENDING_CONFIRMATION_ALLOWED_KEYS
+        if missing or extra or value.get("status") != "queued":
+            raise ValueError(
+                "pending confirmation input schema mismatch "
+                "(missing={0}, extra={1})".format(
+                    sorted(missing),
+                    sorted(extra),
+                )
+            )
         hypothesis_id = str(value.get("hypothesis_id") or "")
         defect_fingerprint = str(value.get("defect_fingerprint") or "")
         seed_binding_identity = str(value.get("seed_binding_identity") or "")
@@ -2613,15 +2915,12 @@ class RecursiveAnalysisState:
             (candidate_ref, hypothesis_id, defect_fingerprint, seed_binding_identity)
         ):
             raise ValueError("confirmation queue entry requires exact semantic identity")
-        resolved = self.graph.resolve(candidate_ref)
-        node = self.graph.nodes.get(resolved or "")
         if (
             resolved != candidate_ref
             or node is None
             or not authored_root_candidate_eligible(self.graph, candidate_ref)
         ):
             return False
-        _validate_pending_confirmation_identity(value)
         try:
             owner = LocalStateOwner.from_dict(value.get("owner"))
         except (TypeError, ValueError):
@@ -2674,9 +2973,50 @@ class RecursiveAnalysisState:
         queued["artifact_evidence_envelopes"] = (
             self._confirmation_artifact_envelopes(queued)
         )
-        self.confirmation_queue_keys.add(queue_key)
+        provided_identity = str(queued.get("semantic_identity") or "")
+        original_queue = copy.deepcopy(self.confirmation_queue)
+        original_keys = set(self.confirmation_queue_keys)
         self.confirmation_queue.append(queued)
+        try:
+            for item in self.confirmation_queue:
+                if item.get("status") != "queued":
+                    continue
+                request = AgenticRecursiveAnalyzer._build_confirmation_request(
+                    self, item
+                )
+                projection = root_confirmation_request_projection(request)
+                expected_identity = _confirmation_request_identity(request)
+                if item is queued and provided_identity and (
+                    provided_identity != expected_identity
+                ):
+                    raise ValueError(
+                        "pending confirmation semantic identity contradicts "
+                        "the canonical factual request"
+                    )
+                item["factual_request_projection"] = projection
+                item["semantic_identity"] = expected_identity
+            self.confirmation_queue_keys = {
+                self._confirmation_queue_key(item)
+                for item in self.confirmation_queue
+            }
+            self.validate_confirmation_queue_bound()
+        except Exception:
+            self.confirmation_queue = original_queue
+            self.confirmation_queue_keys = original_keys
+            raise
         return True
+
+    def refresh_pending_confirmation_request_identities(self) -> None:
+        for item in self.confirmation_queue:
+            if item.get("status") != "queued":
+                continue
+            request = AgenticRecursiveAnalyzer._build_confirmation_request(
+                self, item
+            )
+            item["factual_request_projection"] = (
+                root_confirmation_request_projection(request)
+            )
+            item["semantic_identity"] = _confirmation_request_identity(request)
 
     def validate_confirmation_queue_bound(self) -> None:
         candidates_by_seed: Dict[str, Set[str]] = {}
@@ -2706,8 +3046,11 @@ class RecursiveAnalysisState:
                 raise ValueError(
                     "restored confirmation queue contains a root candidate ineligible for the active revision"
                 )
-            if item.get("status") == "queued":
+            is_pending = item.get("status") == "queued"
+            if is_pending:
                 _validate_pending_confirmation_identity(item)
+            else:
+                _validate_terminal_confirmation_identity(item)
             recursive_path = tuple(
                 str(ref) for ref in item.get("recursive_path") or ()
             )
@@ -2743,14 +3086,26 @@ class RecursiveAnalysisState:
                     "confirmation queue artifact owner envelope contradicts "
                     "the active graph"
                 )
+            stored_projection = item.get("factual_request_projection")
+            if not isinstance(stored_projection, Mapping):
+                raise ValueError(
+                    "confirmation queue factual request projection is missing"
+                )
+            current_request = AgenticRecursiveAnalyzer._build_confirmation_request(
+                self, item
+            )
+            expected_projection = root_confirmation_request_projection(
+                current_request
+            )
+            if stable_json(_checkpoint_json(stored_projection)) != stable_json(
+                _checkpoint_json(expected_projection)
+            ):
+                raise ValueError(
+                    "confirmation queue factual request projection changed"
+                )
             semantic_identity = str(item.get("semantic_identity") or "")
             expected_semantic_identity = _confirmation_request_identity(
-                hypothesis_id=str(item.get("hypothesis_id") or ""),
-                candidate_ref=candidate_ref,
-                defect_fingerprint=str(
-                    item.get("defect_fingerprint") or ""
-                ),
-                seed_binding_identity=seed_binding_identity,
+                current_request
             )
             if (
                 not semantic_identity
@@ -3048,6 +3403,9 @@ class RecursiveAnalysisState:
         self,
         action_records: Optional[Iterable[Any]] = None,
     ) -> None:
+        global_failure_episodes = _classify_global_failure_episodes(
+            self.unresolved_branches
+        )
         passes_by_owner = _global_passes_by_owner(
             self.investigation_journal
         )
@@ -3187,10 +3545,8 @@ class RecursiveAnalysisState:
                 projection = _global_failure_projection_from_action(failure)
                 episodes = [
                     branch
-                    for branch in self.unresolved_branches
-                    if isinstance(branch, Mapping)
-                    and branch.get("failure_projection")
-                    == projection
+                    for branch in global_failure_episodes
+                    if branch.get("failure_projection") == projection
                 ]
                 if (
                     len(episodes) != 1
@@ -3228,9 +3584,7 @@ class RecursiveAnalysisState:
         ]
         episode_projections = [
             copy.deepcopy(branch.get("failure_projection"))
-            for branch in self.unresolved_branches
-            if isinstance(branch, Mapping)
-            and branch.get("failure_projection") is not None
+            for branch in global_failure_episodes
         ]
         _require_canonical_bijection(
             failure_projections,
@@ -4400,6 +4754,10 @@ class RecursiveAnalysisState:
         state.processed_items -= requeued_inflight
         investigation_journal = _migrate_checkpoint_visit_references(
             action_payload["investigation_journal"], frontier
+        )
+        _classify_global_pass_records(investigation_journal)
+        _classify_global_failure_episodes(
+            action_payload["unresolved_branches"]
         )
         stale_visit_keys = {
             item.visit_key
@@ -5876,8 +6234,12 @@ class AgenticRecursiveAnalyzer:
             blocker: str,
             detail: str,
             physical_request_delta: int = 0,
+            physical_request_exact: bool = True,
             candidate_compression: Optional[Mapping[str, Any]] = None,
         ) -> None:
+            state.judge_requests += physical_request_delta
+            if not physical_request_exact:
+                state.judge_request_uncertainty_count += 1
             pass_identity = _global_pass_identity(builder.key)
             owner = _global_pass_owner(builder)
             failure_projection = _global_failure_projection(
@@ -5885,6 +6247,7 @@ class AgenticRecursiveAnalyzer:
                 blocker=blocker,
                 detail=detail,
                 physical_request_delta=physical_request_delta,
+                physical_request_exact=physical_request_exact,
             )
             event = {
                 "kind": "global_candidate_pass",
@@ -5902,6 +6265,7 @@ class AgenticRecursiveAnalyzer:
                 "reason": detail,
                 "missing_evidence": [detail],
                 "physical_request_delta": physical_request_delta,
+                "physical_request_exact": physical_request_exact,
                 "candidate_compression": copy.deepcopy(
                     dict(candidate_compression or {})
                 ),
@@ -5939,6 +6303,9 @@ class AgenticRecursiveAnalyzer:
                 state.unresolved_hypothesis_ids.add(
                     failed_item.hypothesis_id
                 )
+            self._checkpoint_state(
+                state, "global:failed:{0}".format(pass_identity)
+            )
 
         for seed_key, seed_items in items_by_seed.items():
             builder = state.seed_ledger[seed_key]
@@ -6052,7 +6419,6 @@ class AgenticRecursiveAnalyzer:
                     request, max_physical_requests=remaining
                 )
             except BoundedJudgeCallError as exc:
-                state.judge_requests += exc.physical_requests
                 fail_seed(
                     builder=builder,
                     items=seed_items,
@@ -6069,6 +6435,7 @@ class AgenticRecursiveAnalyzer:
                     items=seed_items,
                     blocker="global_judge_bounded_failure",
                     detail="{0}: {1}".format(type(exc).__name__, exc),
+                    physical_request_exact=False,
                     candidate_compression=metrics,
                 )
                 terminal_pass_identities.add(pass_identity)
@@ -6097,7 +6464,6 @@ class AgenticRecursiveAnalyzer:
                     if isinstance(result, BoundedJudgeCallResult)
                     else 0
                 )
-                state.judge_requests += physical_delta
                 fail_seed(
                     builder=builder,
                     items=seed_items,
@@ -6452,6 +6818,7 @@ class AgenticRecursiveAnalyzer:
                 enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis.hypothesis_id,
+                        "hypothesis_semantic_hash": hypothesis.semantic_hash,
                         "candidate_ref": selected_ref,
                         "defect_fingerprint": item.defect_state.fingerprint,
                         "seed_binding_identity": hypothesis.seed_binding_identity,
@@ -6462,16 +6829,6 @@ class AgenticRecursiveAnalyzer:
                             state.graph, state.objective
                         ),
                         "analysis_perspective": state.analysis_perspective,
-                        "semantic_identity": _confirmation_request_identity(
-                            hypothesis_id=hypothesis.hypothesis_id,
-                            candidate_ref=selected_ref,
-                            defect_fingerprint=(
-                                item.defect_state.fingerprint
-                            ),
-                            seed_binding_identity=(
-                                hypothesis.seed_binding_identity
-                            ),
-                        ),
                         "status": "queued",
                         "origin": "global_candidate_judgment",
                         "seed_key": seed_builder.key if seed_builder else "",
@@ -7310,7 +7667,27 @@ class AgenticRecursiveAnalyzer:
             state._confirmation_queue_key(queued)
             try:
                 request = self._build_confirmation_request(state, queued)
+                self._validate_confirmation_request_graph_eligibility(
+                    state, request
+                )
                 preflight_root_confirmation_request(request)
+                factual_projection = root_confirmation_request_projection(
+                    request
+                )
+                request_identity = _confirmation_request_identity(request)
+                if (
+                    str(queued.get("semantic_identity") or "")
+                    != request_identity
+                    or stable_json(
+                        _checkpoint_json(
+                            queued.get("factual_request_projection")
+                        )
+                    )
+                    != stable_json(_checkpoint_json(factual_projection))
+                ):
+                    raise ValueError(
+                        "queued confirmation factual request identity changed"
+                    )
             except (KeyError, TypeError, ValueError) as exc:
                 confirmation = RootConfirmation(
                     candidate_ref=str(queued.get("candidate_ref") or ""),
@@ -7367,7 +7744,7 @@ class AgenticRecursiveAnalyzer:
 
             remaining = max(0, self.max_judge_requests - state.judge_requests)
             confirmation_action_key = "confirmation:{0}".format(
-                str(queued["semantic_identity"])
+                request_identity
             )
             replay_action = self._replay_action(state, confirmation_action_key)
             replayed_confirmation: Optional[RootConfirmation] = None
@@ -7381,6 +7758,11 @@ class AgenticRecursiveAnalyzer:
                 projection = _confirmation_action_projection_from_record(
                     replay_action
                 )
+                if projection["request_identity"] != request_identity:
+                    raise ValueError(
+                        "failed confirmation replay factual request identity "
+                        "does not match the rebuilt request"
+                    )
                 confirmation = RootConfirmation.from_dict(
                     dict(projection["confirmation"])
                 )
@@ -7392,18 +7774,14 @@ class AgenticRecursiveAnalyzer:
                 replay_action is not None
                 and replay_action.get("operation") == "confirmation_started"
             ):
-                replay_payload = replay_action.get("payload")
-                if not isinstance(replay_payload, Mapping):
-                    raise ValueError(
-                        "started confirmation action payload is invalid"
-                    )
+                replay_payload = _validated_confirmation_started_action(
+                    replay_action,
+                    request=request,
+                    request_identity=request_identity,
+                )
                 reserved_requests = replay_payload.get(
                     "physical_requests_reserved"
                 )
-                if type(reserved_requests) is not int or reserved_requests < 0:
-                    raise ValueError(
-                        "started confirmation reservation is invalid"
-                    )
                 state.judge_request_uncertainty_count += 1
                 if state.judge_requests >= self.max_judge_requests:
                     state._increment_budget("judge_requests")
@@ -7430,9 +7808,15 @@ class AgenticRecursiveAnalyzer:
                 self._checkpoint_state(state, confirmation_action_key)
                 continue
             if replay_action is not None and replay_action.get("operation") == "confirmation_completed":
-                replay_payload = replay_action.get("payload")
-                if not isinstance(replay_payload, Mapping):
-                    raise ValueError("completed confirmation action payload is invalid")
+                projection = _confirmation_action_projection_from_record(
+                    replay_action
+                )
+                if projection["request_identity"] != request_identity:
+                    raise ValueError(
+                        "completed confirmation replay factual request identity "
+                        "does not match the rebuilt request"
+                    )
+                replay_payload = replay_action["payload"]
                 replayed_confirmation = RootConfirmation.from_dict(
                     dict(replay_payload.get("confirmation") or {})
                 )
@@ -7458,7 +7842,7 @@ class AgenticRecursiveAnalyzer:
                         "status": "in_flight",
                         "candidate_ref": request.candidate_ref,
                         "hypothesis_id": request.hypothesis_id,
-                        "confirmation_identity": confirmation_action_key.split(":", 1)[1],
+                        "request_identity": request_identity,
                         "physical_requests_reserved": reserved_requests,
                     },
                 )
@@ -7716,8 +8100,67 @@ class AgenticRecursiveAnalyzer:
                 )
         state.confirmed_roots = retained
 
+    @staticmethod
+    def _confirmation_hypothesis_status_at_request(
+        state: RecursiveAnalysisState,
+        *,
+        request_hypothesis_id: str,
+        competitor: Mapping[str, Any],
+    ) -> str:
+        positions: Dict[str, int] = {}
+        for index, entry in enumerate(state.confirmation_journal):
+            if not isinstance(entry, Mapping):
+                continue
+            hypothesis_id = str(entry.get("hypothesis_id") or "")
+            if not hypothesis_id:
+                continue
+            if hypothesis_id in positions:
+                raise ValueError(
+                    "confirmation journal contains a duplicate hypothesis action"
+                )
+            positions[hypothesis_id] = index
+        request_position = positions.get(
+            request_hypothesis_id,
+            len(state.confirmation_journal),
+        )
+        competitor_hypothesis_id = str(
+            competitor.get("hypothesis_id") or ""
+        )
+        competitor_position = positions.get(competitor_hypothesis_id)
+        status = str(competitor.get("status") or "")
+        if (
+            status == "rejected"
+            and competitor_position is not None
+            and competitor_position >= request_position
+        ):
+            status = (
+                "supported"
+                if competitor.get("supporting_evidence")
+                else "active"
+            )
+        return status
+
+    @staticmethod
+    def _validate_confirmation_request_graph_eligibility(
+        state: RecursiveAnalysisState,
+        request: RootConfirmationRequest,
+    ) -> None:
+        for upstream, downstream in zip(
+            request.recursive_path, request.recursive_path[1:]
+        ):
+            edges = state.graph.edge_context(upstream, downstream)
+            if not any(
+                is_confirmation_causal_edge(edge, default_eligible=True)
+                for edge in edges
+            ):
+                raise ValueError(
+                    "queued confirmation path lacks a grounded non-temporal "
+                    "edge: {0}->{1}".format(upstream, downstream)
+                )
+
+    @staticmethod
     def _build_confirmation_request(
-        self, state: RecursiveAnalysisState, queued: Mapping[str, Any]
+        state: RecursiveAnalysisState, queued: Mapping[str, Any]
     ) -> RootConfirmationRequest:
         if "artifact_evidence_envelopes" not in queued:
             queue_key = state._confirmation_queue_key(queued)
@@ -7738,8 +8181,17 @@ class AgenticRecursiveAnalyzer:
             hypothesis.candidate_root_ref != candidate_ref
             or hypothesis.active_defect_fingerprint != fingerprint
             or hypothesis.seed_binding_identity != seed_binding_identity
+            or str(queued.get("hypothesis_semantic_hash") or "")
+            != hypothesis.semantic_hash
         ):
             raise ValueError("queued confirmation is cross-bound to another hypothesis")
+        analysis_perspective = str(
+            queued.get("analysis_perspective") or ""
+        )
+        if analysis_perspective != state.analysis_perspective:
+            raise ValueError(
+                "queued confirmation analysis perspective contradicts its run"
+            )
         binding = next(
             (
                 item
@@ -7779,18 +8231,6 @@ class AgenticRecursiveAnalyzer:
             raise ValueError(
                 "queued confirmation path contains evidence ineligible for the active revision"
             )
-        for upstream, downstream in zip(path, path[1:]):
-            edges = state.graph.edge_context(upstream, downstream)
-            if not any(
-                is_confirmation_causal_edge(edge, default_eligible=True)
-                for edge in edges
-            ):
-                raise ValueError(
-                    "queued confirmation path lacks a grounded non-temporal edge: {0}->{1}".format(
-                        upstream, downstream
-                    )
-                )
-
         candidate_reference = _reference_envelope(
             candidate_ref,
             content=_node_semantic_content(
@@ -7912,6 +8352,13 @@ class AgenticRecursiveAnalyzer:
                 continue
             support = value.get("supporting_evidence") or []
             opposition = value.get("opposing_evidence") or []
+            competitor_status = (
+                AgenticRecursiveAnalyzer._confirmation_hypothesis_status_at_request(
+                    state,
+                    request_hypothesis_id=hypothesis_id,
+                    competitor=value,
+                )
+            )
 
             def competitor_evidence(items: Any, kind: str) -> List[JsonDict]:
                 output: List[JsonDict] = []
@@ -7998,7 +8445,7 @@ class AgenticRecursiveAnalyzer:
                     "recursive_path": list(competitor_path),
                     "seed_binding_identity": competitor_seed_binding_identity,
                     "requires_independent_confirmation": queued_competitor is not None,
-                    "status": str(value.get("status") or "unresolved"),
+                    "status": competitor_status or "unresolved",
                     "claim": str(value.get("claim") or ""),
                     "active_defect": competitor_defect.to_dict(),
                     "candidate_reference": _reference_envelope(
@@ -8079,7 +8526,7 @@ class AgenticRecursiveAnalyzer:
             opposing_evidence=opposing_evidence,
             competing_hypotheses=tuple(competitors),
             task_obligations=tuple(obligations),
-            analysis_perspective="",
+            analysis_perspective=analysis_perspective,
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis.semantic_hash,
             seed_binding_identity=seed_binding_identity,
@@ -8199,6 +8646,7 @@ class AgenticRecursiveAnalyzer:
                     confirmation=confirmation.to_dict(),
                 )
             )
+            state.refresh_pending_confirmation_request_identities()
             return
         if not is_definitive_confirmation(confirmation):
             state.unresolved_hypothesis_ids.add(hypothesis_id)
@@ -8221,6 +8669,7 @@ class AgenticRecursiveAnalyzer:
                     "depth": max(0, len(confirmation.recursive_path) - 1),
                 }
             )
+            state.refresh_pending_confirmation_request_identities()
             return
         if confirmation.status == "rejected":
             state.introduction_hypothesis_ids.discard(hypothesis_id)
@@ -8305,6 +8754,7 @@ class AgenticRecursiveAnalyzer:
                 if pending_alternatives
                 else "no_queued_unresolved_alternative"
             )
+            state.refresh_pending_confirmation_request_identities()
             return
 
     def _rank_confirmed_roots(self, state: RecursiveAnalysisState) -> None:
@@ -8663,6 +9113,7 @@ class AgenticRecursiveAnalyzer:
                 enqueued = state.enqueue_confirmation(
                     {
                         "hypothesis_id": hypothesis_id,
+                        "hypothesis_semantic_hash": hypothesis.semantic_hash,
                         "candidate_ref": candidate_ref,
                         "defect_fingerprint": defect_fingerprint,
                         "seed_binding_identity": hypothesis.seed_binding_identity,
@@ -8675,14 +9126,6 @@ class AgenticRecursiveAnalyzer:
                             list(request.recursive_context.get("task_obligations") or [])
                         ),
                         "analysis_perspective": state.analysis_perspective,
-                        "semantic_identity": _confirmation_request_identity(
-                            hypothesis_id=hypothesis_id,
-                            candidate_ref=candidate_ref,
-                            defect_fingerprint=defect_fingerprint,
-                            seed_binding_identity=(
-                                hypothesis.seed_binding_identity
-                            ),
-                        ),
                         "status": "queued",
                         "seed_key": state.hypothesis_seed_keys.get(
                             hypothesis_id, ""
@@ -8725,6 +9168,7 @@ class AgenticRecursiveAnalyzer:
                 ).hexdigest(),
             },
         )
+        state.refresh_pending_confirmation_request_identities()
         if directive.action == "reject_hypothesis" and status == "applied":
             return "branch_rejected"
         if directive.action == "reject_hypothesis" and status == "rejected":

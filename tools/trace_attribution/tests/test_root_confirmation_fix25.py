@@ -248,12 +248,6 @@ def artifact_state(root: Path, *, content: str = "verified proof"):
         "checked_evidence_refs": ["artifact:proof"],
         "task_obligations": [],
         "analysis_perspective": "",
-        "semantic_identity": _confirmation_request_identity(
-            hypothesis_id=item.hypothesis_id,
-            candidate_ref=item.node_ref,
-            defect_fingerprint=item.defect_state.fingerprint,
-            seed_binding_identity=item.seed_binding_identity,
-        ),
         "status": "queued",
         "owner": LocalStateOwner.create(
             seed_binding_identity=item.seed_binding_identity,
@@ -262,6 +256,12 @@ def artifact_state(root: Path, *, content: str = "verified proof"):
             occurrence_key="confirmation_queue",
         ).to_dict(),
     }
+    queued["artifact_evidence_envelopes"] = (
+        state._confirmation_artifact_envelopes(queued)
+    )
+    queued["semantic_identity"] = _confirmation_request_identity(
+        AgenticRecursiveAnalyzer._build_confirmation_request(state, queued)
+    )
     return graph, state, item, queued
 
 

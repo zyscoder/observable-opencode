@@ -826,14 +826,12 @@ class CanonicalPendingConfirmationIdentityTest(unittest.TestCase):
         self.addCleanup(tempdir.cleanup)
         return artifact_state(Path(tempdir.name))
 
-    def test_enqueue_rejects_arbitrary_noncanonical_and_extra_identity_fields(self):
-        for mutation in ("arbitrary", "missing", "extra"):
+    def test_enqueue_rejects_arbitrary_and_extra_identity_fields(self):
+        for mutation in ("arbitrary", "extra"):
             with self.subTest(mutation=mutation):
                 _, state, _, queued = self.queued_state()
                 if mutation == "arbitrary":
                     queued["semantic_identity"] = "a" * 64
-                elif mutation == "missing":
-                    queued.pop("semantic_identity")
                 else:
                     queued["semantic_identity_alias"] = queued[
                         "semantic_identity"
@@ -843,6 +841,16 @@ class CanonicalPendingConfirmationIdentityTest(unittest.TestCase):
                     "semantic|identity|schema|extra|missing",
                 ):
                     state.enqueue_confirmation(queued)
+
+    def test_enqueue_canonically_populates_a_missing_request_identity(self):
+        _, state, _, queued = self.queued_state()
+        queued.pop("semantic_identity")
+        self.assertTrue(state.enqueue_confirmation(queued))
+        self.assertTrue(
+            state.confirmation_queue[0]["semantic_identity"].startswith(
+                "confirmation_request:v2:"
+            )
+        )
 
     def test_live_queue_key_projection_recomputes_canonical_identity(self):
         _, state, _, queued = self.queued_state()
@@ -894,19 +902,21 @@ class CanonicalPendingConfirmationIdentityTest(unittest.TestCase):
             )
 
     def test_canonical_identity_is_the_provider_action_and_replay_key(self):
+        judge = SelectiveGlobalJudge()
         tempdir, checkpoint_root, config, checkpoint, report = checkpoint_for(
             shared_root_trace(),
-            SelectiveGlobalJudge(),
+            judge,
             fusion_mode="retrieval-global",
             name="fix27-confirmation-replay",
         )
         self.addCleanup(tempdir.cleanup)
         queued = report.metadata["confirmation_queue"][0]
         expected = _confirmation_request_identity(
-            hypothesis_id=queued["hypothesis_id"],
-            candidate_ref=queued["candidate_ref"],
-            defect_fingerprint=queued["defect_fingerprint"],
-            seed_binding_identity=queued["seed_binding_identity"],
+            next(
+                request
+                for request in judge.confirmation_requests
+                if request.hypothesis_id == queued["hypothesis_id"]
+            )
         )
         action = next(
             item
@@ -971,20 +981,20 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "graph-external-evidence-eligibility/v5",
         )
         self.assertIn(
-            "failure-projection/v2",
+            "failure-projection/v3",
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "confirmation-request-identity/v1",
+            "confirmation-request-identity/v2",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v10")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v11")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v9",
+            "recursive-attribution-checkpoint/v10",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v7")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v8")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

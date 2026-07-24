@@ -37,7 +37,7 @@ from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
 
-from tests.test_recursive_benchmarks import FIXTURE_ROOT, run_fixture
+from tests.test_recursive_benchmarks import FIXTURE_ROOT, FixtureJudge, run_fixture
 
 
 def node(*, data, source_refs=(), component="planner", event_type="decision"):
@@ -640,8 +640,8 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             content = b"grounded contract evidence\n"
             (artifact_dir / "proof.txt").write_bytes(content)
             trace = json.loads((FIXTURE_ROOT / "sphinx_recursive_minimal.json").read_text())
-            trace.pop("human_labels")
-            trace.pop("scripted_analysis")
+            labels = trace.pop("human_labels")
+            script = trace.pop("scripted_analysis")
             trace["artifacts"] = [
                 {
                     "artifact_id": "proof",
@@ -655,73 +655,28 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             trace_path = root / "trace.json"
             trace_path.write_text(json.dumps(trace), encoding="utf-8")
             graph = TraceGraph.from_file(trace_path)
-            report, labels, _ = run_fixture(FIXTURE_ROOT / "sphinx_recursive_minimal.json")
+
+            class ArtifactFixtureJudge(FixtureJudge):
+                def confirm_candidate(self, request):
+                    confirmation = super().confirm_candidate(request)
+                    if request.candidate_ref == "record:decision":
+                        confirmation = replace(
+                            confirmation,
+                            evidence_refs=("artifact:proof",),
+                        )
+                    return confirmation
+
+            report = AgenticRecursiveAnalyzer(
+                judge=ArtifactFixtureJudge(script)
+            ).analyze(
+                graph,
+                start_refs=[script["start_ref"]],
+                objective="Find the fixture's semantic defect introduction.",
+                analysis_perspective="Improve Harness reasoning quality.",
+            )
             report = annotate_report_semantic_anchors(
-                graph.case_id, graph.nodes, report, graph=graph
+                graph.case_id, graph.nodes, report.to_dict(), graph=graph
             )
-            root_item = report["confirmed_roots"][0]
-            identity = root_item["confirmation"]["confirmation_identity"]
-            root_item["evidence_refs"] = ["artifact:proof"]
-            root_item["confirmation"]["evidence_refs"] = ["artifact:proof"]
-            for confirmation in report["confirmations"]:
-                if confirmation["confirmation_identity"] == identity:
-                    confirmation["evidence_refs"] = ["artifact:proof"]
-            journal_entry = next(
-                item
-                for item in report["metadata"]["confirmation_journal"]
-                if item["confirmation"]["confirmation_identity"] == identity
-            )
-            journal_entry["confirmation"]["evidence_refs"] = [
-                "artifact:proof"
-            ]
-            queue_entry = next(
-                item
-                for item in report["metadata"]["confirmation_queue"]
-                if item["confirmation"]["confirmation_identity"] == identity
-            )
-            queue_entry["confirmation"]["evidence_refs"] = ["artifact:proof"]
-            action_projection = next(
-                item
-                for item in report["metadata"][
-                    "confirmation_action_projection"
-                ]
-                if item["response_identity"] == identity
-            )
-            action_projection["evidence_refs"] = ["artifact:proof"]
-            action_projection["confirmation"]["evidence_refs"] = [
-                "artifact:proof"
-            ]
-            artifact_envelope = graph.artifact_evidence_envelope(
-                "artifact:proof",
-                fact_kind="supporting_evidence",
-                expected_owner_ref="record:decision",
-            )
-            queue_entry["artifact_evidence_envelopes"] = [
-                copy.deepcopy(artifact_envelope)
-            ]
-            journal_entry["artifact_evidence_envelopes"] = [
-                copy.deepcopy(artifact_envelope)
-            ]
-            action_projection["artifact_evidence_envelopes"] = [
-                copy.deepcopy(artifact_envelope)
-            ]
-            seed = next(
-                item
-                for item in report["seed_results"]
-                if identity in item["confirmation_identities"]
-            )
-            seed["decisive_evidence_refs"] = [
-                "artifact:proof"
-                if ref == root_item["node_ref"]
-                else ref
-                for ref in seed["decisive_evidence_refs"]
-            ]
-            for evidence in seed["decisive_evidence"]:
-                if (
-                    evidence["ref"] == root_item["node_ref"]
-                    and evidence["owner"] == journal_entry["owner"]
-                ):
-                    evidence["ref"] = "artifact:proof"
 
             graph.hydrate_node("record:decision")
             report = annotate_report_semantic_anchors(

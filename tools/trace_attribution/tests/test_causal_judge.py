@@ -967,11 +967,14 @@ class RootConfirmationValidationTest(unittest.TestCase):
         result = validate_recursive_confirmation(payload, request=sample_confirmation_request())
         self.assertEqual(result.factor_mechanism["mechanism_type"], "amplification")
 
-    def test_factual_prompt_omits_analysis_perspective(self):
+    def test_factual_prompt_includes_analysis_perspective(self):
         request = sample_confirmation_request()
         prompt = build_recursive_confirmation_prompt(request)
-        self.assertNotIn(request.analysis_perspective, prompt)
-        self.assertNotIn("analysis_perspective", request.factual_dict())
+        self.assertIn(request.analysis_perspective, prompt)
+        self.assertEqual(
+            request.factual_dict()["analysis_perspective"],
+            request.analysis_perspective,
+        )
     def test_confirmation_requires_grounded_refs_and_excerpt(self):
         result = validate_recursive_confirmation(
             valid_confirmation_payload(), request=sample_confirmation_request()
@@ -2105,7 +2108,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v8")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v9")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):

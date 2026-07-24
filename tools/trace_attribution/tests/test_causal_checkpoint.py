@@ -1221,16 +1221,16 @@ class CausalCheckpointTest(unittest.TestCase):
             config["global_judgment_contract"],
             "global-candidate-judgment/v6+validation-envelope/v6+capsule/v7"
             "+evidence-policy/v5+local-state-owner/v1"
-            "+global-pass-identity/v1+failure-action/v1"
-            "+failure-projection/v2",
+            "+global-pass-identity/v1+failure-action/v2"
+            "+failure-projection/v3+terminal-record-schema/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v11+resolution/v2+evidence-policy/v5"
-            "+artifact-owner/v1+local-state-owner/v1+action-projection/v1"
-            "+step-action-projection/v1+confirmation-request-identity/v1",
+            "recursive-root-confirmation/v12+resolution/v2+evidence-policy/v5"
+            "+artifact-owner/v1+local-state-owner/v1+action-projection/v2"
+            "+step-action-projection/v1+confirmation-request-identity/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v9")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v10")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()

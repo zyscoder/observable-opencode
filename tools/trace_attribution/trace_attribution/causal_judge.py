@@ -42,7 +42,11 @@ from .models import JsonDict, TraceNode, stable_json
 
 
 CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v9"
-ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v8"
+ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v9"
+ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA = (
+    "root-confirmation-request-projection/v1"
+)
+ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX = "confirmation_request:v2:"
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (
@@ -177,13 +181,10 @@ class RootConfirmationRequest:
             object.__setattr__(self, name, tuple(_freeze_json(item) for item in getattr(self, name)))
 
     def to_dict(self) -> JsonDict:
-        return {
-            **self.factual_dict(),
-            "analysis_perspective": self.analysis_perspective,
-        }
+        return self.factual_dict()
 
     def factual_dict(self) -> JsonDict:
-        """Return perspective-neutral facts used by verifier prompts and cache identity."""
+        """Return every Judge-visible fact used by verifier prompts and identity."""
         return {
             "candidate_ref": self.candidate_ref,
             "defect_state": self.defect_state.to_dict(),
@@ -197,7 +198,29 @@ class RootConfirmationRequest:
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_semantic_hash": self.hypothesis_semantic_hash,
             "seed_binding_identity": self.seed_binding_identity,
+            "analysis_perspective": self.analysis_perspective,
         }
+
+
+def root_confirmation_request_projection(
+    request: RootConfirmationRequest,
+) -> JsonDict:
+    if not isinstance(request, RootConfirmationRequest):
+        raise TypeError("root confirmation request projection requires a request")
+    return {
+        "schema": ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA,
+        "facts": request.factual_dict(),
+    }
+
+
+def root_confirmation_request_identity(
+    request: RootConfirmationRequest,
+) -> str:
+    projection = root_confirmation_request_projection(request)
+    return "{0}{1}".format(
+        ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
+        hashlib.sha256(stable_json(projection).encode("utf-8")).hexdigest(),
+    )
 
 
 class CausalJudge(Protocol):
@@ -2901,6 +2924,8 @@ __all__ = [
     "CAUSAL_STEP_PROMPT_SCHEMA_VERSION",
     "CAUSAL_STEP_SYSTEM_PROMPT",
     "ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION",
+    "ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX",
+    "ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA",
     "ROOT_CONFIRMATION_SYSTEM_PROMPT",
     "CausalJudge",
     "CausalStepRequest",
@@ -2910,6 +2935,8 @@ __all__ = [
     "build_recursive_confirmation_prompt",
     "causal_step_from_payload",
     "root_confirmation_from_payload",
+    "root_confirmation_request_identity",
+    "root_confirmation_request_projection",
     "validate_causal_step_payload",
     "validate_recursive_confirmation",
 ]
