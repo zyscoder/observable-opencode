@@ -44,9 +44,27 @@ from .models import JsonDict, TraceNode, stable_json
 CAUSAL_STEP_PROMPT_SCHEMA_VERSION = "recursive-causal-step-v9"
 ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION = "recursive-root-confirmation-v9"
 ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA = (
-    "root-confirmation-request-projection/v1"
+    "root-confirmation-request-projection/v2"
 )
-ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX = "confirmation_request:v2:"
+ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX = "confirmation_request:v3:"
+ROOT_CONFIRMATION_REQUEST_PROJECTION_KEYS = frozenset({"schema", "facts"})
+ROOT_CONFIRMATION_REQUEST_FACT_KEYS = frozenset(
+    {
+        "candidate_ref",
+        "defect_state",
+        "recursive_path",
+        "candidate_reference",
+        "recursive_path_references",
+        "supporting_evidence",
+        "opposing_evidence",
+        "competing_hypotheses",
+        "task_obligations",
+        "hypothesis_id",
+        "hypothesis_semantic_hash",
+        "seed_binding_identity",
+        "analysis_perspective",
+    }
+)
 
 TEMPORAL_CAUSALITY_RULE = "Temporal order or proximity alone is never causal."
 RELATION_DEFINITIONS = (
@@ -207,19 +225,117 @@ def root_confirmation_request_projection(
 ) -> JsonDict:
     if not isinstance(request, RootConfirmationRequest):
         raise TypeError("root confirmation request projection requires a request")
-    return {
+    return validate_root_confirmation_request_projection(
+        {
+            "schema": ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA,
+            "facts": request.factual_dict(),
+        }
+    )
+
+
+def validate_root_confirmation_request_projection(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("root confirmation request projection must be an object")
+    if (
+        {str(key) for key in value}
+        != set(ROOT_CONFIRMATION_REQUEST_PROJECTION_KEYS)
+        or value.get("schema")
+        != ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA
+        or not isinstance(value.get("facts"), Mapping)
+    ):
+        raise ValueError(
+            "root confirmation request projection has an unknown version or "
+            "exact schema"
+        )
+    facts = value["facts"]
+    if {str(key) for key in facts} != set(
+        ROOT_CONFIRMATION_REQUEST_FACT_KEYS
+    ):
+        raise ValueError(
+            "root confirmation request projection facts have an inexact schema"
+        )
+    mapping_fields = ("candidate_reference",)
+    sequence_fields = (
+        "recursive_path_references",
+        "supporting_evidence",
+        "opposing_evidence",
+        "competing_hypotheses",
+        "task_obligations",
+    )
+    string_fields = (
+        "candidate_ref",
+        "hypothesis_id",
+        "hypothesis_semantic_hash",
+        "seed_binding_identity",
+        "analysis_perspective",
+    )
+    if (
+        any(type(facts.get(name)) is not str for name in string_fields)
+        or any(
+            not isinstance(facts.get(name), Mapping)
+            for name in mapping_fields
+        )
+        or not isinstance(facts.get("recursive_path"), (list, tuple))
+        or any(
+            type(item) is not str
+            for item in facts.get("recursive_path") or ()
+        )
+        or any(
+            not isinstance(facts.get(name), (list, tuple))
+            for name in sequence_fields
+        )
+        or any(
+            not isinstance(item, Mapping)
+            for name in sequence_fields
+            for item in facts.get(name) or ()
+        )
+        or not isinstance(facts.get("defect_state"), Mapping)
+    ):
+        raise ValueError(
+            "root confirmation request projection facts have invalid types"
+        )
+    request = RootConfirmationRequest(
+        candidate_ref=facts["candidate_ref"],
+        defect_state=DefectState.from_dict(dict(facts["defect_state"])),
+        recursive_path=tuple(facts["recursive_path"]),
+        candidate_reference=facts["candidate_reference"],
+        recursive_path_references=tuple(
+            facts["recursive_path_references"]
+        ),
+        supporting_evidence=tuple(facts["supporting_evidence"]),
+        opposing_evidence=tuple(facts["opposing_evidence"]),
+        competing_hypotheses=tuple(facts["competing_hypotheses"]),
+        task_obligations=tuple(facts["task_obligations"]),
+        analysis_perspective=facts["analysis_perspective"],
+        hypothesis_id=facts["hypothesis_id"],
+        hypothesis_semantic_hash=facts["hypothesis_semantic_hash"],
+        seed_binding_identity=facts["seed_binding_identity"],
+    )
+    canonical = {
         "schema": ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA,
         "facts": request.factual_dict(),
     }
+    if stable_json(_thaw_json(value)) != stable_json(canonical):
+        raise ValueError(
+            "root confirmation request projection contradicts its canonical "
+            "facts"
+        )
+    return canonical
+
+
+def root_confirmation_request_projection_identity(value: Any) -> str:
+    projection = validate_root_confirmation_request_projection(value)
+    return "{0}{1}".format(
+        ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
+        hashlib.sha256(stable_json(projection).encode("utf-8")).hexdigest(),
+    )
 
 
 def root_confirmation_request_identity(
     request: RootConfirmationRequest,
 ) -> str:
-    projection = root_confirmation_request_projection(request)
-    return "{0}{1}".format(
-        ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
-        hashlib.sha256(stable_json(projection).encode("utf-8")).hexdigest(),
+    return root_confirmation_request_projection_identity(
+        root_confirmation_request_projection(request)
     )
 
 

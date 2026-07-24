@@ -23,6 +23,8 @@ from .causal_judge import (
     preflight_root_confirmation_request,
     root_confirmation_request_identity,
     root_confirmation_request_projection,
+    root_confirmation_request_projection_identity,
+    validate_root_confirmation_request_projection,
 )
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
@@ -105,7 +107,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v10"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v11"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -214,6 +216,7 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
         "evidence_refs",
         "artifact_evidence_envelopes",
         "evidence_disposition",
+        "factual_request_projection",
         "physical_requests_reserved",
         "physical_request_delta",
         "physical_request_exact",
@@ -1547,6 +1550,7 @@ def _confirmation_action_projection(
     physical_requests_reserved: int,
     physical_request_delta: int,
     physical_request_exact: bool,
+    factual_request_projection: Any,
     artifact_evidence_envelopes: Sequence[Mapping[str, Any]] = (),
     evidence_disposition: Optional[Mapping[str, Any]] = None,
 ) -> JsonDict:
@@ -1579,6 +1583,21 @@ def _confirmation_action_projection(
             )
     if type(physical_request_exact) is not bool:
         raise ValueError("confirmation action physical_request_exact must be boolean")
+    canonical_request_projection = (
+        validate_root_confirmation_request_projection(
+            factual_request_projection
+        )
+    )
+    if (
+        root_confirmation_request_projection_identity(
+            canonical_request_projection
+        )
+        != request_identity
+    ):
+        raise ValueError(
+            "confirmation action factual request projection contradicts its "
+            "semantic identity"
+        )
     validated_disposition = _validated_terminal_evidence_disposition(
         evidence_disposition,
         artifact_evidence_envelopes=artifact_evidence_envelopes,
@@ -1604,6 +1623,7 @@ def _confirmation_action_projection(
             list(artifact_evidence_envelopes)
         ),
         "evidence_disposition": validated_disposition,
+        "factual_request_projection": canonical_request_projection,
         "physical_requests_reserved": physical_requests_reserved,
         "physical_request_delta": physical_request_delta,
         "physical_request_exact": physical_request_exact,
@@ -1708,6 +1728,9 @@ def _validated_confirmation_action_projection(value: Any) -> JsonDict:
         physical_requests_reserved=value.get("physical_requests_reserved"),
         physical_request_delta=value.get("physical_request_delta"),
         physical_request_exact=value.get("physical_request_exact"),
+        factual_request_projection=value.get(
+            "factual_request_projection"
+        ),
         artifact_evidence_envelopes=value.get(
             "artifact_evidence_envelopes"
         )
@@ -1933,17 +1956,6 @@ def _global_terminal_residual_signature(
     seed_ref = str(value.get("seed_ref") or "")
     defect_fingerprint = str(value.get("defect_fingerprint") or "")
     seed_binding = str(value.get("seed_binding_identity") or "")
-    matching_pass_authority = [
-        (binding, facts)
-        for binding, facts in authority.items()
-        if (
-            seed_binding == binding
-            or (
-                seed_ref == facts["seed_ref"]
-                and defect_fingerprint == facts["defect_fingerprint"]
-            )
-        )
-    ]
     pass_action_shape = bool(
         isinstance(value.get("candidate_compression"), Mapping)
         and isinstance(owner, Mapping)
@@ -1964,37 +1976,71 @@ def _global_terminal_residual_signature(
             )
         )
     )
-    if (
-        "pass" in allowed_kinds
-        and matching_pass_authority
-        and pass_action_shape
-    ):
+
+    def uniquely_matches_authority(
+        claims: Sequence[Tuple[str, str]],
+    ) -> bool:
+        claimed = [(name, claim) for name, claim in claims if claim]
+        if not claimed:
+            return False
+        matches: List[Set[str]] = []
+        for name, claim in claimed:
+            if name == "seed_binding_identity":
+                matched = {claim} if claim in authority else set()
+            else:
+                matched = {
+                    binding
+                    for binding, facts in authority.items()
+                    if claim == facts[name]
+                }
+            matches.append(matched)
+        common = set.intersection(*matches) if matches else set()
+        if any(not matched for matched in matches) or len(common) != 1:
+            raise ValueError(
+                "residual global terminal authority is contradictory or "
+                "ambiguous"
+            )
         return True
+
+    owner_seed_binding = (
+        str(owner.get("seed_binding_identity") or "")
+        if isinstance(owner, Mapping)
+        else ""
+    )
+    if "pass" in allowed_kinds and pass_action_shape:
+        return uniquely_matches_authority(
+            (
+                ("seed_binding_identity", seed_binding),
+                ("seed_binding_identity", owner_seed_binding),
+                ("seed_ref", seed_ref),
+                ("defect_fingerprint", defect_fingerprint),
+            )
+        )
 
     node_ref = str(value.get("node_ref") or "")
     defect_state_id = str(value.get("defect_state_id") or "")
-    matching_episode_authority = any(
-        node_ref == facts["seed_ref"]
-        and defect_state_id == facts["defect_state_id"]
-        for facts in authority.values()
-    )
     episode_shape = bool(
         isinstance(owner, Mapping)
         and {
             "node_ref",
-            "defect_state_id",
             "hypothesis_id",
             "reason",
             "details",
             "depth",
         }.issubset(keys)
         and type(value.get("depth")) is int
+        and not str(value.get("hypothesis_id") or "")
+        and str(value.get("reason") or "").startswith("global_")
     )
-    return bool(
-        "episode" in allowed_kinds
-        and matching_episode_authority
-        and episode_shape
-    )
+    if "episode" in allowed_kinds and episode_shape:
+        return uniquely_matches_authority(
+            (
+                ("seed_binding_identity", owner_seed_binding),
+                ("seed_ref", node_ref),
+                ("defect_state_id", defect_state_id),
+            )
+        )
+    return False
 
 
 def _classify_global_pass_records(
@@ -3844,14 +3890,20 @@ class RecursiveAnalysisState:
                 )
             semantic_identity = str(item.get("semantic_identity") or "")
             if rejected_snapshot:
-                if not semantic_identity.startswith(
-                    ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
-                ):
+                expected_semantic_identity = (
+                    root_confirmation_request_projection_identity(
+                        stored_projection
+                    )
+                )
+                if semantic_identity != expected_semantic_identity:
                     raise ValueError(
-                        "rejected confirmation snapshot has a non-canonical "
-                        "request identity"
+                        "rejected confirmation snapshot factual projection "
+                        "contradicts its semantic identity"
                     )
             else:
+                validate_root_confirmation_request_projection(
+                    stored_projection
+                )
                 current_request = (
                     AgenticRecursiveAnalyzer._build_confirmation_request(
                         self, item
@@ -4389,6 +4441,7 @@ class RecursiveAnalysisState:
             "status",
             "artifact_evidence_envelopes",
             "evidence_disposition",
+            "factual_request_projection",
             "confirmation",
         )
         for entry in journal_entries:
@@ -4412,6 +4465,9 @@ class RecursiveAnalysisState:
                 ),
                 physical_request_exact=entry.get(
                     "physical_request_exact"
+                ),
+                factual_request_projection=entry.get(
+                    "factual_request_projection"
                 ),
                 artifact_evidence_envelopes=entry.get(
                     "artifact_evidence_envelopes"
@@ -4457,6 +4513,8 @@ class RecursiveAnalysisState:
                 or owner.hypothesis_id != parsed.hypothesis_id
                 or entry.get("evidence_disposition")
                 != canonical_projection["evidence_disposition"]
+                or entry.get("factual_request_projection")
+                != canonical_projection["factual_request_projection"]
             ):
                 raise ValueError(
                     "confirmation journal fields contradict action payload"
@@ -6959,6 +7017,9 @@ class AgenticRecursiveAnalyzer:
             physical_requests_reserved=physical_requests_reserved,
             physical_request_delta=physical_request_delta,
             physical_request_exact=physical_request_exact,
+            factual_request_projection=queued.get(
+                "factual_request_projection"
+            ),
             artifact_evidence_envelopes=artifact_evidence_envelopes,
             evidence_disposition=terminal_disposition,
         )
@@ -7048,6 +7109,8 @@ class AgenticRecursiveAnalyzer:
             != str(queued.get("semantic_identity") or "")
             or projection["artifact_evidence_envelopes"]
             != list(queued.get("artifact_evidence_envelopes") or ())
+            or projection["factual_request_projection"]
+            != queued.get("factual_request_projection")
             or (
                 queued.get("evidence_disposition") is not None
                 and projection["evidence_disposition"]
@@ -9661,6 +9724,9 @@ class AgenticRecursiveAnalyzer:
                 ),
                 "evidence_disposition": copy.deepcopy(
                     projection["evidence_disposition"]
+                ),
+                "factual_request_projection": copy.deepcopy(
+                    projection["factual_request_projection"]
                 ),
                 "confirmation": confirmation.to_dict(),
             }

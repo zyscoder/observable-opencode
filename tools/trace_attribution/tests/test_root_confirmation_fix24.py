@@ -16,6 +16,9 @@ from trace_attribution.causal_state import (
     annotate_report_semantic_anchors,
     seed_binding_identity_for,
 )
+from trace_attribution.causal_judge import (
+    root_confirmation_request_projection_identity,
+)
 from trace_attribution.graph import TraceGraph
 from trace_attribution.recursive_analyzer import (
     AgenticRecursiveAnalyzer,
@@ -63,7 +66,17 @@ def unknown_seed_terminal_action(action):
         ],
         occurrence_key="global_candidate_pass",
     )
-    request_identity = "confirmation_request:v2:{0}".format("0" * 64)
+    factual_request_projection = copy.deepcopy(
+        output["payload"]["action_projection"][
+            "factual_request_projection"
+        ]
+    )
+    factual_request_projection["facts"][
+        "seed_binding_identity"
+    ] = unknown_seed
+    request_identity = root_confirmation_request_projection_identity(
+        factual_request_projection
+    )
     semantic_key = "confirmation:{0}".format(request_identity)
     projection = _confirmation_action_projection(
         operation=output["operation"],
@@ -79,6 +92,7 @@ def unknown_seed_terminal_action(action):
             "physical_request_delta"
         ],
         physical_request_exact=output["payload"]["physical_request_exact"],
+        factual_request_projection=factual_request_projection,
         artifact_evidence_envelopes=output["payload"][
             "action_projection"
         ]["artifact_evidence_envelopes"],

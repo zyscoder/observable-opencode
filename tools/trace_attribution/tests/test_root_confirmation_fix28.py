@@ -70,14 +70,23 @@ class FullFactualConfirmationRequestIdentityTest(unittest.TestCase):
         )
         request = judge.confirmation_requests[0]
         base_identity = _confirmation_request_identity(request)
-        self.assertTrue(base_identity.startswith("confirmation_request:v2:"))
+        self.assertTrue(base_identity.startswith("confirmation_request:v3:"))
 
         mutations = {
             "defect": replace(
                 request,
-                defect_state=replace(
-                    request.defect_state,
+                defect_state=type(request.defect_state).create(
+                    label=request.defect_state.label,
+                    expected=request.defect_state.expected,
                     actual="{0} mutated".format(request.defect_state.actual),
+                    mechanism=request.defect_state.mechanism,
+                    scope=request.defect_state.scope,
+                    derived_from_defect_state_id=(
+                        request.defect_state.derived_from_defect_state_id
+                    ),
+                    transformation_reason=(
+                        request.defect_state.transformation_reason
+                    ),
                 ),
             ),
             "path": replace(

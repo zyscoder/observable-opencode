@@ -850,7 +850,7 @@ class CanonicalPendingConfirmationIdentityTest(unittest.TestCase):
         self.assertTrue(state.enqueue_confirmation(queued))
         self.assertTrue(
             state.confirmation_queue[0]["semantic_identity"].startswith(
-                "confirmation_request:v2:"
+                "confirmation_request:v3:"
             )
         )
 
@@ -987,16 +987,16 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "confirmation-request-identity/v2",
+            "confirmation-request-identity/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v13")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v14")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v12",
+            "recursive-attribution-checkpoint/v13",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v10")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v11")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

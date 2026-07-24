@@ -30,7 +30,7 @@ from trace_attribution.recursive_analyzer import (
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v13"
+REPORT_SCHEMA_VERSION = "recursive-attribution-report/v14"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(

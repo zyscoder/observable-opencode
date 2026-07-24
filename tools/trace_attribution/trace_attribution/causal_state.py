@@ -50,7 +50,7 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v13"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v14"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
@@ -63,10 +63,11 @@ GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v7"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v14+resolution/v2+evidence-policy/v5"
+    "recursive-root-confirmation/v15+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-    "+action-projection/v4"
-    "+step-action-projection/v1+confirmation-request-identity/v2"
+    "+action-projection/v5"
+    "+step-action-projection/v1+confirmation-request-identity/v3"
+    "+confirmation-request-projection/v2"
 )
 SEMANTIC_ANCHOR_SCHEMA_VERSION = "semantic-anchor/v2"
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"

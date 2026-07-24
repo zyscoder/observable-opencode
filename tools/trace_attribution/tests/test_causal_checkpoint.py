@@ -1236,12 +1236,13 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v14+resolution/v2+evidence-policy/v5"
+            "recursive-root-confirmation/v15+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-            "+action-projection/v4"
-            "+step-action-projection/v1+confirmation-request-identity/v2",
+            "+action-projection/v5"
+            "+step-action-projection/v1+confirmation-request-identity/v3"
+            "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v12")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v13")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
