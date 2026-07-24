@@ -14,6 +14,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     annotate_report_semantic_anchors,
     confirmation_identity_for,
+    confirmation_response_identity_for,
 )
 from trace_attribution.hypotheses import RecursiveFrontier
 from trace_attribution.checkpoint import CheckpointBundle
@@ -38,6 +39,25 @@ from tools.trace_attribution.tests.test_root_confirmation_fix31 import (
 from tools.trace_attribution.tests import test_root_confirmation_fix30
 
 
+def _refresh_response_identity(confirmation):
+    confirmation["response_identity"] = confirmation_response_identity_for(
+        confirmation_identity=confirmation["confirmation_identity"],
+        status=confirmation["status"],
+        excerpt=confirmation["excerpt"],
+        reason=confirmation["reason"],
+        counterfactual=confirmation["counterfactual"],
+        confidence=confirmation["confidence"],
+        evidence_refs=tuple(confirmation["evidence_refs"]),
+        counterfactual_status=confirmation["counterfactual_status"],
+        factor_role=confirmation["factor_role"],
+        competitor_comparisons=tuple(
+            confirmation["competitor_comparisons"]
+        ),
+        factor_mechanism=confirmation["factor_mechanism"],
+    )
+    return confirmation
+
+
 def _replacement_confirmation(value, semantic_hash):
     confirmation = copy.deepcopy(dict(value))
     confirmation["hypothesis_semantic_hash"] = semantic_hash
@@ -49,7 +69,7 @@ def _replacement_confirmation(value, semantic_hash):
         recursive_path=tuple(confirmation["recursive_path"]),
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
-    return confirmation
+    return _refresh_response_identity(confirmation)
 
 
 def _rewrite_request_projection(entry, semantic_hash):
@@ -76,7 +96,7 @@ def _rewrite_terminal_entry(entry, semantic_hash):
     )
     entry["confirmation"] = confirmation
     if "response_identity" in entry:
-        entry["response_identity"] = confirmation["confirmation_identity"]
+        entry["response_identity"] = confirmation["response_identity"]
     return request_identity, confirmation
 
 
@@ -129,12 +149,11 @@ def _drift_action_confirmation_path(action):
         recursive_path=tuple(confirmation["recursive_path"]),
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    _refresh_response_identity(confirmation)
     projection["recursive_path"] = copy.deepcopy(
         confirmation["recursive_path"]
     )
-    projection["response_identity"] = confirmation[
-        "confirmation_identity"
-    ]
+    projection["response_identity"] = confirmation["response_identity"]
     projection["confirmation"] = copy.deepcopy(confirmation)
     action["payload"]["confirmation"] = copy.deepcopy(confirmation)
 
@@ -328,6 +347,7 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="validated terminal remains unknown",
+                counterfactual="The counterfactual outcome remains unknown.",
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=semantic_hash,
@@ -369,6 +389,7 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="valid no-frontier terminal",
+                counterfactual="The counterfactual outcome remains unknown.",
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=stored[
@@ -411,6 +432,7 @@ class HypothesisAuthorityBindingTest(unittest.TestCase):
                 candidate_ref=stored["candidate_ref"],
                 status="unknown",
                 reason="drifted no-frontier terminal",
+                counterfactual="The counterfactual outcome remains unknown.",
                 counterfactual_status="unknown",
                 hypothesis_id=stored["hypothesis_id"],
                 hypothesis_semantic_hash=semantic_hash,

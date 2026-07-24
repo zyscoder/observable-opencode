@@ -50,7 +50,7 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v14"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v15"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
@@ -63,9 +63,9 @@ GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v7"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
-    "recursive-root-confirmation/v15+resolution/v2+evidence-policy/v5"
+    "recursive-root-confirmation/v16+resolution/v2+evidence-policy/v5"
     "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-    "+action-projection/v5"
+    "+action-projection/v6+response-identity/v1"
     "+step-action-projection/v1+confirmation-request-identity/v3"
     "+confirmation-request-projection/v2"
 )
@@ -285,6 +285,56 @@ def confirmation_identity_for(
     return "confirmation:{0}".format(
         hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
     )
+
+
+def confirmation_response_identity_for(
+    *,
+    confirmation_identity: str,
+    status: str,
+    excerpt: str,
+    reason: str,
+    counterfactual: str,
+    confidence: float,
+    evidence_refs: Tuple[str, ...],
+    counterfactual_status: str,
+    factor_role: str,
+    competitor_comparisons: Tuple[JsonDict, ...],
+    factor_mechanism: JsonDict,
+) -> str:
+    semantic = {
+        "confirmation_identity": confirmation_identity,
+        "status": status,
+        "excerpt": excerpt,
+        "reason": reason,
+        "counterfactual": counterfactual,
+        "confidence": confidence,
+        "evidence_refs": list(evidence_refs),
+        "counterfactual_status": counterfactual_status,
+        "factor_role": factor_role,
+        "competitor_comparisons": [
+            _thaw(item) for item in competitor_comparisons
+        ],
+        "factor_mechanism": _thaw(factor_mechanism),
+    }
+    return "response:{0}".format(
+        hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def confirmation_counterfactual_for(candidate_ref: str, status: str) -> str:
+    prediction = {
+        "confirmed": ("absent", "prevents_defect"),
+        "rejected": ("present", "does_not_prevent_defect"),
+        "unknown": ("unknown", "unknown"),
+    }.get(status)
+    if prediction is None:
+        raise ValueError(
+            "unsupported root confirmation status: {0}".format(status)
+        )
+    return (
+        "replace_with_semantically_correct_behavior({0}) predicts "
+        "defect_status={1}; causal_effect={2}"
+    ).format(candidate_ref, prediction[0], prediction[1])
 
 
 def _has_blocking_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -1567,6 +1617,22 @@ class RootConfirmation:
             seed_binding_identity=self.seed_binding_identity,
         )
 
+    @property
+    def response_identity(self) -> str:
+        return confirmation_response_identity_for(
+            confirmation_identity=self.confirmation_identity,
+            status=self.status,
+            excerpt=self.excerpt,
+            reason=self.reason,
+            counterfactual=self.counterfactual,
+            confidence=self.confidence,
+            evidence_refs=self.evidence_refs,
+            counterfactual_status=self.counterfactual_status,
+            factor_role=self.factor_role,
+            competitor_comparisons=self.competitor_comparisons,
+            factor_mechanism=self.factor_mechanism,
+        )
+
     @classmethod
     def confirmed(
         cls,
@@ -1600,11 +1666,16 @@ class RootConfirmation:
         evidence_refs: Optional[List[str]] = None,
         *,
         factor_role: str = "unrelated",
+        counterfactual: str = "",
+        confidence: float = 1.0,
     ) -> "RootConfirmation":
         return cls(
             candidate_ref,
             "rejected",
             reason=reason,
+            counterfactual=counterfactual
+            or confirmation_counterfactual_for(candidate_ref, "rejected"),
+            confidence=confidence,
             evidence_refs=list(evidence_refs or []),
             counterfactual_status="rejects_causality",
             factor_role=factor_role,
@@ -1616,6 +1687,9 @@ class RootConfirmation:
             candidate_ref,
             "unknown",
             reason=reason,
+            counterfactual=confirmation_counterfactual_for(
+                candidate_ref, "unknown"
+            ),
             evidence_refs=list(evidence_refs or []),
             counterfactual_status="unknown",
             factor_role="unknown",
@@ -1640,6 +1714,7 @@ class RootConfirmation:
             "competitor_comparisons": [_thaw(item) for item in self.competitor_comparisons],
             "factor_mechanism": _thaw(self.factor_mechanism),
             "confirmation_identity": self.confirmation_identity,
+            "response_identity": self.response_identity,
         }
 
     @classmethod
@@ -1647,6 +1722,11 @@ class RootConfirmation:
         persisted_identity = str(value.get("confirmation_identity") or "")
         if not persisted_identity:
             raise ValueError("RootConfirmation confirmation_identity is required")
+        persisted_response_identity = str(
+            value.get("response_identity") or ""
+        )
+        if not persisted_response_identity:
+            raise ValueError("RootConfirmation response_identity is required")
         status = str(value.get("status") or "unknown")
         result = cls(
             candidate_ref=str(value.get("candidate_ref") or ""),
@@ -1678,13 +1758,78 @@ class RootConfirmation:
                 }.get(status, "unknown")
             ),
             competitor_comparisons=tuple(
-                item for item in value.get("competitor_comparisons", []) if isinstance(item, dict)
+                dict(item)
+                for item in value.get("competitor_comparisons", [])
+                if isinstance(item, Mapping)
             ),
             factor_mechanism=_json_dict(value.get("factor_mechanism")),
         )
         if persisted_identity != result.confirmation_identity:
             raise ValueError("RootConfirmation confirmation_identity does not match semantic fields")
+        if persisted_response_identity != result.response_identity:
+            raise ValueError(
+                "root confirmation response_identity projection does not "
+                "match substantive fields"
+            )
+        validate_root_confirmation_substantive_invariants(result)
         return result
+
+
+def validate_root_confirmation_substantive_invariants(
+    confirmation: RootConfirmation,
+) -> RootConfirmation:
+    if not isinstance(confirmation, RootConfirmation):
+        raise TypeError("root confirmation must be a RootConfirmation")
+    if not confirmation.reason.strip():
+        raise ValueError("root confirmation reason must be non-empty")
+    if (
+        confirmation.status != "unknown"
+        and confirmation.confidence <= 0.0
+    ):
+        raise ValueError(
+            "non-unknown confirmation requires positive confidence"
+        )
+    if not confirmation.counterfactual.strip():
+        raise ValueError(
+            "root confirmation counterfactual must be non-empty"
+        )
+    allowed_counterfactuals = {
+        "confirmed": {"supports_causality"},
+        "rejected": {"rejects_causality", "unknown"},
+        "unknown": {"unknown"},
+    }[confirmation.status]
+    if confirmation.counterfactual_status not in allowed_counterfactuals:
+        raise ValueError(
+            "counterfactual status is inconsistent with confirmation status"
+        )
+    allowed_factor_roles = {
+        "confirmed": {"necessary_cause"},
+        "rejected": {
+            "contributing_condition",
+            "amplifying_factor",
+            "unrelated",
+            "unknown",
+        },
+        "unknown": {"unknown"},
+    }[confirmation.status]
+    if confirmation.factor_role not in allowed_factor_roles:
+        raise ValueError(
+            "confirmation factor_role contradicts its status"
+        )
+    if confirmation.status == "confirmed":
+        if not confirmation.evidence_refs:
+            raise ValueError("confirmed root requires grounded evidence refs")
+        if not confirmation.excerpt.strip():
+            raise ValueError("confirmed root requires a grounded excerpt")
+        if confirmation.counterfactual_status != "supports_causality":
+            raise ValueError(
+                "confirmed root requires a causality-supporting counterfactual"
+            )
+        if confirmation.factor_role != "necessary_cause":
+            raise ValueError(
+                "confirmed root requires factor_role=necessary_cause"
+            )
+    return confirmation
 
 
 def is_definitive_confirmation(confirmation: RootConfirmation) -> bool:
@@ -3140,6 +3285,7 @@ __all__ = [
     "SeedAttributionResult",
     "is_definitive_confirmation",
     "validate_confirmation_ownership",
+    "validate_root_confirmation_substantive_invariants",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
     "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",
     "annotate_report_semantic_anchors",
@@ -3149,7 +3295,9 @@ __all__ = [
     "semantic_occurrence_id",
     "semantic_occurrence_index",
     "semantic_visit_key",
+    "confirmation_counterfactual_for",
     "confirmation_identity_for",
+    "confirmation_response_identity_for",
     "seed_binding_identity_for",
     "validate_seed_outcome_payload",
 ]

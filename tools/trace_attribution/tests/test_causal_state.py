@@ -979,6 +979,7 @@ class CausalStateTest(unittest.TestCase):
             hypothesis_id=rejected_confirmation.hypothesis_id,
             recursive_path=rejected_confirmation.recursive_path,
             confirmation_status="rejected",
+            confidence=rejected_confirmation.confidence,
             confirmation=rejected_confirmation.to_dict(),
         )
         report = RecursiveAttributionReport(

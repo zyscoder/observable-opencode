@@ -34,6 +34,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     confirmation_identity_for,
+    confirmation_response_identity_for,
     seed_binding_identity_for,
 )
 from trace_attribution.checkpoint import (
@@ -282,6 +283,26 @@ class ConfirmedSingleNodeJudge(CountingOfflineJudge):
         )
 
 
+def refresh_checkpoint_confirmation_response_identity(
+    confirmation: dict,
+) -> None:
+    confirmation["response_identity"] = confirmation_response_identity_for(
+        confirmation_identity=confirmation["confirmation_identity"],
+        status=confirmation["status"],
+        excerpt=confirmation["excerpt"],
+        reason=confirmation["reason"],
+        counterfactual=confirmation["counterfactual"],
+        confidence=confirmation["confidence"],
+        evidence_refs=tuple(confirmation["evidence_refs"]),
+        counterfactual_status=confirmation["counterfactual_status"],
+        factor_role=confirmation["factor_role"],
+        competitor_comparisons=tuple(
+            confirmation["competitor_comparisons"]
+        ),
+        factor_mechanism=confirmation["factor_mechanism"],
+    )
+
+
 def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None:
     confirmation = report_payload["confirmations"][0]
     seed = report_payload["seed_results"][0]
@@ -295,6 +316,7 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
         recursive_path=confirmation["recursive_path"],
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    refresh_checkpoint_confirmation_response_identity(confirmation)
     root = report_payload["confirmed_roots"][0]
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
@@ -314,6 +336,7 @@ def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) 
         recursive_path=confirmation["recursive_path"],
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    refresh_checkpoint_confirmation_response_identity(confirmation)
     root = report_payload["confirmed_roots"][0]
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
@@ -339,6 +362,7 @@ def forge_checkpoint_factor_path(payload: dict, recursive_path: list[str]) -> No
         recursive_path=confirmation["recursive_path"],
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    refresh_checkpoint_confirmation_response_identity(confirmation)
     factor["recursive_path"] = list(recursive_path)
     factor["confirmation"] = copy.deepcopy(confirmation)
     for seed in payload["seed_ledger"] if "seed_ledger" in payload else payload["seed_results"]:
@@ -1236,13 +1260,13 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["root_confirmation_contract"],
-            "recursive-root-confirmation/v15+resolution/v2+evidence-policy/v5"
+            "recursive-root-confirmation/v16+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-            "+action-projection/v5"
+            "+action-projection/v6+response-identity/v1"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v13")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v14")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -3267,9 +3291,13 @@ class CausalCheckpointTest(unittest.TestCase):
             snapshot["payload"]["confirmations"][0].update(
                 {
                     "status": "rejected",
+                    "confidence": 0.5,
                     "counterfactual_status": "unknown",
                     "factor_role": "unknown",
                 }
+            )
+            refresh_checkpoint_confirmation_response_identity(
+                snapshot["payload"]["confirmations"][0]
             )
             snapshot["payload"]["seed_ledger"][0].update(
                 {
@@ -3294,9 +3322,13 @@ class CausalCheckpointTest(unittest.TestCase):
             report_action["payload"]["report"]["confirmations"][0].update(
                 {
                     "status": "rejected",
+                    "confidence": 0.5,
                     "counterfactual_status": "unknown",
                     "factor_role": "unknown",
                 }
+            )
+            refresh_checkpoint_confirmation_response_identity(
+                report_action["payload"]["report"]["confirmations"][0]
             )
             report_action["payload"]["report"]["seed_results"][0].update(
                 {

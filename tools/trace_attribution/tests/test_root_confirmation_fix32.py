@@ -15,6 +15,7 @@ from trace_attribution.causal_state import (
     RootConfirmation,
     annotate_report_semantic_anchors,
     confirmation_identity_for,
+    confirmation_response_identity_for,
 )
 from trace_attribution.checkpoint import CheckpointBundle
 from trace_attribution.recursive_analyzer import (
@@ -133,12 +134,25 @@ def drift_terminal_path(action):
         recursive_path=tuple(confirmation["recursive_path"]),
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    confirmation["response_identity"] = confirmation_response_identity_for(
+        confirmation_identity=confirmation["confirmation_identity"],
+        status=confirmation["status"],
+        excerpt=confirmation["excerpt"],
+        reason=confirmation["reason"],
+        counterfactual=confirmation["counterfactual"],
+        confidence=confirmation["confidence"],
+        evidence_refs=tuple(confirmation["evidence_refs"]),
+        counterfactual_status=confirmation["counterfactual_status"],
+        factor_role=confirmation["factor_role"],
+        competitor_comparisons=tuple(
+            confirmation["competitor_comparisons"]
+        ),
+        factor_mechanism=confirmation["factor_mechanism"],
+    )
     projection["recursive_path"] = copy.deepcopy(
         confirmation["recursive_path"]
     )
-    projection["response_identity"] = confirmation[
-        "confirmation_identity"
-    ]
+    projection["response_identity"] = confirmation["response_identity"]
     projection["confirmation"] = copy.deepcopy(confirmation)
     action["payload"]["confirmation"] = copy.deepcopy(confirmation)
 

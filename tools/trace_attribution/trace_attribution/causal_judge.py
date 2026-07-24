@@ -20,6 +20,7 @@ from .causal_state import (
     PredecessorAssessment,
     RootConfirmation,
     confirmation_identity_for,
+    validate_root_confirmation_substantive_invariants,
 )
 from .claude import ClaudeJudgeClient
 from .causal_retrieval import is_navigation_node, root_candidate_eligible
@@ -2415,7 +2416,7 @@ def validate_recursive_confirmation(
             for fragment in fact_tree.candidate_semantic_fragments
         ):
             raise ValueError("confirmed root requires a grounded excerpt from candidate facts")
-    return RootConfirmation(
+    confirmation = RootConfirmation(
         candidate_ref=request.candidate_ref,
         status=status,
         excerpt=excerpt,
@@ -2433,6 +2434,7 @@ def validate_recursive_confirmation(
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
     )
+    return validate_root_confirmation_substantive_invariants(confirmation)
 
 
 def preflight_root_confirmation_request(
@@ -2470,6 +2472,7 @@ def bind_root_confirmation(
         and confirmation.seed_binding_identity != request.seed_binding_identity
     ):
         raise ValueError("confirmation is cross-bound to another seed")
+    validate_root_confirmation_substantive_invariants(confirmation)
     allowed_factor_roles = {
         "confirmed": {"necessary_cause"},
         "rejected": {
@@ -2513,7 +2516,7 @@ def bind_root_confirmation(
         request=request,
         evidence_refs=evidence_refs,
     )
-    return RootConfirmation(
+    result = RootConfirmation(
         candidate_ref=confirmation.candidate_ref,
         status=confirmation.status,
         excerpt=confirmation.excerpt,
@@ -2531,6 +2534,7 @@ def bind_root_confirmation(
         competitor_comparisons=competitor_comparisons,
         factor_mechanism=factor_mechanism,
     )
+    return validate_root_confirmation_substantive_invariants(result)
 
 
 def root_confirmation_from_payload(

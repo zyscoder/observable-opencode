@@ -1147,6 +1147,11 @@ class SeedAttributionModelTests(unittest.TestCase):
                 candidate_ref="record:root",
                 status="rejected",
                 reason="The counterfactual evidence remains unresolved.",
+                counterfactual=(
+                    "Replacing the candidate has an unknown effect on the "
+                    "defect."
+                ),
+                confidence=0.5,
                 counterfactual_status="unknown",
                 factor_role="unknown",
             ),
@@ -1188,6 +1193,7 @@ class SeedAttributionModelTests(unittest.TestCase):
                         reason="The candidate remains a possible root.",
                         counterfactual="Correcting it prevents the defect.",
                         confidence=0.9,
+                        evidence_refs=["record:root"],
                     )
                 elif status == "rejected":
                     raw = RootConfirmation.rejected(
@@ -1964,7 +1970,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v14")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v15")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -1977,7 +1983,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v14")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v15")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

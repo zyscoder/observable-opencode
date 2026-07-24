@@ -29,9 +29,12 @@ from .causal_state import (
     semantic_occurrence_id,
     semantic_occurrence_index,
     semantic_visit_key,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
+    confirmation_response_identity_for,
     is_definitive_confirmation,
     seed_binding_identity_for,
+    validate_root_confirmation_substantive_invariants,
 )
 from .checkpoint import (
     CheckpointBundle,
@@ -118,7 +121,9 @@ __all__ = [
     "semantic_occurrence_id",
     "semantic_occurrence_index",
     "semantic_visit_key",
+    "confirmation_counterfactual_for",
     "confirmation_identity_for",
+    "confirmation_response_identity_for",
     "is_definitive_confirmation",
     "normalize_active_focus_text",
     "seed_binding_identity_for",
@@ -127,4 +132,5 @@ __all__ = [
     "candidate_compression_metrics",
     "publish_output_transaction",
     "validate_active_focus_binding",
+    "validate_root_confirmation_substantive_invariants",
 ]

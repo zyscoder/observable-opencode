@@ -48,11 +48,13 @@ from .causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
+    confirmation_counterfactual_for,
     confirmation_identity_for,
     is_definitive_confirmation,
     semantic_visit_key,
     seed_binding_identity_for,
     validate_confirmation_ownership,
+    validate_root_confirmation_substantive_invariants,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
 from .confirmation_path import is_confirmation_causal_edge
@@ -107,7 +109,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v11"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v12"
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -1871,7 +1873,7 @@ def _confirmation_action_projection(
         "operation": operation,
         "semantic_key": semantic_key,
         "request_identity": request_identity,
-        "response_identity": confirmation.confirmation_identity,
+        "response_identity": confirmation.response_identity,
         "owner": parsed_owner.to_dict(),
         "status": confirmation.status,
         "candidate_ref": confirmation.candidate_ref,
@@ -1901,6 +1903,7 @@ def _validate_terminal_confirmation_evidence(
     artifact_evidence_envelopes: Any,
     label: str,
 ) -> Tuple[JsonDict, ...]:
+    validate_root_confirmation_substantive_invariants(confirmation)
     if not isinstance(artifact_evidence_envelopes, (list, tuple)):
         raise ValueError(
             "{0} artifact evidence envelopes must be an array".format(label)
@@ -3716,6 +3719,7 @@ class SeedAttributionBuilder:
     ) -> None:
         if owner.seed_binding_identity != self.key:
             raise ValueError("confirmation owner does not match seed")
+        validate_root_confirmation_substantive_invariants(confirmation)
         self.candidate_refs.add(confirmation.candidate_ref)
         self.confirmation_identities.add(confirmation.confirmation_identity)
         self.decisive_evidence_refs.update(confirmation.evidence_refs)
@@ -9054,6 +9058,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=str(queued.get("candidate_ref") or ""),
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        str(queued.get("candidate_ref") or ""), "unknown"
+                    ),
                     reason=(
                         "terminal_artifact_preflight_rejected: {0}"
                     ).format(
@@ -9112,6 +9119,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=str(queued.get("candidate_ref") or ""),
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        str(queued.get("candidate_ref") or ""), "unknown"
+                    ),
                     reason="confirmation_request_ineligible: {0}: {1}".format(
                         type(exc).__name__, exc
                     ),
@@ -9144,6 +9154,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        request.candidate_ref, "unknown"
+                    ),
                     reason="confirmation_budget_unenforceable: Judge has no explicit bounded or offline capability",
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
@@ -9208,6 +9221,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        request.candidate_ref, "unknown"
+                    ),
                     reason="confirmation_interrupted: the prior in-flight confirmation is not repeated",
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
@@ -9318,6 +9334,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        request.candidate_ref, "unknown"
+                    ),
                     reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
@@ -9330,6 +9349,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        request.candidate_ref, "unknown"
+                    ),
                     reason="confirmation_failed: {0}: {1}".format(type(exc).__name__, exc),
                     counterfactual_status="unknown",
                     hypothesis_id=request.hypothesis_id,
@@ -9342,6 +9364,9 @@ class AgenticRecursiveAnalyzer:
                 confirmation = RootConfirmation(
                     candidate_ref=request.candidate_ref,
                     status="unknown",
+                    counterfactual=confirmation_counterfactual_for(
+                        request.candidate_ref, "unknown"
+                    ),
                     reason="confirmation_capability_error: {0}: {1}".format(
                         type(exc).__name__, exc
                     ),
@@ -9406,6 +9431,9 @@ class AgenticRecursiveAnalyzer:
                         confirmation = RootConfirmation(
                             candidate_ref=request.candidate_ref,
                             status="unknown",
+                            counterfactual=confirmation_counterfactual_for(
+                                request.candidate_ref, "unknown"
+                            ),
                             reason=(
                                 "terminal_confirmation_evidence_invalid: "
                                 "{0}: {1}"
@@ -9428,6 +9456,9 @@ class AgenticRecursiveAnalyzer:
                     confirmation = RootConfirmation(
                         candidate_ref=request.candidate_ref,
                         status="unknown",
+                        counterfactual=confirmation_counterfactual_for(
+                            request.candidate_ref, "unknown"
+                        ),
                         reason=(
                             "terminal_artifact_preflight_rejected: {0}"
                         ).format(final_disposition["rejection_reason"]),

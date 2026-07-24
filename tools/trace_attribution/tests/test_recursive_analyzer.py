@@ -26,6 +26,7 @@ from trace_attribution.causal_state import (
     RecursiveAttributionReport,
     RootConfirmation,
     confirmation_identity_for,
+    confirmation_response_identity_for,
     semantic_visit_key,
 )
 from trace_attribution.errors import (
@@ -224,6 +225,24 @@ def step(
     )
 
 
+def refresh_confirmation_response_identity(confirmation: dict) -> None:
+    confirmation["response_identity"] = confirmation_response_identity_for(
+        confirmation_identity=confirmation["confirmation_identity"],
+        status=confirmation["status"],
+        excerpt=confirmation["excerpt"],
+        reason=confirmation["reason"],
+        counterfactual=confirmation["counterfactual"],
+        confidence=confirmation["confidence"],
+        evidence_refs=tuple(confirmation["evidence_refs"]),
+        counterfactual_status=confirmation["counterfactual_status"],
+        factor_role=confirmation["factor_role"],
+        competitor_comparisons=tuple(
+            confirmation["competitor_comparisons"]
+        ),
+        factor_mechanism=confirmation["factor_mechanism"],
+    )
+
+
 def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     confirmation = report_payload["confirmations"][0]
     confirmation["candidate_ref"] = ghost_ref
@@ -243,6 +262,7 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
         recursive_path=confirmation["recursive_path"],
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    refresh_confirmation_response_identity(confirmation)
     root = report_payload["confirmed_roots"][0]
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
@@ -263,6 +283,7 @@ def forge_published_root_path(report_payload: dict, recursive_path: list[str]) -
         recursive_path=confirmation["recursive_path"],
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
+    refresh_confirmation_response_identity(confirmation)
     root = report_payload["confirmed_roots"][0]
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
@@ -2520,6 +2541,11 @@ class RecursiveRootRankingTest(unittest.TestCase):
                     candidate_ref="record:decision",
                     status="rejected",
                     reason="The counterfactual evidence is incomplete.",
+                    counterfactual=(
+                        "Replacing the decision has an unknown effect on "
+                        "the defect."
+                    ),
+                    confidence=0.5,
                     counterfactual_status="unknown",
                     factor_role="unknown",
                 )

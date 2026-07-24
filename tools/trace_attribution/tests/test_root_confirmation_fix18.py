@@ -217,6 +217,11 @@ class MixedPublicationJudge(OfflineJudgeCapability):
                 candidate_ref=request.candidate_ref,
                 status="rejected",
                 reason="The stale decision is a condition rather than a necessary root.",
+                counterfactual=(
+                    "Replacing the stale decision leaves the active defect "
+                    "present."
+                ),
+                confidence=0.9,
                 counterfactual_status="rejects_causality",
                 evidence_refs=(
                     request.candidate_ref,
