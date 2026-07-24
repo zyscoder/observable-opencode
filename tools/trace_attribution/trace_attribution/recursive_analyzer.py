@@ -7430,7 +7430,14 @@ class AgenticRecursiveAnalyzer:
             cache_identity=str(self.checkpoint_config.get("cache_identity") or ""),
             require_accounting_match=False,
         )
-        state.provider_state = provider
+        self._apply_validated_provider_result_state(state, provider)
+
+    def _apply_validated_provider_result_state(
+        self,
+        state: RecursiveAnalysisState,
+        provider: Mapping[str, Any],
+    ) -> None:
+        state.provider_state = copy.deepcopy(dict(provider))
         circuit = provider["circuit"]
         target = _judge_transport(self.judge)
         target.provider_circuit_open = bool(circuit["open"])
@@ -7439,6 +7446,47 @@ class AgenticRecursiveAnalyzer:
             circuit["consecutive_provider_errors"]
         )
         target.provider_error_threshold = int(circuit["provider_error_threshold"])
+
+    def _prevalidate_completed_replay_provider_state(
+        self,
+        state: RecursiveAnalysisState,
+        payload: Mapping[str, Any],
+        projection: Mapping[str, Any],
+    ) -> JsonDict:
+        projected_state = copy.copy(state)
+        if projection["physical_request_exact"]:
+            projected_requests = (
+                state.judge_requests
+                + projection["physical_request_delta"]
+                - projection["physical_requests_reserved"]
+            )
+            if projected_requests < 0:
+                raise ValueError(
+                    "completed confirmation replay accounting is invalid"
+                )
+            projected_state.judge_requests = projected_requests
+        else:
+            projected_state.judge_request_uncertainty_count += 1
+        provider = _validate_provider_state(
+            payload.get("provider_state"),
+            projected_state,
+            cache_identity=str(
+                self.checkpoint_config.get("cache_identity") or ""
+            ),
+            require_accounting_match=False,
+        )
+        accounting = provider["accounting"]
+        if (
+            accounting["judge_requests"]
+            != projected_state.judge_requests
+            or accounting["judge_request_uncertainty_count"]
+            != projected_state.judge_request_uncertainty_count
+        ):
+            raise ValueError(
+                "completed confirmation replay physical accounting "
+                "does not match recursive state"
+            )
+        return provider
 
     @staticmethod
     def _replay_action(state: RecursiveAnalysisState, semantic_key: str) -> Optional[JsonDict]:
@@ -9070,6 +9118,8 @@ class AgenticRecursiveAnalyzer:
             replayed_confirmation: Optional[RootConfirmation] = None
             replayed_physical_delta = 0
             replayed_physical_exact = True
+            replayed_provider_state: Optional[JsonDict] = None
+            replayed_projection: Optional[JsonDict] = None
             reserved_requests = 0
             if (
                 replay_action is not None
@@ -9148,15 +9198,23 @@ class AgenticRecursiveAnalyzer:
                     projection,
                     label="completed confirmation replay",
                 )
-                replayed_physical_delta = int(
-                    replay_payload.get("physical_request_delta") or 0
+                replayed_physical_delta = projection[
+                    "physical_request_delta"
+                ]
+                reserved_requests = projection[
+                    "physical_requests_reserved"
+                ]
+                replayed_physical_exact = projection[
+                    "physical_request_exact"
+                ]
+                replayed_provider_state = (
+                    self._prevalidate_completed_replay_provider_state(
+                        state,
+                        replay_payload,
+                        projection,
+                    )
                 )
-                reserved_requests = int(
-                    replay_payload.get("physical_requests_reserved") or 0
-                )
-                replayed_physical_exact = bool(
-                    replay_payload.get("physical_request_exact", True)
-                )
+                replayed_projection = projection
             if replay_action is None:
                 state.logical_judge_calls += 1
                 state.logical_confirmation_calls += 1
@@ -9349,8 +9407,11 @@ class AgenticRecursiveAnalyzer:
                     provider_state=self._capture_provider_result_state(state),
                     evidence_disposition=final_disposition,
                 )
-            elif replay_action is not None:
-                self._apply_provider_result_state(state, replay_action["payload"])
+            elif replayed_provider_state is not None:
+                self._apply_validated_provider_result_state(
+                    state,
+                    replayed_provider_state,
+                )
             normalized_reason = confirmation.reason.casefold()
             if any(
                 marker in normalized_reason
@@ -9361,12 +9422,15 @@ class AgenticRecursiveAnalyzer:
                 )
             ):
                 state._increment_budget("judge_requests")
-            if replayed_confirmation is not None and replay_action is not None:
-                projection = _confirmation_action_projection_from_record(
-                    replay_action
-                )
-                self._record_confirmation(
-                    state, queued, confirmation, projection
+            if (
+                replayed_confirmation is not None
+                and replayed_projection is not None
+            ):
+                self._record_validated_confirmation(
+                    state,
+                    queued,
+                    replayed_confirmation,
+                    replayed_projection,
                 )
             if (
                 confirmation.status == "rejected"
@@ -9964,6 +10028,20 @@ class AgenticRecursiveAnalyzer:
             action_projection,
             label="confirmation",
         )
+        self._record_validated_confirmation(
+            state,
+            queued,
+            confirmation,
+            projection,
+        )
+
+    def _record_validated_confirmation(
+        self,
+        state: RecursiveAnalysisState,
+        queued: JsonDict,
+        confirmation: RootConfirmation,
+        projection: JsonDict,
+    ) -> None:
         node = state.graph.nodes[confirmation.candidate_ref]
         queued["status"] = confirmation.status
         queued["confirmation"] = confirmation.to_dict()
