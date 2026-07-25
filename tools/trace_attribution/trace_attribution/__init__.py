@@ -50,6 +50,12 @@ from .evidence_capsule import (
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
 )
+from .evidence_expansion import (
+    EvidenceExpansionRequest,
+    EvidenceExpansionResult,
+    ExpansionLimits,
+    expand_evidence,
+)
 from .global_judge import (
     GlobalCandidateAssessment,
     GlobalCandidateJudgeRequest,
@@ -92,6 +98,9 @@ __all__ = [
     "CheckpointState",
     "ConfirmedRoot",
     "DefectState",
+    "EvidenceExpansionRequest",
+    "EvidenceExpansionResult",
+    "ExpansionLimits",
     "FrontierItem",
     "GlobalCandidateAssessment",
     "GlobalCandidateJudgeRequest",
@@ -130,6 +139,7 @@ __all__ = [
     "build_checkpoint_config",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
+    "expand_evidence",
     "publish_output_transaction",
     "validate_active_focus_binding",
     "validate_root_confirmation_substantive_invariants",

@@ -666,6 +666,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "anchor_ref": "record:audit_only_external",
                 "context_kind": "action_group",
                 "reason": "Inspect the shared-call member.",
+                "expected_judgment_change": (
+                    "The candidate may become eligible for comparative assessment."
+                ),
             }
         ]
         expansion["missing_evidence"] = ["Shared-call context is missing."]
@@ -818,6 +821,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                     "anchor_ref": "record:forged-expansion-anchor",
                     "context_kind": "action_group",
                     "reason": "Inspect the substituted action-group member.",
+                    "expected_judgment_change": (
+                        "The substituted member may change the candidate role."
+                    ),
                 }
             ]
             value["missing_evidence"] = ["The action-group member needs context."]
@@ -829,7 +835,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v8",
+            "global-candidate-validation-envelope/v9",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
@@ -1445,10 +1451,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_global_schema_is_v7_and_capsule_schema_is_v7(self):
+    def test_global_schema_is_v9_and_capsule_schema_is_v7(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v8",
+            "global-candidate-judgment/v9",
         )
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
 
@@ -1591,6 +1597,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "anchor_ref": "record:decision",
                 "context_kind": "upstream",
                 "reason": "Inspect the authored assumption that produced this decision.",
+                "expected_judgment_change": (
+                    "The decision may change from root_candidate to propagation_only."
+                ),
             }
         ]
 

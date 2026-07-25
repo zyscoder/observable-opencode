@@ -504,6 +504,10 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                     "anchor_ref": "record:decision",
                     "context_kind": "upstream",
                     "reason": "Inspect the authored implementation assumption.",
+                    "expected_judgment_change": (
+                        "The candidate may change from root_candidate to "
+                        "propagation_only."
+                    ),
                 },
             )
             missing = ("The candidate-local assumption needs recursive validation.",)
@@ -5040,7 +5044,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual([item.status for item in report.confirmations], ["confirmed"])
         self.assertEqual(RecursiveAttributionReport.from_dict(report.to_dict()), report)
 
-    def test_global_expansion_routes_only_the_requested_anchor_to_recursion(self):
+    def test_global_expansion_unavailable_context_is_an_evidence_gap(self):
         judge = FusionScriptedJudge(
             global_outcome="needs_expansion",
             script={"record:decision": step("record:decision", status="absent")},
@@ -5055,20 +5059,28 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
             objective="Find the primary trace-visible root.",
         )
 
+        self.assertEqual(judge.requests, [])
+        self.assertEqual(report.visited_order, ())
         self.assertEqual(
-            [request.current_node.ref for request in judge.requests],
-            ["record:decision"],
-        )
-        self.assertEqual(report.visited_order, ("record:decision",))
-        self.assertEqual(
-            report.metadata["recursive_expansion_reasons"][0]["anchor_ref"],
+            report.seed_results[0].expansion_history[0]["request"][
+                "anchor_ref"
+            ],
             "record:decision",
         )
         self.assertEqual(
-            report.seed_results[0].expansion_history[0]["anchor_ref"],
-            "record:decision",
+            report.seed_results[0].expansion_history[0]["status"],
+            "rejected",
         )
-        self.assertEqual(report.seed_results[0].outcome, "no_defect")
+        self.assertEqual(
+            report.seed_results[0].expansion_history[0][
+                "rejection_code"
+            ],
+            "context_unavailable",
+        )
+        self.assertEqual(
+            report.seed_results[0].outcome,
+            "evidence_gap",
+        )
 
 
 if __name__ == "__main__":

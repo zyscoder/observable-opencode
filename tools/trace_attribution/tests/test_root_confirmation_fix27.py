@@ -984,7 +984,7 @@ class Fix27VersionIdentityTest(unittest.TestCase):
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v8",
+            "global-candidate-judgment/v9",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
@@ -1004,7 +1004,7 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             CHECKPOINT_SCHEMA_VERSION,
             "recursive-attribution-checkpoint/v20",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v17")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

@@ -21,6 +21,11 @@ from .evidence_capsule import (
     CandidateEvidenceCapsule,
     validate_candidate_evidence_capsules_against_graph,
 )
+from .evidence_expansion import (
+    EVIDENCE_EXPANSION_CONTEXT_KINDS,
+    EvidenceExpansionResult,
+    validate_evidence_expansion_result_against_graph,
+)
 from .graph import TraceGraph
 from .models import JsonDict, stable_json
 
@@ -42,9 +47,7 @@ CAUSAL_ROLES = frozenset(
         "unknown",
     }
 )
-EXPANSION_CONTEXT_KINDS = frozenset(
-    {"upstream", "downstream", "artifact", "action_group", "full_node"}
-)
+EXPANSION_CONTEXT_KINDS = EVIDENCE_EXPANSION_CONTEXT_KINDS
 
 
 def _thaw(value: Any) -> Any:
@@ -112,6 +115,9 @@ class GlobalCandidateJudgeRequest:
     start_refs: Tuple[str, ...]
     capsules: Tuple[CandidateEvidenceCapsule, ...]
     trace_health: Mapping[str, Any] = field(default_factory=FrozenMapping)
+    evidence_expansions: Tuple[EvidenceExpansionResult, ...] = field(
+        default_factory=tuple
+    )
 
     def __post_init__(self) -> None:
         seed_ref = str(self.seed_ref).strip()
@@ -127,6 +133,9 @@ class GlobalCandidateJudgeRequest:
         object.__setattr__(self, "start_refs", tuple(str(item) for item in self.start_refs))
         object.__setattr__(self, "capsules", tuple(self.capsules))
         object.__setattr__(self, "trace_health", _freeze(self.trace_health))
+        object.__setattr__(
+            self, "evidence_expansions", tuple(self.evidence_expansions)
+        )
         self.validate()
 
     def validate(self) -> None:
@@ -154,6 +163,29 @@ class GlobalCandidateJudgeRequest:
                 raise ValueError("global candidate request capsule defect drifts from active_defect")
             if tuple(capsule.start_refs) != (self.seed_ref,):
                 raise ValueError("global candidate request capsule drifts from active seed_ref")
+        expansion_identities = []
+        for expansion in self.evidence_expansions:
+            if not isinstance(expansion, EvidenceExpansionResult):
+                raise TypeError(
+                    "global candidate request expansion must be EvidenceExpansionResult"
+                )
+            if expansion.status != "expanded":
+                raise ValueError(
+                    "global candidate request may include only successful evidence expansions"
+                )
+            if (
+                expansion.request.seed_ref != self.seed_ref
+                or expansion.request.defect_fingerprint
+                != self.active_defect.fingerprint
+            ):
+                raise ValueError(
+                    "global candidate request expansion drifts from active seed or defect"
+                )
+            expansion_identities.append(expansion.request_identity)
+        if len(expansion_identities) != len(set(expansion_identities)):
+            raise ValueError(
+                "global candidate request contains duplicate evidence expansions"
+            )
 
     @property
     def offered_candidate_refs(self) -> Tuple[str, ...]:
@@ -226,6 +258,14 @@ class GlobalCandidateJudgeRequest:
                         for item in edge.get("evidence_refs") or []
                         if str(item) in resolved_evidence_refs
                     )
+        for expansion in self.evidence_expansions:
+            refs.extend(
+                (
+                    expansion.request.anchor_ref,
+                    *expansion.resolved_refs,
+                )
+            )
+            refs.extend(_expansion_payload_refs(expansion.to_dict()))
         output = []
         seen = set()
         for ref in refs:
@@ -253,6 +293,9 @@ class GlobalCandidateJudgeRequest:
                 "active_focus_text_hash": self.active_focus_text_hash,
             },
             "trace_health": _thaw(self.trace_health),
+            "evidence_expansions": [
+                item.to_dict() for item in self.evidence_expansions
+            ],
             "offered_candidate_refs": list(self.offered_candidate_refs),
             "open_authored_root_candidate_refs": list(
                 self.open_authored_root_candidate_refs
@@ -277,6 +320,9 @@ class GlobalCandidateJudgeRequest:
             "active_focus_text_hash": self.active_focus_text_hash,
             "start_refs": list(self.start_refs),
             "trace_health": _thaw(self.trace_health),
+            "evidence_expansions": [
+                item.to_dict() for item in self.evidence_expansions
+            ],
             "candidate_evidence_capsules": [
                 item.to_dict() for item in self.capsules
             ],
@@ -303,6 +349,7 @@ def global_candidate_request_from_validation_envelope(
         "active_focus_text_hash",
         "start_refs",
         "trace_health",
+        "evidence_expansions",
         "candidate_evidence_capsules",
     }
     if (
@@ -315,6 +362,7 @@ def global_candidate_request_from_validation_envelope(
     trace_health = value.get("trace_health")
     start_refs = value.get("start_refs")
     capsules = value.get("candidate_evidence_capsules")
+    evidence_expansions = value.get("evidence_expansions")
     if not isinstance(active_defect, Mapping):
         raise TypeError("validation envelope active_defect must be an object")
     if not isinstance(trace_health, Mapping):
@@ -325,6 +373,10 @@ def global_candidate_request_from_validation_envelope(
         raise TypeError("validation envelope start_refs must be a string array")
     if not isinstance(capsules, list):
         raise TypeError("validation envelope capsules must be an array")
+    if not isinstance(evidence_expansions, list):
+        raise TypeError(
+            "validation envelope evidence_expansions must be an array"
+        )
     request = GlobalCandidateJudgeRequest(
         case_id=str(value.get("case_id") or ""),
         objective=str(value.get("objective") or ""),
@@ -338,6 +390,10 @@ def global_candidate_request_from_validation_envelope(
             CandidateEvidenceCapsule.from_dict(item) for item in capsules
         ),
         trace_health=trace_health,
+        evidence_expansions=tuple(
+            EvidenceExpansionResult.from_dict(item)
+            for item in evidence_expansions
+        ),
     )
     if graph is not None:
         validate_global_candidate_request_against_graph(
@@ -410,6 +466,12 @@ def validate_global_candidate_request_against_graph(
         request.capsules,
         authoritative_candidates=authoritative_candidates,
     )
+    for expansion in request.evidence_expansions:
+        validate_evidence_expansion_result_against_graph(
+            graph,
+            expansion,
+            limits=expansion.limits,
+        )
     if any(
         not graph.active_revision_evidence_eligible(capsule.candidate_ref)
         for capsule in request.capsules
@@ -575,7 +637,7 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
                 "Never select a candidate with root_candidate_eligible=false as a root; treat tool results, verification, and evidence facts as evidence instead.",
                 "Choose no_defect only when decisive grounded evidence contradicts the observed defect and every open authored root-eligible candidate has exactly one conclusive assessment that rules it out.",
                 "For no_defect, every open authored root-eligible candidate must have known input and output status, absent output, a known causal role, a complete grounded candidate-to-seed path, and a decidable counterfactual; uncertainty requires needs_expansion or inconclusive with concrete missing_evidence.",
-                "Choose needs_expansion only when a specific grounded anchor needs more upstream, downstream, artifact, action_group, or full_node context and the missing content would change the current judgment.",
+                "Choose needs_expansion only when a specific grounded anchor needs more upstream, downstream, artifact, action_group, message_transform, or full_node context and the missing content would change the current judgment.",
                 "An unavailable or truncated artifact is not automatically blocking when recorded structured facts or previews already decide the objective; explain any actual semantic gap instead of expanding by default.",
                 "Outcome evidence and successful verification can expose or contradict a defect but are not root causes merely because they are adjacent.",
                 "Do not force a root; inconclusive and no_defect are valid outcomes.",
@@ -612,8 +674,9 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
                 "expansion_requests": [
                     {
                         "anchor_ref": "grounded ref",
-                        "context_kind": "upstream|downstream|artifact|action_group|full_node",
+                        "context_kind": "upstream|downstream|artifact|action_group|message_transform|full_node",
                         "reason": "non-empty evidence-gap reason",
+                        "expected_judgment_change": "non-empty statement of which assessment or outcome may change",
                     }
                 ],
                 "decisive_evidence_refs": ["grounded refs"],
@@ -1054,22 +1117,67 @@ def _expansion_requests(value: Any, grounded: set[str]) -> Tuple[Mapping[str, An
     output = []
     seen = set()
     for item in value:
-        if not isinstance(item, Mapping) or set(item) != {"anchor_ref", "context_kind", "reason"}:
+        if not isinstance(item, Mapping) or set(item) != {
+            "anchor_ref",
+            "context_kind",
+            "reason",
+            "expected_judgment_change",
+        }:
             raise ValueError("expansion request schema mismatch")
         anchor = str(item.get("anchor_ref") or "")
         kind = str(item.get("context_kind") or "")
         reason = str(item.get("reason") or "").strip()
+        expected_change = str(
+            item.get("expected_judgment_change") or ""
+        ).strip()
         if anchor not in grounded:
             raise ValueError("expansion request requires a grounded anchor")
         if kind not in EXPANSION_CONTEXT_KINDS:
             raise ValueError("unsupported expansion context kind")
         if not reason:
             raise ValueError("expansion request reason must be non-empty")
+        if not expected_change:
+            raise ValueError(
+                "expansion request expected_judgment_change must be non-empty"
+            )
         identity = (anchor, kind)
         if identity in seen:
             raise ValueError("duplicate expansion request")
         seen.add(identity)
-        output.append(FrozenMapping({"anchor_ref": anchor, "context_kind": kind, "reason": reason}))
+        output.append(
+            FrozenMapping(
+                {
+                    "anchor_ref": anchor,
+                    "context_kind": kind,
+                    "reason": reason,
+                    "expected_judgment_change": expected_change,
+                }
+            )
+        )
+    return tuple(output)
+
+
+def _expansion_payload_refs(value: Any) -> Tuple[str, ...]:
+    output = []
+    seen = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str) and item.startswith(
+            ("record:", "progress_episode:", "artifact:")
+        ):
+            if item not in seen:
+                seen.add(item)
+                output.append(item)
+            return
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested)
+            return
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
     return tuple(output)
 
 

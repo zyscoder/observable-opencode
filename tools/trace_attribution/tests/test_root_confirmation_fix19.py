@@ -628,7 +628,7 @@ class LocalStateOwnerRestoreTest(unittest.TestCase):
             CHECKPOINT_SCHEMA_VERSION,
             "recursive-attribution-checkpoint/v20",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v17")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
             "recursive-attribution-report/v20",

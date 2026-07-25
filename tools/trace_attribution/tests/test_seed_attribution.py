@@ -376,6 +376,11 @@ class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
         self.step_requests = []
 
     def judge_candidates_bounded(self, request, *, max_physical_requests):
+        if request.evidence_expansions:
+            return super().judge_candidates_bounded(
+                request,
+                max_physical_requests=max_physical_requests,
+            )
         self.global_requests.append(request)
         return BoundedJudgeCallResult(
             GlobalCandidateJudgment(
@@ -406,8 +411,11 @@ class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
                 expansion_requests=(
                     {
                         "anchor_ref": "record:shared_root",
-                        "context_kind": "upstream",
+                        "context_kind": "downstream",
                         "reason": "Independently inspect the shared root.",
+                        "expected_judgment_change": (
+                            "The shared root may become a confirmed root candidate."
+                        ),
                     },
                 ),
                 decisive_evidence_refs=("record:shared_root",),
@@ -941,13 +949,27 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
         uninterrupted_judge = NeedsExpansionSharedRootFusionJudge()
         uninterrupted = analyze(uninterrupted_judge)
-        root_steps = [
-            request
-            for request in uninterrupted_judge.step_requests
-            if request.current_node.ref == "record:shared_root"
-        ]
-
-        self.assertEqual(len(root_steps), 2)
+        self.assertEqual(uninterrupted_judge.step_requests, [])
+        self.assertEqual(len(uninterrupted_judge.global_requests), 4)
+        requests_by_seed = {
+            seed_ref: [
+                request
+                for request in uninterrupted_judge.global_requests
+                if request.seed_ref == seed_ref
+            ]
+            for seed_ref in start_refs
+        }
+        for seed_ref, requests in requests_by_seed.items():
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0].evidence_expansions, ())
+            self.assertEqual(len(requests[1].evidence_expansions), 1)
+            expansion = requests[1].evidence_expansions[0]
+            self.assertEqual(expansion.status, "expanded")
+            self.assertEqual(expansion.request.seed_ref, seed_ref)
+            self.assertEqual(
+                expansion.request.defect_fingerprint,
+                requests[1].active_defect.fingerprint,
+            )
         self.assertEqual(len(uninterrupted.confirmations), 2)
         self.assertEqual(
             len(
@@ -1907,7 +1929,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={
-                "schema_version": "global-candidate-judgment/v8",
+                "schema_version": "global-candidate-judgment/v9",
                 "outcome": "inconclusive",
                 "reason": "No global candidates were available.",
                 "assessments": [],

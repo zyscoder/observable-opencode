@@ -1275,13 +1275,14 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v8+validation-envelope/v8+capsule/v7"
+            "global-candidate-judgment/v9+validation-envelope/v9+capsule/v7"
             "+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
             "+failure-projection/v4+terminal-record-schema/v3"
             "+judge-lifecycle/v1+graph-seed-authority/v1"
             "+objective-authority/v1"
-            "+candidate-set-closure/v1+comparison-matrix-closure/v1",
+            "+candidate-set-closure/v1+comparison-matrix-closure/v1"
+            "+bounded-evidence-expansion/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],

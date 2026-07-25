@@ -71,6 +71,12 @@ from .evidence_capsule import (
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
 )
+from .evidence_expansion import (
+    EvidenceExpansionRequest,
+    EvidenceExpansionResult,
+    ExpansionLimits,
+    expand_evidence,
+)
 from .global_judge import (
     GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
     MAX_ROOT_CONFIRMATION_CANDIDATES,
@@ -116,7 +122,10 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v17"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v18"
+GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS = 3
+GLOBAL_EVIDENCE_EXPANSION_MAX_NODES = 8
+GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES = 32_768
 GLOBAL_JUDGE_ACTION_OPERATIONS = frozenset(
     {
         "global_judge_started",
@@ -148,6 +157,9 @@ GLOBAL_JUDGE_COMPLETED_PAYLOAD_KEYS = frozenset(
         "physical_request_delta",
         "physical_request_exact",
         "judgment",
+        "final_validation_envelope",
+        "evidence_expansion_history",
+        "expansion_terminal",
         "provider_state",
     }
 )
@@ -194,6 +206,8 @@ COMPLETED_GLOBAL_PASS_KEYS = frozenset(
         "physical_request_delta",
         "candidate_compression",
         "candidate_evidence_capsules",
+        "evidence_expansion_history",
+        "expansion_terminal",
         "judgment",
         "behavior_impact",
     }
@@ -2557,6 +2571,15 @@ def _classify_global_pass_records(
                     item.get("candidate_evidence_capsules"),
                     (list, tuple),
                 )
+                or not isinstance(
+                    item.get("evidence_expansion_history"),
+                    (list, tuple),
+                )
+                or not isinstance(item.get("expansion_terminal"), Mapping)
+                or set(item.get("expansion_terminal") or {}) != {
+                    "blocker",
+                    "detail",
+                }
                 or not isinstance(item.get("judgment"), Mapping)
             ):
                 raise ValueError(
@@ -3623,6 +3646,93 @@ def _global_judge_capsule_identity(
     )
 
 
+def _validated_global_evidence_expansion_envelope(
+    *,
+    initial_request: GlobalCandidateJudgeRequest,
+    final_validation_envelope: Any,
+    expansion_history: Any,
+) -> Tuple[
+    GlobalCandidateJudgeRequest,
+    Tuple[EvidenceExpansionResult, ...],
+]:
+    if not isinstance(expansion_history, list):
+        raise ValueError(
+            "global Judge evidence expansion history must be an array"
+        )
+    history = tuple(
+        EvidenceExpansionResult.from_dict(item) for item in expansion_history
+    )
+    seen = {
+        item.request_identity for item in initial_request.evidence_expansions
+    }
+    successful = list(initial_request.evidence_expansions)
+    for item in history:
+        if (
+            item.request.seed_ref != initial_request.seed_ref
+            or item.request.defect_fingerprint
+            != initial_request.active_defect.fingerprint
+        ):
+            raise ValueError(
+                "global Judge evidence expansion history drifts from the active seed"
+            )
+        if item.status == "expanded":
+            if item.request_identity in seen:
+                raise ValueError(
+                    "global Judge evidence expansion history repeats a successful request"
+                )
+            seen.add(item.request_identity)
+            successful.append(item)
+        elif (
+            item.rejection_code == "duplicate_request"
+            and item.request_identity not in seen
+        ):
+            raise ValueError(
+                "duplicate evidence expansion rejection has no prior request"
+            )
+    final_request = global_candidate_request_from_validation_envelope(
+        final_validation_envelope
+    )
+    expected_final = replace(
+        initial_request,
+        evidence_expansions=tuple(successful),
+    )
+    if stable_json(final_request.validation_envelope()) != stable_json(
+        expected_final.validation_envelope()
+    ):
+        raise ValueError(
+            "global Judge final validation envelope contradicts its bounded expansion history"
+        )
+    return final_request, history
+
+
+def _validated_global_expansion_terminal(
+    value: Any,
+    *,
+    judgment: GlobalCandidateJudgment,
+) -> JsonDict:
+    if not isinstance(value, Mapping) or set(value) != {
+        "blocker",
+        "detail",
+    }:
+        raise ValueError(
+            "global evidence expansion terminal schema mismatch"
+        )
+    terminal = {
+        "blocker": str(value.get("blocker") or ""),
+        "detail": str(value.get("detail") or ""),
+    }
+    if judgment.outcome == "needs_expansion":
+        if not terminal["blocker"] or not terminal["detail"]:
+            raise ValueError(
+                "terminal needs_expansion requires a concrete expansion blocker"
+            )
+    elif terminal["blocker"] or terminal["detail"]:
+        raise ValueError(
+            "terminal expansion blocker is only valid for needs_expansion"
+        )
+    return terminal
+
+
 def _global_pass_owner(builder: "SeedAttributionBuilder") -> LocalStateOwner:
     return _canonical_global_pass_facts(
         seed_ref=builder.start_ref,
@@ -3871,14 +3981,29 @@ def _validated_global_judge_action_history(
                 raise ValueError(
                     "completed global Judge action requires exact accounting"
                 )
+            final_request, _ = (
+                _validated_global_evidence_expansion_envelope(
+                    initial_request=request,
+                    final_validation_envelope=terminal.get(
+                        "final_validation_envelope"
+                    ),
+                    expansion_history=terminal.get(
+                        "evidence_expansion_history"
+                    ),
+                )
+            )
             judgment = validate_global_candidate_payload(
                 terminal.get("judgment"),
-                request=request,
+                request=final_request,
             )
             if judgment.to_dict() != dict(terminal["judgment"]):
                 raise ValueError(
                     "completed global Judge action judgment is not canonical"
                 )
+            _validated_global_expansion_terminal(
+                terminal.get("expansion_terminal"),
+                judgment=judgment,
+            )
         else:
             blocker = str(terminal.get("blocker") or "")
             detail = str(terminal.get("detail") or "")
@@ -4025,14 +4150,27 @@ def _validated_global_judge_action(
             raise ValueError(
                 "completed global Judge action judgment must be an object"
             )
+        final_request, _ = _validated_global_evidence_expansion_envelope(
+            initial_request=request,
+            final_validation_envelope=payload.get(
+                "final_validation_envelope"
+            ),
+            expansion_history=payload.get(
+                "evidence_expansion_history"
+            ),
+        )
         judgment = validate_global_candidate_payload(
             judgment_payload,
-            request=request,
+            request=final_request,
         )
         if judgment.to_dict() != dict(judgment_payload):
             raise ValueError(
                 "completed global Judge action judgment is not canonical"
             )
+        _validated_global_expansion_terminal(
+            payload.get("expansion_terminal"),
+            judgment=judgment,
+        )
     else:
         blocker = str(payload.get("blocker") or "")
         detail = str(payload.get("detail") or "")
@@ -4498,6 +4636,9 @@ class SeedAttributionBuilder:
         candidate_refs: Iterable[str],
         request: GlobalCandidateJudgeRequest,
         owner: LocalStateOwner,
+        expansion_history: Iterable[EvidenceExpansionResult] = (),
+        terminal_blocker: str = "",
+        terminal_blocker_detail: str = "",
     ) -> None:
         if owner.seed_binding_identity != self.key:
             raise ValueError("global judgment owner does not match seed")
@@ -4514,10 +4655,10 @@ class SeedAttributionBuilder:
         self.global_judgment["owner"] = owner.to_dict()
         self.expansion_history.extend(
             {
-                **copy.deepcopy(dict(item)),
+                **copy.deepcopy(item.to_dict()),
                 "owner": owner.to_dict(),
             }
-            for item in judgment.expansion_requests
+            for item in expansion_history
         )
         self._record_decisive_evidence(judgment.decisive_evidence_refs, owner)
         if judgment.outcome == "no_defect":
@@ -4526,6 +4667,14 @@ class SeedAttributionBuilder:
             self.mark_unresolved(
                 "global_judgment_inconclusive",
                 "; ".join(judgment.missing_evidence) or judgment.reason,
+            )
+        elif judgment.outcome == "needs_expansion":
+            self.mark_unresolved(
+                terminal_blocker
+                or "global_evidence_expansion_incomplete",
+                terminal_blocker_detail
+                or "; ".join(judgment.missing_evidence)
+                or judgment.reason,
             )
 
     def _record_decisive_evidence(
@@ -5458,10 +5607,14 @@ class RecursiveAnalysisState:
                     )
                 capsules = action.get("candidate_evidence_capsules")
                 compression = action.get("candidate_compression")
+                raw_expansion_history = action.get(
+                    "evidence_expansion_history"
+                )
                 envelope = judgment.get("validation_envelope")
                 if (
                     not isinstance(capsules, (list, tuple))
                     or not isinstance(compression, Mapping)
+                    or not isinstance(raw_expansion_history, (list, tuple))
                     or not isinstance(envelope, Mapping)
                 ):
                     raise ValueError(
@@ -5489,6 +5642,12 @@ class RecursiveAnalysisState:
                             dict(compression)
                         ),
                     },
+                    "evidence_expansions": [
+                        copy.deepcopy(dict(item))
+                        for item in raw_expansion_history
+                        if isinstance(item, Mapping)
+                        and item.get("status") == "expanded"
+                    ],
                     "candidate_evidence_capsules": copy.deepcopy(
                         list(capsules)
                     ),
@@ -5502,12 +5661,7 @@ class RecursiveAnalysisState:
                     )
                 expected_expansion = [
                     _owned_payload(item, owner.to_dict())
-                    for item in (
-                        action.get("judgment", {}).get(
-                            "expansion_requests"
-                        )
-                        or ()
-                    )
+                    for item in raw_expansion_history
                     if isinstance(item, Mapping)
                 ]
                 expected_candidate_refs[builder.key].update(
@@ -5678,7 +5832,7 @@ class RecursiveAnalysisState:
                         builder.global_judgment.get(
                             "validation_envelope"
                         ),
-                        terminal.get("validation_envelope"),
+                        terminal.get("final_validation_envelope"),
                     )
                 ):
                     raise ValueError(
@@ -8255,6 +8409,22 @@ class RecursiveAnalysisState:
         )
 
 
+@dataclass(frozen=True)
+class GlobalEvidenceExpansionLoopResult:
+    request: GlobalCandidateJudgeRequest
+    judgment: GlobalCandidateJudgment
+    physical_requests: int
+    expansion_history: Tuple[EvidenceExpansionResult, ...]
+    blocker: str = ""
+    blocker_detail: str = ""
+
+
+class GlobalJudgeLoopValidationError(ValueError):
+    def __init__(self, message: str, *, physical_requests: int):
+        super().__init__(message)
+        self.physical_requests = physical_requests
+
+
 class AgenticRecursiveAnalyzer:
     def __init__(
         self,
@@ -8591,6 +8761,196 @@ class AgenticRecursiveAnalyzer:
         value = state.replay_actions.get(semantic_key)
         return dict(value) if isinstance(value, Mapping) else None
 
+    def _run_global_evidence_expansion_loop(
+        self,
+        *,
+        graph: TraceGraph,
+        initial_request: GlobalCandidateJudgeRequest,
+        candidates: Sequence[CausalCandidate],
+        max_physical_requests: int,
+    ) -> GlobalEvidenceExpansionLoopResult:
+        if (
+            isinstance(max_physical_requests, bool)
+            or not isinstance(max_physical_requests, int)
+            or max_physical_requests <= 0
+        ):
+            raise ValueError(
+                "global evidence expansion requires a positive request budget"
+            )
+        current_request = initial_request
+        successful_expansions: List[EvidenceExpansionResult] = list(
+            initial_request.evidence_expansions
+        )
+        expansion_history: List[EvidenceExpansionResult] = []
+        seen_request_identities = {
+            item.request_identity for item in successful_expansions
+        }
+        physical_requests = 0
+        completed_expansion_rounds = 0
+
+        while True:
+            remaining = max_physical_requests - physical_requests
+            if remaining <= 0:
+                return GlobalEvidenceExpansionLoopResult(
+                    request=current_request,
+                    judgment=judgment,
+                    physical_requests=physical_requests,
+                    expansion_history=tuple(expansion_history),
+                    blocker="judge_request_budget_exhausted",
+                    blocker_detail=(
+                        "The Global Judge request budget was exhausted before "
+                        "the expanded evidence could be re-evaluated."
+                    ),
+                )
+            try:
+                result = self.judge.judge_candidates_bounded(
+                    current_request,
+                    max_physical_requests=remaining,
+                )
+            except BoundedJudgeCallError as exc:
+                raise BoundedJudgeCallError(
+                    str(exc),
+                    physical_requests=physical_requests
+                    + exc.physical_requests,
+                ) from exc
+            if not isinstance(result, BoundedJudgeCallResult):
+                raise GlobalJudgeLoopValidationError(
+                    "global Judge must return BoundedJudgeCallResult",
+                    physical_requests=physical_requests,
+                )
+            if result.physical_requests > remaining:
+                raise GlobalJudgeLoopValidationError(
+                    "global Judge exceeded its physical request allowance",
+                    physical_requests=physical_requests,
+                )
+            physical_requests += result.physical_requests
+            judgment = result.value
+            try:
+                if not isinstance(judgment, GlobalCandidateJudgment):
+                    raise TypeError(
+                        "global Judge returned an unsupported judgment"
+                    )
+                validate_active_focus_binding(current_request, judgment)
+                judgment = validate_global_candidate_payload(
+                    judgment.to_dict(),
+                    request=current_request,
+                )
+            except Exception as exc:
+                raise GlobalJudgeLoopValidationError(
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                    physical_requests=physical_requests,
+                ) from exc
+
+            if judgment.outcome != "needs_expansion":
+                return GlobalEvidenceExpansionLoopResult(
+                    request=current_request,
+                    judgment=judgment,
+                    physical_requests=physical_requests,
+                    expansion_history=tuple(expansion_history),
+                )
+            if (
+                completed_expansion_rounds
+                >= GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS
+            ):
+                return GlobalEvidenceExpansionLoopResult(
+                    request=current_request,
+                    judgment=judgment,
+                    physical_requests=physical_requests,
+                    expansion_history=tuple(expansion_history),
+                    blocker="global_evidence_expansion_round_budget_exhausted",
+                    blocker_detail=(
+                        "The Global Judge still requested evidence after "
+                        "{0} bounded expansion rounds."
+                    ).format(GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS),
+                )
+
+            round_nodes = 0
+            round_bytes = 0
+            round_failed: Optional[EvidenceExpansionResult] = None
+            for requested in judgment.expansion_requests:
+                remaining_nodes = (
+                    GLOBAL_EVIDENCE_EXPANSION_MAX_NODES - round_nodes
+                )
+                remaining_bytes = (
+                    GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES - round_bytes
+                )
+                if remaining_nodes <= 0 or remaining_bytes <= 0:
+                    return GlobalEvidenceExpansionLoopResult(
+                        request=current_request,
+                        judgment=judgment,
+                        physical_requests=physical_requests,
+                        expansion_history=tuple(expansion_history),
+                        blocker=(
+                            "global_evidence_expansion_round_budget_exhausted"
+                        ),
+                        blocker_detail=(
+                            "Expansion request {0}/{1} exceeded the shared "
+                            "per-round limit of {2} nodes and {3} bytes."
+                        ).format(
+                            requested.get("anchor_ref"),
+                            requested.get("context_kind"),
+                            GLOBAL_EVIDENCE_EXPANSION_MAX_NODES,
+                            GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES,
+                        ),
+                    )
+                expansion_request = EvidenceExpansionRequest(
+                    seed_ref=current_request.seed_ref,
+                    defect_fingerprint=current_request.active_defect.fingerprint,
+                    anchor_ref=str(requested.get("anchor_ref") or ""),
+                    context_kind=str(requested.get("context_kind") or ""),
+                    reason=str(requested.get("reason") or ""),
+                    expected_judgment_change=str(
+                        requested.get("expected_judgment_change") or ""
+                    ),
+                )
+                expansion = expand_evidence(
+                    graph,
+                    expansion_request,
+                    ExpansionLimits(
+                        max_nodes=remaining_nodes,
+                        max_bytes=remaining_bytes,
+                    ),
+                    seen_request_identities=seen_request_identities,
+                )
+                expansion_history.append(expansion)
+                if expansion.status == "rejected":
+                    round_failed = expansion
+                    break
+                seen_request_identities.add(expansion.request_identity)
+                successful_expansions.append(expansion)
+                round_nodes += max(1, len(expansion.resolved_refs))
+                round_bytes += expansion.total_bytes
+
+            current_request = replace(
+                current_request,
+                evidence_expansions=tuple(successful_expansions),
+            )
+            validate_global_candidate_request_against_graph(
+                graph,
+                current_request,
+                authoritative_candidates=candidates,
+                authoritative_objective=current_request.objective,
+            )
+            if round_failed is not None:
+                return GlobalEvidenceExpansionLoopResult(
+                    request=current_request,
+                    judgment=judgment,
+                    physical_requests=physical_requests,
+                    expansion_history=tuple(expansion_history),
+                    blocker="global_evidence_expansion_{0}".format(
+                        round_failed.rejection_code
+                    ),
+                    blocker_detail=(
+                        "Expansion {0} at {1}/{2} was rejected: {3}"
+                    ).format(
+                        round_failed.request_identity,
+                        round_failed.request.anchor_ref,
+                        round_failed.request.context_kind,
+                        round_failed.rejection_reason,
+                    ),
+                )
+            completed_expansion_rounds += 1
+
     def _run_global_candidate_prepass(
         self, state: RecursiveAnalysisState, graph: TraceGraph
     ) -> None:
@@ -8806,6 +9166,10 @@ class AgenticRecursiveAnalyzer:
             replay_payload: Optional[JsonDict] = None
             replay_provider_state: Optional[JsonDict] = None
             reserved_requests = remaining
+            final_request = request
+            expansion_history: Tuple[EvidenceExpansionResult, ...] = ()
+            terminal_blocker = ""
+            terminal_blocker_detail = ""
             if replay_action is not None:
                 replay_payload = _validated_global_judge_action(
                     replay_action,
@@ -8900,10 +9264,30 @@ class AgenticRecursiveAnalyzer:
                     )
                     terminal_pass_identities.add(pass_identity)
                     continue
+                final_request = (
+                    global_candidate_request_from_validation_envelope(
+                        replay_payload["final_validation_envelope"],
+                        graph=graph,
+                        authoritative_candidates=candidates,
+                        authoritative_objective=state.objective,
+                    )
+                )
                 judgment = validate_global_candidate_payload(
                     replay_payload["judgment"],
-                    request=request,
+                    request=final_request,
                 )
+                expansion_history = tuple(
+                    EvidenceExpansionResult.from_dict(value)
+                    for value in replay_payload[
+                        "evidence_expansion_history"
+                    ]
+                )
+                expansion_terminal = _validated_global_expansion_terminal(
+                    replay_payload["expansion_terminal"],
+                    judgment=judgment,
+                )
+                terminal_blocker = expansion_terminal["blocker"]
+                terminal_blocker_detail = expansion_terminal["detail"]
                 physical_delta = replay_payload[
                     "physical_request_delta"
                 ]
@@ -8934,10 +9318,12 @@ class AgenticRecursiveAnalyzer:
                     started_payload,
                 )
                 state.logical_judge_calls += 1
-                result: Any = None
                 try:
-                    result = self.judge.judge_candidates_bounded(
-                        request, max_physical_requests=remaining
+                    loop_result = self._run_global_evidence_expansion_loop(
+                        graph=graph,
+                        initial_request=request,
+                        candidates=candidates,
+                        max_physical_requests=remaining,
                     )
                 except BoundedJudgeCallError as exc:
                     physical_delta = exc.physical_requests
@@ -8948,6 +9334,51 @@ class AgenticRecursiveAnalyzer:
                         ) from exc
                     state.judge_requests += physical_delta
                     blocker = "global_judge_bounded_failure"
+                    detail = "{0}: {1}".format(type(exc).__name__, exc)
+                    failure_projection = _global_failure_projection(
+                        builder=builder,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        physical_request_exact=True,
+                    )
+                    failed_payload = {
+                        **started_payload,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
+                        "blocker": blocker,
+                        "detail": detail,
+                        "failure_projection": failure_projection,
+                        "provider_state": self._capture_provider_result_state(
+                            state
+                        ),
+                    }
+                    self._checkpoint_action(
+                        "global_judge_failed",
+                        action_key,
+                        failed_payload,
+                    )
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                except GlobalJudgeLoopValidationError as exc:
+                    physical_delta = exc.physical_requests
+                    if physical_delta > remaining:
+                        raise ValueError(
+                            "Global Judge result exceeded its reserved request "
+                            "allowance"
+                        ) from exc
+                    state.judge_requests += physical_delta
+                    blocker = "global_judge_output_invalid"
                     detail = "{0}: {1}".format(type(exc).__name__, exc)
                     failure_projection = _global_failure_projection(
                         builder=builder,
@@ -9029,74 +9460,12 @@ class AgenticRecursiveAnalyzer:
                     )
                     terminal_pass_identities.add(pass_identity)
                     continue
-                try:
-                    if not isinstance(result, BoundedJudgeCallResult):
-                        raise TypeError(
-                            "global Judge must return BoundedJudgeCallResult"
-                        )
-                    physical_delta = result.physical_requests
-                    if physical_delta > remaining:
-                        raise ValueError(
-                            "global Judge exceeded its physical request allowance"
-                        )
-                    judgment = result.value
-                    if not isinstance(judgment, GlobalCandidateJudgment):
-                        raise TypeError(
-                            "global Judge returned an unsupported judgment"
-                        )
-                    validate_active_focus_binding(request, judgment)
-                    judgment = validate_global_candidate_payload(
-                        judgment.to_dict(), request=request
-                    )
-                except Exception as exc:
-                    physical_delta = (
-                        result.physical_requests
-                        if isinstance(result, BoundedJudgeCallResult)
-                        else 0
-                    )
-                    if physical_delta > remaining:
-                        raise ValueError(
-                            "Global Judge result exceeded its reserved request "
-                            "allowance"
-                        ) from exc
-                    state.judge_requests += physical_delta
-                    blocker = "global_judge_output_invalid"
-                    detail = "{0}: {1}".format(type(exc).__name__, exc)
-                    failure_projection = _global_failure_projection(
-                        builder=builder,
-                        blocker=blocker,
-                        detail=detail,
-                        physical_request_delta=physical_delta,
-                        physical_request_exact=True,
-                    )
-                    failed_payload = {
-                        **started_payload,
-                        "status": "failed",
-                        "physical_request_delta": physical_delta,
-                        "physical_request_exact": True,
-                        "blocker": blocker,
-                        "detail": detail,
-                        "failure_projection": failure_projection,
-                        "provider_state": self._capture_provider_result_state(
-                            state
-                        ),
-                    }
-                    self._checkpoint_action(
-                        "global_judge_failed",
-                        action_key,
-                        failed_payload,
-                    )
-                    fail_seed(
-                        builder=builder,
-                        items=seed_items,
-                        blocker=blocker,
-                        detail=detail,
-                        physical_request_delta=physical_delta,
-                        candidate_compression=metrics,
-                        accounting_already_applied=True,
-                    )
-                    terminal_pass_identities.add(pass_identity)
-                    continue
+                final_request = loop_result.request
+                judgment = loop_result.judgment
+                physical_delta = loop_result.physical_requests
+                expansion_history = loop_result.expansion_history
+                terminal_blocker = loop_result.blocker
+                terminal_blocker_detail = loop_result.blocker_detail
                 state.judge_requests += physical_delta
                 completed_payload = {
                     **started_payload,
@@ -9104,6 +9473,16 @@ class AgenticRecursiveAnalyzer:
                     "physical_request_delta": physical_delta,
                     "physical_request_exact": True,
                     "judgment": judgment.to_dict(),
+                    "final_validation_envelope": (
+                        final_request.validation_envelope()
+                    ),
+                    "evidence_expansion_history": [
+                        value.to_dict() for value in expansion_history
+                    ],
+                    "expansion_terminal": {
+                        "blocker": terminal_blocker,
+                        "detail": terminal_blocker_detail,
+                    },
                     "provider_state": self._capture_provider_result_state(
                         state
                     ),
@@ -9129,6 +9508,13 @@ class AgenticRecursiveAnalyzer:
                 "candidate_evidence_capsules": [
                     capsule.to_dict() for capsule in capsules
                 ],
+                "evidence_expansion_history": [
+                    value.to_dict() for value in expansion_history
+                ],
+                "expansion_terminal": {
+                    "blocker": terminal_blocker,
+                    "detail": terminal_blocker_detail,
+                },
                 "judgment": judgment.to_dict(),
                 "behavior_impact": "none_offline_analysis_only",
             }
@@ -9140,7 +9526,10 @@ class AgenticRecursiveAnalyzer:
                 candidates=candidates,
                 capsules=capsules,
                 judgment=judgment,
-                request=request,
+                request=final_request,
+                expansion_history=expansion_history,
+                terminal_blocker=terminal_blocker,
+                terminal_blocker_detail=terminal_blocker_detail,
             )
             self._checkpoint_state(
                 state, "global:after:{0}".format(pass_identity)
@@ -9353,6 +9742,9 @@ class AgenticRecursiveAnalyzer:
         capsules: Sequence[CandidateEvidenceCapsule],
         judgment: GlobalCandidateJudgment,
         request: GlobalCandidateJudgeRequest,
+        expansion_history: Sequence[EvidenceExpansionResult] = (),
+        terminal_blocker: str = "",
+        terminal_blocker_detail: str = "",
     ) -> None:
         seed_builder = state._seed_builder_for_item(item)
         if seed_builder is not None:
@@ -9361,6 +9753,9 @@ class AgenticRecursiveAnalyzer:
                 (candidate.ref for candidate in candidates),
                 request,
                 _global_pass_owner(seed_builder),
+                expansion_history,
+                terminal_blocker,
+                terminal_blocker_detail,
             )
         if judgment.outcome == "no_defect":
             hypothesis = state.ledger.get(item.hypothesis_id)
@@ -9491,71 +9886,31 @@ class AgenticRecursiveAnalyzer:
                         seed_key=seed_builder.key,
                     )
 
-        if judgment.outcome == "needs_expansion":
-            for request in judgment.expansion_requests:
-                anchor = state.graph.resolve(str(request.get("anchor_ref") or ""))
-                if not anchor or anchor not in state.graph.nodes:
-                    continue
-                if not state.graph.analysis_start_eligible(anchor):
-                    continue
-                owner = next(
-                    (
-                        capsule
-                        for capsule in capsules
-                        if anchor == capsule.candidate_ref
-                        or any(
-                            str(member.get("ref") or "") == anchor
-                            for member in capsule.action_group.get("members") or ()
-                            if isinstance(member, Mapping)
-                        )
-                    ),
-                    None,
-                )
-                path = (
-                    owner.downstream_path
-                    if owner is not None and anchor == owner.candidate_ref
-                    else (
-                        (anchor, *owner.downstream_path)
-                        if owner is not None
-                        else (anchor, *item.downstream_path)
-                    )
-                )
-                hypothesis = state.ledger.create(
-                    "Global comparison requested {0} expansion at {1}.".format(
-                        str(request.get("context_kind") or "context"), anchor
-                    ),
-                    anchor,
-                    item.defect_state,
-                    seed_binding_identity=seed_builder.key if seed_builder else "",
-                )
-                state._bind_hypothesis_to_seed(
-                    hypothesis.hypothesis_id, seed_builder
-                )
-                created_hypotheses.add(hypothesis.hypothesis_id)
-                state.ledger.add_support(
-                    hypothesis.hypothesis_id,
-                    anchor,
-                    str(request.get("reason") or judgment.reason),
-                    max(judgment.confidence, 0.01),
-                )
-                hypothesis = state.ledger.get(hypothesis.hypothesis_id)
-                state.frontier.push(
-                    FrontierItem.create(
-                        node_ref=anchor,
-                        defect_state=item.defect_state,
-                        downstream_path=path,
-                        hypothesis_id=hypothesis.hypothesis_id,
-                        hypothesis_semantic_hash=hypothesis.semantic_hash,
-                        seed_binding_identity=hypothesis.seed_binding_identity,
-                        depth=item.depth + 1,
-                        candidate_source="global_requested_expansion",
-                        priority=1.0,
-                        checked_evidence_refs=judgment.decisive_evidence_refs,
-                        graph_position=state.graph.position(anchor),
-                    )
-                )
-
         original = state.ledger.get(item.hypothesis_id)
+        if judgment.outcome == "needs_expansion" and original.status in {
+            "active",
+            "supported",
+        }:
+            state.ledger.reject_with_frontier(
+                item.hypothesis_id,
+                terminal_blocker_detail
+                or "; ".join(judgment.missing_evidence)
+                or judgment.reason,
+                opposing_refs=(),
+                frontier=state.frontier,
+                evidence_hash=hashlib.sha256(
+                    stable_json(
+                        {
+                            "judgment": judgment.to_dict(),
+                            "expansion_history": [
+                                value.to_dict()
+                                for value in expansion_history
+                            ],
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            state.unresolved_hypothesis_ids.add(item.hypothesis_id)
         if created_hypotheses and item.hypothesis_id not in created_hypotheses and original.status in {
             "active",
             "supported",

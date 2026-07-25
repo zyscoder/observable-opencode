@@ -120,18 +120,19 @@ _MODERN_REPORT_STRING_FIELDS = frozenset(
     }
 )
 CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v3"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v8"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v9"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v8+validation-envelope/v8+capsule/v7"
+    "global-candidate-judgment/v9+validation-envelope/v9+capsule/v7"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
     "+failure-action/v3+failure-projection/v4+terminal-record-schema/v3"
     "+judge-lifecycle/v1"
     "+graph-seed-authority/v1+objective-authority/v1"
     "+candidate-set-closure/v1"
     "+comparison-matrix-closure/v1"
+    "+bounded-evidence-expansion/v1"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v8"
+    "global-candidate-validation-envelope/v9"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"

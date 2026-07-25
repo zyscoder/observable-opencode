@@ -583,7 +583,7 @@ class Fix37PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v17",
+            "recursive-analysis-actions/v18",
         )
 
 

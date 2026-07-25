@@ -236,6 +236,9 @@ class GlobalAuthorityAndReplayOwnershipTest(unittest.TestCase):
                 "anchor_ref": "record:decision",
                 "context_kind": "upstream",
                 "reason": "Determine whether the condition is independently necessary.",
+                "expected_judgment_change": (
+                    "The condition may change from root_candidate to contributing_condition."
+                ),
             }
         ]
         value["missing_evidence"] = [

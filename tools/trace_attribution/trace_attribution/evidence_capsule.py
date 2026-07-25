@@ -1161,7 +1161,9 @@ def _causal_path_edges(graph: TraceGraph, path: Tuple[str, ...]) -> List[JsonDic
     return output
 
 
-def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
+def build_action_group_context(
+    graph: TraceGraph, candidate: TraceNode
+) -> JsonDict:
     identity = _action_identity(candidate)
     members = []
     if identity:
@@ -1201,6 +1203,10 @@ def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
     }
 
 
+def _action_group(graph: TraceGraph, candidate: TraceNode) -> JsonDict:
+    return build_action_group_context(graph, candidate)
+
+
 def _action_identity(node: TraceNode) -> str:
     data = node.data if isinstance(node.data, Mapping) else {}
     metadata = data.get("metadata") if isinstance(data.get("metadata"), Mapping) else {}
@@ -1238,6 +1244,7 @@ __all__ = [
     "CAPSULE_SCHEMA_VERSION",
     "MAX_VALIDATION_SOURCE_BYTES",
     "CandidateEvidenceCapsule",
+    "build_action_group_context",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
     "validate_candidate_evidence_capsule_against_graph",
