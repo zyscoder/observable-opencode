@@ -779,7 +779,7 @@ class Fix30PersistenceVersionTest(unittest.TestCase):
         self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v18",
+            "recursive-attribution-report/v19",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -787,7 +787,7 @@ class Fix30PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v17",
+            "recursive-attribution-checkpoint/v18",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",

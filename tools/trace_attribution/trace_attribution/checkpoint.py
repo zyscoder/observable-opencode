@@ -20,8 +20,8 @@ from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
 
-CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v17"
-OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v6"
+CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v18"
+OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v7"
 CHECKPOINT_CONFIG_KEYS = frozenset(
     {
         "schema_version",
@@ -301,7 +301,11 @@ class CheckpointState:
         record = self.latest_actions.get("analysis:result")
         if record is not None and record["operation"] == "analysis_ready":
             report = record["payload"].get("report")
-            return dict(report) if isinstance(report, Mapping) else None
+            if not isinstance(report, Mapping):
+                raise CheckpointCorruptionError(
+                    "analysis_ready report must be an object"
+                )
+            return dict(report)
         return None
 
     @property
@@ -309,7 +313,11 @@ class CheckpointState:
         for record in reversed(self.actions):
             if record["operation"] == "analysis_completed":
                 report = record["payload"].get("report")
-                return dict(report) if isinstance(report, Mapping) else None
+                if not isinstance(report, Mapping):
+                    raise CheckpointCorruptionError(
+                        "analysis_completed report must be an object"
+                    )
+                return dict(report)
         return None
 
     @property

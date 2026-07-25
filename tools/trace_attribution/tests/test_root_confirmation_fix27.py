@@ -990,11 +990,11 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "confirmation-request-identity/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v18")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v19")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v17",
+            "recursive-attribution-checkpoint/v18",
         )
         self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
 

@@ -51,9 +51,74 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v18"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v19"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
+MODERN_REPORT_KEYS = frozenset(
+    {
+        "schema_version",
+        "case_id",
+        "objective",
+        "start_refs",
+        "seed_results",
+        "analysis_outcome",
+        "analysis_perspective",
+        "defect_states",
+        "causal_candidates",
+        "causal_relations",
+        "step_judgments",
+        "hypotheses",
+        "introduction_candidates",
+        "confirmations",
+        "confirmed_roots",
+        "co_roots",
+        "contributing_conditions",
+        "amplifying_factors",
+        "rejected_candidates",
+        "unresolved_hypotheses",
+        "root_causes",
+        "taint_paths",
+        "visited_order",
+        "visited_entries",
+        "unresolved_refs",
+        "investigation_journal",
+        "metadata",
+    }
+)
+_MODERN_REPORT_OBJECT_COLLECTION_FIELDS = frozenset(
+    {
+        "seed_results",
+        "defect_states",
+        "causal_candidates",
+        "causal_relations",
+        "step_judgments",
+        "hypotheses",
+        "introduction_candidates",
+        "confirmations",
+        "confirmed_roots",
+        "co_roots",
+        "contributing_conditions",
+        "amplifying_factors",
+        "rejected_candidates",
+        "unresolved_hypotheses",
+        "root_causes",
+        "visited_entries",
+        "investigation_journal",
+    }
+)
+_MODERN_REPORT_STRING_COLLECTION_FIELDS = frozenset(
+    {"start_refs", "visited_order", "unresolved_refs"}
+)
+_MODERN_REPORT_PATH_COLLECTION_FIELDS = frozenset({"taint_paths"})
+_MODERN_REPORT_STRING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "case_id",
+        "objective",
+        "analysis_outcome",
+        "analysis_perspective",
+    }
+)
 CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v3"
 GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
@@ -2722,6 +2787,73 @@ def _aggregate_seed_outcomes(
     return "inconclusive"
 
 
+def validate_modern_report_shape(value: Any) -> None:
+    """Validate the exact serialized container shape of a modern report."""
+    if not isinstance(value, Mapping):
+        raise TypeError("modern report must be an object")
+    non_string_keys = [repr(key) for key in value if type(key) is not str]
+    if non_string_keys:
+        raise TypeError(
+            "modern report top-level keys must be strings; invalid={0}".format(
+                sorted(non_string_keys)
+            )
+        )
+    actual_keys = set(value)
+    if actual_keys != set(MODERN_REPORT_KEYS):
+        missing = sorted(set(MODERN_REPORT_KEYS) - actual_keys)
+        unknown = sorted(actual_keys - set(MODERN_REPORT_KEYS))
+        raise ValueError(
+            "modern report top-level schema mismatch; missing={0}, unknown={1}".format(
+                missing,
+                unknown,
+            )
+        )
+    if value.get("schema_version") != MODERN_REPORT_SCHEMA_VERSION:
+        raise ValueError(
+            "modern report schema_version must be {0}".format(
+                MODERN_REPORT_SCHEMA_VERSION
+            )
+        )
+    for field_name in _MODERN_REPORT_STRING_FIELDS:
+        if type(value.get(field_name)) is not str:
+            raise TypeError(
+                "modern report {0} must be a string".format(field_name)
+            )
+    for field_name in (
+        *_MODERN_REPORT_OBJECT_COLLECTION_FIELDS,
+        *_MODERN_REPORT_STRING_COLLECTION_FIELDS,
+        *_MODERN_REPORT_PATH_COLLECTION_FIELDS,
+    ):
+        if type(value.get(field_name)) is not list:
+            raise TypeError(
+                "modern report {0} must be an array".format(field_name)
+            )
+    for field_name in _MODERN_REPORT_OBJECT_COLLECTION_FIELDS:
+        if any(
+            not isinstance(item, Mapping)
+            for item in value[field_name]
+        ):
+            raise TypeError(
+                "modern report {0} must contain only objects".format(
+                    field_name
+                )
+            )
+    for field_name in _MODERN_REPORT_STRING_COLLECTION_FIELDS:
+        if any(type(item) is not str for item in value[field_name]):
+            raise TypeError(
+                "modern report {0} must contain only strings".format(
+                    field_name
+                )
+            )
+    for path in value["taint_paths"]:
+        if type(path) is not list or any(type(ref) is not str for ref in path):
+            raise TypeError(
+                "modern report taint_paths must contain only string arrays"
+            )
+    if not isinstance(value.get("metadata"), Mapping):
+        raise TypeError("modern report metadata must be an object")
+
+
 @dataclass(frozen=True)
 class RecursiveAttributionReport:
     case_id: str
@@ -3303,7 +3435,7 @@ class RecursiveAttributionReport:
                 continue
             seen_legacy_roots.add(projection_key)
             legacy_root_causes.append(projection)
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "case_id": self.case_id,
             "objective": self.objective,
@@ -3332,9 +3464,13 @@ class RecursiveAttributionReport:
             "investigation_journal": [_thaw(item) for item in self.investigation_journal],
             "metadata": _thaw(self.metadata),
         }
+        validate_modern_report_shape(payload)
+        return payload
 
     @classmethod
     def from_dict(cls, value: JsonDict) -> "RecursiveAttributionReport":
+        if not isinstance(value, Mapping):
+            raise TypeError("report must be an object")
         schema_version = str(value.get("schema_version") or "")
         if not schema_version:
             raise ValueError("report schema_version is required")
@@ -3342,11 +3478,16 @@ class RecursiveAttributionReport:
         def items(key: str, factory: Any, *, strict_objects: bool = False) -> List[Any]:
             raw = value.get(key)
             if not isinstance(raw, list):
+                if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+                    raise TypeError("{0} must be an array".format(key))
                 return []
             parsed = []
             for index, item in enumerate(raw):
                 if not isinstance(item, Mapping):
-                    if strict_objects:
+                    if (
+                        schema_version == MODERN_REPORT_SCHEMA_VERSION
+                        or strict_objects
+                    ):
                         raise TypeError("{0}[{1}] must be an object".format(key, index))
                     continue
                 parsed.append(factory(dict(item)))
@@ -3381,6 +3522,8 @@ class RecursiveAttributionReport:
             PREVIOUS_REPORT_SCHEMA_VERSION,
         }:
             raise ValueError("unsupported report schema_version: {0}".format(schema_version))
+        if schema_version == MODERN_REPORT_SCHEMA_VERSION:
+            validate_modern_report_shape(value)
         confirmed_roots = items("confirmed_roots", ConfirmedRoot.from_dict)
         co_roots = items("co_roots", ConfirmedRoot.from_dict)
         if not confirmed_roots and value.get("root_causes"):
@@ -3682,10 +3825,17 @@ class RecursiveAttributionReport:
             visited_order=_string_list(value.get("visited_order")),
             visited_entries=visited_entries,
             unresolved_refs=unresolved_refs,
-            investigation_journal=tuple(
-                item
-                for item in value.get("investigation_journal", [])
-                if isinstance(item, dict)
+            investigation_journal=(
+                tuple(
+                    dict(item)
+                    for item in value["investigation_journal"]
+                )
+                if schema_version == MODERN_REPORT_SCHEMA_VERSION
+                else tuple(
+                    dict(item)
+                    for item in value.get("investigation_journal", [])
+                    if isinstance(item, Mapping)
+                )
             ),
             metadata=metadata,
         )
@@ -3703,6 +3853,8 @@ __all__ = [
     "FrontierItem",
     "HypothesisEvidence",
     "LocalStateOwner",
+    "MODERN_REPORT_KEYS",
+    "MODERN_REPORT_SCHEMA_VERSION",
     "PredecessorAssessment",
     "RecursiveAttributionReport",
     "RejectedCandidate",
@@ -3717,6 +3869,7 @@ __all__ = [
     "canonical_rejected_candidate_publication",
     "is_definitive_confirmation",
     "validate_confirmation_ownership",
+    "validate_modern_report_shape",
     "validate_root_confirmation_substantive_invariants",
     "SEMANTIC_ANCHOR_SCHEMA_VERSION",
     "SEMANTIC_OCCURRENCE_SCHEMA_VERSION",

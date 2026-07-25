@@ -58,6 +58,7 @@ from .causal_state import (
     semantic_visit_key,
     seed_binding_identity_for,
     validate_confirmation_ownership,
+    validate_modern_report_shape,
     validate_root_confirmation_substantive_invariants,
 )
 from .checkpoint import CheckpointBundle, CheckpointState
@@ -8582,6 +8583,7 @@ class AgenticRecursiveAnalyzer:
             )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
+                validate_modern_report_shape(final_report)
                 final_report = _quarantine_stale_seed_report_payload(
                     analysis_graph, final_report
                 )
@@ -8627,6 +8629,7 @@ class AgenticRecursiveAnalyzer:
             if pending_report is not None and (
                 not pending_interrupted or self.checkpoint.output_commit_path.exists()
             ):
+                validate_modern_report_shape(pending_report)
                 pending_report = _quarantine_stale_seed_report_payload(
                     analysis_graph, pending_report
                 )

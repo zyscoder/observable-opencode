@@ -13,11 +13,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from trace_attribution.causal_state import (
     LocalStateOwner,
+    MODERN_REPORT_KEYS,
+    MODERN_REPORT_SCHEMA_VERSION,
     RecursiveAttributionReport,
     confirmation_identity_for,
     seed_binding_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
+    validate_modern_report_shape,
     validate_seed_outcome_payload,
 )
 from trace_attribution.graph import TraceGraph, collect_artifact_ids, resolve_edge_endpoint
@@ -30,7 +33,7 @@ from trace_attribution.recursive_analyzer import (
 JsonDict = Dict[str, Any]
 LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
 COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
-REPORT_SCHEMA_VERSION = "recursive-attribution-report/v18"
+REPORT_SCHEMA_VERSION = MODERN_REPORT_SCHEMA_VERSION
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
 TEMPORAL_RELATIONS = frozenset(
@@ -67,37 +70,7 @@ FIXTURE_ALLOWED_KEYS = frozenset(
         "scripted_analysis",
     }
 )
-REPORT_KEYS = frozenset(
-    {
-        "schema_version",
-        "case_id",
-        "objective",
-        "start_refs",
-        "seed_results",
-        "analysis_outcome",
-        "analysis_perspective",
-        "defect_states",
-        "causal_candidates",
-        "causal_relations",
-        "step_judgments",
-        "hypotheses",
-        "introduction_candidates",
-        "confirmations",
-        "confirmed_roots",
-        "co_roots",
-        "contributing_conditions",
-        "amplifying_factors",
-        "rejected_candidates",
-        "unresolved_hypotheses",
-        "root_causes",
-        "taint_paths",
-        "visited_order",
-        "visited_entries",
-        "unresolved_refs",
-        "investigation_journal",
-        "metadata",
-    }
-)
+REPORT_KEYS = MODERN_REPORT_KEYS
 SEED_RESULT_KEYS = frozenset(
     {
         "start_ref",
@@ -315,7 +288,10 @@ def _unresolved_refs(report: Mapping[str, Any]) -> Set[str]:
 
 
 def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any]) -> None:
-    _exact_keys(report, REPORT_KEYS, "report")
+    try:
+        validate_modern_report_shape(report)
+    except (TypeError, ValueError) as exc:
+        raise EvaluationSchemaError(str(exc)) from exc
     if report.get("schema_version") != REPORT_SCHEMA_VERSION:
         raise EvaluationSchemaError("recursive report schema_version must be {0}".format(REPORT_SCHEMA_VERSION))
     if report.get("case_id") != labels["case_id"]:
