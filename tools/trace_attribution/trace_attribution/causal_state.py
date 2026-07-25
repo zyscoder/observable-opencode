@@ -125,6 +125,7 @@ GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
     "+failure-action/v3+failure-projection/v4+terminal-record-schema/v3"
+    "+judge-lifecycle/v1"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
     "global-candidate-validation-envelope/v7"

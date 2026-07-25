@@ -753,7 +753,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
             GLOBAL_FAILURE_PROJECTION_SCHEMA,
             "global-candidate-failure-projection/v4",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
             "recursive-attribution-report/v19",
@@ -764,7 +764,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v18",
+            "recursive-attribution-checkpoint/v19",
         )
 
     def test_old_global_envelope_and_report_are_rejected(self):

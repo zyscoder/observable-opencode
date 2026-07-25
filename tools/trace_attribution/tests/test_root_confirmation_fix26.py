@@ -1093,11 +1093,11 @@ class Fix26VersionIdentityTest(unittest.TestCase):
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v18",
+            "recursive-attribution-checkpoint/v19",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v15",
+            "recursive-analysis-actions/v16",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,

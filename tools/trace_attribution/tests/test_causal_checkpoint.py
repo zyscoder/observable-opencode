@@ -1278,7 +1278,8 @@ class CausalCheckpointTest(unittest.TestCase):
             "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
             "+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
-            "+failure-projection/v4+terminal-record-schema/v3",
+            "+failure-projection/v4+terminal-record-schema/v3"
+            "+judge-lifecycle/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
@@ -1291,7 +1292,7 @@ class CausalCheckpointTest(unittest.TestCase):
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v18")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v19")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -3436,7 +3437,7 @@ class CausalCheckpointTest(unittest.TestCase):
             )
             self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
 
-    def test_resumed_global_prepass_retries_only_interrupted_second_seed(self):
+    def test_resumed_global_prepass_never_retries_started_second_seed(self):
         trace = multi_seed_global_trace()
         start_refs = ["record:defect_one", "record:defect_two"]
         config = sample_config(
@@ -3471,18 +3472,14 @@ class CausalCheckpointTest(unittest.TestCase):
                 objective="Determine whether either observation is supported.",
                 analysis_perspective="",
             )
-            uninterrupted = AgenticRecursiveAnalyzer(
-                judge=InterruptingGlobalNoDefectJudge(),
-                fusion_mode="retrieval-global",
-            ).analyze(
-                TraceGraph.from_trace(trace),
-                start_refs=start_refs,
-                objective="Determine whether either observation is supported.",
-                analysis_perspective="",
-            )
-
-        self.assertEqual(resumed.to_dict(), uninterrupted.to_dict())
-        self.assertEqual(resumed_judge.global_calls, [("record:defect_two",)])
+        self.assertEqual(resumed_judge.global_calls, [])
+        by_ref = {item.start_ref: item for item in resumed.seed_results}
+        self.assertEqual(by_ref["record:defect_one"].outcome, "no_defect")
+        self.assertEqual(by_ref["record:defect_two"].outcome, "evidence_gap")
+        self.assertIn(
+            "global_judge_interrupted",
+            by_ref["record:defect_two"].blocking_reasons,
+        )
 
     def test_tail_repair_audit_is_persisted_in_report_metadata(self):
         with tempfile.TemporaryDirectory() as tempdir:

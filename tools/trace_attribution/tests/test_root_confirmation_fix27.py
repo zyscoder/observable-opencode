@@ -994,9 +994,9 @@ class Fix27VersionIdentityTest(unittest.TestCase):
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v18",
+            "recursive-attribution-checkpoint/v19",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

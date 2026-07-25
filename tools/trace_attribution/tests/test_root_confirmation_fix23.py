@@ -456,13 +456,13 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v18",
+            "recursive-attribution-checkpoint/v19",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v7",
+            "recursive-attribution-output/v8",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v15")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
         self.assertEqual(
             COMPARISON_SCHEMA_VERSION,
             "recursive-attribution-comparison/v5",
@@ -489,7 +489,8 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
             "global-candidate-judgment/v7+validation-envelope/v7"
             "+capsule/v7+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
-            "+failure-projection/v4+terminal-record-schema/v3",
+            "+failure-projection/v4+terminal-record-schema/v3"
+            "+judge-lifecycle/v1",
         )
 
 

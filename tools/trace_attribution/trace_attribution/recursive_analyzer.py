@@ -8,6 +8,7 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .causal_judge import (
@@ -114,7 +115,52 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v15"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v16"
+GLOBAL_JUDGE_ACTION_OPERATIONS = frozenset(
+    {
+        "global_judge_started",
+        "global_judge_completed",
+        "global_judge_failed",
+    }
+)
+GLOBAL_JUDGE_ACTION_BASE_KEYS = frozenset(
+    {
+        "status",
+        "pass_identity",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "hypothesis_id",
+        "visit_key",
+        "owner",
+        "request_identity",
+        "validation_envelope",
+        "capsule_identity",
+        "candidate_compression",
+        "physical_requests_reserved",
+    }
+)
+GLOBAL_JUDGE_STARTED_PAYLOAD_KEYS = GLOBAL_JUDGE_ACTION_BASE_KEYS
+GLOBAL_JUDGE_COMPLETED_PAYLOAD_KEYS = frozenset(
+    {
+        *GLOBAL_JUDGE_ACTION_BASE_KEYS,
+        "physical_request_delta",
+        "physical_request_exact",
+        "judgment",
+        "provider_state",
+    }
+)
+GLOBAL_JUDGE_FAILED_PAYLOAD_KEYS = frozenset(
+    {
+        *GLOBAL_JUDGE_ACTION_BASE_KEYS,
+        "physical_request_delta",
+        "physical_request_exact",
+        "blocker",
+        "detail",
+        "failure_projection",
+        "provider_state",
+    }
+)
 GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
@@ -3544,6 +3590,36 @@ def _global_pass_identity(seed_binding_identity: str) -> str:
     )
 
 
+def _global_judge_action_key(pass_identity: str) -> str:
+    if not str(pass_identity).startswith("global_pass:v1:"):
+        raise ValueError("global Judge action requires a canonical pass identity")
+    return "global_judge:{0}".format(pass_identity)
+
+
+def _global_judge_request_identity(
+    request: GlobalCandidateJudgeRequest,
+) -> str:
+    return "global_request:v1:{0}".format(
+        hashlib.sha256(
+            stable_json(request.validation_envelope()).encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def _global_judge_capsule_identity(
+    request: GlobalCandidateJudgeRequest,
+) -> str:
+    return "global_capsules:v1:{0}".format(
+        hashlib.sha256(
+            stable_json(
+                request.validation_envelope()[
+                    "candidate_evidence_capsules"
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+
+
 def _global_pass_owner(builder: "SeedAttributionBuilder") -> LocalStateOwner:
     return _canonical_global_pass_facts(
         seed_ref=builder.start_ref,
@@ -3576,6 +3652,420 @@ def _canonical_global_pass_facts(
         _global_pass_identity(seed_binding_identity),
         owner,
     )
+
+
+def _global_judge_action_base(
+    *,
+    builder: "SeedAttributionBuilder",
+    item: FrontierItem,
+    request: GlobalCandidateJudgeRequest,
+    candidate_compression: Mapping[str, Any],
+    physical_requests_reserved: int,
+) -> JsonDict:
+    if (
+        isinstance(physical_requests_reserved, bool)
+        or not isinstance(physical_requests_reserved, int)
+        or physical_requests_reserved < 0
+    ):
+        raise ValueError("global Judge reserved request count is invalid")
+    pass_identity = _global_pass_identity(builder.key)
+    return {
+        "status": "in_flight",
+        "pass_identity": pass_identity,
+        "seed_binding_identity": builder.key,
+        "seed_ref": builder.start_ref,
+        "defect_fingerprint": builder.defect_state.fingerprint,
+        "hypothesis_id": item.hypothesis_id,
+        "visit_key": item.visit_key,
+        "owner": _global_pass_owner(builder).to_dict(),
+        "request_identity": _global_judge_request_identity(request),
+        "validation_envelope": request.validation_envelope(),
+        "capsule_identity": _global_judge_capsule_identity(request),
+        "candidate_compression": copy.deepcopy(
+            dict(candidate_compression)
+        ),
+        "physical_requests_reserved": physical_requests_reserved,
+    }
+
+
+def _validate_global_judge_failure_accounting(
+    *,
+    blocker: str,
+    physical_request_delta: int,
+    physical_request_exact: bool,
+    physical_requests_reserved: int,
+) -> None:
+    if physical_request_delta > physical_requests_reserved:
+        raise ValueError(
+            "failed global Judge action exceeded its reserved allowance"
+        )
+    if not physical_request_exact and (
+        blocker != "global_judge_interrupted"
+        or physical_request_delta != physical_requests_reserved
+    ):
+        raise ValueError(
+            "inexact global Judge failure must conservatively consume its "
+            "full reservation as an interrupted request"
+        )
+
+
+def _validated_global_judge_action_history(
+    action_records: Iterable[Any],
+    *,
+    max_judge_requests: Optional[int] = None,
+    cache_identity: Optional[str] = None,
+) -> Dict[str, Tuple[JsonDict, ...]]:
+    if max_judge_requests is not None and (
+        isinstance(max_judge_requests, bool)
+        or not isinstance(max_judge_requests, int)
+        or max_judge_requests < 0
+    ):
+        raise ValueError("global Judge lifecycle budget is invalid")
+    grouped: Dict[str, List[JsonDict]] = {}
+    for record in action_records:
+        if not isinstance(record, Mapping):
+            continue
+        operation = str(record.get("operation") or "")
+        if operation not in GLOBAL_JUDGE_ACTION_OPERATIONS:
+            continue
+        semantic_key = str(record.get("semantic_key") or "")
+        payload = record.get("payload")
+        if not semantic_key or not isinstance(payload, Mapping):
+            raise ValueError("global Judge action record is malformed")
+        expected_keys = {
+            "global_judge_started": GLOBAL_JUDGE_STARTED_PAYLOAD_KEYS,
+            "global_judge_completed": GLOBAL_JUDGE_COMPLETED_PAYLOAD_KEYS,
+            "global_judge_failed": GLOBAL_JUDGE_FAILED_PAYLOAD_KEYS,
+        }[operation]
+        _require_exact_checkpoint_keys(
+            payload,
+            set(expected_keys),
+            "global Judge action payload",
+        )
+        grouped.setdefault(semantic_key, []).append(
+            {
+                "operation": operation,
+                "semantic_key": semantic_key,
+                "payload": copy.deepcopy(dict(payload)),
+            }
+        )
+
+    validated: Dict[str, Tuple[JsonDict, ...]] = {}
+    cumulative_physical_requests = 0
+    cumulative_uncertainty = 0
+    cumulative_logical_calls = 0
+    observed_cache_identity = (
+        str(cache_identity) if cache_identity is not None else None
+    )
+    for semantic_key, records in grouped.items():
+        if (
+            len(records) not in {1, 2}
+            or records[0]["operation"] != "global_judge_started"
+            or (
+                len(records) == 2
+                and records[1]["operation"]
+                not in {"global_judge_completed", "global_judge_failed"}
+            )
+        ):
+            raise ValueError(
+                "global Judge action lifecycle must contain one started "
+                "record followed by at most one terminal record"
+            )
+        started = records[0]["payload"]
+        if started.get("status") != "in_flight":
+            raise ValueError("global Judge started action status is invalid")
+        envelope = started.get("validation_envelope")
+        request = global_candidate_request_from_validation_envelope(envelope)
+        expected_request_identity = _global_judge_request_identity(request)
+        expected_capsule_identity = _global_judge_capsule_identity(request)
+        seed_ref = str(started.get("seed_ref") or "")
+        defect_fingerprint = str(
+            started.get("defect_fingerprint") or ""
+        )
+        (
+            expected_seed_binding,
+            expected_pass_identity,
+            expected_owner,
+        ) = _canonical_global_pass_facts(
+            seed_ref=seed_ref,
+            defect_fingerprint=defect_fingerprint,
+        )
+        reserved = started.get("physical_requests_reserved")
+        expected_reserved = (
+            None
+            if max_judge_requests is None
+            else max(
+                0,
+                max_judge_requests - cumulative_physical_requests,
+            )
+        )
+        if (
+            isinstance(reserved, bool)
+            or not isinstance(reserved, int)
+            or reserved < 0
+            or (
+                expected_reserved is not None
+                and reserved != expected_reserved
+            )
+            or not str(started.get("hypothesis_id") or "")
+            or not str(started.get("visit_key") or "")
+            or not isinstance(started.get("candidate_compression"), Mapping)
+            or started.get("seed_binding_identity")
+            != expected_seed_binding
+            or started.get("pass_identity") != expected_pass_identity
+            or semantic_key
+            != _global_judge_action_key(expected_pass_identity)
+            or LocalStateOwner.from_dict(started.get("owner"))
+            != expected_owner
+            or started.get("request_identity")
+            != expected_request_identity
+            or started.get("capsule_identity")
+            != expected_capsule_identity
+            or request.seed_ref != seed_ref
+            or request.active_defect.fingerprint != defect_fingerprint
+        ):
+            raise ValueError(
+                "global Judge started action contradicts its factual request"
+            )
+        cumulative_logical_calls += 1
+        if len(records) == 1:
+            validated[semantic_key] = tuple(records)
+            continue
+        terminal_record = records[1]
+        terminal = terminal_record["payload"]
+        expected_status = (
+            "completed"
+            if terminal_record["operation"] == "global_judge_completed"
+            else "failed"
+        )
+        expected_terminal_base = copy.deepcopy(dict(started))
+        expected_terminal_base["status"] = expected_status
+        actual_terminal_base = {
+            key: copy.deepcopy(terminal[key])
+            for key in GLOBAL_JUDGE_ACTION_BASE_KEYS
+        }
+        if stable_json(_checkpoint_json(actual_terminal_base)) != stable_json(
+            _checkpoint_json(expected_terminal_base)
+        ):
+            raise ValueError(
+                "global Judge terminal action does not match its started action"
+            )
+        physical_delta = terminal.get("physical_request_delta")
+        physical_exact = terminal.get("physical_request_exact")
+        if (
+            isinstance(physical_delta, bool)
+            or not isinstance(physical_delta, int)
+            or physical_delta < 0
+            or physical_delta > reserved
+            or type(physical_exact) is not bool
+            or not isinstance(terminal.get("provider_state"), Mapping)
+        ):
+            raise ValueError(
+                "global Judge terminal action accounting is invalid"
+            )
+        if terminal_record["operation"] == "global_judge_completed":
+            if physical_exact is not True:
+                raise ValueError(
+                    "completed global Judge action requires exact accounting"
+                )
+            judgment = validate_global_candidate_payload(
+                terminal.get("judgment"),
+                request=request,
+            )
+            if judgment.to_dict() != dict(terminal["judgment"]):
+                raise ValueError(
+                    "completed global Judge action judgment is not canonical"
+                )
+        else:
+            blocker = str(terminal.get("blocker") or "")
+            detail = str(terminal.get("detail") or "")
+            projection = _validated_global_failure_projection(
+                terminal.get("failure_projection")
+            )
+            if (
+                not blocker
+                or not detail
+                or projection["pass_identity"] != expected_pass_identity
+                or projection["seed_binding_identity"]
+                != expected_seed_binding
+                or projection["seed_ref"] != seed_ref
+                or projection["defect_fingerprint"]
+                != defect_fingerprint
+                or projection["blocker"] != blocker
+                or projection["detail"] != detail
+                or projection["physical_request_delta"]
+                != physical_delta
+                or projection["physical_request_exact"]
+                != physical_exact
+            ):
+                raise ValueError(
+                    "failed global Judge action projection is inconsistent"
+                )
+            _validate_global_judge_failure_accounting(
+                blocker=blocker,
+                physical_request_delta=physical_delta,
+                physical_request_exact=physical_exact,
+                physical_requests_reserved=reserved,
+            )
+        cumulative_physical_requests += physical_delta
+        if not physical_exact:
+            cumulative_uncertainty += 1
+        provider_state = terminal["provider_state"]
+        terminal_cache_identity = str(
+            provider_state.get("cache_identity") or ""
+        )
+        if observed_cache_identity is None:
+            observed_cache_identity = terminal_cache_identity
+        if terminal_cache_identity != observed_cache_identity:
+            raise ValueError(
+                "global Judge lifecycle cache identity is inconsistent"
+            )
+        _validate_provider_state(
+            provider_state,
+            SimpleNamespace(
+                judge_requests=cumulative_physical_requests,
+                judge_request_uncertainty_count=cumulative_uncertainty,
+                logical_judge_calls=cumulative_logical_calls,
+                logical_confirmation_calls=0,
+                investigation_rounds=0,
+                artifact_bytes=0,
+            ),
+            cache_identity=observed_cache_identity or "",
+        )
+        validated[semantic_key] = tuple(records)
+    return validated
+
+
+def _validated_global_judge_action(
+    record: Mapping[str, Any],
+    *,
+    builder: "SeedAttributionBuilder",
+    item: FrontierItem,
+    request: GlobalCandidateJudgeRequest,
+    candidate_compression: Mapping[str, Any],
+    expected_physical_requests_reserved: int,
+) -> JsonDict:
+    operation = str(record.get("operation") or "")
+    if operation not in GLOBAL_JUDGE_ACTION_OPERATIONS:
+        raise ValueError("unsupported global Judge action operation")
+    expected_key = _global_judge_action_key(
+        _global_pass_identity(builder.key)
+    )
+    if str(record.get("semantic_key") or "") != expected_key:
+        raise ValueError("global Judge action semantic key is invalid")
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("global Judge action payload must be an object")
+    expected_keys = {
+        "global_judge_started": GLOBAL_JUDGE_STARTED_PAYLOAD_KEYS,
+        "global_judge_completed": GLOBAL_JUDGE_COMPLETED_PAYLOAD_KEYS,
+        "global_judge_failed": GLOBAL_JUDGE_FAILED_PAYLOAD_KEYS,
+    }[operation]
+    _require_exact_checkpoint_keys(
+        payload,
+        set(expected_keys),
+        "global Judge action payload",
+    )
+    reserved = payload.get("physical_requests_reserved")
+    if (
+        isinstance(reserved, bool)
+        or not isinstance(reserved, int)
+        or reserved < 0
+        or reserved != expected_physical_requests_reserved
+    ):
+        raise ValueError(
+            "global Judge action reserved request count is invalid"
+        )
+    expected_base = _global_judge_action_base(
+        builder=builder,
+        item=item,
+        request=request,
+        candidate_compression=candidate_compression,
+        physical_requests_reserved=reserved,
+    )
+    actual_base = {
+        key: copy.deepcopy(payload[key])
+        for key in GLOBAL_JUDGE_ACTION_BASE_KEYS
+    }
+    expected_status = {
+        "global_judge_started": "in_flight",
+        "global_judge_completed": "completed",
+        "global_judge_failed": "failed",
+    }[operation]
+    expected_base["status"] = expected_status
+    if stable_json(_checkpoint_json(actual_base)) != stable_json(
+        _checkpoint_json(expected_base)
+    ):
+        raise ValueError(
+            "global Judge action contradicts its factual request"
+        )
+    if operation == "global_judge_started":
+        return copy.deepcopy(dict(payload))
+    physical_delta = payload.get("physical_request_delta")
+    physical_exact = payload.get("physical_request_exact")
+    if (
+        isinstance(physical_delta, bool)
+        or not isinstance(physical_delta, int)
+        or physical_delta < 0
+        or type(physical_exact) is not bool
+    ):
+        raise ValueError(
+            "global Judge terminal action accounting is invalid"
+        )
+    if operation == "global_judge_completed":
+        if physical_exact is not True or physical_delta > reserved:
+            raise ValueError(
+                "completed global Judge action requires exact accounting"
+            )
+        judgment_payload = payload.get("judgment")
+        if not isinstance(judgment_payload, Mapping):
+            raise ValueError(
+                "completed global Judge action judgment must be an object"
+            )
+        judgment = validate_global_candidate_payload(
+            judgment_payload,
+            request=request,
+        )
+        if judgment.to_dict() != dict(judgment_payload):
+            raise ValueError(
+                "completed global Judge action judgment is not canonical"
+            )
+    else:
+        blocker = str(payload.get("blocker") or "")
+        detail = str(payload.get("detail") or "")
+        if not blocker or not detail:
+            raise ValueError(
+                "failed global Judge action requires blocker and detail"
+            )
+        projection = _validated_global_failure_projection(
+            payload.get("failure_projection")
+        )
+        if (
+            projection["pass_identity"]
+            != _global_pass_identity(builder.key)
+            or projection["seed_binding_identity"] != builder.key
+            or projection["seed_ref"] != builder.start_ref
+            or projection["defect_fingerprint"]
+            != builder.defect_state.fingerprint
+            or projection["blocker"] != blocker
+            or projection["detail"] != detail
+            or projection["physical_request_delta"] != physical_delta
+            or projection["physical_request_exact"] != physical_exact
+        ):
+            raise ValueError(
+                "failed global Judge action projection is inconsistent"
+            )
+        _validate_global_judge_failure_accounting(
+            blocker=blocker,
+            physical_request_delta=physical_delta,
+            physical_request_exact=physical_exact,
+            physical_requests_reserved=reserved,
+        )
+    if not isinstance(payload.get("provider_state"), Mapping):
+        raise ValueError(
+            "global Judge terminal action provider state must be an object"
+        )
+    return copy.deepcopy(dict(payload))
 
 
 def _global_failure_projection(
@@ -4801,6 +5291,11 @@ class RecursiveAnalysisState:
         self,
         action_records: Optional[Iterable[Any]] = None,
     ) -> None:
+        lifecycle_records = (
+            _validated_global_judge_action_history(tuple(action_records))
+            if action_records is not None
+            else {}
+        )
         seed_authority = _seed_authority_from_records(
             builder.to_dict() for builder in self.seed_ledger.values()
         )
@@ -4998,6 +5493,126 @@ class RecursiveAnalysisState:
             raise ValueError(
                 "global pass action has no unique seed judgment or failure episode"
             )
+        terminal_lifecycle_by_pass: Dict[str, JsonDict] = {}
+
+        def same_checkpoint_value(left: Any, right: Any) -> bool:
+            return stable_json(_checkpoint_json(left)) == stable_json(
+                _checkpoint_json(right)
+            )
+
+        for records in lifecycle_records.values():
+            if len(records) != 2:
+                continue
+            terminal_record = records[-1]
+            terminal = terminal_record["payload"]
+            pass_identity = str(terminal.get("pass_identity") or "")
+            if pass_identity in terminal_lifecycle_by_pass:
+                raise ValueError(
+                    "global Judge pass has duplicate terminal lifecycle actions"
+                )
+            _validate_provider_state(
+                terminal.get("provider_state"),
+                self,
+                cache_identity=str(
+                    terminal.get("provider_state", {}).get(
+                        "cache_identity"
+                    )
+                    or ""
+                ),
+                require_accounting_match=False,
+            )
+            terminal_lifecycle_by_pass[pass_identity] = terminal_record
+            applied = passes_by_owner.get(pass_identity)
+            if applied is None:
+                continue
+            if (
+                terminal.get("seed_binding_identity")
+                != applied.get("seed_binding_identity")
+                or terminal.get("seed_ref") != applied.get("seed_ref")
+                or terminal.get("defect_fingerprint")
+                != applied.get("defect_fingerprint")
+                or terminal.get("hypothesis_id")
+                != applied.get("hypothesis_id")
+                or terminal.get("visit_key") != applied.get("visit_key")
+                or not same_checkpoint_value(
+                    terminal.get("owner"), applied.get("owner")
+                )
+                or not same_checkpoint_value(
+                    terminal.get("candidate_compression"),
+                    applied.get("candidate_compression"),
+                )
+                or terminal.get("physical_request_delta")
+                != applied.get("physical_request_delta")
+            ):
+                raise ValueError(
+                    "global Judge terminal action contradicts the applied pass"
+                )
+            if terminal_record["operation"] == "global_judge_completed":
+                completed_mismatches = []
+                if applied.get("status") != "completed":
+                    completed_mismatches.append("status")
+                if not same_checkpoint_value(
+                    terminal.get("judgment"),
+                    applied.get("judgment"),
+                ):
+                    completed_mismatches.append("judgment")
+                if not same_checkpoint_value(
+                    terminal.get("validation_envelope", {}).get(
+                        "candidate_evidence_capsules"
+                    ),
+                    applied.get("candidate_evidence_capsules"),
+                ):
+                    completed_mismatches.append("candidate_evidence_capsules")
+                if completed_mismatches:
+                    raise ValueError(
+                        "completed global Judge action contradicts applied "
+                        "judgment fields: {0}".format(
+                            ", ".join(completed_mismatches)
+                        )
+                    )
+                builder = self.seed_ledger.get(
+                    str(terminal.get("seed_binding_identity") or "")
+                )
+                if (
+                    builder is None
+                    or not same_checkpoint_value(
+                        builder.global_judgment.get(
+                            "validation_envelope"
+                        ),
+                        terminal.get("validation_envelope"),
+                    )
+                ):
+                    raise ValueError(
+                        "completed global Judge action contradicts seed judgment"
+                    )
+            elif (
+                applied.get("status") != "failed"
+                or not same_checkpoint_value(
+                    terminal.get("failure_projection"),
+                    applied.get("failure_projection"),
+                )
+            ):
+                raise ValueError(
+                    "failed global Judge action contradicts applied failure"
+                )
+        if action_records is not None:
+            for pass_identity, applied in passes_by_owner.items():
+                requires_lifecycle = (
+                    applied.get("status") == "completed"
+                    or applied.get("blocker")
+                    in {
+                        "global_judge_bounded_failure",
+                        "global_judge_output_invalid",
+                        "global_judge_interrupted",
+                    }
+                )
+                if (
+                    requires_lifecycle
+                    and pass_identity not in terminal_lifecycle_by_pass
+                ):
+                    raise ValueError(
+                        "applied global pass has no terminal Judge lifecycle action"
+                    )
 
         journal_entries = []
         for item in self.confirmation_journal:
@@ -5902,6 +6517,21 @@ class RecursiveAnalysisState:
             raise ValueError("unsupported recursive hypothesis state schema")
         if action_payload["schema"] != ACTION_STATE_SCHEMA:
             raise ValueError("unsupported recursive action state schema")
+        checkpoint_budgets = checkpoint.config.get("budgets")
+        _validated_global_judge_action_history(
+            checkpoint.actions,
+            max_judge_requests=(
+                int(checkpoint_budgets["max_judge_requests"])
+                if isinstance(checkpoint_budgets, Mapping)
+                and "max_judge_requests" in checkpoint_budgets
+                else None
+            ),
+            cache_identity=(
+                str(checkpoint.config["cache_identity"])
+                if "cache_identity" in checkpoint.config
+                else None
+            ),
+        )
         checkpoint_seed_authority = _seed_authority_from_records(
             action_payload["seed_ledger"]
         )
@@ -7829,6 +8459,26 @@ class AgenticRecursiveAnalyzer:
         )
         return provider
 
+    def _prevalidate_global_replay_provider_state(
+        self,
+        state: RecursiveAnalysisState,
+        payload: Mapping[str, Any],
+    ) -> JsonDict:
+        projected_state = copy.copy(state)
+        projected_state.logical_judge_calls += 1
+        projected_state.judge_requests += payload[
+            "physical_request_delta"
+        ]
+        if not payload["physical_request_exact"]:
+            projected_state.judge_request_uncertainty_count += 1
+        return _validate_provider_state(
+            payload.get("provider_state"),
+            projected_state,
+            cache_identity=str(
+                self.checkpoint_config.get("cache_identity") or ""
+            ),
+        )
+
     @staticmethod
     def _replay_action(state: RecursiveAnalysisState, semantic_key: str) -> Optional[JsonDict]:
         value = state.replay_actions.get(semantic_key)
@@ -7867,10 +8517,12 @@ class AgenticRecursiveAnalyzer:
             physical_request_delta: int = 0,
             physical_request_exact: bool = True,
             candidate_compression: Optional[Mapping[str, Any]] = None,
+            accounting_already_applied: bool = False,
         ) -> None:
-            state.judge_requests += physical_request_delta
-            if not physical_request_exact:
-                state.judge_request_uncertainty_count += 1
+            if not accounting_already_applied:
+                state.judge_requests += physical_request_delta
+                if not physical_request_exact:
+                    state.judge_request_uncertainty_count += 1
             pass_identity = _global_pass_identity(builder.key)
             owner = _global_pass_owner(builder)
             failure_projection = _global_failure_projection(
@@ -8041,71 +8693,318 @@ class AgenticRecursiveAnalyzer:
             remaining = max(
                 0, self.max_judge_requests - state.judge_requests
             )
-            self._checkpoint_state(
-                state, "global:before:{0}".format(pass_identity)
-            )
-            state.logical_judge_calls += 1
-            try:
-                result = self.judge.judge_candidates_bounded(
-                    request, max_physical_requests=remaining
-                )
-            except BoundedJudgeCallError as exc:
-                fail_seed(
+            action_key = _global_judge_action_key(pass_identity)
+            replay_action = self._replay_action(state, action_key)
+            replay_payload: Optional[JsonDict] = None
+            replay_provider_state: Optional[JsonDict] = None
+            reserved_requests = remaining
+            if replay_action is not None:
+                replay_payload = _validated_global_judge_action(
+                    replay_action,
                     builder=builder,
-                    items=seed_items,
-                    blocker="global_judge_bounded_failure",
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
-                    physical_request_delta=exc.physical_requests,
+                    item=item,
+                    request=request,
                     candidate_compression=metrics,
+                    expected_physical_requests_reserved=remaining,
                 )
-                terminal_pass_identities.add(pass_identity)
-                continue
-            except Exception as exc:
-                fail_seed(
-                    builder=builder,
-                    items=seed_items,
-                    blocker="global_judge_bounded_failure",
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
-                    physical_request_exact=False,
-                    candidate_compression=metrics,
+                reserved_requests = replay_payload[
+                    "physical_requests_reserved"
+                ]
+                if (
+                    replay_action["operation"]
+                    == "global_judge_started"
+                ):
+                    state.logical_judge_calls += 1
+                    state.judge_requests += reserved_requests
+                    state.judge_request_uncertainty_count += 1
+                    blocker = "global_judge_interrupted"
+                    detail = (
+                        "The prior process ended after durably recording the "
+                        "Global Judge request but before a terminal result; "
+                        "the request is not repeated."
+                    )
+                    failure_projection = _global_failure_projection(
+                        builder=builder,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=reserved_requests,
+                        physical_request_exact=False,
+                    )
+                    failed_payload = {
+                        **replay_payload,
+                        "status": "failed",
+                        "physical_request_delta": reserved_requests,
+                        "physical_request_exact": False,
+                        "blocker": blocker,
+                        "detail": detail,
+                        "failure_projection": failure_projection,
+                        "provider_state": self._capture_provider_result_state(
+                            state
+                        ),
+                    }
+                    self._checkpoint_action(
+                        "global_judge_failed",
+                        action_key,
+                        failed_payload,
+                    )
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=reserved_requests,
+                        physical_request_exact=False,
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                replay_provider_state = (
+                    self._prevalidate_global_replay_provider_state(
+                        state,
+                        replay_payload,
+                    )
                 )
-                terminal_pass_identities.add(pass_identity)
-                continue
-            try:
-                if not isinstance(result, BoundedJudgeCallResult):
-                    raise TypeError(
-                        "global Judge must return BoundedJudgeCallResult"
+                state.logical_judge_calls += 1
+                state.judge_requests += replay_payload[
+                    "physical_request_delta"
+                ]
+                if not replay_payload["physical_request_exact"]:
+                    state.judge_request_uncertainty_count += 1
+                self._apply_validated_provider_result_state(
+                    state,
+                    replay_provider_state,
+                )
+                if replay_action["operation"] == "global_judge_failed":
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=replay_payload["blocker"],
+                        detail=replay_payload["detail"],
+                        physical_request_delta=replay_payload[
+                            "physical_request_delta"
+                        ],
+                        physical_request_exact=replay_payload[
+                            "physical_request_exact"
+                        ],
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
                     )
-                if result.physical_requests > remaining:
-                    raise ValueError(
-                        "global Judge exceeded its physical request allowance"
-                    )
-                judgment = result.value
-                if not isinstance(judgment, GlobalCandidateJudgment):
-                    raise TypeError(
-                        "global Judge returned an unsupported judgment"
-                    )
-                validate_active_focus_binding(request, judgment)
+                    terminal_pass_identities.add(pass_identity)
+                    continue
                 judgment = validate_global_candidate_payload(
-                    judgment.to_dict(), request=request
+                    replay_payload["judgment"],
+                    request=request,
                 )
-            except Exception as exc:
-                physical_delta = (
-                    result.physical_requests
-                    if isinstance(result, BoundedJudgeCallResult)
-                    else 0
-                )
-                fail_seed(
+                physical_delta = replay_payload[
+                    "physical_request_delta"
+                ]
+            else:
+                if remaining == 0:
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker="judge_request_budget_exhausted",
+                        detail=(
+                            "The Global Judge physical request budget is "
+                            "exhausted before this seed can start."
+                        ),
+                        candidate_compression=metrics,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                started_payload = _global_judge_action_base(
                     builder=builder,
-                    items=seed_items,
-                    blocker="global_judge_output_invalid",
-                    detail="{0}: {1}".format(type(exc).__name__, exc),
-                    physical_request_delta=physical_delta,
+                    item=item,
+                    request=request,
                     candidate_compression=metrics,
+                    physical_requests_reserved=remaining,
                 )
-                terminal_pass_identities.add(pass_identity)
-                continue
-            state.judge_requests += result.physical_requests
+                self._checkpoint_action(
+                    "global_judge_started",
+                    action_key,
+                    started_payload,
+                )
+                state.logical_judge_calls += 1
+                result: Any = None
+                try:
+                    result = self.judge.judge_candidates_bounded(
+                        request, max_physical_requests=remaining
+                    )
+                except BoundedJudgeCallError as exc:
+                    physical_delta = exc.physical_requests
+                    if physical_delta > remaining:
+                        raise ValueError(
+                            "Global Judge bounded failure exceeded its "
+                            "reserved request allowance"
+                        ) from exc
+                    state.judge_requests += physical_delta
+                    blocker = "global_judge_bounded_failure"
+                    detail = "{0}: {1}".format(type(exc).__name__, exc)
+                    failure_projection = _global_failure_projection(
+                        builder=builder,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        physical_request_exact=True,
+                    )
+                    failed_payload = {
+                        **started_payload,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
+                        "blocker": blocker,
+                        "detail": detail,
+                        "failure_projection": failure_projection,
+                        "provider_state": self._capture_provider_result_state(
+                            state
+                        ),
+                    }
+                    self._checkpoint_action(
+                        "global_judge_failed",
+                        action_key,
+                        failed_payload,
+                    )
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                except Exception as exc:
+                    state.judge_requests += remaining
+                    state.judge_request_uncertainty_count += 1
+                    blocker = "global_judge_interrupted"
+                    detail = (
+                        "The Global Judge call ended without exact physical "
+                        "request accounting and is treated as interrupted: "
+                        "{0}: {1}"
+                    ).format(type(exc).__name__, exc)
+                    failure_projection = _global_failure_projection(
+                        builder=builder,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=remaining,
+                        physical_request_exact=False,
+                    )
+                    failed_payload = {
+                        **started_payload,
+                        "status": "failed",
+                        "physical_request_delta": remaining,
+                        "physical_request_exact": False,
+                        "blocker": blocker,
+                        "detail": detail,
+                        "failure_projection": failure_projection,
+                        "provider_state": self._capture_provider_result_state(
+                            state
+                        ),
+                    }
+                    self._checkpoint_action(
+                        "global_judge_failed",
+                        action_key,
+                        failed_payload,
+                    )
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=remaining,
+                        physical_request_exact=False,
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                try:
+                    if not isinstance(result, BoundedJudgeCallResult):
+                        raise TypeError(
+                            "global Judge must return BoundedJudgeCallResult"
+                        )
+                    physical_delta = result.physical_requests
+                    if physical_delta > remaining:
+                        raise ValueError(
+                            "global Judge exceeded its physical request allowance"
+                        )
+                    judgment = result.value
+                    if not isinstance(judgment, GlobalCandidateJudgment):
+                        raise TypeError(
+                            "global Judge returned an unsupported judgment"
+                        )
+                    validate_active_focus_binding(request, judgment)
+                    judgment = validate_global_candidate_payload(
+                        judgment.to_dict(), request=request
+                    )
+                except Exception as exc:
+                    physical_delta = (
+                        result.physical_requests
+                        if isinstance(result, BoundedJudgeCallResult)
+                        else 0
+                    )
+                    if physical_delta > remaining:
+                        raise ValueError(
+                            "Global Judge result exceeded its reserved request "
+                            "allowance"
+                        ) from exc
+                    state.judge_requests += physical_delta
+                    blocker = "global_judge_output_invalid"
+                    detail = "{0}: {1}".format(type(exc).__name__, exc)
+                    failure_projection = _global_failure_projection(
+                        builder=builder,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        physical_request_exact=True,
+                    )
+                    failed_payload = {
+                        **started_payload,
+                        "status": "failed",
+                        "physical_request_delta": physical_delta,
+                        "physical_request_exact": True,
+                        "blocker": blocker,
+                        "detail": detail,
+                        "failure_projection": failure_projection,
+                        "provider_state": self._capture_provider_result_state(
+                            state
+                        ),
+                    }
+                    self._checkpoint_action(
+                        "global_judge_failed",
+                        action_key,
+                        failed_payload,
+                    )
+                    fail_seed(
+                        builder=builder,
+                        items=seed_items,
+                        blocker=blocker,
+                        detail=detail,
+                        physical_request_delta=physical_delta,
+                        candidate_compression=metrics,
+                        accounting_already_applied=True,
+                    )
+                    terminal_pass_identities.add(pass_identity)
+                    continue
+                state.judge_requests += physical_delta
+                completed_payload = {
+                    **started_payload,
+                    "status": "completed",
+                    "physical_request_delta": physical_delta,
+                    "physical_request_exact": True,
+                    "judgment": judgment.to_dict(),
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "global_judge_completed",
+                    action_key,
+                    completed_payload,
+                )
             owner = _global_pass_owner(builder)
             event = {
                 "kind": "global_candidate_pass",
@@ -8117,7 +9016,7 @@ class AgenticRecursiveAnalyzer:
                 "hypothesis_id": item.hypothesis_id,
                 "visit_key": item.visit_key,
                 "owner": owner.to_dict(),
-                "physical_request_delta": result.physical_requests,
+                "physical_request_delta": physical_delta,
                 "candidate_compression": metrics,
                 "candidate_evidence_capsules": [
                     capsule.to_dict() for capsule in capsules
@@ -8577,9 +9476,44 @@ class AgenticRecursiveAnalyzer:
             requested_starts = tuple(analysis_graph.default_start_refs())
         restored_checkpoint: Optional[CheckpointState] = None
         if self.checkpoint is not None:
+            checkpoint_budgets = self.checkpoint_config.get("budgets")
+            runtime_budgets = {
+                "max_frontier_items": self.max_frontier_items,
+                "max_depth": self.max_depth,
+                "max_hypotheses": self.max_hypotheses,
+                "max_investigation_rounds": self.max_investigation_rounds,
+                "max_artifact_bytes": self.max_artifact_bytes,
+                "max_judge_requests": self.max_judge_requests,
+            }
+            for budget_name, runtime_value in runtime_budgets.items():
+                checkpoint_value = (
+                    checkpoint_budgets.get(budget_name)
+                    if isinstance(checkpoint_budgets, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(checkpoint_value, bool)
+                    or not isinstance(checkpoint_value, int)
+                    or checkpoint_value != runtime_value
+                ):
+                    raise ValueError(
+                        "checkpoint budget {0} must match the analyzer "
+                        "runtime budget".format(budget_name)
+                    )
             self.checkpoint.initialize(self.checkpoint_config)
             restored_checkpoint = self.checkpoint.restore(
                 expected_config=self.checkpoint_config
+            )
+            _validated_global_judge_action_history(
+                restored_checkpoint.actions,
+                max_judge_requests=int(
+                    restored_checkpoint.config["budgets"][
+                        "max_judge_requests"
+                    ]
+                ),
+                cache_identity=str(
+                    restored_checkpoint.config.get("cache_identity") or ""
+                ),
             )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
