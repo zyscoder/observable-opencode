@@ -51,7 +51,7 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v19"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v20"
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 LEGACY_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v1-legacy"
 MODERN_REPORT_KEYS = frozenset(
@@ -120,15 +120,18 @@ _MODERN_REPORT_STRING_FIELDS = frozenset(
     }
 )
 CAUSAL_PUBLICATION_CONTRACT_VERSION = "causal-publication/v3"
-GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v7"
+GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v8"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
-    "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
+    "global-candidate-judgment/v8+validation-envelope/v8+capsule/v7"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
     "+failure-action/v3+failure-projection/v4+terminal-record-schema/v3"
     "+judge-lifecycle/v1"
+    "+graph-seed-authority/v1+objective-authority/v1"
+    "+candidate-set-closure/v1"
+    "+comparison-matrix-closure/v1"
 )
 GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION = (
-    "global-candidate-validation-envelope/v7"
+    "global-candidate-validation-envelope/v8"
 )
 ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION = (
     "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
@@ -1133,6 +1136,101 @@ class DefectState:
         if defect_state_id and defect_state_id != state.defect_state_id:
             raise ValueError("DefectState defect_state_id does not match semantic fields")
         return state
+
+
+def _seed_semantic_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value in (None, [], {}):
+        return ""
+    return stable_json(value)
+
+
+def _first_seed_semantic_value(
+    data: Mapping[str, Any],
+    keys: Tuple[str, ...],
+    fallback: str,
+) -> str:
+    for key in keys:
+        value = _seed_semantic_text(data.get(key))
+        if value:
+            return value
+    return fallback
+
+
+def seed_defect_state(node: TraceNode, objective: str) -> DefectState:
+    data = node.data
+    if node.event_type == "external.evaluation_fact":
+        status = _first_seed_semantic_value(
+            data, ("status",), node.status or "unknown"
+        ).lower()
+        return DefectState.create(
+            label="external_evaluation_{0}".format(status),
+            expected=_first_seed_semantic_value(
+                data,
+                ("assertion",),
+                "The externally evaluated behavior satisfies its assertion.",
+            ),
+            actual=_first_seed_semantic_value(
+                data,
+                ("observation",),
+                "The external evaluator did not record an observation.",
+            ),
+            mechanism="External evaluation status: {0}.".format(status),
+            scope=_first_seed_semantic_value(
+                data, ("scope",), "external_evaluation"
+            ),
+        )
+    if node.event_type == "response.claim":
+        claim = _first_seed_semantic_value(
+            data,
+            ("text", "claim", "summary", "description"),
+            "The final response contains an ungrounded claim candidate.",
+        )
+        return DefectState.create(
+            label="unsupported_response_claim",
+            expected=(
+                objective
+                or "The final response claim is fully grounded, temporally valid, and not contradicted."
+            ),
+            actual=claim,
+            mechanism=(
+                "The claim may be unsupported, contradicted, incomplete, or fully valid; "
+                "defect presence is unconfirmed until evidence comparison."
+            ),
+            scope="response_quality",
+        )
+    label = _first_seed_semantic_value(
+        data,
+        ("failure_type", "gap_kind", "dimension", "issue_kind", "defect_type"),
+        "observed_defect",
+    )
+    summary = _first_seed_semantic_value(
+        data, ("summary", "description", "reason", "text"), label
+    )
+    return DefectState.create(
+        label=label,
+        expected=_first_seed_semantic_value(
+            data,
+            ("expected", "expected_behavior", "requirement", "criterion"),
+            objective,
+        ),
+        actual=_first_seed_semantic_value(
+            data,
+            ("actual", "actual_behavior", "observed", "result"),
+            summary,
+        ),
+        mechanism=_first_seed_semantic_value(
+            data,
+            ("mechanism", "failure_mechanism", "cause", "reason"),
+            summary,
+        ),
+        scope=_first_seed_semantic_value(
+            data,
+            ("scope", "attribution_domain", "component", "dimension"),
+            node.component or node.event_type or "task_quality",
+        ),
+    )
 
 
 def semantic_visit_key(
@@ -3885,5 +3983,6 @@ __all__ = [
     "confirmation_identity_for",
     "confirmation_response_identity_for",
     "seed_binding_identity_for",
+    "seed_defect_state",
     "validate_seed_outcome_payload",
 ]

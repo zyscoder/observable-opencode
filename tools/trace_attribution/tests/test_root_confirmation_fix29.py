@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from scripts.evaluate_recursive_attribution import (
@@ -13,7 +14,10 @@ from scripts.evaluate_recursive_attribution import (
     compare_report,
 )
 from trace_attribution.cache import JudgmentCache
-from trace_attribution.causal_judge import ClaudeCausalJudge
+from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
+    ClaudeCausalJudge,
+)
 from trace_attribution.causal_state import (
     GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
     GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
@@ -229,7 +233,34 @@ class NoDefectOpenCandidateClosureTest(unittest.TestCase):
         )
 
     def test_analyzer_turns_insufficient_no_defect_into_seed_gap(self):
-        judge = recursive_test_support.FusionScriptedJudge(
+        class IncompleteNoDefectJudge(
+            recursive_test_support.FusionScriptedJudge
+        ):
+            def judge_candidates_bounded(
+                self,
+                request,
+                *,
+                max_physical_requests,
+            ):
+                result = super().judge_candidates_bounded(
+                    request,
+                    max_physical_requests=max_physical_requests,
+                )
+                incomplete_ref = (
+                    request.open_authored_root_candidate_refs[0]
+                )
+                assessments = tuple(
+                    replace(item, input_defect_status="unknown")
+                    if item.candidate_ref == incomplete_ref
+                    else item
+                    for item in result.value.assessments
+                )
+                return BoundedJudgeCallResult(
+                    replace(result.value, assessments=assessments),
+                    result.physical_requests,
+                )
+
+        judge = IncompleteNoDefectJudge(
             global_outcome="no_defect"
         )
 
@@ -727,15 +758,15 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
     def test_versions_name_every_changed_judge_and_persistence_contract(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v7",
+            "global-candidate-judgment/v8",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
-            "global-candidate-judgment/v7",
+            "global-candidate-judgment/v8",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
-            "global-candidate-validation-envelope/v7",
+            "global-candidate-validation-envelope/v8",
         )
         self.assertIn(
             "failure-projection/v4",
@@ -753,10 +784,10 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
             GLOBAL_FAILURE_PROJECTION_SCHEMA,
             "global-candidate-failure-projection/v4",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v17")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v19",
+            "recursive-attribution-report/v20",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -764,7 +795,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v19",
+            "recursive-attribution-checkpoint/v20",
         )
 
     def test_old_global_envelope_and_report_are_rejected(self):

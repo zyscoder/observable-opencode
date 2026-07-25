@@ -431,9 +431,8 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
         assessments = []
         for capsule in request.capsules:
             is_selected = capsule.candidate_ref in selected
-            is_open_no_defect = (
-                self.global_outcome == "no_defect"
-                and capsule.candidate_ref
+            is_open = (
+                capsule.candidate_ref
                 in request.open_authored_root_candidate_refs
             )
             assessments.append(
@@ -450,7 +449,7 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                     ),
                     input_defect_status=(
                         "absent"
-                        if is_selected or is_open_no_defect
+                        if is_selected or is_open
                         else "unknown"
                     ),
                     output_defect_status=(
@@ -464,7 +463,7 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                     ),
                     causal_path_refs=(
                         tuple(capsule.downstream_path)
-                        if is_selected or is_open_no_defect
+                        if is_selected or is_open
                         else ()
                     ),
                     counterfactual={
@@ -508,6 +507,11 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                 },
             )
             missing = ("The candidate-local assumption needs recursive validation.",)
+        elif self.global_outcome == "inconclusive":
+            missing = (
+                "The comparative evidence does not resolve which open "
+                "candidate introduced the active defect.",
+            )
         return BoundedJudgeCallResult(
             GlobalCandidateJudgment(
                 outcome=self.global_outcome,

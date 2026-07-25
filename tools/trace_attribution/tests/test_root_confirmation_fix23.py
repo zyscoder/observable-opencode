@@ -451,18 +451,18 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
     def test_all_affected_persisted_identities_are_bumped(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v19",
+            "recursive-attribution-report/v20",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v19",
+            "recursive-attribution-checkpoint/v20",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v8",
+            "recursive-attribution-output/v9",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v17")
         self.assertEqual(
             COMPARISON_SCHEMA_VERSION,
             "recursive-attribution-comparison/v5",
@@ -486,11 +486,13 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
-            "global-candidate-judgment/v7+validation-envelope/v7"
+            "global-candidate-judgment/v8+validation-envelope/v8"
             "+capsule/v7+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
             "+failure-projection/v4+terminal-record-schema/v3"
-            "+judge-lifecycle/v1",
+            "+judge-lifecycle/v1+graph-seed-authority/v1"
+            "+objective-authority/v1"
+            "+candidate-set-closure/v1+comparison-matrix-closure/v1",
         )
 
 

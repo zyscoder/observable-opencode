@@ -1275,11 +1275,13 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v7+validation-envelope/v7+capsule/v7"
+            "global-candidate-judgment/v8+validation-envelope/v8+capsule/v7"
             "+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
             "+failure-projection/v4+terminal-record-schema/v3"
-            "+judge-lifecycle/v1",
+            "+judge-lifecycle/v1+graph-seed-authority/v1"
+            "+objective-authority/v1"
+            "+candidate-set-closure/v1+comparison-matrix-closure/v1",
         )
         self.assertEqual(
             config["root_confirmation_contract"],
@@ -1292,7 +1294,7 @@ class CausalCheckpointTest(unittest.TestCase):
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v19")
+        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v20")
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1520,7 +1522,10 @@ class CausalCheckpointTest(unittest.TestCase):
             route_capsule["validation_source"][
                 "candidate_source"
             ] = "semantic_fallback"
-            with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "authoritative retrieval route|completed pass",
+            ):
                 RecursiveAnalysisState.from_checkpoint(
                     graph=TraceGraph.from_trace(trace),
                     checkpoint=replace(partial, actions=tuple(route_actions)),
@@ -1554,7 +1559,8 @@ class CausalCheckpointTest(unittest.TestCase):
                 membership_source["candidate_evidence_refs"][0]
             )
             with self.assertRaisesRegex(
-                ValueError, "authoritative recorded route"
+                ValueError,
+                "authoritative recorded route|completed pass",
             ):
                 RecursiveAnalysisState.from_checkpoint(
                     graph=TraceGraph.from_trace(trace),
@@ -1624,7 +1630,10 @@ class CausalCheckpointTest(unittest.TestCase):
             route_capsule["validation_source"][
                 "candidate_source"
             ] = "semantic_fallback"
-            with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "authoritative retrieval route|completed pass",
+            ):
                 AgenticRecursiveAnalyzer(
                     judge=InterruptingGlobalNoDefectJudge(),
                     fusion_mode="retrieval-global",
@@ -1663,7 +1672,8 @@ class CausalCheckpointTest(unittest.TestCase):
                 membership_source["candidate_evidence_refs"][0]
             )
             with self.assertRaisesRegex(
-                ValueError, "authoritative recorded route"
+                ValueError,
+                "authoritative recorded route|completed pass",
             ):
                 AgenticRecursiveAnalyzer(
                     judge=InterruptingGlobalNoDefectJudge(),

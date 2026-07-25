@@ -14,6 +14,7 @@ from .causal_state import (
     CausalCandidate,
     DefectState,
     FrozenMapping,
+    seed_defect_state,
 )
 from .confirmation_path import is_confirmation_causal_edge
 from .evidence_capsule import (
@@ -165,6 +166,12 @@ class GlobalCandidateJudgeRequest:
                 item.candidate_ref
                 for item in self.capsules
                 if item.candidate.get("root_candidate_eligible") is True
+                and len(item.downstream_path) > 1
+                and item.downstream_path[0] == item.candidate_ref
+                and item.downstream_path[-1] == self.seed_ref
+                and _has_eligible_causal_path_hops(
+                    item, item.downstream_path
+                )
             )
         )
 
@@ -281,6 +288,7 @@ def global_candidate_request_from_validation_envelope(
     *,
     graph: Optional[TraceGraph] = None,
     authoritative_candidates: Sequence[CausalCandidate] = (),
+    authoritative_objective: Optional[str] = None,
 ) -> GlobalCandidateJudgeRequest:
     if not isinstance(value, Mapping):
         raise TypeError("global candidate validation envelope must be an object")
@@ -336,6 +344,7 @@ def global_candidate_request_from_validation_envelope(
             graph,
             request,
             authoritative_candidates=authoritative_candidates,
+            authoritative_objective=authoritative_objective,
         )
     return request
 
@@ -345,8 +354,40 @@ def validate_global_candidate_request_against_graph(
     request: GlobalCandidateJudgeRequest,
     *,
     authoritative_candidates: Sequence[CausalCandidate] = (),
+    authoritative_objective: Optional[str] = None,
 ) -> None:
     request.validate()
+    if authoritative_objective is None:
+        raise ValueError(
+            "global candidate graph validation requires an authoritative objective"
+        )
+    if request.objective != authoritative_objective:
+        raise ValueError(
+            "global candidate request objective drifts from the authoritative objective"
+        )
+    resolved_seed = graph.resolve(request.seed_ref)
+    seed_node = graph.nodes.get(resolved_seed or "")
+    if seed_node is None:
+        raise ValueError(
+            "global candidate request graph seed is unresolved"
+        )
+    authoritative_defect = seed_defect_state(
+        seed_node,
+        authoritative_objective,
+    )
+    if request.active_defect != authoritative_defect:
+        raise ValueError(
+            "global candidate request active defect contradicts the graph seed"
+        )
+    if (
+        normalize_active_focus_text(request.active_focus_text)
+        != normalize_active_focus_text(authoritative_defect.actual)
+        or request.active_focus_text_hash
+        != active_focus_text_sha256(authoritative_defect.actual)
+    ):
+        raise ValueError(
+            "global candidate request active focus contradicts the graph seed"
+        )
     for label, refs in (
         ("seed", (request.seed_ref,)),
         ("start", request.start_refs),
@@ -632,6 +673,9 @@ def validate_global_candidate_payload(
     decisive = _strings(value.get("decisive_evidence_refs"), "decisive_evidence_refs")
     if any(ref not in grounded for ref in decisive):
         raise ValueError("decisive evidence must use grounded refs")
+    open_authored_ref_set = set(
+        request.open_authored_root_candidate_refs
+    )
     for item in assessments:
         if any(ref not in grounded for ref in item.evidence_refs):
             raise ValueError("assessment evidence must use grounded refs")
@@ -664,19 +708,41 @@ def validate_global_candidate_payload(
             raise ValueError(
                 "present causal candidate requires causal_path_refs to the active seed"
             )
-        expected_compared = set(request.open_authored_root_candidate_refs)
-        if set(item.compared_candidate_refs) != expected_compared:
+        if set(item.compared_candidate_refs) != open_authored_ref_set:
             raise ValueError(
                 "compared_candidate_refs must cover every open authored root-eligible candidate"
             )
     missing = _strings(value.get("missing_evidence"), "missing_evidence")
     expansion = _expansion_requests(value.get("expansion_requests"), grounded)
     by_ref = {item.candidate_ref: item for item in assessments}
+    open_assessments = [
+        by_ref[ref]
+        for ref in sorted(open_authored_ref_set)
+    ]
+    incomplete_open_assessments = [
+        item
+        for item in open_assessments
+        if (
+            not item.causal_path_refs
+            or item.output_defect_status == "unknown"
+            or item.causal_role == "unknown"
+            or (
+                item.input_defect_status == "unknown"
+                and item.causal_role != "root_candidate"
+            )
+        )
+    ]
     if outcome == "candidate_roots":
         if not selected:
             raise ValueError("candidate_roots requires selected candidates")
         if not decisive:
             raise ValueError("candidate_roots requires decisive evidence")
+        if incomplete_open_assessments:
+            raise ValueError(
+                "candidate_roots requires a complete comparison for every "
+                "open authored root-eligible candidate, including known "
+                "status, role, and causal_path_refs"
+            )
         for ref in selected:
             assessment = by_ref[ref]
             if (
@@ -703,13 +769,9 @@ def validate_global_candidate_payload(
             raise ValueError("no_defect requires decisive evidence")
         if missing:
             raise ValueError("no_defect cannot retain missing evidence")
-        open_authored_refs = tuple(request.open_authored_root_candidate_refs)
-        open_authored_ref_set = set(open_authored_refs)
-        open_assessments = [
-            item
-            for item in assessments
-            if item.candidate_ref in open_authored_ref_set
-        ]
+        open_authored_refs = tuple(
+            request.open_authored_root_candidate_refs
+        )
         if (
             len(open_assessments) != len(open_authored_refs)
             or {item.candidate_ref for item in open_assessments}
@@ -768,6 +830,21 @@ def validate_global_candidate_payload(
             raise ValueError("needs_expansion requires requests and missing evidence")
     elif selected or expansion:
         raise ValueError("inconclusive cannot select roots or request expansion")
+    elif not missing:
+        raise ValueError(
+            "inconclusive requires concrete missing evidence"
+        )
+    elif not incomplete_open_assessments and any(
+        item.input_defect_status != "present"
+        and item.output_defect_status == "present"
+        and item.causal_role == "root_candidate"
+        and item.causal_path_refs
+        and item.counterfactual["predicted_defect_status"] == "absent"
+        for item in open_assessments
+    ):
+        raise ValueError(
+            "inconclusive cannot hide a complete selectable root matrix"
+        )
     judgment = GlobalCandidateJudgment(
         outcome=outcome,
         reason=reason,
@@ -899,10 +976,21 @@ def _validate_assessment_counterfactual_consistency(
             raise ValueError(
                 "root_candidate with unknown input defect cannot claim certain confidence"
             )
-        expected_prevents = True
-    else:
-        expected_prevents = False
-    if counterfactual_prevents is not expected_prevents:
+        if not counterfactual_prevents:
+            raise ValueError(
+                "counterfactual contradicts assessment causal role and "
+                "defect status"
+            )
+    elif (
+        assessment.causal_role
+        in {
+            "outcome_evidence",
+            "exculpatory_evidence",
+            "unrelated",
+            "unknown",
+        }
+        and counterfactual_prevents
+    ):
         raise ValueError(
             "counterfactual contradicts assessment causal role and defect status"
         )

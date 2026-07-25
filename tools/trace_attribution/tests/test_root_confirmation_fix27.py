@@ -22,6 +22,7 @@ from trace_attribution.causal_state import (
     LocalStateOwner,
     RecursiveAttributionReport,
     annotate_report_semantic_anchors,
+    seed_defect_state,
 )
 from trace_attribution.checkpoint import CheckpointBundle
 from trace_attribution.errors import (
@@ -510,10 +511,29 @@ class StrictGlobalArtifactHydrationTest(unittest.TestCase):
                 Path(directory),
                 (("candidate", "active"),),
             )
-            capsule = artifact_capsule(graph, "record:candidate")
+            objective = "Inspect strict artifact evidence."
+            defect = seed_defect_state(
+                graph.nodes["record:candidate"],
+                objective,
+            )
+            candidate = CausalCandidate(
+                ref="record:candidate",
+                node=graph.nodes["record:candidate"],
+                source="progress_window",
+                evidence_refs=("record:candidate",),
+            )
+            capsule = build_candidate_evidence_capsules(
+                graph=graph,
+                candidates=(candidate,),
+                defect_state=defect,
+                downstream_paths={
+                    "record:candidate": ("record:candidate",)
+                },
+                start_refs=("record:candidate",),
+            )[0]
             request = GlobalCandidateJudgeRequest(
                 case_id=graph.case_id,
-                objective="Inspect strict artifact evidence.",
+                objective=objective,
                 analysis_perspective="",
                 seed_ref="record:candidate",
                 active_defect=capsule.defect_state,
@@ -527,26 +547,14 @@ class StrictGlobalArtifactHydrationTest(unittest.TestCase):
             restored = global_candidate_request_from_validation_envelope(
                 request.validation_envelope(),
                 graph=graph,
-                authoritative_candidates=(
-                    CausalCandidate(
-                        ref="record:candidate",
-                        node=graph.nodes["record:candidate"],
-                        source="progress_window",
-                        evidence_refs=("record:candidate",),
-                    ),
-                ),
+                authoritative_candidates=(candidate,),
+                authoritative_objective=objective,
             )
             validate_global_candidate_request_against_graph(
                 graph,
                 restored,
-                authoritative_candidates=(
-                    CausalCandidate(
-                        ref="record:candidate",
-                        node=graph.nodes["record:candidate"],
-                        source="progress_window",
-                        evidence_refs=("record:candidate",),
-                    ),
-                ),
+                authoritative_candidates=(candidate,),
+                authoritative_objective=objective,
             )
             self.assertEqual(restored, request)
             self.assertEqual(
@@ -976,7 +984,7 @@ class Fix27VersionIdentityTest(unittest.TestCase):
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v7",
+            "global-candidate-judgment/v8",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
@@ -990,13 +998,13 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "confirmation-request-identity/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v19")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v20")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v19",
+            "recursive-attribution-checkpoint/v20",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v16")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v17")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

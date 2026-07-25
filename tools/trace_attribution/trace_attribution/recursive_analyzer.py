@@ -56,6 +56,7 @@ from .causal_state import (
     confirmation_counterfactual_for,
     confirmation_identity_for,
     is_definitive_confirmation,
+    seed_defect_state,
     semantic_visit_key,
     seed_binding_identity_for,
     validate_confirmation_ownership,
@@ -115,7 +116,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v16"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v17"
 GLOBAL_JUDGE_ACTION_OPERATIONS = frozenset(
     {
         "global_judge_started",
@@ -542,97 +543,6 @@ def _dedupe_strings(values: Iterable[str]) -> Tuple[str, ...]:
     return tuple(output)
 
 
-def _semantic_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip()
-    if value in (None, [], {}):
-        return ""
-    return stable_json(value)
-
-
-def _first_semantic_value(data: Mapping[str, Any], keys: Sequence[str], fallback: str) -> str:
-    for key in keys:
-        value = _semantic_text(data.get(key))
-        if value:
-            return value
-    return fallback
-
-
-def _seed_defect_state(node: TraceNode, objective: str) -> DefectState:
-    data = node.data
-    if node.event_type == "external.evaluation_fact":
-        status = _first_semantic_value(
-            data, ("status",), node.status or "unknown"
-        ).lower()
-        return DefectState.create(
-            label="external_evaluation_{0}".format(status),
-            expected=_first_semantic_value(
-                data,
-                ("assertion",),
-                "The externally evaluated behavior satisfies its assertion.",
-            ),
-            actual=_first_semantic_value(
-                data,
-                ("observation",),
-                "The external evaluator did not record an observation.",
-            ),
-            mechanism="External evaluation status: {0}.".format(status),
-            scope=_first_semantic_value(
-                data, ("scope",), "external_evaluation"
-            ),
-        )
-    if node.event_type == "response.claim":
-        claim = _first_semantic_value(
-            data,
-            ("text", "claim", "summary", "description"),
-            "The final response contains an ungrounded claim candidate.",
-        )
-        return DefectState.create(
-            label="unsupported_response_claim",
-            expected=(
-                objective
-                or "The final response claim is fully grounded, temporally valid, and not contradicted."
-            ),
-            actual=claim,
-            mechanism=(
-                "The claim may be unsupported, contradicted, incomplete, or fully valid; "
-                "defect presence is unconfirmed until evidence comparison."
-            ),
-            scope="response_quality",
-        )
-    label = _first_semantic_value(
-        data,
-        ("failure_type", "gap_kind", "dimension", "issue_kind", "defect_type"),
-        "observed_defect",
-    )
-    summary = _first_semantic_value(
-        data, ("summary", "description", "reason", "text"), label
-    )
-    return DefectState.create(
-        label=label,
-        expected=_first_semantic_value(
-            data,
-            ("expected", "expected_behavior", "requirement", "criterion"),
-            objective,
-        ),
-        actual=_first_semantic_value(
-            data,
-            ("actual", "actual_behavior", "observed", "result"),
-            summary,
-        ),
-        mechanism=_first_semantic_value(
-            data,
-            ("mechanism", "failure_mechanism", "cause", "reason"),
-            summary,
-        ),
-        scope=_first_semantic_value(
-            data,
-            ("scope", "attribution_domain", "component", "dimension"),
-            node.component or node.event_type or "task_quality",
-        ),
-    )
-
-
 def _global_evidence_search_text(node: TraceNode) -> str:
     data = node.data
     payload: JsonDict = {
@@ -735,6 +645,84 @@ def _grounded_downstream_path(
     return ()
 
 
+def _global_envelope_authoritative_candidates(
+    graph: TraceGraph,
+    envelope: Any,
+    candidates: Sequence[CausalCandidate],
+) -> Tuple[CausalCandidate, ...]:
+    if not isinstance(envelope, Mapping):
+        raise TypeError("global candidate validation envelope must be an object")
+    capsules = envelope.get("candidate_evidence_capsules")
+    if not isinstance(capsules, list):
+        raise TypeError(
+            "global candidate validation envelope capsules must be an array"
+        )
+    requested_refs = {
+        graph.resolve(str(capsule.get("candidate_ref") or ""))
+        or str(capsule.get("candidate_ref") or "")
+        for capsule in capsules
+        if isinstance(capsule, Mapping)
+        and str(capsule.get("candidate_ref") or "")
+    }
+    authoritative = tuple(
+        candidate
+        for candidate in candidates
+        if (graph.resolve(candidate.ref) or candidate.ref) in requested_refs
+    )
+    authoritative_refs = {
+        graph.resolve(candidate.ref) or candidate.ref
+        for candidate in authoritative
+    }
+    if authoritative_refs != requested_refs:
+        raise ValueError(
+            "global candidate validation envelope has no complete "
+            "authoritative candidate route set"
+        )
+    return authoritative
+
+
+def _assert_global_envelope_matches_completed_pass(
+    report: RecursiveAttributionReport,
+    seed: SeedAttributionResult,
+    envelope: Any,
+) -> None:
+    judgment = seed.global_judgment
+    owner = LocalStateOwner.from_dict(judgment.get("owner"))
+    matching_passes = [
+        item
+        for item in report.investigation_journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+        and item.get("status") == "completed"
+        and LocalStateOwner.from_dict(item.get("owner")) == owner
+    ]
+    if len(matching_passes) != 1:
+        raise ValueError(
+            "global judgment has no unique completed pass capsule authority"
+        )
+    pass_capsules = matching_passes[0].get(
+        "candidate_evidence_capsules"
+    )
+    envelope_capsules = (
+        envelope.get("candidate_evidence_capsules")
+        if isinstance(envelope, Mapping)
+        else None
+    )
+    if not isinstance(pass_capsules, (list, tuple)) or not isinstance(
+        envelope_capsules,
+        (list, tuple),
+    ):
+        raise ValueError(
+            "global judgment capsule authority is incomplete"
+        )
+    if stable_json(_checkpoint_json(pass_capsules)) != stable_json(
+        _checkpoint_json(envelope_capsules)
+    ):
+        raise ValueError(
+            "global validation envelope capsules contradict the completed pass"
+        )
+
+
 def _assert_report_grounded_evidence(
     graph: TraceGraph, report: RecursiveAttributionReport, *, label: str
 ) -> None:
@@ -754,10 +742,25 @@ def _assert_report_grounded_evidence(
         refs.extend(seed.decisive_evidence_refs)
         judgment = seed.global_judgment
         if judgment:
+            envelope = seed.to_dict()["global_judgment"].get(
+                "validation_envelope"
+            )
+            _assert_global_envelope_matches_completed_pass(
+                report,
+                seed,
+                envelope,
+            )
             global_candidate_request_from_validation_envelope(
-                seed.to_dict()["global_judgment"].get("validation_envelope"),
+                envelope,
                 graph=graph,
-                authoritative_candidates=report.causal_candidates,
+                authoritative_candidates=(
+                    _global_envelope_authoritative_candidates(
+                        graph,
+                        envelope,
+                        report.causal_candidates,
+                    )
+                ),
+                authoritative_objective=report.objective,
             )
         refs.extend(judgment.get("decisive_evidence_refs") or ())
         identity_refs.extend(judgment.get("selected_candidate_refs") or ())
@@ -4068,6 +4071,102 @@ def _validated_global_judge_action(
     return copy.deepcopy(dict(payload))
 
 
+def _validated_investigation_replay_action(
+    record: Mapping[str, Any],
+    *,
+    action_key: str,
+    directive: InvestigationDirective,
+    item: FrontierItem,
+) -> Tuple[str, JsonDict, Optional[InvestigationResult]]:
+    operation = str(record.get("operation") or "")
+    if operation not in {
+        "investigation_started",
+        "investigation_completed",
+        "investigation_failed",
+    }:
+        raise ValueError("unsupported investigation replay action")
+    if str(record.get("semantic_key") or "") != action_key:
+        raise ValueError(
+            "investigation replay action ownership key is invalid"
+        )
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("investigation replay action payload is invalid")
+    expected_keys = {
+        "investigation_started": {
+            "directive_id",
+            "directive",
+            "visit_key",
+            "status",
+        },
+        "investigation_completed": {
+            "directive_id",
+            "visit_key",
+            "status",
+            "result",
+        },
+        "investigation_failed": {
+            "directive_id",
+            "visit_key",
+            "status",
+            "reason",
+        },
+    }[operation]
+    _require_exact_checkpoint_keys(
+        payload,
+        expected_keys,
+        "investigation replay action payload",
+    )
+    if str(payload.get("directive_id") or "") != directive.directive_id:
+        raise ValueError(
+            "investigation replay directive ownership is invalid"
+        )
+    if payload.get("visit_key") != item.visit_key:
+        raise ValueError(
+            "investigation replay visit ownership is invalid"
+        )
+    if operation == "investigation_started":
+        persisted_directive = InvestigationDirective.from_dict(
+            payload.get("directive")
+            if isinstance(payload.get("directive"), Mapping)
+            else {}
+        )
+        if (
+            persisted_directive != directive
+            or payload.get("visit_key") != item.visit_key
+            or payload.get("status") != "in_flight"
+        ):
+            raise ValueError(
+                "started investigation replay binding is invalid"
+            )
+        return operation, copy.deepcopy(dict(payload)), None
+    if operation == "investigation_failed":
+        if (
+            payload.get("status") != "unknown"
+            or payload.get("reason") != "interrupted_investigation_call"
+        ):
+            raise ValueError(
+                "failed investigation replay binding is invalid"
+            )
+        return operation, copy.deepcopy(dict(payload)), None
+    result_payload = payload.get("result")
+    result = InvestigationResult.from_dict(
+        dict(result_payload)
+        if isinstance(result_payload, Mapping)
+        else {}
+    )
+    if (
+        result.directive_id != directive.directive_id
+        or result.directive_kind != directive.directive_kind
+        or result.tool_name != directive.tool_name
+        or payload.get("status") != result.status
+    ):
+        raise ValueError(
+            "completed investigation replay directive binding is invalid"
+        )
+    return operation, copy.deepcopy(dict(payload)), result
+
+
 def _global_failure_projection(
     *,
     builder: "SeedAttributionBuilder",
@@ -6169,7 +6268,7 @@ class RecursiveAnalysisState:
                     seed_key=builder.key,
                 )
                 continue
-            defect_state = _seed_defect_state(node, objective)
+            defect_state = seed_defect_state(node, objective)
             builder = state._ensure_seed(start_ref, defect_state)
             state._remember_defect(defect_state)
             if not graph.analysis_start_eligible(start_ref):
@@ -7001,10 +7100,18 @@ class RecursiveAnalysisState:
         for builder in state.seed_ledger.values():
             judgment = builder.global_judgment
             if judgment and builder.key not in stale_seed_keys:
+                envelope = judgment.get("validation_envelope")
                 global_candidate_request_from_validation_envelope(
-                    judgment.get("validation_envelope"),
+                    envelope,
                     graph=graph,
-                    authoritative_candidates=state.causal_candidates,
+                    authoritative_candidates=(
+                        _global_envelope_authoritative_candidates(
+                            graph,
+                            envelope,
+                            state.causal_candidates,
+                        )
+                    ),
+                    authoritative_objective=state.objective,
                 )
         if len(state.seed_ledger) != len(action_payload["seed_ledger"]):
             raise ValueError("checkpoint contains duplicate per-seed attribution identity")
@@ -8679,6 +8786,7 @@ class AgenticRecursiveAnalyzer:
                     graph,
                     request,
                     authoritative_candidates=candidates,
+                    authoritative_objective=state.objective,
                 )
             except Exception as exc:
                 fail_seed(
@@ -11480,7 +11588,23 @@ class AgenticRecursiveAnalyzer:
             return "rejected"
         investigation_action_key = "investigation:{0}".format(directive.directive_id)
         replay_action = self._replay_action(state, investigation_action_key)
-        if replay_action is not None and replay_action.get("operation") == "investigation_started":
+        replay_operation = ""
+        replayed_result: Optional[InvestigationResult] = None
+        if replay_action is not None:
+            (
+                replay_operation,
+                _replay_payload,
+                replayed_result,
+            ) = _validated_investigation_replay_action(
+                replay_action,
+                action_key=investigation_action_key,
+                directive=directive,
+                item=item,
+            )
+        if replay_operation in {
+            "investigation_started",
+            "investigation_failed",
+        }:
             state.record_terminal_action(
                 item=item,
                 judgment=judgment,
@@ -11500,24 +11624,18 @@ class AgenticRecursiveAnalyzer:
                 item, "unresolved:interrupted_investigation_call"
             )
             self._checkpoint_state(state, investigation_action_key)
-            self._checkpoint_action(
-                "investigation_failed",
-                investigation_action_key,
-                {
-                    "directive_id": directive.directive_id,
-                    "status": "unknown",
-                    "reason": "interrupted_investigation_call",
-                },
-            )
+            if replay_operation == "investigation_started":
+                self._checkpoint_action(
+                    "investigation_failed",
+                    investigation_action_key,
+                    {
+                        "directive_id": directive.directive_id,
+                        "visit_key": item.visit_key,
+                        "status": "unknown",
+                        "reason": "interrupted_investigation_call",
+                    },
+                )
             return "completed"
-        replayed_result: Optional[InvestigationResult] = None
-        if replay_action is not None and replay_action.get("operation") == "investigation_completed":
-            replay_payload = replay_action.get("payload")
-            if not isinstance(replay_payload, Mapping):
-                raise ValueError("completed investigation action payload is invalid")
-            replayed_result = InvestigationResult.from_dict(
-                dict(replay_payload.get("result") or {})
-            )
         if replay_action is None and state.investigation_rounds >= self.max_investigation_rounds:
             state._increment_budget("investigation_rounds")
             result = InvestigationResult.rejected(
@@ -11556,6 +11674,7 @@ class AgenticRecursiveAnalyzer:
                 investigation_action_key,
                 {
                     "directive_id": directive.directive_id,
+                    "visit_key": item.visit_key,
                     "status": result.status,
                     "result": result.to_dict(),
                 },

@@ -288,6 +288,7 @@ class EventSpecificRevisionEligibilityTest(unittest.TestCase):
                 TraceGraph.from_trace(revision_trace()),
                 request,
                 authoritative_candidates=(candidate,),
+                authoritative_objective=request.objective,
             )
 
 

@@ -1069,6 +1069,23 @@ def validate_candidate_evidence_capsules_against_graph(
     *,
     authoritative_candidates: Sequence[CausalCandidate] = (),
 ) -> None:
+    if authoritative_candidates:
+        authoritative_refs = {
+            graph.resolve(candidate.ref) or candidate.ref
+            for candidate in authoritative_candidates
+            if graph.active_revision_evidence_eligible(
+                graph.resolve(candidate.ref) or candidate.ref
+            )
+        }
+        capsule_refs = {
+            graph.resolve(capsule.candidate_ref) or capsule.candidate_ref
+            for capsule in capsules
+        }
+        if capsule_refs != authoritative_refs:
+            raise ValueError(
+                "candidate capsule set must exactly cover the active "
+                "authoritative candidate set"
+            )
     for capsule in capsules:
         validate_candidate_evidence_capsule_against_graph(
             graph,

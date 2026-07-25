@@ -1907,14 +1907,16 @@ class SeedAttributionModelTests(unittest.TestCase):
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={
-                "schema_version": "global-candidate-judgment/v7",
+                "schema_version": "global-candidate-judgment/v8",
                 "outcome": "inconclusive",
                 "reason": "No global candidates were available.",
                 "assessments": [],
                 "selected_candidate_refs": [],
                 "expansion_requests": [],
                 "decisive_evidence_refs": [],
-                "missing_evidence": [],
+                "missing_evidence": [
+                    "No global candidate evidence was available."
+                ],
                 "confidence": 0.0,
                 "active_focus_binding": {
                     "seed_ref": "record:seed",
@@ -2012,7 +2014,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v19")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v20")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -2025,7 +2027,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v19")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v20")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

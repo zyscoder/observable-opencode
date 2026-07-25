@@ -690,20 +690,20 @@ class Fix39PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v19",
+            "recursive-attribution-report/v20",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v19",
+            "recursive-attribution-checkpoint/v20",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v8",
+            "recursive-attribution-output/v9",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v16",
+            "recursive-analysis-actions/v17",
         )
 
 

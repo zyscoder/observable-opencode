@@ -12,7 +12,10 @@ from unittest.mock import patch
 from trace_attribution.cache import JudgmentCache
 from trace_attribution import evidence_capsule
 from trace_attribution.causal_judge import BoundedJudgeCallError, ClaudeCausalJudge
-from trace_attribution.causal_state import CausalCandidate, DefectState
+from trace_attribution.causal_state import (
+    CausalCandidate,
+    seed_defect_state,
+)
 from trace_attribution.evidence_capsule import (
     CAPSULE_SCHEMA_VERSION,
     build_candidate_evidence_capsules,
@@ -61,7 +64,7 @@ def sample_request(
                 "component": "evaluation",
                 "event_type": "case.observed_defect",
                 "source_refs": ["record:verification", "record:decision"],
-                "data": {"actual": "Cleanup is interrupted after process SIGINT."},
+                "data": {"actual": "Started cleanup is interrupted."},
             },
         ],
         "dataflow_edges": [
@@ -87,13 +90,11 @@ def sample_request(
         trace["records"][2]["source_refs"].remove("record:decision")
     trace["dataflow_edges"][1].update(decision_edge_fields or {})
     graph = TraceGraph.from_trace(trace)
-    defect = DefectState.create(
-        label="sigint_cleanup_interrupted",
-        expected="Started cleanup completes after process SIGINT.",
-        actual="Started cleanup is interrupted.",
-        mechanism="The cancellation model may not preserve cleanup.",
-        scope="task_quality",
+    objective = (
+        "Find the trace-visible root or determine that the observed defect "
+        "is contradicted."
     )
+    defect = seed_defect_state(graph.nodes["record:defect"], objective)
     candidates = [
         CausalCandidate(
             ref="record:decision",
@@ -122,7 +123,7 @@ def sample_request(
     )
     request = GlobalCandidateJudgeRequest(
         case_id="global-judge-case",
-        objective="Find the trace-visible root or determine that the observed defect is contradicted.",
+        objective=objective,
         analysis_perspective="task quality",
         seed_ref="record:defect",
         active_defect=defect,
@@ -173,13 +174,8 @@ def multi_root_request(*refs: str) -> GlobalCandidateJudgeRequest:
         ],
     }
     graph = TraceGraph.from_trace(trace)
-    defect = DefectState.create(
-        label="active_defect",
-        expected="The active defect is absent.",
-        actual="The active defect is present.",
-        mechanism="One of the authored decisions introduced it.",
-        scope="task_quality",
-    )
+    objective = "Select no more than three authored root candidates."
+    defect = seed_defect_state(graph.nodes["record:defect"], objective)
     capsules = build_candidate_evidence_capsules(
         graph=graph,
         candidates=[
@@ -198,7 +194,7 @@ def multi_root_request(*refs: str) -> GlobalCandidateJudgeRequest:
     )
     return GlobalCandidateJudgeRequest(
         case_id=trace["case_id"],
-        objective="Select no more than three authored root candidates.",
+        objective=objective,
         analysis_perspective="task quality",
         seed_ref="record:defect",
         active_defect=defect,
@@ -278,13 +274,8 @@ def evidence_only_request(event_type: str) -> GlobalCandidateJudgeRequest:
         ],
     }
     graph = TraceGraph.from_trace(trace)
-    defect = DefectState.create(
-        label="active_defect",
-        expected="The active defect is absent.",
-        actual="The active defect is present.",
-        mechanism="Evidence observed the defect.",
-        scope="task_quality",
-    )
+    objective = "Keep evidence-only nodes out of root confirmation."
+    defect = seed_defect_state(graph.nodes["record:defect"], objective)
     capsules = build_candidate_evidence_capsules(
         graph=graph,
         candidates=[
@@ -302,7 +293,7 @@ def evidence_only_request(event_type: str) -> GlobalCandidateJudgeRequest:
     )
     return GlobalCandidateJudgeRequest(
         case_id=trace["case_id"],
-        objective="Keep evidence-only nodes out of root confirmation.",
+        objective=objective,
         analysis_perspective="task quality",
         seed_ref="record:defect",
         active_defect=defect,
@@ -506,6 +497,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 envelope,
                 graph=graph,
                 authoritative_candidates=candidates,
+                authoritative_objective=request.objective,
             )
 
     def test_valid_synthetic_envelope_requires_active_routes_before_judge_or_anchors(self):
@@ -513,12 +505,17 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         envelope = request.validation_envelope()
 
         with self.assertRaisesRegex(ValueError, "authoritative retrieval route"):
-            global_candidate_request_from_validation_envelope(envelope, graph=graph)
+            global_candidate_request_from_validation_envelope(
+                envelope,
+                graph=graph,
+                authoritative_objective=request.objective,
+            )
 
         restored = global_candidate_request_from_validation_envelope(
             envelope,
             graph=graph,
             authoritative_candidates=candidates,
+            authoritative_objective=request.objective,
         )
         self.assertEqual(restored.grounded_refs, request.grounded_refs)
 
@@ -556,12 +553,14 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 envelope,
                 graph=graph,
                 authoritative_candidates=candidates,
+                authoritative_objective=recorded_request.objective,
             )
 
         restored = global_candidate_request_from_validation_envelope(
             recorded_request.validation_envelope(),
             graph=graph,
             authoritative_candidates=candidates,
+            authoritative_objective=recorded_request.objective,
         )
         self.assertEqual(restored, recorded_request)
         self.assertEqual(restored.grounded_refs, recorded_request.grounded_refs)
@@ -610,13 +609,8 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             ],
         }
         graph = TraceGraph.from_trace(trace)
-        defect = DefectState.create(
-            label="active_defect",
-            expected="The active defect is absent.",
-            actual="The active defect is present.",
-            mechanism="The recorded decision introduced the defect.",
-            scope="task_quality",
-        )
+        objective = "Judge the active candidate."
+        defect = seed_defect_state(graph.nodes["record:defect"], objective)
         candidate = CausalCandidate(
             ref="record:decision",
             node=graph.nodes["record:decision"],
@@ -636,7 +630,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         )[0]
         request = GlobalCandidateJudgeRequest(
             case_id=trace["case_id"],
-            objective="Judge the active candidate.",
+            objective=objective,
             analysis_perspective="task quality",
             seed_ref="record:defect",
             active_defect=defect,
@@ -652,6 +646,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             request.validation_envelope(),
             graph=graph,
             authoritative_candidates=(candidate,),
+            authoritative_objective=request.objective,
         )
         self.assertEqual(restored, request)
 
@@ -751,13 +746,8 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             ],
         }
         graph = TraceGraph.from_trace(trace)
-        defect = DefectState.create(
-            label="incomplete_implementation",
-            expected="The implementation is complete.",
-            actual="The implementation is incomplete.",
-            mechanism="An incomplete decision propagated through the change.",
-            scope="task_quality",
-        )
+        objective = "Find the active root."
+        defect = seed_defect_state(graph.nodes["record:defect"], objective)
         candidate = CausalCandidate(
             ref="record:decision",
             node=graph.nodes["record:decision"],
@@ -781,7 +771,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         )[0]
         request = GlobalCandidateJudgeRequest(
             case_id=trace["case_id"],
-            objective="Find the active root.",
+            objective=objective,
             analysis_perspective="task quality",
             seed_ref="record:defect",
             active_defect=defect,
@@ -794,6 +784,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             graph,
             request,
             authoritative_candidates=(candidate,),
+            authoritative_objective=objective,
         )
 
         stale_trace = copy.deepcopy(trace)
@@ -809,6 +800,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 stale_graph,
                 request,
                 authoritative_candidates=(candidate,),
+                authoritative_objective=objective,
             )
 
     def test_substituted_action_group_member_cannot_become_expansion_anchor(self):
@@ -837,7 +829,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v7",
+            "global-candidate-validation-envelope/v8",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
@@ -1456,7 +1448,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
     def test_global_schema_is_v7_and_capsule_schema_is_v7(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v7",
+            "global-candidate-judgment/v8",
         )
         self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
 
