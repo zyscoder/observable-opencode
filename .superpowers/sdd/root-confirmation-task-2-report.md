@@ -5,7 +5,7 @@
 Implemented on base `bd8f1ab27` using test-driven development.
 
 Global candidate judgment now uses the fail-closed
-`global-candidate-judgment/v2` contract. Every request is bound to exactly one
+`global-candidate-judgment/v8` contract. Every request is bound to exactly one
 seed and every accepted judgment carries a complete, immutable candidate
 comparison matrix for that seed.
 
@@ -37,9 +37,9 @@ comparison matrix for that seed.
 - Made comparison-before-selection an explicit ordered prompt phase and emitted
   `retrieval_is_not_causal_verdict=true`. Rank and score remain navigation-only.
 - Updated Claude success, repair, cache, and fallback paths. Fallback produces a
-  valid bound v2 `inconclusive` judgment instead of bypassing the schema.
+  valid bound v8 `inconclusive` judgment instead of bypassing the schema.
 - Bound cache audit identities and analyzer journal events to the active seed.
-  Analyzer consumption revalidates the complete v2 judgment, including offline
+  Analyzer consumption revalidates the complete v8 judgment, including offline
   and scripted judge implementations, before applying it.
 - Preserved offline, passive, read-only analysis behavior and added no dependency.
 
@@ -82,7 +82,7 @@ orders navigation inputs and cannot change comparison coverage.
 - Global Judge suite: 23 tests passed.
 - Causal Judge suite: 86 tests passed.
 - Recursive Analyzer suite: 80 tests passed.
-- Full Python attribution suite: 626 tests passed.
+- Full Python attribution suite: 1,052 tests passed.
 
 ## Final Commands
 
@@ -104,7 +104,7 @@ orders navigation inputs and cannot change comparison coverage.
 
    `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/trace_attribution python3 -m unittest discover -s tools/trace_attribution/tests -p 'test_*.py'`
 
-   Result: `Ran 626 tests in 3.110s` / `OK`.
+   Result: `Ran 1052 tests in 29.266s` / `OK`.
 
 3. Compile and diff checks:
 
@@ -128,11 +128,20 @@ orders navigation inputs and cannot change comparison coverage.
 - `tools/trace_attribution/tests/test_causal_checkpoint.py`
 - `.superpowers/sdd/root-confirmation-task-2-report.md`
 
+## Cumulative Review
+
+The complete Task 2 range `bd8f1ab27..59822ecdf` received two independent
+read-only reviews:
+
+- Global Judge, candidate matrix, capsule, retrieval, and graph boundaries:
+  CLEAN.
+- Persistence, resume, publication, ownership, and report boundaries: CLEAN.
+
 ## Risks
 
 No blocking risks.
 
-The strict v2 schema intentionally invalidates v1 cached global judgments and
+The strict v8 schema intentionally invalidates pre-v8 cached global judgments and
 requires external/offline judge implementations to populate the complete matrix.
 Provider responses may therefore use the existing bounded repair path more often
 until prompts settle; exhausted repairs remain a valid seed-bound inconclusive
