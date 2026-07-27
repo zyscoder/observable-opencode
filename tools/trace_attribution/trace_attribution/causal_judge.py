@@ -37,6 +37,7 @@ from .global_judge import (
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
     build_global_candidate_prompt,
+    global_candidate_comparison_contract_from_context,
     global_candidate_judgment_from_payload,
     validate_global_candidate_payload,
 )
@@ -2591,6 +2592,11 @@ def _repair_constraints(
             },
             "open_authored_root_candidate_refs": list(
                 request_context.get("open_authored_root_candidate_refs") or []
+            ),
+            "candidate_comparison_contract": (
+                global_candidate_comparison_contract_from_context(
+                    request_context
+                )
             ),
             "comparison_then_selection": True,
             "valid_outcomes": [

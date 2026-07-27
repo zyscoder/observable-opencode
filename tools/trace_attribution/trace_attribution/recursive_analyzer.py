@@ -7783,7 +7783,21 @@ class RecursiveAnalysisState:
                     if candidate is not None:
                         if seed_builder is not None:
                             seed_builder.candidate_refs.add(candidate.ref)
-                        self.introduction_candidates.append(candidate)
+                        semantic_binding_exists = any(
+                            str(binding.get("candidate_ref") or "")
+                            == item.node_ref
+                            and str(
+                                binding.get("defect_fingerprint") or ""
+                            )
+                            == item.defect_state.fingerprint
+                            and str(
+                                binding.get("seed_binding_identity") or ""
+                            )
+                            == hypothesis.seed_binding_identity
+                            for binding in self.introduction_bindings
+                        )
+                        if not semantic_binding_exists:
+                            self.introduction_candidates.append(candidate)
                         self._remember_candidate(candidate)
                         self.introduction_bindings.append(
                             {
@@ -9121,6 +9135,56 @@ class AgenticRecursiveAnalyzer:
             for candidate in candidates:
                 state._remember_candidate(candidate)
             metrics = candidate_compression_metrics(graph, capsules)
+            fusion_payload = metrics.get("global_fusion_payload")
+            if (
+                isinstance(fusion_payload, Mapping)
+                and fusion_payload.get("eligible") is False
+            ):
+                gate_identity = (
+                    builder.start_ref,
+                    builder.defect_state.fingerprint,
+                    str(fusion_payload.get("reason") or ""),
+                )
+                already_recorded = any(
+                    isinstance(event, Mapping)
+                    and event.get("kind") == "global_candidate_gate"
+                    and (
+                        str(event.get("seed_ref") or ""),
+                        str(event.get("defect_fingerprint") or ""),
+                        str(event.get("reason") or ""),
+                    )
+                    == gate_identity
+                    for event in state.investigation_journal
+                )
+                if not already_recorded:
+                    state.investigation_journal.append(
+                        {
+                            "kind": "global_candidate_gate",
+                            "status": "bypassed",
+                            "seed_ref": builder.start_ref,
+                            "defect_fingerprint": (
+                                builder.defect_state.fingerprint
+                            ),
+                            "reason": str(
+                                fusion_payload.get("reason") or ""
+                            ),
+                            "candidate_compression": copy.deepcopy(
+                                metrics
+                            ),
+                            "fallback": "recursive_backward_taint",
+                            "behavior_impact": (
+                                "none_offline_analysis_only"
+                            ),
+                        }
+                    )
+                    self._checkpoint_state(
+                        state,
+                        "global:gate:{0}:{1}".format(
+                            builder.start_ref,
+                            builder.defect_state.fingerprint,
+                        ),
+                    )
+                continue
             try:
                 request = GlobalCandidateJudgeRequest(
                     case_id=graph.case_id,
@@ -9523,6 +9587,7 @@ class AgenticRecursiveAnalyzer:
             self._apply_global_candidate_judgment(
                 state=state,
                 item=item,
+                seed_items=seed_items,
                 candidates=candidates,
                 capsules=capsules,
                 judgment=judgment,
@@ -9738,6 +9803,7 @@ class AgenticRecursiveAnalyzer:
         *,
         state: RecursiveAnalysisState,
         item: FrontierItem,
+        seed_items: Sequence[FrontierItem],
         candidates: Sequence[CausalCandidate],
         capsules: Sequence[CandidateEvidenceCapsule],
         judgment: GlobalCandidateJudgment,
@@ -9746,6 +9812,10 @@ class AgenticRecursiveAnalyzer:
         terminal_blocker: str = "",
         terminal_blocker_detail: str = "",
     ) -> None:
+        bound_seed_items = {
+            seed_item.hypothesis_id: seed_item
+            for seed_item in seed_items
+        }
         seed_builder = state._seed_builder_for_item(item)
         if seed_builder is not None:
             seed_builder.record_global_judgment(
@@ -9758,10 +9828,14 @@ class AgenticRecursiveAnalyzer:
                 terminal_blocker_detail,
             )
         if judgment.outcome == "no_defect":
-            hypothesis = state.ledger.get(item.hypothesis_id)
-            if hypothesis.status in {"active", "supported"}:
+            for seed_item in bound_seed_items.values():
+                hypothesis = state.ledger.get(
+                    seed_item.hypothesis_id
+                )
+                if hypothesis.status not in {"active", "supported"}:
+                    continue
                 state.ledger.reject_with_frontier(
-                    item.hypothesis_id,
+                    seed_item.hypothesis_id,
                     judgment.reason,
                     opposing_refs=judgment.decisive_evidence_refs,
                     frontier=state.frontier,
@@ -9886,44 +9960,50 @@ class AgenticRecursiveAnalyzer:
                         seed_key=seed_builder.key,
                     )
 
-        original = state.ledger.get(item.hypothesis_id)
-        if judgment.outcome == "needs_expansion" and original.status in {
-            "active",
-            "supported",
-        }:
-            state.ledger.reject_with_frontier(
-                item.hypothesis_id,
-                terminal_blocker_detail
-                or "; ".join(judgment.missing_evidence)
-                or judgment.reason,
-                opposing_refs=(),
-                frontier=state.frontier,
-                evidence_hash=hashlib.sha256(
-                    stable_json(
-                        {
-                            "judgment": judgment.to_dict(),
-                            "expansion_history": [
-                                value.to_dict()
-                                for value in expansion_history
-                            ],
-                        }
-                    ).encode("utf-8")
-                ).hexdigest(),
-            )
-            state.unresolved_hypothesis_ids.add(item.hypothesis_id)
-        if created_hypotheses and item.hypothesis_id not in created_hypotheses and original.status in {
-            "active",
-            "supported",
-        }:
-            state.ledger.reject_with_frontier(
-                item.hypothesis_id,
-                "Global comparison superseded the seed with selected candidates.",
-                opposing_refs=(),
-                frontier=state.frontier,
-                evidence_hash=hashlib.sha256(
-                    stable_json(judgment.to_dict()).encode("utf-8")
-                ).hexdigest(),
-            )
+        for seed_item in bound_seed_items.values():
+            original = state.ledger.get(seed_item.hypothesis_id)
+            if original.status not in {"active", "supported"}:
+                continue
+            if judgment.outcome == "needs_expansion":
+                state.ledger.reject_with_frontier(
+                    seed_item.hypothesis_id,
+                    terminal_blocker_detail
+                    or "; ".join(judgment.missing_evidence)
+                    or judgment.reason,
+                    opposing_refs=(),
+                    frontier=state.frontier,
+                    evidence_hash=hashlib.sha256(
+                        stable_json(
+                            {
+                                "judgment": judgment.to_dict(),
+                                "expansion_history": [
+                                    value.to_dict()
+                                    for value in expansion_history
+                                ],
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+                state.unresolved_hypothesis_ids.add(
+                    seed_item.hypothesis_id
+                )
+            elif (
+                created_hypotheses
+                and seed_item.hypothesis_id
+                not in created_hypotheses
+            ):
+                state.ledger.reject_with_frontier(
+                    seed_item.hypothesis_id,
+                    (
+                        "Global comparison superseded the seed with "
+                        "selected candidates."
+                    ),
+                    opposing_refs=(),
+                    frontier=state.frontier,
+                    evidence_hash=hashlib.sha256(
+                        stable_json(judgment.to_dict()).encode("utf-8")
+                    ).hexdigest(),
+                )
 
     def analyze(
         self,
@@ -12230,8 +12310,7 @@ class AgenticRecursiveAnalyzer:
                 )
                 if not binding_exists:
                     raise ValueError("confirmation requires an existing introduction binding")
-                enqueued = state.enqueue_confirmation(
-                    {
+                queue_value = {
                         "hypothesis_id": hypothesis_id,
                         "hypothesis_semantic_hash": hypothesis.semantic_hash,
                         "candidate_ref": candidate_ref,
@@ -12254,7 +12333,46 @@ class AgenticRecursiveAnalyzer:
                             item, "confirmation_queue"
                         ).to_dict(),
                     }
+                reusable = next(
+                    (
+                        queued
+                        for queued in state.confirmation_queue
+                        if queued.get("origin")
+                        == "global_candidate_judgment"
+                        and str(queued.get("candidate_ref") or "")
+                        == candidate_ref
+                        and str(
+                            queued.get("defect_fingerprint") or ""
+                        )
+                        == defect_fingerprint
+                        and str(
+                            queued.get("seed_binding_identity") or ""
+                        )
+                        == hypothesis.seed_binding_identity
+                        and str(queued.get("hypothesis_id") or "")
+                        != hypothesis_id
+                    ),
+                    None,
                 )
+                if reusable is not None:
+                    successor_hypothesis_id = str(
+                        reusable.get("hypothesis_id") or ""
+                    )
+                    state.ledger.supersede(
+                        hypothesis_id,
+                        successor_hypothesis_id,
+                        (
+                            "The same candidate, defect, and seed already "
+                            "has a Global Judge confirmation request."
+                        ),
+                    )
+                    state.introduction_hypothesis_ids.discard(
+                        hypothesis_id
+                    )
+                    enqueued = True
+                    status = "unchanged"
+                else:
+                    enqueued = state.enqueue_confirmation(queue_value)
                 if not enqueued:
                     state._mark_ref_unresolved(
                         item.node_ref,

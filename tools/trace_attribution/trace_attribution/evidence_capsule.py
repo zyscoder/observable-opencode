@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Set, Tuple
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
 from .causal_retrieval import (
     canonical_candidate_route,
+    global_authored_root_candidate_eligible,
     root_candidate_eligible,
 )
 from .graph import TraceGraph
@@ -21,6 +22,8 @@ CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v7"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
+GLOBAL_FUSION_MAX_PAYLOAD_BYTES = 32_768
+GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES = 3
 VALIDATION_SOURCE_KEYS = frozenset(
     {
         "candidate_ref",
@@ -505,7 +508,9 @@ def build_candidate_evidence_capsules(
                 "source": candidate.source,
                 "retrieval_is_not_causal_verdict": True,
                 "evidence_eligible": graph.active_revision_evidence_eligible(ref),
-                "root_candidate_eligible": root_candidate_eligible(node),
+                "root_candidate_eligible": global_authored_root_candidate_eligible(
+                    graph, ref
+                ),
                 "active_graph_facts": _active_candidate_graph_facts(graph, node),
                 "retrieval_edge": prompt_collections["retrieval_edge"],
                 "node": _grounded_node_snapshot(
@@ -682,7 +687,15 @@ def candidate_compression_metrics(
     capsule_bytes = len(
         stable_json([item.to_dict() for item in unique.values()]).encode("utf-8")
     )
-    return {
+    open_root_candidate_count = sum(
+        1
+        for item in unique.values()
+        if item.candidate.get("root_candidate_eligible") is True
+        and len(item.downstream_path) > 1
+        and item.downstream_path[0] == item.candidate_ref
+        and item.downstream_path[-1] in item.start_refs
+    )
+    metrics = {
         "trace_node_count": trace_nodes,
         "candidate_count": candidate_count,
         "candidate_node_reduction_ratio": (
@@ -690,9 +703,59 @@ def candidate_compression_metrics(
         ),
         "trace_json_bytes": trace_bytes,
         "capsule_bytes": capsule_bytes,
+        "open_root_candidate_count": open_root_candidate_count,
         "candidate_byte_reduction_ratio": (
             round(1.0 - capsule_bytes / trace_bytes, 6) if trace_bytes else 0.0
         ),
+    }
+    metrics["global_fusion_payload"] = global_fusion_payload_decision(
+        metrics
+    )
+    return metrics
+
+
+def global_fusion_payload_decision(
+    metrics: Mapping[str, Any],
+    *,
+    max_payload_bytes: int = GLOBAL_FUSION_MAX_PAYLOAD_BYTES,
+    max_open_root_candidates: int = (
+        GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES
+    ),
+) -> JsonDict:
+    """Gate oversized payloads only when the root comparison is also dense."""
+    trace_bytes = max(0, int(metrics.get("trace_json_bytes") or 0))
+    capsule_bytes = max(0, int(metrics.get("capsule_bytes") or 0))
+    open_root_candidates = max(
+        0, int(metrics.get("open_root_candidate_count") or 0)
+    )
+    expansion_ratio = round(
+        capsule_bytes / max(trace_bytes, 1),
+        6,
+    )
+    negative_compression = capsule_bytes > trace_bytes
+    oversized = capsule_bytes > max_payload_bytes
+    dense_root_matrix = (
+        open_root_candidates > max_open_root_candidates
+    )
+    eligible = not (
+        negative_compression and oversized and dense_root_matrix
+    )
+    if not negative_compression or not oversized:
+        reason = "within_global_fusion_budget"
+    elif not dense_root_matrix:
+        reason = "bounded_root_matrix_despite_negative_compression"
+    else:
+        reason = "oversized_negative_compression"
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "capsule_to_trace_expansion_ratio": expansion_ratio,
+        "max_payload_bytes": max_payload_bytes,
+        "open_root_candidate_count": open_root_candidates,
+        "max_open_root_candidates": max_open_root_candidates,
+        "negative_compression": negative_compression,
+        "oversized": oversized,
+        "dense_root_matrix": dense_root_matrix,
     }
 
 
@@ -768,7 +831,9 @@ def _active_candidate_graph_facts(
         "semantic_role": str(node.data.get("semantic_role") or ""),
         "navigation_role": str(node.data.get("navigation_role") or ""),
         "evidence_eligible": graph.active_revision_evidence_eligible(node.ref),
-        "root_candidate_eligible": root_candidate_eligible(node),
+        "root_candidate_eligible": global_authored_root_candidate_eligible(
+            graph, node.ref
+        ),
     }
 
 
@@ -1247,6 +1312,7 @@ __all__ = [
     "build_action_group_context",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
+    "global_fusion_payload_decision",
     "validate_candidate_evidence_capsule_against_graph",
     "validate_candidate_evidence_capsules_against_graph",
 ]

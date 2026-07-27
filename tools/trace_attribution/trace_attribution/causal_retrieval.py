@@ -66,6 +66,13 @@ ROOT_INELIGIBLE_EVENT_TYPES = EVIDENCE_ONLY_EVENT_TYPES | frozenset(
         "run.start",
     }
 )
+GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
+    {
+        "process.signal",
+        "run.interruption",
+    }
+)
+MATERIALIZED_RESULT_EVENT_TYPES = frozenset({"change"})
 
 
 class SemanticPredecessorRetriever:
@@ -658,6 +665,33 @@ def authored_root_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
         and node is not None
         and graph.active_revision_evidence_eligible(resolved)
         and root_candidate_eligible(node)
+    )
+
+
+def global_authored_root_candidate_eligible(
+    graph: TraceGraph, ref: str
+) -> bool:
+    """Apply root-selection policy without removing recursive factor candidates."""
+    resolved = graph.resolve(ref)
+    node = graph.nodes.get(resolved or "")
+    if (
+        not resolved
+        or node is None
+        or not authored_root_candidate_eligible(graph, resolved)
+    ):
+        return False
+    event_type = node.event_type.strip().lower()
+    if event_type in GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES:
+        return False
+    if event_type not in MATERIALIZED_RESULT_EVENT_TYPES:
+        return True
+    return not any(
+        predecessor is not None
+        and predecessor.event_type.strip().lower()
+        not in MATERIALIZED_RESULT_EVENT_TYPES
+        and root_candidate_eligible(predecessor)
+        for edge in graph.semantic_predecessor_edges(resolved)
+        for predecessor in (graph.nodes.get(str(edge.get("ref") or "")),)
     )
 
 

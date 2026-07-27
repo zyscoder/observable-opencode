@@ -10,6 +10,7 @@ from trace_attribution.causal_judge import CausalStepRequest, build_causal_step_
 from trace_attribution.causal_retrieval import (
     SemanticPredecessorRetriever,
     authored_root_candidate_eligible,
+    global_authored_root_candidate_eligible,
     root_candidate_eligible,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
@@ -445,6 +446,109 @@ class CausalRetrievalTest(unittest.TestCase):
                     }
                 ).nodes["record:candidate"]
                 self.assertTrue(root_candidate_eligible(node))
+
+    def test_lifecycle_events_are_factor_candidates_but_not_global_roots(self):
+        for event_type in ("process.signal", "run.interruption"):
+            with self.subTest(event_type=event_type):
+                graph = TraceGraph.from_trace(
+                    {
+                        "case_id": "lifecycle-root-exclusion",
+                        "records": [
+                            {
+                                "record_id": "candidate",
+                                "component": "runtime",
+                                "event_type": event_type,
+                            }
+                        ],
+                    }
+                )
+
+                self.assertTrue(
+                    root_candidate_eligible(graph.nodes["record:candidate"])
+                )
+                self.assertTrue(
+                    authored_root_candidate_eligible(
+                        graph, "record:candidate"
+                    )
+                )
+                self.assertFalse(
+                    global_authored_root_candidate_eligible(
+                        graph, "record:candidate"
+                    )
+                )
+
+    def test_change_is_only_a_fallback_root_when_no_authored_producer_exists(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "materialized-change-root",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "agent",
+                        "event_type": "decision",
+                    },
+                    {
+                        "record_id": "change",
+                        "component": "tool",
+                        "event_type": "change",
+                        "source_refs": ["record:decision"],
+                    },
+                    {
+                        "record_id": "defect",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "source_refs": ["record:change"],
+                    },
+                ],
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": "decision"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "decision_materialized_as_change",
+                        "evidence_type": "confirmed",
+                        "confidence": 1.0,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "change"},
+                        "to": {"type": "record", "id": "defect"},
+                        "relation": "change_exposed_by_evaluation",
+                        "evidence_type": "confirmed",
+                        "confidence": 1.0,
+                        "eligible_for_attribution": True,
+                    },
+                ],
+            }
+        )
+        sparse_graph = TraceGraph.from_trace(
+            {
+                "case_id": "sparse-change-root",
+                "records": [
+                    {
+                        "record_id": "change",
+                        "component": "tool",
+                        "event_type": "change",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(
+            authored_root_candidate_eligible(graph, "record:decision")
+        )
+        self.assertFalse(
+            global_authored_root_candidate_eligible(
+                graph, "record:change"
+            )
+        )
+        self.assertTrue(
+            authored_root_candidate_eligible(graph, "record:change")
+        )
+        self.assertTrue(
+            global_authored_root_candidate_eligible(
+                sparse_graph, "record:change"
+            )
+        )
 
     def test_canonical_root_contract_excludes_external_evaluation_facts(self):
         graph = TraceGraph.from_trace(

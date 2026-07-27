@@ -13,6 +13,7 @@ from scripts.evaluate_recursive_attribution import (
 )
 from trace_attribution.causal_state import (
     CausalStepJudgment,
+    FrontierItem,
     LocalStateOwner,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -369,6 +370,79 @@ class VerifiedArtifactConfirmationEvidenceTest(unittest.TestCase):
                 branch.get("reason") == "confirmation_enqueue_failed"
                 for branch in state.unresolved_branches
             )
+        )
+
+    def test_recursive_duplicate_reuses_confirmed_global_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            graph, state, item, queued = artifact_state(Path(directory))
+            queued["origin"] = "global_candidate_judgment"
+            self.assertTrue(state.enqueue_confirmation(queued))
+            second_hypothesis = state.ledger.create(
+                "Recursive traversal independently reached the same root.",
+                item.node_ref,
+                item.defect_state,
+                seed_binding_identity=item.seed_binding_identity,
+            )
+            state.introduction_bindings.append(
+                {
+                    "candidate_ref": item.node_ref,
+                    "defect_state_id": item.defect_state.defect_state_id,
+                    "defect_fingerprint": item.defect_state.fingerprint,
+                    "hypothesis_id": second_hypothesis.hypothesis_id,
+                    "hypothesis_semantic_hash": (
+                        second_hypothesis.semantic_hash
+                    ),
+                    "seed_binding_identity": item.seed_binding_identity,
+                    "seed_key": item.seed_binding_identity,
+                }
+            )
+            second_item = FrontierItem.create(
+                node_ref=item.node_ref,
+                defect_state=item.defect_state,
+                downstream_path=item.downstream_path,
+                hypothesis_id=second_hypothesis.hypothesis_id,
+                hypothesis_semantic_hash=second_hypothesis.semantic_hash,
+                seed_binding_identity=item.seed_binding_identity,
+                depth=item.depth,
+                candidate_source="same_defect_propagation",
+                checked_evidence_refs=["artifact:proof"],
+            )
+            judgment = CausalStepJudgment(
+                current_node_ref=item.node_ref,
+                current_defect_status="present",
+                current_defect_reason="The same root was reached recursively.",
+                candidate_introduction=True,
+                confidence=0.9,
+            )
+            request = state.build_step_request(graph, second_item, ())
+            suggestion = {
+                "action": "request_root_confirmation",
+                "arguments": {
+                    "hypothesis_id": second_hypothesis.hypothesis_id,
+                    "candidate_ref": item.node_ref,
+                    "defect_fingerprint": item.defect_state.fingerprint,
+                },
+                "reason": "Reuse the independent confirmation.",
+            }
+
+            AgenticRecursiveAnalyzer(
+                judge=CountingJudge()
+            )._apply_control_directive(
+                state,
+                second_item,
+                judgment,
+                request,
+                suggestion,
+            )
+
+        self.assertEqual(len(state.confirmation_queue), 1)
+        self.assertEqual(
+            state.ledger.get(second_hypothesis.hypothesis_id).status,
+            "superseded",
+        )
+        result = state.seed_ledger[item.seed_binding_identity].to_result()
+        self.assertNotIn(
+            "confirmation_enqueue_failed", result.blocking_reasons
         )
 
 

@@ -611,11 +611,170 @@ class GlobalJudgeCapability:
         raise NotImplementedError
 
 
+def global_candidate_comparison_contract_from_context(
+    request_context: Mapping[str, Any],
+) -> JsonDict:
+    """Build the exact structural obligations for every offered candidate."""
+    raw_capsules = request_context.get("candidate_evidence_capsules")
+    capsules = (
+        [item for item in raw_capsules if isinstance(item, Mapping)]
+        if isinstance(raw_capsules, list)
+        else []
+    )
+    open_refs = [
+        str(item)
+        for item in request_context.get(
+            "open_authored_root_candidate_refs"
+        )
+        or ()
+        if str(item)
+    ]
+    active_focus = request_context.get("active_focus")
+    if not isinstance(active_focus, Mapping):
+        active_defect = request_context.get("active_defect")
+        active_focus = {
+            "seed_ref": request_context.get("seed_ref"),
+            "defect_fingerprint": (
+                active_defect.get("fingerprint")
+                if isinstance(active_defect, Mapping)
+                else ""
+            ),
+            "active_focus_text_hash": request_context.get(
+                "active_focus_text_hash"
+            ),
+        }
+    requirements = []
+    role_order = [
+        "root_candidate",
+        "contributing_condition",
+        "amplifying_factor",
+        "outcome_evidence",
+        "exculpatory_evidence",
+        "unrelated",
+        "unknown",
+    ]
+    for capsule in capsules:
+        candidate = capsule.get("candidate")
+        if not isinstance(candidate, Mapping):
+            candidate = {}
+        candidate_ref = str(capsule.get("candidate_ref") or "")
+        path = [
+            str(item)
+            for item in capsule.get("downstream_path") or ()
+            if str(item)
+        ]
+        root_eligible = (
+            candidate.get("root_candidate_eligible") is True
+        )
+        exact_path = (
+            path
+            if len(path) > 1
+            and path[0] == candidate_ref
+            and path[-1] == str(active_focus.get("seed_ref") or "")
+            else []
+        )
+        requirements.append(
+            {
+                "candidate_ref": candidate_ref,
+                "root_candidate_eligible": root_eligible,
+                "open_authored_root_candidate": candidate_ref in open_refs,
+                "required_causal_path_refs": exact_path,
+                "required_compared_candidate_refs": open_refs,
+                "exact_output_fields": {
+                    "candidate_ref": candidate_ref,
+                    "causal_path_refs": exact_path,
+                    "compared_candidate_refs": open_refs,
+                    "counterfactual_intervention_ref": candidate_ref,
+                    "counterfactual_intervention_kind": (
+                        "replace_with_semantically_correct_behavior"
+                    ),
+                },
+                "model_decides_fields": [
+                    "defect_status",
+                    "input_defect_status",
+                    "output_defect_status",
+                    "counterfactual.predicted_defect_status",
+                    "counterfactual.causal_effect",
+                    "causal_role",
+                    "reason",
+                    "evidence_refs",
+                    "confidence",
+                ],
+                "allowed_causal_roles": [
+                    role
+                    for role in role_order
+                    if root_eligible or role != "root_candidate"
+                ],
+                "status_values": ["present", "absent", "unknown"],
+                "defect_status_relation": (
+                    "defect_status_equals_output_defect_status"
+                ),
+                "causal_path_requirement": (
+                    "exact_required_path_for_any_causal_role"
+                ),
+                "counterfactual_requirement": (
+                    "decidable_present_or_absent_prediction_for_any_causal_role"
+                ),
+                "root_candidate_requirement": (
+                    "output_present_and_counterfactual_prevents_defect"
+                ),
+            }
+        )
+    return {
+        "schema": "global-candidate-comparison-contract/v1",
+        "active_focus_binding": {
+            "seed_ref": str(active_focus.get("seed_ref") or ""),
+            "defect_fingerprint": str(
+                active_focus.get("defect_fingerprint") or ""
+            ),
+            "active_focus_text_hash": str(
+                active_focus.get("active_focus_text_hash") or ""
+            ),
+        },
+        "open_authored_root_candidate_refs": open_refs,
+        "assessment_requirements": requirements,
+        "candidate_roots_terminal_matrix": {
+            "candidate_refs": open_refs,
+            "every_candidate_requires": [
+                "non_unknown_output_defect_status",
+                "non_unknown_causal_role",
+                "exact_non_empty_causal_path_refs",
+                (
+                    "unknown_input_for_root_condition_or_amplifier_requires_"
+                    "confidence_below_1"
+                ),
+            ],
+            "selected_root_requires": [
+                "input_defect_status_is_absent_or_unknown",
+                "output_defect_status_is_present",
+                "causal_role_is_root_candidate",
+                "counterfactual_predicted_defect_status_is_absent",
+                "counterfactual_causal_effect_is_prevents_defect",
+            ],
+        },
+        "matrix_completion_rule": (
+            "assess_every_offered_candidate_exactly_once_before_selection"
+        ),
+    }
+
+
+def global_candidate_comparison_contract(
+    request: GlobalCandidateJudgeRequest,
+) -> JsonDict:
+    request.validate()
+    return global_candidate_comparison_contract_from_context(
+        request.to_dict()
+    )
+
+
 def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
     request.validate()
     return stable_json(
         {
             "request": request.to_dict(),
+            "candidate_comparison_contract": (
+                global_candidate_comparison_contract(request)
+            ),
             "comparison_then_selection": [
                 "compare_input_and_output_defect_status",
                 "ground_causal_paths",
@@ -629,7 +788,7 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
                 "First compare every offered candidate and return exactly one complete assessment per candidate; only after the comparison matrix is complete may selected_candidate_refs be chosen.",
                 "Judge only request.active_focus. Do not substitute another claim or defect from a shared response, neighboring capsule, or broader objective.",
                 "For each assessment, judge input_defect_status before the candidate and output_defect_status after it to determine whether the active defect is true; defect_status must equal output_defect_status and does not answer whether the record itself exists or contains defect-related words.",
-                "A root_candidate may use input_defect_status=unknown because unknown is not proof that the defect was present, but its reason and confidence must preserve that uncertainty; confidence cannot be 1.0.",
+                "Any candidate may use input_defect_status=unknown when the supplied facts do not establish its prior state; for a root_candidate, contributing_condition, or amplifying_factor, its reason and confidence must preserve that uncertainty and confidence cannot be 1.0.",
                 "causal_path_refs must be the supplied candidate-to-seed path when claiming a causal role, and counterfactual must make a decidable present-or-absent output prediction.",
                 "compared_candidate_refs must list every open authored root-eligible candidate, including the assessed candidate itself when eligible; retrieval order never changes this set.",
                 "When decisive counterevidence refutes a derived defect observation, mark that observation absent for the active defect even though its trace record exists.",
@@ -782,18 +941,25 @@ def validate_global_candidate_payload(
         by_ref[ref]
         for ref in sorted(open_authored_ref_set)
     ]
-    incomplete_open_assessments = [
-        item
-        for item in open_assessments
-        if (
-            not item.causal_path_refs
-            or item.output_defect_status == "unknown"
-            or item.causal_role == "unknown"
-            or (
-                item.input_defect_status == "unknown"
-                and item.causal_role != "root_candidate"
+    incomplete_open_assessment_fields = []
+    for item in open_assessments:
+        missing_fields = []
+        if not item.causal_path_refs:
+            missing_fields.append("causal_path_refs")
+        if item.output_defect_status == "unknown":
+            missing_fields.append("output_defect_status")
+        if item.causal_role == "unknown":
+            missing_fields.append("causal_role")
+        if missing_fields:
+            incomplete_open_assessment_fields.append(
+                {
+                    "candidate_ref": item.candidate_ref,
+                    "incomplete_fields": missing_fields,
+                }
             )
-        )
+    incomplete_open_assessments = [
+        by_ref[item["candidate_ref"]]
+        for item in incomplete_open_assessment_fields
     ]
     if outcome == "candidate_roots":
         if not selected:
@@ -804,7 +970,9 @@ def validate_global_candidate_payload(
             raise ValueError(
                 "candidate_roots requires a complete comparison for every "
                 "open authored root-eligible candidate, including known "
-                "status, role, and causal_path_refs"
+                "status, role, and causal_path_refs; incomplete={0}".format(
+                    stable_json(incomplete_open_assessment_fields)
+                )
             )
         for ref in selected:
             assessment = by_ref[ref]
@@ -1022,6 +1190,19 @@ def _validate_assessment_counterfactual_consistency(
         assessment.counterfactual.get("predicted_defect_status") == "absent"
         and assessment.counterfactual.get("causal_effect") == "prevents_defect"
     )
+    if (
+        assessment.input_defect_status == "unknown"
+        and assessment.causal_role
+        in {
+            "root_candidate",
+            "contributing_condition",
+            "amplifying_factor",
+        }
+        and assessment.confidence >= 1.0
+    ):
+        raise ValueError(
+            "candidate with unknown input defect cannot claim certain confidence"
+        )
     if assessment.causal_role == "root_candidate":
         if (
             assessment.input_defect_status == "present"
@@ -1031,13 +1212,6 @@ def _validate_assessment_counterfactual_consistency(
             raise ValueError(
                 "root_candidate causal role requires input defect not present, "
                 "present output, and a causal path"
-            )
-        if (
-            assessment.input_defect_status == "unknown"
-            and assessment.confidence >= 1.0
-        ):
-            raise ValueError(
-                "root_candidate with unknown input defect cannot claim certain confidence"
             )
         if not counterfactual_prevents:
             raise ValueError(
@@ -1190,6 +1364,8 @@ __all__ = [
     "GlobalJudgeCapability",
     "build_global_candidate_prompt",
     "active_focus_text_sha256",
+    "global_candidate_comparison_contract",
+    "global_candidate_comparison_contract_from_context",
     "global_candidate_judgment_from_payload",
     "normalize_active_focus_text",
     "validate_active_focus_binding",

@@ -49,6 +49,7 @@ from .evidence_capsule import (
     CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
+    global_fusion_payload_decision,
 )
 from .evidence_expansion import (
     EvidenceExpansionRequest,
@@ -139,6 +140,7 @@ __all__ = [
     "build_checkpoint_config",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
+    "global_fusion_payload_decision",
     "expand_evidence",
     "publish_output_transaction",
     "validate_active_focus_binding",

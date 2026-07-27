@@ -13,6 +13,7 @@ from trace_attribution.evidence_capsule import (
     CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
+    validate_candidate_evidence_capsule_against_graph,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
@@ -180,6 +181,49 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             },
             start_refs=("record:observed_defect",),
         )[0]
+
+    def test_capsule_persists_graph_aware_materialized_change_eligibility(self):
+        graph = sample_graph(decision_event_type="change")
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="semantic_fallback",
+            score=1.0,
+        )
+        defect = DefectState.create(
+            label="cleanup_interrupted",
+            expected="cleanup completes",
+            actual="cleanup interrupted",
+            mechanism="cancellation mismatch",
+            scope="task_quality",
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=defect,
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+        )[0]
+
+        self.assertFalse(capsule.candidate["root_candidate_eligible"])
+        drifted = capsule.to_dict()
+        drifted["candidate"]["root_candidate_eligible"] = True
+        drifted["candidate"]["active_graph_facts"][
+            "root_candidate_eligible"
+        ] = True
+        with self.assertRaisesRegex(
+            ValueError, "facts do not match active graph"
+        ):
+            validate_candidate_evidence_capsule_against_graph(
+                graph,
+                CandidateEvidenceCapsule.from_dict(drifted),
+                authoritative_candidates=[candidate],
+            )
 
     def test_capsule_restore_rejects_cross_candidate_identity_substitution(self):
         original = self._decision_capsule().to_dict()
@@ -1421,6 +1465,45 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         self.assertEqual(metrics["candidate_count"], 1)
         self.assertEqual(metrics["candidate_node_reduction_ratio"], 0.8)
         self.assertGreater(metrics["capsule_bytes"], 0)
+
+    def test_global_fusion_payload_gate_rejects_oversized_negative_compression(self):
+        eligible = evidence_capsule.global_fusion_payload_decision(
+            {
+                "trace_json_bytes": 100_000,
+                "capsule_bytes": 30_000,
+                "open_root_candidate_count": 4,
+            }
+        )
+        oversized = evidence_capsule.global_fusion_payload_decision(
+            {
+                "trace_json_bytes": 1_591,
+                "capsule_bytes": 38_966,
+                "open_root_candidate_count": 4,
+            }
+        )
+        bounded_matrix = evidence_capsule.global_fusion_payload_decision(
+            {
+                "trace_json_bytes": 1_591,
+                "capsule_bytes": 38_966,
+                "open_root_candidate_count": 1,
+            }
+        )
+
+        self.assertTrue(eligible["eligible"])
+        self.assertEqual(eligible["reason"], "within_global_fusion_budget")
+        self.assertFalse(oversized["eligible"])
+        self.assertEqual(
+            oversized["reason"],
+            "oversized_negative_compression",
+        )
+        self.assertGreater(
+            oversized["capsule_to_trace_expansion_ratio"], 20.0
+        )
+        self.assertTrue(bounded_matrix["eligible"])
+        self.assertEqual(
+            bounded_matrix["reason"],
+            "bounded_root_matrix_despite_negative_compression",
+        )
 
 
 if __name__ == "__main__":

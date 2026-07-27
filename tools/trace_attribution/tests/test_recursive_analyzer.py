@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
@@ -3014,6 +3015,122 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
 
 class RetrievalGlobalFusionTest(unittest.TestCase):
+    def test_global_root_judgment_consumes_all_initial_seed_branches(self):
+        trace = observed_trace()
+        trace["records"].insert(
+            -1,
+            {
+                "record_id": "timeout",
+                "component": "harness",
+                "event_type": "run.interruption",
+                "data": {"reason": "request deadline exceeded"},
+            },
+        )
+        observed = next(
+            item
+            for item in trace["records"]
+            if item["record_id"] == "observed_defect"
+        )
+        observed["source_refs"] = [
+            "record:change",
+            "record:timeout",
+        ]
+        trace["dataflow_edges"].append(
+            {
+                "from": {"type": "record", "id": "timeout"},
+                "to": {"type": "record", "id": "observed_defect"},
+                "relation": "interruption_amplified_evaluation",
+                "evidence_type": "confirmed",
+                "confidence": 1.0,
+                "eligible_for_attribution": True,
+            }
+        )
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            confirmations={
+                "record:decision": RootConfirmation.confirmed(
+                    "record:decision",
+                    excerpt=(
+                        "Implement only the methods found in the first search."
+                    ),
+                    reason="The decision independently introduced the defect.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision", "confirmed"
+                    ),
+                    confidence=0.9,
+                    evidence_refs=["record:decision"],
+                )
+            },
+        )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+
+        self.assertEqual(judge.requests, [])
+        self.assertEqual(
+            [item.node_ref for item in report.confirmed_roots],
+            ["record:decision"],
+        )
+        self.assertNotIn("record:timeout", report.unresolved_refs)
+
+    def test_oversized_negative_compression_bypasses_global_judge_and_recurses(self):
+        judge = FusionScriptedJudge(global_outcome="inconclusive")
+        oversized_metrics = {
+            "trace_node_count": 4,
+            "candidate_count": 3,
+            "candidate_node_reduction_ratio": 0.25,
+            "trace_json_bytes": 1_591,
+            "capsule_bytes": 38_966,
+            "candidate_byte_reduction_ratio": -23.491515,
+            "open_root_candidate_count": 4,
+            "global_fusion_payload": {
+                "eligible": False,
+                "reason": "oversized_negative_compression",
+                "capsule_to_trace_expansion_ratio": 24.491515,
+                "max_payload_bytes": 32_768,
+                "max_open_root_candidates": 3,
+            },
+        }
+
+        with patch(
+            "trace_attribution.recursive_analyzer.candidate_compression_metrics",
+            return_value=oversized_metrics,
+        ):
+            report = AgenticRecursiveAnalyzer(
+                judge=judge,
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(observed_trace()),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+
+        self.assertEqual(judge.global_requests, [])
+        self.assertGreater(len(judge.requests), 0)
+        self.assertFalse(
+            any(
+                item.get("kind") == "global_candidate_pass"
+                and item.get("status") == "failed"
+                for item in report.investigation_journal
+            )
+        )
+        gates = [
+            item
+            for item in report.investigation_journal
+            if item.get("kind") == "global_candidate_gate"
+        ]
+        self.assertEqual(len(gates), 1)
+        self.assertEqual(gates[0]["status"], "bypassed")
+        self.assertEqual(
+            gates[0]["reason"], "oversized_negative_compression"
+        )
+
     def test_progress_navigation_score_only_changes_queue_priority(self):
         class ScoreAdjustedRetriever(SemanticPredecessorRetriever):
             def __init__(self, score):

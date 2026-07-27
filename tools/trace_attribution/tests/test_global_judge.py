@@ -10,7 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
+from trace_attribution import causal_judge as causal_judge_module
 from trace_attribution import evidence_capsule
+from trace_attribution import global_judge as global_judge_module
 from trace_attribution.causal_judge import BoundedJudgeCallError, ClaudeCausalJudge
 from trace_attribution.causal_state import (
     CausalCandidate,
@@ -1403,6 +1405,35 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertEqual(judgment.selected_candidate_refs, ("record:decision",))
         self.assertEqual(judgment.assessments[0].input_defect_status, "unknown")
 
+    def test_accepts_contributing_condition_with_uncertain_input(self):
+        request = multi_root_request("record:first", "record:second")
+        value = multi_root_payload(request, ["record:first"])
+        second = next(
+            item
+            for item in value["assessments"]
+            if item["candidate_ref"] == "record:second"
+        )
+        second["input_defect_status"] = "unknown"
+        second["causal_role"] = "contributing_condition"
+        second["counterfactual"] = counterfactual(
+            "record:second", prevents_defect=False
+        )
+        second["confidence"] = 0.8
+
+        judgment = validate_global_candidate_payload(
+            value, request=request
+        )
+
+        assessed = next(
+            item
+            for item in judgment.assessments
+            if item.candidate_ref == "record:second"
+        )
+        self.assertEqual(assessed.input_defect_status, "unknown")
+        self.assertEqual(
+            assessed.causal_role, "contributing_condition"
+        )
+
     def test_unknown_root_input_cannot_claim_certain_assessment(self):
         request = sample_request()
         value = payload(outcome="candidate_roots", request=request)
@@ -1644,6 +1675,108 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             "Started cleanup is interrupted.",
         )
         self.assertIn("Do not substitute another claim", prompt)
+
+    def test_prompt_contains_exact_per_candidate_comparison_contract(self):
+        request = sample_request()
+
+        contract = global_judge_module.global_candidate_comparison_contract(
+            request
+        )
+        parsed = json.loads(build_global_candidate_prompt(request))
+
+        self.assertEqual(
+            contract["schema"],
+            "global-candidate-comparison-contract/v1",
+        )
+        self.assertEqual(
+            parsed["candidate_comparison_contract"], contract
+        )
+        self.assertEqual(
+            [
+                item["candidate_ref"]
+                for item in contract["assessment_requirements"]
+            ],
+            list(request.offered_candidate_refs),
+        )
+        for capsule, requirement in zip(
+            request.capsules, contract["assessment_requirements"]
+        ):
+            self.assertEqual(
+                requirement["required_causal_path_refs"],
+                list(capsule.downstream_path),
+            )
+            self.assertEqual(
+                requirement["required_compared_candidate_refs"],
+                list(request.open_authored_root_candidate_refs),
+            )
+            self.assertEqual(
+                requirement["defect_status_relation"],
+                "defect_status_equals_output_defect_status",
+            )
+            self.assertEqual(
+                requirement["exact_output_fields"][
+                    "compared_candidate_refs"
+                ],
+                list(request.open_authored_root_candidate_refs),
+            )
+            self.assertEqual(
+                requirement["exact_output_fields"]["causal_path_refs"],
+                list(capsule.downstream_path),
+            )
+            if not requirement["root_candidate_eligible"]:
+                self.assertNotIn(
+                    "root_candidate",
+                    requirement["allowed_causal_roles"],
+                )
+
+    def test_repair_constraints_reuse_exact_candidate_comparison_contract(self):
+        request = sample_request()
+        contract = global_judge_module.global_candidate_comparison_contract(
+            request
+        )
+
+        constraints = causal_judge_module._repair_constraints(
+            stage="global_candidate_judgment",
+            node_ref=request.seed_ref,
+            request_context=request.to_dict(),
+        )
+
+        self.assertEqual(
+            constraints["candidate_comparison_contract"], contract
+        )
+        self.assertEqual(
+            constraints["open_authored_root_candidate_refs"],
+            list(request.open_authored_root_candidate_refs),
+        )
+
+    def test_incomplete_open_candidate_error_names_candidate_and_fields(self):
+        request = multi_root_request("record:first", "record:second")
+        value = multi_root_payload(request, ["record:first"])
+        second = next(
+            item
+            for item in value["assessments"]
+            if item["candidate_ref"] == "record:second"
+        )
+        second["input_defect_status"] = "unknown"
+        second["defect_status"] = "unknown"
+        second["output_defect_status"] = "unknown"
+        second["causal_role"] = "unknown"
+        second["causal_path_refs"] = []
+        second["counterfactual"] = counterfactual(
+            "record:second", prevents_defect=False
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate_roots requires a complete comparison",
+        ) as raised:
+            validate_global_candidate_payload(value, request=request)
+
+        detail = str(raised.exception)
+        self.assertIn('"candidate_ref": "record:second"', detail)
+        self.assertIn('"causal_path_refs"', detail)
+        self.assertIn('"output_defect_status"', detail)
+        self.assertIn('"causal_role"', detail)
 
     def test_claude_judge_uses_bounded_global_provider_call(self):
         class Transport:
