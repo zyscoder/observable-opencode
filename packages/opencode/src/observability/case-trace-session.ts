@@ -4,6 +4,7 @@ export type TraceRouteHint = {
 }
 
 const directSessionKeys = new Set(["sessionID", "session_id", "parentSessionID", "parent_session_id"])
+const directSessionContainers = new Set(["input", "data", "metadata"])
 const referenceKeys = new Set([
   "span_id",
   "turn_id",
@@ -35,7 +36,6 @@ function endpointRef(value: unknown): string | undefined {
 }
 
 export function traceRouteHint(input: unknown): TraceRouteHint {
-  let sessionID: string | undefined
   const refs: string[] = []
   const seenRefs = new Set<string>()
   const seenObjects = new WeakSet<object>()
@@ -46,6 +46,22 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
     refs.push(value)
   }
 
+  const directSessionID = (value: Record<string, unknown>): string | undefined => {
+    for (const key of directSessionKeys) {
+      const candidate = value[key]
+      if (typeof candidate === "string" && candidate) return candidate
+    }
+  }
+
+  let sessionID = isRecord(input) ? directSessionID(input) : undefined
+  if (isRecord(input) && !sessionID) {
+    for (const [key, value] of Object.entries(input)) {
+      if (!directSessionContainers.has(key) || !isRecord(value)) continue
+      sessionID = directSessionID(value)
+      if (sessionID) break
+    }
+  }
+
   const visit = (value: unknown): void => {
     if (Array.isArray(value)) {
       for (const item of value) visit(item)
@@ -53,11 +69,6 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
     }
     if (!isRecord(value) || seenObjects.has(value)) return
     seenObjects.add(value)
-
-    for (const key of directSessionKeys) {
-      const candidate = value[key]
-      if (!sessionID && typeof candidate === "string" && candidate) sessionID = candidate
-    }
 
     for (const [key, field] of Object.entries(value)) {
       if (referenceKeys.has(key)) {
@@ -84,6 +95,7 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
 
 export class SessionTraceRegistry<T extends object> {
   private readonly roots = new Map<string, T>()
+  private readonly orphans = new Set<T>()
   private readonly aliases = new Map<string, string>()
   private readonly owners = new Map<string, T>()
   private finalized = new WeakSet<T>()
@@ -109,8 +121,14 @@ export class SessionTraceRegistry<T extends object> {
   alias(childSessionID: string, parentSessionID: string): T {
     const parent = this.rootSessionID(parentSessionID)
     const trace = this.rootTrace(parent)
+    const child = this.rootSessionID(childSessionID)
+    const childTrace = this.roots.get(child)
+
     this.aliases.set(childSessionID, parent)
-    this.roots.delete(childSessionID)
+    if (childTrace && childTrace !== trace) {
+      this.roots.delete(child)
+      this.orphans.add(childTrace)
+    }
     return trace
   }
 
@@ -124,22 +142,36 @@ export class SessionTraceRegistry<T extends object> {
   }
 
   finishAll(finish: (trace: T) => void): void {
-    for (const trace of this.values()) this.finish(trace, finish)
+    const errors: unknown[] = []
+    for (const trace of this.values()) {
+      try {
+        this.finish(trace, finish)
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, "Failed to finish all traces")
   }
 
   values(): T[] {
     const traces = new Set<T>(this.roots.values())
+    for (const trace of this.orphans) traces.add(trace)
     if (this.processTrace) traces.add(this.processTrace)
     return [...traces]
   }
 
   reset(finish?: (trace: T) => void): void {
-    if (finish) this.finishAll(finish)
-    this.roots.clear()
-    this.aliases.clear()
-    this.owners.clear()
-    this.processTrace = undefined
-    this.finalized = new WeakSet<T>()
+    try {
+      if (finish) this.finishAll(finish)
+    } finally {
+      this.roots.clear()
+      this.orphans.clear()
+      this.aliases.clear()
+      this.owners.clear()
+      this.processTrace = undefined
+      this.finalized = new WeakSet<T>()
+      this.ordinal = 0
+    }
   }
 
   private rootTrace(sessionID: string): T {
@@ -166,7 +198,7 @@ export class SessionTraceRegistry<T extends object> {
 
   private finish(trace: T, callback: (trace: T) => void): void {
     if (this.finalized.has(trace)) return
-    this.finalized.add(trace)
     callback(trace)
+    this.finalized.add(trace)
   }
 }
