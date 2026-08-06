@@ -107,7 +107,7 @@ test("resolves generic model credentials through native provider config", async 
 Run:
 
 ```bash
-bun test packages/opencode/test/config/config.test.ts --timeout 30000
+bun --cwd packages/opencode test test/config/config.test.ts
 ```
 
 Expected: PASS without any production Config edit. If the schema normalizes an option without changing its value, assert the normalized structure rather than weakening the value assertions.
@@ -181,7 +181,7 @@ Also test `traceRouteHint()` for `sessionID`, `session_id`, nested `data.session
 Run:
 
 ```bash
-bun test packages/opencode/test/observability/case-trace-session.test.ts
+bun --cwd packages/opencode test test/observability/case-trace-session.test.ts
 ```
 
 Expected: FAIL because `case-trace-session.ts` does not exist.
@@ -232,7 +232,7 @@ const referenceKeys = new Set([
 - [ ] **Step 4: Run router tests**
 
 ```bash
-bun test packages/opencode/test/observability/case-trace-session.test.ts
+bun --cwd packages/opencode test test/observability/case-trace-session.test.ts
 ```
 
 Expected: all tests PASS.
@@ -309,7 +309,7 @@ Assert that two root directories exist, root A contains `ses_root_a` plus `ses_c
 - [ ] **Step 2: Run the integration test to verify current singleton contamination**
 
 ```bash
-bun test packages/opencode/test/observability/case-trace.test.ts --timeout 30000 --test-name-pattern "isolates root sessions"
+bun --cwd packages/opencode test test/observability/case-trace.test.ts --test-name-pattern "isolates root sessions"
 ```
 
 Expected: FAIL because only one process-wide active Trace exists.
@@ -400,7 +400,7 @@ This must execute before `subagent_prompt` and `ops.prompt(...)`, ensuring child
 - [ ] **Step 6: Run focused routing and semantic regressions**
 
 ```bash
-bun test packages/opencode/test/observability/case-trace-session.test.ts packages/opencode/test/observability/case-trace.test.ts --timeout 30000
+bun --cwd packages/opencode test test/observability/case-trace-session.test.ts test/observability/case-trace.test.ts
 ```
 
 Expected: PASS, including all pre-existing semantic Trace assertions.
@@ -442,7 +442,7 @@ Run without `OPENCODE_CASE_TRACE_QUIET`. Capture `stderr` and assert exactly two
 - [ ] **Step 2: Verify the focused receipt test**
 
 ```bash
-bun test packages/opencode/test/observability/case-trace.test.ts --timeout 30000 --test-name-pattern "publishes every interactive session"
+bun --cwd packages/opencode test test/observability/case-trace.test.ts --test-name-pattern "publishes every interactive session"
 ```
 
 Expected before the worker edit: the direct API test passes after Task 3, while source inspection still finds `CaseTrace.finish(` in `worker.ts`.
@@ -483,7 +483,7 @@ Place this after the existing deletion work succeeds. Child deletion must not ca
 Run the focused tests that spawn child processes for normal exit, `SIGINT`, `SIGTERM`, and `SIGHUP`. Assert every pre-existing root has `trace.json`, `trace.html`, and `partial/latest.json`, and signal traces retain `cancelled` status.
 
 ```bash
-bun test packages/opencode/test/observability/case-trace.test.ts packages/opencode/test/observability/trace-publication.test.ts --timeout 30000
+bun --cwd packages/opencode test test/observability/case-trace.test.ts test/observability/trace-publication.test.ts
 ```
 
 Expected: PASS with no duplicate receipts and no changed signal exit codes.
@@ -574,7 +574,7 @@ git commit -m "docs: document native providers and interactive traces"
 - [ ] **Step 1: Run focused tests**
 
 ```bash
-bun test packages/opencode/test/config/config.test.ts packages/opencode/test/observability/case-trace-session.test.ts packages/opencode/test/observability/case-trace.test.ts packages/opencode/test/observability/trace-publication.test.ts --timeout 30000
+bun --cwd packages/opencode test test/config/config.test.ts test/observability/case-trace-session.test.ts test/observability/case-trace.test.ts test/observability/trace-publication.test.ts
 ```
 
 Expected: all tests PASS.
