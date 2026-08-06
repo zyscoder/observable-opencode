@@ -465,6 +465,58 @@ test("handles environment variable substitution", async () => {
   }
 })
 
+test("resolves generic model credentials through native provider config", async () => {
+  const previous = {
+    MODEL: process.env.MODEL,
+    APIKEY: process.env.APIKEY,
+    URL: process.env.URL,
+  }
+  process.env.MODEL = "compatible/glm-4.5"
+  process.env.APIKEY = "test-compatible-key"
+  process.env.URL = "https://compatible.example.test/v1"
+
+  try {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await writeConfig(dir, {
+          $schema: "https://opencode.ai/config.json",
+          model: "{env:MODEL}",
+          provider: {
+            compatible: {
+              npm: "@ai-sdk/openai-compatible",
+              name: "OpenAI Compatible",
+              options: {
+                apiKey: "{env:APIKEY}",
+                baseURL: "{env:URL}",
+              },
+              models: {
+                "glm-4.5": { name: "GLM 4.5" },
+              },
+            },
+          },
+        })
+      },
+    })
+    await WithInstance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const config = await load()
+        expect(config.model).toBe("compatible/glm-4.5")
+        expect(config.provider?.compatible?.options).toEqual({
+          apiKey: "test-compatible-key",
+          baseURL: "https://compatible.example.test/v1",
+        })
+        expect(config.provider?.compatible?.models?.["glm-4.5"]?.name).toBe("GLM 4.5")
+      },
+    })
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
 test("preserves env variables when adding $schema to config", async () => {
   const originalEnv = process.env["PRESERVE_VAR"]
   process.env["PRESERVE_VAR"] = "secret_value"
