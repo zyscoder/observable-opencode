@@ -1627,7 +1627,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
-        const span = CaseTrace.get()?.startSpan({
+        const span = CaseTrace.startSpan({
           component: "prompt",
           operation: "prompt",
           name: input.agent,
@@ -2289,7 +2289,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      const span = CaseTrace.get()?.startSpan({
+      const span = CaseTrace.startSpan({
         component: "prompt",
         operation: "loop",
         name: "session.loop",

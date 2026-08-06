@@ -311,6 +311,128 @@ function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partia
 }
 
 describe("case trace", () => {
+  test("isolates root sessions and keeps child aliases in the parent trace", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-session-routing-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "session-routing.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_root_a", message_id: "msg_a", input: { parts: [{ type: "text", text: "root A" }] } })`,
+        `const spanA = "startSpan" in CaseTrace ? CaseTrace.startSpan({ component: "llm", operation: "stream", name: "compatible/model-a", input: { sessionID: "ses_root_a" } }) : CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "compatible/model-a", input: { sessionID: "ses_root_a" } })`,
+        `if ("aliasSession" in CaseTrace) CaseTrace.aliasSession("ses_child_a", "ses_root_a")`,
+        `CaseTrace.llmTurn({ turn_id: "turn_child_a", session_id: "ses_child_a", parent_session_id: "ses_root_a", agent: "general", agent_role: "subagent", provider_id: "compatible", model_id: "model-a", status: "success", source_refs: spanA ? ["span:" + spanA.id] : [] })`,
+        `CaseTrace.promptAssembly({ stage: "initial_user_request", session_id: "ses_root_b", message_id: "msg_b", input: { parts: [{ type: "text", text: "root B" }] } })`,
+        `if ("finishAll" in CaseTrace) CaseTrace.finishAll({ status: "success", result: { reason: "test.shutdown" } }); else CaseTrace.finish({ status: "success", result: { reason: "test.shutdown" } })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "multi-session-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDirectories = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+    expect(caseDirectories).toEqual(["multi-session-case", "multi-session-case--ses_root_b"])
+
+    const rootADir = path.join(dir, "multi-session-case")
+    const rootBDir = path.join(dir, "multi-session-case--ses_root_b")
+    const manifestA = JSON.parse(await fs.readFile(path.join(rootADir, "manifest.json"), "utf8")) as any
+    const manifestB = JSON.parse(await fs.readFile(path.join(rootBDir, "manifest.json"), "utf8")) as any
+    const traceA = await fs.readFile(path.join(rootADir, "trace.json"), "utf8")
+    const traceB = await fs.readFile(path.join(rootBDir, "trace.json"), "utf8")
+
+    expect(manifestA.session_id).toBe("ses_root_a")
+    expect(manifestB.session_id).toBe("ses_root_b")
+    expect(manifestA.run_id).not.toBe(manifestB.run_id)
+    expect(traceA).toContain("ses_root_a")
+    expect(traceA).toContain("ses_child_a")
+    expect(traceA).toContain("root A")
+    expect(traceA).not.toContain("root B")
+    expect(traceB).toContain("ses_root_b")
+    expect(traceB).not.toContain("ses_root_a")
+    expect(traceB).not.toContain("ses_child_a")
+    expect(traceB).toContain("root B")
+    expect(traceB).not.toContain("root A")
+  })
+
+  test("does not create trace directories when routed APIs are disabled", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-routing-disabled-"))
+    const traceRoot = path.join(dir, "traces")
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "routing-disabled.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure()`,
+        `CaseTrace.get()`,
+        `CaseTrace.setSessionID("ses_disabled")`,
+        `CaseTrace.startSpan({ component: "trace", operation: "disabled", input: { sessionID: "ses_disabled" } })`,
+        `CaseTrace.aliasSession("ses_child", "ses_disabled")`,
+        `CaseTrace.event({ component: "trace", event_type: "disabled", data: { sessionID: "ses_disabled" } })`,
+        `CaseTrace.usage({ total: 1 }, "span_disabled")`,
+        `CaseTrace.contextSnapshot({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.decision({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.promptAssembly({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.contextTransform({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.edge({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.verification({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.change({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.constraint({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.finalEvidence({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.responseOutput({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.designRecord({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.llmTurn({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.agentLifecycle({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.exitGate({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.evidenceFact({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.node({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.causalEdge({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.observation({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.compaction({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.compactionCheck({ session_id: "ses_disabled" } as any)`,
+        `CaseTrace.currentEvidenceRefs()`,
+        `CaseTrace.currentSourceRefs()`,
+        `CaseTrace.finishSession("ses_disabled", { status: "success" })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "0",
+        OPENCODE_CASE_ID: "disabled-routing-case",
+        OPENCODE_CASE_TRACE_DIR: traceRoot,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(await exists(traceRoot)).toBe(false)
+  })
+
   test("captures config subject revision at case start and keeps it immutable", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-subject-revision-config-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -883,6 +1005,8 @@ describe("case trace", () => {
         `const fact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "pricing owner is billing", data: { subject: "pricing", predicate: "owner", value: "billing" }, source_refs: [] })`,
         `const generic = CaseTrace.node({ node_id: "temporal_generic", kind: "execution.observation", component: "runtime", input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], output_refs: ["recent_change_records"], source_refs: ["recent_evidence_records"], data: { nested: { input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], evidence_refs: ["recent_verification_records"], payload_refs: ["recent_tool_results"], typed_refs: [{ ref_type: "external", ref_id: "recent_change_records", legacy_ref: "recent_change_records" }] } } })`,
         `const edgeTarget = CaseTrace.node({ node_id: "temporal_edge_target", kind: "execution.observation", component: "runtime", data: { marker: "edge_target" } })`,
+        `CaseTrace.setSessionID("ses_temporal")`,
+        `CaseTrace.aliasSession("ses_repeat", "ses_temporal")`,
         `CaseTrace.edge({ edge_id: "temporal_legacy_edge", from: { type: "external", id: "explicit_source" }, to: { type: "node", id: edgeTarget.node_id }, relation: "derived_from", evidence_refs: ["recent_evidence_records"] })`,
         `CaseTrace.decision({ decision_id: "temporal_decision", component: "processor", decision_type: "tool_selection", intent: "inspect pricing owner", chosen_action: "read", source_refs: ["recent_evidence_records"], metadata: { payload_refs: ["recent_change_records"] } })`,
         `CaseTrace.promptAssembly({ stage: "temporal_prompt", session_id: "ses_temporal", input: { text: "inspect pricing owner", evidence_refs: ["recent_evidence_records"] }, source_refs: ["recent_evidence_records"] })`,
@@ -1238,6 +1362,7 @@ describe("case trace", () => {
         `CaseTrace.configure({ input: { prompt: "parent request" }, environment: { model: "unit-test" } })`,
         `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", message_id: "msg_parent", input: { messages: ["parent"] }, output: { model_messages: ["parent"] } })`,
         `CaseTrace.llmTurn({ session_id: "ses_parent", message_id: "msg_parent", agent: "build", provider_id: "deepseek", model_id: "unit-test", status: "success", finish_reason: "tool-calls" })`,
+        `CaseTrace.aliasSession("ses_child", "ses_parent")`,
         `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_child", message_id: "msg_child", input: { messages: ["child"] }, output: { model_messages: ["child"] } })`,
         `CaseTrace.llmTurn({ session_id: "ses_child", message_id: "msg_child", agent: "general", provider_id: "deepseek", model_id: "unit-test", status: "success", finish_reason: "tool-calls" })`,
         `CaseTrace.decision({ component: "processor", decision_type: "reasoning_block", chosen_action: "edit parent", rationale: "parent reasoning", metadata: { sessionID: "ses_parent", messageID: "msg_parent" } })`,
@@ -1287,6 +1412,7 @@ describe("case trace", () => {
         `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", input: { messages: ["parent-ready"] }, output: { model_messages: ["parent-ready"] } })`,
         `const parentSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_parent", agent: "build", model: { providerID: "deepseek", id: "unit-test" } } })`,
         `const parentSnapshot = CaseTrace.contextSnapshot({ span_id: parentSpan?.id, phase: "llm_request", agent: "build", messages: ["parent"], metadata: { session_id: "ses_parent", message_id: "msg_parent_assistant" } })`,
+        `CaseTrace.aliasSession("ses_child", "ses_parent")`,
         `CaseTrace.contextTransform({ stage: "model_messages_built", session_id: "ses_child", message_id: "msg_child_assistant", input: { messages: ["child"] }, output: { model_messages: ["child"] } })`,
         `const childSpan = CaseTrace.get()?.startSpan({ component: "llm", operation: "stream", name: "deepseek/unit-test", input: { sessionID: "ses_child", agent: "general", model: { providerID: "deepseek", id: "unit-test" } } })`,
         `const childSnapshot = CaseTrace.contextSnapshot({ span_id: childSpan?.id, phase: "llm_request", agent: "general", messages: ["child"], metadata: { session_id: "ses_child", message_id: "msg_child_assistant" } })`,
@@ -1348,6 +1474,8 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "inspect" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.aliasSession("ses_owner", "ses_fixture")`,
+        `CaseTrace.aliasSession("ses_other", "ses_fixture")`,
         `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { sessionID: "ses_owner", messageID: "msg_tool", callID: "call_1", tool: "read", input: { path: "owner.txt" } } })`,
         `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "owner observation", data: { session_id: "ses_owner", call_id: "call_1", output: "owner pending" }, source_refs: ["tool_call:call_1"] })`,
         `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "unscoped legacy observation", data: { call_id: "call_1", output: "ambiguous pending" }, source_refs: ["tool_call:call_1"] })`,
@@ -4363,6 +4491,7 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "long running" } })`,
+        `CaseTrace.setSessionID("ses_sigint")`,
         `CaseTrace.agentLifecycle({ session_id: "ses_sigint", message_id: "msg_sigint", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGINT arrives" })`,
         `CaseTrace.node({ node_id: "fixture_signal_sigint_ready", kind: "verification", component: "runtime", title: "SIGINT fixture readiness marker" })`,
         `;(CaseTrace.get() as any).writePartial(true)`,
@@ -4812,6 +4941,7 @@ describe("case trace", () => {
         `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
         `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner" } })`,
         `span?.end({ output: { child_session_id: "ses_child_content", child_status: "success", output: "renewalQuote owner is billing-platform" } })`,
+        `CaseTrace.aliasSession("ses_child_content", "ses_parent")`,
         `CaseTrace.responseOutput({ response_role: "subagent_result", text: "renewalQuote owner is billing-platform", metadata: { session_id: "ses_child_content" } })`,
         `CaseTrace.contextTransform({ stage: "llm_request_ready", session_id: "ses_parent", message_id: "msg_parent", input: { messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "tool", content: "renewalQuote owner is billing-platform" }] } })`,
         `CaseTrace.responseOutput({ text: "The renewalQuote owner is billing-platform." })`,
@@ -4904,6 +5034,8 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
+        `CaseTrace.aliasSession("ses_child_boundary", "ses_parent")`,
+        `CaseTrace.aliasSession("ses_other", "ses_parent")`,
         `CaseTrace.contextTransform({ stage: "before_child", session_id: "ses_parent", message_id: "msg_before", input: { messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] } })`,
         `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner", parent_session_id: "ses_parent", message_id: "msg_parent" } })`,
         `span?.end({ output: { child_session_id: "ses_child_boundary", child_status: "success", output: "renewalQuote owner is billing-platform" } })`,

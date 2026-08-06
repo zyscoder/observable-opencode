@@ -605,7 +605,7 @@ export const ShellTool = Tool.define(
               const timeout = params.timeout ?? DEFAULT_TIMEOUT
               const ps = Shell.ps(shell)
               const operationKind = Tool.classifyShellOperation(params.command)
-              const captureMutation = Boolean(CaseTrace.get()) && operationKind !== "code_inspection"
+              const captureMutation = CaseTrace.isEnabled() && operationKind !== "code_inspection"
               const repositoryBefore = captureMutation ? captureRepositorySnapshot(cwd) : undefined
               yield* Effect.scoped(
                 Effect.gen(function* () {

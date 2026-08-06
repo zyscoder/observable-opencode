@@ -316,7 +316,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
         }
         let traceSpan: ActiveSpan | undefined
         return Effect.gen(function* () {
-          traceSpan = CaseTrace.get()?.startSpan({
+          traceSpan = CaseTrace.startSpan({
             component: "tool",
             operation: "execute",
             name: id,
@@ -403,7 +403,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                 status: "error",
                 error,
               })
-              CaseTrace.get()?.event({
+              CaseTrace.event({
                 component: "tool",
                 event_type: "execute.error",
                 data: {

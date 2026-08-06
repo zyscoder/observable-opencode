@@ -1070,7 +1070,7 @@ export const layer: Layer.Layer<
         slog.info("process")
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
-        const span = CaseTrace.get()?.startSpan({
+        const span = CaseTrace.startSpan({
           component: "processor",
           operation: "process",
           name: "session.processor",

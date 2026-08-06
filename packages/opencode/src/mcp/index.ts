@@ -193,7 +193,7 @@ function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClie
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(schema),
     execute: async (args: unknown) => {
-      const span = CaseTrace.get()?.startSpan({
+      const span = CaseTrace.startSpan({
         component: "mcp",
         operation: "tool.call",
         name: `${clientName}:${mcpTool.name}`,
@@ -529,7 +529,7 @@ export const layer = Layer.effect(
       }
 
       log.info("found", { key, type: mcp.type })
-      const span = CaseTrace.get()?.startSpan({
+      const span = CaseTrace.startSpan({
         component: "mcp",
         operation: "connect",
         name: key,

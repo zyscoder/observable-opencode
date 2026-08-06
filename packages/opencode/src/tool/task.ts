@@ -86,6 +86,7 @@ export const TaskTool = Tool.define(
             })) ?? []),
           ],
         }))
+      CaseTrace.aliasSession(nextSession.id, ctx.sessionID)
 
       const msg = yield* Effect.sync(() => MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }))
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
@@ -220,7 +221,7 @@ export const TaskTool = Tool.define(
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => {
-        const traceSpan = CaseTrace.get()?.startSpan({
+        const traceSpan = CaseTrace.startSpan({
           component: "task",
           operation: "subagent",
           name: params.subagent_type,

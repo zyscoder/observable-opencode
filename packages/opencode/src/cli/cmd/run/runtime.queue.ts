@@ -161,7 +161,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           const start = Date.now()
           const ctrl = new AbortController()
           state.ctrl = ctrl
-          const span = CaseTrace.get()?.startSpan({
+          const span = CaseTrace.startSpan({
             component: "runtime",
             operation: "turn",
             name: "interactive.turn",

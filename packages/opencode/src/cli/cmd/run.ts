@@ -594,7 +594,7 @@ export const RunCommand = effectCmd({
       }
 
       async function execute(sdk: OpencodeClient) {
-        const runSpan = CaseTrace.get()?.startSpan({
+        const runSpan = CaseTrace.startSpan({
           component: "run",
           operation: "execute",
           name: args.interactive ? "interactive" : "non-interactive",
@@ -927,13 +927,15 @@ export const RunCommand = effectCmd({
               exit_code: process.exitCode ?? 0,
             },
           })
-          CaseTrace.finish({
-            status,
-            error: failure,
-            result: {
-              exit_code: process.exitCode ?? 0,
-            },
-          })
+          try {
+            CaseTrace.finishAll({
+              status,
+              error: failure,
+              result: {
+                exit_code: process.exitCode ?? 0,
+              },
+            })
+          } catch {}
         }
       }
 
@@ -946,7 +948,7 @@ export const RunCommand = effectCmd({
           return Server.Default().app.fetch(request)
         }) as typeof globalThis.fetch
 
-        const runSpan = CaseTrace.get()?.startSpan({
+        const runSpan = CaseTrace.startSpan({
           component: "run",
           operation: "execute",
           name: "interactive-local",
@@ -989,13 +991,15 @@ export const RunCommand = effectCmd({
               exit_code: process.exitCode ?? 0,
             },
           })
-          CaseTrace.finish({
-            status,
-            error: failure,
-            result: {
-              exit_code: process.exitCode ?? 0,
-            },
-          })
+          try {
+            CaseTrace.finishAll({
+              status,
+              error: failure,
+              result: {
+                exit_code: process.exitCode ?? 0,
+              },
+            })
+          } catch {}
         }
       }
 

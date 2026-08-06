@@ -24,7 +24,7 @@ export const SkillTool = Tool.define(
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) => {
         let traceSpan: ActiveSpan | undefined
         return Effect.gen(function* () {
-          traceSpan = CaseTrace.get()?.startSpan({
+          traceSpan = CaseTrace.startSpan({
             component: "skill",
             operation: "load",
             name: params.name,

@@ -22,6 +22,7 @@ import {
   type CausalNodeLike,
 } from "./causal-ir"
 import { writeProvenanceTraceHtmlFile } from "./case-trace-html"
+import { SessionTraceRegistry, traceRouteHint } from "./case-trace-session"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
 import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
@@ -1385,7 +1386,14 @@ const legacySemanticEdgeOptionalFields = [
 ] as const
 type LegacySemanticEdgeOptionalField = (typeof legacySemanticEdgeOptionalFields)[number]
 const legacySemanticEdgeOptionalFieldSet = new Set<string>(legacySemanticEdgeOptionalFields)
-let active: ActiveCaseTrace | false | undefined
+let registry: SessionTraceRegistry<ActiveCaseTrace> | undefined
+let baseConfig: CaseTraceConfig = {}
+let baseCaseID: string | undefined
+let lifecycleConfigured = false
+let compatibilityFinished = false
+let compatibilityTrace: ActiveCaseTrace | undefined
+let compatibilitySessionID: string | undefined
+let compatibilityBindingAllowed = false
 let processFinalizerInstalled = false
 
 function nowIso() {
@@ -1407,6 +1415,13 @@ function stamp() {
 function safeCaseID(input: string) {
   const trimmed = input.trim() || `case-${stamp()}-${process.pid}`
   return trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 160)
+}
+
+function routedCaseID(base: string | undefined, sessionID: string | undefined, ordinal: number) {
+  if (!sessionID) return safeCaseID(base ?? "")
+  if (base && ordinal === 0) return safeCaseID(base)
+  if (base) return safeCaseID(`${base}--${sessionID}`)
+  return safeCaseID(`session-${sessionID}`)
 }
 
 function safeNumber(input: unknown) {
@@ -11247,37 +11262,127 @@ function prettyJsonString(input: string) {
 const summarizeTextField = summarizeText
 const summarizeJsonField = summarizeJson
 
-function finishActiveFromProcessExit(code: number | undefined) {
-  const current = active || undefined
-  if (!current) return
-  current.finish({
-    status: code && code !== 0 ? "error" : "success",
-    result: {
-      exit_code: code ?? process.exitCode ?? 0,
-      reason: "process.exit",
-    },
+function configuredBaseCaseID(input: CaseTraceConfig) {
+  const value = input.caseID ?? process.env.OPENCODE_CASE_ID
+  return value?.trim() ? safeCaseID(value) : undefined
+}
+
+function traceRegistry() {
+  if (registry) return registry
+  registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal) => {
+    if (
+      sessionID &&
+      compatibilityBindingAllowed &&
+      compatibilityTrace &&
+      (!compatibilitySessionID || compatibilitySessionID === sessionID)
+    ) {
+      compatibilitySessionID = sessionID
+      compatibilityTrace.setSessionID(sessionID)
+      return compatibilityTrace
+    }
+
+    const trace = new ActiveCaseTrace({
+      ...baseConfig,
+      caseID: routedCaseID(baseCaseID, sessionID, ordinal),
+    })
+    trace.setSessionID(sessionID)
+    if (!sessionID) compatibilityTrace = trace
+    return trace
   })
-  active = false
+  return registry
+}
+
+function beginLifecycle(input: CaseTraceConfig = {}) {
+  baseCaseID = configuredBaseCaseID(input)
+  baseConfig = {
+    ...input,
+    caseID: baseCaseID,
+  }
+  lifecycleConfigured = true
+  compatibilityFinished = false
+  compatibilityTrace = undefined
+  compatibilitySessionID = undefined
+  compatibilityBindingAllowed = false
+  installProcessFinalizer()
+}
+
+function ensureLifecycle() {
+  if (lifecycleConfigured) return
+  beginLifecycle()
+}
+
+function routed(input?: unknown) {
+  if (!enabledFromEnv() || compatibilityFinished) return undefined
+  ensureLifecycle()
+  return traceRegistry().resolve(traceRouteHint(input))
+}
+
+function remember<T>(trace: ActiveCaseTrace | undefined, value: T): T {
+  if (!trace) return value
+  const refs = traceRouteHint(value).refs
+  const record = recordFromUnknown(value)
+  if (record) {
+    const nodeID = typeof record.node_id === "string" ? record.node_id : undefined
+    const kind = typeof record.kind === "string" ? record.kind : undefined
+    if (nodeID) {
+      refs.push(nodeID, `node:${nodeID}`)
+      if (kind === "prompt.assembly") refs.push(`prompt:${nodeID}`)
+      if (kind === "context.transform" || kind === "context.pack") refs.push(`context:${nodeID}`)
+      if (kind === "response.claim") refs.push(`response_claim:${nodeID}`)
+      if (kind === "evidence.semantic_fact" || kind === "evidence.fact") refs.push(`evidence:${nodeID}`)
+      if (kind === "execution.observation" || kind === "observation") refs.push(`observation:${nodeID}`)
+    }
+
+    const snapshotID = typeof record.snapshot_id === "string" ? record.snapshot_id : undefined
+    if (snapshotID) refs.push(`context:${snapshotID}`, `context_snapshot:${snapshotID}`)
+    for (const [key, prefix] of [
+      ["segment_id", "response_segment"],
+      ["claim_id", "response_claim"],
+      ["constraint_id", "constraint"],
+      ["design_id", "design"],
+      ["gate_id", "exit_gate"],
+    ] as const) {
+      const identity = record[key]
+      if (typeof identity === "string") refs.push(`${prefix}:${identity}`)
+    }
+  }
+  traceRegistry().remember(trace, dedupeStrings(refs))
+  return value
+}
+
+function finishTracesBestEffort(finish: (trace: ActiveCaseTrace) => void) {
+  try {
+    registry?.finishAll(finish)
+  } catch {}
+  compatibilityFinished = true
+}
+
+function finishActiveFromProcessExit(code: number | undefined) {
+  finishTracesBestEffort((trace) =>
+    trace.finish({
+      status: code && code !== 0 ? "error" : "success",
+      result: {
+        exit_code: code ?? process.exitCode ?? 0,
+        reason: "process.exit",
+      },
+    }),
+  )
 }
 
 function finishActiveFromSignal(signal: NodeJS.Signals) {
-  const current = active || undefined
-  if (!current) return
-  current.flushForSignal(signal)
-  active = false
+  finishTracesBestEffort((trace) => trace.flushForSignal(signal))
 }
 
 function finishActiveFromError(reason: string, error: unknown) {
-  const current = active || undefined
-  if (!current) return
-  current.finish({
-    status: "error",
-    error,
-    result: {
-      reason,
-    },
-  })
-  active = false
+  finishTracesBestEffort((trace) =>
+    trace.finish({
+      status: "error",
+      error,
+      result: {
+        reason,
+      },
+    }),
+  )
 }
 
 function installProcessFinalizer() {
@@ -11309,136 +11414,219 @@ export namespace CaseTrace {
 
   export function configure(input: CaseTraceConfig = {}) {
     if (!enabledFromEnv()) {
-      active = false
+      registry?.reset()
+      registry = undefined
+      baseConfig = {}
+      baseCaseID = undefined
+      lifecycleConfigured = false
+      compatibilityFinished = false
+      compatibilityTrace = undefined
+      compatibilitySessionID = undefined
+      compatibilityBindingAllowed = false
       return undefined
     }
-    const caseID = safeCaseID(input.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
-    if (active && active.caseID === caseID) {
-      if (input.input) active.setInput(input.input)
-      if (input.environment) active.setEnvironment(input.environment)
-      return active
+
+    const nextBaseCaseID = configuredBaseCaseID(input)
+    if (lifecycleConfigured && (compatibilityFinished || nextBaseCaseID !== baseCaseID)) {
+      if (!compatibilityFinished) {
+        registry?.reset((trace) => trace.finish({ status: "cancelled", result: { reason: "reconfigured" } }))
+      } else {
+        registry?.reset()
+      }
+      beginLifecycle(input)
+      return get()
     }
-    if (active) active.finish({ status: "cancelled", result: { reason: "reconfigured" } })
-    installProcessFinalizer()
-    active = new ActiveCaseTrace({ ...input, caseID })
-    return active || undefined
+
+    if (!lifecycleConfigured) beginLifecycle(input)
+    else {
+      baseConfig = {
+        ...baseConfig,
+        input: input.input ? { ...(baseConfig.input ?? {}), ...input.input } : baseConfig.input,
+        environment: input.environment
+          ? { ...(baseConfig.environment ?? {}), ...input.environment }
+          : baseConfig.environment,
+      }
+      for (const trace of registry?.values() ?? []) {
+        if (input.input) trace.setInput(input.input)
+        if (input.environment) trace.setEnvironment(input.environment)
+      }
+    }
+    return get()
   }
 
   export function get() {
-    if (active === undefined && enabledFromEnv()) return configure()
-    return active || undefined
+    if (!enabledFromEnv() || compatibilityFinished) return undefined
+    ensureLifecycle()
+    compatibilityBindingAllowed = true
+    return traceRegistry().resolve()
   }
 
   export function setSessionID(sessionID: string | undefined) {
-    get()?.setSessionID(sessionID)
+    const trace = get()
+    trace?.setSessionID(sessionID)
+    if (!trace || !sessionID) return
+    compatibilityTrace = trace
+    compatibilitySessionID = sessionID
+    traceRegistry().resolve({ sessionID })
+  }
+
+  export function startSpan(input: StartSpanInput) {
+    const trace = routed(input)
+    if (!trace) return undefined
+    const span = trace.startSpan(input)
+    traceRegistry().remember(trace, [`span:${span.id}`, span.id])
+    return span
+  }
+
+  export function aliasSession(childSessionID: string, parentSessionID: string) {
+    if (!enabledFromEnv() || compatibilityFinished) return
+    ensureLifecycle()
+    traceRegistry().alias(childSessionID, parentSessionID)
   }
 
   export function event(input: TraceEventInput) {
-    get()?.event(input)
+    routed(input)?.event(input)
   }
 
   export function usage(input: unknown, spanID?: string) {
-    get()?.usage(input, spanID)
+    routed({ input, span_id: spanID })?.usage(input, spanID)
   }
 
   export function contextSnapshot(input: ContextSnapshotInput) {
-    return get()?.contextSnapshot(input)
+    const trace = routed(input)
+    return remember(trace, trace?.contextSnapshot(input))
   }
 
   export function decision(input: SemanticDecisionInput) {
-    return get()?.decision(input)
+    const trace = routed(input)
+    return remember(trace, trace?.decision(input))
   }
 
   export function promptAssembly(input: PromptAssemblyInput) {
-    return get()?.promptAssembly(input)
+    const trace = routed(input)
+    return remember(trace, trace?.promptAssembly(input))
   }
 
   export function contextTransform(input: ContextTransformInput) {
-    return get()?.contextTransform(input)
+    const trace = routed(input)
+    return remember(trace, trace?.contextTransform(input))
   }
 
   export function edge(input: SemanticEdgeInput) {
-    return get()?.edge(input)
+    const trace = routed(input)
+    return remember(trace, trace?.edge(input))
   }
 
   export function verification(input: VerificationRecordInput) {
-    return get()?.verification(input)
+    const trace = routed(input)
+    return remember(trace, trace?.verification(input))
   }
 
   export function change(input: ChangeRecordInput) {
-    return get()?.change(input)
+    const trace = routed(input)
+    return remember(trace, trace?.change(input))
   }
 
   export function constraint(input: ConstraintRecordInput) {
-    return get()?.constraint(input)
+    const trace = routed(input)
+    return remember(trace, trace?.constraint(input))
   }
 
   export function finalEvidence(input: FinalResponseEvidenceInput) {
-    return get()?.finalEvidence(input)
+    const trace = routed(input)
+    return remember(trace, trace?.finalEvidence(input))
   }
 
   export function responseOutput(input: ResponseOutputInput) {
-    return get()?.responseOutput(input)
+    const trace = routed(input)
+    return remember(trace, trace?.responseOutput(input))
   }
 
   export function designRecord(input: DesignRecordInput) {
-    return get()?.designRecord(input)
+    const trace = routed(input)
+    return remember(trace, trace?.designRecord(input))
   }
 
   export function llmTurn(input: LlmTurnInput) {
-    return get()?.llmTurn(input)
+    const trace = routed(input)
+    return remember(trace, trace?.llmTurn(input))
   }
 
   export function agentLifecycle(input: AgentLifecycleInput) {
-    return get()?.agentLifecycle(input)
+    const trace = routed(input)
+    return remember(trace, trace?.agentLifecycle(input))
   }
 
   export function exitGate(input: ExitGateInput) {
-    return get()?.exitGate(input)
+    const trace = routed(input)
+    return remember(trace, trace?.exitGate(input))
   }
 
   export function evidenceFact(input: EvidenceFactInput) {
-    return get()?.evidenceFact(input)
+    const trace = routed(input)
+    return remember(trace, trace?.evidenceFact(input))
   }
 
   export function node(input: CausalNodeInput) {
-    return get()?.node(input)
+    const trace = routed(input)
+    return remember(trace, trace?.node(input))
   }
 
   export function causalEdge(input: CausalEdgeInput) {
-    return get()?.causalEdge(input)
+    const trace = routed(input)
+    return remember(trace, trace?.causalEdge(input))
   }
 
   export function observation(input: ObservationInput) {
-    return get()?.observation(input)
+    const trace = routed(input)
+    return remember(trace, trace?.observation(input))
   }
 
   export function compaction(input: CompactionRecordInput) {
-    return get()?.compaction(input)
+    const trace = routed(input)
+    return remember(trace, trace?.compaction(input))
   }
 
   export function compactionCheck(input: CompactionCheckInput) {
-    return get()?.compactionCheck(input)
+    const trace = routed(input)
+    return remember(trace, trace?.compactionCheck(input))
   }
 
   export function currentEvidenceRefs() {
-    return get()?.currentSourceRefs() ?? []
+    return routed()?.currentSourceRefs() ?? []
   }
 
   export function currentSourceRefs() {
-    return get()?.currentSourceRefs() ?? []
+    return routed()?.currentSourceRefs() ?? []
+  }
+
+  export function finishSession(sessionID: string, input?: FinishTraceInput) {
+    if (!enabledFromEnv()) return
+    registry?.finishSession(sessionID, (trace) => trace.finish(input))
+  }
+
+  export function finishAll(input?: FinishTraceInput) {
+    if (!enabledFromEnv()) return
+    try {
+      registry?.finishAll((trace) => trace.finish(input))
+    } finally {
+      compatibilityFinished = true
+    }
   }
 
   export function finish(input?: FinishTraceInput) {
-    get()?.finish(input)
-    active = false
+    if (!enabledFromEnv() || compatibilityFinished) return
+    get()
+    finishAll(input)
   }
 
   export function summarizeText(input: unknown) {
-    return active ? active.summarizeText(input) : summarizeTextField(input)
+    const traces = registry?.values() ?? []
+    return traces.length === 1 ? traces[0].summarizeText(input) : summarizeTextField(input)
   }
 
   export function summarizeJson(input: unknown) {
-    return active ? active.summarizeJson(input) : summarizeJsonField(input)
+    const traces = registry?.values() ?? []
+    return traces.length === 1 ? traces[0].summarizeJson(input) : summarizeJsonField(input)
   }
 }

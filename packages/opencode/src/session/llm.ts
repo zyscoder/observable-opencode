@@ -544,7 +544,7 @@ const live: Layer.Layer<
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
 
-            const span = CaseTrace.get()?.startSpan({
+            const span = CaseTrace.startSpan({
               component: "llm",
               operation: "stream",
               name: `${input.model.providerID}/${input.model.id}`,
