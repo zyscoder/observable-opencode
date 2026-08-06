@@ -1,23 +1,50 @@
+import { createHash } from "node:crypto"
 import fs from "fs"
 import path from "path"
-import type { TraceArtifact, TraceComponent, TraceFieldSummary, TraceSummary } from "./case-trace"
+import {
+  VIEWER_STRING_BUDGET,
+  boundedViewerJoin,
+  boundedViewerText,
+  escapeViewerHtml,
+  provenanceTraceHtmlChunks,
+  safeArtifactRelativePath,
+} from "./causal-trace-viewer"
+import type {
+  ProvenanceTraceView,
+  TraceArtifact,
+  TraceComponent,
+  TraceFieldSummary,
+  TraceSummary,
+} from "./case-trace"
 
 type RenderCaseTraceHtmlOptions = {
   artifactDir?: string
   artifactContents?: Map<string, string> | Record<string, string>
 }
 
-function escapeHtml(input: unknown) {
-  return String(input ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;")
+export type WriteProvenanceTraceHtmlOptions = {
+  forceStreaming?: boolean
+  maxChunkBytes?: number
+  streamingThreshold?: number
 }
 
+export type TraceHtmlWriteStats = {
+  mode: "inline" | "streaming"
+  record_count: number
+  chunk_count: number
+  max_chunk_bytes: number
+  max_generator_chunk_bytes: number
+  max_temporary_buffer_bytes: number
+  artifact_payloads_embedded: number
+}
+
+const escapeHtml = escapeViewerHtml
+
 function jsonScript(input: unknown) {
-  return JSON.stringify(input).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026")
+  return JSON.stringify(boundedViewerText(input, VIEWER_STRING_BUDGET))
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026")
 }
 
 function formatMs(input: number | undefined) {
@@ -79,41 +106,298 @@ function componentRank(component: string) {
 }
 
 function componentClass(component: string) {
-  return component.replace(/[^a-z0-9_-]/gi, "-")
+  return boundedViewerText(component, 80).replace(/[^a-z0-9_-]/gi, "-")
 }
 
 function preview(input: unknown, limit = 180): string {
   if (input === undefined || input === null) return ""
-  if (typeof input === "string") return input.slice(0, limit)
-  if (typeof input === "number" || typeof input === "boolean") return String(input)
+  if (typeof input === "string") return boundedViewerText(input, limit)
+  if (typeof input === "number" || typeof input === "boolean") return boundedViewerText(input, limit)
   const summary = input as Partial<TraceFieldSummary>
-  if (typeof summary.preview === "string") return summary.preview.slice(0, limit)
-  if (summary.value !== undefined) return String(summary.value).slice(0, limit)
-  try {
-    return JSON.stringify(input).slice(0, limit)
-  } catch {
-    return String(input).slice(0, limit)
-  }
+  if (typeof summary.preview === "string") return boundedViewerText(summary.preview, limit)
+  if (summary.value !== undefined) return boundedViewerText(summary.value, limit)
+  return boundedViewerText(input, limit)
 }
 
 function artifactID(input: unknown) {
   if (!input || typeof input !== "object") return undefined
   const summary = input as Partial<TraceFieldSummary>
-  return typeof summary.artifact_id === "string" ? summary.artifact_id : undefined
+  return typeof summary.artifact_id === "string" ? boundedViewerText(summary.artifact_id, 520) : undefined
 }
 
-function collectArtifactContents(trace: TraceSummary, options: RenderCaseTraceHtmlOptions = {}) {
+function writeAtomicChunks(target: string, chunks: Iterable<string>, maxChunkBytes: number) {
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
+  )
+  let chunkCount = 0
+  let largestChunk = 0
+  let largestGeneratorChunk = 0
+  let largestTemporaryBuffer = 0
+  let fd: number | undefined
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fd = fs.openSync(temporary, "w")
+    for (const chunk of chunks) {
+      const chunkBytes = Buffer.byteLength(chunk, "utf8")
+      if (chunkBytes > maxChunkBytes) {
+        throw new RangeError(`HTML generator chunk ${chunkBytes} exceeds ${maxChunkBytes} bytes`)
+      }
+      largestGeneratorChunk = Math.max(largestGeneratorChunk, chunkBytes)
+      const bytes = Buffer.from(chunk, "utf8")
+      largestTemporaryBuffer = Math.max(largestTemporaryBuffer, bytes.byteLength)
+      fs.writeSync(fd, bytes)
+      chunkCount += 1
+      largestChunk = Math.max(largestChunk, bytes.byteLength)
+    }
+    fs.closeSync(fd)
+    fd = undefined
+    fs.renameSync(temporary, target)
+    return { chunkCount, largestChunk, largestGeneratorChunk, largestTemporaryBuffer }
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(temporary)
+    } catch {}
+    throw error
+  }
+}
+
+type AuthorizedArtifactTarget = {
+  fd: number
+  dev: number
+  ino: number
+}
+
+function sameArtifactIdentity(left: fs.Stats, right: Pick<AuthorizedArtifactTarget, "dev" | "ino">) {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+function closeAuthorizedArtifactTargets(targets: ReadonlyMap<string, AuthorizedArtifactTarget>) {
+  for (const target of targets.values()) {
+    try {
+      fs.closeSync(target.fd)
+    } catch {}
+  }
+}
+
+function authorizedArtifactTargets(artifacts: readonly TraceArtifact[], caseRoot: string | undefined) {
+  const allowed = new Map<string, AuthorizedArtifactTarget>()
+  if (!caseRoot) return allowed
+  try {
+    const realCaseRoot = fs.realpathSync(caseRoot)
+    const artifactRoot = fs.realpathSync(path.resolve(caseRoot, "artifacts"))
+    const artifactRootRelative = path.relative(realCaseRoot, artifactRoot)
+    if (!artifactRootRelative || artifactRootRelative.startsWith("..") || path.isAbsolute(artifactRootRelative)) return allowed
+    for (const artifact of artifacts) {
+      const relativePath = safeArtifactRelativePath(artifact.path)
+      if (!relativePath || allowed.has(relativePath)) continue
+      let fd: number | undefined
+      try {
+        const lexicalTarget = path.resolve(caseRoot, relativePath)
+        fd = fs.openSync(lexicalTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+        const descriptor = fs.fstatSync(fd)
+        if (!descriptor.isFile()) continue
+        const realTarget = fs.realpathSync(lexicalTarget)
+        const relative = path.relative(artifactRoot, realTarget)
+        if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue
+        if (!sameArtifactIdentity(fs.statSync(realTarget), descriptor)) continue
+        allowed.set(relativePath, {
+          fd,
+          dev: descriptor.dev,
+          ino: descriptor.ino,
+        })
+        fd = undefined
+      } catch {
+      } finally {
+        if (fd !== undefined) {
+          try {
+            fs.closeSync(fd)
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  return allowed
+}
+
+function fsyncDirectory(directory: string) {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(directory, fs.constants.O_RDONLY)
+    fs.fsyncSync(fd)
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
+  }
+}
+
+function descriptorDigest(fd: number) {
+  const digest = createHash("sha256")
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  let position = 0
+  while (true) {
+    const count = fs.readSync(fd, buffer, 0, buffer.length, position)
+    if (!count) break
+    digest.update(buffer.subarray(0, count))
+    position += count
+  }
+  return { digest: digest.digest("hex"), length: position }
+}
+
+function validatePublishedSnapshot(target: string, expectedDigest: string, expectedLength: number) {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    const stats = fs.fstatSync(fd)
+    if (!stats.isFile() || stats.size !== expectedLength) return false
+    return descriptorDigest(fd).digest === expectedDigest
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+  }
+}
+
+function publishArtifactSnapshot(caseRoot: string, target: AuthorizedArtifactTarget) {
+  const snapshotRoot = path.resolve(caseRoot, "artifacts", "render-snapshots", "sha256")
+  fs.mkdirSync(snapshotRoot, { recursive: true })
+  const realCaseRoot = fs.realpathSync(caseRoot)
+  const realSnapshotRoot = fs.realpathSync(snapshotRoot)
+  const snapshotRootRelative = path.relative(realCaseRoot, realSnapshotRoot)
+  if (!snapshotRootRelative || snapshotRootRelative.startsWith("..") || path.isAbsolute(snapshotRootRelative)) return undefined
+
+  const temporary = path.join(snapshotRoot, `.snapshot.${process.pid}.${Math.random().toString(16).substring(2)}.tmp`)
+  let temporaryFd: number | undefined
+  try {
+    temporaryFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
+    const digest = createHash("sha256")
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    let sourcePosition = 0
+    while (true) {
+      const count = fs.readSync(target.fd, buffer, 0, buffer.length, sourcePosition)
+      if (!count) break
+      digest.update(buffer.subarray(0, count))
+      let written = 0
+      while (written < count) written += fs.writeSync(temporaryFd, buffer, written, count - written)
+      sourcePosition += count
+    }
+    fs.fchmodSync(temporaryFd, 0o444)
+    fs.fsyncSync(temporaryFd)
+    fs.closeSync(temporaryFd)
+    temporaryFd = undefined
+
+    const contentDigest = digest.digest("hex")
+    const relativeSnapshot = `artifacts/render-snapshots/sha256/${contentDigest}`
+    const published = path.resolve(caseRoot, relativeSnapshot)
+    try {
+      fs.linkSync(temporary, published)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      if (!validatePublishedSnapshot(published, contentDigest, sourcePosition)) return undefined
+    }
+    fs.unlinkSync(temporary)
+    fsyncDirectory(snapshotRoot)
+    return relativeSnapshot
+  } catch {
+    return undefined
+  } finally {
+    if (temporaryFd !== undefined) {
+      try {
+        fs.closeSync(temporaryFd)
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(temporary)
+    } catch {}
+  }
+}
+
+function publishArtifactSnapshots(
+  caseRoot: string | undefined,
+  targets: ReadonlyMap<string, AuthorizedArtifactTarget>,
+) {
+  const snapshots = new Map<string, string>()
+  if (!caseRoot) return snapshots
+  for (const [relativePath, target] of targets) {
+    const snapshot = publishArtifactSnapshot(caseRoot, target)
+    if (snapshot) snapshots.set(relativePath, snapshot)
+  }
+  return snapshots
+}
+
+export function writeProvenanceTraceHtmlFile(
+  target: string,
+  trace: ProvenanceTraceView,
+  options: WriteProvenanceTraceHtmlOptions = {},
+): TraceHtmlWriteStats {
+  const maxChunkBytes = Math.max(1024, Math.floor(options.maxChunkBytes ?? 256 * 1024))
+  const streamingThreshold = Math.max(1, Math.floor(options.streamingThreshold ?? 5000))
+  const streaming = options.forceStreaming === true || trace.records.length >= streamingThreshold
+  const authorized = authorizedArtifactTargets(trace.artifacts, path.dirname(target))
+  let artifactSnapshotPaths: ReadonlyMap<string, string>
+  try {
+    artifactSnapshotPaths = publishArtifactSnapshots(path.dirname(target), authorized)
+  } finally {
+    closeAuthorizedArtifactTargets(authorized)
+  }
+  const chunks = provenanceTraceHtmlChunks(trace, { maxChunkBytes, artifactSnapshotPaths })
+  const written = writeAtomicChunks(target, chunks, maxChunkBytes)
+  return {
+    mode: streaming ? "streaming" : "inline",
+    record_count: trace.records.length,
+    chunk_count: written.chunkCount,
+    max_chunk_bytes: written.largestChunk,
+    max_generator_chunk_bytes: written.largestGeneratorChunk,
+    max_temporary_buffer_bytes: written.largestTemporaryBuffer,
+    artifact_payloads_embedded: 0,
+  }
+}
+
+function collectArtifactContents(
+  trace: TraceSummary,
+  options: RenderCaseTraceHtmlOptions,
+  allowedArtifactTargets: ReadonlyMap<string, AuthorizedArtifactTarget>,
+  artifactSnapshotPaths: ReadonlyMap<string, string>,
+) {
   const contents = new Map<string, string>()
+  // Large traces keep artifact bodies authoritative on disk. Embedding them in
+  // trace.html creates another full payload collection during finalization.
+  if (trace.events.length + trace.spans.length >= 5000) return contents
+  const artifactsByID = new Map<string, AuthorizedArtifactTarget>()
+  for (const artifact of trace.artifacts ?? []) {
+    const id = boundedViewerText(artifact.artifact_id, 520)
+    const relativePath = safeArtifactRelativePath(artifact.path)
+    const target = relativePath ? allowedArtifactTargets.get(relativePath) : undefined
+    if (id && relativePath && target && artifactSnapshotPaths.has(relativePath)) artifactsByID.set(id, target)
+  }
   if (options.artifactContents instanceof Map) {
-    for (const [key, value] of options.artifactContents) contents.set(key, value)
+    for (const [key, value] of options.artifactContents) {
+      const id = boundedViewerText(key, 520)
+      if (artifactsByID.has(id)) contents.set(id, boundedViewerText(value, VIEWER_STRING_BUDGET))
+    }
   } else if (options.artifactContents) {
-    for (const [key, value] of Object.entries(options.artifactContents)) contents.set(key, value)
+    for (const key in options.artifactContents) {
+      if (!Object.prototype.hasOwnProperty.call(options.artifactContents, key)) continue
+      const id = boundedViewerText(key, 520)
+      if (artifactsByID.has(id))
+        contents.set(id, boundedViewerText(options.artifactContents[key], VIEWER_STRING_BUDGET))
+    }
   }
   if (!options.artifactDir) return contents
-  for (const artifact of trace.artifacts ?? []) {
-    if (contents.has(artifact.artifact_id)) continue
+  const buffer = Buffer.allocUnsafe(VIEWER_STRING_BUDGET * 4)
+  for (const [id, target] of artifactsByID) {
+    if (contents.has(id)) continue
     try {
-      contents.set(artifact.artifact_id, fs.readFileSync(path.join(options.artifactDir, artifact.path), "utf8"))
+      const count = fs.readSync(target.fd, buffer, 0, buffer.length, 0)
+      contents.set(id, boundedViewerText(buffer.toString("utf8", 0, count), VIEWER_STRING_BUDGET))
     } catch {}
   }
   return contents
@@ -121,15 +405,15 @@ function collectArtifactContents(trace: TraceSummary, options: RenderCaseTraceHt
 
 function collectComponents(trace: TraceSummary) {
   const components = new Set<string>()
-  for (const span of trace.spans) components.add(span.component)
-  for (const event of trace.events) components.add(event.component)
+  for (const span of trace.spans) components.add(boundedViewerText(span.component, 80))
+  for (const event of trace.events) components.add(boundedViewerText(event.component, 80))
   return [...components].sort((a, b) => componentRank(a) - componentRank(b) || a.localeCompare(b))
 }
 
 function componentMetrics(trace: TraceSummary) {
   return collectComponents(trace).map((component) => {
-    const spans = trace.spans.filter((span) => span.component === component)
-    const events = trace.events.filter((event) => event.component === component)
+    const spans = trace.spans.filter((span) => boundedViewerText(span.component, 80) === component)
+    const events = trace.events.filter((event) => boundedViewerText(event.component, 80) === component)
     return {
       component,
       spans: spans.length,
@@ -156,19 +440,19 @@ function processItems(trace: TraceSummary) {
   const items: ProcessItem[] = [
     ...trace.spans.map((span) => ({
       time: span.start_ms,
-      component: span.component,
+      component: boundedViewerText(span.component, 80) as TraceComponent,
       kind: "span" as const,
-      title: span.name ?? span.operation,
-      status: span.status,
+      title: boundedViewerText(span.name ?? span.operation, 520),
+      status: boundedViewerText(span.status, 80),
       duration: span.duration_ms,
       input: span.input_summary,
       output: span.output_summary,
     })),
     ...trace.events.map((event) => ({
       time: event.time_ms,
-      component: event.component,
+      component: boundedViewerText(event.component, 80) as TraceComponent,
       kind: "event" as const,
-      title: event.event_type,
+      title: boundedViewerText(event.event_type, 520),
       data: event.data,
     })),
   ]
@@ -183,11 +467,13 @@ type FlowEdge = {
 }
 
 function addEdge(edges: Map<string, FlowEdge>, from: TraceComponent, to: TraceComponent, sample: string) {
-  if (from === to) return
-  const key = `${from}->${to}`
-  const edge = edges.get(key) ?? { from, to, count: 0, samples: [] }
+  const boundedFrom = boundedViewerText(from, 80) as TraceComponent
+  const boundedTo = boundedViewerText(to, 80) as TraceComponent
+  if (boundedFrom === boundedTo) return
+  const key = boundedViewerJoin([boundedFrom, boundedTo], "->", 180)
+  const edge = edges.get(key) ?? { from: boundedFrom, to: boundedTo, count: 0, samples: [] }
   edge.count += 1
-  if (edge.samples.length < 3 && sample) edge.samples.push(sample)
+  if (edge.samples.length < 3 && sample) edge.samples.push(boundedViewerText(sample, 1200))
   edges.set(key, edge)
 }
 
@@ -196,37 +482,42 @@ function flowEdges(trace: TraceSummary) {
   const points = [
     ...trace.spans.map((span) => ({
       time: span.start_ms,
-      component: span.component,
-      label: `${span.name ?? span.operation}:start`,
+      component: boundedViewerText(span.component, 80) as TraceComponent,
+      label: boundedViewerJoin([boundedViewerText(span.name ?? span.operation, 520), "start"], ":", 530),
     })),
     ...trace.events.map((event) => ({
       time: event.time_ms,
-      component: event.component,
-      label: event.event_type,
+      component: boundedViewerText(event.component, 80) as TraceComponent,
+      label: boundedViewerText(event.event_type, 530),
     })),
     ...trace.spans.map((span) => ({
       time: span.end_ms ?? span.start_ms,
-      component: span.component,
-      label: `${span.name ?? span.operation}:end`,
+      component: boundedViewerText(span.component, 80) as TraceComponent,
+      label: boundedViewerJoin([boundedViewerText(span.name ?? span.operation, 520), "end"], ":", 530),
     })),
   ].toSorted((a, b) => a.time - b.time)
 
   let previous: (typeof points)[number] | undefined
   for (const point of points) {
-    if (previous) addEdge(edges, previous.component, point.component, `${previous.label} -> ${point.label}`)
+    if (previous)
+      addEdge(edges, previous.component, point.component, boundedViewerJoin([previous.label, point.label], " -> ", 1200))
     previous = point
   }
 
-  const spanByID = new Map(trace.spans.map((span) => [span.span_id, span]))
+  const spanByID = new Map(trace.spans.map((span) => [boundedViewerText(span.span_id, 520), span]))
   for (const span of trace.spans) {
     if (!span.parent_span_id) continue
-    const parent = spanByID.get(span.parent_span_id)
+    const parent = spanByID.get(boundedViewerText(span.parent_span_id, 520))
     if (parent)
       addEdge(
         edges,
         parent.component,
         span.component,
-        `parent ${parent.name ?? parent.operation} -> ${span.name ?? span.operation}`,
+        boundedViewerJoin(
+          ["parent", boundedViewerText(parent.name ?? parent.operation, 520), boundedViewerText(span.name ?? span.operation, 520)],
+          " -> ",
+          1200,
+        ),
       )
   }
 
@@ -285,22 +576,29 @@ function renderAgentProcess(trace: TraceSummary, artifactContents: Map<string, s
   </div></div>`
 }
 
-function renderArtifacts(trace: TraceSummary, artifactContents: Map<string, string>) {
+function renderArtifacts(
+  trace: TraceSummary,
+  artifactContents: Map<string, string>,
+  artifactSnapshotPaths: ReadonlyMap<string, string>,
+) {
   const artifacts = trace.artifacts ?? []
   if (!artifacts.length) return `<div class="empty">没有大文本 artifact。</div>`
   return `<div class="artifacts">
-    ${artifacts
+      ${artifacts
       .map((artifact: TraceArtifact) => {
-        const content = artifactContents.get(artifact.artifact_id)
+        const id = boundedViewerText(artifact.artifact_id, 520)
+        const content = artifactContents.get(id)
+        const safePath = safeArtifactRelativePath(artifact.path)
+        const snapshotPath = safePath ? artifactSnapshotPaths.get(safePath) : undefined
         return `<details class="artifact-row">
           <summary>
             <span class="pill trace">${escapeHtml(artifact.kind)}</span>
-            <strong>${escapeHtml(artifact.label ?? artifact.artifact_id)}</strong>
-            <code>${escapeHtml(artifact.artifact_id)}</code>
+            <strong>${escapeHtml(artifact.label ?? id)}</strong>
+            <code>${escapeHtml(id)}</code>
             <span class="muted">${artifact.length} chars</span>
           </summary>
           <div class="artifact-meta">
-            <span>path: <code>${escapeHtml(artifact.path)}</code></span>
+            <span>path: ${snapshotPath ? `<a href="${escapeHtml(snapshotPath)}"><code>${escapeHtml(snapshotPath)}</code></a>` : `<span class="artifact-missing" title="Artifact unavailable">Artifact unavailable</span>`}</span>
             <span>hash: <code>${escapeHtml(artifact.hash)}</code></span>
           </div>
           ${
@@ -346,7 +644,7 @@ function renderFlow(trace: TraceSummary) {
                   <span class="arrow">→</span>
                   <span class="pill ${escapeHtml(componentClass(edge.to))}">${escapeHtml(edge.to)}</span>
                   <span class="edge-count">${edge.count} 次</span>
-                  <span class="edge-sample">${escapeHtml(edge.samples.join("；"))}</span>
+                  <span class="edge-sample">${escapeHtml(boundedViewerJoin(edge.samples, "；"))}</span>
                 </div>`,
               )
               .join("")
@@ -369,7 +667,7 @@ function renderContextSnapshots(trace: TraceSummary, artifactContents: Map<strin
             <div class="step-head">
               <span class="pill context">context</span>
               <strong>${escapeHtml(snapshot.snapshot_id)}</strong>
-              <span class="muted">${escapeHtml([snapshot.provider_id, snapshot.model_id].filter(Boolean).join("/") || "-")}</span>
+              <span class="muted">${escapeHtml(boundedViewerJoin([snapshot.provider_id, snapshot.model_id], "/") || "-")}</span>
               <span class="muted">${snapshot.message_count ?? 0} messages</span>
               <span class="muted">${snapshot.tool_count ?? 0} tools</span>
             </div>
@@ -406,7 +704,7 @@ function renderSourceRecords(trace: TraceSummary, artifactContents: Map<string, 
                   <td>${escapeHtml(item.intent ?? "")}</td>
                   <td>${escapeHtml(item.chosen_action ?? "")}</td>
                   <td>${renderSummary(item.rationale)}</td>
-                  <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
+                  <td>${escapeHtml(boundedViewerJoin(item.source_refs ?? []))}</td>
                 </tr>`,
               )
               .join("")}
@@ -441,7 +739,7 @@ function renderSourceRecords(trace: TraceSummary, artifactContents: Map<string, 
               (item) => `<div class="io-cell">
                 <div class="io-label"><code>${escapeHtml(item.segment_id)}</code></div>
                 ${renderIoCell("Text", item.text, artifactContents)}
-                <div class="muted">source refs: ${escapeHtml((item.source_refs ?? []).join(", ") || "-")}</div>
+                <div class="muted">source refs: ${escapeHtml(boundedViewerJoin(item.source_refs ?? []) || "-")}</div>
               </div>`,
             )
             .join("")}
@@ -471,18 +769,28 @@ function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map
                   <td><code>${escapeHtml(item.command ?? "")}</code></td>
                   <td>${escapeHtml(
                     item.parsed_failures
-                      .map((failure) =>
-                        [
-                          failure.file,
-                          failure.line,
-                          failure.message,
-                          failure.expected && `expected ${failure.expected}`,
-                          failure.actual && `actual ${failure.actual}`,
-                        ]
-                          .filter(Boolean)
-                          .join(" "),
-                      )
-                      .join("; "),
+                      .reduce(
+                        (output, failure) =>
+                          boundedViewerJoin(
+                            [
+                              output,
+                              boundedViewerJoin(
+                                [
+                                  failure.file,
+                                  failure.line,
+                                  failure.message,
+                                  failure.expected && `expected ${boundedViewerText(failure.expected, 260)}`,
+                                  failure.actual && `actual ${boundedViewerText(failure.actual, 260)}`,
+                                ],
+                                " ",
+                                720,
+                              ),
+                            ],
+                            "; ",
+                            2400,
+                          ),
+                        "",
+                      ),
                   )}</td>
                   <td>
                     ${item.stdout ? renderArtifactDetails(item.stdout, artifactContents) || renderSummary(item.stdout) : ""}
@@ -504,9 +812,9 @@ function renderChangesAndVerification(trace: TraceSummary, artifactContents: Map
               .map(
                 (item) => `<tr>
                   <td><code>${escapeHtml(item.change_id)}</code></td>
-                  <td>${escapeHtml(item.files.join(", "))}</td>
+                  <td>${escapeHtml(boundedViewerJoin(item.files))}</td>
                   <td>${escapeHtml(item.intent ?? "")}</td>
-                  <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
+                  <td>${escapeHtml(boundedViewerJoin(item.source_refs ?? []))}</td>
                   <td>${item.diff ? renderArtifactDetails(item.diff, artifactContents) || renderSummary(item.diff) : ""}</td>
                 </tr>`,
               )
@@ -539,7 +847,7 @@ function renderDesignRecords(trace: TraceSummary, artifactContents: Map<string, 
             ${item.risks ? renderIoCell("Risks", item.risks, artifactContents) : ""}
             ${item.test_strategy ? renderIoCell("Test Strategy", item.test_strategy, artifactContents) : ""}
           </div>
-          <div class="muted">source refs: ${escapeHtml((item.source_refs ?? []).join(", ") || "-")}</div>
+          <div class="muted">source refs: ${escapeHtml(boundedViewerJoin(item.source_refs ?? []) || "-")}</div>
         </div>`,
       )
       .join("")}
@@ -559,7 +867,7 @@ function renderConstraints(trace: TraceSummary) {
             <td>${escapeHtml(item.source)}</td>
             <td>${escapeHtml(item.constraint)}</td>
             <td>${escapeHtml(item.status)}</td>
-            <td>${escapeHtml((item.source_refs ?? []).join(", "))}</td>
+            <td>${escapeHtml(boundedViewerJoin(item.source_refs ?? []))}</td>
           </tr>`,
         )
         .join("")}
@@ -568,7 +876,15 @@ function renderConstraints(trace: TraceSummary) {
 }
 
 export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTraceHtmlOptions = {}) {
-  const artifactContents = collectArtifactContents(trace, options)
+  const allowedArtifactTargets = authorizedArtifactTargets(trace.artifacts ?? [], options.artifactDir)
+  let artifactContents: Map<string, string>
+  let artifactSnapshotPaths: ReadonlyMap<string, string>
+  try {
+    artifactSnapshotPaths = publishArtifactSnapshots(options.artifactDir, allowedArtifactTargets)
+    artifactContents = collectArtifactContents(trace, options, allowedArtifactTargets, artifactSnapshotPaths)
+  } finally {
+    closeAuthorizedArtifactTargets(allowedArtifactTargets)
+  }
   const spans = trace.spans.toSorted((a, b) => a.start_ms - b.start_ms)
   const maxEnd = Math.max(trace.duration_ms, ...spans.map((span) => span.end_ms ?? span.start_ms))
   const duration = Math.max(1, maxEnd)
@@ -959,7 +1275,7 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
 
     <section>
       <h2>Artifacts</h2>
-      ${renderArtifacts(trace, artifactContents)}
+      ${renderArtifacts(trace, artifactContents, artifactSnapshotPaths)}
     </section>
 
     <section>
@@ -1039,7 +1355,7 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
               (error) => `<tr>
                 <td>${escapeHtml(error.component ?? "")}</td>
                 <td><code>${escapeHtml(error.span_id ?? "")}</code></td>
-                <td>${escapeHtml(error.message ?? JSON.stringify(error))}</td>
+                <td>${escapeHtml(error.message ?? error)}</td>
               </tr>`,
             )
             .join("")}
@@ -1057,8 +1373,8 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
     </section>
   </main>
   <script>
-    const trace = ${jsonScript(trace)};
-    document.getElementById("raw").textContent = JSON.stringify(trace, null, 2);
+    const tracePreview = ${jsonScript(trace)};
+    document.getElementById("raw").textContent = tracePreview;
   </script>
 </body>
 </html>`

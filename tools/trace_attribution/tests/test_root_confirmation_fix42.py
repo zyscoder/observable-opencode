@@ -88,6 +88,7 @@ class GlobalAuthorityAndReplayOwnershipTest(unittest.TestCase):
         disconnected_payload["validation_source"]["downstream_path"] = [
             "record:decision"
         ]
+        disconnected_payload["episode_facts"]["grounded_hops"] = 0
         disconnected = CandidateEvidenceCapsule.from_dict(
             disconnected_payload
         )
@@ -204,6 +205,14 @@ class GlobalAuthorityAndReplayOwnershipTest(unittest.TestCase):
                     "record:b", prevents_defect=False
                 ),
                 "causal_role": "unrelated",
+                "responsibility": "none",
+                "candidate_phase": "intermediate",
+                "obligation_status_before": "unknown",
+                "obligation_status_after": "unknown",
+                "repair_window_effect": "remained_open",
+                "failure_mode": "none",
+                "obligation_refs": [],
+                "contribution_mechanism": None,
             }
         )
 
@@ -245,6 +254,26 @@ class GlobalAuthorityAndReplayOwnershipTest(unittest.TestCase):
             "Independent necessity of the contributing condition is unresolved."
         ]
         value["assessments"][0]["causal_role"] = "contributing_condition"
+        value["assessments"][0].update(
+            {
+                "responsibility": "shared",
+                "candidate_phase": "planning",
+                "obligation_status_before": "unknown",
+                "obligation_status_after": "unknown",
+                "repair_window_effect": "remained_open",
+                "failure_mode": "omission_enabling_condition",
+                "obligation_refs": [],
+                "contribution_mechanism": {
+                    "type": "scope_narrowing",
+                    "target_ref": request.seed_ref,
+                    "effect": (
+                        "The condition narrowed the implementation scope "
+                        "reaching the active defect."
+                    ),
+                    "evidence_refs": ["record:decision"],
+                },
+            }
+        )
 
         judgment = validate_global_candidate_payload(value, request=request)
 

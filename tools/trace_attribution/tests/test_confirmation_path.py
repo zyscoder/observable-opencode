@@ -87,6 +87,24 @@ class ConfirmationPathPolicyTest(unittest.TestCase):
                     )
                 )
 
+    def test_accepts_fact_grounded_process_lifecycle_reconstruction(self):
+        self.assertTrue(
+            is_confirmation_causal_edge(
+                {
+                    "relation": "process_lifecycle_observed",
+                    "evidence_type": "offline_reconstruction",
+                    "edge_origin": (
+                        "offline.process_lifecycle_reconstruction"
+                    ),
+                    "inference_method": (
+                        "candidate_process_trajectory_v1"
+                    ),
+                    "eligible_for_attribution": True,
+                },
+                default_eligible=False,
+            )
+        )
+
     def test_rejects_ineligible_repository_causal_relation(self):
         self.assertFalse(
             is_confirmation_causal_edge(

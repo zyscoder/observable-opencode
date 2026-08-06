@@ -6,16 +6,20 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from trace_attribution.cache import build_judge_cache_key
 from trace_attribution.causal_judge import (
     CAUSAL_STEP_PROMPT_SCHEMA_VERSION,
     ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
+    BoundedJudgeCallResult,
     CausalStepRequest,
+    FactorRoleJudgment,
     OfflineJudgeCapability,
     RootConfirmationRequest,
     build_causal_step_prompt,
     build_recursive_confirmation_prompt,
+    factor_role_request_identity,
 )
 from trace_attribution.causal_state import (
     GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
@@ -38,9 +42,13 @@ from trace_attribution.evidence_capsule import (
     CAPSULE_SCHEMA_VERSION,
     CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
+    candidate_compression_metrics,
 )
 from trace_attribution.global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgment,
     GlobalCandidateJudgeRequest,
+    GlobalJudgeCapability,
     active_focus_text_sha256,
     build_global_candidate_prompt,
 )
@@ -101,6 +109,7 @@ def checkpoint_config(trace: dict, start_refs: list[str]) -> dict:
             "thinking_mode": "disabled",
             "base_url": "offline://fix18",
             "provider_error_threshold": 3,
+            "fusion_mode": "retrieval-global",
         },
     )
 
@@ -167,7 +176,10 @@ def mixed_seed_trace() -> dict:
     }
 
 
-class MixedPublicationJudge(OfflineJudgeCapability):
+class MixedPublicationJudge(
+    OfflineJudgeCapability,
+    GlobalJudgeCapability,
+):
     def judge_step_offline(self, request):
         ref = request.current_node.ref
         if "defect_" in ref:
@@ -214,27 +226,10 @@ class MixedPublicationJudge(OfflineJudgeCapability):
 
     def confirm_candidate_offline(self, request):
         if request.candidate_ref == "record:decision_stale":
-            return RootConfirmation(
-                candidate_ref=request.candidate_ref,
-                status="rejected",
-                reason="The stale decision is a condition rather than a necessary root.",
-                counterfactual=confirmation_counterfactual_for(
-                    request.candidate_ref,
-                    "rejected",
-                ),
-                confidence=0.9,
-                counterfactual_status="rejects_causality",
-                evidence_refs=(
-                    request.candidate_ref,
-                    "record:change_stale",
-                ),
-                factor_role="contributing_condition",
-                factor_mechanism={
-                    "mechanism_type": "enabling_condition",
-                    "source_ref": request.candidate_ref,
-                    "target_ref": "record:change_stale",
-                    "effect": "The decision enabled the defective change.",
-                },
+            return RootConfirmation.rejected(
+                request.candidate_ref,
+                "The stale decision is not a necessary root.",
+                evidence_refs=[request.candidate_ref],
             )
         return RootConfirmation.confirmed(
             request.candidate_ref,
@@ -248,6 +243,203 @@ class MixedPublicationJudge(OfflineJudgeCapability):
             evidence_refs=[request.candidate_ref],
         )
 
+    def judge_factor_role(self, request):
+        return FactorRoleJudgment(
+            candidate_ref=request.candidate_ref,
+            necessity_status="not_necessary",
+            factor_role="contributing_condition",
+            reason=(
+                "The stale change carried the defect without becoming "
+                "a necessary root."
+            ),
+            confidence=0.9,
+            evidence_refs=(request.candidate_ref,),
+            recursive_path=request.recursive_path,
+            factor_mechanism={
+                "schema": "factor-role-mechanism/v1",
+                "mechanism_type": "enabling_condition",
+                "source_ref": request.candidate_ref,
+                "target_ref": request.recursive_path[-1],
+                "effect": "increased_defect_likelihood",
+            },
+            counterfactual={
+                "schema": "factor-role-counterfactual/v1",
+                "intervention_ref": request.candidate_ref,
+                "intervention_kind": (
+                    "replace_with_semantically_correct_behavior"
+                ),
+                "predicted_effect": "reduces_defect_likelihood",
+            },
+            hypothesis_id=request.hypothesis_id,
+            hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+            defect_fingerprint=request.defect_state.fingerprint,
+            seed_binding_identity=request.seed_binding_identity,
+            analysis_perspective=request.analysis_perspective,
+            request_identity=factor_role_request_identity(request),
+        )
+
+    def judge_candidates_bounded(
+        self,
+        request,
+        *,
+        max_physical_requests,
+    ):
+        stale_seed = request.seed_ref == "record:defect_stale"
+        selected_ref = (
+            "record:decision_stale"
+            if stale_seed
+            else "record:decision_active"
+        )
+        assessments = []
+        for capsule in request.capsules:
+            selected = capsule.candidate_ref == selected_ref
+            factor = (
+                stale_seed
+                and capsule.candidate_ref == "record:change_stale"
+            )
+            assessments.append(
+                GlobalCandidateAssessment(
+                    candidate_ref=capsule.candidate_ref,
+                    defect_status=(
+                        "present" if selected or factor else "absent"
+                    ),
+                    input_defect_status=(
+                        "absent"
+                        if selected
+                        else ("unknown" if factor else "absent")
+                    ),
+                    output_defect_status=(
+                        "present" if selected or factor else "absent"
+                    ),
+                    causal_path_refs=(
+                        tuple(capsule.downstream_path)
+                        if selected or factor
+                        else ()
+                    ),
+                    counterfactual={
+                        "intervention_ref": capsule.candidate_ref,
+                        "intervention_kind": (
+                            "replace_with_semantically_correct_behavior"
+                        ),
+                        "predicted_defect_status": (
+                            "absent"
+                            if selected or factor
+                            else "present"
+                        ),
+                        "causal_effect": (
+                            "prevents_defect"
+                            if selected or factor
+                            else "does_not_prevent_defect"
+                        ),
+                    },
+                    compared_candidate_refs=(
+                        request.open_authored_root_candidate_refs
+                    ),
+                    causal_role=(
+                        "root_candidate"
+                        if selected
+                        else (
+                            "contributing_condition"
+                            if factor
+                            else "exculpatory_evidence"
+                        )
+                    ),
+                    responsibility=(
+                        "primary"
+                        if selected
+                        else ("shared" if factor else "none")
+                    ),
+                    candidate_phase=(
+                        "implementation"
+                        if selected
+                        else ("planning" if factor else "intermediate")
+                    ),
+                    obligation_status_before="unknown",
+                    obligation_status_after="unknown",
+                    repair_window_effect="remained_open",
+                    failure_mode=(
+                        "positive_introduction"
+                        if selected
+                        else (
+                            "omission_enabling_condition"
+                            if factor
+                            else "none"
+                        )
+                    ),
+                    obligation_refs=(),
+                    contribution_mechanism=(
+                        {
+                            "type": "scope_narrowing",
+                            "target_ref": request.seed_ref,
+                            "effect": (
+                                "The stale change narrowed the implementation "
+                                "scope reaching the defect."
+                            ),
+                            "evidence_refs": (capsule.candidate_ref,),
+                        }
+                        if factor
+                        else None
+                    ),
+                    reason="Canonical mixed-seed assessment.",
+                    evidence_refs=(capsule.candidate_ref,),
+                    confidence=0.9,
+                )
+            )
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome="candidate_roots",
+                reason="Each seed has one independently reviewed root.",
+                assessments=tuple(assessments),
+                selected_candidate_refs=(selected_ref,),
+                expansion_requests=(),
+                decisive_evidence_refs=(selected_ref,),
+                missing_evidence=(),
+                confidence=0.9,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": (
+                        request.active_defect.fingerprint
+                    ),
+                    "active_focus_text_hash": (
+                        request.active_focus_text_hash
+                    ),
+                },
+            ),
+            0,
+        )
+
+
+class MixedLifecycleAnalyzer(AgenticRecursiveAnalyzer):
+    def _run_global_candidate_prepass(self, state, graph):
+        def mixed_metrics(candidate_graph, capsules):
+            metrics = candidate_compression_metrics(
+                candidate_graph, capsules
+            )
+            if (
+                capsules
+                and tuple(capsules[0].start_refs)
+                == ("record:defect_active",)
+            ):
+                metrics["global_fusion_payload"] = {
+                    "eligible": False,
+                    "reason": "oversized_negative_compression",
+                    "capsule_to_trace_expansion_ratio": 24.491515,
+                    "max_payload_bytes": 65_536,
+                    "open_root_candidate_count": 4,
+                    "max_open_root_candidates": 3,
+                    "negative_compression": True,
+                    "oversized": True,
+                    "dense_root_matrix": True,
+                }
+            return metrics
+
+        with patch(
+            "trace_attribution.recursive_analyzer."
+            "candidate_compression_metrics",
+            side_effect=mixed_metrics,
+        ):
+            super()._run_global_candidate_prepass(state, graph)
+
 
 class StaleSeedPublicationQuarantineTest(unittest.TestCase):
     def test_partial_and_completed_restore_quarantine_stale_mixed_publications(self):
@@ -256,8 +448,9 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
         config = checkpoint_config(trace, start_refs)
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "mixed.checkpoint"
-            report = AgenticRecursiveAnalyzer(
+            report = MixedLifecycleAnalyzer(
                 judge=MixedPublicationJudge(),
+                fusion_mode="retrieval-global",
                 checkpoint=CheckpointBundle(root),
                 checkpoint_config=config,
             ).analyze(
@@ -326,6 +519,14 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
                         ],
                     )
                     self.assertEqual(
+                        restored.factor_role_action_projection,
+                        [],
+                    )
+                    self.assertEqual(
+                        restored.factor_role_judgments,
+                        [],
+                    )
+                    self.assertEqual(
                         [
                             item["candidate_ref"]
                             for item in restored.introduction_bindings
@@ -336,6 +537,9 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
                         [
                             item["active_visit"]["node_ref"]
                             for item in restored.investigation_journal
+                            if isinstance(
+                                item.get("active_visit"), dict
+                            )
                         ],
                         ["record:decision_active"],
                     )
@@ -353,6 +557,14 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
                             ),
                         ],
                     )
+                    self.assertEqual(
+                        restored.confirmed_roots[0].recursive_path,
+                        (
+                            "record:decision_active",
+                            "record:change_active",
+                            "record:defect_active",
+                        ),
+                    )
 
     def test_completed_report_restore_quarantines_stale_seed_without_blocking_active(self):
         trace = mixed_seed_trace()
@@ -360,8 +572,9 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
         config = checkpoint_config(trace, start_refs)
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "completed.checkpoint"
-            AgenticRecursiveAnalyzer(
+            MixedLifecycleAnalyzer(
                 judge=MixedPublicationJudge(),
+                fusion_mode="retrieval-global",
                 checkpoint=CheckpointBundle(root),
                 checkpoint_config=config,
             ).analyze(
@@ -377,8 +590,9 @@ class StaleSeedPublicationQuarantineTest(unittest.TestCase):
                 if item["record_id"] == "defect_stale"
             )["data"]["revision_status"] = "stale"
 
-            restored = AgenticRecursiveAnalyzer(
+            restored = MixedLifecycleAnalyzer(
                 judge=MixedPublicationJudge(),
+                fusion_mode="retrieval-global",
                 checkpoint=CheckpointBundle(root),
                 checkpoint_config=config,
             ).analyze(
@@ -790,19 +1004,19 @@ class EvidencePolicyCompatibilityTest(unittest.TestCase):
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
             "graph-external-evidence-eligibility/v5",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v8")
         self.assertEqual(
             GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
-            "global-candidate-judgment/v9",
+            "global-candidate-judgment/v11",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
-            "global-candidate-validation-envelope/v9",
+            "global-candidate-validation-envelope/v11",
         )
-        self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v9")
+        self.assertEqual(CAUSAL_STEP_PROMPT_SCHEMA_VERSION, "recursive-causal-step-v14")
         self.assertEqual(
             ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
-            "recursive-root-confirmation-v10",
+            "recursive-root-confirmation-v14",
         )
 
         common = {

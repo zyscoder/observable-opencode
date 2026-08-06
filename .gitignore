@@ -24,6 +24,11 @@ target
 .scripts
 .direnv/
 
+# Observable OpenCode local evaluation outputs
+.benchmark-runs/
+**/__pycache__/
+*.py[cod]
+
 # Local dev files
 opencode-dev
 UPCOMING_CHANGELOG.md

@@ -307,6 +307,26 @@ class SharedRootFusionJudge(OfflineJudgeCapability, GlobalJudgeCapability):
                     if capsule.candidate_ref == "record:shared_root"
                     else "exculpatory_evidence"
                 ),
+                responsibility=(
+                    "primary"
+                    if capsule.candidate_ref == "record:shared_root"
+                    else "none"
+                ),
+                candidate_phase=(
+                    "implementation"
+                    if capsule.candidate_ref == "record:shared_root"
+                    else "intermediate"
+                ),
+                obligation_status_before="unknown",
+                obligation_status_after="unknown",
+                repair_window_effect="remained_open",
+                failure_mode=(
+                    "positive_introduction"
+                    if capsule.candidate_ref == "record:shared_root"
+                    else "none"
+                ),
+                obligation_refs=(),
+                contribution_mechanism=None,
                 reason="The shared decision is the trace-visible defect source.",
                 evidence_refs=(capsule.candidate_ref,),
                 confidence=0.9,
@@ -401,6 +421,14 @@ class NeedsExpansionSharedRootFusionJudge(SharedRootFusionJudge):
                         },
                         compared_candidate_refs=request.open_authored_root_candidate_refs,
                         causal_role="unknown",
+                        responsibility="unknown",
+                        candidate_phase="intermediate",
+                        obligation_status_before="unknown",
+                        obligation_status_after="unknown",
+                        repair_window_effect="unknown",
+                        failure_mode="unknown",
+                        obligation_refs=(),
+                        contribution_mechanism=None,
                         reason="Expansion is required before selecting a root.",
                         evidence_refs=(capsule.candidate_ref,),
                         confidence=0.5,
@@ -574,7 +602,13 @@ def two_hop_shared_root_trace():
     }
 
 
-def shared_root_checkpoint_config(trace, objective, start_refs):
+def shared_root_checkpoint_config(
+    trace,
+    objective,
+    start_refs,
+    *,
+    fusion_mode="retrieval-global",
+):
     return build_checkpoint_config(
         trace=trace,
         case_id=trace["case_id"],
@@ -597,6 +631,7 @@ def shared_root_checkpoint_config(trace, objective, start_refs):
             "thinking_mode": "disabled",
             "base_url": "offline://test",
             "provider_error_threshold": 3,
+            "fusion_mode": fusion_mode,
         },
     )
 
@@ -876,7 +911,12 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             {"confirmed_root"},
         )
 
-        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        config = shared_root_checkpoint_config(
+            trace,
+            objective,
+            start_refs,
+            fusion_mode="off",
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "two-hop-shared-root.checkpoint"
             with self.assertRaises(KeyboardInterrupt):
@@ -985,7 +1025,12 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             {"confirmed_root"},
         )
 
-        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        config = shared_root_checkpoint_config(
+            trace,
+            objective,
+            start_refs,
+            fusion_mode="retrieval-global",
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "global-expansion.checkpoint"
             with self.assertRaises(KeyboardInterrupt):
@@ -1056,7 +1101,12 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             all(len(item.confirmation_identities) == 1 for item in uninterrupted.seed_results)
         )
 
-        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        config = shared_root_checkpoint_config(
+            trace,
+            objective,
+            start_refs,
+            fusion_mode="retrieval-global",
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "shared-root.checkpoint"
             with self.assertRaises(KeyboardInterrupt):
@@ -1108,7 +1158,12 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
             )
         )
 
-        config = shared_root_checkpoint_config(trace, objective, start_refs)
+        config = shared_root_checkpoint_config(
+            trace,
+            objective,
+            start_refs,
+            fusion_mode="retrieval-global",
+        )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "divergent-shared-root.checkpoint"
             with self.assertRaises(KeyboardInterrupt):
@@ -1929,7 +1984,7 @@ class SeedAttributionModelTests(unittest.TestCase):
             candidate_refs=["record:z", "record:a"],
             missing_evidence=["The independent verification transcript is unavailable."],
             global_judgment={
-                "schema_version": "global-candidate-judgment/v9",
+                "schema_version": "global-candidate-judgment/v11",
                 "outcome": "inconclusive",
                 "reason": "No global candidates were available.",
                 "assessments": [],
@@ -2036,7 +2091,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v20")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v22")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -2049,7 +2104,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v20")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v22")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

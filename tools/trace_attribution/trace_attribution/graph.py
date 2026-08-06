@@ -18,6 +18,14 @@ from .evaluation_facts import (
 from .models import JsonDict, TraceNode, stable_json
 from .progress import reconstruct_progress_episodes
 from .reconstruction import reconstruct_message_lineage
+from .judge_payload import HISTORICAL_LINEAGE_REFERENCE_KEYS
+from .trace_eligibility import (
+    TraceEligibilityPolicy,
+    build_record_alias_index,
+    record_aliases,
+    resolve_edge_endpoint,
+    resolve_ref,
+)
 
 
 EVIDENCE_ELIGIBILITY_POLICY_IDENTITY = "graph-external-evidence-eligibility/v5"
@@ -42,8 +50,6 @@ RECORDED_PROVENANCE_KEYS = (
     "edge_origin",
     "inference_method",
 )
-
-
 @dataclass(frozen=True)
 class BoundedAdjacencyResult:
     refs: Tuple[str, ...]
@@ -105,7 +111,13 @@ class TraceGraph:
         )
 
     @classmethod
-    def from_trace(cls, trace: JsonDict, artifact_root: Optional[Path] = None) -> "TraceGraph":
+    def from_trace(
+        cls,
+        trace: JsonDict,
+        artifact_root: Optional[Path] = None,
+        *,
+        artifact_reader: Optional[VerifiedArtifactReader] = None,
+    ) -> "TraceGraph":
         nodes: Dict[str, TraceNode] = {}
         aliases: Dict[str, str] = {}
         artifact_index = {
@@ -113,7 +125,8 @@ class TraceGraph:
             for item in trace.get("artifacts") or []
             if isinstance(item, dict) and item.get("artifact_id")
         }
-        artifact_reader = VerifiedArtifactReader(artifact_index, artifact_root)
+        if artifact_reader is None:
+            artifact_reader = VerifiedArtifactReader(artifact_index, artifact_root)
         unique_referenced_artifacts: Set[str] = set()
         artifact_hydration: JsonDict = {
             # "referenced" sums per-record unique refs; "unique_referenced" deduplicates
@@ -157,9 +170,7 @@ class TraceGraph:
                 source_refs=[str(item) for item in record.get("source_refs") or []],
             )
             nodes[ref] = node
-            for alias in record_aliases(record):
-                aliases[alias] = ref
-            aliases[ref] = ref
+        aliases = dict(build_record_alias_index(records).aliases)
 
         evidence_eligible_refs: Set[str] = set()
         analysis_start_eligible_refs: Set[str] = set()
@@ -185,6 +196,7 @@ class TraceGraph:
                 revision_matched
                 and status == "failed"
                 and data.get("eligible_for_decisive_judgment") is True
+                and not data.get("observed_defect_seed_id")
             ):
                 analysis_start_eligible_refs.add(ref)
 
@@ -429,56 +441,33 @@ class TraceGraph:
 
     def active_repository_revision(self) -> Optional[int]:
         """Return the current CaseTrace generation only from authoritative records."""
-        cached = getattr(self, "_active_repository_revision", None)
-        if hasattr(self, "_active_repository_revision"):
+        return self._eligibility_policy().active_repository_revision()
+
+    def _eligibility_policy(self) -> TraceEligibilityPolicy:
+        cached = getattr(self, "_trace_eligibility_policy", None)
+        if isinstance(cached, TraceEligibilityPolicy):
             return cached
-        revisions: List[int] = []
-        for node in self.nodes.values():
-            value = self._eligible_repository_revision_authority(node)
-            if value is not None:
-                revisions.append(value)
-        self._active_repository_revision = max(revisions) if revisions else None
-        return self._active_repository_revision
+        policy = TraceEligibilityPolicy(
+            trace=self.raw_trace,
+            refs=self.nodes,
+            resolve=self.resolve,
+            node_for_ref=self.nodes.get,
+            node_data=lambda node: node.data,
+            node_event_type=lambda node: node.event_type,
+            evidence_eligible=lambda ref, _node: self.evidence_eligible(ref),
+            trace_execution_revision=trace_execution_revision,
+        )
+        self._trace_eligibility_policy = policy
+        return policy
 
     def _eligible_repository_revision_authority(
         self,
         node: TraceNode,
     ) -> Optional[int]:
-        if not self.evidence_eligible(node.ref):
-            return None
-        data = node.data
-        if not self._subject_provenance_binding_eligible(
+        return self._eligibility_policy().eligible_repository_revision_authority(
+            node.ref,
             node,
-            require_formal_binding=True,
-        ):
-            return None
-        if (
-            data.get("audit_only") is True
-            or data.get("offline_only") is True
-            or data.get("eligible_for_attribution") is False
-            or str(data.get("behavior_impact") or "").strip().lower()
-            in {"none", "none_offline_analysis_only"}
-        ):
-            return None
-        revision_status = data.get("revision_status")
-        if revision_status not in (None, "") and (
-            not isinstance(revision_status, str)
-            or revision_status.strip().lower() != "matched"
-        ):
-            return None
-        value = None
-        if node.event_type == "response.claim":
-            value = data.get("repository_revision")
-        elif (
-            node.event_type == "verification"
-            and data.get("effective_for_final_state") is True
-        ):
-            value = data.get("repository_revision")
-        elif node.event_type == "change":
-            value = data.get("revision_after")
-        if type(value) is not int or value < 0:
-            return None
-        return value
+        )
 
     def _subject_provenance_binding_eligible(
         self,
@@ -487,60 +476,9 @@ class TraceGraph:
         require_formal_binding: bool = False,
     ) -> bool:
         """Validate subject/provenance independently of event semantics."""
-        data = node.data
-        if "revision_provenance_status" in data and (
-            not isinstance(data.get("revision_provenance_status"), str)
-            or data["revision_provenance_status"].strip().lower() != "valid"
-        ):
-            return False
-        manifest = (
-            self.raw_trace.get("manifest")
-            if isinstance(self.raw_trace.get("manifest"), Mapping)
-            else {}
-        )
-        manifest_declares_revision = manifest.get("subject_revision") not in (
-            None,
-            "",
-        )
-        _, manifest_provenance_status = trace_execution_revision(self.raw_trace)
-        formal_manifest = manifest_provenance_status == "valid"
-        revision_bearing = any(
-            key in data
-            for key in (
-                "repository_revision",
-                "revision_before",
-                "revision_after",
-                "subject_revision",
-            )
-        )
-        binding_required = (
-            require_formal_binding and manifest_declares_revision
-        ) or (formal_manifest and revision_bearing)
-        if binding_required:
-            active_subject_revision, active_provenance_status = (
-                trace_execution_revision(self.raw_trace)
-            )
-            return bool(
-                active_provenance_status == "valid"
-                and isinstance(data.get("subject_revision"), str)
-                and data["subject_revision"].strip()
-                == str(active_subject_revision or "").strip()
-                and isinstance(
-                    data.get("revision_provenance_status"), str
-                )
-                and data["revision_provenance_status"].strip().lower()
-                == "valid"
-            )
-        subject_revision = data.get("subject_revision")
-        if subject_revision in (None, ""):
-            return True
-        if not isinstance(subject_revision, str):
-            return False
-        active_subject_revision = manifest.get("subject_revision")
-        return not (
-            isinstance(active_subject_revision, str)
-            and active_subject_revision.strip()
-            and subject_revision.strip() != active_subject_revision.strip()
+        return self._eligibility_policy().subject_provenance_binding_eligible(
+            node,
+            require_formal_binding=require_formal_binding,
         )
 
     def active_revision_evidence_eligible(
@@ -550,86 +488,10 @@ class TraceGraph:
         require_formal_binding: bool = False,
     ) -> bool:
         """Require canonical evidence to satisfy active revision contracts."""
-        resolved = self.resolve(str(ref))
-        if (
-            not resolved
-            or resolved not in self.nodes
-            or not self.evidence_eligible(resolved)
-        ):
-            return False
-        node = self.nodes[resolved]
-        data = node.data
-        if not self._subject_provenance_binding_eligible(
-            node,
+        return self._eligibility_policy().active_revision_evidence_eligible(
+            ref,
             require_formal_binding=require_formal_binding,
-        ):
-            return False
-        authority_value = None
-        if node.event_type == "response.claim":
-            authority_value = data.get("repository_revision")
-        elif (
-            node.event_type == "verification"
-            and data.get("effective_for_final_state") is True
-        ):
-            authority_value = data.get("repository_revision")
-        elif node.event_type == "change":
-            authority_value = data.get("revision_after")
-        if (
-            authority_value is not None
-            and self._eligible_repository_revision_authority(node) is None
-        ):
-            return False
-        if node.event_type == "progress.episode":
-            member_refs = [
-                self.resolve(str(item)) or str(item)
-                for item in data.get("member_refs") or ()
-                if str(item)
-            ]
-            if member_refs and not any(
-                member_ref != resolved
-                and member_ref in self.nodes
-                and self.active_revision_evidence_eligible(member_ref)
-                for member_ref in member_refs
-            ):
-                return False
-        revision_status = data.get("revision_status")
-        if revision_status not in (None, ""):
-            if (
-                not isinstance(revision_status, str)
-                or revision_status.strip().lower() != "matched"
-            ):
-                return False
-
-        active_repository_revision = self.active_repository_revision()
-        required_revision_field = ""
-        if node.event_type == "response.claim":
-            required_revision_field = "repository_revision"
-        elif (
-            node.event_type == "verification"
-            and data.get("effective_for_final_state") is True
-        ):
-            required_revision_field = "repository_revision"
-        elif node.event_type == "change":
-            required_revision_field = "revision_after"
-
-        revision_field = required_revision_field
-        if not revision_field and data.get("repository_revision") is not None:
-            revision_field = "repository_revision"
-        revision_value = data.get(revision_field) if revision_field else None
-        if revision_value is not None:
-            if (
-                type(revision_value) is not int
-                or revision_value < 0
-            ):
-                return False
-            if (
-                active_repository_revision is not None
-                and revision_value != active_repository_revision
-            ):
-                return False
-        elif required_revision_field and active_repository_revision is not None:
-            return False
-        return True
+        )
 
     def active_revision_start_eligible(self, ref: str) -> bool:
         """Apply the additional formal binding required for analysis starts."""
@@ -699,7 +561,9 @@ class TraceGraph:
             if str(ref)
         }
         if isinstance(value, Mapping):
-            for child in value.values():
+            for key, child in value.items():
+                if str(key) in HISTORICAL_LINEAGE_REFERENCE_KEYS:
+                    continue
                 self.assert_evidence_eligible_references(
                     child,
                     label=label,
@@ -1095,6 +959,49 @@ class TraceGraph:
             eligible_for_attribution=True,
             inference_method="bounded_delivery_history_semantic_ranking_v1",
             edge_origin="offline.navigation_routing",
+        )
+
+    def add_offline_process_lifecycle_edge(
+        self,
+        from_ref: str,
+        to_ref: str,
+        *,
+        evidence_refs: Iterable[str],
+    ) -> None:
+        source = self.resolve(from_ref) or from_ref
+        target = self.resolve(to_ref) or to_ref
+        if source not in self.nodes or target not in self.nodes or source == target:
+            raise ValueError(
+                "offline process lifecycle edge endpoints must resolve to distinct nodes"
+            )
+        resolved_evidence = []
+        for raw_ref in evidence_refs:
+            resolved = self.resolve(str(raw_ref)) or str(raw_ref)
+            if resolved not in self.nodes:
+                raise ValueError(
+                    "offline process lifecycle evidence must resolve"
+                )
+            if resolved not in resolved_evidence:
+                resolved_evidence.append(resolved)
+        if source not in resolved_evidence:
+            raise ValueError(
+                "offline process lifecycle evidence must include the source"
+            )
+        if not self.edge_endpoints_eligible(source, target):
+            return
+        self._upstream[target][source] = None
+        self._downstream[source][target] = None
+        add_edge_context(
+            self._edge_context_index,
+            from_ref=source,
+            to_ref=target,
+            relation="process_lifecycle_observed",
+            evidence_type="offline_reconstruction",
+            evidence_refs=resolved_evidence,
+            confidence=1.0,
+            eligible_for_attribution=True,
+            inference_method="candidate_process_trajectory_v1",
+            edge_origin="offline.process_lifecycle_reconstruction",
         )
 
     def semantic_predecessor_edges(self, ref: str) -> List[JsonDict]:
@@ -1615,6 +1522,14 @@ class TraceGraph:
         return [self.hydrate_node(item) for item in refs[:limit]]
 
     def default_start_refs(self) -> List[str]:
+        structured_seed_starts = [
+            ref
+            for ref, node in self.nodes.items()
+            if node.event_type == "case.observed_defect"
+            and isinstance(node.data.get("failure_signature"), dict)
+            and node.data.get("seed_id")
+            and self.active_revision_start_eligible(ref)
+        ]
         external_evaluation_starts = [
             ref
             for ref, node in self.nodes.items()
@@ -1622,8 +1537,10 @@ class TraceGraph:
             and self.analysis_start_eligible(ref)
             and self.active_revision_start_eligible(ref)
         ]
-        if external_evaluation_starts:
-            return dedupe(external_evaluation_starts)
+        if structured_seed_starts or external_evaluation_starts:
+            return dedupe(
+                [*structured_seed_starts, *external_evaluation_starts]
+            )
         failed_cases = [
             ref
             for ref, node in self.nodes.items()
@@ -1924,78 +1841,6 @@ def resolved_data_refs(value: Any, aliases: Dict[str, str]) -> Set[str]:
         for resolved in [resolve_ref(item, aliases)]
         if resolved
     }
-
-
-def record_aliases(record: JsonDict) -> Iterable[str]:
-    record_id = str(record.get("record_id") or "")
-    event_type = str(record.get("event_type") or "")
-    data = record.get("data") if isinstance(record.get("data"), dict) else {}
-    if record_id:
-        yield f"record:{record_id}"
-        yield f"node:{record_id}"
-    if event_type in ("evidence.semantic_fact", "evidence.fact") and record_id:
-        yield f"evidence:{record_id}"
-    if event_type == "external.evaluation_fact":
-        if record_id:
-            yield f"external_evaluation:{record_id}"
-        if data.get("evaluation_id"):
-            yield f"external_evaluation:{data['evaluation_id']}"
-    if event_type == "change":
-        if record_id:
-            yield f"change:{record_id}"
-        if data.get("change_id"):
-            yield f"change:{data['change_id']}"
-    if event_type == "verification" and data.get("verification_id"):
-        yield f"verification:{data['verification_id']}"
-    if event_type == "response.output" and data.get("segment_id"):
-        yield f"response_segment:{data['segment_id']}"
-    if event_type == "response.claim":
-        if record_id:
-            yield f"response_claim:{record_id}"
-        if data.get("claim_id"):
-            yield f"response_claim:{data['claim_id']}"
-    if event_type == "claim.support_assessment":
-        if record_id:
-            yield f"claim_support:{record_id}"
-        if data.get("assessment_id"):
-            yield f"claim_support:{data['assessment_id']}"
-    if event_type == "decision" and data.get("decision_id"):
-        yield f"decision:{data['decision_id']}"
-    call_id = data.get("call_id") or data.get("callID")
-    if call_id:
-        if event_type == "tool.error":
-            yield f"tool_error:{call_id}"
-        elif event_type == "tool.result":
-            yield f"tool_result:{call_id}"
-        elif event_type == "tool.call":
-            yield f"tool_call:{call_id}"
-        elif event_type == "mcp.call":
-            yield f"mcp:{call_id}"
-
-
-def resolve_edge_endpoint(endpoint: Any, aliases: Dict[str, str]) -> Optional[str]:
-    if not isinstance(endpoint, dict):
-        return None
-    ref_type = endpoint.get("type")
-    ref_id = endpoint.get("id")
-    if not ref_type or not ref_id:
-        return None
-    candidates = [f"{ref_type}:{ref_id}", f"record:{ref_id}", f"node:{ref_id}"]
-    for candidate in candidates:
-        resolved = resolve_ref(candidate, aliases)
-        if resolved:
-            return resolved
-    return None
-
-
-def resolve_ref(ref: str, aliases: Dict[str, str]) -> Optional[str]:
-    if ref in aliases:
-        return aliases[ref]
-    if ref.startswith("record:"):
-        return aliases.get(ref)
-    if ":" not in ref:
-        return aliases.get(f"record:{ref}") or aliases.get(f"node:{ref}")
-    return None
 
 
 def add_edge_context(

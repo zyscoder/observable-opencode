@@ -1,65 +1,24 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import signal
-import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Optional
 
-from .analyzer import BackwardTaintAnalyzer
-from .cache import JudgmentCache
-from .causal_judge import ClaudeCausalJudge
-from .causal_state import (
-    GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
-    ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
-    annotate_report_semantic_anchors,
+from .claude import default_judge_timeout_seconds
+from .request import AttributionOptions, AttributionRequest
+from .errors import AttributionInputError
+from .service import (
+    GracefulSignalState,
+    analysis_start_refs,
+    analyze,
+    attribution_output_payload,
+    atomic_write_json,
+    judge_cache_output_path,
+    lineage_output_path,
+    load_graph,
+    recursive_checkpoint_path,
 )
-from .checkpoint import (
-    CheckpointBundle,
-    build_checkpoint_config,
-    publish_output_transaction,
-)
-from .claude import ClaudeJudgeClient, default_judge_timeout_seconds
-from .evaluation_facts import inject_external_evaluation_facts
-from .graph import (
-    TraceGraph,
-    artifact_root_for_trace_path,
-)
-from .models import stable_json
-from .quality_review import inject_quality_gap_records
-from .recursive_analyzer import AgenticRecursiveAnalyzer
-
-
-class GracefulSignalState:
-    """Signal-safe stop flag shared by SIGINT and SIGTERM."""
-
-    def __init__(self) -> None:
-        self._requested = False
-        self.signal_name = ""
-        self._previous: dict[int, Any] = {}
-
-    def handle(self, signum: int, _frame: Any) -> None:
-        self._requested = True
-        try:
-            self.signal_name = signal.Signals(signum).name
-        except ValueError:
-            self.signal_name = str(signum)
-
-    def stop_requested(self) -> bool:
-        return self._requested
-
-    def __enter__(self) -> "GracefulSignalState":
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            self._previous[signum] = signal.getsignal(signum)
-            signal.signal(signum, self.handle)
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        for signum, handler in self._previous.items():
-            signal.signal(signum, handler)
-        self._previous.clear()
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -76,7 +35,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="retrieval-global",
         help="Recursive engine candidate strategy; retrieval-global compares evidence capsules before bounded recursive expansion.",
     )
-    parser.add_argument("--trace", required=True, help="Path to observable-opencode trace.json")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--trace", help="Path to observable-opencode trace.json")
+    source.add_argument(
+        "--benchmark-bundle",
+        default="",
+        help="Path to a verified immutable benchmark Trace bundle",
+    )
     parser.add_argument("--review", default="", help="Optional trace-review JSON; quality gaps are injected as start nodes")
     parser.add_argument(
         "--evaluation",
@@ -95,7 +60,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="",
         help="Optional judgment checkpoint path; defaults next to --out as <stem>.judge-cache.jsonl",
     )
-    parser.add_argument("--objective", default="Find the root cause of the observed bad final result.")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--question", default="")
+    target.add_argument("--objective", default="")
     parser.add_argument(
         "--analysis-perspective",
         default="Find the best-supported causal explanation.",
@@ -162,220 +129,50 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    graph = load_graph(
-        Path(args.trace),
-        Path(args.review) if args.review else None,
-        [Path(path) for path in args.evaluation],
-    )
     try:
-        starts = analysis_start_refs(graph, args.start_ref)
-    except ValueError as exc:
-        raise SystemExit("error: {0}".format(exc)) from exc
-    out = Path(args.out)
-    cache_path = judge_cache_output_path(out, args.judge_cache)
-    transport = ClaudeJudgeClient(
-        model=args.model,
-        api_key_env=args.api_key_env,
-        base_url=args.base_url,
-        base_url_env=args.base_url_env,
-        max_tokens=args.judge_max_tokens,
-        timeout_seconds=args.judge_timeout_sec,
-        thinking_mode=args.thinking_mode,
-        cache_path=str(cache_path),
-        provider_error_threshold=args.provider_error_threshold,
-    )
-    if args.engine == "recursive-agentic":
-        checkpoint_path = recursive_checkpoint_path(out, args.checkpoint_dir)
-        lineage_out = lineage_output_path(out, args.lineage_out)
-        budgets = {
-            "max_frontier_items": args.max_frontier_items,
-            "max_depth": args.max_depth,
-            "max_hypotheses": args.max_hypotheses,
-            "max_investigation_rounds": args.max_investigation_rounds,
-            "max_artifact_bytes": args.max_artifact_bytes,
-            "max_judge_requests": args.max_judge_requests,
-        }
-        model_identity = stable_json(
-            {
-                "model": transport.model,
-                "base_url": transport.base_url,
-                "thinking": transport.thinking_config,
-                "max_tokens": transport.max_tokens,
-                "provider_error_threshold": transport.provider_error_threshold,
-                "fusion_mode": args.fusion_mode,
-                "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
-                "root_confirmation_contract": ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
-            }
-        )
-        checkpoint_config = build_checkpoint_config(
-            trace=graph.raw_trace,
-            case_id=graph.case_id,
+        request = AttributionRequest(
+            trace_path=Path(args.trace) if args.trace else None,
+            benchmark_bundle_path=(
+                Path(args.benchmark_bundle) if args.benchmark_bundle else None
+            ),
+            output_path=Path(args.out),
+            review_path=Path(args.review) if args.review else None,
+            evaluation_paths=tuple(Path(path) for path in args.evaluation),
+            start_refs=tuple(args.start_ref),
+            question=args.question,
             objective=args.objective,
-            analysis_perspective=args.analysis_perspective,
-            start_refs=starts,
-            budgets=budgets,
-            model_identity=model_identity,
-            cache_identity=str(cache_path.expanduser().resolve()),
-            runtime_identity={
-                "judge_timeout_sec": args.judge_timeout_sec,
-                "judge_max_tokens": transport.max_tokens,
-                "thinking_mode": stable_json(transport.thinking_config),
-                "base_url": transport.base_url,
-                "provider_error_threshold": transport.provider_error_threshold,
-            },
-        )
-        causal_judge = ClaudeCausalJudge(
-            transport=transport,
-            cache=transport.cache
-            if isinstance(transport.cache, JudgmentCache)
-            else JudgmentCache(cache_path),
-        )
-        checkpoint = CheckpointBundle(checkpoint_path)
-        with GracefulSignalState() as shutdown:
-            report = AgenticRecursiveAnalyzer(
-                judge=causal_judge,
-                max_frontier_items=args.max_frontier_items,
+            options=AttributionOptions(
+                engine=args.engine,
+                fusion_mode=args.fusion_mode,
+                analysis_perspective=args.analysis_perspective,
                 max_depth=args.max_depth,
+                max_nodes=args.max_nodes,
+                max_frontier_items=args.max_frontier_items,
                 max_hypotheses=args.max_hypotheses,
                 max_investigation_rounds=args.max_investigation_rounds,
                 max_artifact_bytes=args.max_artifact_bytes,
                 max_judge_requests=args.max_judge_requests,
-                checkpoint=checkpoint,
-                checkpoint_config=checkpoint_config,
-                stop_requested=shutdown.stop_requested,
-                fusion_mode=args.fusion_mode,
-            ).analyze(
-                graph,
-                start_refs=starts,
-                objective=args.objective,
-                analysis_perspective=args.analysis_perspective,
-            )
-            report_payload = attribution_output_payload(report, graph)
-            output_commit = publish_output_transaction(
-                bundle=checkpoint,
-                attribution_path=out,
-                lineage_path=lineage_out,
-                report=report_payload,
-                message_lineage=graph.message_lineage,
-                stop_requested=shutdown.stop_requested,
-            )
-            if report.metadata.get("termination_reason") == "signal_interrupted":
-                checkpoint.record_action(
-                    "analysis_interrupted",
-                    "analysis:result",
-                    {
-                        "report": report_payload,
-                        "interrupted": True,
-                        "output_transaction_id": output_commit["transaction_id"],
-                        "output_commit_hash": output_commit["output_commit_hash"],
-                    },
-                )
-            else:
-                checkpoint.mark_analysis_completed(
-                    report=report_payload, output_commit=output_commit
-                )
-    else:
-        report = BackwardTaintAnalyzer(
-            judge=transport, max_depth=args.max_depth, max_nodes=args.max_nodes
-        ).analyze(
-            graph,
-            start_refs=starts,
-            objective=args.objective,
+                lineage_output_path=(Path(args.lineage_out) if args.lineage_out else None),
+                judge_cache_path=(Path(args.judge_cache) if args.judge_cache else None),
+                checkpoint_path=(Path(args.checkpoint_dir) if args.checkpoint_dir else None),
+                model=args.model,
+                api_key_env=args.api_key_env,
+                base_url=args.base_url,
+                base_url_env=args.base_url_env,
+                judge_timeout_sec=args.judge_timeout_sec,
+                judge_max_tokens=args.judge_max_tokens,
+                thinking_mode=args.thinking_mode,
+                provider_error_threshold=args.provider_error_threshold,
+            ),
         )
-        atomic_write_json(out, attribution_output_payload(report, graph))
-        lineage_out = lineage_output_path(out, args.lineage_out)
-        atomic_write_json(lineage_out, graph.message_lineage)
-    print(str(out))
-    return 0
-
-
-def analysis_start_refs(
-    graph: TraceGraph, explicit_refs: Iterable[str]
-) -> tuple[str, ...]:
-    requested = tuple(explicit_refs)
-    if not requested:
-        return tuple(graph.default_start_refs())
-    resolved = tuple(graph.resolve(ref) or ref for ref in requested)
-    for requested_ref, resolved_ref in zip(requested, resolved):
-        node = graph.nodes.get(resolved_ref)
-        if node is None or graph.analysis_start_eligible(resolved_ref):
-            continue
-        raise ValueError(
-            "--start-ref {0} resolves to an external evaluation fact that is ineligible for decisive judgment".format(
-                requested_ref
-            )
-        )
-    return resolved
-
-
-def attribution_output_payload(report: Any, graph: TraceGraph) -> dict[str, Any]:
-    return annotate_report_semantic_anchors(
-        graph.case_id, graph.nodes, report.to_dict(), graph=graph
-    )
-
-
-def lineage_output_path(attribution_out: Path, configured: str) -> Path:
-    if configured:
-        return Path(configured)
-    return attribution_out.with_name(f"{attribution_out.stem}.message-lineage.json")
-
-
-def judge_cache_output_path(attribution_out: Path, configured: str) -> Path:
-    if configured:
-        return Path(configured)
-    return attribution_out.with_name(f"{attribution_out.stem}.judge-cache.jsonl")
-
-
-def recursive_checkpoint_path(attribution_out: Path, configured: str) -> Path:
-    if configured:
-        return Path(configured)
-    return attribution_out.with_name(f"{attribution_out.stem}.checkpoint")
-
-
-def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
-    """Atomically replace a JSON output after fsyncing file and directory."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".{0}.".format(path.name), suffix=".tmp", dir=str(path.parent)
-    )
+    except ValueError as exc:
+        raise SystemExit("error: {0}".format(exc)) from exc
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def load_graph(
-    trace_path: Path,
-    review_path: Optional[Path] = None,
-    evaluation_paths: Iterable[Path] = (),
-) -> TraceGraph:
-    trace = json.loads(trace_path.read_text(encoding="utf-8"))
-    if review_path:
-        review = json.loads(review_path.read_text(encoding="utf-8"))
-        trace = inject_quality_gap_records(trace, review)
-    payloads = [
-        json.loads(path.read_text(encoding="utf-8")) for path in evaluation_paths
-    ]
-    if payloads:
-        trace = inject_external_evaluation_facts(trace, payloads)
-    return TraceGraph.from_trace(
-        trace,
-        artifact_root=artifact_root_for_trace_path(trace_path, trace),
-    )
+        analyze(request)
+    except AttributionInputError as exc:
+        raise SystemExit("error: {0}".format(exc)) from exc
+    print(args.out)
+    return 0
 
 
 if __name__ == "__main__":

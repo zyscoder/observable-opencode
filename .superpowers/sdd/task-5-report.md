@@ -1,138 +1,516 @@
-# Task 5 Report: Recursive Analyzer Core
+# Task 5 Report: Necessary-Cause Escalation Without Direct Promotion
 
-## Scope
+Status: **DONE**
 
-- Base commit: `9f74e21d1`
-- Initial task commit: `c50934e2b`
-- Independent-review fix commit: `d67711401`
-- Final Judge-capability fix commit: this commit
-- Current task range: `9f74e21d1..HEAD`
-- Changed production/test files:
-  - `tools/trace_attribution/trace_attribution/recursive_analyzer.py`
-  - `tools/trace_attribution/trace_attribution/__init__.py`
-  - `tools/trace_attribution/tests/test_recursive_analyzer.py`
-  - `tools/trace_attribution/trace_attribution/causal_judge.py`
-  - `tools/trace_attribution/tests/test_causal_judge.py`
-- The only adjacent production edit is the bounded physical-request allowance in
-  `ClaudeCausalJudge`, required to enforce the Task 5 Judge budget immediately
-  before initial and repair transport requests while preserving cache hits.
-- No network calls or runtime dependencies were added.
+No git commit was created. The pre-existing dirty worktree was preserved.
 
-## RED Evidence
+## Scope Delivered
 
-1. Initial propagation/transformation tests failed with `ModuleNotFoundError: No module named 'trace_attribution.recursive_analyzer'`.
-2. Boundary tests then exposed four implementation gaps:
-   - empty `start_refs` did not fall back to graph defaults;
-   - an empty trace incorrectly returned `no_defect`;
-   - propagation with missing evidence still recursed;
-   - a fabricated predecessor crashed context construction with `KeyError`.
-3. A frontier accounting test showed depth-limited popped items were omitted from the 96-item traversal budget (`processed_frontier_items` was 1 instead of 2).
-4. A public-interface test showed `RecursiveAnalysisState.create()` incorrectly required an explicit `max_hypotheses` argument.
-5. A duplicate-transformation test showed an existing semantic hypothesis was rejected at the budget boundary (`hypotheses: 1` was incorrectly exhausted).
-6. Independent review adversarial tests reproduced four additional failures before fixes:
-   - a retained `present` defect with no recursive explanation or introduction produced `no_defect`;
-   - competing same-defect predecessors shared the downstream seed hypothesis and bypassed `max_hypotheses`;
-   - ordinary `data.content` text incorrectly consumed the artifact-byte budget;
-   - a one-request Claude allowance made zero calls, while a cache hit was reported as one physical request.
-7. Thirteen review-specific probes were run together. Before implementation, 12 failed or errored; only the already-correct duplicate grounded-artifact identity case passed.
-8. The final P1 adversarial test ran a protocol-compatible Judge whose single
-   `judge_step()` incremented its transport count twice under
-   `max_judge_requests=1`. Before the fix, the Judge was invoked, produced an
-   introduction candidate, and consumed two physical requests. A second RED
-   run failed at import because the explicit offline capability and adapter did
-   not yet exist. After implementation, the unbounded Judge is rejected before
-   invocation with `judge_budget_unenforceable`, while the adapted legacy
-   offline Judge remains callable with a zero physical-request allowance.
+- A completed non-root `FactorRoleJudgment` with
+  `necessity_status="necessary"` now enqueues exactly one root-scope
+  confirmation. Recording the FactorRole itself never edits primary roots or
+  co-roots.
+- The queue origin has the exact contract:
 
-Each failure was observed before the corresponding production change, then rerun to GREEN.
+  ```python
+  {
+      "kind": "factor_role_escalation",
+      "factor_action_identity": "...",
+      "factor_judgment_identity": "...",
+      "factor_request_identity": "...",
+  }
+  ```
 
-## Design Choices
+- The root request is rebuilt by the existing authoritative
+  graph/ledger/frontier request builder. No FactorRole provider reason,
+  evidence, role claim, or other response field is copied into root request
+  facts.
+- Replay and repeated application of the same completed FactorRole action
+  reuse the exact escalation binding and cannot enqueue another root action.
+- Escalations are excluded from the ordinary per-seed Global root Top-3 count,
+  while queue closure permits only the exact non-root source plus one
+  escalation lifecycle for a candidate.
+- A confirmed escalation publishes only when the existing reciprocal
+  independent co-root checks pass, then uses the existing deterministic
+  primary/co-root ranking. A confirmed response without mutual support is not
+  published and does not remove an existing root.
+- Rejected and unknown escalation results produce exact
+  `factor_role_escalation_gaps`. Unknown is non-blocking for the owning seed;
+  both statuses leave existing roots unchanged.
+- Report and restore closure reject non-necessary or non-completed sources,
+  cross-seed/hypothesis/defect/perspective bindings, foreign request or
+  judgment identities, duplicate consumption, and root publication not
+  authorized by a confirmed escalation.
+- Escalation origins are supported across queue, journal, action projection,
+  checkpoint restore, stale quarantine, report reconstruction, graph
+  validation, and response-identity validation without weakening ordinary
+  confirmation validation.
+- No Agent, Trace, step-Judge, or Global-Judge input was changed. The only new
+  provider operation is the required root confirmation for a completed
+  necessary FactorRole.
 
-- The analyzer clones `TraceGraph.raw_trace` into an analysis-owned graph. Artifact hydration and context reconstruction therefore cannot mutate the caller's graph or Agent behavior.
-- Evaluation assertions become `outcome_evidence` relations and seed concrete upstream records; the evaluator node is not treated as a defect introducer.
-- Traversal uses the existing `RecursiveFrontier`, `HypothesisLedger`, `semantic_visit_key`, immutable `DefectState`, and `build_recursive_judgment_context` contracts.
-- Every recursive predecessor explanation creates or reuses a hypothesis whose
-  `candidate_root_ref` is that predecessor. Same-defect branches preserve the
-  fingerprint; transformations retain a deterministic defect chain.
-- Duplicate visits merge only when candidate, defect, and hypothesis semantics
-  are identical. Distinct candidates, defects, or hypothesis claims remain
-  separate frontier visits and consume the shared hypothesis budget.
-- Introduction candidates carry a serialized binding to their exact hypothesis
-  and defect fingerprint for Task 7 confirmation. Unrelated candidates are
-  retained both as rejected candidates and ledger opposition.
-- Only grounded propagation/transformation assessments recurse. Missing evidence and unresolved predecessor refs become explicit unresolved branches.
-- A `present` defective dead end is explicitly unresolved. Report finalization
-  also prevents `no_defect` whenever any visited judgment retained a defect.
-  Introduction candidates remain unresolved/inconclusive and produce no
-  confirmed root; independent confirmation is explicitly deferred to Task 7.
-- Depth, frontier, hypothesis, artifact-byte, Judge-request, investigation, and provider-circuit boundaries are represented in report metadata and unresolved branches.
-- Artifact-byte accounting scans only `hydrated_artifacts` manifests with a
-  stable artifact identity; ordinary message, context, LLM, and tool `content`
-  fields consume zero artifact bytes. Repeated grounded artifacts are charged once.
-- Claude-backed Judge calls use a bounded allowance inside the cache/transport
-  request path. Cache hits cost zero, one valid initial request is allowed at
-  `max_judge_requests=1`, and a repair is blocked before its physical call when
-  no allowance remains. Reports separate actual physical request delta from
-  logical Judge call count.
-- Analyzer invocation now requires one of two nominal, runtime-verifiable
-  capabilities. `BoundedJudgeCapability` requires the allowance-aware call and
-  is implemented by `ClaudeCausalJudge`; `OfflineJudgeCapability` guarantees
-  zero transport requests. `OfflineCausalJudgeAdapter` is the explicit opt-in
-  bridge for legacy in-process Judges. A Judge with neither capability is never
-  invoked and becomes an explicit unresolved branch. The legacy direct
-  `judge_step()` API remains available outside the analyzer.
-- Recursive request contexts include objective, analysis perspective, active hypothesis/visit, checked evidence, obligations, downstream judgments/path, candidate provenance, transformation chain, and a SHA-256 evidence hash.
-- Reports preserve frontier checkpoints, hypothesis snapshots, merged evidence, paths, judgments, candidates, unresolved facts, and legacy-compatible fields.
+## TDD Record
 
-## Verification
-
-Focused Task 5 tests:
+Baseline before Task 5:
 
 ```text
-PYTHONPYCACHEPREFIX=/tmp/observable-opencode-pycache PYTHONPATH=. \
-python3 -m unittest tests.test_recursive_analyzer -v
-Ran 34 tests - OK
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_factor_role_projection -v
+
+Ran 87 tests in 6.596s
+OK
 ```
 
-Task 5 plus legacy analyzer regression:
+Initial Task 5 RED:
 
 ```text
-PYTHONPYCACHEPREFIX=/tmp/observable-opencode-pycache PYTHONPATH=. \
-python3 -m unittest tests.test_recursive_analyzer \
-  tests.test_backward_taint.BackwardTaintAnalyzerTest -v
-Ran 76 tests - OK
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_factor_role_projection.FactorRoleEscalationTest -v
+
+Ran 7 tests
+FAILED (failures=5, errors=5)
 ```
 
-Task 5 plus recursive Judge tests:
+The failures were the intended missing behaviors: no escalation queue,
+origin, terminal escalation action, independent gap, or report binding
+closure existed.
+
+Final Task 5 GREEN:
 
 ```text
-PYTHONPYCACHEPREFIX=/tmp/observable-opencode-pycache PYTHONPATH=. \
-python3 -m unittest tests.test_recursive_analyzer tests.test_causal_judge -v
-Ran 92 tests - OK
+Ran 7 tests in 1.136s
+OK
 ```
 
-Full offline suite:
+The seven tests cover exact enqueue and origin binding, authoritative request
+facts, idempotent replay, reciprocal confirmed ranking, rejected/unknown gap
+closure, ordinary Top-3 exclusion, and report rejection of non-necessary,
+non-completed, foreign, or multiply consumed sources.
+
+## Regression Verification
+
+Task 5 brief four-module command:
 
 ```text
-PYTHONPYCACHEPREFIX=/tmp/observable-opencode-pycache PYTHONPATH=. \
-python3 -m unittest discover -s tests -v
-Ran 264 tests - OK
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_factor_role_projection \
+  tools.trace_attribution.tests.test_causal_role_closure \
+  tools.trace_attribution.tests.test_root_confirmation_fix39 \
+  tools.trace_attribution.tests.test_seed_attribution -v
+
+Ran 159 tests in 12.787s
+OK
 ```
 
-Static whitespace check:
+Complete attribution discovery:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest discover \
+  -s tools/trace_attribution/tests -v
+
+Ran 1200 tests in 44.622s
+OK
+```
+
+The total is the reviewed Task 4 baseline of 1193 plus seven Task 5 tests.
+
+Static compilation:
+
+```text
+PYTHONPYCACHEPREFIX=/tmp/task5-pycache python3 -m py_compile \
+  tools/trace_attribution/trace_attribution/recursive_analyzer.py \
+  tools/trace_attribution/trace_attribution/causal_state.py \
+  tools/trace_attribution/tests/test_factor_role_projection.py \
+  tools/trace_attribution/tests/test_causal_role_closure.py
+
+passed with no output
+```
+
+Whitespace validation:
 
 ```text
 git diff --check
-exit 0
+
+passed with no output
 ```
 
-## Risks and Deferred Work
+## Necessary Test Migration
 
-- Bounded semantic investigation is intentionally deferred to Task 6. Suggested investigations are preserved as unresolved facts.
-- Independent root confirmation is intentionally deferred to Task 7; this task cannot emit confirmed roots.
-- Graph cloning adds offline memory/CPU overhead proportional to trace size, in exchange for strict input immutability.
-- Third-party provider-backed Judges must explicitly implement
-  `BoundedJudgeCapability`; otherwise recursive analysis records
-  `judge_budget_unenforceable` without invoking them. Legacy zero-transport
-  Judges require the explicit offline capability or adapter.
-- Semantic fallback retrieval remains bounded by the existing retriever limit and is evidence candidate generation only; temporal proximity is never promoted into a causal relation.
+`tools/trace_attribution/tests/test_causal_role_closure.py` is outside the
+brief's three primary files but required one migration. Its Task 4 assertion
+required a necessary non-root factor to remain absent from roots even after a
+reciprocal confirmed root result. Task 5 explicitly changes that terminal
+behavior. The migrated assertion now verifies that the factor first remains
+non-root, then enters the root set only through a
+`factor_role_escalation` root queue. The adjacent outperformed case still
+verifies that a non-publishable escalation cannot erase the existing root.
+
+## Self-Review
+
+- Verified that escalation creation consumes only
+  `factor_role_completed` actions whose canonical judgment is exactly
+  necessary/unknown-role and whose queue is completed non-root.
+- Verified exact action/judgment/request identity equality and exact
+  candidate, seed, hypothesis, semantic hash, defect, perspective, path,
+  owner, request projection, response, and terminal action binding.
+- Verified root request identity and projection are recomputed from
+  authoritative state and checked again at dispatch, replay, report, and
+  restore boundaries.
+- Verified ordinary root queue keys retain their four-part identity and only
+  escalation keys append the source FactorRole action identity.
+- Verified escalation entries do not count toward ordinary root scope or
+  total Global candidate quotas, and no second escalation lifecycle can be
+  created for the same source candidate.
+- Verified necessary signals cannot use the ordinary factor gap/publication
+  paths and cannot directly authorize a root.
+- Verified rejected/unknown gaps are reconstructed from terminal actions;
+  deletion, identity rewrite, foreign binding, and duplication are rejected.
+- Verified confirmed escalation publication uses the existing mutual
+  competitor graph and canonical ranking, including the legal confirmed but
+  unpublished case.
+- Verified Task 3/4 physical accounting, lifecycle reachability, publication
+  bijections, queue-key closure, provider-free replay, stale quarantine, and
+  response-identity checks remain green in full discovery.
+- Verified no additional runtime feedback or Agent/Trace/Judge factual input
+  path was introduced.
+
+## Modified Files
+
+- `tools/trace_attribution/trace_attribution/recursive_analyzer.py`
+- `tools/trace_attribution/trace_attribution/causal_state.py`
+- `tools/trace_attribution/tests/test_factor_role_projection.py`
+- `tools/trace_attribution/tests/test_causal_role_closure.py`
+  (necessary Task 4 expectation migration)
+- `.superpowers/sdd/task-5-report.md`
+
+## Concerns
+
+None.
+
+## R1 Review Closure
+
+Status: **DONE**
+
+No git commit was created. The pre-existing dirty worktree was preserved.
+
+### Changes
+
+- A confirmed `factor_role_escalation` now uses the root-scope publication
+  path when its seed has no published root. It enters the existing
+  deterministic primary-root ranking and can become the primary root.
+- Reciprocal `co_root` comparisons remain mandatory when an escalation
+  competes with an already published root. Ordinary non-root confirmations
+  retain their Task 4 mutual-support gate.
+- When a newly published escalation explicitly and independently marks an
+  ordinary unresolved root candidate `outperformed` or `rejected`, that
+  candidate's seed blocker is resolved without changing its persisted
+  confirmation response or authoritative request facts. The exact relation
+  is recomputed at live, checkpoint, report, and `from_dict` boundaries.
+- Escalation closure now requires exact canonical `LocalStateOwner` equality
+  from the completed FactorRole action to the escalation queue and terminal
+  root action. This includes `visit_key`, `occurrence_identity`, hypothesis,
+  seed, defect, and candidate occurrence bindings. Escalation gaps continue
+  to be derived from that terminal action, so their owner must match exactly.
+- Added a coordinated foreign-occurrence regression that rewrites queue,
+  journal, root action, and gap together while leaving the completed
+  FactorRole owner unchanged. `RecursiveAttributionReport.from_dict` fails
+  closed.
+- Added field-closure regressions for coordinated seed, hypothesis, defect,
+  and candidate mutations.
+- Added completed necessary FactorRole plus terminal escalation checkpoint
+  replay coverage. Replay performs zero FactorRole/root provider calls and
+  retains exactly one escalation queue/action and one consumed source action.
+
+### R1 TDD Evidence
+
+Initial focused RED command exercised four new or migrated methods:
+
+```text
+PYTHONPATH=tools/trace_attribution:tools/trace_attribution/tests \
+python3 -m unittest \
+  test_causal_role_closure.GlobalNonRootSchedulingTest.test_non_root_necessity_without_published_root_becomes_primary \
+  test_factor_role_projection.FactorRoleEscalationTest.test_report_rejects_coordinated_foreign_escalation_owner \
+  test_factor_role_projection.FactorRoleEscalationTest.test_report_rejects_escalation_binding_field_mutations \
+  test_factor_role_projection.FactorRoleEscalationTest.test_completed_necessary_escalation_checkpoint_replays_once -v
+
+Ran 4 tests in 0.904s
+FAILED (failures=6)
+```
+
+The two intended R1 failures were:
+
+- the confirmed escalation produced `inconclusive` with no primary root;
+- coordinated foreign occurrence owners were accepted by `from_dict`.
+
+Four additional subtest failures were test-assertion mismatches: the existing
+queue-key closure rejected coordinated field mutations before the new
+escalation-specific regex matched. After synchronizing the queue-key fixture,
+the four mutation cases already failed closed:
+
+```text
+Ran 1 test in 0.467s
+OK
+```
+
+The terminal escalation checkpoint replay case was already behaviorally green,
+matching the R1 review probe; the new test makes that behavior durable.
+
+Final focused GREEN:
+
+```text
+PYTHONPATH=tools/trace_attribution:tools/trace_attribution/tests \
+python3 -m unittest \
+  test_causal_role_closure.GlobalNonRootSchedulingTest.test_non_root_necessity_without_published_root_becomes_primary \
+  test_factor_role_projection.FactorRoleEscalationTest -v
+
+Ran 11 tests in 2.046s
+OK
+```
+
+### R1 Verification
+
+Task 5 brief four-module command:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_factor_role_projection \
+  tools.trace_attribution.tests.test_causal_role_closure \
+  tools.trace_attribution.tests.test_root_confirmation_fix39 \
+  tools.trace_attribution.tests.test_seed_attribution -v
+
+Ran 162 tests in 13.536s
+OK
+```
+
+Complete attribution suite:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest discover \
+  -s tools/trace_attribution/tests -v
+
+Ran 1203 tests in 45.208s
+OK
+```
+
+Static compilation:
+
+```text
+PYTHONPYCACHEPREFIX=/tmp/task5-r1-pycache python3 -m py_compile \
+  tools/trace_attribution/trace_attribution/recursive_analyzer.py \
+  tools/trace_attribution/trace_attribution/causal_state.py \
+  tools/trace_attribution/tests/test_factor_role_projection.py \
+  tools/trace_attribution/tests/test_causal_role_closure.py
+
+passed with no output
+```
+
+The first unprefixed compile attempt could not write macOS's default Python
+cache directory and raised `PermissionError`; redirecting bytecode cache to
+`/tmp` produced the successful command above.
+
+Whitespace validation:
+
+```text
+git diff --check
+
+passed with no output
+```
+
+### R1 Self-Review
+
+- Confirmed that a necessary FactorRole still never edits roots directly; only
+  its independently completed root-scope escalation can publish.
+- Confirmed that no-root escalation publication and existing-root reciprocal
+  co-root publication take separate gates, then share canonical ranking.
+- Confirmed that an ordinary unknown root remains blocking unless a published
+  escalation on the same seed has one exact independent
+  `outperformed`/`rejected` comparison to it.
+- Confirmed that resolving an outperformed blocker does not rewrite provider
+  output, root request projection, confirmation identity, queue identity, or
+  lifecycle accounting.
+- Confirmed exact owner equality includes the complete canonical owner object,
+  not only hypothesis and seed.
+- Confirmed journal/queue/action/gap closure, queue-key closure, duplicate
+  consumption rejection, and provider-free replay remain intact.
+- Confirmed no additional provider request beyond the necessary
+  RootConfirmation and no Agent/Trace/Judge input feedback were introduced.
+
+### R1 Modified Files
+
+- `tools/trace_attribution/trace_attribution/recursive_analyzer.py`
+- `tools/trace_attribution/trace_attribution/causal_state.py`
+- `tools/trace_attribution/tests/test_factor_role_projection.py`
+- `tools/trace_attribution/tests/test_causal_role_closure.py`
+- `.superpowers/sdd/task-5-report.md`
+
+### R1 Concerns
+
+None.
+
+---
+
+# Task 5: Question Binding, User Projection, and Read-Only Trace Proof
+
+## Status
+
+Completed. No files were staged or committed; the existing dirty worktree was
+preserved.
+
+## Delivery
+
+- Question mode now emits `analysis_question` with the v1 schema version,
+  original and normalized question, deterministic question ID, SHA-256 binding
+  of `stable_json(graph.raw_trace)`, selected starts, and
+  `offline_read_only` analysis mode.
+- The projection is constructed before legacy output writes and before every
+  recursive completed-replay/output transaction operation. Published report,
+  completed checkpoint report, and returned result payload therefore bind the
+  same final JSON object.
+- Only question mode adds `conclusion`, `causal_chain`,
+  `supporting_evidence_refs`, `rejected_hypotheses`, `confidence`, and
+  `unresolved_gaps`. Objective-mode reports retain their existing shape.
+- Projection is deterministic and report-bound: confirmed-root reasons and
+  confidence, existing taint paths, rejected candidates/rejected hypotheses,
+  unresolved refs, and recorded trace-improvement gaps are reused directly.
+  Evidence refs are retained only when they occur in confirmed-root evidence
+  and resolve in the graph. Question text is never promoted to evidence.
+- When no root is independently confirmed, conclusion explicitly reports the
+  existing outcome and insufficient evidence. The checkpoint schema remains
+  unchanged; normalized questions continue to occupy the existing `objective`
+  field, so different questions produce different config fingerprints.
+
+## TDD Record
+
+Initial RED:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_attribution_request -v
+
+Ran 18 tests in 0.012s
+FAILED (errors=4)
+```
+
+The expected failures were absent question payload construction, absent
+question-mode fields in legacy output, and a recursive output transaction that
+did not yet carry the final bound payload.
+
+Focused GREEN:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_attribution_request -v
+
+Ran 18 tests in 0.012s
+OK
+```
+
+The final focused checkpoint command additionally includes the objective-mode
+shape regression:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_attribution_request \
+  tools.trace_attribution.tests.test_recursive_cli \
+  tools.trace_attribution.tests.test_causal_checkpoint -v
+
+Ran 128 tests in 9.067s
+OK
+```
+
+## Regression Verification
+
+Task 4 related regression set:
+
+```text
+PYTHONPATH=tools/trace_attribution python3 -m unittest \
+  tools.trace_attribution.tests.test_attribution_request \
+  tools.trace_attribution.tests.test_recursive_cli \
+  tools.trace_attribution.tests.test_causal_checkpoint \
+  tools.trace_attribution.tests.test_benchmark_bundle \
+  tools.trace_attribution.tests.test_benchmark_case \
+  tools.trace_attribution.tests.test_evaluation_facts \
+  tools.trace_attribution.tests.test_recursive_acceptance_review \
+  tools.trace_attribution.tests.test_backward_taint \
+  tools.trace_attribution.tests.test_recursive_benchmarks -v
+
+Ran 393 tests in 53.796s
+OK
+```
+
+The original Task 4 set contained 390 tests; this run includes the three new
+Task 5 tests. Test transports are mocked/offline and no network call occurred.
+
+```text
+PYTHONPYCACHEPREFIX=/tmp/observable-opencode-task5-pycache python3 -m py_compile \
+  tools/trace_attribution/trace_attribution/request.py \
+  tools/trace_attribution/trace_attribution/service.py \
+  tools/trace_attribution/tests/test_attribution_request.py \
+  tools/trace_attribution/tests/test_recursive_cli.py
+
+exit 0
+
+git diff --check
+
+passed with no output
+```
+
+## Modified Files
+
+- `tools/trace_attribution/trace_attribution/service.py`
+- `tools/trace_attribution/tests/test_attribution_request.py`
+- `tools/trace_attribution/tests/test_recursive_cli.py`
+- `.superpowers/sdd/task-5-report.md`
+
+## Concerns
+
+Legacy reports do not contain independently confirmed roots. In question mode,
+they therefore intentionally project `inconclusive`/`no_defect` with evidence
+gaps instead of promoting legacy `root_causes` into newly confirmed causes.
+
+---
+
+# Task 5 Review Closure: Projection and Replay Integrity
+
+## Status
+
+Completed the Important and Minor review items without staging or committing.
+
+## Changes
+
+- Question projections now combine `confirmed_roots` and `co_roots`, dedupe by
+  node and semantic/confirmation identity, include every root in the conclusion,
+  take the maximum existing confidence, and aggregate eligible root evidence.
+- Evidence eligibility uses the graph's public active/revision eligibility API,
+  allowing supported artifact evidence while dropping stale or invalid refs.
+- Existing taint paths are retained only when they touch selected starts and,
+  when roots exist, confirmed roots; path direction is not inferred or changed.
+- Gaps are stable structured dictionaries, and question payload construction
+  recursively copies mappings and sequences before projection.
+- The completed checkpoint replay test exercises the actual checkpoint bundle,
+  output transaction, completion marker, and replay commit against the final
+  question-bound payload.
+
+## TDD And Verification
+
+Review RED (42 focused tests) produced six expected failures covering root
+coverage, evidence eligibility, path filtering, structured gaps, deep copying,
+and trace binding. A subsequent one-test RED exposed iterator consumption for
+selected starts; caching the starts before projection made that test pass.
+
+```text
+Focused attribution/CLI/checkpoint suite: Ran 131 tests in 8.833s - OK
+Task 4 related regression suite: Ran 397 tests in 52.747s - OK
+py_compile (service and changed tests): exit 0
+git diff --check: passed with no output
+```
+
+The trace-binding coverage computes both the immutable source-file byte SHA-256
+and `sha256(stable_json(graph.raw_trace))`; it asserts the latter is the bound
+value and the former remains unchanged. All tests use offline/mocked transports;
+no network call is made.
+
+## Concerns
+
+None known. Existing objective-mode output remains field-compatible while its
+returned nested structures are independently copied.

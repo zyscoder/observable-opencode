@@ -1,8 +1,274 @@
 import { createHash } from "node:crypto"
+import fs from "node:fs"
+import path from "node:path"
 import { isFormalRecordType, normalizeRelationDetails, type FormalDataflowRelation } from "./trace-semantic-contract"
 import type { DataflowEdge, ProvenanceRecord } from "./case-trace"
 
 export const CAUSAL_IR_VERSION = "1.0" as const
+
+export type StreamingJsonWriteOptions = {
+  maxChunkBytes?: number
+  sanitize?: (value: unknown, key: string, path: readonly string[]) => unknown
+  sanitizeStringChunks?: (
+    fragments: Iterable<string>,
+    key: string,
+    path: readonly string[],
+    maxChunkCharacters: number,
+  ) => Iterable<string>
+  normalizeTemporalReferences?: boolean
+}
+
+export type StreamingJsonWriteStats = {
+  mode: "streaming_json"
+  chunk_count: number
+  max_chunk_bytes: number
+  max_encoder_temporary_bytes: number
+  top_level_array_items: number
+  full_document_buffered: false
+}
+
+export function writeJsonDocumentAtomic(
+  target: string,
+  input: unknown,
+  options: StreamingJsonWriteOptions = {},
+): StreamingJsonWriteStats {
+  const maxChunkBytes = Math.max(1024, Math.floor(options.maxChunkBytes ?? 256 * 1024))
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
+  )
+  let fd: number | undefined
+  let chunkCount = 0
+  let largestChunk = 0
+  let largestEncoderTemporary = 0
+  let topLevelArrayItems = 0
+  let pending = ""
+  let pendingBytes = 0
+
+  const flush = () => {
+    if (!pending) return
+    const bytesWritten = fs.writeSync(fd!, pending, undefined, "utf8")
+    chunkCount += 1
+    largestChunk = Math.max(largestChunk, bytesWritten)
+    pending = ""
+    pendingBytes = 0
+  }
+
+  const writeFragment = (fragment: string) => {
+    if (!fragment) return
+    const fragmentBytes = Buffer.byteLength(fragment, "utf8")
+    largestEncoderTemporary = Math.max(largestEncoderTemporary, fragmentBytes)
+    if (pending && pendingBytes + fragmentBytes > maxChunkBytes) flush()
+    pending += fragment
+    pendingBytes += fragmentBytes
+    largestEncoderTemporary = Math.max(largestEncoderTemporary, pendingBytes)
+  }
+
+  const writeJsonStringContent = (value: string) => {
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index)
+      if (code === 0x22) writeFragment('\\"')
+      else if (code === 0x5c) writeFragment("\\\\")
+      else if (code === 0x08) writeFragment("\\b")
+      else if (code === 0x0c) writeFragment("\\f")
+      else if (code === 0x0a) writeFragment("\\n")
+      else if (code === 0x0d) writeFragment("\\r")
+      else if (code === 0x09) writeFragment("\\t")
+      else if (code < 0x20) writeFragment(`\\u${code.toString(16).padStart(4, "0")}`)
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(index + 1)
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          writeFragment(value.slice(index, index + 2))
+          index += 1
+        } else {
+          writeFragment(`\\u${code.toString(16).padStart(4, "0")}`)
+        }
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        writeFragment(`\\u${code.toString(16).padStart(4, "0")}`)
+      } else {
+        writeFragment(value[index]!)
+      }
+    }
+  }
+
+  const writeJsonStringChunks = (chunks: Iterable<string>, trackChunkTemporary = false) => {
+    writeFragment('"')
+    let pendingHighSurrogate = ""
+    for (let chunk of chunks) {
+      if (!chunk) continue
+      if (pendingHighSurrogate) {
+        chunk = pendingHighSurrogate + chunk
+        pendingHighSurrogate = ""
+      }
+      const last = chunk.charCodeAt(chunk.length - 1)
+      if (last >= 0xd800 && last <= 0xdbff) {
+        pendingHighSurrogate = chunk.at(-1)!
+        chunk = chunk.slice(0, -1)
+      }
+      if (trackChunkTemporary)
+        largestEncoderTemporary = Math.max(largestEncoderTemporary, Buffer.byteLength(chunk, "utf8"))
+      writeJsonStringContent(chunk)
+    }
+    if (pendingHighSurrogate) writeJsonStringContent(pendingHighSurrogate)
+    writeFragment('"')
+  }
+
+  const writeJsonString = (value: string) => writeJsonStringChunks([value])
+
+  function* boundedStringFragments(value: string, maxChunkCharacters: number) {
+    if (!value.length) {
+      yield ""
+      return
+    }
+    for (let offset = 0; offset < value.length; offset += maxChunkCharacters) {
+      yield value.substring(offset, offset + maxChunkCharacters)
+    }
+  }
+
+  const ancestors = new WeakSet<object>()
+  const ancestorPaths = new WeakMap<object, string>()
+  const temporalNormalization = options.normalizeTemporalReferences ?? options.sanitize !== undefined
+  const maxSanitizerChunkCharacters = Math.max(1, Math.floor(maxChunkBytes / 4))
+  const normalizeJsonValue = (value: unknown, key: string) => {
+    if (value && typeof value === "object") {
+      const toJSON = (value as { toJSON?: (key: string) => unknown }).toJSON
+      if (typeof toJSON === "function") value = toJSON.call(value, key)
+      if (value instanceof Number || value instanceof String || value instanceof Boolean) value = value.valueOf()
+    }
+    return value
+  }
+  type PreparedValue = { omitted: boolean; value?: unknown }
+  const prepareValue = (
+    raw: unknown,
+    key: string,
+    valuePath: readonly string[],
+    inRefField: boolean,
+    root: boolean,
+  ): PreparedValue => {
+    let value = raw
+    if (temporalNormalization && inRefField) {
+      if (temporalSelector(value) || temporalSelectorFromRef(value)) return { omitted: true }
+    }
+    if (!root && options.sanitize) value = options.sanitize(value, key, valuePath)
+    value = normalizeJsonValue(value, key)
+    return { omitted: false, value }
+  }
+  const encodePrepared = (
+    prepared: PreparedValue,
+    key: string,
+    arrayPosition: boolean,
+    depth: number,
+    valuePath: readonly string[],
+    inRefField: boolean,
+  ): boolean => {
+    if (prepared.omitted) return false
+    const value = prepared.value
+    if (value === null) {
+      writeFragment("null")
+      return true
+    }
+    if (typeof value === "string") {
+      const chunks = options.sanitizeStringChunks
+        ? options.sanitizeStringChunks(
+            boundedStringFragments(value, maxSanitizerChunkCharacters),
+            key,
+            valuePath,
+            maxSanitizerChunkCharacters,
+          )
+        : [value]
+      writeJsonStringChunks(chunks, options.sanitizeStringChunks !== undefined)
+      return true
+    }
+    if (typeof value === "boolean") {
+      writeFragment(value ? "true" : "false")
+      return true
+    }
+    if (typeof value === "number") {
+      writeFragment(Number.isFinite(value) ? String(value) : "null")
+      return true
+    }
+    if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt")
+    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+      if (arrayPosition) writeFragment("null")
+      return arrayPosition
+    }
+    if (typeof value !== "object") return false
+    if (ancestors.has(value)) {
+      if (!options.sanitize) throw new TypeError("Converting circular structure to JSON")
+      writeJsonString(`[Circular:${ancestorPaths.get(value) ?? "$"}]`)
+      return true
+    }
+    ancestors.add(value)
+    ancestorPaths.set(value, traversalPath(valuePath))
+    try {
+      if (Array.isArray(value)) {
+        writeFragment("[")
+        if (depth <= 1) topLevelArrayItems += value.length
+        let first = true
+        for (let index = 0; index < value.length; index++) {
+          const childPath = [...valuePath, String(index)]
+          const child = prepareValue(value[index], String(index), childPath, inRefField, false)
+          if (child.omitted) continue
+          if (!first) writeFragment(",")
+          first = false
+          encodePrepared(child, String(index), true, depth + 1, childPath, inRefField)
+        }
+        writeFragment("]")
+        return true
+      }
+      writeFragment("{")
+      const record = value as Record<string, unknown>
+      const inheritRefField = temporalNormalization && inRefField && !structuredReferenceObject(record)
+      let first = true
+      for (const childKey of Object.keys(record)) {
+        const childPath = [...valuePath, childKey]
+        const childInRefField = temporalNormalization && (inheritRefField || semanticRefField(childKey))
+        const child = prepareValue(record[childKey], childKey, childPath, childInRefField, false)
+        if (child.omitted) continue
+        if (child.value === undefined || typeof child.value === "function" || typeof child.value === "symbol") continue
+        if (!first) writeFragment(",")
+        first = false
+        writeJsonString(childKey)
+        writeFragment(":")
+        encodePrepared(child, childKey, false, depth + 1, childPath, childInRefField)
+      }
+      writeFragment("}")
+      return true
+    } finally {
+      ancestors.delete(value)
+      ancestorPaths.delete(value)
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fd = fs.openSync(temporary, "w")
+    const root = prepareValue(input, "", [], false, true)
+    if (!encodePrepared(root, "", false, 0, [], false)) writeFragment("null")
+    flush()
+    fs.closeSync(fd)
+    fd = undefined
+    fs.renameSync(temporary, target)
+    return {
+      mode: "streaming_json",
+      chunk_count: chunkCount,
+      max_chunk_bytes: largestChunk,
+      max_encoder_temporary_bytes: largestEncoderTemporary,
+      top_level_array_items: topLevelArrayItems,
+      full_document_buffered: false,
+    }
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(temporary)
+    } catch {}
+    throw error
+  }
+}
 
 export type CausalIRRef = {
   ref_type: "node" | "artifact" | "raw_event" | "external"
@@ -666,13 +932,31 @@ function structuredReferenceObject(input: Record<string, unknown>) {
   ].some((key) => key in input)
 }
 
-export function normalizeTemporalReferences<T>(input: T): { value: T; selectors: string[] } {
+type TemporalNormalizationOptions = {
+  path?: readonly string[]
+  inRefField?: boolean
+}
+
+function traversalPath(path: readonly string[]) {
+  return path.length ? `$.${path.join(".")}` : "$"
+}
+
+export function normalizeTemporalReferences<T>(
+  input: T,
+  options: TemporalNormalizationOptions = {},
+): { value: T; selectors: string[] } {
   const selectors = new Set<string>()
+  const stack = new WeakSet<object>()
+  const ancestorPaths = new WeakMap<object, string>()
   const omit = (selector: string) => {
     selectors.add(selector)
     return OMIT_TEMPORAL_REFERENCE
   }
-  const visit = (value: unknown, inRefField: boolean): unknown | typeof OMIT_TEMPORAL_REFERENCE => {
+  const visit = (
+    value: unknown,
+    inRefField: boolean,
+    valuePath: readonly string[],
+  ): unknown | typeof OMIT_TEMPORAL_REFERENCE => {
     if (typeof value === "string") {
       const selector = inRefField ? temporalSelector(value) : undefined
       return selector ? omit(selector) : value
@@ -682,37 +966,47 @@ export function normalizeTemporalReferences<T>(input: T): { value: T; selectors:
       const selector = temporalSelectorFromRef(value)
       if (selector) return omit(selector)
     }
-    if (Array.isArray(value)) {
-      if (inRefField) {
-        return value.flatMap((item) => {
-          const normalized = visit(item, true)
-          return normalized === OMIT_TEMPORAL_REFERENCE ? [] : [normalized]
-        })
+    if (stack.has(value)) return `[Circular:${ancestorPaths.get(value) ?? "$"}]`
+    stack.add(value)
+    ancestorPaths.set(value, traversalPath(valuePath))
+    try {
+      if (Array.isArray(value)) {
+        if (inRefField) {
+          return value.flatMap((item, index) => {
+            const normalized = visit(item, true, [...valuePath, String(index)])
+            return normalized === OMIT_TEMPORAL_REFERENCE ? [] : [normalized]
+          })
+        }
+        const output = new Array(value.length)
+        for (let index = 0; index < value.length; index++) {
+          if (!(index in value)) continue
+          const normalized = visit(value[index], false, [...valuePath, String(index)])
+          if (normalized !== OMIT_TEMPORAL_REFERENCE) output[index] = normalized
+        }
+        return output
       }
-      const output = new Array(value.length)
-      for (let index = 0; index < value.length; index++) {
-        if (!(index in value)) continue
-        const normalized = visit(value[index], false)
-        if (normalized !== OMIT_TEMPORAL_REFERENCE) output[index] = normalized
+      const prototype = Object.getPrototypeOf(value)
+      if (prototype !== Object.prototype && prototype !== null) return value
+
+      const record = value as Record<string, unknown>
+      const inheritRefField = inRefField && !structuredReferenceObject(record)
+      const output: Record<string, unknown> = {}
+      for (const [key, child] of Object.entries(record)) {
+        const childIsRef = semanticRefField(key)
+        const normalized = visit(child, inheritRefField || childIsRef, [...valuePath, key])
+        if (normalized === OMIT_TEMPORAL_REFERENCE) continue
+        output[key] = normalized
       }
       return output
+    } finally {
+      stack.delete(value)
+      ancestorPaths.delete(value)
     }
-    const prototype = Object.getPrototypeOf(value)
-    if (prototype !== Object.prototype && prototype !== null) return value
-
-    const record = value as Record<string, unknown>
-    const inheritRefField = inRefField && !structuredReferenceObject(record)
-    const output: Record<string, unknown> = {}
-    for (const [key, child] of Object.entries(record)) {
-      const childIsRef = semanticRefField(key)
-      const normalized = visit(child, inheritRefField || childIsRef)
-      if (normalized === OMIT_TEMPORAL_REFERENCE) continue
-      output[key] = normalized
-    }
-    return output
   }
 
-  const value = visit(input, false)
+  const rootPath = options.path ?? []
+  const rootInRefField = options.inRefField ?? rootPath.some(semanticRefField)
+  const value = visit(input, rootInRefField, rootPath)
   return {
     value: (value === OMIT_TEMPORAL_REFERENCE ? undefined : value) as T,
     selectors: [...selectors],

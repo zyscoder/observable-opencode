@@ -8,8 +8,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from trace_attribution.causal_judge import (
+    FactorRoleRequest,
     RootConfirmationRequest,
     build_causal_step_prompt,
+    build_factor_role_prompt,
     build_recursive_confirmation_prompt,
     validate_recursive_confirmation,
 )
@@ -24,6 +26,7 @@ from trace_attribution.global_judge import (
     build_global_candidate_prompt,
 )
 from trace_attribution.graph import TraceGraph
+from trace_attribution.judge_payload import reject_analysis_control_envelopes
 from trace_attribution.models import stable_json
 from trace_attribution.recursive_analyzer import RecursiveAnalysisState
 from tools.trace_attribution.tests.test_causal_judge import (
@@ -34,6 +37,13 @@ from tools.trace_attribution.tests.test_causal_judge import (
 
 OBJECTIVE = "Confirm each active defect seed independently."
 VISIBLE_MARKER = "FIX20_VISIBLE_FACT"
+HISTORICAL_LINEAGE_MARKER = "FIX20_HISTORICAL_LINEAGE_TEXT"
+HISTORICAL_LINEAGE_KEYS = (
+    "superseded_evidence_refs",
+    "supersedes_refs",
+    "verification_superseded_by_refs",
+    "verification_supersedes_refs",
+)
 
 
 def active_defect() -> DefectState:
@@ -139,6 +149,49 @@ def final_json(graph: TraceGraph, stage: str) -> dict:
             capsules=capsules,
         )
         return json.loads(build_global_candidate_prompt(request))
+    if stage == "factor":
+        candidate_reference = {
+            **reference_envelope(
+                "record:decision",
+                raw_ref="decision",
+                canonical_ref="record:decision",
+            ),
+            "content": stable_json(
+                graph.nodes["record:decision"].data
+            ),
+        }
+        request = FactorRoleRequest(
+            candidate_ref="record:decision",
+            defect_state=defect,
+            recursive_path=("record:decision", "record:defect"),
+            candidate_reference=candidate_reference,
+            recursive_path_references=(
+                candidate_reference,
+                reference_envelope("record:defect"),
+            ),
+            supporting_evidence=(candidate_reference,),
+            opposing_evidence=(),
+            task_obligations=(),
+            confirmed_root_summaries=(),
+            hypothesis_id="hypothesis:fix20-factor",
+            hypothesis_semantic_hash="sha256:fix20-factor",
+            seed_binding_identity="seed:fix20-factor",
+            analysis_perspective="Improve repository reasoning.",
+        )
+        sanitized = graph.sanitize_judge_visible_payload(
+            request.factual_dict()
+        )
+        request = replace(
+            request,
+            candidate_reference=sanitized["candidate_reference"],
+            recursive_path_references=tuple(
+                sanitized["recursive_path_references"]
+            ),
+            supporting_evidence=tuple(
+                sanitized["supporting_evidence"]
+            ),
+        )
+        return json.loads(build_factor_role_prompt(request))
     if stage == "step":
         state = RecursiveAnalysisState.create(
             graph=graph,
@@ -239,7 +292,122 @@ def artifact_fact(content: str, *, owner: dict | None = None, **updates) -> dict
     return value
 
 
+class AnalysisControlSchemaClassifierTest(unittest.TestCase):
+    def test_string_subclass_cannot_bypass_control_schema_classification(self):
+        class SchemaString(str):
+            pass
+
+        with self.assertRaisesRegex(ValueError, "analysis-control"):
+            reject_analysis_control_envelopes(
+                {
+                    "schema_version": SchemaString(
+                        "global-candidate-validation-envelope/v11"
+                    )
+                }
+            )
+
+    def test_rejects_real_control_schema_families_with_normalized_keys_and_values(self):
+        families = (
+            "global-candidate-judgment/v11",
+            "global-candidate-validation-envelope/v11",
+            "recursive-root-confirmation/v17+resolution/v2",
+            "factor-role-judgment/v1",
+            "candidate-cluster-triage-page-response/v1",
+            "candidate-cluster-triage-page-judgment/v1",
+        )
+        keys = ("schema", "SCHEMA_VERSION", "Schema-Version")
+        for family in families:
+            for key in keys:
+                variant = family.upper().replace("-", "_").replace("/", ".")
+                with self.subTest(family=family, key=key), self.assertRaisesRegex(
+                    ValueError, "analysis-control"
+                ):
+                    reject_analysis_control_envelopes({key: variant})
+
+    def test_rejects_doubly_encoded_control_and_bounded_container_attacks(self):
+        encoded = json.dumps(
+            json.dumps(
+                {
+                    "Schema Version": (
+                        "GLOBAL_CANDIDATE.VALIDATION_ENVELOPE/V11"
+                    )
+                }
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "analysis-control"):
+            reject_analysis_control_envelopes({"rationale": encoded})
+
+        recursive = {}
+        recursive["child"] = recursive
+        with self.assertRaisesRegex(ValueError, "recursive"):
+            reject_analysis_control_envelopes(recursive)
+
+        too_deep = {"ordinary_fact": "leaf"}
+        for _ in range(80):
+            too_deep = {"child": too_deep}
+        with self.assertRaisesRegex(ValueError, "depth|complex"):
+            reject_analysis_control_envelopes(too_deep)
+
+    def test_preserves_ordinary_root_validation_and_confirmation_text(self):
+        payload = {
+            "schema": "business-validation-record/v11",
+            "schema_version": "customer-confirmation-note/v2",
+            "summary": (
+                "Root validation confirmed the repository path and ordinary "
+                "business requirement."
+            ),
+            "validation": "The account validation remains pending.",
+        }
+
+        self.assertIsNone(reject_analysis_control_envelopes(payload))
+
+
 class TypedIdentityEquivalenceTest(unittest.TestCase):
+    def historical_lineage_graph(self) -> TraceGraph:
+        return TraceGraph.from_trace(
+            reviewer_trace(
+                {
+                    key: [
+                        "record:alternative",
+                        "{0}_{1}".format(
+                            HISTORICAL_LINEAGE_MARKER,
+                            key,
+                        ),
+                    ]
+                    for key in HISTORICAL_LINEAGE_KEYS
+                }
+            )
+        )
+
+    def assert_historical_lineage_hidden(self, stage: str) -> None:
+        graph = self.historical_lineage_graph()
+        raw_payload = stable_json(
+            graph.nodes["record:decision"].data
+        )
+        prompt = stable_json(final_json(graph, stage))
+        for key in HISTORICAL_LINEAGE_KEYS:
+            self.assertIn(key, raw_payload)
+            self.assertNotIn(key, prompt)
+        self.assertIn("record:alternative", raw_payload)
+        self.assertIn(HISTORICAL_LINEAGE_MARKER, raw_payload)
+        self.assertNotIn("record:alternative", prompt)
+        self.assertNotIn(HISTORICAL_LINEAGE_MARKER, prompt)
+
+    def test_historical_lineage_is_audit_only_in_factor_role_prompt(
+        self,
+    ) -> None:
+        self.assert_historical_lineage_hidden("factor")
+
+    def test_historical_lineage_is_audit_only_in_root_confirmation_prompt(
+        self,
+    ) -> None:
+        self.assert_historical_lineage_hidden("confirmation")
+
+    def test_historical_lineage_is_audit_only_in_global_prompt(
+        self,
+    ) -> None:
+        self.assert_historical_lineage_hidden("global")
+
     def assert_all_stages_hide_marker(self, graph: TraceGraph) -> None:
         for stage in ("global", "step", "confirmation"):
             with self.subTest(stage=stage):

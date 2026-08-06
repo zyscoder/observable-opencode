@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 import signal
@@ -9,6 +10,7 @@ from unittest import mock
 
 from trace_attribution.checkpoint import (
     CheckpointBundle,
+    CheckpointCompatibilityError,
     build_checkpoint_config,
     publish_output_transaction,
 )
@@ -22,6 +24,8 @@ from trace_attribution.cli import (
     recursive_checkpoint_path,
 )
 from trace_attribution.graph import TraceGraph
+from trace_attribution.request import AttributionQuestion, AttributionResult
+from trace_attribution import service
 
 
 def output_config():
@@ -52,6 +56,260 @@ def output_config():
 
 
 class RecursiveCliTest(unittest.TestCase):
+    def test_question_is_accepted_and_mutually_exclusive_with_objective(self):
+        args = parse_args(
+            [
+                "--trace",
+                "/tmp/trace.json",
+                "--out",
+                "/tmp/out.json",
+                "--question",
+                "为什么回答错误？",
+            ]
+        )
+        self.assertEqual(args.question, "为什么回答错误？")
+
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--trace",
+                    "/tmp/trace.json",
+                    "--out",
+                    "/tmp/out.json",
+                    "--question",
+                    "why",
+                    "--objective",
+                    "root",
+                ]
+            )
+
+    def test_question_reorders_all_default_starts_stably_but_not_explicit_starts(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "question-starts",
+                "records": [
+                    {
+                        "record_id": "tests",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "title": "Tests failed",
+                        "data": {
+                            "seed_id": "tests",
+                            "failure_signature": {"kind": "test_failure"},
+                            "summary": "verification tests",
+                        },
+                    },
+                    {
+                        "record_id": "compile",
+                        "component": "build",
+                        "event_type": "case.observed_defect",
+                        "title": "编译失败",
+                        "data": {
+                            "seed_id": "compile",
+                            "failure_signature": {"kind": "compile_failure"},
+                            "summary": "编译器拒绝源码",
+                        },
+                    },
+                    {
+                        "record_id": "docs",
+                        "component": "documentation",
+                        "event_type": "case.observed_defect",
+                        "title": "Documentation issue",
+                        "data": {
+                            "seed_id": "docs",
+                            "failure_signature": {"kind": "docs_failure"},
+                            "summary": "missing prose",
+                        },
+                    },
+                ],
+            }
+        )
+
+        defaults = tuple(graph.default_start_refs())
+        ranked = analysis_start_refs(graph, [], question="为什么编译失败？")
+
+        self.assertEqual(ranked[0], "record:compile")
+        self.assertCountEqual(ranked, defaults)
+        self.assertEqual(ranked[1:], ("record:tests", "record:docs"))
+        self.assertEqual(
+            analysis_start_refs(
+                graph,
+                ["record:tests", "record:compile"],
+                question="compiler",
+            ),
+            ("record:tests", "record:compile"),
+        )
+
+    def test_single_cjk_character_reorders_related_default_start(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "single-cjk-start",
+                "records": [
+                    {
+                        "record_id": "tests",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "title": "测试失败",
+                        "data": {
+                            "seed_id": "tests",
+                            "failure_signature": {"kind": "test_failure"},
+                        },
+                    },
+                    {
+                        "record_id": "compile",
+                        "component": "build",
+                        "event_type": "case.observed_defect",
+                        "title": "编译失败",
+                        "data": {
+                            "seed_id": "compile",
+                            "failure_signature": {"kind": "compile_failure"},
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            analysis_start_refs(graph, [], question="译"),
+            ("record:compile", "record:tests"),
+        )
+
+    def test_cli_helper_aliases_are_shared_service_objects(self):
+        from trace_attribution import cli
+
+        for name in (
+            "GracefulSignalState",
+            "analysis_start_refs",
+            "analyze",
+            "attribution_output_payload",
+            "atomic_write_json",
+            "judge_cache_output_path",
+            "lineage_output_path",
+            "load_graph",
+            "recursive_checkpoint_path",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(getattr(cli, name), getattr(service, name))
+
+    def test_main_constructs_shared_request_and_prints_only_result_path(self):
+        from trace_attribution import cli
+
+        result = AttributionResult(
+            output_path=Path("/tmp/result.json"),
+            lineage_path=Path("/tmp/lineage.json"),
+            payload={"analysis_outcome": "inconclusive"},
+        )
+        argv = [
+            "trace-attribution",
+            "--trace",
+            "/tmp/trace.json",
+            "--out",
+            "/tmp/result.json",
+            "--question",
+            "  Why did validation fail?  ",
+            "--engine",
+            "recursive-agentic",
+            "--max-frontier-items",
+            "7",
+            "--model",
+            "offline-model",
+            "--judge-timeout-sec",
+            "12.5",
+            "--thinking-mode",
+            "disabled",
+        ]
+
+        with mock.patch.object(cli, "analyze", return_value=result) as analyze, mock.patch(
+            "sys.argv", argv
+        ), mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
+            self.assertEqual(cli.main(), 0)
+
+        request = analyze.call_args.args[0]
+        self.assertEqual(request.effective_objective, "Why did validation fail?")
+        self.assertEqual(request.output_path, Path("/tmp/result.json").resolve())
+        self.assertEqual(request.start_refs, ())
+        self.assertEqual(request.options.engine, "recursive-agentic")
+        self.assertEqual(request.options.max_frontier_items, 7)
+        self.assertEqual(request.options.model, "offline-model")
+        self.assertEqual(request.options.judge_timeout_sec, 12.5)
+        self.assertEqual(request.options.thinking_mode, "disabled")
+        self.assertEqual(stdout.getvalue(), "/tmp/result.json\n")
+
+    def test_main_prints_original_relative_out_and_preserves_duplicate_start_refs(self):
+        from trace_attribution import cli
+
+        result = AttributionResult(
+            output_path=Path("result.json"),
+            lineage_path=None,
+            payload={"analysis_outcome": "inconclusive"},
+        )
+        argv = [
+            "trace-attribution",
+            "--trace",
+            "/tmp/trace.json",
+            "--out",
+            "result.json",
+            "--start-ref",
+            " record:failure ",
+            "--start-ref",
+            "record:failure",
+        ]
+
+        with mock.patch.object(cli, "analyze", return_value=result) as analyze, mock.patch(
+            "sys.argv", argv
+        ), mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
+            self.assertEqual(cli.main(), 0)
+
+        request = analyze.call_args.args[0]
+        self.assertTrue(request.output_path.is_absolute())
+        self.assertEqual(
+            request.start_refs,
+            ("record:failure", "record:failure"),
+        )
+        self.assertEqual(stdout.getvalue(), "result.json\n")
+
+    def test_main_does_not_rewrite_service_value_error(self):
+        from trace_attribution import cli
+
+        argv = [
+            "trace-attribution",
+            "--trace",
+            "/tmp/trace.json",
+            "--out",
+            "/tmp/result.json",
+        ]
+        with mock.patch.object(
+            cli,
+            "analyze",
+            side_effect=ValueError("checkpoint corruption"),
+        ), mock.patch("sys.argv", argv):
+            with self.assertRaisesRegex(ValueError, "checkpoint corruption"):
+                cli.main()
+
+    def test_main_rewrites_invalid_transport_limits_as_user_input_error(self):
+        from trace_attribution import cli
+
+        for flag in (
+            "--judge-timeout-sec",
+            "--judge-max-tokens",
+            "--provider-error-threshold",
+        ):
+            argv = [
+                "trace-attribution",
+                "--trace",
+                "/tmp/trace.json",
+                "--out",
+                "/tmp/result.json",
+                flag,
+                "-1",
+            ]
+            with self.subTest(flag=flag), mock.patch.object(cli, "analyze") as analyze, mock.patch(
+                "sys.argv", argv
+            ):
+                with self.assertRaisesRegex(SystemExit, "error: .*must be.*positive"):
+                    cli.main()
+                analyze.assert_not_called()
+
     def test_explicit_ineligible_external_evaluation_start_is_rejected(self):
         graph = TraceGraph.from_trace(
             {
@@ -112,6 +370,158 @@ class RecursiveCliTest(unittest.TestCase):
             recursive_checkpoint_path(Path(args.out), args.checkpoint_dir),
             Path("/tmp/case.attribution.checkpoint"),
         )
+
+    def test_different_questions_produce_different_checkpoint_config_fingerprints(self):
+        trace = {"case_id": "question-checkpoint", "records": []}
+        kwargs = {
+            "trace": trace,
+            "case_id": "question-checkpoint",
+            "analysis_perspective": "",
+            "start_refs": [],
+            "budgets": {
+                "max_frontier_items": 96,
+                "max_depth": 20,
+                "max_hypotheses": 24,
+                "max_investigation_rounds": 12,
+                "max_artifact_bytes": 1_048_576,
+                "max_judge_requests": 128,
+            },
+            "model_identity": "offline:test",
+            "cache_identity": "cache:test",
+            "runtime_identity": {
+                "judge_timeout_sec": 3600.0,
+                "judge_max_tokens": 4096,
+                "thinking_mode": "disabled",
+                "base_url": "offline://test",
+                "provider_error_threshold": 3,
+            },
+        }
+
+        compile_question = build_checkpoint_config(
+            **kwargs,
+            objective="Why did compilation fail?",
+        )
+        test_question = build_checkpoint_config(
+            **kwargs,
+            objective="Why did verification fail?",
+        )
+
+        self.assertNotEqual(
+            compile_question["config_fingerprint"],
+            test_question["config_fingerprint"],
+        )
+
+    def test_question_bound_payload_replays_through_real_checkpoint_transaction(self):
+        trace = {
+            "case_id": "question-replay",
+            "records": [
+                {
+                    "record_id": "start",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "title": "Validation failed",
+                },
+                {
+                    "record_id": "root",
+                    "component": "implementation",
+                    "event_type": "change.applied",
+                    "title": "Invalid validation rule",
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        question = AttributionQuestion.create("Why did validation fail?")
+        report = service.question_bound_output_payload(
+            {
+                "case_id": "question-replay",
+                "analysis_outcome": "root_found",
+                "confirmed_roots": [
+                    {
+                        "node_ref": "record:root",
+                        "reason": "The validation rule is invalid.",
+                        "confidence": 0.8,
+                        "evidence_refs": ["record:start"],
+                    }
+                ],
+                "taint_paths": [["record:root", "record:start"]],
+            },
+            graph,
+            binding=question,
+            starts=("record:start",),
+        )
+        lineage = {"turns": [], "edges": []}
+        config_kwargs = {
+            "trace": graph.raw_trace,
+            "case_id": graph.case_id,
+            "analysis_perspective": "",
+            "start_refs": ["record:start"],
+            "budgets": {
+                "max_frontier_items": 96,
+                "max_depth": 20,
+                "max_hypotheses": 24,
+                "max_investigation_rounds": 12,
+                "max_artifact_bytes": 1_048_576,
+                "max_judge_requests": 128,
+            },
+            "model_identity": "offline:test",
+            "cache_identity": "cache:test",
+            "runtime_identity": {
+                "judge_timeout_sec": 3600.0,
+                "judge_max_tokens": 4096,
+                "thinking_mode": "disabled",
+                "base_url": "offline://test",
+                "provider_error_threshold": 3,
+            },
+        }
+        config = build_checkpoint_config(
+            **config_kwargs,
+            objective=question.normalized,
+        )
+        other_config = build_checkpoint_config(
+            **config_kwargs,
+            objective="Why did another validation fail?",
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle = CheckpointBundle(root / "question.checkpoint")
+            bundle.initialize(config)
+            output = publish_output_transaction(
+                bundle=bundle,
+                attribution_path=root / "report.json",
+                lineage_path=root / "lineage.json",
+                report=report,
+                message_lineage=lineage,
+            )
+            bundle.mark_analysis_completed(report=report, output_commit=output)
+
+            replay_bundle = CheckpointBundle(bundle.root)
+            replay_bundle.restore_for_replay(
+                expected_config=config,
+                expected_lineage=lineage,
+            )
+            replay = replay_bundle.completed_replay_output_commit(
+                attribution_path=root / "report.json",
+                lineage_path=root / "lineage.json",
+                report=report,
+                message_lineage=lineage,
+            )
+
+            self.assertEqual(replay["status"], "published")
+            self.assertEqual(replay["attribution_hash"], output["attribution_hash"])
+            self.assertEqual(
+                hashlib.sha256((root / "report.json").read_bytes()).hexdigest(),
+                output["attribution_hash"],
+            )
+            self.assertEqual(
+                json.loads((root / "report.json").read_text(encoding="utf-8")),
+                report,
+            )
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=other_config,
+                    expected_lineage=lineage,
+                )
 
     def test_recursive_flags_accept_exact_overrides(self):
         with tempfile.TemporaryDirectory() as tempdir:

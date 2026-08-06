@@ -82,6 +82,41 @@ export function buildAgentPrompt(row, repoDir) {
   ].join("\n")
 }
 
+export function featureBenchSubjectRevision(row) {
+  return [
+    "featurebench",
+    row.instance_id,
+    row.base_commit,
+    "mask",
+    sha256(row.patch),
+  ].join(":")
+}
+
+export function writeNoninteractiveBenchmarkConfig(configRoot) {
+  const configFile = path.join(path.resolve(configRoot), "opencode", "opencode.json")
+  fs.mkdirSync(path.dirname(configFile), { recursive: true })
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify(
+      {
+        $schema: "https://opencode.ai/config.json",
+        permission: {
+          external_directory: "deny",
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+  )
+  return configFile
+}
+
+export function binarySupportsSubjectRevision(binaryPath) {
+  return fs
+    .readFileSync(path.resolve(binaryPath))
+    .includes(Buffer.from("OPENCODE_TRACE_SUBJECT_REVISION"))
+}
+
 export function officialEvaluationStatus({ dockerAvailable }) {
   if (!dockerAvailable) {
     return {
@@ -158,6 +193,8 @@ function signalExitCode(signal) {
   return signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129
 }
 
+export const DEFAULT_CHILD_EXIT_TIMEOUT_MS = 5 * 60_000
+
 function waitForChildExit(child, timeoutMs) {
   if (child.exitCode !== null) return Promise.resolve(child.exitCode)
   return new Promise((resolve, reject) => {
@@ -177,7 +214,7 @@ export function createRunnerSignalLifecycle(options) {
   const child = options.child
   const traceFile = options.traceFile
   const traceTimeoutMs = options.traceTimeoutMs ?? 60_000
-  const childExitTimeoutMs = options.childExitTimeoutMs ?? 30_000
+  const childExitTimeoutMs = options.childExitTimeoutMs ?? DEFAULT_CHILD_EXIT_TIMEOUT_MS
   const handlers = new Map()
   let forwardedSignal
   let forwarding
@@ -346,6 +383,7 @@ async function runOneCase(row, args, sourceManifest) {
   for (const directory of [tracesDir, homeDir, configDir, dataDir, cacheDir, resultDir]) {
     fs.mkdirSync(directory, { recursive: true })
   }
+  if (!args.config) writeNoninteractiveBenchmarkConfig(configDir)
   const prompt = buildAgentPrompt(row, repoDir)
   const traceFile = path.join(tracesDir, row.instance_id, "trace.json")
   const child = spawn(path.resolve(args.binary), ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
@@ -362,6 +400,7 @@ async function runOneCase(row, args, sourceManifest) {
       OPENCODE_BENCHMARK_SOURCE: sourceManifest.source.dataset,
       OPENCODE_BENCHMARK_SPLIT: sourceManifest.source.split,
       OPENCODE_BENCHMARK_INSTANCE_ID: row.instance_id,
+      OPENCODE_TRACE_SUBJECT_REVISION: featureBenchSubjectRevision(row),
     },
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
@@ -441,6 +480,11 @@ export async function runFeatureBenchCases(args) {
     return []
   }
   if (!args.binary) throw new Error("--binary is required")
+  if (!binarySupportsSubjectRevision(args.binary)) {
+    throw new Error(
+      "observable-opencode binary does not support OPENCODE_TRACE_SUBJECT_REVISION; use a newer build before running a benchmark",
+    )
+  }
   if (!process.env.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY is required")
   const results = []
   for (const row of rows) {

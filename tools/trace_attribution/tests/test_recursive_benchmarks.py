@@ -6,21 +6,36 @@ import io
 import json
 import tempfile
 import unittest
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import scripts.evaluate_recursive_attribution as evaluator_module
 from scripts.evaluate_recursive_attribution import (
     EvaluationSafetyError,
+    _semantic_decision_counts,
+    _validate_candidate,
+    _validate_factored_item,
     compare_report,
     load_fixture,
     main as evaluate_main,
 )
-from trace_attribution.causal_judge import OfflineJudgeCapability
+from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
+    OfflineJudgeCapability,
+    factor_role_request_identity,
+)
 from trace_attribution.cli import attribution_output_payload, parse_args
+from trace_attribution.checkpoint import LegacyProjectionNotRequired
 from trace_attribution.causal_state import (
+    ActiveFailureRoleBinding,
+    CausalCandidate,
     CausalStepJudgment,
     DefectState,
+    FactorRoleJudgment,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -32,10 +47,21 @@ from trace_attribution.causal_state import (
     semantic_anchor_index,
     semantic_occurrence_index,
 )
+from trace_attribution.global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+)
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import TraceNode, stable_json
-from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer, RecursiveAnalysisState
+from trace_attribution.recursive_analyzer import (
+    AgenticRecursiveAnalyzer,
+    RecursiveAnalysisState,
+    classify_legacy_projection_shape,
+    _canonicalize_checkpoint_candidate_payloads,
+    _canonicalize_candidate_publications,
+)
 from scripts.characterize_trace_fact_closure import characterize_archive, main as characterize_main
 
 
@@ -85,11 +111,13 @@ def decision_node(
     )
 
 
-class FixtureJudge(OfflineJudgeCapability):
+class FixtureJudge(OfflineJudgeCapability, GlobalJudgeCapability):
     def __init__(self, script: dict):
         self.script = script
         self.requests = []
         self.confirmation_requests = []
+        self.factor_requests = []
+        self.global_requests = []
         self.request_count = 0
         self.provider_circuit_open = False
         self.provider_circuit_reason = ""
@@ -210,12 +238,324 @@ class FixtureJudge(OfflineJudgeCapability):
             )
         return result
 
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.global_requests.append(request)
+        capsules_by_ref = {
+            capsule.candidate_ref: capsule
+            for capsule in request.capsules
+        }
+        selected = tuple(
+            sorted(
+                ref
+                for ref, value in self.script["confirmations"].items()
+                if value["status"] == "confirmed"
+                and ref in capsules_by_ref
+            )
+        )
+        page_has_scripted_factor = any(
+            value.get("status") == "rejected"
+            and value.get("factor_role")
+            in {
+                "contributing_condition",
+                "amplifying_factor",
+                "outcome_evidence",
+            }
+            and ref in capsules_by_ref
+            for ref, value in self.script["confirmations"].items()
+        )
+        outcome = (
+            "candidate_roots"
+            if selected
+            else (
+                "inconclusive"
+                if page_has_scripted_factor
+                else "no_defect"
+            )
+        )
+        assessments = []
+        for capsule in request.capsules:
+            value = self.script["confirmations"].get(
+                capsule.candidate_ref
+            )
+            is_root = capsule.candidate_ref in selected
+            is_open = (
+                capsule.candidate_ref
+                in request.open_authored_root_candidate_refs
+            )
+            factor_role = (
+                value.get("factor_role")
+                if value is not None
+                and value.get("status") == "rejected"
+                else None
+            )
+            candidate_node = capsule.candidate.get("node")
+            event_type = (
+                str(candidate_node.get("event_type") or "")
+                if isinstance(candidate_node, Mapping)
+                else ""
+            )
+            if (
+                factor_role is not None
+                and event_type
+                in {
+                    "case.failed",
+                    "subagent.result",
+                    "tool.error",
+                    "tool.result",
+                }
+            ):
+                factor_role = "outcome_evidence"
+            is_factor = factor_role in {
+                "contributing_condition",
+                "amplifying_factor",
+                "outcome_evidence",
+            }
+            assessments.append(
+                GlobalCandidateAssessment(
+                    candidate_ref=capsule.candidate_ref,
+                    defect_status=(
+                        "present"
+                        if is_root or is_factor
+                        else "absent"
+                    ),
+                    input_defect_status=(
+                        "absent"
+                        if is_root
+                        or is_factor
+                        or outcome == "no_defect"
+                        else "unknown"
+                    ),
+                    output_defect_status=(
+                        "present"
+                        if is_root or is_factor
+                        else "absent"
+                    ),
+                    causal_path_refs=(
+                        tuple(capsule.downstream_path)
+                        if is_root or is_factor or is_open
+                        else ()
+                    ),
+                    counterfactual={
+                        "intervention_ref": capsule.candidate_ref,
+                        "intervention_kind": (
+                            "replace_with_semantically_correct_behavior"
+                        ),
+                        "predicted_defect_status": (
+                            "absent"
+                            if is_root
+                            or factor_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "present"
+                        ),
+                        "causal_effect": (
+                            "prevents_defect"
+                            if is_root
+                            or factor_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "does_not_prevent_defect"
+                        ),
+                    },
+                    compared_candidate_refs=(
+                        request.open_authored_root_candidate_refs
+                    ),
+                    causal_role=(
+                        "root_candidate"
+                        if is_root
+                        else (
+                            factor_role
+                            if is_factor
+                            else "exculpatory_evidence"
+                        )
+                    ),
+                    responsibility=(
+                        "primary"
+                        if is_root
+                        else (
+                            "shared"
+                            if factor_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "none"
+                        )
+                    ),
+                    candidate_phase=(
+                        "implementation"
+                        if is_root
+                        else (
+                            "planning"
+                            if factor_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "intermediate"
+                        )
+                    ),
+                    obligation_status_before="unknown",
+                    obligation_status_after="unknown",
+                    repair_window_effect="remained_open",
+                    failure_mode=(
+                        "positive_introduction"
+                        if is_root
+                        else (
+                            "omission_enabling_condition"
+                            if factor_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "none"
+                        )
+                    ),
+                    obligation_refs=(),
+                    contribution_mechanism=(
+                        {
+                            "type": "scope_narrowing",
+                            "target_ref": request.seed_ref,
+                            "effect": (
+                                "The factor constrained the behavior reaching "
+                                "the observed defect."
+                            ),
+                            "evidence_refs": (capsule.candidate_ref,),
+                        }
+                        if factor_role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else None
+                    ),
+                    reason=(
+                        "Scripted fixture-wide comparative assessment."
+                    ),
+                    evidence_refs=(capsule.candidate_ref,),
+                    confidence=0.95,
+                )
+            )
+        decisive = selected
+        if outcome == "no_defect" and request.capsules:
+            decisive = (request.capsules[0].candidate_ref,)
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome=outcome,
+                reason="Scripted fixture-wide candidate comparison.",
+                assessments=tuple(assessments),
+                selected_candidate_refs=selected,
+                expansion_requests=(),
+                decisive_evidence_refs=decisive,
+                missing_evidence=(
+                    (
+                        "This page contains a non-root factor; compare it "
+                        "with surviving root candidates."
+                    ),
+                )
+                if outcome == "inconclusive"
+                else (),
+                confidence=0.95,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": (
+                        request.active_defect.fingerprint
+                    ),
+                    "active_focus_text_hash": (
+                        request.active_focus_text_hash
+                    ),
+                },
+            ),
+            0,
+        )
+
+    def judge_factor_role(self, request):
+        self.factor_requests.append(request)
+        value = self.script["confirmations"][request.candidate_ref]
+        role = value["factor_role"]
+        reference_content = request.candidate_reference.get("content")
+        reference = (
+            json.loads(reference_content)
+            if isinstance(reference_content, str)
+            else {}
+        )
+        if (
+            isinstance(reference, Mapping)
+            and reference.get("event_type")
+            in {
+                "case.failed",
+                "subagent.result",
+                "tool.error",
+                "tool.result",
+            }
+        ):
+            role = "downstream_materialization"
+        mechanism_type = {
+            "contributing_condition": "enabling_condition",
+            "amplifying_factor": "amplification",
+            "downstream_materialization": (
+                "downstream_materialization"
+            ),
+        }[role]
+        predicted_effect = {
+            "contributing_condition": "reduces_defect_likelihood",
+            "amplifying_factor": "reduces_defect_severity",
+            "downstream_materialization": (
+                "defect_still_present_without_materialization"
+            ),
+        }[role]
+        return FactorRoleJudgment(
+            candidate_ref=request.candidate_ref,
+            necessity_status="not_necessary",
+            factor_role=role,
+            reason=(
+                "The independent fixture review classified the "
+                "candidate's non-root causal role."
+            ),
+            confidence=value["confidence"],
+            evidence_refs=(request.candidate_ref,),
+            recursive_path=request.recursive_path,
+            factor_mechanism={
+                "schema": "factor-role-mechanism/v1",
+                "mechanism_type": mechanism_type,
+                "source_ref": request.candidate_ref,
+                "target_ref": request.recursive_path[-1],
+                "effect": (
+                    "The factor changes exposure without independently "
+                    "introducing the defect."
+                ),
+            },
+            counterfactual={
+                "schema": "factor-role-counterfactual/v1",
+                "intervention_ref": request.candidate_ref,
+                "intervention_kind": (
+                    "replace_with_semantically_correct_behavior"
+                ),
+                "predicted_effect": predicted_effect,
+            },
+            hypothesis_id=request.hypothesis_id,
+            hypothesis_semantic_hash=(
+                request.hypothesis_semantic_hash
+            ),
+            defect_fingerprint=request.defect_state.fingerprint,
+            seed_binding_identity=request.seed_binding_identity,
+            analysis_perspective=request.analysis_perspective,
+            request_identity=factor_role_request_identity(request),
+        )
+
 
 def run_fixture(path: Path):
     trace, human_labels, script = load_fixture(path)
     graph = TraceGraph.from_trace(trace)
     judge = FixtureJudge(script)
-    report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+    report = AgenticRecursiveAnalyzer(
+        judge=judge,
+        fusion_mode="retrieval-global",
+    ).analyze(
         graph,
         start_refs=[script["start_ref"]],
         objective="Find the fixture's semantic defect introduction.",
@@ -581,7 +921,7 @@ class RecursiveMetricTest(unittest.TestCase):
             graph=graph,
         )
 
-        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v5")
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v7")
         self.assertEqual(
             set(result),
             {
@@ -589,6 +929,8 @@ class RecursiveMetricTest(unittest.TestCase):
                 "case_id",
                 "metrics",
                 "counts",
+                "metric_scope",
+                "factor_role_confusion_matrix",
                 "disagreements",
                 "safety",
             },
@@ -610,11 +952,17 @@ class RecursiveMetricTest(unittest.TestCase):
                 "request_ratio",
                 "mean_causal_path_length",
                 "factor_role_precision",
+                "factor_role_pair_precision",
+                "factor_role_pair_recall",
+                "factor_role_pair_f1",
                 "unknown_rate",
+                "necessity_unknown_rate",
+                "non_root_role_unknown_rate",
                 "confirmation_rejection_rate",
                 "investigation_yield",
                 "checkpoint_reuse_rate",
                 "human_llm_disagreement_rate",
+                "root_and_factor_role_pair_jaccard_distance",
             },
         )
         self.assertEqual(result["metrics"]["confirmed_root_recall"], 1.0)
@@ -623,11 +971,413 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["judge_request_reduction"], 1.0)
         self.assertEqual(result["metrics"]["request_ratio"], 0.0)
         self.assertEqual(result["counts"]["request_delta"], 10)
+        self.assertEqual(
+            result["metric_scope"]["factor_roles"]["scope"],
+            "full",
+        )
+        self.assertEqual(
+            result["metric_scope"]["factor_roles"]["evaluated_roles"],
+            [
+                "contributing_condition",
+                "amplifying_factor",
+                "downstream_materialization",
+                "unrelated",
+            ],
+        )
+        self.assertEqual(
+            result["metrics"]["human_llm_disagreement_rate"],
+            0.4,
+        )
+        self.assertEqual(
+            result["metrics"][
+                "root_and_factor_role_pair_jaccard_distance"
+            ],
+            0.4,
+        )
+        self.assertEqual(
+            result["metric_scope"]["human_llm_disagreement_rate"][
+                "denominator"
+            ],
+            "unique_human_labeled_semantic_occurrences",
+        )
+        self.assertEqual(
+            result["counts"]["human_labeled_item_count"],
+            5,
+        )
+        self.assertEqual(
+            result["counts"]["human_llm_disagreement_count"],
+            2,
+        )
         for key, value in result["metrics"].items():
             if key in {"top1_match", "negative_control_correct", "judge_request_reduction", "request_ratio", "mean_causal_path_length"}:
                 continue
             self.assertGreaterEqual(value, 0.0, key)
             self.assertLessEqual(value, 1.0, key)
+
+    def test_factor_mechanism_can_target_an_intermediate_recursive_path_node(self):
+        report, _, _, graph = self.fixture()
+        condition = copy.deepcopy(report["contributing_conditions"][0])
+        condition["mechanism"]["target_ref"] = condition["recursive_path"][1]
+
+        violations = _validate_factored_item(
+            graph,
+            condition,
+            semantic_anchor_index("sphinx-recursive-minimal", graph),
+            role="condition",
+        )
+
+        self.assertNotIn(
+            "condition_mechanism_target_mismatch:{0}".format(
+                condition["node_ref"]
+            ),
+            violations,
+        )
+
+    def test_factor_mechanism_cannot_target_its_source_candidate(self):
+        report, _, _, graph = self.fixture()
+        condition = copy.deepcopy(report["contributing_conditions"][0])
+        condition["mechanism"]["target_ref"] = condition["node_ref"]
+
+        violations = _validate_factored_item(
+            graph,
+            condition,
+            semantic_anchor_index("sphinx-recursive-minimal", graph),
+            role="condition",
+        )
+
+        self.assertIn(
+            "condition_mechanism_target_must_be_downstream:{0}".format(
+                condition["node_ref"]
+            ),
+            violations,
+        )
+
+    def test_public_compare_report_never_enables_legacy_gate_bypass(self):
+        report, labels, _, graph = self.fixture()
+        with patch(
+            "scripts.evaluate_recursive_attribution."
+            "validate_recursive_report_against_graph"
+        ) as validate:
+            compare_report(report, labels, None, graph=graph)
+
+        self.assertIs(
+            validate.call_args.kwargs[
+                "migration_decision"
+            ],
+            None,
+        )
+
+    def test_public_compare_report_passes_checkpoint_actions_to_strict_validator(self):
+        report, labels, _, graph = self.fixture()
+        actions = ({"operation": "candidate_cluster_triage_page_completed"},)
+        with patch(
+            "scripts.evaluate_recursive_attribution."
+            "validate_recursive_report_against_graph"
+        ) as validate:
+            compare_report(
+                report,
+                labels,
+                None,
+                graph=graph,
+                action_records=actions,
+            )
+
+        self.assertIs(validate.call_args.kwargs["action_records"], actions)
+
+    def test_evaluator_cli_accepts_checkpoint_directory(self):
+        args = evaluator_module.parse_args(
+            [
+                "--trace",
+                "/tmp/trace.json",
+                "--review",
+                "/tmp/review.json",
+                "--evaluation",
+                "/tmp/evaluation-a.json",
+                "--evaluation",
+                "/tmp/evaluation-b.json",
+                "--report",
+                "/tmp/report.json",
+                "--labels",
+                "/tmp/labels.json",
+                "--checkpoint-dir",
+                "/tmp/checkpoint",
+                "--out",
+                "/tmp/comparison.json",
+            ]
+        )
+
+        self.assertEqual(args.checkpoint_dir, "/tmp/checkpoint")
+        self.assertEqual(args.review, "/tmp/review.json")
+        self.assertEqual(
+            args.evaluation,
+            ["/tmp/evaluation-a.json", "/tmp/evaluation-b.json"],
+        )
+
+    def test_evaluator_checkpoint_loader_uses_validated_committed_actions(self):
+        actions = ({"operation": "candidate_cluster_triage_page_completed"},)
+        state = type("State", (), {"actions": actions})()
+        with patch(
+            "scripts.evaluate_recursive_attribution.CheckpointBundle"
+        ) as bundle_type:
+            bundle_type.return_value.restore.return_value = state
+            result = evaluator_module._read_checkpoint_actions(
+                "/tmp/checkpoint"
+            )
+
+        bundle_type.assert_called_once_with(Path("/tmp/checkpoint"))
+        bundle_type.return_value.restore.assert_called_once_with()
+        self.assertIs(result, actions)
+
+    def test_evaluator_main_reuses_attribution_graph_input_assembly(self):
+        report, labels, _, graph = self.fixture()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            paths = {
+                name: root / "{0}.json".format(name)
+                for name in (
+                    "trace",
+                    "review",
+                    "evaluation_a",
+                    "evaluation_b",
+                    "report",
+                    "labels",
+                    "comparison",
+                )
+            }
+            for name, path in paths.items():
+                if name != "comparison":
+                    path.write_text(
+                        json.dumps(
+                            report if name == "report" else labels
+                            if name == "labels"
+                            else {}
+                        ),
+                        encoding="utf-8",
+                    )
+            with patch(
+                "scripts.evaluate_recursive_attribution.load_benchmark_case",
+                return_value=SimpleNamespace(
+                    graph=graph,
+                    labels_bytes=json.dumps(labels).encode("utf-8"),
+                ),
+            ) as load_case, patch(
+                "scripts.evaluate_recursive_attribution.compare_report",
+                return_value={"schema_version": "test-comparison/v1"},
+            ):
+                status = evaluate_main(
+                    [
+                        "--trace",
+                        str(paths["trace"]),
+                        "--review",
+                        str(paths["review"]),
+                        "--evaluation",
+                        str(paths["evaluation_a"]),
+                        "--evaluation",
+                        str(paths["evaluation_b"]),
+                        "--report",
+                        str(paths["report"]),
+                        "--labels",
+                        str(paths["labels"]),
+                        "--out",
+                        str(paths["comparison"]),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            load_case.assert_called_once_with(
+                bundle_path=None,
+                trace_path=paths["trace"],
+                review_path=paths["review"],
+                evaluation_paths=(paths["evaluation_a"], paths["evaluation_b"]),
+                labels_path=paths["labels"],
+                role="evaluation",
+            )
+
+    def test_modern_sphinx_strict_shape_does_not_require_migration(self):
+        report, _, _, _ = self.fixture()
+
+        classification = classify_legacy_projection_shape(
+            report["investigation_journal"],
+            report["metadata"],
+        )
+
+        self.assertIsInstance(
+            classification,
+            LegacyProjectionNotRequired,
+        )
+        self.assertEqual(
+            classification.reason,
+            "modern_global_projection",
+        )
+
+    def test_candidate_snapshot_tampering_fails_closed_through_compare_report(self):
+        report, labels, _, graph = self.fixture()
+        for mutation in ("content", "owner", "artifact_hash", "ref"):
+            with self.subTest(mutation=mutation):
+                tampered = copy.deepcopy(report)
+                candidate = next(
+                    item
+                    for item in tampered["causal_candidates"]
+                    if item["ref"] == "record:decision"
+                )
+                if mutation == "content":
+                    candidate["node"]["data"]["rationale"] = "forged"
+                elif mutation == "owner":
+                    candidate["node"]["data"]["hydrated_artifacts"] = [
+                        {
+                            "artifact_id": "artifact:forged",
+                            "owner_ref": "record:foreign",
+                            "hash": "sha256:forged",
+                        }
+                    ]
+                elif mutation == "artifact_hash":
+                    candidate["node"]["data"]["hydrated_artifacts"] = [
+                        {
+                            "artifact_id": "artifact:forged",
+                            "hash": "sha256:forged",
+                        }
+                    ]
+                else:
+                    candidate["node"]["ref"] = "record:prompt"
+
+                with self.assertRaises(EvaluationSafetyError):
+                    compare_report(tampered, labels, None, graph=graph)
+
+    def test_evaluator_accepts_all_canonical_candidate_snapshot_views(self):
+        _, _, _, graph = self.fixture()
+        ref = "record:decision"
+        snapshots = (
+            graph.nodes[ref],
+            graph.hydrate_node(ref),
+            graph.sanitize_judge_node(graph.nodes[ref]),
+            graph.sanitize_judge_node(graph.hydrate_node(ref)),
+        )
+        anchors = semantic_anchor_index("sphinx-recursive-minimal", graph)
+        for snapshot in snapshots:
+            with self.subTest(snapshot=snapshot.data):
+                candidate = CausalCandidate(
+                    ref=ref,
+                    node=snapshot,
+                    source="test",
+                ).to_dict()
+                candidate["semantic_anchor_id"] = anchors[ref]
+                self.assertEqual(
+                    _validate_candidate(
+                        graph,
+                        candidate,
+                        anchors,
+                        section="causal_candidates",
+                    ),
+                    [],
+                )
+
+    def test_candidate_publications_use_the_final_canonical_graph_node(self):
+        _, _, _, graph = self.fixture()
+        ref = "record:prompt"
+        raw_node = graph.nodes[ref]
+        hydrated_snapshot = replace(
+            raw_node,
+            data={
+                **raw_node.data,
+                "hydrated_artifacts": [
+                    {
+                        "artifact_id": "artifact:prompt",
+                        "hash": "sha256:prompt",
+                    }
+                ],
+            },
+        )
+        graph.nodes[ref] = hydrated_snapshot
+        publications = _canonicalize_candidate_publications(
+            graph,
+            (
+                CausalCandidate(
+                    ref=ref,
+                    node=raw_node,
+                    source="recursive",
+                    edge={"relation": "semantic"},
+                ),
+                CausalCandidate(
+                    ref=ref,
+                    node=hydrated_snapshot,
+                    source="global",
+                    edge={"relation": "comparison"},
+                ),
+            ),
+        )
+
+        self.assertEqual(len(publications), 2)
+        self.assertEqual(publications[0].node, publications[1].node)
+
+        revision_graph = TraceGraph.from_trace(
+            {
+                "case_id": "candidate-publication-revisions",
+                "records": [
+                    {
+                        "record_id": "stale_change",
+                        "component": "tool",
+                        "event_type": "change",
+                        "data": {"revision_after": 0},
+                    },
+                    {
+                        "record_id": "candidate",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "source_refs": ["record:stale_change"],
+                        "data": {
+                            "repository_revision": 1,
+                            "changed_production_refs": [
+                                "record:stale_change"
+                            ],
+                        },
+                    },
+                    {
+                        "record_id": "active_claim",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "data": {
+                            "repository_revision": 1,
+                            "is_final_for_case": True,
+                        },
+                    },
+                ],
+            }
+        )
+        sanitized = _canonicalize_candidate_publications(
+            revision_graph,
+            (
+                CausalCandidate(
+                    ref="record:candidate",
+                    node=revision_graph.nodes["record:candidate"],
+                    source="recursive",
+                    edge={"relation": "semantic"},
+                ),
+            ),
+        )[0]
+        self.assertEqual(sanitized.node.source_refs, ())
+        self.assertNotIn("changed_production_refs", sanitized.node.data)
+        migrated = _canonicalize_checkpoint_candidate_payloads(
+            revision_graph,
+            {
+                "causal_candidates": [
+                    CausalCandidate(
+                        ref="record:candidate",
+                        node=revision_graph.nodes["record:candidate"],
+                        source="recursive",
+                        edge={"relation": "semantic"},
+                    ).to_dict()
+                ],
+                "introduction_candidates": [],
+            },
+        )
+        migrated_candidate = CausalCandidate.from_dict(
+            migrated["causal_candidates"][0]
+        )
+        self.assertEqual(migrated_candidate.node.source_refs, ())
+        self.assertNotIn(
+            "changed_production_refs",
+            migrated_candidate.node.data,
+        )
 
     def test_empty_denominators_are_explicit_and_success_control_scores_cleanly(self):
         report, labels, _, graph = self.fixture("success_negative_control.json")
@@ -645,6 +1395,379 @@ class RecursiveMetricTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["confirmation_rejection_rate"], 0.0)
         self.assertEqual(result["metrics"]["investigation_yield"], 0.0)
         self.assertEqual(result["metrics"]["checkpoint_reuse_rate"], 0.0)
+
+    def test_unknown_rate_includes_factor_role_judgments(self):
+        total, unknown = _semantic_decision_counts(
+            {
+                "step_judgments": [
+                    {"current_defect_status": "defective"},
+                    {"current_defect_status": "unknown"},
+                ],
+                "confirmations": [
+                    {"status": "confirmed"},
+                    {"status": "unknown"},
+                ],
+                "metadata": {
+                    "factor_role_judgments": [
+                        {
+                            "necessity_status": "not_necessary",
+                            "factor_role": "contributing_condition",
+                        },
+                        {
+                            "necessity_status": "unknown",
+                            "factor_role": "unknown",
+                        },
+                    ]
+                },
+            }
+        )
+        self.assertEqual(total, 6)
+        self.assertEqual(unknown, 3)
+
+    def test_necessary_unknown_role_is_escalation_not_abstention(self):
+        counts = evaluator_module._semantic_unknown_counts(
+            {
+                "step_judgments": [],
+                "confirmations": [],
+                "metadata": {
+                    "factor_role_judgments": [
+                        {
+                            "necessity_status": "necessary",
+                            "factor_role": "unknown",
+                        },
+                        {
+                            "necessity_status": "unknown",
+                            "factor_role": "unknown",
+                        },
+                        {
+                            "necessity_status": "not_necessary",
+                            "factor_role": "unknown",
+                        },
+                        {
+                            "necessity_status": "not_necessary",
+                            "factor_role": "contributing_condition",
+                        },
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(counts["semantic_decision_count"], 4)
+        self.assertEqual(counts["unknown_decision_count"], 2)
+        self.assertEqual(counts["necessity_unknown_count"], 1)
+        self.assertEqual(counts["factor_necessity_decision_count"], 4)
+        self.assertEqual(counts["non_root_role_unknown_count"], 2)
+        self.assertEqual(counts["non_root_role_decision_count"], 3)
+        self.assertEqual(counts["necessary_escalation_count"], 1)
+
+    def test_v3_labels_publish_partial_factor_metric_scope(self):
+        report, labels, _, graph = self.fixture(
+            "timeout_amplifier.json"
+        )
+        result = compare_report(report, labels, None, graph=graph)
+
+        self.assertEqual(
+            labels["schema_version"],
+            "recursive-attribution-labels/v3",
+        )
+        self.assertEqual(
+            result["metric_scope"]["factor_roles"],
+            {
+                "label_schema_version": (
+                    "recursive-attribution-labels/v3"
+                ),
+                "scope": "partial",
+                "unit": "semantic_occurrence_role_pair",
+                "evaluated_roles": [
+                    "contributing_condition",
+                    "amplifying_factor",
+                ],
+                "excluded_roles": [
+                    "downstream_materialization",
+                    "unrelated",
+                ],
+            },
+        )
+
+    def test_v4_role_pair_metrics_include_all_roles_and_confusions(self):
+        occurrence = {
+            role: "semantic_occurrence:v1:{0}".format(role)
+            for role in ("condition", "amplifier", "materialization", "unrelated")
+        }
+        labels = {
+            "schema_version": "recursive-attribution-labels/v4",
+            "case_id": "role-metric-unit",
+            "roots": [],
+            "conditions": [
+                {
+                    "semantic_anchor_id": "semantic_anchor:v2:condition",
+                    "semantic_occurrence_id": occurrence["condition"],
+                }
+            ],
+            "amplifiers": [
+                {
+                    "semantic_anchor_id": "semantic_anchor:v2:amplifier",
+                    "semantic_occurrence_id": occurrence["amplifier"],
+                }
+            ],
+            "materializations": [
+                {
+                    "semantic_anchor_id": "semantic_anchor:v2:materialization",
+                    "semantic_occurrence_id": occurrence[
+                        "materialization"
+                    ],
+                }
+            ],
+            "unrelated": [
+                {
+                    "semantic_anchor_id": "semantic_anchor:v2:unrelated",
+                    "semantic_occurrence_id": occurrence["unrelated"],
+                }
+            ],
+            "forbidden_roots": [],
+            "allowed_unresolved_outcomes": [],
+        }
+        report = {
+            "contributing_conditions": [
+                {
+                    "semantic_occurrence_id": occurrence["condition"],
+                }
+            ],
+            "amplifying_factors": [],
+            "downstream_materializations": [
+                {
+                    "semantic_occurrence_id": occurrence["amplifier"],
+                }
+            ],
+            "rejected_candidates": [
+                {
+                    "semantic_occurrence_id": occurrence["unrelated"],
+                    "confirmation": {
+                        "factor_role": "unrelated",
+                    },
+                }
+            ],
+            "metadata": {
+                "semantic_occurrence_index": {
+                    "record:materialization": occurrence[
+                        "materialization"
+                    ],
+                },
+                "factor_role_judgments": [
+                    {
+                        "candidate_ref": "record:materialization",
+                        "necessity_status": "not_necessary",
+                        "factor_role": "unknown",
+                    }
+                ],
+            },
+        }
+
+        result = evaluator_module._factor_role_evaluation(
+            report,
+            evaluator_module.validate_labels(labels),
+        )
+
+        self.assertEqual(result["precision"], 0.666667)
+        self.assertEqual(result["recall"], 0.5)
+        self.assertEqual(result["f1"], 0.571429)
+        self.assertEqual(
+            result["confusion_matrix"]["amplifying_factor"][
+                "downstream_materialization"
+            ],
+            1,
+        )
+        self.assertEqual(
+            result["confusion_matrix"]["downstream_materialization"][
+                "unknown"
+            ],
+            1,
+        )
+        self.assertEqual(
+            result["confusion_matrix"]["unrelated"]["unrelated"],
+            1,
+        )
+
+    def test_item_disagreement_differs_from_pair_jaccard_for_one_wrong_role(self):
+        occurrence_a = "semantic_occurrence:v1:item-a"
+        occurrence_b = "semantic_occurrence:v1:item-b"
+        labels = evaluator_module.validate_labels(
+            {
+                "schema_version": "recursive-attribution-labels/v4",
+                "case_id": "item-disagreement-unit",
+                "roots": [],
+                "conditions": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:item-a",
+                        "semantic_occurrence_id": occurrence_a,
+                    }
+                ],
+                "amplifiers": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:item-b",
+                        "semantic_occurrence_id": occurrence_b,
+                    }
+                ],
+                "materializations": [],
+                "unrelated": [],
+                "forbidden_roots": [],
+                "allowed_unresolved_outcomes": [],
+            }
+        )
+        report = {
+            "contributing_conditions": [
+                {"semantic_occurrence_id": occurrence_a},
+                {"semantic_occurrence_id": occurrence_b},
+            ],
+            "amplifying_factors": [],
+            "downstream_materializations": [],
+            "rejected_candidates": [],
+            "confirmations": [],
+            "metadata": {
+                "semantic_occurrence_index": {},
+                "factor_role_judgments": [],
+            },
+        }
+        factor_evaluation = evaluator_module._factor_role_evaluation(
+            report,
+            labels,
+        )
+
+        evaluation = (
+            evaluator_module._human_llm_disagreement_evaluation(
+                report,
+                labels,
+                expected_root_occurrences=set(),
+                predicted_root_occurrences=set(),
+                factor_evaluation=factor_evaluation,
+            )
+        )
+
+        self.assertEqual(evaluation["disagreement_count"], 1)
+        self.assertEqual(evaluation["item_count"], 2)
+        self.assertEqual(evaluation["disagreement_rate"], 0.5)
+        self.assertEqual(
+            evaluation["pair_jaccard_distance"],
+            0.666667,
+        )
+        self.assertEqual(
+            evaluation["predicted_class_by_occurrence"],
+            {
+                occurrence_a: "contributing_condition",
+                occurrence_b: "contributing_condition",
+            },
+        )
+
+    def test_sphinx_item_disagreement_includes_the_correct_root(self):
+        occurrences = {
+            name: "semantic_occurrence:v1:{0}".format(name)
+            for name in (
+                "root",
+                "condition",
+                "amplifier",
+                "materialization",
+                "unrelated",
+            )
+        }
+        labels = evaluator_module.validate_labels(
+            {
+                "schema_version": "recursive-attribution-labels/v4",
+                "case_id": "sphinx-disagreement-unit",
+                "roots": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:root",
+                        "semantic_occurrence_id": occurrences["root"],
+                    }
+                ],
+                "conditions": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:condition",
+                        "semantic_occurrence_id": occurrences["condition"],
+                    }
+                ],
+                "amplifiers": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:amplifier",
+                        "semantic_occurrence_id": occurrences["amplifier"],
+                    }
+                ],
+                "materializations": [
+                    {
+                        "semantic_anchor_id": (
+                            "semantic_anchor:v2:materialization"
+                        ),
+                        "semantic_occurrence_id": occurrences[
+                            "materialization"
+                        ],
+                    }
+                ],
+                "unrelated": [
+                    {
+                        "semantic_anchor_id": "semantic_anchor:v2:unrelated",
+                        "semantic_occurrence_id": occurrences["unrelated"],
+                    }
+                ],
+                "forbidden_roots": [],
+                "allowed_unresolved_outcomes": [],
+            }
+        )
+        report = {
+            "confirmed_roots": [
+                {
+                    "semantic_occurrence_id": occurrences["root"],
+                }
+            ],
+            "co_roots": [],
+            "contributing_conditions": [
+                {
+                    "semantic_occurrence_id": occurrences["condition"],
+                }
+            ],
+            "amplifying_factors": [],
+            "downstream_materializations": [
+                {
+                    "semantic_occurrence_id": occurrences["amplifier"],
+                }
+            ],
+            "rejected_candidates": [],
+            "confirmations": [],
+            "metadata": {
+                "semantic_occurrence_index": {
+                    "record:materialization": occurrences[
+                        "materialization"
+                    ],
+                },
+                "factor_role_judgments": [
+                    {
+                        "candidate_ref": "record:materialization",
+                        "necessity_status": "unknown",
+                        "factor_role": "unknown",
+                    }
+                ],
+            },
+        }
+        factor_evaluation = evaluator_module._factor_role_evaluation(
+            report,
+            labels,
+        )
+
+        evaluation = (
+            evaluator_module._human_llm_disagreement_evaluation(
+                report,
+                labels,
+                expected_root_occurrences={occurrences["root"]},
+                predicted_root_occurrences={occurrences["root"]},
+                factor_evaluation=factor_evaluation,
+            )
+        )
+
+        self.assertEqual(evaluation["disagreement_count"], 3)
+        self.assertEqual(evaluation["item_count"], 5)
+        self.assertEqual(evaluation["disagreement_rate"], 0.6)
+        self.assertEqual(
+            evaluation["pair_jaccard_distance"],
+            0.666667,
+        )
 
     def test_evaluator_rejects_all_no_defect_seeds_with_published_roots(self):
         report, labels, _, graph = self.fixture()
@@ -667,7 +1790,7 @@ class RecursiveMetricTest(unittest.TestCase):
         owner_seed_ref = root["observed_defect_refs"][0]
         other_seed_ref = next(
             ref
-            for ref in report["visited_order"]
+            for ref in root["recursive_path"]
             if ref != owner_seed_ref
         )
         other_seed = copy.deepcopy(report["seed_results"][0])
@@ -729,10 +1852,25 @@ class RecursiveMetricTest(unittest.TestCase):
             owner,
             confirmation_identities=(root_confirmation.confirmation_identity,),
         )
+        active_role_binding = ActiveFailureRoleBinding.from_dict(
+            root.provenance["active_role_binding"]
+        )
         updated_root = replace(
             root,
             defect_state=root_defect,
             confirmation=root_confirmation.to_dict(),
+            provenance={
+                **dict(root.provenance),
+                "active_role_binding": replace(
+                    active_role_binding,
+                    failure_signature=root_defect.fingerprint,
+                    defect_fingerprint=root_defect.fingerprint,
+                    failure_identity_source="legacy_defect_state",
+                    counterfactual_prevention_signatures=(
+                        root_defect.fingerprint,
+                    ),
+                ).to_dict(),
+            },
         )
         mutated = parsed.to_dict()
         mutated["seed_results"] = [
@@ -804,7 +1942,11 @@ class RecursiveMetricTest(unittest.TestCase):
         cases.append(unresolved)
 
         duplicate = copy.deepcopy(base)
-        duplicate["step_judgments"].append(copy.deepcopy(duplicate["step_judgments"][0]))
+        duplicate["metadata"]["factor_role_judgments"].append(
+            copy.deepcopy(
+                duplicate["metadata"]["factor_role_judgments"][0]
+            )
+        )
         cases.append(duplicate)
 
         exhausted = copy.deepcopy(base)
@@ -879,9 +2021,22 @@ class RecursiveFixtureTest(unittest.TestCase):
             anchors = semantic_anchor_index(trace["case_id"], graph)
             occurrences = semantic_occurrence_index(trace["case_id"], graph)
             self.assertEqual(
-                human_labels["schema_version"], "recursive-attribution-labels/v3"
+                human_labels["schema_version"],
+                (
+                    "recursive-attribution-labels/v4"
+                    if name == "sphinx_recursive_minimal.json"
+                    else "recursive-attribution-labels/v3"
+                ),
             )
-            for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
+            roles = [
+                "roots",
+                "conditions",
+                "amplifiers",
+                "forbidden_roots",
+            ]
+            if human_labels["schema_version"].endswith("/v4"):
+                roles.extend(["materializations", "unrelated"])
+            for role in roles:
                 for item in human_labels[role]:
                     self.assertEqual(
                         item["semantic_anchor_id"],

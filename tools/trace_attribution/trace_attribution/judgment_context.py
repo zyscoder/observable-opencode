@@ -1,21 +1,333 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Optional
 
-from .causal_state import AttributionHypothesis, CausalCandidate, CausalStepJudgment, DefectState
+from .causal_state import (
+    ActiveFailureRoleBinding,
+    AttributionHypothesis,
+    CausalCandidate,
+    CausalStepJudgment,
+    DefectState,
+    active_failure_signature_for,
+)
+from .confirmation_path import (
+    build_tiered_confirmation_path,
+    validate_tiered_confirmation_path,
+)
 from .episodes import CausalEpisodeIndex
 from .graph import TraceGraph
 from .models import JsonDict, NodeJudgment, TraceNode, stable_json
 from .progress import (
     active_progress_episode_data,
+    active_progress_episode_projection,
     active_progress_navigation_window,
 )
 
 
 JUDGMENT_CONTEXT_VERSION = "1.0"
 EPISODE_MEMBER_LIMIT = 16
+PROCESS_TRAJECTORY_EPISODE_LIMIT = 6
+COMMITMENT_CUE_LIMIT = 4
+ACTIVE_FAILURE_FACTUAL_CONTEXT_SCHEMA = (
+    "active-failure-factual-context/v1"
+)
+ACTIVE_FAILURE_FACT_LIMIT = 8
+_FORBIDDEN_HUMAN_LABEL_KEYS = frozenset(
+    {
+        "human_root",
+        "human_roots",
+        "human_root_labels",
+        "ground_truth_root",
+        "ground_truth_roots",
+        "expected_root",
+        "expected_roots",
+    }
+)
+
+
+def _contains_forbidden_human_labels(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            str(key).strip().casefold() in _FORBIDDEN_HUMAN_LABEL_KEYS
+            or _contains_forbidden_human_labels(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_forbidden_human_labels(item) for item in value)
+    return False
+
+
+def _active_failure_reference(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("active failure factual reference must be an object")
+    raw_ref = str(value.get("raw_ref") or value.get("resolved_ref") or "")
+    resolved_ref = str(value.get("resolved_ref") or "")
+    resolution_status = str(value.get("resolution_status") or "")
+    revision_status = str(
+        value.get("revision_provenance_status") or "valid"
+    )
+    if (
+        not raw_ref
+        or not resolved_ref
+        or resolution_status != "resolved"
+    ):
+        raise ValueError("unresolved ref in active failure factual context")
+    if revision_status != "valid":
+        raise ValueError(
+            "revision provenance mismatch in active failure factual context"
+        )
+    return {
+        "raw_ref": raw_ref,
+        "resolved_ref": resolved_ref,
+        "resolution_status": "resolved",
+        "revision_provenance_status": "valid",
+        "provenance_class": str(
+            value.get("provenance_class") or "recorded"
+        ),
+    }
+
+
+def _active_failure_fact(
+    *,
+    reference: Mapping[str, Any],
+    node: Mapping[str, Any],
+) -> JsonDict:
+    return {
+        "reference": _active_failure_reference(reference),
+        "component": str(node.get("component") or ""),
+        "event_type": str(node.get("event_type") or ""),
+        "status": str(node.get("status") or ""),
+        "data": dict(node.get("data") or {})
+        if isinstance(node.get("data"), Mapping)
+        else {},
+    }
+
+
+def _active_failure_fact_categories(fact: Mapping[str, Any]) -> tuple:
+    semantic = stable_json(
+        {
+            "component": fact.get("component"),
+            "event_type": fact.get("event_type"),
+            "status": fact.get("status"),
+            "data": fact.get("data"),
+        }
+    ).casefold()
+    categories = []
+    if any(token in semantic for token in ("decision", "plan", "rationale")):
+        categories.append("plans")
+    if any(
+        token in semantic
+        for token in ("edit", "patch", "diff", "implementation", "change")
+    ):
+        categories.append("edits")
+    if any(token in semantic for token in ("verification", "verify", "test")):
+        categories.append("verifications")
+    if any(
+        token in semantic
+        for token in ("evaluation", "outcome", "observed_defect", "failure")
+    ):
+        categories.append("outcomes")
+    return tuple(categories)
+
+
+def build_active_failure_factual_context(
+    *,
+    defect_state: DefectState,
+    seed_ref: str,
+    candidate_entries: Iterable[Mapping[str, Any]],
+    obligations: Iterable[Mapping[str, Any]] = (),
+    competitors: Iterable[Mapping[str, Any]] = (),
+    active_role_binding: Optional[ActiveFailureRoleBinding] = None,
+) -> JsonDict:
+    categories = {
+        "plans": [],
+        "edits": [],
+        "verifications": [],
+        "outcomes": [],
+    }
+    tiered_paths = []
+    seed_fact_payloads = []
+    seen_facts = {name: set() for name in categories}
+    for entry in candidate_entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("candidate factual context entry must be an object")
+        path_refs = tuple(str(ref) for ref in entry.get("path_refs") or ())
+        tiered_paths.append(
+            build_tiered_confirmation_path(
+                path_refs,
+                entry.get("edges") or (),
+            )
+        )
+        references = entry.get("path_references") or ()
+        if not isinstance(references, (list, tuple)):
+            raise ValueError("candidate path references must be an array")
+        for raw_reference in references:
+            if not isinstance(raw_reference, Mapping):
+                raise ValueError("candidate path reference must be an object")
+            node = raw_reference.get("node")
+            if not isinstance(node, Mapping):
+                node = (
+                    entry.get("candidate_node")
+                    if str(raw_reference.get("resolved_ref") or "")
+                    == str(entry.get("candidate_ref") or "")
+                    else {}
+                )
+            fact = _active_failure_fact(
+                reference=raw_reference,
+                node=node if isinstance(node, Mapping) else {},
+            )
+            if fact["reference"]["resolved_ref"] == seed_ref:
+                seed_fact_payloads.append(fact["data"])
+                fact_categories = ("outcomes",)
+            else:
+                fact_categories = _active_failure_fact_categories(fact)
+            for category in fact_categories:
+                identity = fact["reference"]["resolved_ref"]
+                if (
+                    identity not in seen_facts[category]
+                    and len(categories[category]) < ACTIVE_FAILURE_FACT_LIMIT
+                ):
+                    seen_facts[category].add(identity)
+                    categories[category].append(fact)
+    context = {
+        "schema": ACTIVE_FAILURE_FACTUAL_CONTEXT_SCHEMA,
+        "failure_signature": active_failure_signature_for(
+            defect_state,
+            seed_ref=seed_ref,
+            seed_facts=(
+                seed_fact_payloads[0] if seed_fact_payloads else None
+            ),
+        ),
+        "obligations": [
+            dict(item)
+            for item in obligations
+            if isinstance(item, Mapping)
+        ][:ACTIVE_FAILURE_FACT_LIMIT],
+        **categories,
+        "competitors": [
+            dict(item)
+            for item in competitors
+            if isinstance(item, Mapping)
+        ][:ACTIVE_FAILURE_FACT_LIMIT],
+        "tiered_paths": sorted(
+            tiered_paths,
+            key=lambda item: tuple(item["path_refs"]),
+        ),
+    }
+    if active_role_binding is not None:
+        context["active_role_binding"] = active_role_binding.to_dict()
+    return validate_active_failure_factual_context(context)
+
+
+def validate_active_failure_factual_context(value: Any) -> JsonDict:
+    base_keys = {
+        "schema",
+        "failure_signature",
+        "obligations",
+        "plans",
+        "edits",
+        "verifications",
+        "outcomes",
+        "competitors",
+        "tiered_paths",
+    }
+    actual_keys = (
+        frozenset(value) if isinstance(value, Mapping) else frozenset()
+    )
+    if not isinstance(value, Mapping) or actual_keys not in {
+        frozenset(base_keys),
+        frozenset({*base_keys, "active_role_binding"}),
+    }:
+        raise ValueError("active failure factual context schema mismatch")
+    if value.get("schema") != ACTIVE_FAILURE_FACTUAL_CONTEXT_SCHEMA:
+        raise ValueError("unsupported active failure factual context schema")
+    if _contains_forbidden_human_labels(value):
+        raise ValueError("human labels are forbidden in Judge factual context")
+    signature = value.get("failure_signature")
+    if not isinstance(signature, Mapping) or set(signature) != {
+        "schema",
+        "seed_ref",
+        "signature_id",
+        "fingerprint",
+        "identity_source",
+        "kind",
+        "expected",
+        "actual",
+        "mechanism",
+        "scope",
+    }:
+        raise ValueError("failure signature factual context is invalid")
+    if (
+        signature.get("schema") != "active-failure-signature/v2"
+        or not str(signature.get("seed_ref") or "")
+        or not str(signature.get("signature_id") or "")
+        or not str(signature.get("fingerprint") or "")
+        or signature.get("identity_source")
+        not in {"structured_failure_signature", "legacy_defect_state"}
+    ):
+        raise ValueError("failure signature factual context is incomplete")
+    canonical: JsonDict = {
+        "schema": ACTIVE_FAILURE_FACTUAL_CONTEXT_SCHEMA,
+        "failure_signature": dict(signature),
+    }
+    for field_name in (
+        "obligations",
+        "plans",
+        "edits",
+        "verifications",
+        "outcomes",
+        "competitors",
+    ):
+        items = value.get(field_name)
+        if (
+            not isinstance(items, (list, tuple))
+            or len(items) > ACTIVE_FAILURE_FACT_LIMIT
+            or any(not isinstance(item, Mapping) for item in items)
+        ):
+            raise ValueError(
+                "{0} factual context must be a bounded object array".format(
+                    field_name
+                )
+            )
+        canonical[field_name] = [dict(item) for item in items]
+        if field_name in {"plans", "edits", "verifications", "outcomes"}:
+            for item in items:
+                _active_failure_reference(item.get("reference"))
+    paths = value.get("tiered_paths")
+    if not isinstance(paths, (list, tuple)) or not paths:
+        raise ValueError("active failure context requires tiered paths")
+    canonical["tiered_paths"] = sorted(
+        (validate_tiered_confirmation_path(item) for item in paths),
+        key=lambda item: tuple(item["path_refs"]),
+    )
+    if "active_role_binding" in value:
+        binding = ActiveFailureRoleBinding.from_dict(
+            value.get("active_role_binding")
+        )
+        if (
+            binding.seed_ref != signature.get("seed_ref")
+            or binding.failure_signature != signature.get("signature_id")
+            or binding.defect_fingerprint != signature.get("fingerprint")
+            or binding.failure_identity_source
+            != signature.get("identity_source")
+        ):
+            raise ValueError(
+                "active role binding contradicts failure signature"
+            )
+        canonical["active_role_binding"] = binding.to_dict()
+    return canonical
+
+
+def judge_visible_active_failure_factual_context(value: Any) -> JsonDict:
+    """Project factual context without prior causal-role verdicts."""
+    canonical = validate_active_failure_factual_context(value)
+    canonical.pop("active_role_binding", None)
+    return canonical
+
+
 def build_causal_judgment_context(
     *,
     graph: TraceGraph,
@@ -53,6 +365,15 @@ def build_causal_judgment_context(
             current_ref=resolved,
             path=path,
         ),
+        "candidate_process_trajectory": candidate_process_trajectory_context(
+            graph=graph,
+            current_ref=resolved,
+            path=path,
+        ),
+        "candidate_commitment_cues": candidate_commitment_cue_context(
+            graph=graph,
+            current_ref=resolved,
+        ),
     }
     context["context_manifest"] = {
         "upstream_candidate_count": len(upstream_refs),
@@ -61,6 +382,12 @@ def build_causal_judgment_context(
         "downstream_judgment_count": len(downstream_judgments),
         "has_progress_episode": bool(progress_episode),
         "has_progress_navigation_window": bool(context["progress_navigation_window"]),
+        "has_candidate_process_trajectory": bool(
+            context["candidate_process_trajectory"]
+        ),
+        "has_candidate_commitment_cues": bool(
+            context["candidate_commitment_cues"]
+        ),
         "missing_active_defect_fields": [
             key
             for key in ("expected", "actual", "mechanism")
@@ -151,6 +478,12 @@ def build_recursive_judgment_context(
         "progress_episode": legacy_context.get("progress_episode", {}),
         "progress_navigation_window": legacy_context.get(
             "progress_navigation_window", {}
+        ),
+        "candidate_process_trajectory": legacy_context.get(
+            "candidate_process_trajectory", {}
+        ),
+        "candidate_commitment_cues": legacy_context.get(
+            "candidate_commitment_cues", {}
         ),
         "incoming_edges": legacy_context.get("incoming_edges", []),
         "outgoing_edges_on_active_path": legacy_context.get(
@@ -734,9 +1067,252 @@ def progress_navigation_context(*, graph: TraceGraph, current_ref: str, path: Li
             if node and node.event_type == "progress.episode":
                 anchor_ref = resolved
                 break
+    if not anchor_ref and path:
+        candidate_episode_ref = str(
+            progress_episode_context(graph, current_ref).get("ref") or ""
+        )
+        target_ref = graph.resolve(path[-1]) or path[-1]
+        candidate_windows = []
+        for upstream_ref in graph.upstream_refs(target_ref):
+            upstream = graph.nodes.get(upstream_ref)
+            if upstream is None or upstream.event_type != "progress.episode":
+                continue
+            window = active_progress_navigation_window(
+                graph,
+                upstream_ref,
+            )
+            if candidate_episode_ref in (
+                window.get("member_episode_refs") or ()
+            ):
+                candidate_windows.append((upstream_ref, window))
+        if candidate_windows:
+            anchor_ref = max(
+                candidate_windows,
+                key=lambda item: graph.position(item[0]),
+            )[0]
     if not anchor_ref:
         return {}
     return active_progress_navigation_window(graph, anchor_ref)
+
+
+def candidate_process_trajectory_context(
+    *, graph: TraceGraph, current_ref: str, path: List[str]
+) -> JsonDict:
+    """Project bounded post-candidate execution facts without assigning blame."""
+    navigation = progress_navigation_context(
+        graph=graph,
+        current_ref=current_ref,
+        path=path,
+    )
+    episode_refs = [
+        str(ref) for ref in navigation.get("member_episode_refs") or ()
+    ]
+    if not episode_refs:
+        return {}
+    projected = active_progress_episode_projection(graph).get("episodes") or {}
+    candidate_index = next(
+        (
+            index
+            for index, ref in enumerate(episode_refs)
+            if current_ref in (projected.get(ref, {}).get("member_refs") or ())
+        ),
+        None,
+    )
+    if candidate_index is None:
+        return {}
+    trailing_refs = episode_refs[candidate_index:]
+    trailing = [projected[ref] for ref in trailing_refs if ref in projected]
+    if not trailing:
+        return {}
+
+    def count(key: str) -> int:
+        return sum(int(item.get(key) or 0) for item in trailing)
+
+    mutation_count = count("mutation_count")
+    verification_count = count("verification_count")
+    anchor_refs = [trailing_refs[0]]
+    first_delivery = next(
+        (
+            ref
+            for ref in trailing_refs[1:]
+            if int(projected[ref].get("mutation_count") or 0)
+            or int(projected[ref].get("verification_count") or 0)
+        ),
+        "",
+    )
+    if first_delivery:
+        anchor_refs.append(first_delivery)
+    most_exploratory = max(
+        trailing_refs,
+        key=lambda ref: (
+            int(projected[ref].get("search_read_count") or 0),
+            int(projected[ref].get("action_count") or 0),
+            int(projected[ref].get("chronology_index") or 0),
+        ),
+    )
+    anchor_refs.append(most_exploratory)
+    anchor_refs.extend(trailing_refs[-2:])
+    bounded_anchor_refs = list(dict.fromkeys(anchor_refs))[
+        :PROCESS_TRAJECTORY_EPISODE_LIMIT
+    ]
+
+    def summary(ref: str) -> JsonDict:
+        data = projected[ref]
+        return {
+            "episode_ref": ref,
+            "reference": ground_reference(graph, ref, "reconstructed"),
+            **{
+                key: data[key]
+                for key in (
+                    "chronology_index",
+                    "phase",
+                    "no_delivery_progress",
+                    "search_read_count",
+                    "mutation_count",
+                    "verification_count",
+                    "error_count",
+                    "member_summaries",
+                )
+                if data.get(key) not in (None, "", [], {})
+            },
+        }
+
+    return {
+        "schema": "candidate-process-trajectory/v1",
+        "behavior_impact": "none_offline_analysis_only",
+        "candidate_ref": current_ref,
+        "candidate_reference": ground_reference(
+            graph, current_ref, "recorded"
+        ),
+        "candidate_episode_ref": trailing_refs[0],
+        "window_anchor_ref": str(
+            navigation.get("anchor_episode_ref") or ""
+        ),
+        "post_candidate_episode_count": len(trailing_refs),
+        "post_candidate_no_delivery_episode_count": sum(
+            bool(item.get("no_delivery_progress")) for item in trailing
+        ),
+        "post_candidate_search_read_count": count("search_read_count"),
+        "post_candidate_mutation_count": mutation_count,
+        "post_candidate_verification_count": verification_count,
+        "post_candidate_delivery_observed": bool(
+            mutation_count or verification_count
+        ),
+        "trajectory_boundary": "trace_observation_boundary",
+        "episode_summaries": [summary(ref) for ref in bounded_anchor_refs],
+        "episode_summaries_truncated": len(bounded_anchor_refs)
+        < len(trailing_refs),
+    }
+
+
+_COMMITMENT_CUE_PATTERNS = (
+    re.compile(
+        r"\b(?:I(?:'ll| will)|I(?:'m| am) going to)\s+(?:now\s+)?"
+        r"(?:write|implement|add|edit|patch|modify|fix|complete|finish|"
+        r"replace|restore|reconstruct|create|update|remove|test|verify)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:我会|我将|接下来我会|接下来我将)\s*"
+        r"(?:编写|实现|添加|编辑|修改|修复|补全|完成|替换|恢复|重构|创建|更新|删除|测试|验证)"
+    ),
+)
+
+
+def candidate_commitment_cue_context(
+    *, graph: TraceGraph, current_ref: str
+) -> JsonDict:
+    """Project exact forward-action language as a cue, never as a verdict."""
+    node = graph.hydrate_node(current_ref)
+    if str(node.data.get("decision_type") or "") != "reasoning_block":
+        return {}
+    sources = []
+    hydrated = node.data.get("hydrated_artifacts")
+    if isinstance(hydrated, (list, tuple)):
+        for item in hydrated:
+            if not isinstance(item, Mapping):
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                sources.append(
+                    (
+                        "hydrated_artifact",
+                        str(item.get("artifact_id") or ""),
+                        content,
+                    )
+                )
+    rationale = node.data.get("rationale")
+    if isinstance(rationale, str) and rationale:
+        sources.append(("recorded_rationale", "", rationale))
+    elif isinstance(rationale, Mapping):
+        preview = rationale.get("preview")
+        if isinstance(preview, str) and preview:
+            sources.append(
+                (
+                    "recorded_artifact_preview",
+                    str(rationale.get("artifact_id") or ""),
+                    preview,
+                )
+            )
+
+    cues = []
+    seen = set()
+    for source_kind, artifact_id, text in sources:
+        for pattern in _COMMITMENT_CUE_PATTERNS:
+            for match in pattern.finditer(text):
+                end_candidates = [
+                    index
+                    for marker in ("\n", ".", "!", "?", "。", "！", "？")
+                    for index in [text.find(marker, match.end())]
+                    if index >= 0
+                ]
+                excerpt_end = min(end_candidates) + 1 if end_candidates else min(
+                    len(text), match.end() + 180
+                )
+                excerpt = text[match.start() : excerpt_end].strip()
+                normalized = " ".join(excerpt.casefold().split())
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                cue_id = "commitment_cue:{0}".format(
+                    hashlib.sha256(
+                        "{0}\0{1}\0{2}".format(
+                            current_ref, source_kind, excerpt
+                        ).encode("utf-8")
+                    ).hexdigest()[:20]
+                )
+                cues.append(
+                    {
+                        "cue_id": cue_id,
+                        "cue_type": "explicit_forward_action_language",
+                        "strength": "strong",
+                        "verbatim_excerpt": excerpt,
+                        "source_kind": source_kind,
+                        "source_artifact_id": artifact_id,
+                        "semantic_status": (
+                            "candidate_cue_not_a_commitment_verdict"
+                        ),
+                    }
+                )
+                if len(cues) >= COMMITMENT_CUE_LIMIT:
+                    break
+            if len(cues) >= COMMITMENT_CUE_LIMIT:
+                break
+        if len(cues) >= COMMITMENT_CUE_LIMIT:
+            break
+    if not cues:
+        return {}
+    return {
+        "schema": "candidate-commitment-cues/v1",
+        "behavior_impact": "none_offline_analysis_only",
+        "candidate_ref": current_ref,
+        "candidate_reference": ground_reference(
+            graph, current_ref, "recorded"
+        ),
+        "cue_count": len(cues),
+        "cues": cues,
+        "cues_truncated": len(cues) >= COMMITMENT_CUE_LIMIT,
+    }
 
 
 def compact_node_summary(node: TraceNode) -> JsonDict:

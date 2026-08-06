@@ -102,7 +102,12 @@ def checkpoint_for(
     fusion_mode: str = "off",
     name: str = "fix26",
 ):
-    config = shared_root_checkpoint_config(trace, OBJECTIVE, starts)
+    config = shared_root_checkpoint_config(
+        trace,
+        OBJECTIVE,
+        starts,
+        fusion_mode=fusion_mode,
+    )
     tempdir = tempfile.TemporaryDirectory()
     root = Path(tempdir.name) / "{0}.checkpoint".format(name)
     report = AgenticRecursiveAnalyzer(
@@ -1088,16 +1093,16 @@ class Fix26VersionIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v18",
+            "recursive-analysis-actions/v25",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,

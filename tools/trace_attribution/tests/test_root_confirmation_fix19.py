@@ -45,6 +45,7 @@ from trace_attribution.recursive_analyzer import (
     ACTION_STATE_SCHEMA,
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
+    _assert_report_checkpoint_evidence,
 )
 from tools.trace_attribution.tests.test_seed_attribution import (
     SharedRootFusionJudge,
@@ -210,6 +211,74 @@ class TypedEvidenceSanitizerTest(unittest.TestCase):
                 ]
             },
         )
+
+    def test_verification_refs_are_active_graph_references_not_plain_text(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "fix19-verification-reference-sanitizer",
+                "records": [
+                    {
+                        "record_id": "baseline",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "baseline",
+                            "repository_revision": 0,
+                            "effective_for_final_state": False,
+                        },
+                    },
+                    {
+                        "record_id": "current",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "current",
+                            "repository_revision": 1,
+                            "effective_for_final_state": True,
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            graph.sanitize_judge_visible_payload(
+                {
+                    "summary": "Keep the semantic fact.",
+                    "verification_refs": ["verification:baseline"],
+                }
+            ),
+            {"summary": "Keep the semantic fact."},
+        )
+        self.assertEqual(
+            graph.sanitize_judge_visible_payload(
+                {"verification_refs": ["verification:current"]}
+            ),
+            {"verification_refs": ["record:current"]},
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "violates graph evidence eligibility",
+        ):
+            _assert_report_checkpoint_evidence(
+                graph,
+                {
+                    "seed_results": [],
+                    "investigation_journal": [
+                        {
+                            "candidate": {
+                                "data": {
+                                    "verification_refs": [
+                                        "verification:baseline"
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                },
+                label="fresh completed report",
+            )
 
     def test_truncated_semantic_slice_is_not_available_or_judge_visible(self):
         content = "partial semantic slice"
@@ -626,12 +695,12 @@ class LocalStateOwnerRestoreTest(unittest.TestCase):
     def test_persisted_local_owner_contract_versions_are_current(self):
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
 
 

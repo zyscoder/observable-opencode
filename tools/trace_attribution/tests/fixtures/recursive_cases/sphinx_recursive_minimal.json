@@ -11,11 +11,13 @@
   ],
   "dataflow_edges": [],
   "human_labels": {
-    "schema_version": "recursive-attribution-labels/v3",
+    "schema_version": "recursive-attribution-labels/v4",
     "case_id": "sphinx-recursive-minimal",
     "roots": [{"node_ref": "record:decision", "semantic_anchor_id": "semantic_anchor:v2:5a67e700f8eb2841a383adeb", "semantic_occurrence_id": "semantic_occurrence:v1:02dffeebc2dc81747aa5bb58"}],
     "conditions": [{"node_ref": "record:prompt", "semantic_anchor_id": "semantic_anchor:v2:a47fd087a7418b041d9b9db7", "semantic_occurrence_id": "semantic_occurrence:v1:71d2624da202a5bcb5a1d205"}],
     "amplifiers": [{"node_ref": "record:timeout", "semantic_anchor_id": "semantic_anchor:v2:ab9849be297bbfb72e04a1e7", "semantic_occurrence_id": "semantic_occurrence:v1:a4227f3638a9212135c3a810"}],
+    "materializations": [{"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:878fe4dbbbe4313d825144ea", "semantic_occurrence_id": "semantic_occurrence:v1:92b16d4b7c17524c058db00e"}],
+    "unrelated": [{"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:98204061fc42c7e51c84f00c", "semantic_occurrence_id": "semantic_occurrence:v1:2e1d67206858fd695261dd98"}],
     "forbidden_roots": [
       {"node_ref": "record:verification", "semantic_anchor_id": "semantic_anchor:v2:98204061fc42c7e51c84f00c", "semantic_occurrence_id": "semantic_occurrence:v1:2e1d67206858fd695261dd98"},
       {"node_ref": "record:change", "semantic_anchor_id": "semantic_anchor:v2:878fe4dbbbe4313d825144ea", "semantic_occurrence_id": "semantic_occurrence:v1:92b16d4b7c17524c058db00e"}

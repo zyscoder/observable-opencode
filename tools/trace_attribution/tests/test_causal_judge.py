@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution.causal_judge import (
@@ -13,10 +16,17 @@ from trace_attribution.causal_judge import (
     ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION,
     BoundedJudgeCallResult,
     BoundedJudgeCallError,
+    CausalJudge,
     CausalStepRequest,
     ClaudeCausalJudge,
+    FactorRoleRequest,
+    OfflineCausalJudgeAdapter,
+    OfflineJudgeCapability,
     RootConfirmationRequest,
+    _factor_role_allowed_refs_from_facts,
+    _repair_constraints,
     build_causal_step_prompt,
+    build_factor_role_prompt,
     build_recursive_confirmation_prompt,
     bind_root_confirmation,
     validate_causal_step_payload,
@@ -25,10 +35,13 @@ from trace_attribution.causal_judge import (
 from trace_attribution.causal_state import (
     CausalCandidate,
     DefectState,
+    FactorRoleJudgment,
     confirmation_counterfactual_for,
     confirmation_identity_for,
 )
 from trace_attribution.claude import ClaudeJudgeClient
+from trace_attribution import claude as claude_module
+from trace_attribution import errors as provider_errors
 from trace_attribution.errors import (
     JudgeProviderError,
     JudgeProviderUnavailable,
@@ -153,6 +166,224 @@ def valid_step_payload(
         "suggested_investigation": None,
         "confidence": 0.9,
     }
+
+
+class ProcessDefectPromptTests(unittest.TestCase):
+    def test_causal_step_prompt_distinguishes_process_defect_from_baseline_failure(self):
+        prompt = build_causal_step_prompt(sample_step_request())
+
+        self.assertIn("candidate-local process defect", prompt)
+        self.assertIn("pre-existing downstream functional defect", prompt)
+        self.assertIn("responsible non-repair", prompt)
+
+    def process_request(self) -> CausalStepRequest:
+        base = sample_step_request()
+        context = dict(base.recursive_context)
+        context["active_hypothesis_id"] = "hyp:process"
+        context["candidate_process_trajectory"] = {
+            "schema": "candidate-process-trajectory/v1",
+            "candidate_ref": "record:change",
+            "candidate_reference": reference_envelope("record:change"),
+            "post_candidate_episode_count": 12,
+            "post_candidate_no_delivery_episode_count": 12,
+            "post_candidate_mutation_count": 0,
+            "post_candidate_verification_count": 0,
+            "post_candidate_delivery_observed": False,
+            "episode_summaries": [
+                {
+                    "episode_ref": "record:trajectory_episode",
+                    "reference": reference_envelope(
+                        "record:trajectory_episode",
+                        provenance="reconstructed",
+                    ),
+                }
+            ],
+        }
+        context["candidate_commitment_cues"] = {
+            "schema": "candidate-commitment-cues/v1",
+            "candidate_ref": "record:change",
+            "candidate_reference": reference_envelope("record:change"),
+            "cue_count": 1,
+            "cues": [
+                {
+                    "cue_id": "commitment_cue:test",
+                    "cue_type": "explicit_forward_action_language",
+                    "verbatim_excerpt": (
+                        "I will implement the required parser methods now."
+                    ),
+                    "semantic_status": (
+                        "candidate_cue_not_a_commitment_verdict"
+                    ),
+                }
+            ],
+        }
+        context["task_obligations"] = [
+            {
+                "source": "analysis_objective",
+                "text": "Explain why the required parser repair was not delivered.",
+            }
+        ]
+        return replace(
+            base,
+            recursive_context=context,
+            defect_state=DefectState.create(
+                label="candidate_local_process_defect",
+                expected="The implementation commitment is fulfilled.",
+                actual="No mutation or verification followed the commitment.",
+                mechanism=(
+                    "Judge responsible non-repair separately from the "
+                    "pre-existing downstream functional defect."
+                ),
+                scope="candidate_local_process_execution",
+            ),
+        )
+
+    def process_payload(self, *, status="present", commitment="unfulfilled"):
+        request = self.process_request()
+        return {
+            "current_node_ref": "record:change",
+            "current_defect_status": status,
+            "current_defect_reason": (
+                "The explicit implementation commitment remained unfulfilled "
+                "through twelve no-delivery episodes."
+            ),
+            "predecessors": [
+                {
+                    "ref": "record:decision",
+                    "relation": "unrelated",
+                    "reason": "The predecessor does not carry this commitment breach.",
+                    "confidence": 0.8,
+                    "recurse": False,
+                    "upstream_defect": None,
+                    "evidence_refs": ["record:decision"],
+                    "missing_evidence": [],
+                }
+            ],
+            "candidate_introduction": status == "present",
+            "process_assessment": {
+                "candidate_role": "implementation_commitment",
+                "commitment_status": commitment,
+                "trajectory_relation": "remained_investigation",
+                "failure_mode": (
+                    "responsible_omission"
+                    if status == "present"
+                    else "none"
+                ),
+                "commitment_cue_disposition": "commitment",
+                "commitment_cue_reason": (
+                    "The first-person forward statement commits to the repair."
+                ),
+                "obligation_refs": ["analysis_objective"],
+                "reason": "The commitment was not materialized before the trace boundary.",
+                "evidence_refs": [
+                    "record:change",
+                    "record:trajectory_episode",
+                ],
+            },
+            "missing_evidence": [],
+            "suggested_investigation": (
+                {
+                    "action": "request_root_confirmation",
+                    "arguments": {
+                        "hypothesis_id": "hyp:process",
+                        "candidate_ref": "record:change",
+                        "defect_fingerprint": request.defect_state.fingerprint,
+                    },
+                    "reason": "Independently confirm the commitment breach.",
+                }
+                if status == "present"
+                else None
+            ),
+            "confidence": 0.9,
+        }
+
+    def test_process_assessment_accepts_grounded_unfulfilled_commitment(self):
+        request = self.process_request()
+        judgment = validate_causal_step_payload(
+            self.process_payload(), request=request
+        )
+
+        self.assertTrue(judgment.candidate_introduction)
+        self.assertEqual(
+            judgment.process_assessment["failure_mode"],
+            "responsible_omission",
+        )
+
+    def test_process_assessment_rejects_absent_unfulfilled_commitment(self):
+        with self.assertRaisesRegex(
+            ValueError, "unfulfilled commitment requires a present process defect"
+        ):
+            validate_causal_step_payload(
+                self.process_payload(status="absent"),
+                request=self.process_request(),
+            )
+
+    def test_unfulfilled_commitment_requires_distinct_trajectory_evidence(self):
+        payload = self.process_payload()
+        payload["process_assessment"]["evidence_refs"] = ["record:change"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "unfulfilled commitment requires grounded candidate and trajectory evidence",
+        ):
+            validate_causal_step_payload(
+                payload,
+                request=self.process_request(),
+            )
+
+    def test_responsible_omission_requires_exact_task_obligation_reference(self):
+        payload = self.process_payload()
+        payload["process_assessment"]["obligation_refs"] = [
+            "task_obligations[0]"
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "responsible omission requires exact supplied task obligation refs",
+        ):
+            validate_causal_step_payload(
+                payload,
+                request=self.process_request(),
+            )
+
+    def test_process_candidate_requires_structured_assessment(self):
+        payload = self.process_payload()
+        payload.pop("process_assessment")
+
+        with self.assertRaisesRegex(
+            ValueError, "candidate-local process defect requires process_assessment"
+        ):
+            validate_causal_step_payload(
+                payload, request=self.process_request()
+            )
+
+    def test_explicit_commitment_cue_cannot_be_silently_ignored(self):
+        payload = self.process_payload(status="absent", commitment="not_applicable")
+        payload["process_assessment"]["commitment_cue_disposition"] = (
+            "not_applicable"
+        )
+        payload["process_assessment"]["failure_mode"] = "none"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "recorded commitment cue requires an explicit disposition",
+        ):
+            validate_causal_step_payload(
+                payload, request=self.process_request()
+            )
+
+    def test_fulfilled_commitment_requires_observed_delivery(self):
+        payload = self.process_payload(status="absent", commitment="fulfilled")
+        payload["process_assessment"]["trajectory_relation"] = "materialized"
+        payload["process_assessment"]["failure_mode"] = "none"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "fulfilled commitment requires observed delivery",
+        ):
+            validate_causal_step_payload(
+                payload, request=self.process_request()
+            )
 
 
 def reference_envelope(
@@ -967,6 +1198,31 @@ class RootConfirmationValidationTest(unittest.TestCase):
         payload["evidence_refs"] = ["record:decision", "record:change"]
         result = validate_recursive_confirmation(payload, request=sample_confirmation_request())
         self.assertEqual(result.factor_mechanism["mechanism_type"], "amplification")
+
+    def test_rejected_unrelated_role_requires_grounded_evidence(self):
+        payload = valid_confirmation_payload()
+        payload.update(
+            {
+                "status": "rejected",
+                "factor_role": "unrelated",
+                "excerpt": "",
+                "evidence_refs": [],
+                "counterfactual": {
+                    "intervention_ref": "record:decision",
+                    "intervention_kind": "replace_with_semantically_correct_behavior",
+                    "predicted_defect_status": "present",
+                    "causal_effect": "does_not_prevent_defect",
+                },
+                "factor_mechanism": {},
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "definitive confirmation requires grounded evidence refs"
+        ):
+            validate_recursive_confirmation(
+                payload, request=sample_confirmation_request()
+            )
 
     def test_factual_prompt_includes_analysis_perspective(self):
         request = sample_confirmation_request()
@@ -2069,6 +2325,181 @@ class RootConfirmationValidationTest(unittest.TestCase):
 
 
 class CausalJudgePromptTest(unittest.TestCase):
+    def process_confirmation_request(self):
+        process_facts = {
+            "schema": "candidate-process-confirmation-facts/v1",
+            "candidate_commitment_cues": {
+                "schema": "candidate-commitment-cues/v1",
+                "candidate_ref": "record:decision",
+                "candidate_reference": reference_envelope(
+                    "record:decision"
+                ),
+                "cue_count": 1,
+                "cues": [
+                    {
+                        "cue_id": "commitment_cue:test",
+                        "verbatim_excerpt": "I will implement the repair.",
+                        "semantic_status": (
+                            "candidate_cue_not_a_commitment_verdict"
+                        ),
+                    }
+                ],
+            },
+            "candidate_process_trajectory": {
+                "schema": "candidate-process-trajectory/v1",
+                "candidate_ref": "record:decision",
+                "candidate_reference": reference_envelope(
+                    "record:decision"
+                ),
+                "post_candidate_mutation_count": 0,
+                "post_candidate_verification_count": 0,
+                "post_candidate_delivery_observed": False,
+                "episode_summaries": [
+                    {
+                        "episode_ref": "record:change",
+                        "reference": reference_envelope(
+                            "record:change",
+                            provenance="reconstructed",
+                        ),
+                    }
+                ],
+            },
+        }
+        return replace(
+            sample_confirmation_request(),
+            defect_state=DefectState.create(
+                label="candidate_local_process_defect",
+                expected="The committed repair is delivered and verified.",
+                actual="No mutation or verification followed the commitment.",
+                mechanism="The decision did not materialize its repair obligation.",
+                scope="candidate_local_process_execution",
+            ),
+            process_factual_context=process_facts,
+        )
+
+    def process_confirmation_payload(self):
+        payload = valid_confirmation_payload()
+        payload["evidence_refs"] = [
+            "record:decision",
+            "record:change",
+        ]
+        payload["process_confirmation_assessment"] = {
+            "candidate_role": "implementation_commitment",
+            "commitment_cue_disposition": "commitment",
+            "commitment_status": "unfulfilled",
+            "trajectory_relation": "diverged",
+            "intervention_scope": "decision_and_committed_followup",
+            "task_precondition_disposition": "repair_obligation",
+            "active_process_defect_after_intervention": "absent",
+            "downstream_failure_after_intervention": "absent",
+            "reason": (
+                "Fulfilling and verifying the committed repair closes the "
+                "candidate-local omission and the downstream failure."
+            ),
+            "evidence_refs": ["record:decision", "record:change"],
+        }
+        return payload
+
+    def test_process_confirmation_requires_structured_counterfactual_assessment(self):
+        confirmation = validate_recursive_confirmation(
+            self.process_confirmation_payload(),
+            request=self.process_confirmation_request(),
+        )
+
+        self.assertEqual(
+            confirmation.process_confirmation_assessment[
+                "task_precondition_disposition"
+            ],
+            "repair_obligation",
+        )
+
+    def test_process_confirmation_rejects_counterfactual_self_contradiction(self):
+        payload = self.process_confirmation_payload()
+        payload.update(
+            {
+                "status": "rejected",
+                "factor_role": "unrelated",
+                "excerpt": "",
+                "counterfactual": {
+                    "intervention_ref": "record:decision",
+                    "intervention_kind": (
+                        "replace_with_semantically_correct_behavior"
+                    ),
+                    "predicted_defect_status": "present",
+                    "causal_effect": "does_not_prevent_defect",
+                },
+                "factor_mechanism": None,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "process confirmation assessment contradicts top-level counterfactual",
+        ):
+            validate_recursive_confirmation(
+                payload,
+                request=self.process_confirmation_request(),
+            )
+
+    def test_process_confirmation_receives_facts_without_first_pass_verdict(self):
+        process_facts = {
+            "schema": "candidate-process-confirmation-facts/v1",
+            "candidate_commitment_cues": {
+                "schema": "candidate-commitment-cues/v1",
+                "candidate_ref": "record:decision",
+                "candidate_reference": reference_envelope(
+                    "record:decision"
+                ),
+                "cue_count": 1,
+                "cues": [
+                    {
+                        "cue_id": "commitment_cue:test",
+                        "verbatim_excerpt": "I will implement the repair.",
+                        "semantic_status": (
+                            "candidate_cue_not_a_commitment_verdict"
+                        ),
+                    }
+                ],
+            },
+            "candidate_process_trajectory": {
+                "schema": "candidate-process-trajectory/v1",
+                "candidate_ref": "record:decision",
+                "candidate_reference": reference_envelope(
+                    "record:decision"
+                ),
+                "post_candidate_mutation_count": 0,
+                "post_candidate_verification_count": 0,
+                "post_candidate_delivery_observed": False,
+                "episode_summaries": [
+                    {
+                        "episode_ref": "record:change",
+                        "reference": reference_envelope(
+                            "record:change",
+                            provenance="reconstructed",
+                        ),
+                    }
+                ],
+            },
+        }
+        request = replace(
+            sample_confirmation_request(),
+            process_factual_context=process_facts,
+        )
+
+        facts = request.factual_dict()
+        prompt = build_recursive_confirmation_prompt(request)
+
+        self.assertEqual(
+            facts["process_factual_context"]["schema"],
+            "candidate-process-confirmation-facts/v1",
+        )
+        self.assertNotIn("process_assessment", prompt)
+        self.assertIn("candidate_process_trajectory", prompt)
+        self.assertIn("independently classify", prompt)
+        self.assertIn("trace-visible Agent decision output", prompt)
+        self.assertIn("task precondition", prompt)
+        self.assertIn("obligation-consistent follow-up action", prompt)
+
     def test_step_and_confirmation_prompts_define_complete_causal_contract(self):
         prompts = (
             build_causal_step_prompt(sample_step_request()),
@@ -2114,7 +2545,7 @@ class CausalJudgePromptTest(unittest.TestCase):
         ):
             with self.subTest(confirmation_phrase=phrase):
                 self.assertIn(phrase, confirmation_prompt)
-        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v10")
+        self.assertEqual(ROOT_CONFIRMATION_PROMPT_SCHEMA_VERSION, "recursive-root-confirmation-v14")
 
 
 class JudgmentCachePayloadTest(unittest.TestCase):
@@ -2184,7 +2615,476 @@ class ClaudeTransportAdapterTest(unittest.TestCase):
         self.assertEqual(calls, [("system", [{"role": "user", "content": "prompt"}], 23)])
 
 
+class ProviderFailureClassificationTest(unittest.TestCase):
+    def test_structured_provider_failures_have_stable_retry_dispositions(self):
+        cases = (
+            (400, "invalid_request_error", False),
+            (400, "schema_validation_error", False),
+            (400, "validation_error", False),
+            (400, "unsupported_model", False),
+            (400, "invalid_endpoint", False),
+            (400, "bad_request", True),
+            (400, "temporarily_unavailable", True),
+            (400, "", True),
+            (401, "authentication_error", False),
+            (402, "invalid_request_error", False),
+            (403, "permission_error", False),
+            (404, "not_found_error", False),
+            (408, "request_timeout", True),
+            (409, "conflict", True),
+            (425, "too_early", True),
+            (429, "rate_limit_error", True),
+            (503, "service_unavailable", True),
+            (None, "connect_timeout", True),
+        )
+
+        for status, code, retryable in cases:
+            with self.subTest(status=status, code=code):
+                disposition = provider_errors.classify_provider_failure(
+                    status=status,
+                    code=code,
+                )
+                self.assertEqual(disposition.retryable, retryable)
+                self.assertEqual(disposition.status_code, status)
+                self.assertEqual(disposition.error_code, code)
+
+    def test_retryable_circuit_records_the_first_failure_not_the_opening_failure(self):
+        class FailingMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                error = RuntimeError("temporarily unavailable")
+                error.status_code = 503
+                error.code = "service_unavailable"
+                raise error
+
+        messages = FailingMessages()
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.timeout_seconds = None
+        transport.thinking_config = None
+        transport.model = "test-model"
+        transport.client = types.SimpleNamespace(messages=messages)
+        transport.request_count = 0
+        transport.provider_error_threshold = 3
+        transport.consecutive_provider_errors = 0
+        transport.provider_circuit_open = False
+        transport.provider_circuit_reason = ""
+        transport.provider_circuit_disposition = None
+        transport.provider_circuit_first_request = 0
+        transport.provider_circuit_first_failure_at = ""
+
+        with self.assertRaises(TransportCallError):
+            transport.create_message_text_with_usage(
+                system="system",
+                messages=[{"role": "user", "content": "prompt"}],
+                max_tokens=32,
+            )
+        first_failure_at = transport.provider_circuit_stats["first_failure_at"]
+        self.assertEqual(transport.provider_circuit_stats["first_request"], 1)
+        self.assertTrue(first_failure_at)
+        self.assertFalse(transport.provider_circuit_open)
+
+        for _ in range(2):
+            with self.assertRaises(TransportCallError):
+                transport.create_message_text_with_usage(
+                    system="system",
+                    messages=[{"role": "user", "content": "prompt"}],
+                    max_tokens=32,
+                )
+
+        self.assertTrue(transport.provider_circuit_open)
+        self.assertEqual(transport.provider_circuit_stats["first_request"], 1)
+        self.assertEqual(
+            transport.provider_circuit_stats["first_failure_at"],
+            first_failure_at,
+        )
+
+    def test_success_resets_active_failure_streak_provenance(self):
+        class SequencedMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                if self.calls != 2:
+                    error = RuntimeError("temporarily unavailable")
+                    error.status_code = 503
+                    error.code = "service_unavailable"
+                    raise error
+                return types.SimpleNamespace(
+                    content=[types.SimpleNamespace(type="text", text="recovered")]
+                )
+
+        messages = SequencedMessages()
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.timeout_seconds = None
+        transport.thinking_config = None
+        transport.model = "test-model"
+        transport.client = types.SimpleNamespace(messages=messages)
+        transport.request_count = 0
+        transport.provider_error_threshold = 3
+        transport.consecutive_provider_errors = 0
+        transport.provider_circuit_open = False
+        transport.provider_circuit_reason = ""
+        transport.provider_circuit_disposition = None
+        transport.provider_circuit_first_request = 0
+        transport.provider_circuit_first_failure_at = ""
+
+        with self.assertRaises(TransportCallError):
+            transport.create_message_text_with_usage(
+                system="system",
+                messages=[{"role": "user", "content": "prompt"}],
+                max_tokens=32,
+            )
+        self.assertEqual(transport.provider_circuit_stats["first_request"], 1)
+
+        recovered = transport.create_message_text_with_usage(
+            system="system",
+            messages=[{"role": "user", "content": "prompt"}],
+            max_tokens=32,
+        )
+        self.assertEqual(recovered.text, "recovered")
+        self.assertEqual(transport.provider_circuit_stats["first_request"], 0)
+        self.assertEqual(transport.provider_circuit_stats["first_failure_at"], "")
+        self.assertIsNone(transport.provider_circuit_stats["disposition"])
+
+        for _ in range(3):
+            with self.assertRaises(TransportCallError):
+                transport.create_message_text_with_usage(
+                    system="system",
+                    messages=[{"role": "user", "content": "prompt"}],
+                    max_tokens=32,
+                )
+
+        self.assertTrue(transport.provider_circuit_open)
+        self.assertEqual(transport.provider_circuit_stats["first_request"], 3)
+        self.assertTrue(transport.provider_circuit_stats["first_failure_at"])
+        self.assertEqual(
+            transport.provider_circuit_stats["disposition"]["status_code"],
+            503,
+        )
+
+    def test_anthropic_sdk_bad_request_shape_opens_circuit_immediately(self):
+        class AnthropicBadRequestError(RuntimeError):
+            def __init__(self):
+                self.status_code = 400
+                self.type = "invalid_request_error"
+                self.body = {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error",
+                        "message": "model parameter is invalid",
+                    },
+                }
+                super().__init__("Bad Request")
+
+        class FailingMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                raise AnthropicBadRequestError()
+
+        messages = FailingMessages()
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.timeout_seconds = None
+        transport.thinking_config = None
+        transport.model = "test-model"
+        transport.client = types.SimpleNamespace(messages=messages)
+        transport.request_count = 0
+        transport.provider_error_threshold = 3
+        transport.consecutive_provider_errors = 0
+        transport.provider_circuit_open = False
+        transport.provider_circuit_reason = ""
+        transport.provider_circuit_disposition = None
+        transport.provider_circuit_first_request = 0
+        transport.provider_circuit_first_failure_at = ""
+
+        with self.assertRaises(TransportCallError) as raised:
+            transport.create_message_text_with_usage(
+                system="system",
+                messages=[{"role": "user", "content": "prompt"}],
+                max_tokens=32,
+            )
+
+        self.assertIsInstance(raised.exception.error, JudgeProviderUnavailable)
+        self.assertEqual(messages.calls, 1)
+        self.assertTrue(transport.provider_circuit_open)
+        disposition = transport.provider_circuit_stats["disposition"]
+        self.assertFalse(disposition["retryable"])
+        self.assertEqual(disposition["status_code"], 400)
+        self.assertEqual(disposition["error_code"], "invalid_request_error")
+        self.assertIn("model parameter is invalid", disposition["reason"])
+
+    def test_402_opens_provider_circuit_after_one_physical_request(self):
+        class StructuredProviderError(RuntimeError):
+            def __init__(self):
+                self.status_code = 402
+                self.code = "invalid_request_error"
+                super().__init__("insufficient balance")
+
+        class FailingMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                raise StructuredProviderError()
+
+        messages = FailingMessages()
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.timeout_seconds = None
+        transport.thinking_config = None
+        transport.model = "test-model"
+        transport.max_tokens = 2048
+        transport.repair_max_tokens = 512
+        transport.client = types.SimpleNamespace(messages=messages)
+        transport.request_count = 0
+        transport.provider_error_threshold = 3
+        transport.consecutive_provider_errors = 0
+        transport.provider_circuit_open = False
+        transport.provider_circuit_reason = ""
+
+        with self.assertRaises(TransportCallError) as raised:
+            transport.create_message_text_with_usage(
+                system="system",
+                messages=[{"role": "user", "content": "prompt"}],
+                max_tokens=32,
+            )
+
+        self.assertEqual(raised.exception.physical_requests, 1)
+        self.assertIsInstance(raised.exception.error, JudgeProviderUnavailable)
+        self.assertEqual(messages.calls, 1)
+        self.assertTrue(transport.provider_circuit_open)
+        self.assertEqual(
+            transport.provider_circuit_stats["disposition"]["status_code"],
+            402,
+        )
+
+    def test_restored_disposition_mapping_is_serialized_without_attribute_error(self):
+        disposition = provider_errors.classify_provider_failure(
+            status=402,
+            code="invalid_request_error",
+            reason="insufficient balance",
+        )
+        transport = object.__new__(ClaudeJudgeClient)
+        transport.provider_error_threshold = 3
+        transport.consecutive_provider_errors = 1
+        transport.provider_circuit_open = True
+        transport.provider_circuit_reason = "payment required"
+        transport.provider_circuit_disposition = disposition.to_dict()
+        transport.provider_circuit_first_request = 7
+        transport.provider_circuit_first_failure_at = "2026-07-31T00:00:00Z"
+
+        self.assertEqual(
+            transport.provider_circuit_stats["disposition"],
+            disposition.to_dict(),
+        )
+        self.assertEqual(
+            transport.provider_circuit_stats["first_failure_at"],
+            "2026-07-31T00:00:00Z",
+        )
+
+    def test_worker_error_result_preserves_structured_provider_fields(self):
+        with self.assertRaises(JudgeProviderError) as raised:
+            claude_module.raise_worker_failure(
+                {
+                    "ok": False,
+                    "error_type": "APIStatusError",
+                    "error": "payment required",
+                    "status_code": 402,
+                    "error_code": "invalid_request_error",
+                }
+            )
+
+        disposition = provider_errors.provider_failure_disposition(raised.exception)
+        self.assertIsNotNone(disposition)
+        self.assertEqual(disposition.status_code, 402)
+        self.assertEqual(disposition.error_code, "invalid_request_error")
+
+    def test_timeout_worker_serializes_real_structured_402_result(self):
+        class StructuredProviderError(RuntimeError):
+            def __init__(self):
+                self.status_code = 402
+                self.code = "insufficient_balance"
+                super().__init__("payment required")
+
+        class FakeAnthropic:
+            def __init__(self, **_kwargs):
+                self.messages = types.SimpleNamespace(
+                    create=lambda **_request: (_ for _ in ()).throw(
+                        StructuredProviderError()
+                    )
+                )
+
+        results = []
+        with mock.patch.dict(
+            "sys.modules",
+            {"anthropic": types.SimpleNamespace(Anthropic=FakeAnthropic)},
+        ):
+            claude_module.anthropic_request_worker(
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://provider.invalid",
+                    "timeout_seconds": 60,
+                    "model": "test-model",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "thinking": None,
+                    "system": "system",
+                    "messages": [{"role": "user", "content": "prompt"}],
+                },
+                types.SimpleNamespace(put=results.append),
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(results[0]["status_code"], 402)
+        self.assertEqual(results[0]["error_code"], "insufficient_balance")
+        with self.assertRaises(JudgeProviderError) as raised:
+            claude_module.raise_worker_failure(results[0])
+        disposition = provider_errors.provider_failure_disposition(
+            raised.exception
+        )
+        self.assertIsNotNone(disposition)
+        self.assertFalse(disposition.retryable)
+        self.assertEqual(disposition.status_code, 402)
+
+
 class ClaudeCausalJudgeTest(unittest.TestCase):
+    def test_confirmation_repair_names_exact_process_evidence_refs(self):
+        request = CausalJudgePromptTest().process_confirmation_request()
+
+        constraints = _repair_constraints(
+            stage="recursive_root_confirmation",
+            node_ref=request.candidate_ref,
+            request_context=request.factual_dict(),
+            validation_error=(
+                "ValueError: process confirmation assessment requires "
+                "candidate and trajectory evidence"
+            ),
+        )
+
+        resolution = constraints[
+            "required_process_confirmation_evidence_resolution"
+        ]
+        self.assertEqual(
+            resolution["required_candidate_evidence_ref"],
+            "record:decision",
+        )
+        self.assertEqual(
+            resolution["allowed_trajectory_evidence_refs"],
+            ["record:change"],
+        )
+
+    def test_process_repair_names_exact_trajectory_and_obligation_refs(self):
+        request = replace(
+            ProcessDefectPromptTests().process_request(),
+            candidates=(),
+        )
+
+        constraints = _repair_constraints(
+            stage="recursive_causal_step",
+            node_ref=request.current_node.ref,
+            request_context=request.to_dict(),
+            validation_error=(
+                "ValueError: unfulfilled commitment requires grounded "
+                "candidate and trajectory evidence"
+            ),
+        )
+
+        resolution = constraints["required_process_evidence_resolution"]
+        self.assertEqual(
+            resolution["required_candidate_evidence_ref"],
+            "record:change",
+        )
+        self.assertEqual(
+            resolution["allowed_trajectory_evidence_refs"],
+            ["record:trajectory_episode"],
+        )
+        self.assertEqual(
+            resolution["allowed_obligation_refs"],
+            ["analysis_objective"],
+        )
+
+    def test_process_repair_requires_root_action_when_no_predecessor_exists(self):
+        request = replace(
+            ProcessDefectPromptTests().process_request(),
+            candidates=(),
+        )
+        constraints = _repair_constraints(
+            stage="recursive_causal_step",
+            node_ref=request.current_node.ref,
+            request_context=request.to_dict(),
+            validation_error=(
+                "ValueError: a present defect cannot terminate silently "
+                "without recursion, introduction, or missing_evidence"
+            ),
+        )
+
+        resolution = constraints["required_process_root_resolution"]
+        self.assertEqual(
+            resolution["when"],
+            {
+                "current_defect_status": "present",
+                "offered_predecessor_refs": [],
+            },
+        )
+        self.assertEqual(
+            resolution["preferred_resolution"],
+            {
+                "candidate_introduction": True,
+                "missing_evidence": [],
+                "suggested_investigation": {
+                    "action": "request_root_confirmation",
+                    "arguments": {
+                        "hypothesis_id": "hyp:process",
+                        "candidate_ref": "record:change",
+                        "defect_fingerprint": request.defect_state.fingerprint,
+                    },
+                    "reason": "non-empty grounded reason",
+                },
+            },
+        )
+        self.assertIn("process_assessment", resolution["preserve_fields"])
+
+    def test_confirmation_repair_names_every_required_competitor(self):
+        constraints = _repair_constraints(
+            stage="recursive_root_confirmation",
+            node_ref="record:factor",
+            request_context={
+                "competing_hypotheses": [
+                    {
+                        "candidate_reference": {
+                            "resolved_ref": "record:root",
+                        },
+                        "confirmation_identity": "confirmation:root",
+                        "hypothesis_id": "hyp:root",
+                    }
+                ]
+            },
+            validation_error=(
+                "ValueError: competitor_comparisons must cover every open "
+                "competitor"
+            ),
+        )
+
+        self.assertEqual(
+            constraints["required_competitor_comparisons"],
+            [
+                {
+                    "candidate_ref": "record:root",
+                    "confirmation_identity": "confirmation:root",
+                    "hypothesis_id": "hyp:root",
+                }
+            ],
+        )
+        self.assertTrue(constraints["exact_competitor_coverage"])
+
     def test_local_open_circuit_rejection_costs_zero_physical_requests(self):
         transport = object.__new__(ClaudeJudgeClient)
         transport.model = "test-model"
@@ -2525,6 +3425,44 @@ class ClaudeCausalJudgeTest(unittest.TestCase):
             self.assertIn("grounded evidence", transport.calls[1]["messages"][0]["content"])
             self.assertEqual(transport.request_count, 2)
 
+    def test_rejected_confirmation_repair_requires_nonempty_grounded_evidence(self):
+        invalid = valid_confirmation_payload()
+        invalid.update(
+            {
+                "status": "rejected",
+                "factor_role": "unrelated",
+                "excerpt": "",
+                "evidence_refs": [],
+                "counterfactual": {
+                    "intervention_ref": "record:decision",
+                    "intervention_kind": "replace_with_semantically_correct_behavior",
+                    "predicted_defect_status": "present",
+                    "causal_effect": "does_not_prevent_defect",
+                },
+            }
+        )
+        repaired = dict(invalid)
+        repaired["evidence_refs"] = ["record:decision"]
+        transport = ScriptedTransport(
+            [json.dumps(invalid), json.dumps(repaired)]
+        )
+        judge = ClaudeCausalJudge(transport=transport, cache=JudgmentCache())
+
+        result = judge.confirm_candidate_bounded(
+            sample_confirmation_request(), max_physical_requests=2
+        )
+
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        self.assertEqual(result.value.status, "rejected")
+        self.assertEqual(result.value.factor_role, "unrelated")
+        self.assertEqual(result.value.evidence_refs, ("record:decision",))
+        self.assertIn(
+            "non-empty array",
+            repair_payload["repair_constraints"]["required_field_corrections"][0][
+                "require"
+            ]["evidence_refs"],
+        )
+
     def test_decisive_confirmation_grounding_gaps_return_uncached_unknown(self):
         unresolved_opposition = {
             **reference_envelope("record:opposition", status="unresolved"),
@@ -2691,6 +3629,453 @@ class CausalRootConfirmationTest(unittest.TestCase):
         self.assertEqual(second.physical_requests, 0)
         self.assertEqual(first.value.hypothesis_id, "hyp:decision")
         self.assertEqual(first.value.defect_fingerprint, request.defect_state.fingerprint)
+        self.assertEqual(transport.request_count, 1)
+
+
+def sample_factor_role_request() -> FactorRoleRequest:
+    defect = DefectState.create(
+        label="Missing required repository check.",
+        expected="The repository verifies the required behavior.",
+        actual="The required behavior is omitted.",
+        mechanism="An incomplete decision was materialized in the change.",
+        scope="record:defect",
+    )
+    root_hypothesis_id = "hypothesis:confirmed-root"
+    root_hypothesis_semantic_hash = "sha256:confirmed-root"
+    root_candidate_ref = "record:decision"
+    root_recursive_path = ("record:decision", "record:defect")
+    root_confirmation_identity = confirmation_identity_for(
+        hypothesis_id=root_hypothesis_id,
+        hypothesis_semantic_hash=root_hypothesis_semantic_hash,
+        candidate_ref=root_candidate_ref,
+        defect_fingerprint=defect.fingerprint,
+        recursive_path=root_recursive_path,
+        seed_binding_identity="seed:test",
+    )
+    return FactorRoleRequest(
+        candidate_ref="record:prompt",
+        defect_state=defect,
+        recursive_path=("record:prompt", "record:decision", "record:defect"),
+        candidate_reference={"ref": "record:prompt", "content": "ambiguous requirement"},
+        recursive_path_references=(
+            {"ref": "record:prompt", "content": "ambiguous requirement"},
+            {"ref": "record:decision", "content": "omitted requirement"},
+            {"ref": "record:defect", "content": "missing check"},
+        ),
+        supporting_evidence=({"ref": "record:prompt", "content": "ambiguous"},),
+        opposing_evidence=({"ref": "record:policy", "content": "clear policy"},),
+        task_obligations=({"ref": "record:task", "content": "verify behavior"},),
+        confirmed_root_summaries=(
+            {
+                "schema": "factor-role-root-evidence-summary/v2",
+                "candidate_ref": root_candidate_ref,
+                "hypothesis_id": root_hypothesis_id,
+                "hypothesis_semantic_hash": root_hypothesis_semantic_hash,
+                "confirmation_identity": root_confirmation_identity,
+                "defect_fingerprint": defect.fingerprint,
+                "seed_binding_identity": "seed:test",
+                "reason": "The decision introduced the omission.",
+                "evidence_refs": ["record:root-evidence"],
+                "recursive_path": list(root_recursive_path),
+            },
+        ),
+        hypothesis_id="hypothesis:test",
+        hypothesis_semantic_hash="sha256:test",
+        seed_binding_identity="seed:test",
+        analysis_perspective="Improve repository reasoning.",
+    )
+
+
+class _FactorStringSubclass(str):
+    pass
+
+
+def valid_factor_role_payload(request=None) -> dict:
+    request = request or sample_factor_role_request()
+    from trace_attribution.causal_judge import factor_role_request_identity
+
+    return {
+        "candidate_ref": request.candidate_ref,
+        "necessity_status": "not_necessary",
+        "factor_role": "contributing_condition",
+        "reason": "The ambiguous requirement increased the likelihood of omission.",
+        "confidence": 0.83,
+        "evidence_refs": ["record:prompt", "record:decision"],
+        "recursive_path": list(request.recursive_path),
+        "factor_mechanism": {
+            "schema": "factor-role-mechanism/v1",
+            "mechanism_type": "enabling_condition",
+            "source_ref": "record:prompt",
+            "target_ref": "record:decision",
+            "effect": "increased_defect_likelihood",
+        },
+        "counterfactual": {
+            "schema": "factor-role-counterfactual/v1",
+            "intervention_ref": "record:prompt",
+            "intervention_kind": "replace_with_semantically_correct_behavior",
+            "predicted_effect": "reduces_defect_likelihood",
+        },
+        "hypothesis_id": request.hypothesis_id,
+        "hypothesis_semantic_hash": request.hypothesis_semantic_hash,
+        "defect_fingerprint": request.defect_state.fingerprint,
+        "seed_binding_identity": request.seed_binding_identity,
+        "analysis_perspective": request.analysis_perspective,
+        "request_identity": factor_role_request_identity(request),
+    }
+
+
+class FactorRoleJudgeBoundaryTest(unittest.TestCase):
+    def test_legacy_offline_adapter_returns_unknown_without_root_confirmation(self):
+        class LegacyJudge:
+            def __init__(self):
+                self.confirmation_calls = 0
+
+            def confirm_candidate(self, request):
+                self.confirmation_calls += 1
+                return object()
+
+        legacy = LegacyJudge()
+        adapter = OfflineCausalJudgeAdapter(legacy)
+
+        result = adapter.judge_factor_role_offline(sample_factor_role_request())
+
+        self.assertIsInstance(result, FactorRoleJudgment)
+        self.assertEqual(result.necessity_status, "unknown")
+        self.assertEqual(result.factor_role, "unknown")
+        self.assertIn("does not implement", result.reason)
+        self.assertEqual(legacy.confirmation_calls, 0)
+
+    def test_inherited_protocol_stub_returns_unknown_without_calling_stub(self):
+        class ProtocolLegacyJudge(CausalJudge):
+            def judge_step(self, request):
+                return object()
+
+            def confirm_candidate(self, request):
+                return object()
+
+        request = sample_factor_role_request()
+        result = OfflineCausalJudgeAdapter(
+            ProtocolLegacyJudge()
+        ).judge_factor_role_offline(request)
+
+        self.assertEqual(result.necessity_status, "unknown")
+        self.assertEqual(result.factor_role, "unknown")
+        self.assertEqual(result.recursive_path, request.recursive_path)
+
+    def test_real_factor_implementation_not_implemented_error_is_not_swallowed(self):
+        class BrokenFactorJudge(CausalJudge):
+            def judge_step(self, request):
+                return object()
+
+            def confirm_candidate(self, request):
+                return object()
+
+            def judge_factor_role(self, request):
+                raise NotImplementedError("real factor implementation failed")
+
+        with self.assertRaisesRegex(
+            NotImplementedError, "real factor implementation failed"
+        ):
+            OfflineCausalJudgeAdapter(
+                BrokenFactorJudge()
+            ).judge_factor_role_offline(sample_factor_role_request())
+
+    def test_legacy_unknown_fallback_preserves_request_path_exactly(self):
+        request = sample_factor_role_request()
+        result = OfflineCausalJudgeAdapter(
+            object()
+        ).judge_factor_role_offline(request)
+
+        self.assertEqual(result.recursive_path, request.recursive_path)
+
+    def test_offline_capability_delegates_independent_factor_method(self):
+        expected = object()
+
+        class FactorJudge(OfflineJudgeCapability):
+            def judge_factor_role(self, request):
+                return expected
+
+        self.assertIs(
+            FactorJudge().judge_factor_role_offline(sample_factor_role_request()),
+            expected,
+        )
+
+    def test_bounded_factor_repair_and_cache_use_exact_physical_counts(self):
+        request = replace(
+            sample_factor_role_request(),
+            candidate_reference={
+                "content": {
+                    "foreign_ref": "record:fabricated",
+                }
+            },
+            supporting_evidence=(
+                {
+                    "content": {
+                        "foreign_refs": ["record:also-fabricated"],
+                    }
+                },
+            ),
+        )
+        invalid = valid_factor_role_payload()
+        invalid["evidence_refs"] = ["record:fabricated"]
+        invalid["request_identity"] = valid_factor_role_payload(
+            request
+        )["request_identity"]
+        with tempfile.TemporaryDirectory() as tempdir:
+            transport = ScriptedTransport(
+                [
+                    json.dumps(invalid),
+                    json.dumps(valid_factor_role_payload(request)),
+                ]
+            )
+            judge = ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(Path(tempdir) / "cache.jsonl"),
+            )
+            repaired = judge.judge_factor_role_bounded(
+                request, max_physical_requests=2
+            )
+            cached = judge.judge_factor_role_bounded(
+                request, max_physical_requests=0
+            )
+
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        self.assertEqual(repaired.physical_requests, 2)
+        self.assertEqual(cached.physical_requests, 0)
+        self.assertEqual(repaired.value, cached.value)
+        self.assertEqual(transport.request_count, 2)
+        self.assertIn("record:fabricated", repair_payload["invalid_output"])
+        self.assertIn("evidence_refs cite refs outside request", repair_payload["validation_error"])
+        self.assertEqual(
+            repair_payload["canonical_request_context"], request.factual_dict()
+        )
+        initial_prompt = json.loads(build_factor_role_prompt(request))
+        self.assertEqual(
+            initial_prompt["allowed_fact_refs"],
+            repair_payload["repair_constraints"]["allowed_fact_refs"],
+        )
+        self.assertNotIn(
+            "record:fabricated",
+            repair_payload["repair_constraints"]["allowed_fact_refs"],
+        )
+        self.assertNotIn(
+            "record:also-fabricated",
+            repair_payload["repair_constraints"]["allowed_fact_refs"],
+        )
+        self.assertNotIn(
+            "record:task",
+            repair_payload["repair_constraints"]["allowed_fact_refs"],
+        )
+        self.assertEqual(
+            repair_payload["repair_constraints"]["exact_request_identity"],
+            valid_factor_role_payload(request)["request_identity"],
+        )
+
+    def test_bounded_factor_repairs_self_target_with_downstream_contract(self):
+        request = sample_factor_role_request()
+        invalid = valid_factor_role_payload(request)
+        invalid["factor_mechanism"]["target_ref"] = request.candidate_ref
+        transport = ScriptedTransport(
+            [
+                json.dumps(invalid),
+                json.dumps(valid_factor_role_payload(request)),
+            ]
+        )
+        result = ClaudeCausalJudge(
+            transport=transport,
+            cache=JudgmentCache(),
+        ).judge_factor_role_bounded(request, max_physical_requests=2)
+
+        repair_payload = json.loads(
+            transport.calls[1]["messages"][0]["content"]
+        )
+        self.assertEqual(result.physical_requests, 2)
+        self.assertEqual(
+            result.value.factor_mechanism["target_ref"],
+            request.recursive_path[1],
+        )
+        self.assertIn(
+            "target_ref must be a downstream recursive path ref",
+            repair_payload["validation_error"],
+        )
+        self.assertEqual(
+            repair_payload["repair_constraints"][
+                "allowed_mechanism_target_refs"
+            ],
+            list(request.recursive_path[1:]),
+        )
+
+    def test_factor_repair_closure_rejects_each_root_identity_forgery(self):
+        request = sample_factor_role_request()
+        base_facts = request.factual_dict()
+        root_summary = base_facts["confirmed_root_summaries"][0]
+        self.assertEqual(
+            root_summary["schema"],
+            "factor-role-root-evidence-summary/v2",
+        )
+        self.assertNotIn("confirmation_status", root_summary)
+        self.assertNotIn("factor_role", root_summary)
+        changed_defect = request.defect_state.transformed(
+            label="Different bound defect.",
+            mechanism="Different bound mechanism.",
+            transformation_reason="Exercise repair identity binding.",
+        )
+        mutations = {
+            "hypothesis_id": ("hypothesis:forged", {}),
+            "hypothesis_semantic_hash": ("sha256:forged", {}),
+            "candidate_ref": ("record:forged-root", {}),
+            "defect_fingerprint": (
+                changed_defect.fingerprint,
+                {"defect_state": changed_defect.to_dict()},
+            ),
+            "recursive_path": (
+                ["record:decision", "record:forged-path"],
+                {},
+            ),
+            "seed_binding_identity": (
+                "seed:forged",
+                {"seed_binding_identity": "seed:forged"},
+            ),
+        }
+        for field, (replacement, fact_overrides) in mutations.items():
+            facts = copy.deepcopy(base_facts)
+            summary = facts["confirmed_root_summaries"][0]
+            summary[field] = replacement
+            if field == "candidate_ref":
+                summary["recursive_path"][0] = replacement
+            facts.update(fact_overrides)
+            with self.subTest(field=field):
+                allowed_refs = _factor_role_allowed_refs_from_facts(facts)
+                direct_refs = {
+                    facts["candidate_ref"],
+                    *facts["recursive_path"],
+                }
+                summary_refs = {
+                    summary["candidate_ref"],
+                    *summary["evidence_refs"],
+                    *summary["recursive_path"],
+                }
+                for ref in summary_refs - direct_refs:
+                    self.assertNotIn(ref, allowed_refs)
+
+    def test_factor_repair_constraints_exclude_invalid_reference_envelopes(self):
+        invalid_envelopes = (
+            {
+                "resolved_ref": "record:three-field",
+                "resolution_status": "resolved",
+                "provenance_class": "recorded",
+            },
+            {
+                "raw_ref": "record:contradictory",
+                "resolved_ref": "record:contradictory",
+                "resolution_status": "unresolved",
+                "provenance_class": "recorded",
+            },
+            {
+                "raw_ref": "record:inferred-without-metadata",
+                "resolved_ref": "record:inferred-without-metadata",
+                "resolution_status": "resolved",
+                "provenance_class": "inferred",
+            },
+        )
+        request = replace(
+            sample_factor_role_request(),
+            supporting_evidence=tuple(
+                {"reference": envelope} for envelope in invalid_envelopes
+            ),
+        )
+        invalid = valid_factor_role_payload(request)
+        invalid["evidence_refs"] = [
+            "record:three-field",
+            "record:contradictory",
+            "record:inferred-without-metadata",
+        ]
+        transport = ScriptedTransport(
+            [json.dumps(invalid), json.dumps(valid_factor_role_payload(request))]
+        )
+        result = ClaudeCausalJudge(
+            transport=transport, cache=JudgmentCache()
+        ).judge_factor_role_bounded(request, max_physical_requests=2)
+
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        self.assertEqual(result.physical_requests, 2)
+        self.assertEqual(transport.request_count, 2)
+        for ref in invalid["evidence_refs"]:
+            self.assertNotIn(
+                ref,
+                repair_payload["repair_constraints"]["allowed_fact_refs"],
+            )
+
+    def test_factor_repair_constraints_exclude_non_exact_envelope_types(self):
+        base = {
+            "raw_ref": "record:strict-envelope",
+            "resolved_ref": "record:strict-envelope",
+            "resolution_status": "resolved",
+            "provenance_class": "recorded",
+        }
+        invalid_envelopes = (
+            {**base, "raw_ref": 1},
+            {**base, "resolved_ref": True},
+            {**base, "resolution_status": ["resolved"]},
+            {**base, "provenance_class": _FactorStringSubclass("recorded")},
+            {
+                **base,
+                "provenance_class": "inferred",
+                "inference_metadata": {
+                    "evidence_type": "semantic_inferred",
+                    "inference_method": 9,
+                },
+            },
+        )
+        request = replace(
+            sample_factor_role_request(),
+            supporting_evidence=tuple(
+                {"reference": envelope} for envelope in invalid_envelopes
+            ),
+        )
+        invalid = valid_factor_role_payload(request)
+        invalid["evidence_refs"] = ["record:strict-envelope"]
+        transport = ScriptedTransport(
+            [json.dumps(invalid), json.dumps(valid_factor_role_payload(request))]
+        )
+        result = ClaudeCausalJudge(
+            transport=transport, cache=JudgmentCache()
+        ).judge_factor_role_bounded(request, max_physical_requests=2)
+
+        self.assertEqual(transport.request_count, 2)
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        self.assertEqual(result.physical_requests, 2)
+        self.assertNotIn(
+            "record:strict-envelope",
+            repair_payload["repair_constraints"]["allowed_fact_refs"],
+        )
+
+    def test_bounded_factor_exhaustion_raises_with_exact_usage(self):
+        invalid = valid_factor_role_payload()
+        del invalid["confidence"]
+        transport = ScriptedTransport([json.dumps(invalid)])
+        with self.assertRaises(BoundedJudgeCallError) as raised:
+            ClaudeCausalJudge(
+                transport=transport, cache=JudgmentCache()
+            ).judge_factor_role_bounded(
+                sample_factor_role_request(), max_physical_requests=1
+            )
+
+        self.assertEqual(raised.exception.physical_requests, 1)
+        self.assertIn("request_budget_exhausted", str(raised.exception))
+        self.assertEqual(transport.request_count, 1)
+
+    def test_factor_provider_failure_raises_with_exact_usage(self):
+        transport = ScriptedTransport([JudgeProviderUnavailable("timed out")])
+        with self.assertRaises(BoundedJudgeCallError) as raised:
+            ClaudeCausalJudge(
+                transport=transport, cache=JudgmentCache()
+            ).judge_factor_role_bounded(
+                sample_factor_role_request(), max_physical_requests=1
+            )
+
+        self.assertEqual(raised.exception.physical_requests, 1)
+        self.assertIn("provider_error", str(raised.exception))
         self.assertEqual(transport.request_count, 1)
 
 

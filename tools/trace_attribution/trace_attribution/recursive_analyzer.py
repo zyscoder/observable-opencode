@@ -6,10 +6,10 @@ import copy
 import hashlib
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from .causal_judge import (
     BoundedJudgeCallResult,
@@ -17,15 +17,57 @@ from .causal_judge import (
     BoundedJudgeCapability,
     CausalJudge,
     CausalStepRequest,
+    FACTOR_ROLE_REQUEST_IDENTITY_PREFIX,
+    FactorRoleRequest,
     OfflineJudgeCapability,
     ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
     RootConfirmationRequest,
     bind_root_confirmation,
+    factor_role_request_identity,
+    factor_role_request_projection,
+    factor_role_request_projection_identity,
+    parse_factor_role_judgment,
     preflight_root_confirmation_request,
     root_confirmation_request_identity,
     root_confirmation_request_projection,
     root_confirmation_request_projection_identity,
+    validate_factor_role_request_projection,
     validate_root_confirmation_request_projection,
+)
+from .candidate_budget import (
+    NO_ACTIVE_SEED_CAUSAL_PATH,
+    select_global_candidates,
+)
+from .candidate_clustering import (
+    CandidateClusterManifest,
+    build_candidate_cluster_manifest,
+    build_candidate_cluster_shadow_event,
+    validate_candidate_cluster_shadow_event,
+)
+from .cluster_triage import (
+    CandidateClusterTriageDecision,
+    build_candidate_cluster_triage_request,
+    safe_build_candidate_cluster_triage_plan,
+)
+from .cluster_triage_judge import (
+    ClusterTriageCapability,
+    ClusterTriageJudgment,
+    ClusterTriagePageRequest,
+    build_cluster_triage_page_requests,
+    merge_cluster_triage_judgments,
+)
+from .candidate_paging import (
+    CANDIDATE_PAGE_SIZE,
+    DEFAULT_FINALIST_SOFT_LIMIT,
+    GLOBAL_CANDIDATE_MAX_COMPARISON_ROUNDS,
+    GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+    CandidatePage,
+    CandidatePageOutcome,
+    CandidatePagePlan,
+    CandidateRoundSummary,
+    build_candidate_page_outcome,
+    build_candidate_page_plan,
+    summarize_candidate_round,
 )
 from .causal_retrieval import (
     SemanticPredecessorRetriever,
@@ -33,15 +75,24 @@ from .causal_retrieval import (
     canonical_candidate_route,
     is_evidence_only_node,
     is_navigation_node,
+    non_root_factor_candidate_eligible,
+    obligation_gap_causal_candidates,
+    obligation_gap_for_candidate,
+    obligation_gaps_for_candidate,
     root_candidate_eligible,
 )
 from .causal_state import (
+    ActiveFailureRoleBinding,
     AttributionHypothesis,
     CausalCandidate,
     CausalFactor,
+    CausalMaterialization,
     CausalStepJudgment,
     ConfirmedRoot,
     DefectState,
+    FACTOR_ROLE_FAILURE_CLASSIFICATIONS,
+    FACTOR_ROLE_GAP_KEYS,
+    FactorRoleJudgment,
     FrontierItem,
     LocalStateOwner,
     PredecessorAssessment,
@@ -49,13 +100,29 @@ from .causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
-    canonical_causal_factor_publication,
+    TERMINAL_FACTOR_ROLE_QUEUE_ALLOWED_KEYS,
+    TERMINAL_FACTOR_ROLE_QUEUE_REQUIRED_KEYS,
+    active_failure_causal_role_for,
+    active_failure_factor_role_for,
+    active_failure_signature_for,
+    canonical_active_failure_role_request_binding,
+    canonical_factor_role_publication,
+    canonical_factor_role_gap,
+    canonical_factor_role_escalation_binding,
+    canonical_factor_role_escalation_gap,
+    canonical_factor_role_escalation_origin,
+    canonical_factor_role_queue_binding_snapshot,
+    canonical_confirmation_origin,
+    canonical_confirmation_queue_key,
+    canonical_terminal_factor_role_queue_binding,
     canonical_confirmed_root_publication,
     canonical_ranked_root_publications,
-    canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     confirmation_identity_for,
+    factor_escalation_outperformed_confirmation_identities,
     is_definitive_confirmation,
+    is_factor_role_escalation_origin,
+    owning_root_request_projection,
     seed_defect_state,
     semantic_visit_key,
     seed_binding_identity_for,
@@ -63,13 +130,32 @@ from .causal_state import (
     validate_modern_report_shape,
     validate_root_confirmation_substantive_invariants,
 )
-from .checkpoint import CheckpointBundle, CheckpointState
-from .confirmation_path import is_confirmation_causal_edge
-from .errors import JudgeProviderError, JudgeProviderUnavailable
+from .checkpoint import (
+    CheckpointBundle,
+    CheckpointCompatibilityError,
+    CheckpointState,
+    CompletedCheckpointMigrationDecision,
+    CompletedCheckpointReplayProof,
+    LEGACY_PROJECTION_CLASSIFIER_IDENTITY,
+    LegacyProjectionNotRequired,
+    LegacyProjectionRequired,
+)
+from .confirmation_path import (
+    has_confirmation_causal_hop,
+    is_confirmation_causal_edge,
+)
+from .errors import (
+    JudgeProviderError,
+    JudgeProviderUnavailable,
+    provider_failure_disposition_from_value,
+    provider_failure_disposition_to_dict,
+)
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
     build_candidate_evidence_capsules,
+    candidate_compression_with_funnel,
     candidate_compression_metrics,
+    validate_candidate_evidence_capsule_against_graph,
 )
 from .evidence_expansion import (
     EvidenceExpansionRequest,
@@ -85,9 +171,11 @@ from .global_judge import (
     GlobalJudgeCapability,
     active_focus_text_sha256,
     global_candidate_request_from_validation_envelope,
+    global_judge_diagnostics,
     validate_active_focus_binding,
     validate_global_candidate_request_against_graph,
     validate_global_candidate_payload,
+    validate_global_judge_diagnostics,
 )
 from .graph import TraceGraph
 from .hypotheses import HypothesisLedger, RecursiveFrontier
@@ -98,18 +186,23 @@ from .investigation import (
     InvestigationResult,
 )
 from .judgment_context import (
+    build_active_failure_factual_context,
     build_recursive_judgment_context,
+    candidate_commitment_cue_context,
+    candidate_process_trajectory_context,
     sanitize_judge_evidence_payload,
     task_obligations,
 )
 from .models import JsonDict, TraceNode, stable_json
+from .reconstruction import obligation_gap_candidate_audit
+from .restoration_obligation import RestorationObligation
 
 
 RECURSIVE_RELATIONS = frozenset(
     {"same_defect_propagation", "defect_transformation", "contributing_condition"}
 )
 CAUSAL_STEP_CANDIDATE_LIMIT = 8
-NAVIGATION_ROUTE_CANDIDATE_LIMIT = 2
+NAVIGATION_ROUTE_CANDIDATE_LIMIT = 64
 EVALUATION_START_EVENTS = frozenset(
     {
         "case.failed",
@@ -122,15 +215,188 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v18"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v25"
 GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS = 3
 GLOBAL_EVIDENCE_EXPANSION_MAX_NODES = 8
-GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES = 32_768
+GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES = 65_536
+# Discovery is CPU-only and intentionally wider than the downstream LLM
+# assessment budget, so candidate recall is not silently capped by model cost.
+GLOBAL_GROUNDED_DISCOVERY_MAX_NODES = 512
+GLOBAL_GROUNDED_SCAN_MAX_EDGES = 8192
+GLOBAL_GROUNDED_DISCOVERY_MAX_DEPTH = 8
+MAX_NON_ROOT_CONFIRMATION_CANDIDATES = CANDIDATE_PAGE_SIZE - 1
+CONFIRMATION_REVIEW_SCOPES = frozenset({"root", "non_root"})
+GLOBAL_NON_ROOT_REVIEW_ROLES = frozenset(
+    {
+        "contributing_condition",
+        "amplifying_factor",
+        "outcome_evidence",
+        "unrelated",
+    }
+)
+
+
+def _process_confirmation_factual_context(
+    *,
+    graph: TraceGraph,
+    candidate_ref: str,
+    path: Sequence[str],
+    defect_state: DefectState,
+) -> JsonDict:
+    if defect_state.label != "candidate_local_process_defect":
+        return {}
+    cues = candidate_commitment_cue_context(
+        graph=graph,
+        current_ref=candidate_ref,
+    )
+    trajectory = candidate_process_trajectory_context(
+        graph=graph,
+        current_ref=candidate_ref,
+        path=list(path),
+    )
+    if not cues and not trajectory:
+        return {}
+    projected_cues = {
+        key: copy.deepcopy(cues[key])
+        for key in (
+            "schema",
+            "behavior_impact",
+            "candidate_ref",
+            "candidate_reference",
+            "cue_count",
+            "cues_truncated",
+        )
+        if key in cues
+    }
+    projected_cues["cues"] = [
+        {
+            key: copy.deepcopy(cue[key])
+            for key in (
+                "cue_id",
+                "cue_type",
+                "strength",
+                "verbatim_excerpt",
+                "source_kind",
+                "semantic_status",
+            )
+            if key in cue
+        }
+        for cue in cues.get("cues") or ()
+        if isinstance(cue, Mapping)
+    ]
+    projected_trajectory = {
+        key: copy.deepcopy(trajectory[key])
+        for key in (
+            "schema",
+            "behavior_impact",
+            "candidate_ref",
+            "candidate_reference",
+            "candidate_episode_ref",
+            "window_anchor_ref",
+            "post_candidate_episode_count",
+            "post_candidate_no_delivery_episode_count",
+            "post_candidate_search_read_count",
+            "post_candidate_mutation_count",
+            "post_candidate_verification_count",
+            "post_candidate_delivery_observed",
+            "trajectory_boundary",
+            "episode_summaries_truncated",
+        )
+        if key in trajectory
+    }
+    projected_trajectory["episode_summaries"] = [
+        {
+            key: copy.deepcopy(summary[key])
+            for key in (
+                "episode_ref",
+                "reference",
+                "chronology_index",
+                "phase",
+                "no_delivery_progress",
+                "search_read_count",
+                "mutation_count",
+                "verification_count",
+                "error_count",
+            )
+            if key in summary
+        }
+        for summary in trajectory.get("episode_summaries") or ()
+        if isinstance(summary, Mapping)
+    ]
+    return {
+        "schema": "candidate-process-confirmation-facts/v1",
+        "candidate_commitment_cues": projected_cues,
+        "candidate_process_trajectory": projected_trajectory,
+    }
+
+
 GLOBAL_JUDGE_ACTION_OPERATIONS = frozenset(
     {
         "global_judge_started",
         "global_judge_completed",
         "global_judge_failed",
+    }
+)
+GLOBAL_JUDGE_PAGE_ACTION_OPERATIONS = frozenset(
+    {
+        "global_judge_page_started",
+        "global_judge_page_completed",
+        "global_judge_page_failed",
+    }
+)
+GLOBAL_JUDGE_CALL_DIAGNOSTICS_SCHEMA = (
+    "global-judge-call-diagnostics/v1"
+)
+GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS = frozenset(
+    {
+        "status",
+        "pass_identity",
+        "seed_binding_identity",
+        "owner",
+        "seed_ref",
+        "defect_fingerprint",
+        "hypothesis_id",
+        "visit_key",
+        "owner",
+        "plan_identity",
+        "page_plan",
+        "round_index",
+        "page_index",
+        "page_count",
+        "page_identity",
+        "page_phase",
+        "request_identity",
+        "validation_envelope",
+        "capsule_identity",
+        "candidate_compression",
+        "physical_requests_reserved",
+    }
+)
+GLOBAL_JUDGE_PAGE_STARTED_PAYLOAD_KEYS = (
+    GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS
+)
+GLOBAL_JUDGE_PAGE_COMPLETED_PAYLOAD_KEYS = frozenset(
+    {
+        *GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS,
+        "physical_request_delta",
+        "physical_request_exact",
+        "judgment",
+        "final_validation_envelope",
+        "evidence_expansion_history",
+        "expansion_terminal",
+        "judge_diagnostics",
+        "provider_state",
+    }
+)
+GLOBAL_JUDGE_PAGE_FAILED_PAYLOAD_KEYS = frozenset(
+    {
+        *GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS,
+        "physical_request_delta",
+        "physical_request_exact",
+        "blocker",
+        "detail",
+        "judge_diagnostics",
+        "provider_state",
     }
 )
 GLOBAL_JUDGE_ACTION_BASE_KEYS = frozenset(
@@ -205,7 +471,9 @@ COMPLETED_GLOBAL_PASS_KEYS = frozenset(
         "owner",
         "physical_request_delta",
         "candidate_compression",
+        "restoration_obligations",
         "candidate_evidence_capsules",
+        "evidence_context_capsules",
         "evidence_expansion_history",
         "expansion_terminal",
         "judgment",
@@ -254,9 +522,157 @@ GLOBAL_TERMINAL_MARKER_KEYS = frozenset(
         "terminal_status",
     }
 )
+GLOBAL_CANDIDATE_PAGE_PLAN_EVENT_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "plan_identity",
+        "page_phase",
+        "plan",
+        "behavior_impact",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_EVENT_BASE_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "seed_binding_identity",
+        "owner",
+        "seed_ref",
+        "defect_fingerprint",
+        "plan_identity",
+        "round_index",
+        "page_index",
+        "page_identity",
+        "page_phase",
+        "candidate_refs",
+        "candidate_count",
+        "request_identity",
+        "validation_envelope",
+        "candidate_compression",
+        "physical_request_delta",
+        "physical_request_exact",
+        "behavior_impact",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_COMPLETED_EVENT_KEYS = frozenset(
+    {
+        *GLOBAL_CANDIDATE_PAGE_EVENT_BASE_KEYS,
+        "judgment",
+        "page_outcome",
+        "evidence_expansion_history",
+        "expansion_terminal",
+        "judge_diagnostics",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_FAILED_EVENT_KEYS = frozenset(
+    {
+        *GLOBAL_CANDIDATE_PAGE_EVENT_BASE_KEYS,
+        "blocker",
+        "detail",
+        "judge_diagnostics",
+    }
+)
+GLOBAL_CANDIDATE_ROUND_SUMMARY_EVENT_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "plan_identity",
+        "round_summary",
+        "behavior_impact",
+    }
+)
+GLOBAL_CANDIDATE_CONVERGENCE_EVENT_KEYS = frozenset(
+    {
+        "kind",
+        "status",
+        "seed_binding_identity",
+        "seed_ref",
+        "defect_fingerprint",
+        "active_plan_identity",
+        "round_count",
+        "completed_page_count",
+        "failed_page_count",
+        "supported_finalist_refs",
+        "unresolved_refs",
+        "physical_request_delta",
+        "behavior_impact",
+    }
+)
 CONFIRMATION_ACTION_OPERATIONS = frozenset(
     {"confirmation_completed", "confirmation_failed"}
 )
+FACTOR_ROLE_ACTION_OPERATIONS = frozenset(
+    {"factor_role_completed", "factor_role_failed"}
+)
+FACTOR_ROLE_ACTION_BASE_KEYS = frozenset(
+    {
+        "owner",
+        "origin",
+        "candidate_ref",
+        "hypothesis_id",
+        "defect_fingerprint",
+        "seed_binding_identity",
+        "request_projection",
+        "request_identity",
+        "physical_requests_reserved",
+    }
+)
+FACTOR_ROLE_STARTED_PAYLOAD_KEYS = FACTOR_ROLE_ACTION_BASE_KEYS
+FACTOR_ROLE_TERMINAL_PROJECTION_KEYS = frozenset(
+    {
+        "operation",
+        "semantic_key",
+        *FACTOR_ROLE_ACTION_BASE_KEYS,
+        "physical_request_delta",
+        "physical_request_exact",
+        "judgment",
+        "judgment_identity",
+        "failure_classification",
+        "queue_binding",
+        "active_role_binding",
+    }
+)
+FACTOR_ROLE_TERMINAL_PAYLOAD_KEYS = frozenset(
+    {
+        "status",
+        "physical_requests_reserved",
+        "physical_request_delta",
+        "physical_request_exact",
+        "judgment",
+        "action_projection",
+        "provider_state",
+    }
+)
+FACTOR_ROLE_JOURNAL_KEYS = frozenset(
+    {
+        *FACTOR_ROLE_TERMINAL_PROJECTION_KEYS,
+        "status",
+    }
+)
+class FactorRoleAccountingError(RuntimeError):
+    """Fatal mismatch between the factor provider allowance and reported usage."""
+
+    def __init__(
+        self,
+        *,
+        reported_requests: int,
+        allowed_requests: int,
+    ) -> None:
+        self.reported_requests = reported_requests
+        self.allowed_requests = allowed_requests
+        super().__init__(
+            "bounded factor Judge reported {0} physical requests with "
+            "allowance {1}".format(reported_requests, allowed_requests)
+        )
+
+
 CONFIRMATION_STARTED_PAYLOAD_KEYS = frozenset(
     {
         "status",
@@ -264,6 +680,8 @@ CONFIRMATION_STARTED_PAYLOAD_KEYS = frozenset(
         "hypothesis_id",
         "request_identity",
         "physical_requests_reserved",
+        "review_scope",
+        "origin",
     }
 )
 CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
@@ -280,6 +698,8 @@ CONFIRMATION_ACTION_PROJECTION_KEYS = frozenset(
         "defect_fingerprint",
         "seed_binding_identity",
         "seed_key",
+        "review_scope",
+        "origin",
         "recursive_path",
         "evidence_refs",
         "artifact_evidence_envelopes",
@@ -304,6 +724,8 @@ PENDING_CONFIRMATION_REQUIRED_KEYS = frozenset(
         "analysis_perspective",
         "artifact_evidence_envelopes",
         "factual_request_projection",
+        "review_scope",
+        "origin",
     }
 )
 PENDING_CONFIRMATION_ALLOWED_KEYS = frozenset(
@@ -314,7 +736,6 @@ PENDING_CONFIRMATION_ALLOWED_KEYS = frozenset(
         "recursive_path",
         "checked_evidence_refs",
         "task_obligations",
-        "origin",
     }
 )
 TERMINAL_CONFIRMATION_REQUIRED_KEYS = frozenset(
@@ -375,10 +796,13 @@ STEP_ACTION_PROJECTION_KEYS = frozenset(
         "causal_relations",
     }
 )
-PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
+PROVIDER_STATE_SCHEMA = "recursive-provider-state/v3"
+INTERMEDIATE_PROVIDER_STATE_SCHEMA = "recursive-provider-state/v2"
+LEGACY_PROVIDER_STATE_SCHEMA = "recursive-provider-state/v1"
 PROVIDER_STATE_KEYS = {
     "schema",
     "circuit",
+    "previous_failure",
     "cache_identity",
     "cache_stats",
     "accounting",
@@ -389,6 +813,22 @@ PROVIDER_CIRCUIT_KEYS = {
     "reason",
     "consecutive_provider_errors",
     "provider_error_threshold",
+    "disposition",
+    "first_request",
+    "first_failure_at",
+}
+LEGACY_PROVIDER_STATE_KEYS = PROVIDER_STATE_KEYS - {"previous_failure"}
+LEGACY_PROVIDER_CIRCUIT_REQUIRED_KEYS = {
+    "open",
+    "reason",
+    "consecutive_provider_errors",
+    "provider_error_threshold",
+}
+LEGACY_PROVIDER_CIRCUIT_OPTIONAL_KEYS = {
+    "disposition",
+    "first_request",
+    "opened_at",
+    "first_failure_at",
 }
 PROVIDER_ACCOUNTING_KEYS = {
     "judge_requests",
@@ -646,9 +1086,9 @@ def _grounded_downstream_path(
             if next_ref in visited:
                 continue
             edges = graph.edge_context(current, next_ref)
-            if not any(
-                is_confirmation_causal_edge(edge, default_eligible=True)
-                for edge in edges
+            if not has_confirmation_causal_hop(
+                edges,
+                default_eligible=True,
             ) or not graph.edge_endpoints_eligible(current, next_ref):
                 continue
             next_path = (*path, next_ref)
@@ -659,6 +1099,141 @@ def _grounded_downstream_path(
     return ()
 
 
+def _materialize_process_lifecycle_path(
+    graph: TraceGraph,
+    candidate: CausalCandidate,
+    *,
+    active_path: Sequence[str],
+) -> Tuple[str, ...]:
+    """Ground a recorded candidate in its observed post-decision lifecycle."""
+    if not active_path:
+        return ()
+    active_seed_ref = graph.resolve(active_path[-1]) or str(active_path[-1])
+    grounded_path = _grounded_downstream_path(
+        graph,
+        candidate.ref,
+        (active_seed_ref,),
+    )
+    if len(grounded_path) >= 2 or not authored_root_candidate_eligible(
+        graph,
+        candidate.ref,
+    ):
+        return grounded_path
+    process_trajectory = candidate_process_trajectory_context(
+        graph=graph,
+        current_ref=candidate.ref,
+        path=[candidate.ref, *active_path],
+    )
+    episode_refs = [
+        str(summary.get("episode_ref") or "")
+        for summary in process_trajectory.get("episode_summaries") or ()
+        if isinstance(summary, Mapping)
+        and str(summary.get("episode_ref") or "")
+    ]
+    if not episode_refs:
+        return grounded_path
+    lifecycle_evidence_refs = tuple(
+        dict.fromkeys(
+            [
+                candidate.ref,
+                str(process_trajectory.get("candidate_episode_ref") or ""),
+                str(process_trajectory.get("window_anchor_ref") or ""),
+                *episode_refs,
+                active_seed_ref,
+            ]
+        )
+    )
+    lifecycle_evidence_refs = tuple(
+        ref for ref in lifecycle_evidence_refs if ref
+    )
+    graph.add_offline_process_lifecycle_edge(
+        candidate.ref,
+        active_seed_ref,
+        evidence_refs=lifecycle_evidence_refs,
+    )
+    return _grounded_downstream_path(
+        graph,
+        candidate.ref,
+        (active_seed_ref,),
+    )
+
+
+def _restoration_obligations_for_active_seed(
+    graph: TraceGraph,
+    *,
+    seed_ref: str,
+    defect_state: DefectState,
+) -> Tuple[RestorationObligation, ...]:
+    """Project external defect remediation facts for the offline Judge only."""
+    resolved_seed_ref = graph.resolve(seed_ref) or seed_ref
+    seed = graph.nodes.get(resolved_seed_ref)
+    if seed is None or seed.event_type != "case.observed_defect":
+        return ()
+    prompt_refs = tuple(
+        ref
+        for ref, node in sorted(
+            graph.nodes.items(),
+            key=lambda entry: (graph.position(entry[0]), entry[0]),
+        )
+        if node.event_type
+        in {
+            "message.input",
+            "prompt.assembly",
+            "request.received",
+        }
+    )[:4]
+    data = seed.data if isinstance(seed.data, Mapping) else {}
+    component = str(data.get("component") or "").strip()
+    failure_type = str(
+        data.get("failure_type")
+        or data.get("defect_type")
+        or defect_state.label
+    ).strip()
+    capabilities = tuple(
+        dict.fromkeys(
+            value
+            for value in (
+                component,
+                failure_type,
+                "active_defect_remediation",
+            )
+            if value
+        )
+    )
+    expected = str(data.get("expected") or "").strip()
+    required_end_state = (
+        expected
+        or "The active defect is absent when the task closes: {0}".format(
+            defect_state.actual
+        )
+    )
+    return (
+        RestorationObligation.create(
+            obligation_id="obligation:restore:{0}".format(
+                defect_state.fingerprint[:24]
+            ),
+            kind="observed_defect_remediation",
+            baseline_state=(
+                "active_defect_observed_before_offline_judgment"
+            ),
+            required_end_state=required_end_state,
+            required_capabilities=capabilities,
+            scope_refs=tuple(
+                dict.fromkeys((*prompt_refs, resolved_seed_ref))
+            ),
+            acceptance_evidence_refs=(resolved_seed_ref,),
+            provenance={
+                "source": "external_quality_review",
+                "source_refs": (resolved_seed_ref,),
+                "derivation": (
+                    "The offline evaluation declared this active defect; "
+                    "candidate responsibility remains a Judge decision."
+                ),
+            },
+        ),
+    )
+
+
 def _global_envelope_authoritative_candidates(
     graph: TraceGraph,
     envelope: Any,
@@ -667,14 +1242,17 @@ def _global_envelope_authoritative_candidates(
     if not isinstance(envelope, Mapping):
         raise TypeError("global candidate validation envelope must be an object")
     capsules = envelope.get("candidate_evidence_capsules")
-    if not isinstance(capsules, list):
+    context_capsules = envelope.get("evidence_context_capsules")
+    if not isinstance(capsules, list) or not isinstance(
+        context_capsules, list
+    ):
         raise TypeError(
             "global candidate validation envelope capsules must be an array"
         )
     requested_refs = {
         graph.resolve(str(capsule.get("candidate_ref") or ""))
         or str(capsule.get("candidate_ref") or "")
-        for capsule in capsules
+        for capsule in (*capsules, *context_capsules)
         if isinstance(capsule, Mapping)
         and str(capsule.get("candidate_ref") or "")
     }
@@ -717,13 +1295,27 @@ def _assert_global_envelope_matches_completed_pass(
     pass_capsules = matching_passes[0].get(
         "candidate_evidence_capsules"
     )
+    pass_context_capsules = matching_passes[0].get(
+        "evidence_context_capsules"
+    )
     envelope_capsules = (
         envelope.get("candidate_evidence_capsules")
         if isinstance(envelope, Mapping)
         else None
     )
+    envelope_context_capsules = (
+        envelope.get("evidence_context_capsules")
+        if isinstance(envelope, Mapping)
+        else None
+    )
     if not isinstance(pass_capsules, (list, tuple)) or not isinstance(
         envelope_capsules,
+        (list, tuple),
+    ) or not isinstance(
+        pass_context_capsules,
+        (list, tuple),
+    ) or not isinstance(
+        envelope_context_capsules,
         (list, tuple),
     ):
         raise ValueError(
@@ -731,19 +1323,97 @@ def _assert_global_envelope_matches_completed_pass(
         )
     if stable_json(_checkpoint_json(pass_capsules)) != stable_json(
         _checkpoint_json(envelope_capsules)
+    ) or stable_json(
+        _checkpoint_json(pass_context_capsules)
+    ) != stable_json(
+        _checkpoint_json(envelope_context_capsules)
     ):
         raise ValueError(
             "global validation envelope capsules contradict the completed pass"
         )
 
 
+def _assert_report_checkpoint_evidence(
+    graph: TraceGraph,
+    report_payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    allowed_start_blocking_reasons = {
+        "start_ref_active_revision_ineligible",
+        "start_ref_ineligible",
+    }
+    stale_report_starts = {
+        graph.resolve(str(item.get("start_ref") or ""))
+        or str(item.get("start_ref") or "")
+        for item in report_payload.get("seed_results") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("outcome") or "") == "evidence_gap"
+        and allowed_start_blocking_reasons.intersection(
+            str(reason) for reason in item.get("blocking_reasons") or ()
+        )
+    }
+    graph.assert_evidence_eligible_references(
+        report_payload,
+        label=label,
+        allowed_ineligible_refs=stale_report_starts,
+    )
+
+
 def _assert_report_grounded_evidence(
     graph: TraceGraph, report: RecursiveAttributionReport, *, label: str
 ) -> None:
+    escalation_confirmation_identities = {
+        RootConfirmation.from_dict(
+            dict(item["confirmation"])
+        ).confirmation_identity
+        for item in report.metadata.get(
+            "confirmation_action_projection", ()
+        )
+        if isinstance(item, Mapping)
+        and isinstance(item.get("confirmation"), Mapping)
+        and is_factor_role_escalation_origin(item.get("origin"))
+    }
+    published_root_confirmation_identities = {
+        str(root.confirmation.get("confirmation_identity") or "")
+        for root in (*report.confirmed_roots, *report.co_roots)
+    }
+    unpublished_escalation_confirmation_identities = (
+        escalation_confirmation_identities
+        - published_root_confirmation_identities
+    )
+    non_blocking_outperformed_confirmation_identities = (
+        factor_escalation_outperformed_confirmation_identities(
+            confirmations=report.confirmations,
+            published_roots=(
+                *report.confirmed_roots,
+                *report.co_roots,
+            ),
+            confirmation_queue=report.metadata.get(
+                "confirmation_queue", ()
+            ),
+        )
+    )
     validate_confirmation_ownership(
         report.confirmations,
         report.seed_results,
         label=label,
+        non_blocking_unresolved_confirmation_identities=(
+            *non_blocking_outperformed_confirmation_identities,
+            *(
+                str(item.get("confirmation_identity") or "")
+                for field_name in (
+                    "factor_confirmation_gaps",
+                    "factor_role_escalation_gaps",
+                )
+                for item in report.metadata.get(field_name, ())
+                if isinstance(item, Mapping)
+                and (
+                    field_name != "factor_role_escalation_gaps"
+                    or item.get("status") == "unknown"
+                )
+            ),
+        ),
     )
     refs: List[str] = []
     identity_refs: List[str] = []
@@ -787,8 +1457,13 @@ def _assert_report_grounded_evidence(
             refs.extend(assessment.get("causal_path_refs") or ())
     for confirmation in report.confirmations:
         candidate = graph.nodes.get(confirmation.candidate_ref)
-        if candidate is not None and not authored_root_candidate_eligible(
-            graph, confirmation.candidate_ref
+        if (
+            candidate is not None
+            and not authored_root_candidate_eligible(
+                graph, confirmation.candidate_ref
+            )
+            and confirmation.confirmation_identity
+            not in escalation_confirmation_identities
         ):
             raise ValueError(
                 "{0} confirmation candidate is not authored-root eligible for the active revision".format(
@@ -890,7 +1565,11 @@ def _assert_report_grounded_evidence(
             label=label,
         )
         global_judgment = seed.global_judgment
-        if global_judgment.get("outcome") == "candidate_roots":
+        if (
+            global_judgment.get("outcome") == "candidate_roots"
+            and confirmation.confirmation_identity
+            not in escalation_confirmation_identities
+        ):
             selected = tuple(
                 str(ref)
                 for ref in global_judgment.get("selected_candidate_refs") or ()
@@ -902,11 +1581,32 @@ def _assert_report_grounded_evidence(
                 and str(item.get("candidate_ref") or "")
                 == confirmation.candidate_ref
             ]
+            confirmation_queue_entries = [
+                item
+                for item in report.metadata.get("confirmation_queue", ())
+                if isinstance(item, Mapping)
+                and isinstance(item.get("confirmation"), Mapping)
+                and str(
+                    item["confirmation"].get(
+                        "confirmation_identity"
+                    )
+                    or ""
+                )
+                == confirmation.confirmation_identity
+            ]
             if (
                 confirmation.candidate_ref not in selected
                 or len(assessments) != 1
                 or tuple(assessments[0].get("causal_path_refs") or ())
                 != confirmation.recursive_path
+                or len(confirmation_queue_entries) != 1
+                or str(
+                    confirmation_queue_entries[0].get(
+                        "review_scope"
+                    )
+                    or "root"
+                )
+                != "root"
             ):
                 raise ValueError(
                     "{0} confirmation path does not match its selected global assessment path".format(
@@ -917,6 +1617,10 @@ def _assert_report_grounded_evidence(
         if (
             graph.resolve(root.node_ref) in graph.nodes
             and not authored_root_candidate_eligible(graph, root.node_ref)
+            and str(
+                root.confirmation.get("confirmation_identity") or ""
+            )
+            not in escalation_confirmation_identities
         ):
             raise ValueError(
                 "{0} published root candidate is ineligible for the active revision".format(
@@ -949,6 +1653,21 @@ def _assert_report_grounded_evidence(
             defect_state=root.defect_state,
             candidate_node=candidate_node,
             seed_start_ref=owner.start_ref,
+            active_role_binding=(
+                ActiveFailureRoleBinding.from_dict(
+                    root.provenance["active_role_binding"]
+                )
+                if "active_role_binding" in root.provenance
+                else None
+            ),
+            request_projection=owning_root_request_projection(
+                confirmation=confirmation,
+                confirmation_action_projections=report.metadata.get(
+                    "confirmation_action_projection", ()
+                ),
+            )
+            if "active_role_binding" in root.provenance
+            else None,
         )
         if root != expected_root:
             raise ValueError(
@@ -971,16 +1690,36 @@ def _assert_report_grounded_evidence(
         co_roots=report.co_roots,
         analysis_perspective=report.analysis_perspective,
         label=label,
+        confirmation_action_projections=report.metadata.get(
+            "confirmation_action_projection", ()
+        ),
+        non_root_conflict_confirmation_identities=(
+            *(
+                str(item.get("confirmation_identity") or "")
+                for item in report.metadata.get(
+                    "factor_confirmation_conflicts", ()
+                )
+                if isinstance(item, Mapping)
+            ),
+            *unpublished_escalation_confirmation_identities,
+        ),
     )
     _assert_published_non_root_factors(
         graph,
-        confirmations=report.confirmations,
         seed_results=report.seed_results,
         defect_states=report.defect_states,
         contributing_conditions=report.contributing_conditions,
         amplifying_factors=report.amplifying_factors,
+        downstream_materializations=(
+            report.downstream_materializations
+        ),
         rejected_candidates=report.rejected_candidates,
-        analysis_perspective=report.analysis_perspective,
+        factor_confirmation_gaps=report.metadata.get(
+            "factor_confirmation_gaps", ()
+        ),
+        factor_role_action_projections=report.metadata.get(
+            "factor_role_action_projections", ()
+        ),
         label=label,
     )
 
@@ -1144,12 +1883,41 @@ def _quarantine_stale_seed_report_payload(
         and str(item.get("seed_binding_identity") or "")
         not in stale_seed_keys
     }
+    active_candidate_refs.update(
+        str(capsule.get("candidate_ref") or "")
+        for seed in payload.get("seed_results") or ()
+        if isinstance(seed, Mapping)
+        and str(seed.get("start_ref") or "") not in stale_start_refs
+        for capsule in (
+            (
+                *seed.get("global_judgment", {})
+                .get("validation_envelope", {})
+                .get("candidate_evidence_capsules", ()),
+                *seed.get("global_judgment", {})
+                .get("validation_envelope", {})
+                .get("evidence_context_capsules", ()),
+            )
+            if isinstance(seed.get("global_judgment"), Mapping)
+            else ()
+        )
+        if isinstance(capsule, Mapping)
+        and str(capsule.get("candidate_ref") or "")
+    )
 
     def seed_binding(item: Any) -> str:
         if not isinstance(item, Mapping):
             return ""
         confirmation = item.get("confirmation")
-        source = confirmation if isinstance(confirmation, Mapping) else item
+        role_judgment = item.get("role_judgment")
+        source = (
+            confirmation
+            if isinstance(confirmation, Mapping)
+            else (
+                role_judgment
+                if isinstance(role_judgment, Mapping)
+                else item
+            )
+        )
         return str(source.get("seed_binding_identity") or "")
 
     def keep_publication(item: Any) -> bool:
@@ -1161,6 +1929,7 @@ def _quarantine_stale_seed_report_payload(
         "co_roots",
         "contributing_conditions",
         "amplifying_factors",
+        "downstream_materializations",
         "rejected_candidates",
     ):
         payload[name] = [
@@ -1312,6 +2081,42 @@ def _quarantine_stale_seed_report_payload(
             for item in metadata.get(key) or ()
             if keep_owned_local_state(item, label=key)
         ]
+    metadata["factor_role_judgments"] = []
+    for item in source_metadata.get("factor_role_judgments") or ():
+        judgment = _validated_factor_role_judgment(item)
+        if judgment.seed_binding_identity in stale_seed_keys:
+            continue
+        metadata["factor_role_judgments"].append(judgment.to_dict())
+    metadata["factor_role_journal"] = []
+    for item in source_metadata.get("factor_role_journal") or ():
+        journal = _validated_factor_role_journal_entry(item)
+        if journal["seed_binding_identity"] in stale_seed_keys:
+            continue
+        metadata["factor_role_journal"].append(journal)
+    metadata["factor_role_action_projections"] = []
+    for item in source_metadata.get(
+        "factor_role_action_projections"
+    ) or ():
+        projection = _validated_factor_role_terminal_projection(item)
+        if projection["seed_binding_identity"] in stale_seed_keys:
+            continue
+        metadata["factor_role_action_projections"].append(projection)
+    metadata["factor_role_gaps"] = []
+    for item in source_metadata.get("factor_role_gaps") or ():
+        gap = _validated_factor_role_gap(item)
+        if gap["seed_binding_identity"] in stale_seed_keys:
+            continue
+        metadata["factor_role_gaps"].append(gap)
+    metadata["factor_role_escalation_gaps"] = [
+        copy.deepcopy(dict(item))
+        for item in source_metadata.get(
+            "factor_role_escalation_gaps"
+        )
+        or ()
+        if isinstance(item, Mapping)
+        and str(item.get("seed_binding_identity") or "")
+        not in stale_seed_keys
+    ]
     metadata["introduction_bindings"] = [
         item
         for item in metadata.get("introduction_bindings") or ()
@@ -1341,6 +2146,11 @@ def _quarantine_stale_seed_report_payload(
     metadata["global_judge_physical_request_count"] = sum(
         int(item.get("physical_request_delta") or 0)
         for item in retained_global_passes
+    ) + sum(
+        int(item.get("physical_request_delta") or 0)
+        for item in payload["investigation_journal"]
+        if isinstance(item, Mapping)
+        and item.get("kind") == "candidate_cluster_triage_page"
     )
     (
         metadata["investigation_rounds"],
@@ -1351,6 +2161,24 @@ def _quarantine_stale_seed_report_payload(
         "blocking_reason": "start_ref_active_revision_ineligible",
         "behavior_impact": "none_offline_analysis_only",
     }
+    retained_factor_publications = (
+        _canonical_factor_role_publication_sets(
+            metadata["factor_role_action_projections"]
+        )
+    )
+    for key in (
+        "contributing_conditions",
+        "amplifying_factors",
+        "downstream_materializations",
+        "rejected_candidates",
+    ):
+        payload[key] = [
+            item.to_dict()
+            for item in retained_factor_publications[key]
+        ]
+    metadata["factor_confirmation_gaps"] = copy.deepcopy(
+        retained_factor_publications["factor_confirmation_gaps"]
+    )
     payload["metadata"] = metadata
     legacy_root_causes = []
     seen_legacy_root_causes = set()
@@ -1455,6 +2283,1086 @@ def _synthetic_unknown_confirmation(
     )
 
 
+def _factor_role_request_from_projection(value: Any) -> FactorRoleRequest:
+    projection = validate_factor_role_request_projection(value)
+    facts = projection["facts"]
+    return FactorRoleRequest(
+        candidate_ref=facts["candidate_ref"],
+        defect_state=DefectState.from_dict(dict(facts["defect_state"])),
+        recursive_path=tuple(facts["recursive_path"]),
+        candidate_reference=facts["candidate_reference"],
+        recursive_path_references=tuple(facts["recursive_path_references"]),
+        supporting_evidence=tuple(facts["supporting_evidence"]),
+        opposing_evidence=tuple(facts["opposing_evidence"]),
+        task_obligations=tuple(facts["task_obligations"]),
+        confirmed_root_summaries=tuple(facts["confirmed_root_summaries"]),
+        hypothesis_id=facts["hypothesis_id"],
+        hypothesis_semantic_hash=facts["hypothesis_semantic_hash"],
+        seed_binding_identity=facts["seed_binding_identity"],
+        analysis_perspective=facts["analysis_perspective"],
+        factual_context=facts.get("factual_context") or {},
+    )
+
+
+def _synthetic_unknown_factor_role(
+    request: FactorRoleRequest,
+    *,
+    reason: str,
+) -> FactorRoleJudgment:
+    return FactorRoleJudgment(
+        candidate_ref=request.candidate_ref,
+        necessity_status="unknown",
+        factor_role="unknown",
+        reason=reason,
+        confidence=0.0,
+        evidence_refs=(request.candidate_ref,),
+        recursive_path=request.recursive_path,
+        factor_mechanism={},
+        counterfactual={
+            "schema": "factor-role-counterfactual/v1",
+            "intervention_ref": request.candidate_ref,
+            "intervention_kind": "replace_with_semantically_correct_behavior",
+            "predicted_effect": "insufficient_grounded_evidence",
+        },
+        hypothesis_id=request.hypothesis_id,
+        hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+        defect_fingerprint=request.defect_state.fingerprint,
+        seed_binding_identity=request.seed_binding_identity,
+        analysis_perspective=request.analysis_perspective,
+        request_identity=factor_role_request_identity(request),
+    )
+
+
+def _validate_factor_role_judgment_binding(
+    judgment: FactorRoleJudgment,
+    *,
+    request: FactorRoleRequest,
+) -> FactorRoleJudgment:
+    canonical = FactorRoleJudgment.from_dict(judgment.to_dict())
+    provider_payload = canonical.to_dict()
+    provider_payload.pop("judgment_identity")
+    canonical = parse_factor_role_judgment(
+        provider_payload,
+        request=request,
+    )
+    expected = {
+        "candidate_ref": request.candidate_ref,
+        "hypothesis_id": request.hypothesis_id,
+        "hypothesis_semantic_hash": request.hypothesis_semantic_hash,
+        "defect_fingerprint": request.defect_state.fingerprint,
+        "seed_binding_identity": request.seed_binding_identity,
+        "analysis_perspective": request.analysis_perspective,
+        "request_identity": factor_role_request_identity(request),
+    }
+    if any(getattr(canonical, key) != value for key, value in expected.items()):
+        raise ValueError("factor role judgment identity does not match request")
+    if canonical.recursive_path != request.recursive_path:
+        raise ValueError("factor role judgment path does not match request")
+    return canonical
+
+
+def _factor_role_action_base(
+    *,
+    owner: Any,
+    origin: Any,
+    request_projection: Any,
+    request_identity: Any,
+    physical_requests_reserved: Any,
+) -> JsonDict:
+    parsed_owner = LocalStateOwner.from_dict(owner)
+    canonical_projection = validate_factor_role_request_projection(
+        request_projection
+    )
+    request = _factor_role_request_from_projection(canonical_projection)
+    expected_identity = factor_role_request_projection_identity(
+        canonical_projection
+    )
+    if (
+        type(origin) is not str
+        or not origin
+        or type(request_identity) is not str
+        or request_identity != expected_identity
+        or parsed_owner.seed_binding_identity
+        != request.seed_binding_identity
+        or parsed_owner.hypothesis_id != request.hypothesis_id
+        or type(physical_requests_reserved) is not int
+        or physical_requests_reserved < 0
+    ):
+        raise ValueError(
+            "factor role action request, owner, origin, or reservation is inconsistent"
+        )
+    return {
+        "owner": parsed_owner.to_dict(),
+        "origin": origin,
+        "candidate_ref": request.candidate_ref,
+        "hypothesis_id": request.hypothesis_id,
+        "defect_fingerprint": request.defect_state.fingerprint,
+        "seed_binding_identity": request.seed_binding_identity,
+        "request_projection": canonical_projection,
+        "request_identity": request_identity,
+        "physical_requests_reserved": physical_requests_reserved,
+    }
+
+
+def _factor_role_terminal_projection(
+    *,
+    operation: str,
+    semantic_key: str,
+    owner: Any,
+    origin: Any,
+    request_projection: Any,
+    request_identity: Any,
+    physical_requests_reserved: Any,
+    physical_request_delta: Any,
+    physical_request_exact: Any,
+    judgment: FactorRoleJudgment,
+    failure_classification: Any,
+    queue_binding: Any,
+    active_role_binding: Any,
+) -> JsonDict:
+    if operation not in FACTOR_ROLE_ACTION_OPERATIONS:
+        raise ValueError("factor role action operation is invalid")
+    base = _factor_role_action_base(
+        owner=owner,
+        origin=origin,
+        request_projection=request_projection,
+        request_identity=request_identity,
+        physical_requests_reserved=physical_requests_reserved,
+    )
+    request = _factor_role_request_from_projection(base["request_projection"])
+    canonical_queue_binding = (
+        canonical_factor_role_queue_binding_snapshot(
+            value=queue_binding,
+            request_projection=base["request_projection"],
+        )
+    )
+    canonical_judgment = _validate_factor_role_judgment_binding(
+        judgment,
+        request=request,
+    )
+    expected_active_role = active_failure_factor_role_for(
+        canonical_judgment.factor_role
+    )
+    role_binding = (
+        ActiveFailureRoleBinding.from_dict(active_role_binding)
+        if active_role_binding is not None
+        else None
+    )
+    if expected_active_role is None:
+        if role_binding is not None:
+            raise ValueError(
+                "non-causal factor role cannot claim an active failure binding"
+            )
+    else:
+        if role_binding is None:
+            raise ValueError(
+                "factor role action contradicts its independent active "
+                "failure role"
+            )
+        role_binding = canonical_active_failure_role_request_binding(
+            active_role_binding=role_binding.to_dict(),
+            request_projection=base["request_projection"],
+            disposition="factor",
+            causal_role=expected_active_role,
+        )
+    terminal_state_is_reachable = False
+    if (
+        type(physical_request_delta) is int
+        and physical_request_delta >= 0
+        and type(physical_request_exact) is bool
+        and type(failure_classification) is str
+        and failure_classification
+        in FACTOR_ROLE_FAILURE_CLASSIFICATIONS
+    ):
+        reserved = base["physical_requests_reserved"]
+        within_reservation = physical_request_delta <= reserved
+        if operation == "factor_role_completed":
+            terminal_state_is_reachable = (
+                failure_classification == "none"
+                and physical_request_exact is True
+                and within_reservation
+            )
+        elif (
+            canonical_judgment.necessity_status == "unknown"
+            and canonical_judgment.factor_role == "unknown"
+        ):
+            if failure_classification == "accounting_breach":
+                terminal_state_is_reachable = (
+                    physical_request_exact is True
+                    and physical_request_delta > reserved
+                )
+            elif failure_classification == "interrupted":
+                terminal_state_is_reachable = (
+                    physical_request_exact is False
+                    and physical_request_delta == 0
+                    and within_reservation
+                )
+            elif failure_classification in {
+                "bounded_provider_failure",
+                "judgment_invalid",
+            }:
+                terminal_state_is_reachable = (
+                    physical_request_exact is True
+                    and within_reservation
+                )
+            elif failure_classification in {
+                "provider_failure",
+                "capability_error",
+            }:
+                terminal_state_is_reachable = (
+                    (
+                        physical_request_exact is True
+                        and reserved == 0
+                        and physical_request_delta == 0
+                    )
+                    or (
+                        physical_request_exact is False
+                        and physical_request_delta == reserved
+                    )
+                )
+    if (
+        semantic_key != "factor_role:{0}".format(base["request_identity"])
+        or not terminal_state_is_reachable
+    ):
+        raise ValueError(
+            "factor role terminal action accounting or classification is inconsistent"
+        )
+    return {
+        "operation": operation,
+        "semantic_key": semantic_key,
+        **base,
+        "physical_request_delta": physical_request_delta,
+        "physical_request_exact": physical_request_exact,
+        "judgment": canonical_judgment.to_dict(),
+        "judgment_identity": canonical_judgment.judgment_identity,
+        "failure_classification": failure_classification,
+        "queue_binding": canonical_queue_binding,
+        "active_role_binding": (
+            role_binding.to_dict() if role_binding is not None else None
+        ),
+    }
+
+
+def _validated_factor_role_terminal_projection(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role terminal action projection must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(FACTOR_ROLE_TERMINAL_PROJECTION_KEYS),
+        "factor role terminal action projection",
+    )
+    judgment = FactorRoleJudgment.from_dict(
+        dict(value.get("judgment") or {})
+    )
+    canonical = _factor_role_terminal_projection(
+        operation=value.get("operation"),
+        semantic_key=value.get("semantic_key"),
+        owner=value.get("owner"),
+        origin=value.get("origin"),
+        request_projection=value.get("request_projection"),
+        request_identity=value.get("request_identity"),
+        physical_requests_reserved=value.get("physical_requests_reserved"),
+        physical_request_delta=value.get("physical_request_delta"),
+        physical_request_exact=value.get("physical_request_exact"),
+        judgment=judgment,
+        failure_classification=value.get("failure_classification"),
+        queue_binding=value.get("queue_binding"),
+        active_role_binding=value.get("active_role_binding"),
+    )
+    if stable_json(_checkpoint_json(value)) != stable_json(canonical):
+        raise ValueError("factor role terminal action projection is non-canonical")
+    return canonical
+
+
+def _validated_factor_role_judgment(value: Any) -> FactorRoleJudgment:
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role judgment must be an object")
+    judgment = FactorRoleJudgment.from_dict(dict(value))
+    if stable_json(_checkpoint_json(value)) != stable_json(
+        judgment.to_dict()
+    ):
+        raise ValueError("factor role judgment is non-canonical")
+    return judgment
+
+
+def _validated_factor_role_journal_entry(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role journal entry must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(FACTOR_ROLE_JOURNAL_KEYS),
+        "factor role journal entry",
+    )
+    projection = _validated_factor_role_terminal_projection(
+        {
+            key: copy.deepcopy(value[key])
+            for key in FACTOR_ROLE_TERMINAL_PROJECTION_KEYS
+        }
+    )
+    expected_status = (
+        "completed"
+        if projection["operation"] == "factor_role_completed"
+        else "failed"
+    )
+    if value.get("status") != expected_status:
+        raise ValueError(
+            "factor role journal status contradicts action operation"
+        )
+    return {
+        **projection,
+        "status": expected_status,
+    }
+
+
+def _validated_factor_role_gap(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role gap must be an object")
+    _require_exact_checkpoint_keys(
+        value,
+        set(FACTOR_ROLE_GAP_KEYS),
+        "factor role gap",
+    )
+    owner = LocalStateOwner.from_dict(value.get("owner"))
+    required_strings = (
+        "candidate_ref",
+        "hypothesis_id",
+        "defect_fingerprint",
+        "seed_binding_identity",
+        "request_identity",
+        "judgment_identity",
+        "reason",
+        "failure_classification",
+        "origin",
+    )
+    if any(
+        type(value.get(key)) is not str or not value[key]
+        for key in required_strings
+    ):
+        raise ValueError("factor role gap identity is incomplete")
+    if (
+        owner.seed_binding_identity
+        != value["seed_binding_identity"]
+        or owner.hypothesis_id != value["hypothesis_id"]
+        or not value["request_identity"].startswith(
+            FACTOR_ROLE_REQUEST_IDENTITY_PREFIX
+        )
+        or value["failure_classification"]
+        not in FACTOR_ROLE_FAILURE_CLASSIFICATIONS
+        or value["origin"] != "global_candidate_factor_assessment"
+    ):
+        raise ValueError(
+            "factor role gap owner, request, or origin is inconsistent"
+        )
+    return {
+        key: (
+            owner.to_dict()
+            if key == "owner"
+            else copy.deepcopy(value[key])
+        )
+        for key in FACTOR_ROLE_GAP_KEYS
+    }
+
+
+def _factor_role_projection_from_record(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("factor role action record must be an object")
+    operation = str(value.get("operation") or "")
+    payload = value.get("payload")
+    if operation not in FACTOR_ROLE_ACTION_OPERATIONS:
+        raise ValueError("factor role terminal action operation is invalid")
+    if not isinstance(payload, Mapping):
+        raise ValueError("factor role terminal action payload must be an object")
+    _require_exact_checkpoint_keys(
+        payload,
+        set(FACTOR_ROLE_TERMINAL_PAYLOAD_KEYS),
+        "factor role terminal action payload",
+    )
+    projection = _validated_factor_role_terminal_projection(
+        payload.get("action_projection")
+    )
+    expected_status = (
+        "completed" if operation == "factor_role_completed" else "failed"
+    )
+    if (
+        str(value.get("semantic_key") or "")
+        != projection["semantic_key"]
+        or projection["operation"] != operation
+        or payload.get("status") != expected_status
+        or payload.get("physical_requests_reserved")
+        != projection["physical_requests_reserved"]
+        or payload.get("physical_request_delta")
+        != projection["physical_request_delta"]
+        or payload.get("physical_request_exact")
+        != projection["physical_request_exact"]
+        or payload.get("judgment") != projection["judgment"]
+        or not isinstance(payload.get("provider_state"), Mapping)
+    ):
+        raise ValueError(
+            "factor role terminal action record contradicts its projection"
+        )
+    return projection
+
+
+def _factor_role_started_projection_from_record(value: Any) -> JsonDict:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("operation") != "factor_role_started"
+        or not isinstance(value.get("payload"), Mapping)
+    ):
+        raise ValueError("factor role started action record is invalid")
+    payload = value["payload"]
+    _require_exact_checkpoint_keys(
+        payload,
+        set(FACTOR_ROLE_STARTED_PAYLOAD_KEYS),
+        "factor role started action payload",
+    )
+    base = _factor_role_action_base(
+        owner=payload.get("owner"),
+        origin=payload.get("origin"),
+        request_projection=payload.get("request_projection"),
+        request_identity=payload.get("request_identity"),
+        physical_requests_reserved=payload.get(
+            "physical_requests_reserved"
+        ),
+    )
+    if str(value.get("semantic_key") or "") != "factor_role:{0}".format(
+        base["request_identity"]
+    ):
+        raise ValueError(
+            "factor role started action semantic key is inconsistent"
+        )
+    return base
+
+
+def _validated_factor_role_action_record(
+    value: Any,
+) -> Optional[Tuple[str, JsonDict]]:
+    if not isinstance(value, Mapping):
+        return None
+    operation = str(value.get("operation") or "")
+    if operation == "factor_role_started":
+        return (
+            operation,
+            _factor_role_started_projection_from_record(value),
+        )
+    if operation in FACTOR_ROLE_ACTION_OPERATIONS:
+        return operation, _factor_role_projection_from_record(value)
+    return None
+
+
+def _factor_role_action_seed_key(value: Any) -> str:
+    parsed = _validated_factor_role_action_record(value)
+    if parsed is None:
+        return ""
+    return str(parsed[1]["seed_binding_identity"])
+
+
+def _validate_factor_role_action_lifecycles(
+    records: Iterable[Any],
+    *,
+    stale_seed_keys: Set[str],
+) -> None:
+    grouped: Dict[str, List[Tuple[int, Mapping[str, Any]]]] = {}
+    for position, value in enumerate(records):
+        parsed = _validated_factor_role_action_record(value)
+        if parsed is None:
+            continue
+        operation, projection = parsed
+        if projection["seed_binding_identity"] in stale_seed_keys:
+            continue
+        semantic_key = str(value.get("semantic_key") or "")
+        grouped.setdefault(semantic_key, []).append((position, value))
+
+    for semantic_key, lifecycle in grouped.items():
+        starts = [
+            (position, value)
+            for position, value in lifecycle
+            if value.get("operation") == "factor_role_started"
+        ]
+        terminals = [
+            (position, value)
+            for position, value in lifecycle
+            if value.get("operation") in FACTOR_ROLE_ACTION_OPERATIONS
+        ]
+        if len(starts) > 1 or len(terminals) > 1:
+            raise ValueError(
+                "factor role lifecycle must contain at most one started "
+                "and one terminal action"
+            )
+        if not terminals:
+            if len(starts) == 1:
+                _factor_role_started_projection_from_record(starts[0][1])
+            continue
+        if len(starts) != 1:
+            raise ValueError(
+                "factor role terminal has no unique matching started action"
+            )
+        start_position, start_record = starts[0]
+        terminal_position, terminal_record = terminals[0]
+        if start_position >= terminal_position:
+            raise ValueError(
+                "factor role lifecycle terminal must follow its started action"
+            )
+        started = _factor_role_started_projection_from_record(start_record)
+        terminal = _factor_role_projection_from_record(terminal_record)
+        terminal_base = {
+            key: copy.deepcopy(terminal[key])
+            for key in FACTOR_ROLE_ACTION_BASE_KEYS
+        }
+        if (
+            semantic_key != terminal["semantic_key"]
+            or stable_json(_checkpoint_json(started))
+            != stable_json(_checkpoint_json(terminal_base))
+        ):
+            raise ValueError(
+                "factor role terminal has no exact matching started action"
+            )
+
+
+def _validate_shared_judge_action_accounting(
+    records: Iterable[Any],
+    *,
+    max_judge_requests: Optional[int] = None,
+    cache_identity: Optional[str] = None,
+) -> None:
+    actions = tuple(records)
+    shared_keys = (
+        "judge_requests",
+        "judge_request_uncertainty_count",
+        "logical_judge_calls",
+        "logical_confirmation_calls",
+    )
+    if max_judge_requests is not None and (
+        type(max_judge_requests) is not int or max_judge_requests < 0
+    ):
+        raise ValueError("shared Judge budget is invalid")
+    observed_cache_identity = cache_identity
+    current_accounting = {
+        "judge_requests": 0,
+        "judge_request_uncertainty_count": 0,
+        "logical_judge_calls": 0,
+        "logical_confirmation_calls": 0,
+        "investigation_rounds": 0,
+        "artifact_bytes": 0,
+    }
+    pending: Optional[JsonDict] = None
+
+    def provider_accounting(value: Any, *, label: str) -> JsonDict:
+        nonlocal observed_cache_identity
+        if not isinstance(value, Mapping):
+            raise ValueError("{0} provider state is missing".format(label))
+        provider_cache_identity = str(value.get("cache_identity") or "")
+        if observed_cache_identity is None:
+            observed_cache_identity = provider_cache_identity
+        parsed = _validate_provider_state(
+            value,
+            SimpleNamespace(
+                judge_requests=0,
+                judge_request_uncertainty_count=0,
+                logical_judge_calls=0,
+                logical_confirmation_calls=0,
+                investigation_rounds=0,
+                artifact_bytes=0,
+            ),
+            cache_identity=str(observed_cache_identity or ""),
+            require_accounting_match=False,
+        )
+        return copy.deepcopy(dict(parsed["accounting"]))
+
+    def snapshot_accounting(
+        record: Mapping[str, Any],
+        *,
+        label: str,
+    ) -> JsonDict:
+        payload = record.get("payload")
+        if (
+            record.get("operation") != "state_snapshot"
+            or not isinstance(payload, Mapping)
+            or payload.get("schema") != ACTION_STATE_SCHEMA
+        ):
+            raise ValueError(
+                "{0} has no canonical shared budget snapshot".format(label)
+            )
+        accounting = provider_accounting(
+            payload.get("provider_state"),
+            label=label,
+        )
+        for key in shared_keys:
+            if payload.get(key) != accounting[key]:
+                raise ValueError(
+                    "{0} snapshot contradicts provider accounting".format(
+                        label
+                    )
+                )
+        return accounting
+
+    def require_accounting(
+        actual: Mapping[str, Any],
+        expected: Mapping[str, Any],
+        *,
+        label: str,
+    ) -> None:
+        if any(actual[key] != expected[key] for key in shared_keys):
+            raise ValueError(
+                "{0} contradicts reconstructed provider accounting".format(
+                    label
+                )
+            )
+
+    def remaining_budget(accounting: Mapping[str, Any]) -> Optional[int]:
+        if max_judge_requests is None:
+            return None
+        return max(
+            0,
+            max_judge_requests - accounting["judge_requests"],
+        )
+
+    def require_canonical_reservation(
+        reservation: Any,
+        *,
+        accounting: Mapping[str, Any],
+        label: str,
+        page_bounded: bool = False,
+    ) -> int:
+        if type(reservation) is not int or reservation < 0:
+            raise ValueError("{0} reservation is invalid".format(label))
+        remaining = remaining_budget(accounting)
+        expected_page_reservation = (
+            min(
+                remaining,
+                GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+            )
+            if remaining is not None
+            else None
+        )
+        if page_bounded and (
+            reservation
+            > GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+            or (
+                expected_page_reservation is not None
+                and reservation != expected_page_reservation
+            )
+        ):
+            raise ValueError(
+                "{0} reservation contradicts the page-bounded shared "
+                "Judge budget".format(label)
+            )
+        if (
+            not page_bounded
+            and remaining is not None
+            and reservation not in {0, remaining}
+        ):
+            raise ValueError(
+                "{0} reservation contradicts the shared Judge budget".format(
+                    label
+                )
+            )
+        return reservation
+
+    for position, record in enumerate(actions):
+        if not isinstance(record, Mapping):
+            continue
+        operation = str(record.get("operation") or "")
+        semantic_key = str(record.get("semantic_key") or "")
+        payload = record.get("payload")
+
+        if operation == "state_snapshot":
+            next_record = (
+                actions[position + 1]
+                if position + 1 < len(actions)
+                and isinstance(actions[position + 1], Mapping)
+                else None
+            )
+            pre_start = (
+                isinstance(next_record, Mapping)
+                and next_record.get("operation")
+                in {
+                    "confirmation_started",
+                    "factor_role_started",
+                    "provider_call_started",
+                    "global_judge_page_started",
+                    "candidate_cluster_triage_page_started",
+                }
+                and (
+                    next_record.get("operation") == "provider_call_started"
+                    or str(next_record.get("semantic_key") or "")
+                    == semantic_key
+                )
+            )
+            if pre_start:
+                continue
+            actual = snapshot_accounting(
+                record,
+                label="shared Judge state",
+            )
+            if (
+                pending is not None
+                and isinstance(next_record, Mapping)
+                and next_record.get("operation")
+                == "provider_call_interrupted"
+                and pending["kind"] == "provider_call"
+                and str(next_record.get("semantic_key") or "")
+                == pending["semantic_key"]
+            ):
+                expected = copy.deepcopy(
+                    pending["snapshot_accounting"]
+                )
+                expected["judge_request_uncertainty_count"] += 1
+                require_accounting(
+                    actual,
+                    expected,
+                    label="interrupted provider action snapshot",
+                )
+                current_accounting = actual
+                pending["interrupted_snapshot"] = True
+                continue
+            if pending is not None:
+                raise ValueError(
+                    "{0} action lifecycle is interleaved".format(
+                        str(pending.get("kind") or "Judge")
+                    )
+                )
+            if position == 0:
+                current_accounting = actual
+                continue
+            require_accounting(
+                actual,
+                current_accounting,
+                label="continuous shared Judge state snapshot",
+            )
+            current_accounting = actual
+            continue
+
+        if operation in {
+            "global_judge_started",
+            "global_judge_page_started",
+            "candidate_cluster_triage_page_started",
+            "confirmation_started",
+            "factor_role_started",
+            "provider_call_started",
+        }:
+            if pending is not None:
+                raise ValueError(
+                    "{0} action lifecycle is interleaved".format(
+                        str(pending.get("kind") or "Judge")
+                    )
+                )
+            if not isinstance(payload, Mapping):
+                raise ValueError("Judge start payload is invalid")
+            if operation == "global_judge_started":
+                reservation = require_canonical_reservation(
+                    payload.get("physical_requests_reserved"),
+                    accounting=current_accounting,
+                    label="global Judge start",
+                )
+                reserved_accounting = copy.deepcopy(current_accounting)
+                reserved_accounting["logical_judge_calls"] += 1
+                pending = {
+                    "kind": "global_judge",
+                    "semantic_key": semantic_key,
+                    "reservation": reservation,
+                    "base_accounting": copy.deepcopy(
+                        current_accounting
+                    ),
+                    "snapshot_accounting": reserved_accounting,
+                }
+                continue
+            if operation in {
+                "global_judge_page_started",
+                "candidate_cluster_triage_page_started",
+            }:
+                reservation = require_canonical_reservation(
+                    payload.get("physical_requests_reserved"),
+                    accounting=current_accounting,
+                    label="global Judge page start",
+                    page_bounded=True,
+                )
+                reserved_accounting = copy.deepcopy(
+                    current_accounting
+                )
+                reserved_accounting["logical_judge_calls"] += 1
+                pending = {
+                    "kind": (
+                        "candidate_cluster_triage_page"
+                        if operation
+                        == "candidate_cluster_triage_page_started"
+                        else "global_judge_page"
+                    ),
+                    "semantic_key": semantic_key,
+                    "reservation": reservation,
+                    "base_accounting": copy.deepcopy(
+                        current_accounting
+                    ),
+                    "snapshot_accounting": reserved_accounting,
+                }
+                continue
+            if position == 0:
+                raise ValueError(
+                    "Judge start has no immediately preceding budget snapshot"
+                )
+            snapshot = actions[position - 1]
+            if (
+                not isinstance(snapshot, Mapping)
+                or snapshot.get("operation") != "state_snapshot"
+                or (
+                    operation != "provider_call_started"
+                    and str(snapshot.get("semantic_key") or "")
+                    != semantic_key
+                )
+            ):
+                raise ValueError(
+                    "Judge start has no immediately preceding budget snapshot"
+                )
+            snapshot_values = snapshot_accounting(
+                snapshot,
+                label="Judge start budget snapshot",
+            )
+            expected = copy.deepcopy(current_accounting)
+            expected["logical_judge_calls"] += 1
+            kind = (
+                "confirmation"
+                if operation == "confirmation_started"
+                else "factor_role"
+                if operation == "factor_role_started"
+                else "provider_call"
+            )
+            if kind == "confirmation":
+                expected["logical_confirmation_calls"] += 1
+            reservation = (
+                snapshot_values["judge_requests"]
+                - current_accounting["judge_requests"]
+            )
+            require_canonical_reservation(
+                reservation,
+                accounting=current_accounting,
+                label="Judge start",
+            )
+            expected["judge_requests"] += reservation
+            require_accounting(
+                snapshot_values,
+                expected,
+                label="Judge start budget snapshot",
+            )
+            factor_started = (
+                _validated_factor_role_action_record(record)
+                if kind == "factor_role"
+                else None
+            )
+            started_reservation = (
+                factor_started[1]["physical_requests_reserved"]
+                if factor_started is not None
+                else payload.get("physical_requests_reserved")
+            )
+            if (
+                type(started_reservation) is not int
+                or started_reservation < 0
+            ):
+                raise ValueError("Judge start reservation is invalid")
+            if started_reservation != reservation:
+                raise ValueError(
+                    "Judge start reservation contradicts shared Judge budget "
+                    "snapshot"
+                )
+            pending = {
+                "kind": kind,
+                "semantic_key": semantic_key,
+                "reservation": reservation,
+                "base_accounting": copy.deepcopy(current_accounting),
+                "snapshot_accounting": snapshot_values,
+            }
+            continue
+
+        if operation in {
+            "global_judge_completed",
+            "global_judge_failed",
+            "global_judge_page_completed",
+            "global_judge_page_failed",
+            "candidate_cluster_triage_page_completed",
+            "candidate_cluster_triage_page_failed",
+            "provider_call_completed",
+            "provider_call_failed",
+            *CONFIRMATION_ACTION_OPERATIONS,
+            *FACTOR_ROLE_ACTION_OPERATIONS,
+        }:
+            if not isinstance(payload, Mapping):
+                raise ValueError("Judge terminal payload is invalid")
+            if operation in {
+                "global_judge_completed",
+                "global_judge_failed",
+            }:
+                kind = "global_judge"
+                projection = payload
+            elif operation in {
+                "global_judge_page_completed",
+                "global_judge_page_failed",
+            }:
+                kind = "global_judge_page"
+                projection = payload
+            elif operation in {
+                "candidate_cluster_triage_page_completed",
+                "candidate_cluster_triage_page_failed",
+            }:
+                kind = "candidate_cluster_triage_page"
+                projection = payload
+            elif operation in {
+                "provider_call_completed",
+                "provider_call_failed",
+            }:
+                kind = "provider_call"
+                projection = payload
+            elif operation in CONFIRMATION_ACTION_OPERATIONS:
+                projection = _confirmation_action_projection_from_record(
+                    record
+                )
+                kind = "confirmation"
+            else:
+                parsed_factor = _validated_factor_role_action_record(record)
+                if parsed_factor is None:
+                    raise ValueError(
+                        "factor role terminal accounting projection is invalid"
+                    )
+                projection = parsed_factor[1]
+                kind = "factor_role"
+            reservation = projection.get("physical_requests_reserved")
+            delta = projection.get("physical_request_delta")
+            exact = projection.get("physical_request_exact")
+            if (
+                type(reservation) is not int
+                or reservation < 0
+                or type(delta) is not int
+                or delta < 0
+                or type(exact) is not bool
+            ):
+                raise ValueError("Judge terminal accounting is invalid")
+            if pending is None:
+                if (
+                    kind != "confirmation"
+                    or reservation != 0
+                    or delta != 0
+                    or exact is not True
+                ):
+                    raise ValueError(
+                        "{0} action terminal has no shared budget start".format(
+                            "provider"
+                            if kind == "provider_call"
+                            else kind.replace("_", " ")
+                        )
+                    )
+                expected = copy.deepcopy(current_accounting)
+            else:
+                if (
+                    pending["kind"] != kind
+                    or pending["semantic_key"] != semantic_key
+                    or pending["reservation"] != reservation
+                ):
+                    raise ValueError(
+                        "Judge terminal contradicts shared budget start"
+                    )
+                expected = copy.deepcopy(
+                    pending["snapshot_accounting"]
+                )
+                expected["judge_requests"] = pending[
+                    "base_accounting"
+                ]["judge_requests"] + (
+                    delta
+                    if exact
+                    or kind
+                    in {
+                        "global_judge",
+                        "global_judge_page",
+                        "candidate_cluster_triage_page",
+                    }
+                    else reservation
+                )
+                if not exact:
+                    expected[
+                        "judge_request_uncertainty_count"
+                    ] += 1
+            terminal_provider_state = payload.get("provider_state")
+            if isinstance(terminal_provider_state, Mapping):
+                actual = provider_accounting(
+                    terminal_provider_state,
+                    label="{0} terminal".format(kind),
+                )
+            elif (
+                kind == "confirmation"
+                and pending is None
+                and reservation == 0
+                and delta == 0
+                and exact is True
+            ):
+                actual = copy.deepcopy(expected)
+            elif (
+                kind == "confirmation"
+                and pending is not None
+                and delta == 0
+                and exact is False
+                and position + 1 < len(actions)
+                and isinstance(actions[position + 1], Mapping)
+                and actions[position + 1].get("operation")
+                == "state_snapshot"
+                and str(
+                    actions[position + 1].get("semantic_key") or ""
+                )
+                == semantic_key
+            ):
+                actual = snapshot_accounting(
+                    actions[position + 1],
+                    label="interrupted confirmation terminal",
+                )
+            else:
+                raise ValueError(
+                    "{0} terminal provider state is missing".format(kind)
+                )
+            require_accounting(
+                actual,
+                expected,
+                label=(
+                    "completed confirmation actions"
+                    if operation == "confirmation_completed"
+                    else "confirmation action terminal"
+                    if kind == "confirmation"
+                    else "factor_role terminal"
+                ),
+            )
+            current_accounting = actual
+            pending = None
+            continue
+
+        if operation == "provider_call_interrupted":
+            if (
+                pending is None
+                or pending["kind"] != "provider_call"
+                or pending["semantic_key"] != semantic_key
+                or pending.get("interrupted_snapshot") is not True
+            ):
+                raise ValueError(
+                    "interrupted provider action has no canonical shared "
+                    "accounting snapshot"
+                )
+            pending = None
+            continue
+
+        if isinstance(payload, Mapping) and isinstance(
+            payload.get("provider_state"), Mapping
+        ):
+            if pending is not None:
+                raise ValueError(
+                    "{0} action lifecycle is interleaved".format(
+                        str(pending.get("kind") or "Judge")
+                    )
+                )
+            actual = provider_accounting(
+                payload["provider_state"],
+                label=operation or "Judge action",
+            )
+            require_accounting(
+                actual,
+                current_accounting,
+                label="non-authoritative provider action",
+            )
+
+
 def _validate_pending_confirmation_identity(
     value: Mapping[str, Any],
 ) -> Tuple[str, str, str, str]:
@@ -1479,9 +3387,12 @@ def _validate_pending_confirmation_identity(
         raise ValueError(
             "pending confirmation requires complete request identity fields"
         )
-    if not str(value.get("semantic_identity") or "").startswith(
-        ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
-    ):
+    expected_prefix = (
+        FACTOR_ROLE_REQUEST_IDENTITY_PREFIX
+        if str(value.get("review_scope") or "root") == "non_root"
+        else ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX
+    )
+    if not str(value.get("semantic_identity") or "").startswith(expected_prefix):
         raise ValueError(
             "pending confirmation semantic identity is not a canonical "
             "versioned request hash"
@@ -1519,6 +3430,48 @@ def _validate_terminal_confirmation_identity(
             "terminal confirmation queue response_identity contradicts its "
             "confirmation response"
         )
+
+
+def _validate_terminal_factor_role_identity(
+    value: Mapping[str, Any],
+) -> FactorRoleJudgment:
+    actual_keys = {str(key) for key in value}
+    missing = TERMINAL_FACTOR_ROLE_QUEUE_REQUIRED_KEYS - actual_keys
+    extra = actual_keys - TERMINAL_FACTOR_ROLE_QUEUE_ALLOWED_KEYS
+    if (
+        missing
+        or extra
+        or value.get("status") not in {"completed", "failed"}
+        or not isinstance(value.get("factor_role_judgment"), Mapping)
+    ):
+        raise ValueError(
+            "terminal factor role identity schema mismatch "
+            "(missing={0}, extra={1})".format(
+                sorted(missing),
+                sorted(extra),
+            )
+        )
+    judgment = FactorRoleJudgment.from_dict(
+        dict(value.get("factor_role_judgment") or {})
+    )
+    if (
+        str(value.get("response_identity") or "")
+        != judgment.judgment_identity
+        or value.get("failure_classification")
+        not in FACTOR_ROLE_FAILURE_CLASSIFICATIONS
+        or (
+            value.get("status") == "completed"
+            and value.get("failure_classification") != "none"
+        )
+        or (
+            value.get("status") == "failed"
+            and value.get("failure_classification") == "none"
+        )
+    ):
+        raise ValueError(
+            "terminal factor role queue response or failure identity is inconsistent"
+        )
+    return judgment
 
 
 def _validate_confirmation_request_projection_binding(
@@ -1995,6 +3948,8 @@ def _confirmation_action_projection(
     request_identity: str,
     owner: Any,
     seed_key: str,
+    review_scope: str,
+    origin: Any,
     confirmation: RootConfirmation,
     physical_requests_reserved: int,
     physical_request_delta: int,
@@ -2006,6 +3961,9 @@ def _confirmation_action_projection(
     if operation not in CONFIRMATION_ACTION_OPERATIONS:
         raise ValueError("confirmation action operation is invalid")
     parsed_owner = LocalStateOwner.from_dict(owner)
+    if review_scope not in CONFIRMATION_REVIEW_SCOPES:
+        raise ValueError("confirmation action review_scope is unsupported")
+    canonical_origin = canonical_confirmation_origin(origin)
     if (
         not request_identity
         or not request_identity.startswith(
@@ -2066,6 +4024,8 @@ def _confirmation_action_projection(
         "defect_fingerprint": confirmation.defect_fingerprint,
         "seed_binding_identity": confirmation.seed_binding_identity,
         "seed_key": seed_key,
+        "review_scope": review_scope,
+        "origin": canonical_origin,
         "recursive_path": list(confirmation.recursive_path),
         "evidence_refs": list(confirmation.evidence_refs),
         "artifact_evidence_envelopes": copy.deepcopy(
@@ -2174,6 +4134,8 @@ def _validated_confirmation_action_projection(value: Any) -> JsonDict:
         request_identity=str(value.get("request_identity") or ""),
         owner=value.get("owner"),
         seed_key=str(value.get("seed_key") or ""),
+        review_scope=str(value.get("review_scope") or ""),
+        origin=value.get("origin"),
         confirmation=confirmation,
         physical_requests_reserved=value.get("physical_requests_reserved"),
         physical_request_delta=value.get("physical_request_delta"),
@@ -2232,6 +4194,8 @@ def _validated_confirmation_started_action(
     *,
     request: RootConfirmationRequest,
     request_identity: str,
+    review_scope: str,
+    origin: Any,
 ) -> JsonDict:
     payload = record.get("payload")
     if not isinstance(payload, Mapping):
@@ -2253,6 +4217,10 @@ def _validated_confirmation_started_action(
         != request.hypothesis_id
         or str(payload.get("request_identity") or "")
         != request_identity
+        or str(payload.get("review_scope") or "") != review_scope
+        or canonical_confirmation_origin(payload.get("origin"))
+        != canonical_confirmation_origin(origin)
+        or review_scope not in CONFIRMATION_REVIEW_SCOPES
         or type(reserved) is not int
         or reserved < 0
     ):
@@ -2391,6 +4359,13 @@ def _global_terminal_residual_signature(
 ) -> bool:
     """Recognize explicit or ledger-bound residual global terminal state."""
     if not isinstance(value, Mapping):
+        return False
+    if value.get("kind") in {
+        "global_candidate_page",
+        "global_candidate_page_plan",
+        "global_candidate_round_summary",
+        "global_candidate_convergence",
+    }:
         return False
     if value.get("kind") == "global_candidate_pass" or any(
         key in value for key in GLOBAL_TERMINAL_MARKER_KEYS
@@ -2572,6 +4547,14 @@ def _classify_global_pass_records(
                     (list, tuple),
                 )
                 or not isinstance(
+                    item.get("restoration_obligations"),
+                    (list, tuple),
+                )
+                or not isinstance(
+                    item.get("evidence_context_capsules"),
+                    (list, tuple),
+                )
+                or not isinstance(
                     item.get("evidence_expansion_history"),
                     (list, tuple),
                 )
@@ -2586,6 +4569,10 @@ def _classify_global_pass_records(
                     "completed global pass record[{0}] is malformed".format(
                         index
                     )
+                )
+            for obligation in item.get("restoration_obligations") or ():
+                RestorationObligation.from_dict(
+                    _checkpoint_json(obligation)
                 )
             completed.append(item)
             continue
@@ -2727,27 +4714,266 @@ def _owned_payload(value: Mapping[str, Any], owner: Any) -> JsonDict:
     }
 
 
+LEGACY_BYPASSED_GLOBAL_GATE_KEYS = frozenset(
+    {
+        "behavior_impact",
+        "candidate_compression",
+        "defect_fingerprint",
+        "fallback",
+        "kind",
+        "reason",
+        "seed_ref",
+        "status",
+    }
+)
+LEGACY_CANDIDATE_COMPRESSION_KEYS = frozenset(
+    {
+        "candidate_byte_reduction_ratio",
+        "candidate_count",
+        "candidate_node_reduction_ratio",
+        "capsule_bytes",
+        "global_fusion_payload",
+        "open_root_candidate_count",
+        "trace_json_bytes",
+        "trace_node_count",
+    }
+)
+LEGACY_GLOBAL_FUSION_PAYLOAD_KEYS = frozenset(
+    {
+        "capsule_to_trace_expansion_ratio",
+        "dense_root_matrix",
+        "eligible",
+        "max_open_root_candidates",
+        "max_payload_bytes",
+        "negative_compression",
+        "open_root_candidate_count",
+        "oversized",
+        "reason",
+    }
+)
+LEGACY_PROJECTION_METADATA_KEYS = (
+    "analysis",
+    "fusion_mode",
+    "global_candidate_pass_count",
+    "global_judge_physical_request_count",
+    "global_candidate_judgments",
+    "candidate_compression",
+    "recursive_expansion_reasons",
+    "global_candidate_failures",
+)
+
+
+def _is_exact_legacy_candidate_compression(value: Any) -> bool:
+    if (
+        not isinstance(value, Mapping)
+        or {str(key) for key in value}
+        != set(LEGACY_CANDIDATE_COMPRESSION_KEYS)
+    ):
+        return False
+    fusion = value.get("global_fusion_payload")
+    if (
+        not isinstance(fusion, Mapping)
+        or {str(key) for key in fusion}
+        != set(LEGACY_GLOBAL_FUSION_PAYLOAD_KEYS)
+    ):
+        return False
+    return (
+        all(
+            type(value.get(key)) is float
+            and 0.0 <= value[key] <= 1.0
+            for key in (
+                "candidate_byte_reduction_ratio",
+                "candidate_node_reduction_ratio",
+            )
+        )
+        and all(
+            type(value.get(key)) is int and value[key] >= 0
+            for key in (
+                "candidate_count",
+                "capsule_bytes",
+                "open_root_candidate_count",
+                "trace_json_bytes",
+                "trace_node_count",
+            )
+        )
+        and type(fusion.get("capsule_to_trace_expansion_ratio"))
+        is float
+        and fusion["capsule_to_trace_expansion_ratio"] >= 0.0
+        and type(fusion.get("max_open_root_candidates")) is int
+        and fusion["max_open_root_candidates"] >= 0
+        and type(fusion.get("max_payload_bytes")) is int
+        and fusion["max_payload_bytes"] >= 0
+        and type(fusion.get("open_root_candidate_count")) is int
+        and fusion["open_root_candidate_count"] >= 0
+        and fusion["open_root_candidate_count"]
+        == value["open_root_candidate_count"]
+        and fusion.get("negative_compression") is False
+        and fusion.get("dense_root_matrix") is True
+        and fusion.get("eligible") is False
+        and fusion.get("oversized") is True
+        and fusion.get("reason") == "oversized_dense_root_matrix"
+    )
+
+
+def classify_legacy_projection_shape(
+    investigation_journal: Iterable[Any],
+    metadata: Mapping[str, Any],
+) -> Union[LegacyProjectionNotRequired, LegacyProjectionRequired]:
+    """Purely classify the one exact historical Global-bypass projection."""
+
+    journal = tuple(investigation_journal)
+    global_passes = tuple(
+        item
+        for item in journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_pass"
+    )
+    gates = tuple(
+        item
+        for item in journal
+        if isinstance(item, Mapping)
+        and item.get("kind") == "global_candidate_gate"
+    )
+    if (
+        global_passes
+        or str(metadata.get("fusion_mode") or "") == "retrieval-global"
+        or str(metadata.get("analysis") or "")
+        == "retrieval_global_recursive_fusion"
+    ):
+        return LegacyProjectionNotRequired(
+            classifier_identity=LEGACY_PROJECTION_CLASSIFIER_IDENTITY,
+            reason="modern_global_projection",
+        )
+    if not gates:
+        return LegacyProjectionNotRequired(
+            classifier_identity=LEGACY_PROJECTION_CLASSIFIER_IDENTITY,
+            reason="no_legacy_global_gate",
+        )
+
+    exact_metadata = (
+        str(metadata.get("analysis") or "")
+        == "agentic_recursive_semantic_taint"
+        and str(metadata.get("fusion_mode") or "") == "off"
+        and type(metadata.get("global_candidate_pass_count")) is int
+        and metadata.get("global_candidate_pass_count") == 0
+        and type(metadata.get("global_judge_physical_request_count"))
+        is int
+        and metadata.get("global_judge_physical_request_count") == 0
+        and all(
+            isinstance(metadata.get(key), (list, tuple))
+            and not metadata.get(key)
+            for key in (
+                "global_candidate_judgments",
+                "candidate_compression",
+                "recursive_expansion_reasons",
+                "global_candidate_failures",
+            )
+        )
+    )
+    exact_gates = all(
+        {str(key) for key in gate}
+        == set(LEGACY_BYPASSED_GLOBAL_GATE_KEYS)
+        and gate.get("behavior_impact")
+        == "none_offline_analysis_only"
+        and gate.get("fallback") == "recursive_backward_taint"
+        and gate.get("status") == "bypassed"
+        and gate.get("reason") == "oversized_dense_root_matrix"
+        and isinstance(gate.get("seed_ref"), str)
+        and bool(gate.get("seed_ref"))
+        and isinstance(gate.get("defect_fingerprint"), str)
+        and bool(gate.get("defect_fingerprint"))
+        and _is_exact_legacy_candidate_compression(
+            gate.get("candidate_compression")
+        )
+        for gate in gates
+    )
+    if not exact_metadata or not exact_gates:
+        return LegacyProjectionNotRequired(
+            classifier_identity=LEGACY_PROJECTION_CLASSIFIER_IDENTITY,
+            reason="legacy_shape_not_exact",
+        )
+    return LegacyProjectionRequired.create(
+        gate_count=len(gates),
+        shape_payload={
+            "metadata": {
+                key: copy.deepcopy(metadata.get(key))
+                for key in LEGACY_PROJECTION_METADATA_KEYS
+            },
+            "global_candidate_gates": [
+                copy.deepcopy(dict(gate)) for gate in gates
+            ],
+        },
+    )
+
+
 def _validate_global_pass_derivations(
     investigation_journal: Iterable[Any],
     metadata: Mapping[str, Any],
     *,
     label: str,
     seed_authority: Optional[Mapping[str, Any]] = None,
+    authorized_legacy_projection: Optional[
+        LegacyProjectionRequired
+    ] = None,
 ) -> None:
     journal = tuple(investigation_journal)
+    legacy_classification = classify_legacy_projection_shape(
+        journal,
+        metadata,
+    )
+    if authorized_legacy_projection is not None:
+        authorized_legacy_projection.assert_valid()
+        if (
+            not isinstance(
+                legacy_classification,
+                LegacyProjectionRequired,
+            )
+            or legacy_classification
+            != authorized_legacy_projection
+        ):
+            raise ValueError(
+                "legacy projection authorization does not match report shape"
+            )
     completed_passes, failed_passes = _classify_global_pass_records(
         journal,
         seed_authority=seed_authority,
     )
     terminal_passes = [*completed_passes, *failed_passes]
+    global_page_events = [
+        event
+        for event in journal
+        if isinstance(event, Mapping)
+        and event.get("kind") == "global_candidate_page"
+    ]
     _global_passes_by_owner(
         terminal_passes,
         seed_authority=seed_authority,
     )
+    completed_page_events = [
+        event
+        for event in journal
+        if isinstance(event, Mapping)
+        and event.get("kind") == "global_candidate_page"
+        and event.get("status") == "completed"
+        and isinstance(event.get("judgment"), Mapping)
+        and isinstance(event.get("owner"), Mapping)
+    ]
+    paged_seed_bindings = {
+        str(event.get("seed_binding_identity") or "")
+        for event in completed_page_events
+    }
     expected_judgments = [
+        *[
+            _owned_payload(event["judgment"], event["owner"])
+            for event in completed_page_events
+        ],
+        *[
         _owned_payload(action["judgment"], action["owner"])
         for action in completed_passes
         if isinstance(action.get("judgment"), Mapping)
+        and str(action.get("seed_binding_identity") or "")
+        not in paged_seed_bindings
+        ],
     ]
     expected_compression = [
         _owned_payload(action["candidate_compression"], action["owner"])
@@ -2766,6 +4992,43 @@ def _validate_global_pass_derivations(
         for action in terminal_passes
         if action.get("status") == "failed"
     ]
+    active_plan_by_seed = {
+        str(event.get("seed_binding_identity") or ""): str(
+            event.get("active_plan_identity") or ""
+        )
+        for event in journal
+        if isinstance(event, Mapping)
+        and event.get("kind") == "global_candidate_convergence"
+        and event.get("status")
+        in {"page_failure", "final_page_failure", "interrupted"}
+    }
+    completed_page_ids = {
+        str(event.get("page_identity") or "")
+        for event in global_page_events
+        if event.get("status") == "completed"
+    }
+    expected_unresolved_page_refs = []
+    for event in journal:
+        if (
+            not isinstance(event, Mapping)
+            or event.get("kind") != "global_candidate_page_plan"
+            or active_plan_by_seed.get(
+                str(event.get("seed_binding_identity") or "")
+            ) != str(event.get("plan_identity") or "")
+        ):
+            continue
+        plan = event.get("plan")
+        for page in plan.get("pages", ()) if isinstance(plan, Mapping) else ():
+            page_identity = (
+                str(page.get("identity") or "")
+                if isinstance(page, Mapping)
+                else ""
+            )
+            if page_identity and page_identity not in completed_page_ids:
+                expected_unresolved_page_refs.append(page_identity)
+    expected_unresolved_page_refs = list(
+        dict.fromkeys(expected_unresolved_page_refs)
+    )
     _require_canonical_bijection(
         expected_judgments,
         metadata.get("global_candidate_judgments") or (),
@@ -2786,17 +5049,67 @@ def _validate_global_pass_derivations(
         metadata.get("global_candidate_failures") or (),
         label="{0} global candidate failures".format(label),
     )
+    if list(metadata.get("unresolved_page_refs") or ()) != expected_unresolved_page_refs:
+        raise ValueError(
+            "{0} unresolved page refs contradict the active page plan".format(
+                label
+            )
+        )
+    terminal_pass_seed_bindings = {
+        str(action.get("seed_binding_identity") or "")
+        for action in terminal_passes
+    }
     expected_physical_requests = sum(
         int(action.get("physical_request_delta") or 0)
         for action in terminal_passes
+    ) + sum(
+        int(event.get("physical_request_delta") or 0)
+        for event in global_page_events
+        if str(event.get("seed_binding_identity") or "")
+        not in terminal_pass_seed_bindings
+    ) + sum(
+        int(event.get("physical_request_delta") or 0)
+        for event in journal
+        if isinstance(event, Mapping)
+        and event.get("kind") == "candidate_cluster_triage_page"
+    )
+    global_mode_exercised = bool(terminal_passes) or bool(global_page_events) or any(
+        isinstance(item, Mapping)
+        and item.get("kind")
+        in {"global_candidate_gate", "global_candidate_page_plan"}
+        for item in journal
+    )
+    expected_fusion_mode = (
+        "retrieval-global" if global_mode_exercised else "off"
+    )
+    legacy_bypassed_gate_projection = bool(
+        authorized_legacy_projection is not None
+        and isinstance(
+            legacy_classification,
+            LegacyProjectionRequired,
+        )
+        and global_mode_exercised
+        and not terminal_passes
+        and str(metadata.get("fusion_mode") or "") == "off"
+        and str(metadata.get("analysis") or "")
+        == "agentic_recursive_semantic_taint"
+        and all(
+            not isinstance(item, Mapping)
+            or item.get("kind") != "global_candidate_gate"
+            or item.get("status") == "bypassed"
+            for item in journal
+        )
     )
     if (
         int(metadata.get("global_candidate_pass_count") or 0)
         != len(terminal_passes)
         or int(metadata.get("global_judge_physical_request_count") or 0)
         != expected_physical_requests
-        or str(metadata.get("fusion_mode") or "")
-        != ("retrieval-global" if terminal_passes else "off")
+        or (
+            str(metadata.get("fusion_mode") or "")
+            != expected_fusion_mode
+            and not legacy_bypassed_gate_projection
+        )
     ):
         raise ValueError(
             "{0} global pass metadata contradicts authoritative actions".format(
@@ -2805,11 +5118,401 @@ def _validate_global_pass_derivations(
         )
 
 
+def _validate_global_pagination_journal(
+    investigation_journal: Iterable[Any],
+    *,
+    action_records: Optional[Iterable[Any]] = None,
+) -> None:
+    plans: Dict[str, Tuple[CandidatePagePlan, str, str]] = {}
+    page_events: Dict[str, JsonDict] = {}
+    page_event_attempts: Dict[str, List[JsonDict]] = {}
+    page_outcomes: Dict[str, CandidatePageOutcome] = {}
+    round_summaries: Dict[str, CandidateRoundSummary] = {}
+    round_summary_seed_bindings: Dict[str, str] = {}
+    convergence_by_seed: Dict[str, JsonDict] = {}
+    for index, raw_event in enumerate(investigation_journal):
+        if not isinstance(raw_event, Mapping):
+            continue
+        kind = str(raw_event.get("kind") or "")
+        if kind == "global_candidate_page_plan":
+            if {str(key) for key in raw_event} != set(
+                GLOBAL_CANDIDATE_PAGE_PLAN_EVENT_KEYS
+            ):
+                raise ValueError(
+                    "global candidate page plan event[{0}] schema "
+                    "mismatch".format(index)
+                )
+            plan = CandidatePagePlan.from_dict(
+                _checkpoint_json(raw_event.get("plan"))
+            )
+            plan_identity = str(
+                raw_event.get("plan_identity") or ""
+            )
+            phase = str(raw_event.get("page_phase") or "")
+            seed_binding = str(
+                raw_event.get("seed_binding_identity") or ""
+            )
+            if (
+                raw_event.get("status") != "planned"
+                or raw_event.get("behavior_impact")
+                != "none_offline_analysis_only"
+                or phase not in {"initial", "comparison", "final"}
+                or plan.identity != plan_identity
+                or plan.seed_ref != raw_event.get("seed_ref")
+                or plan.defect_fingerprint
+                != raw_event.get("defect_fingerprint")
+                or seed_binding
+                != seed_binding_identity_for(
+                    plan.seed_ref,
+                    plan.defect_fingerprint,
+                )
+                or plan_identity in plans
+            ):
+                raise ValueError(
+                    "global candidate page plan event contradicts its "
+                    "canonical plan"
+                )
+            plans[plan_identity] = (plan, phase, seed_binding)
+            continue
+        if kind == "global_candidate_page":
+            status = str(raw_event.get("status") or "")
+            expected_keys = (
+                GLOBAL_CANDIDATE_PAGE_COMPLETED_EVENT_KEYS
+                if status == "completed"
+                else GLOBAL_CANDIDATE_PAGE_FAILED_EVENT_KEYS
+                if status == "failed"
+                else frozenset()
+            )
+            if (
+                not expected_keys
+                or {str(key) for key in raw_event}
+                != set(expected_keys)
+            ):
+                raise ValueError(
+                    "global candidate page event[{0}] schema mismatch".format(
+                        index
+                    )
+                )
+            plan_entry = plans.get(
+                str(raw_event.get("plan_identity") or "")
+            )
+            if plan_entry is None:
+                raise ValueError(
+                    "global candidate page event has no prior page plan"
+                )
+            plan, phase, seed_binding = plan_entry
+            page_index = raw_event.get("page_index")
+            if (
+                type(page_index) is not int
+                or page_index < 0
+                or page_index >= len(plan.pages)
+            ):
+                raise ValueError(
+                    "global candidate page event page index is invalid"
+                )
+            page = plan.pages[page_index]
+            request = global_candidate_request_from_validation_envelope(
+                _checkpoint_json(
+                    raw_event.get("validation_envelope")
+                )
+            )
+            page_identity = str(
+                raw_event.get("page_identity") or ""
+            )
+            delta = raw_event.get("physical_request_delta")
+            exact = raw_event.get("physical_request_exact")
+            diagnostics = (
+                _validate_global_judge_call_diagnostics(
+                    _checkpoint_json(
+                        raw_event.get("judge_diagnostics")
+                    )
+                )
+            )
+            if (
+                raw_event.get("seed_binding_identity") != seed_binding
+                or raw_event.get("seed_ref") != plan.seed_ref
+                or raw_event.get("defect_fingerprint")
+                != plan.defect_fingerprint
+                or raw_event.get("round_index") != plan.round_index
+                or raw_event.get("page_phase") != phase
+                or page.identity != page_identity
+                or any(
+                    prior.get("status") == "completed"
+                    for prior in page_event_attempts.get(page_identity, ())
+                )
+                or tuple(raw_event.get("candidate_refs") or ())
+                != page.candidate_refs
+                or raw_event.get("candidate_count")
+                != len(page.candidate_refs)
+                or request.seed_ref != plan.seed_ref
+                or request.active_defect.fingerprint
+                != plan.defect_fingerprint
+                or request.offered_candidate_refs
+                != page.candidate_refs
+                or raw_event.get("request_identity")
+                != _global_judge_request_identity(request)
+                or not isinstance(
+                    raw_event.get("candidate_compression"), Mapping
+                )
+                or request.trace_health.get(
+                    "candidate_compression"
+                )
+                != raw_event.get("candidate_compression")
+                or type(delta) is not int
+                or delta < 0
+                or type(exact) is not bool
+                or raw_event.get("behavior_impact")
+                != "none_offline_analysis_only"
+            ):
+                raise ValueError(
+                    "global candidate page event contradicts its plan or "
+                    "request"
+                )
+            event = copy.deepcopy(dict(raw_event))
+            event["judge_diagnostics"] = diagnostics
+            page_event_attempts.setdefault(page_identity, []).append(event)
+            page_events[page_identity] = event
+            if status == "completed":
+                judgment = validate_global_candidate_payload(
+                    _checkpoint_json(raw_event.get("judgment")),
+                    request=request,
+                )
+                outcome = CandidatePageOutcome.from_dict(
+                    _checkpoint_json(raw_event.get("page_outcome"))
+                )
+                expected_outcome = build_candidate_page_outcome(
+                    page=page,
+                    judgment=judgment,
+                    root_eligible_candidate_refs=(
+                        request.open_authored_root_candidate_refs
+                    ),
+                )
+                history = raw_event.get(
+                    "evidence_expansion_history"
+                )
+                terminal = raw_event.get("expansion_terminal")
+                if (
+                    exact is not True
+                    or outcome != expected_outcome
+                    or not isinstance(history, (list, tuple))
+                    or not isinstance(terminal, Mapping)
+                    or set(terminal) != {"blocker", "detail"}
+                ):
+                    raise ValueError(
+                        "completed global candidate page event is invalid"
+                    )
+                page_outcomes[page_identity] = outcome
+            elif (
+                not str(raw_event.get("blocker") or "")
+                or not str(raw_event.get("detail") or "")
+                or (
+                    exact is not True
+                    and (
+                        raw_event.get("blocker")
+                        != "global_judge_page_interrupted"
+                        or delta
+                        > GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+                    )
+                )
+            ):
+                raise ValueError(
+                    "failed global candidate page event is invalid"
+                )
+            continue
+        if kind == "global_candidate_round_summary":
+            if {str(key) for key in raw_event} != set(
+                GLOBAL_CANDIDATE_ROUND_SUMMARY_EVENT_KEYS
+            ):
+                raise ValueError(
+                    "global candidate round summary schema mismatch"
+                )
+            plan_entry = plans.get(
+                str(raw_event.get("plan_identity") or "")
+            )
+            summary = CandidateRoundSummary.from_dict(
+                _checkpoint_json(raw_event.get("round_summary"))
+            )
+            if plan_entry is None:
+                raise ValueError(
+                    "global candidate round summary has no page plan"
+                )
+            plan, _, seed_binding = plan_entry
+            expected_outcomes = tuple(
+                page_outcomes.get(page.identity)
+                for page in plan.pages
+            )
+            if (
+                raw_event.get("status") != "completed"
+                or raw_event.get("seed_binding_identity")
+                != seed_binding
+                or raw_event.get("seed_ref") != plan.seed_ref
+                or raw_event.get("defect_fingerprint")
+                != plan.defect_fingerprint
+                or any(
+                    outcome is None
+                    for outcome in expected_outcomes
+                )
+                or summary
+                != summarize_candidate_round(
+                    round_index=plan.round_index,
+                    page_outcomes=tuple(
+                        outcome
+                        for outcome in expected_outcomes
+                        if outcome is not None
+                    ),
+                    finalist_soft_limit=(
+                        summary.finalist_soft_limit
+                    ),
+                )
+                or raw_event.get("behavior_impact")
+                != "none_offline_analysis_only"
+            ):
+                raise ValueError(
+                    "global candidate round summary contradicts its pages"
+                )
+            if summary.identity in round_summaries:
+                raise ValueError(
+                    "global candidate round summary is duplicated"
+                )
+            round_summaries[summary.identity] = summary
+            round_summary_seed_bindings[summary.identity] = seed_binding
+            continue
+        if kind == "global_candidate_convergence":
+            if {str(key) for key in raw_event} != set(
+                GLOBAL_CANDIDATE_CONVERGENCE_EVENT_KEYS
+            ):
+                raise ValueError(
+                    "global candidate convergence schema mismatch"
+                )
+            seed_binding = str(
+                raw_event.get("seed_binding_identity") or ""
+            )
+            matching_pages = [
+                event
+                for attempts in page_event_attempts.values()
+                for event in attempts
+                if event.get("seed_binding_identity") == seed_binding
+            ]
+            matching_rounds = [
+                summary
+                for identity, summary in round_summaries.items()
+                if round_summary_seed_bindings.get(identity)
+                == seed_binding
+            ]
+            if (
+                not seed_binding
+                or seed_binding in convergence_by_seed
+                or raw_event.get("round_count")
+                != len(matching_rounds)
+                or raw_event.get("completed_page_count")
+                != sum(
+                    event.get("status") == "completed"
+                    for event in matching_pages
+                )
+                or raw_event.get("failed_page_count")
+                != sum(
+                    event.get("status") == "failed"
+                    for event in matching_pages
+                )
+                or raw_event.get("physical_request_delta")
+                != sum(
+                    int(event.get("physical_request_delta") or 0)
+                    for event in matching_pages
+                )
+                or raw_event.get("behavior_impact")
+                != "none_offline_analysis_only"
+            ):
+                raise ValueError(
+                    "global candidate convergence contradicts its pages"
+                )
+            convergence_by_seed[seed_binding] = copy.deepcopy(
+                dict(raw_event)
+            )
+
+    if action_records is None:
+        return
+    action_history = _validated_global_judge_page_action_history(
+        action_records
+    )
+    terminal_by_page_identity: Dict[str, List[JsonDict]] = {}
+    for lifecycle in action_history.values():
+        for index in range(1, len(lifecycle), 2):
+            terminal = lifecycle[index]
+            page_identity = str(
+                terminal["payload"].get("page_identity") or ""
+            )
+            terminal_by_page_identity.setdefault(
+                page_identity, []
+            ).append(terminal)
+    if set(page_event_attempts) != set(terminal_by_page_identity):
+        raise ValueError(
+            "global candidate page events and terminal actions are not "
+            "bijective"
+        )
+    for page_identity, events in page_event_attempts.items():
+        terminals = terminal_by_page_identity[page_identity]
+        if len(events) != len(terminals):
+            raise ValueError(
+                "global candidate page events and terminal actions are not "
+                "bijective"
+            )
+        for event, terminal in zip(events, terminals):
+            payload = terminal["payload"]
+            expected_status = (
+                "completed"
+                if terminal["operation"]
+                == "global_judge_page_completed"
+                else "failed"
+            )
+            terminal_envelope = (
+                payload.get("final_validation_envelope")
+                if expected_status == "completed"
+                else payload["validation_envelope"]
+            )
+            terminal_request = (
+                global_candidate_request_from_validation_envelope(
+                    terminal_envelope
+                )
+            )
+            if (
+                event["status"] != expected_status
+                or event["request_identity"]
+                != _global_judge_request_identity(terminal_request)
+                or event["validation_envelope"]
+                != terminal_envelope
+                or event["candidate_compression"]
+                != payload["candidate_compression"]
+                or event["physical_request_delta"]
+                != payload["physical_request_delta"]
+                or event["physical_request_exact"]
+                != payload["physical_request_exact"]
+                or event["judge_diagnostics"]
+                != payload["judge_diagnostics"]
+                or (
+                    expected_status == "completed"
+                    and event["judgment"] != payload["judgment"]
+                )
+                or (
+                    expected_status == "failed"
+                    and (
+                        event["blocker"] != payload["blocker"]
+                        or event["detail"] != payload["detail"]
+                    )
+                )
+            ):
+                raise ValueError(
+                    "global candidate page event contradicts its terminal action"
+                )
+
+
 def _validate_restored_report_local_state_owners(
     graph: TraceGraph,
     report: RecursiveAttributionReport,
     *,
     action_records: Optional[Iterable[Any]] = None,
+    authorized_legacy_projection: Optional[
+        LegacyProjectionRequired
+    ] = None,
 ) -> None:
     metadata = report.to_dict()["metadata"]
     frontier_payload = metadata.get("frontier_checkpoint")
@@ -2855,6 +5558,8 @@ def _validate_restored_report_local_state_owners(
             list(metadata.get("introduction_bindings") or ())
         ),
         confirmations=list(report.confirmations),
+        confirmed_roots=list(report.confirmed_roots),
+        co_roots=list(report.co_roots),
         confirmation_queue=copy.deepcopy(
             list(metadata.get("confirmation_queue") or ())
         ),
@@ -2868,6 +5573,19 @@ def _validate_restored_report_local_state_owners(
         ),
         confirmation_action_projection=copy.deepcopy(
             list(metadata.get("confirmation_action_projection") or ())
+        ),
+        factor_role_judgments=[
+            _validated_factor_role_judgment(item)
+            for item in metadata.get("factor_role_judgments") or ()
+        ],
+        factor_role_journal=copy.deepcopy(
+            list(metadata.get("factor_role_journal") or ())
+        ),
+        factor_role_action_projection=copy.deepcopy(
+            list(metadata.get("factor_role_action_projections") or ())
+        ),
+        factor_role_gaps=copy.deepcopy(
+            list(metadata.get("factor_role_gaps") or ())
         ),
     )
     state.seed_ledger = {
@@ -2891,6 +5609,7 @@ def _validate_restored_report_local_state_owners(
         seed_authority=_seed_authority_from_records(
             builder.to_dict() for builder in state.seed_ledger.values()
         ),
+        authorized_legacy_projection=authorized_legacy_projection,
     )
 
 
@@ -2900,8 +5619,47 @@ def validate_recursive_report_against_graph(
     *,
     label: str,
     action_records: Optional[Iterable[Any]] = None,
+    migration_decision: Optional[CompletedCheckpointMigrationDecision] = None,
 ) -> None:
     """Apply the analyzer's exact restore validation to a report."""
+    authorized_legacy_projection = None
+    has_directory_provider_facts = any(
+        isinstance(event, Mapping)
+        and event.get("kind") == "candidate_cluster_triage_page"
+        for event in report.investigation_journal
+    )
+    if action_records is None and has_directory_provider_facts:
+        raise ValueError(
+            "completed directory facts are unverifiable without action records"
+        )
+    if action_records is not None:
+        action_records = tuple(action_records)
+        _validated_global_judge_action_history(action_records)
+        _validated_global_judge_page_action_history(action_records)
+        _validate_shared_judge_action_accounting(action_records)
+        _validate_candidate_cluster_triage_journal_actions(
+            report.investigation_journal,
+            action_records,
+        )
+    if migration_decision is not None:
+        if action_records is None:
+            raise ValueError(
+                "completed checkpoint migration decision requires action records"
+            )
+        classification = classify_legacy_projection_shape(
+            report.investigation_journal,
+            report.metadata,
+        )
+        if not isinstance(classification, LegacyProjectionRequired):
+            raise ValueError(
+                "migration decision supplied for a non-legacy report shape"
+            )
+        migration_decision.assert_authorizes(
+            report=report.to_dict(),
+            action_records=action_records,
+            classification=classification,
+        )
+        authorized_legacy_projection = classification
     formal_unbound_starts = [
         ref
         for ref in report.start_refs
@@ -2918,124 +5676,186 @@ def validate_recursive_report_against_graph(
         graph,
         report,
         action_records=action_records,
+        authorized_legacy_projection=authorized_legacy_projection,
     )
+
+
+def _canonical_factor_role_publication_sets(
+    projections: Iterable[Any],
+) -> JsonDict:
+    contributing_conditions: List[CausalFactor] = []
+    amplifying_factors: List[CausalFactor] = []
+    downstream_materializations: List[CausalMaterialization] = []
+    rejected_candidates: List[RejectedCandidate] = []
+    factor_confirmation_gaps: List[JsonDict] = []
+    seen_requests: Set[str] = set()
+    seen_judgments: Set[str] = set()
+    for value in projections:
+        projection = _validated_factor_role_terminal_projection(value)
+        if projection["operation"] != "factor_role_completed":
+            continue
+        judgment = FactorRoleJudgment.from_dict(
+            dict(projection["judgment"])
+        )
+        if (
+            judgment.request_identity in seen_requests
+            or judgment.judgment_identity in seen_judgments
+        ):
+            raise ValueError(
+                "completed factor role publication identities are not one-to-one"
+            )
+        seen_requests.add(judgment.request_identity)
+        seen_judgments.add(judgment.judgment_identity)
+        publication = canonical_factor_role_publication(
+            judgment=judgment,
+            request_projection=projection["request_projection"],
+            action_projection=projection,
+        )
+        if (
+            judgment.necessity_status == "necessary"
+            and judgment.factor_role == "unknown"
+        ):
+            continue
+        if judgment.factor_role == "contributing_condition":
+            contributing_conditions.append(publication)
+        elif judgment.factor_role == "amplifying_factor":
+            amplifying_factors.append(publication)
+        elif judgment.factor_role == "downstream_materialization":
+            downstream_materializations.append(publication)
+        elif judgment.factor_role == "unrelated":
+            rejected_candidates.append(publication)
+        elif judgment.factor_role == "unknown":
+            factor_confirmation_gaps.append(publication)
+    return {
+        "contributing_conditions": tuple(contributing_conditions),
+        "amplifying_factors": tuple(amplifying_factors),
+        "downstream_materializations": tuple(
+            downstream_materializations
+        ),
+        "rejected_candidates": tuple(rejected_candidates),
+        "factor_confirmation_gaps": factor_confirmation_gaps,
+    }
 
 
 def _assert_published_non_root_factors(
     graph: TraceGraph,
     *,
-    confirmations: Sequence[RootConfirmation],
     seed_results: Sequence[SeedAttributionResult],
     defect_states: Sequence[DefectState],
     contributing_conditions: Sequence[CausalFactor],
     amplifying_factors: Sequence[CausalFactor],
+    downstream_materializations: Sequence[CausalMaterialization],
     rejected_candidates: Sequence[RejectedCandidate],
-    analysis_perspective: str,
+    factor_confirmation_gaps: Sequence[Mapping[str, Any]],
+    factor_role_action_projections: Sequence[Mapping[str, Any]],
     label: str,
 ) -> None:
-    confirmations = {
-        confirmation.confirmation_identity: confirmation
-        for confirmation in confirmations
-    }
     seeds_by_binding = {
         seed_binding_identity_for(seed.start_ref, seed.defect_fingerprint): seed
         for seed in seed_results
     }
-    publications = [
-        ("contributing_condition", item) for item in contributing_conditions
-    ]
-    publications.extend(
-        ("amplifying_factor", item) for item in amplifying_factors
+    expected = _canonical_factor_role_publication_sets(
+        factor_role_action_projections
     )
-    publications.extend(
-        ("rejected_candidate", item) for item in rejected_candidates
-    )
-    for published_role, item in publications:
-        confirmation = RootConfirmation.from_dict(item.to_dict()["confirmation"])
-        if not authored_root_candidate_eligible(
-            graph, confirmation.candidate_ref
+    actual = {
+        "contributing_conditions": tuple(contributing_conditions),
+        "amplifying_factors": tuple(amplifying_factors),
+        "downstream_materializations": tuple(
+            downstream_materializations
+        ),
+        "rejected_candidates": tuple(rejected_candidates),
+        "factor_confirmation_gaps": [
+            copy.deepcopy(dict(item))
+            for item in factor_confirmation_gaps
+        ],
+    }
+
+    def publication_payload(value: Mapping[str, Any]) -> JsonDict:
+        return {
+            key: [
+                item.to_dict() if hasattr(item, "to_dict") else copy.deepcopy(item)
+                for item in items
+            ]
+            for key, items in value.items()
+        }
+
+    if stable_json(_checkpoint_json(publication_payload(actual))) != stable_json(
+        _checkpoint_json(publication_payload(expected))
+    ):
+        raise ValueError(
+            "{0} FactorRole publications contradict completed actions".format(
+                label
+            )
+        )
+    for projection_value in factor_role_action_projections:
+        projection = _validated_factor_role_terminal_projection(
+            projection_value
+        )
+        if projection["operation"] != "factor_role_completed":
+            continue
+        judgment = FactorRoleJudgment.from_dict(
+            dict(projection["judgment"])
+        )
+        if not non_root_factor_candidate_eligible(
+            graph, judgment.candidate_ref
         ):
             raise ValueError(
                 "{0} published non-root factor candidate is ineligible for the active revision".format(
                     label
                 )
             )
-        canonical = confirmations.get(confirmation.confirmation_identity)
-        owner = seeds_by_binding.get(confirmation.seed_binding_identity)
+        owner = seeds_by_binding.get(judgment.seed_binding_identity)
         if (
-            canonical != confirmation
-            or owner is None
-            or confirmation.confirmation_identity
-            not in owner.confirmation_identities
-            or confirmation.defect_fingerprint not in {
+            owner is None
+            or judgment.defect_fingerprint not in {
                 state.fingerprint
                 for state in defect_states
             }
             | {owner.defect_fingerprint}
         ):
             raise ValueError(
-                "{0} published non-root factor has no exact confirmation owner".format(
+                "{0} published non-root factor has no exact seed and defect owner".format(
                     label
                 )
             )
-        if published_role != "rejected_candidate" and confirmation.factor_role != published_role:
-            raise ValueError(
-                "{0} published non-root factor role contradicts confirmation".format(
-                    label
-                )
-            )
-        if published_role == "rejected_candidate" and confirmation.factor_role not in {
-            "unrelated",
-            "unknown",
-        }:
-            raise ValueError(
-                "{0} rejected candidate role contradicts confirmation".format(label)
-            )
-        expected_publication = (
-            canonical_rejected_candidate_publication(confirmation)
-            if published_role == "rejected_candidate"
-            else canonical_causal_factor_publication(
-                confirmation=confirmation,
-                analysis_perspective=analysis_perspective,
-            )
-        )
-        if item != expected_publication:
-            raise ValueError(
-                "{0} published non-root factor contradicts canonical "
-                "publication".format(label)
-            )
-        if not confirmation.evidence_refs:
+        if not judgment.evidence_refs:
             raise ValueError(
                 "{0} published non-root factor requires grounded evidence".format(label)
             )
         _assert_active_confirmation_path(
             graph,
-            confirmation.recursive_path,
-            candidate_ref=confirmation.candidate_ref,
+            judgment.recursive_path,
+            candidate_ref=judgment.candidate_ref,
             seed_ref=owner.start_ref,
             label="{0} published non-root factor".format(label),
         )
+        mechanism = judgment.factor_mechanism
+        if mechanism and mechanism.get("target_ref") not in judgment.recursive_path[1:]:
+            raise ValueError(
+                "{0} published non-root factor mechanism target must be a "
+                "downstream recursive path node".format(label)
+            )
         assessments = [
             assessment
             for assessment in owner.global_judgment.get("assessments") or ()
             if isinstance(assessment, Mapping)
             and str(assessment.get("candidate_ref") or "")
-            == confirmation.candidate_ref
+            == judgment.candidate_ref
         ]
-        if assessments:
-            assessment = assessments[0]
-            if (
-                len(assessments) != 1
-                or tuple(assessment.get("causal_path_refs") or ())
-                != confirmation.recursive_path
-                or str(assessment.get("causal_role") or "")
-                != confirmation.factor_role
-            ):
-                raise ValueError(
-                    "{0} published non-root factor contradicts its global assessment facts".format(
-                        label
-                    )
+        if (
+            len(assessments) != 1
+            or judgment.candidate_ref in owner.selected_candidate_refs
+            or tuple(assessments[0].get("causal_path_refs") or ())
+            != judgment.recursive_path
+            or str(assessments[0].get("causal_role") or "")
+            not in GLOBAL_NON_ROOT_REVIEW_ROLES
+        ):
+            raise ValueError(
+                "{0} published non-root factor is not grounded in one "
+                "reviewable Global non-root assessment path".format(
+                    label
                 )
+            )
 
 
 def _assert_canonical_published_roots(
@@ -3047,7 +5867,14 @@ def _assert_canonical_published_roots(
     co_roots: Sequence[ConfirmedRoot],
     analysis_perspective: str,
     label: str,
+    confirmation_action_projections: Sequence[Mapping[str, Any]] = (),
+    non_root_conflict_confirmation_identities: Iterable[str] = (),
 ) -> None:
+    non_root_conflict_identities = {
+        str(identity)
+        for identity in non_root_conflict_confirmation_identities
+        if str(identity)
+    }
     confirmation_by_identity: Dict[str, RootConfirmation] = {}
     for confirmation in confirmations:
         if confirmation.confirmation_identity in confirmation_by_identity:
@@ -3100,6 +5927,21 @@ def _assert_canonical_published_roots(
             defect_state=root.defect_state,
             candidate_node=candidate_node,
             seed_start_ref=owner.start_ref,
+            active_role_binding=(
+                ActiveFailureRoleBinding.from_dict(
+                    root.provenance["active_role_binding"]
+                )
+                if "active_role_binding" in root.provenance
+                else None
+            ),
+            request_projection=owning_root_request_projection(
+                confirmation=embedded,
+                confirmation_action_projections=(
+                    confirmation_action_projections
+                ),
+            )
+            if "active_role_binding" in root.provenance
+            else None,
         )
         if root != expected:
             raise ValueError(
@@ -3130,6 +5972,7 @@ def _assert_canonical_published_roots(
             for identity in seed.confirmation_identities
             if identity in confirmation_by_identity
             and confirmation_by_identity[identity].status == "confirmed"
+            and identity not in non_root_conflict_identities
         }
         published_identities = roots_by_seed.get(binding, set())
         if seed.outcome == "confirmed_root":
@@ -3183,9 +6026,12 @@ def _assert_active_confirmation_path(
         )
     for source_ref, target_ref in zip(canonical_path, canonical_path[1:]):
         edges = graph.edge_context(source_ref, target_ref)
-        if not graph.edge_endpoints_eligible(source_ref, target_ref) or not any(
-            is_confirmation_causal_edge(edge, default_eligible=True)
-            for edge in edges
+        if not graph.edge_endpoints_eligible(
+            source_ref,
+            target_ref,
+        ) or not has_confirmation_causal_hop(
+            edges,
+            default_eligible=True,
         ):
             raise ValueError(
                 "{0} confirmation path lacks a grounded causal edge: {1}->{2}".format(
@@ -3246,6 +6092,49 @@ def _candidate_key(candidate: CausalCandidate) -> Tuple[str, str, str]:
     return (candidate.ref, candidate.source, stable_json(candidate.edge))
 
 
+def _canonicalize_candidate_publications(
+    graph: TraceGraph,
+    candidates: Iterable[CausalCandidate],
+) -> Tuple[CausalCandidate, ...]:
+    publications: List[CausalCandidate] = []
+    for candidate in candidates:
+        resolved = graph.resolve(candidate.ref) or candidate.ref
+        canonical_node = graph.nodes.get(resolved)
+        publications.append(
+            replace(
+                candidate,
+                ref=resolved,
+                node=graph.sanitize_judge_node(
+                    canonical_node or candidate.node
+                ),
+            )
+        )
+    return tuple(publications)
+
+
+def _canonicalize_checkpoint_candidate_payloads(
+    graph: TraceGraph,
+    payload: Mapping[str, Any],
+) -> JsonDict:
+    migrated = copy.deepcopy(dict(payload))
+    for field_name in (
+        "causal_candidates",
+        "introduction_candidates",
+    ):
+        candidates = (
+            CausalCandidate.from_dict(item)
+            for item in migrated.get(field_name) or ()
+        )
+        migrated[field_name] = [
+            candidate.to_dict()
+            for candidate in _canonicalize_candidate_publications(
+                graph,
+                candidates,
+            )
+        ]
+    return migrated
+
+
 def _artifact_payloads(value: Any) -> Iterable[Tuple[str, bytes]]:
     """Yield only explicitly hydrated artifact payloads with stable identities."""
     if isinstance(value, Mapping):
@@ -3292,7 +6181,96 @@ def _provider_circuit(judge: CausalJudge) -> JsonDict:
     return {
         "open": bool(getattr(target, "provider_circuit_open", False)),
         "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
+        "consecutive_errors": int(
+            getattr(target, "consecutive_provider_errors", 0) or 0
+        ),
+        "disposition": provider_failure_disposition_to_dict(
+            getattr(target, "provider_circuit_disposition", None)
+        ),
+        "first_request": int(
+            getattr(target, "provider_circuit_first_request", 0) or 0
+        ),
+        "first_failure_at": str(
+            getattr(target, "provider_circuit_first_failure_at", "") or ""
+        ),
+        "previous_failure": copy.deepcopy(
+            getattr(target, "provider_circuit_previous_failure", None)
+        ),
     }
+
+
+def _empty_provider_circuit(provider_error_threshold: int) -> JsonDict:
+    return {
+        "open": False,
+        "reason": "",
+        "consecutive_provider_errors": 0,
+        "provider_error_threshold": provider_error_threshold,
+        "disposition": None,
+        "first_request": 0,
+        "first_failure_at": "",
+    }
+
+
+def _provider_failure_snapshot(value: Mapping[str, Any]) -> JsonDict:
+    return {
+        "open": bool(value.get("open", False)),
+        "reason": str(value.get("reason") or ""),
+        "consecutive_provider_errors": int(
+            value.get("consecutive_provider_errors") or 0
+        ),
+        "provider_error_threshold": int(
+            value.get("provider_error_threshold") or 3
+        ),
+        "disposition": provider_failure_disposition_to_dict(
+            value.get("disposition")
+        ),
+        "first_request": int(value.get("first_request") or 0),
+        "first_failure_at": str(value.get("first_failure_at") or ""),
+    }
+
+
+def _capsule_route_from_validation_source(
+    graph: TraceGraph,
+    capsule: CandidateEvidenceCapsule,
+) -> CausalCandidate:
+    validation_source = capsule.validation_source
+    candidate_ref = capsule.candidate_ref
+    candidate_edge = _checkpoint_json(
+        validation_source.get("candidate_edge") or {}
+    )
+    evidence_refs = tuple(
+        str(ref)
+        for ref in validation_source.get("candidate_evidence_refs") or ()
+    )
+    persisted_prompt_refs = {
+        str(item.get("raw_ref") or "")
+        for item in capsule.evidence_references
+        if isinstance(item, Mapping)
+    }
+    if (
+        evidence_refs == (candidate_ref,)
+        and not candidate_edge.get("evidence_refs")
+        and candidate_ref not in persisted_prompt_refs
+    ):
+        evidence_refs = ()
+    return CausalCandidate(
+        ref=candidate_ref,
+        node=graph.nodes[candidate_ref],
+        source=str(validation_source.get("candidate_source") or ""),
+        edge=candidate_edge,
+        evidence_refs=evidence_refs,
+    )
+
+
+def _circuit_has_failure_history(value: Mapping[str, Any]) -> bool:
+    return bool(
+        value.get("open")
+        or value.get("reason")
+        or value.get("consecutive_provider_errors")
+        or value.get("disposition") is not None
+        or value.get("first_request")
+        or value.get("first_failure_at")
+    )
 
 
 def _provider_state_payload(
@@ -3305,18 +6283,37 @@ def _provider_state_payload(
     cache = getattr(judge, "cache", None) or getattr(target, "cache", None)
     stats = getattr(cache, "stats", None)
     cache_stats = stats() if callable(stats) else {"enabled": False}
+    circuit = {
+        "open": bool(getattr(target, "provider_circuit_open", False)),
+        "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
+        "consecutive_provider_errors": int(
+            getattr(target, "consecutive_provider_errors", 0) or 0
+        ),
+        "provider_error_threshold": int(
+            getattr(target, "provider_error_threshold", 3) or 3
+        ),
+        "disposition": provider_failure_disposition_to_dict(
+            getattr(target, "provider_circuit_disposition", None)
+        ),
+        "first_request": int(
+            getattr(target, "provider_circuit_first_request", 0) or 0
+        ),
+        "first_failure_at": str(
+            getattr(target, "provider_circuit_first_failure_at", "") or ""
+        ),
+    }
+    raw_previous_failure = getattr(
+        target, "provider_circuit_previous_failure", None
+    )
+    previous_failure = (
+        _provider_failure_snapshot(raw_previous_failure)
+        if isinstance(raw_previous_failure, Mapping)
+        else None
+    )
     unsigned = {
         "schema": PROVIDER_STATE_SCHEMA,
-        "circuit": {
-            "open": bool(getattr(target, "provider_circuit_open", False)),
-            "reason": str(getattr(target, "provider_circuit_reason", "") or ""),
-            "consecutive_provider_errors": int(
-                getattr(target, "consecutive_provider_errors", 0) or 0
-            ),
-            "provider_error_threshold": int(
-                getattr(target, "provider_error_threshold", 3) or 3
-            ),
-        },
+        "circuit": circuit,
+        "previous_failure": previous_failure,
         "cache_identity": str(cache_identity),
         "cache_stats": _checkpoint_json(cache_stats),
         "accounting": {
@@ -3372,6 +6369,32 @@ def _validate_provider_cache_stats(value: Any) -> JsonDict:
     return copy.deepcopy(cache_stats)
 
 
+def _validate_provider_circuit_snapshot(value: Any, *, label: str) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("{0} must be an object".format(label))
+    circuit = dict(value)
+    _require_exact_checkpoint_keys(circuit, PROVIDER_CIRCUIT_KEYS, label)
+    if type(circuit["open"]) is not bool:
+        raise ValueError("{0} open flag is invalid".format(label))
+    if not isinstance(circuit["reason"], str):
+        raise ValueError("{0} reason is invalid".format(label))
+    for key in ("consecutive_provider_errors", "provider_error_threshold"):
+        if type(circuit[key]) is not int or circuit[key] < 0:
+            raise ValueError(
+                "{0} counter is invalid: {1}".format(label, key)
+            )
+    if circuit["provider_error_threshold"] < 1:
+        raise ValueError("provider error threshold must be positive")
+    circuit["disposition"] = provider_failure_disposition_to_dict(
+        circuit["disposition"]
+    )
+    if type(circuit["first_request"]) is not int or circuit["first_request"] < 0:
+        raise ValueError("{0} first request is invalid".format(label))
+    if not isinstance(circuit["first_failure_at"], str):
+        raise ValueError("{0} first failure time is invalid".format(label))
+    return circuit
+
+
 def _validate_provider_state(
     value: Any,
     state: "RecursiveAnalysisState",
@@ -3381,21 +6404,88 @@ def _validate_provider_state(
 ) -> JsonDict:
     if not isinstance(value, Mapping):
         raise ValueError("provider state must be an object")
-    _require_exact_checkpoint_keys(value, PROVIDER_STATE_KEYS, "provider state")
+    source_schema = value.get("schema")
+    expected_provider_keys = (
+        LEGACY_PROVIDER_STATE_KEYS
+        if source_schema
+        in {LEGACY_PROVIDER_STATE_SCHEMA, INTERMEDIATE_PROVIDER_STATE_SCHEMA}
+        else PROVIDER_STATE_KEYS
+    )
+    _require_exact_checkpoint_keys(
+        value, expected_provider_keys, "provider state"
+    )
     provider = dict(value)
-    if provider["schema"] != PROVIDER_STATE_SCHEMA:
+    if source_schema in {
+        LEGACY_PROVIDER_STATE_SCHEMA,
+        INTERMEDIATE_PROVIDER_STATE_SCHEMA,
+    }:
+        legacy_unsigned = {
+            key: provider[key] for key in provider if key != "identity"
+        }
+        if provider["identity"] != hashlib.sha256(
+            stable_json(legacy_unsigned).encode("utf-8")
+        ).hexdigest():
+            raise ValueError("provider state identity does not match contents")
+        legacy_circuit = provider["circuit"]
+        if source_schema == LEGACY_PROVIDER_STATE_SCHEMA:
+            if not isinstance(legacy_circuit, Mapping):
+                raise ValueError("provider circuit must be an object")
+            legacy_keys = {str(key) for key in legacy_circuit}
+            if (
+                not LEGACY_PROVIDER_CIRCUIT_REQUIRED_KEYS.issubset(legacy_keys)
+                or legacy_keys
+                - LEGACY_PROVIDER_CIRCUIT_REQUIRED_KEYS
+                - LEGACY_PROVIDER_CIRCUIT_OPTIONAL_KEYS
+            ):
+                raise ValueError("legacy provider circuit schema mismatch")
+            legacy_circuit = {
+                **{
+                    key: copy.deepcopy(legacy_circuit[key])
+                    for key in LEGACY_PROVIDER_CIRCUIT_REQUIRED_KEYS
+                },
+                "disposition": provider_failure_disposition_to_dict(
+                    legacy_circuit.get("disposition")
+                ),
+                "first_request": legacy_circuit.get("first_request", 0),
+                "first_failure_at": str(
+                    legacy_circuit.get("first_failure_at")
+                    or legacy_circuit.get("opened_at")
+                    or ""
+                ),
+            }
+        historical = _validate_provider_circuit_snapshot(
+            legacy_circuit,
+            label="provider circuit",
+        )
+        provider["schema"] = PROVIDER_STATE_SCHEMA
+        provider["previous_failure"] = (
+            historical if _circuit_has_failure_history(historical) else None
+        )
+        provider["circuit"] = _empty_provider_circuit(
+            historical["provider_error_threshold"]
+        )
+        migrated_unsigned = {
+            key: provider[key] for key in provider if key != "identity"
+        }
+        provider["identity"] = hashlib.sha256(
+            stable_json(migrated_unsigned).encode("utf-8")
+        ).hexdigest()
+    elif source_schema != PROVIDER_STATE_SCHEMA:
         raise ValueError("unsupported provider state schema")
-    circuit = provider["circuit"]
-    _require_exact_checkpoint_keys(circuit, PROVIDER_CIRCUIT_KEYS, "provider circuit")
-    if type(circuit["open"]) is not bool:
-        raise ValueError("provider circuit open flag is invalid")
-    if not isinstance(circuit["reason"], str):
-        raise ValueError("provider circuit reason is invalid")
-    for key in ("consecutive_provider_errors", "provider_error_threshold"):
-        if type(circuit[key]) is not int or circuit[key] < 0:
-            raise ValueError("provider circuit counter is invalid: {0}".format(key))
-    if circuit["provider_error_threshold"] < 1:
-        raise ValueError("provider error threshold must be positive")
+    circuit = _validate_provider_circuit_snapshot(
+        provider["circuit"],
+        label="provider circuit",
+    )
+    provider["circuit"] = circuit
+    previous_failure = provider["previous_failure"]
+    if previous_failure is not None:
+        previous_failure = _validate_provider_circuit_snapshot(
+            previous_failure,
+            label="previous provider failure",
+        )
+        if not _circuit_has_failure_history(previous_failure):
+            raise ValueError("previous provider failure is empty")
+    provider["previous_failure"] = previous_failure
     if provider["cache_identity"] != cache_identity:
         raise ValueError("provider cache identity does not match checkpoint config")
     provider["cache_stats"] = _validate_provider_cache_stats(
@@ -3622,6 +6712,522 @@ def _global_judge_action_key(pass_identity: str) -> str:
     return "global_judge:{0}".format(pass_identity)
 
 
+def _global_judge_page_action_key(
+    pass_identity: str,
+    page_identity: str,
+) -> str:
+    if not str(pass_identity).startswith("global_pass:v1:"):
+        raise ValueError(
+            "global Judge page action requires a canonical pass identity"
+        )
+    page_identity = str(page_identity or "")
+    if len(page_identity) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in page_identity
+    ):
+        raise ValueError(
+            "global Judge page action requires a canonical page identity"
+        )
+    return "global_judge_page:{0}:{1}".format(
+        pass_identity, page_identity
+    )
+
+
+_CANDIDATE_CLUSTER_TRIAGE_EVENT_SCHEMAS = {
+    "candidate_cluster_triage_plan": (
+        "candidate-cluster-triage-plan-event/v1"
+    ),
+    "candidate_cluster_triage_page": (
+        "candidate-cluster-triage-page-event/v1"
+    ),
+    "candidate_cluster_triage_result": (
+        "candidate-cluster-triage-result-event/v1"
+    ),
+    "candidate_cluster_expansion": (
+        "candidate-cluster-expansion-event/v1"
+    ),
+}
+CANDIDATE_CLUSTER_MANIFEST_REJECTION_SCHEMA = (
+    "candidate-cluster-manifest-rejection/v1"
+)
+CANDIDATE_CLUSTER_MANIFEST_REJECTION_KEYS = frozenset(
+    {
+        "kind",
+        "event_schema",
+        "seed_binding_identity",
+        "source_selection_identity",
+        "rejected_manifest_identity",
+        "reason",
+        "observed_seed_ref",
+        "observed_defect_fingerprint",
+        "expected_seed_ref",
+        "expected_defect_fingerprint",
+        "behavior_impact",
+        "content_identity",
+    }
+)
+
+
+def _candidate_cluster_manifest_rejection_event(
+    *,
+    seed_binding_identity: str,
+    source_selection_identity: str,
+    manifest: CandidateClusterManifest,
+    expected_seed_ref: str,
+    expected_defect_fingerprint: str,
+    reason: str,
+) -> JsonDict:
+    if reason not in {"stale_seed_ref", "stale_defect_fingerprint"}:
+        raise ValueError("candidate cluster manifest rejection reason is invalid")
+    unsigned = {
+        "kind": "candidate_cluster_manifest_rejection",
+        "event_schema": CANDIDATE_CLUSTER_MANIFEST_REJECTION_SCHEMA,
+        "seed_binding_identity": seed_binding_identity,
+        "source_selection_identity": source_selection_identity,
+        "rejected_manifest_identity": manifest.manifest_identity,
+        "reason": reason,
+        "observed_seed_ref": manifest.seed_ref,
+        "observed_defect_fingerprint": manifest.defect_fingerprint,
+        "expected_seed_ref": expected_seed_ref,
+        "expected_defect_fingerprint": expected_defect_fingerprint,
+        "behavior_impact": "none_offline_analysis_only",
+    }
+    return {
+        **unsigned,
+        "content_identity": hashlib.sha256(
+            stable_json(
+                {
+                    "schema": (
+                        "candidate-cluster-manifest-rejection-content-identity/v1"
+                    ),
+                    "facts": unsigned,
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _validate_candidate_cluster_manifest_rejection_event(
+    value: Any,
+) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate cluster manifest rejection must be an object")
+    event = _checkpoint_json(value)
+    if set(event) != set(CANDIDATE_CLUSTER_MANIFEST_REJECTION_KEYS):
+        raise ValueError("candidate cluster manifest rejection schema is invalid")
+    content_identity = str(event.pop("content_identity") or "")
+    if (
+        event["kind"] != "candidate_cluster_manifest_rejection"
+        or event["event_schema"]
+        != CANDIDATE_CLUSTER_MANIFEST_REJECTION_SCHEMA
+        or event["reason"]
+        not in {"stale_seed_ref", "stale_defect_fingerprint"}
+        or event["behavior_impact"] != "none_offline_analysis_only"
+        or content_identity
+        != hashlib.sha256(
+            stable_json(
+                {
+                    "schema": (
+                        "candidate-cluster-manifest-rejection-content-identity/v1"
+                    ),
+                    "facts": event,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise ValueError("candidate cluster manifest rejection is invalid")
+    return {**event, "content_identity": content_identity}
+
+
+def _quarantine_stale_candidate_cluster_shadows(
+    investigation_journal: List[JsonDict],
+    *,
+    graph: TraceGraph,
+    seed_builders: Mapping[str, Any],
+) -> Set[str]:
+    suppressed_seed_bindings: Set[str] = set()
+    rejection_identities = set()
+    for value in investigation_journal:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("kind")
+            != "candidate_cluster_manifest_rejection"
+        ):
+            continue
+        rejection = _validate_candidate_cluster_manifest_rejection_event(value)
+        rejection_identities.add(rejection["content_identity"])
+        builder = seed_builders.get(rejection["seed_binding_identity"])
+        if (
+            builder is not None
+            and rejection["expected_seed_ref"] == builder.start_ref
+            and rejection["expected_defect_fingerprint"]
+            == builder.defect_state.fingerprint
+        ):
+            suppressed_seed_bindings.add(
+                rejection["seed_binding_identity"]
+            )
+
+    for value in tuple(investigation_journal):
+        if (
+            not isinstance(value, Mapping)
+            or value.get("kind") != "candidate_cluster_manifest_shadow"
+        ):
+            continue
+        seed_binding_identity = str(
+            value.get("seed_binding_identity") or ""
+        )
+        builder = seed_builders.get(seed_binding_identity)
+        if builder is None:
+            continue
+        manifest = validate_candidate_cluster_shadow_event(
+            value,
+            graph=graph,
+            expected_seed_binding_identity=seed_binding_identity,
+        )
+        reason = (
+            "stale_seed_ref"
+            if manifest.seed_ref != builder.start_ref
+            else "stale_defect_fingerprint"
+            if manifest.defect_fingerprint
+            != builder.defect_state.fingerprint
+            else ""
+        )
+        if not reason:
+            continue
+        investigation_journal.remove(value)
+        rejection = _candidate_cluster_manifest_rejection_event(
+            seed_binding_identity=seed_binding_identity,
+            source_selection_identity=manifest.source_selection_identity,
+            manifest=manifest,
+            expected_seed_ref=builder.start_ref,
+            expected_defect_fingerprint=builder.defect_state.fingerprint,
+            reason=reason,
+        )
+        if rejection["content_identity"] not in rejection_identities:
+            investigation_journal.append(rejection)
+            rejection_identities.add(rejection["content_identity"])
+        suppressed_seed_bindings.add(seed_binding_identity)
+    return suppressed_seed_bindings
+
+
+def _candidate_cluster_triage_page_action_key(
+    request_identity: str,
+    page_identity: str,
+) -> str:
+    for value, label in (
+        (request_identity, "request"),
+        (page_identity, "page"),
+    ):
+        if len(str(value or "")) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in str(value or "")
+        ):
+            raise ValueError(
+                "cluster triage action requires a canonical {0} identity".format(
+                    label
+                )
+            )
+    return "candidate_cluster_triage_page:{0}:{1}".format(
+        request_identity,
+        page_identity,
+    )
+
+
+def _candidate_cluster_triage_event(
+    kind: str,
+    *,
+    seed_binding_identity: str,
+    source_selection_identity: str,
+    manifest_identity: str,
+    request_identity: str,
+    payload: Mapping[str, Any],
+) -> JsonDict:
+    event_schema = _CANDIDATE_CLUSTER_TRIAGE_EVENT_SCHEMAS.get(kind)
+    if event_schema is None:
+        raise ValueError("unsupported candidate cluster triage event kind")
+    unsigned = {
+        "kind": kind,
+        "event_schema": event_schema,
+        "seed_binding_identity": str(seed_binding_identity),
+        "source_selection_identity": str(source_selection_identity),
+        "manifest_identity": str(manifest_identity),
+        "request_identity": str(request_identity),
+        **_checkpoint_json(dict(payload)),
+    }
+    return {
+        **unsigned,
+        "content_identity": hashlib.sha256(
+            stable_json(
+                {
+                    "schema": "{0}-content-identity/v1".format(
+                        event_schema
+                    ),
+                    "facts": unsigned,
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _validate_candidate_cluster_triage_event(
+    value: Any,
+    *,
+    expected_kind: str,
+    seed_binding_identity: str,
+    source_selection_identity: str,
+    manifest_identity: str,
+    request_identity: str,
+) -> JsonDict:
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate cluster triage event must be an object")
+    payload = copy.deepcopy(dict(value))
+    content_identity = str(payload.pop("content_identity", "") or "")
+    expected_schema = _CANDIDATE_CLUSTER_TRIAGE_EVENT_SCHEMAS.get(
+        expected_kind
+    )
+    if (
+        payload.get("kind") != expected_kind
+        or payload.get("event_schema") != expected_schema
+        or payload.get("seed_binding_identity") != seed_binding_identity
+        or payload.get("source_selection_identity")
+        != source_selection_identity
+        or payload.get("manifest_identity") != manifest_identity
+        or payload.get("request_identity") != request_identity
+    ):
+        raise ValueError(
+            "candidate cluster triage event identity binding is stale"
+        )
+    expected_identity = hashlib.sha256(
+        stable_json(
+            {
+                "schema": "{0}-content-identity/v1".format(
+                    expected_schema
+                ),
+                "facts": payload,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    if content_identity != expected_identity:
+        raise ValueError(
+            "candidate cluster triage event content identity is invalid"
+        )
+    return {**payload, "content_identity": content_identity}
+
+
+def _validated_candidate_cluster_triage_terminal_action(
+    record: Any,
+    *,
+    page: ClusterTriagePageRequest,
+    seed_binding_identity: str,
+    source_selection_identity: str,
+    manifest_identity: str,
+    request_identity: str,
+) -> Tuple[str, JsonDict, Optional[ClusterTriageJudgment]]:
+    if not isinstance(record, Mapping):
+        raise ValueError("directory page terminal action is missing")
+    operation = str(record.get("operation") or "")
+    if operation not in {
+        "candidate_cluster_triage_page_completed",
+        "candidate_cluster_triage_page_failed",
+    }:
+        raise ValueError("directory page action is not terminal")
+    if str(record.get("semantic_key") or "") != (
+        _candidate_cluster_triage_page_action_key(
+            request_identity,
+            page.page_identity,
+        )
+    ):
+        raise ValueError("directory page terminal action key is stale")
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("directory page terminal payload is invalid")
+    base_keys = {
+        "status",
+        "seed_binding_identity",
+        "source_selection_identity",
+        "manifest_identity",
+        "request_identity",
+        "page_identity",
+        "page_index",
+        "page_count",
+        "page_request",
+        "physical_requests_reserved",
+    }
+    terminal_keys = base_keys | {
+        "physical_request_delta",
+        "physical_request_exact",
+        "provider_diagnostics",
+        "blocker",
+        "detail",
+        "provider_state",
+    }
+    expected_keys = (
+        terminal_keys | {"judgment_identity", "judgment"}
+        if operation == "candidate_cluster_triage_page_completed"
+        else terminal_keys
+    )
+    if set(payload) != expected_keys:
+        raise ValueError("directory page terminal payload schema is invalid")
+    expected_base = {
+        "status": (
+            "completed"
+            if operation == "candidate_cluster_triage_page_completed"
+            else "failed"
+        ),
+        "seed_binding_identity": seed_binding_identity,
+        "source_selection_identity": source_selection_identity,
+        "manifest_identity": manifest_identity,
+        "request_identity": request_identity,
+        "page_identity": page.page_identity,
+        "page_index": page.page_index,
+        "page_count": page.page_count,
+        "page_request": page.to_dict(),
+        "physical_requests_reserved": payload[
+            "physical_requests_reserved"
+        ],
+    }
+    if {
+        key: copy.deepcopy(payload[key]) for key in base_keys
+    } != expected_base:
+        raise ValueError("directory page terminal request is stale")
+    reserved = payload["physical_requests_reserved"]
+    physical_delta = payload["physical_request_delta"]
+    physical_exact = payload["physical_request_exact"]
+    if (
+        type(reserved) is not int
+        or reserved < 0
+        or reserved > GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+        or type(physical_delta) is not int
+        or physical_delta < 0
+        or physical_delta > reserved
+        or type(physical_exact) is not bool
+        or not isinstance(payload["provider_diagnostics"], Mapping)
+        or not isinstance(payload["provider_state"], Mapping)
+    ):
+        raise ValueError("directory page terminal accounting is invalid")
+    judgment: Optional[ClusterTriageJudgment] = None
+    if operation == "candidate_cluster_triage_page_completed":
+        judgment = ClusterTriageJudgment.from_dict(payload["judgment"])
+        if (
+            physical_exact is not True
+            or payload["blocker"]
+            or payload["detail"]
+            or judgment.to_dict() != payload["judgment"]
+            or payload["judgment_identity"]
+            != judgment.judgment_identity
+            or judgment.page_identity != page.page_identity
+            or judgment.request_identity != request_identity
+            or judgment.partition_identity != page.partition_identity
+            or judgment.page_index != page.page_index
+            or judgment.page_count != page.page_count
+        ):
+            raise ValueError("completed directory page terminal is invalid")
+    elif (
+        not payload["blocker"]
+        or not payload["detail"]
+        or (not physical_exact and physical_delta != reserved)
+    ):
+        raise ValueError("failed directory page terminal is invalid")
+    return operation, copy.deepcopy(dict(payload)), judgment
+
+
+def _validate_candidate_cluster_triage_journal_actions(
+    investigation_journal: Iterable[Any],
+    action_records: Iterable[Any],
+) -> None:
+    latest_terminals: Dict[str, Mapping[str, Any]] = {}
+    for record in action_records:
+        if (
+            isinstance(record, Mapping)
+            and record.get("operation")
+            in {
+                "candidate_cluster_triage_page_completed",
+                "candidate_cluster_triage_page_failed",
+            }
+        ):
+            latest_terminals[str(record.get("semantic_key") or "")] = record
+
+    for raw_event in investigation_journal:
+        if (
+            not isinstance(raw_event, Mapping)
+            or raw_event.get("kind") != "candidate_cluster_triage_page"
+        ):
+            continue
+        seed_binding_identity = str(
+            raw_event.get("seed_binding_identity") or ""
+        )
+        source_selection_identity = str(
+            raw_event.get("source_selection_identity") or ""
+        )
+        manifest_identity = str(raw_event.get("manifest_identity") or "")
+        request_identity = str(raw_event.get("request_identity") or "")
+        try:
+            event = _validate_candidate_cluster_triage_event(
+                _checkpoint_json(raw_event),
+                expected_kind="candidate_cluster_triage_page",
+                seed_binding_identity=seed_binding_identity,
+                source_selection_identity=source_selection_identity,
+                manifest_identity=manifest_identity,
+                request_identity=request_identity,
+            )
+            page = ClusterTriagePageRequest.from_dict(event["page_request"])
+            if (
+                page.request_identity != request_identity
+                or event.get("page_identity") != page.page_identity
+                or event.get("page_index") != page.page_index
+                or event.get("page_count") != page.page_count
+            ):
+                raise ValueError(
+                    "directory page journal contradicts its canonical page"
+                )
+            action_key = _candidate_cluster_triage_page_action_key(
+                request_identity,
+                page.page_identity,
+            )
+            operation, terminal, judgment = (
+                _validated_candidate_cluster_triage_terminal_action(
+                    latest_terminals.get(action_key),
+                    page=page,
+                    seed_binding_identity=seed_binding_identity,
+                    source_selection_identity=source_selection_identity,
+                    manifest_identity=manifest_identity,
+                    request_identity=request_identity,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "directory page journal has no exact durable terminal lifecycle"
+            ) from error
+
+        expected_status = (
+            "completed"
+            if operation == "candidate_cluster_triage_page_completed"
+            else "failed"
+        )
+        expected_judgment = (
+            judgment.to_dict() if judgment is not None else None
+        )
+        if (
+            event.get("status") != expected_status
+            or event.get("physical_requests_reserved")
+            != terminal["physical_requests_reserved"]
+            or event.get("physical_request_delta")
+            != terminal["physical_request_delta"]
+            or event.get("physical_request_exact")
+            != terminal["physical_request_exact"]
+            or event.get("provider_diagnostics")
+            != terminal["provider_diagnostics"]
+            or event.get("blocker") != terminal["blocker"]
+            or event.get("detail") != terminal["detail"]
+            or event.get("judgment_identity")
+            != str(terminal.get("judgment_identity") or "")
+            or event.get("judgment") != expected_judgment
+        ):
+            raise ValueError(
+                "directory page journal contradicts durable terminal action"
+            )
+
+
 def _global_judge_request_identity(
     request: GlobalCandidateJudgeRequest,
 ) -> str:
@@ -3632,15 +7238,68 @@ def _global_judge_request_identity(
     )
 
 
+def _global_judge_call_diagnostics(
+    calls: Sequence[Mapping[str, Any]] = (),
+) -> JsonDict:
+    validated_calls = []
+    for item in calls:
+        if not isinstance(item, Mapping) or set(item) != {
+            "request_identity",
+            "diagnostics",
+        }:
+            raise ValueError(
+                "global Judge call diagnostics entry schema mismatch"
+            )
+        request_identity = str(
+            item.get("request_identity") or ""
+        )
+        if not request_identity.startswith("global_request:v1:"):
+            raise ValueError(
+                "global Judge call diagnostics request identity is invalid"
+            )
+        validated_calls.append(
+            {
+                "request_identity": request_identity,
+                "diagnostics": validate_global_judge_diagnostics(
+                    _checkpoint_json(item.get("diagnostics"))
+                ),
+            }
+        )
+    return {
+        "schema": GLOBAL_JUDGE_CALL_DIAGNOSTICS_SCHEMA,
+        "calls": validated_calls,
+    }
+
+
+def _validate_global_judge_call_diagnostics(
+    value: Any,
+) -> JsonDict:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema", "calls"}
+        or value.get("schema")
+        != GLOBAL_JUDGE_CALL_DIAGNOSTICS_SCHEMA
+        or not isinstance(value.get("calls"), (list, tuple))
+    ):
+        raise ValueError("global Judge call diagnostics schema mismatch")
+    return _global_judge_call_diagnostics(value["calls"])
+
+
 def _global_judge_capsule_identity(
     request: GlobalCandidateJudgeRequest,
 ) -> str:
-    return "global_capsules:v1:{0}".format(
+    envelope = request.validation_envelope()
+    return "global_capsules:v2:{0}".format(
         hashlib.sha256(
             stable_json(
-                request.validation_envelope()[
-                    "candidate_evidence_capsules"
-                ]
+                {
+                    "candidate_evidence_capsules": envelope[
+                        "candidate_evidence_capsules"
+                    ],
+                    "evidence_context_capsules": envelope[
+                        "evidence_context_capsules"
+                    ],
+                }
             ).encode("utf-8")
         ).hexdigest()
     )
@@ -3799,6 +7458,146 @@ def _global_judge_action_base(
         ),
         "physical_requests_reserved": physical_requests_reserved,
     }
+
+
+def _global_judge_page_action_base(
+    *,
+    builder: "SeedAttributionBuilder",
+    item: FrontierItem,
+    request: GlobalCandidateJudgeRequest,
+    candidate_compression: Mapping[str, Any],
+    plan: CandidatePagePlan,
+    page: CandidatePage,
+    page_phase: str,
+    physical_requests_reserved: int,
+) -> JsonDict:
+    if page_phase not in {"initial", "comparison", "final"}:
+        raise ValueError("unsupported global Judge page phase")
+    if (
+        type(physical_requests_reserved) is not int
+        or physical_requests_reserved < 0
+        or physical_requests_reserved
+        > GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+    ):
+        raise ValueError(
+            "global Judge page reserved request count is invalid"
+        )
+    if (
+        plan.seed_ref != builder.start_ref
+        or plan.defect_fingerprint != builder.defect_state.fingerprint
+        or page not in plan.pages
+        or page.round_index != plan.round_index
+        or request.offered_candidate_refs != page.candidate_refs
+    ):
+        raise ValueError(
+            "global Judge page action contradicts its page plan"
+        )
+    return {
+        "status": "in_flight",
+        "pass_identity": _global_pass_identity(builder.key),
+        "seed_binding_identity": builder.key,
+        "seed_ref": builder.start_ref,
+        "defect_fingerprint": builder.defect_state.fingerprint,
+        "hypothesis_id": item.hypothesis_id,
+        "visit_key": item.visit_key,
+        "owner": _global_pass_owner(builder).to_dict(),
+        "plan_identity": plan.identity,
+        "page_plan": plan.to_dict(),
+        "round_index": page.round_index,
+        "page_index": page.page_index,
+        "page_count": len(plan.pages),
+        "page_identity": page.identity,
+        "page_phase": page_phase,
+        "request_identity": _global_judge_request_identity(request),
+        "validation_envelope": request.validation_envelope(),
+        "capsule_identity": _global_judge_capsule_identity(request),
+        "candidate_compression": copy.deepcopy(
+            dict(candidate_compression)
+        ),
+        "physical_requests_reserved": physical_requests_reserved,
+    }
+
+
+def _global_page_candidate_compression(
+    *,
+    graph: TraceGraph,
+    capsules: Sequence[CandidateEvidenceCapsule],
+    full_candidate_compression: Mapping[str, Any],
+    plan: CandidatePagePlan,
+    page: CandidatePage,
+    page_phase: str,
+) -> JsonDict:
+    metrics = candidate_compression_metrics(graph, capsules)
+    funnel = full_candidate_compression.get("candidate_funnel")
+    if isinstance(funnel, Mapping):
+        metrics = candidate_compression_with_funnel(metrics, funnel)
+    triage_projection = full_candidate_compression.get(
+        "candidate_cluster_triage"
+    )
+    if isinstance(triage_projection, Mapping):
+        metrics["candidate_cluster_triage"] = copy.deepcopy(
+            dict(triage_projection)
+        )
+    metrics["candidate_page"] = {
+        "schema": "global-candidate-page-execution/v1",
+        "plan_identity": plan.identity,
+        "round_index": page.round_index,
+        "page_index": page.page_index,
+        "page_count": len(plan.pages),
+        "page_identity": page.identity,
+        "page_phase": page_phase,
+        "candidate_count": len(page.candidate_refs),
+    }
+    return metrics
+
+
+def _aggregate_no_defect_page_judgments(
+    *,
+    request: GlobalCandidateJudgeRequest,
+    judgments: Sequence[GlobalCandidateJudgment],
+) -> GlobalCandidateJudgment:
+    if not judgments or any(
+        judgment.outcome != "no_defect" for judgment in judgments
+    ):
+        raise ValueError(
+            "no-defect page aggregation requires only no-defect judgments"
+        )
+    compared_refs = request.open_authored_root_candidate_refs
+    assessments = tuple(
+        replace(
+            assessment,
+            compared_candidate_refs=compared_refs,
+        )
+        for judgment in judgments
+        for assessment in judgment.assessments
+    )
+    decisive_refs = _dedupe_strings(
+        ref
+        for judgment in judgments
+        for ref in judgment.decisive_evidence_refs
+    )
+    aggregate = GlobalCandidateJudgment(
+        outcome="no_defect",
+        reason=(
+            "Every deterministic candidate page independently ruled out "
+            "all of its offered candidates for the same active defect."
+        ),
+        assessments=assessments,
+        selected_candidate_refs=(),
+        expansion_requests=(),
+        decisive_evidence_refs=tuple(decisive_refs),
+        missing_evidence=(),
+        confidence=min(judgment.confidence for judgment in judgments),
+        active_focus_binding={
+            "seed_ref": request.seed_ref,
+            "defect_fingerprint": request.active_defect.fingerprint,
+            "active_focus_text_hash": request.active_focus_text_hash,
+        },
+    )
+    return validate_global_candidate_payload(
+        aggregate.to_dict(),
+        request=request,
+    )
 
 
 def _validate_global_judge_failure_accounting(
@@ -4064,6 +7863,281 @@ def _validated_global_judge_action_history(
     return validated
 
 
+def _validated_global_judge_page_action_history(
+    action_records: Iterable[Any],
+) -> Dict[str, Tuple[JsonDict, ...]]:
+    grouped: Dict[str, List[JsonDict]] = {}
+    for record in action_records:
+        if not isinstance(record, Mapping):
+            continue
+        operation = str(record.get("operation") or "")
+        if operation not in GLOBAL_JUDGE_PAGE_ACTION_OPERATIONS:
+            continue
+        semantic_key = str(record.get("semantic_key") or "")
+        payload = record.get("payload")
+        if not semantic_key or not isinstance(payload, Mapping):
+            raise ValueError(
+                "global Judge page action record is malformed"
+            )
+        expected_keys = {
+            "global_judge_page_started": (
+                GLOBAL_JUDGE_PAGE_STARTED_PAYLOAD_KEYS
+            ),
+            "global_judge_page_completed": (
+                GLOBAL_JUDGE_PAGE_COMPLETED_PAYLOAD_KEYS
+            ),
+            "global_judge_page_failed": (
+                GLOBAL_JUDGE_PAGE_FAILED_PAYLOAD_KEYS
+            ),
+        }[operation]
+        _require_exact_checkpoint_keys(
+            payload,
+            set(expected_keys),
+            "global Judge page action payload",
+        )
+        grouped.setdefault(semantic_key, []).append(
+            {
+                "operation": operation,
+                "semantic_key": semantic_key,
+                "payload": copy.deepcopy(dict(payload)),
+            }
+        )
+
+    validated: Dict[str, Tuple[JsonDict, ...]] = {}
+    coordinate_identities: Dict[
+        Tuple[str, int, int], str
+    ] = {}
+    for semantic_key, records in grouped.items():
+        attempts: List[List[JsonDict]] = []
+        cursor = 0
+        while cursor < len(records):
+            if records[cursor]["operation"] != "global_judge_page_started":
+                attempts = []
+                break
+            attempt = [records[cursor]]
+            cursor += 1
+            if cursor < len(records):
+                terminal_operation = records[cursor]["operation"]
+                if terminal_operation in {
+                    "global_judge_page_completed",
+                    "global_judge_page_failed",
+                }:
+                    attempt.append(records[cursor])
+                    cursor += 1
+            attempts.append(attempt)
+        if (
+            not attempts
+            or cursor != len(records)
+            or any(len(attempt) != 2 for attempt in attempts[:-1])
+            or any(
+                attempt[-1]["operation"] != "global_judge_page_failed"
+                for attempt in attempts[:-1]
+            )
+        ):
+            raise ValueError(
+                "global Judge page lifecycle must contain ordered attempts "
+                "whose prior terminal records are failures"
+            )
+        latest_records = attempts[-1]
+        all_attempt_records = tuple(
+            record for attempt in attempts for record in attempt
+        )
+        latest_started = latest_records[0]["payload"]
+        immutable_retry_keys = (
+            set(GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS)
+            - {"status", "physical_requests_reserved"}
+        )
+        for prior_attempt in attempts[:-1]:
+            prior_started = prior_attempt[0]["payload"]
+            prior_terminal = prior_attempt[1]["payload"]
+            expected_prior_base = copy.deepcopy(dict(prior_started))
+            expected_prior_base["status"] = "failed"
+            actual_prior_base = {
+                key: copy.deepcopy(prior_terminal[key])
+                for key in GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS
+            }
+            if (
+                stable_json(_checkpoint_json(actual_prior_base))
+                != stable_json(_checkpoint_json(expected_prior_base))
+                or any(
+                    prior_started[key] != latest_started[key]
+                    for key in immutable_retry_keys
+                )
+            ):
+                raise ValueError(
+                    "global Judge page retry contradicts its prior failed attempt"
+                )
+        records = latest_records
+        started = records[0]["payload"]
+        if started.get("status") != "in_flight":
+            raise ValueError(
+                "global Judge page started status is invalid"
+            )
+        plan = CandidatePagePlan.from_dict(started.get("page_plan"))
+        page_index = started.get("page_index")
+        if (
+            type(page_index) is not int
+            or page_index < 0
+            or page_index >= len(plan.pages)
+        ):
+            raise ValueError(
+                "global Judge page index is invalid"
+            )
+        page = plan.pages[page_index]
+        request = global_candidate_request_from_validation_envelope(
+            started.get("validation_envelope")
+        )
+        seed_ref = str(started.get("seed_ref") or "")
+        defect_fingerprint = str(
+            started.get("defect_fingerprint") or ""
+        )
+        (
+            expected_seed_binding,
+            expected_pass_identity,
+            expected_owner,
+        ) = _canonical_global_pass_facts(
+            seed_ref=seed_ref,
+            defect_fingerprint=defect_fingerprint,
+        )
+        reserved = started.get("physical_requests_reserved")
+        page_phase = str(started.get("page_phase") or "")
+        coordinate = (
+            expected_pass_identity,
+            page.round_index,
+            page.page_index,
+        )
+        prior_page_identity = coordinate_identities.get(coordinate)
+        if (
+            prior_page_identity is not None
+            and prior_page_identity != page.identity
+        ):
+            raise ValueError(
+                "global Judge page coordinate binds multiple identities"
+            )
+        coordinate_identities[coordinate] = page.identity
+        if (
+            started.get("seed_binding_identity")
+            != expected_seed_binding
+            or started.get("pass_identity")
+            != expected_pass_identity
+            or LocalStateOwner.from_dict(started.get("owner"))
+            != expected_owner
+            or semantic_key
+            != _global_judge_page_action_key(
+                expected_pass_identity,
+                page.identity,
+            )
+            or started.get("plan_identity") != plan.identity
+            or started.get("round_index") != page.round_index
+            or started.get("page_count") != len(plan.pages)
+            or started.get("page_identity") != page.identity
+            or page_phase
+            not in {"initial", "comparison", "final"}
+            or request.seed_ref != seed_ref
+            or request.active_defect.fingerprint
+            != defect_fingerprint
+            or request.offered_candidate_refs
+            != page.candidate_refs
+            or started.get("request_identity")
+            != _global_judge_request_identity(request)
+            or started.get("capsule_identity")
+            != _global_judge_capsule_identity(request)
+            or not isinstance(
+                started.get("candidate_compression"), Mapping
+            )
+            or type(reserved) is not int
+            or reserved < 0
+            or reserved
+            > GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+        ):
+            raise ValueError(
+                "global Judge page started action contradicts its facts"
+            )
+        if len(records) == 1:
+            validated[semantic_key] = all_attempt_records
+            continue
+        terminal_record = records[1]
+        terminal = terminal_record["payload"]
+        expected_status = (
+            "completed"
+            if terminal_record["operation"]
+            == "global_judge_page_completed"
+            else "failed"
+        )
+        expected_base = copy.deepcopy(dict(started))
+        expected_base["status"] = expected_status
+        actual_base = {
+            key: copy.deepcopy(terminal[key])
+            for key in GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS
+        }
+        if stable_json(_checkpoint_json(actual_base)) != stable_json(
+            _checkpoint_json(expected_base)
+        ):
+            raise ValueError(
+                "global Judge page terminal does not match its start"
+            )
+        delta = terminal.get("physical_request_delta")
+        exact = terminal.get("physical_request_exact")
+        if (
+            type(delta) is not int
+            or delta < 0
+            or delta > reserved
+            or type(exact) is not bool
+            or not isinstance(
+                terminal.get("provider_state"), Mapping
+            )
+        ):
+            raise ValueError(
+                "global Judge page terminal accounting is invalid"
+            )
+        _validate_global_judge_call_diagnostics(
+            terminal.get("judge_diagnostics")
+        )
+        if (
+            terminal_record["operation"]
+            == "global_judge_page_completed"
+        ):
+            if exact is not True:
+                raise ValueError(
+                    "completed global Judge page requires exact accounting"
+                )
+            final_request, _ = (
+                _validated_global_evidence_expansion_envelope(
+                    initial_request=request,
+                    final_validation_envelope=terminal.get(
+                        "final_validation_envelope"
+                    ),
+                    expansion_history=terminal.get(
+                        "evidence_expansion_history"
+                    ),
+                )
+            )
+            judgment = validate_global_candidate_payload(
+                terminal.get("judgment"),
+                request=final_request,
+            )
+            _validated_global_expansion_terminal(
+                terminal.get("expansion_terminal"),
+                judgment=judgment,
+            )
+        else:
+            blocker = str(terminal.get("blocker") or "")
+            detail = str(terminal.get("detail") or "")
+            if not blocker or not detail:
+                raise ValueError(
+                    "failed global Judge page requires blocker and detail"
+                )
+            if not exact and (
+                blocker != "global_judge_page_interrupted"
+                or delta != reserved
+            ):
+                raise ValueError(
+                    "inexact page failure must consume its reservation"
+                )
+        validated[semantic_key] = all_attempt_records
+    return validated
+
+
 def _validated_global_judge_action(
     record: Mapping[str, Any],
     *,
@@ -4206,6 +8280,141 @@ def _validated_global_judge_action(
         raise ValueError(
             "global Judge terminal action provider state must be an object"
         )
+    return copy.deepcopy(dict(payload))
+
+
+def _validated_global_judge_page_action(
+    record: Mapping[str, Any],
+    *,
+    builder: "SeedAttributionBuilder",
+    item: FrontierItem,
+    request: GlobalCandidateJudgeRequest,
+    candidate_compression: Mapping[str, Any],
+    plan: CandidatePagePlan,
+    page: CandidatePage,
+    page_phase: str,
+    expected_physical_requests_reserved: int,
+) -> JsonDict:
+    operation = str(record.get("operation") or "")
+    if operation not in GLOBAL_JUDGE_PAGE_ACTION_OPERATIONS:
+        raise ValueError("unsupported global Judge page action operation")
+    expected_key = _global_judge_page_action_key(
+        _global_pass_identity(builder.key),
+        page.identity,
+    )
+    if str(record.get("semantic_key") or "") != expected_key:
+        raise ValueError("global Judge page action semantic key is invalid")
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("global Judge page action payload must be an object")
+    expected_keys = {
+        "global_judge_page_started": (
+            GLOBAL_JUDGE_PAGE_STARTED_PAYLOAD_KEYS
+        ),
+        "global_judge_page_completed": (
+            GLOBAL_JUDGE_PAGE_COMPLETED_PAYLOAD_KEYS
+        ),
+        "global_judge_page_failed": (
+            GLOBAL_JUDGE_PAGE_FAILED_PAYLOAD_KEYS
+        ),
+    }[operation]
+    _require_exact_checkpoint_keys(
+        payload,
+        set(expected_keys),
+        "global Judge page action payload",
+    )
+    reserved = payload.get("physical_requests_reserved")
+    if (
+        type(reserved) is not int
+        or reserved < 0
+        or reserved != expected_physical_requests_reserved
+    ):
+        raise ValueError(
+            "global Judge page action reserved request count is invalid"
+        )
+    expected_base = _global_judge_page_action_base(
+        builder=builder,
+        item=item,
+        request=request,
+        candidate_compression=candidate_compression,
+        plan=plan,
+        page=page,
+        page_phase=page_phase,
+        physical_requests_reserved=reserved,
+    )
+    actual_base = {
+        key: copy.deepcopy(payload[key])
+        for key in GLOBAL_JUDGE_PAGE_ACTION_BASE_KEYS
+    }
+    expected_base["status"] = {
+        "global_judge_page_started": "in_flight",
+        "global_judge_page_completed": "completed",
+        "global_judge_page_failed": "failed",
+    }[operation]
+    if stable_json(_checkpoint_json(actual_base)) != stable_json(
+        _checkpoint_json(expected_base)
+    ):
+        raise ValueError(
+            "global Judge page action contradicts its factual request"
+        )
+    if operation == "global_judge_page_started":
+        return copy.deepcopy(dict(payload))
+    physical_delta = payload.get("physical_request_delta")
+    physical_exact = payload.get("physical_request_exact")
+    if (
+        type(physical_delta) is not int
+        or physical_delta < 0
+        or physical_delta > reserved
+        or type(physical_exact) is not bool
+        or not isinstance(payload.get("provider_state"), Mapping)
+    ):
+        raise ValueError(
+            "global Judge page terminal accounting is invalid"
+        )
+    _validate_global_judge_call_diagnostics(
+        payload.get("judge_diagnostics")
+    )
+    if operation == "global_judge_page_completed":
+        if physical_exact is not True:
+            raise ValueError(
+                "completed global Judge page requires exact accounting"
+            )
+        final_request, _ = _validated_global_evidence_expansion_envelope(
+            initial_request=request,
+            final_validation_envelope=payload.get(
+                "final_validation_envelope"
+            ),
+            expansion_history=payload.get(
+                "evidence_expansion_history"
+            ),
+        )
+        judgment = validate_global_candidate_payload(
+            payload.get("judgment"),
+            request=final_request,
+        )
+        if judgment.to_dict() != dict(payload["judgment"]):
+            raise ValueError(
+                "completed global Judge page judgment is not canonical"
+            )
+        _validated_global_expansion_terminal(
+            payload.get("expansion_terminal"),
+            judgment=judgment,
+        )
+    else:
+        blocker = str(payload.get("blocker") or "")
+        detail = str(payload.get("detail") or "")
+        if not blocker or not detail:
+            raise ValueError(
+                "failed global Judge page requires blocker and detail"
+            )
+        if not physical_exact and (
+            blocker != "global_judge_page_interrupted"
+            or physical_delta != reserved
+        ):
+            raise ValueError(
+                "inexact global Judge page failure must conservatively "
+                "consume its page reservation"
+            )
     return copy.deepcopy(dict(payload))
 
 
@@ -4702,7 +8911,12 @@ class SeedAttributionBuilder:
             )
 
     def record_confirmation(
-        self, confirmation: RootConfirmation, owner: LocalStateOwner
+        self,
+        confirmation: RootConfirmation,
+        owner: LocalStateOwner,
+        *,
+        unresolved_blocks_seed: bool = True,
+        confirmed_counts_as_root: bool = True,
     ) -> None:
         if owner.seed_binding_identity != self.key:
             raise ValueError("confirmation owner does not match seed")
@@ -4712,12 +8926,16 @@ class SeedAttributionBuilder:
         self.decisive_evidence_refs.update(confirmation.evidence_refs)
         self._record_decisive_evidence(confirmation.evidence_refs, owner)
         if confirmation.status == "confirmed":
-            self.confirmed_root_confirmation_identities.add(
-                confirmation.confirmation_identity
-            )
-            self.confirmed_root_refs.add(confirmation.candidate_ref)
+            if confirmed_counts_as_root:
+                self.confirmed_root_confirmation_identities.add(
+                    confirmation.confirmation_identity
+                )
+                self.confirmed_root_refs.add(confirmation.candidate_ref)
             return
-        if not is_definitive_confirmation(confirmation):
+        if (
+            unresolved_blocks_seed
+            and not is_definitive_confirmation(confirmation)
+        ):
             self.mark_unresolved(
                 (
                     "root_confirmation_unknown"
@@ -4828,13 +9046,24 @@ class RecursiveAnalysisState:
     investigation_evidence_hashes: Dict[str, Set[str]] = field(default_factory=dict)
     control_directive_ids: Set[str] = field(default_factory=set)
     confirmation_queue: List[JsonDict] = field(default_factory=list)
-    confirmation_queue_keys: Set[Tuple[str, str, str, str]] = field(default_factory=set)
+    confirmation_queue_keys: Set[Tuple[str, ...]] = field(default_factory=set)
+    factor_confirmation_enqueue_gaps: List[JsonDict] = field(
+        default_factory=list
+    )
     confirmations: List[RootConfirmation] = field(default_factory=list)
     confirmed_roots: List[ConfirmedRoot] = field(default_factory=list)
     co_roots: List[ConfirmedRoot] = field(default_factory=list)
     amplifying_factors: List[CausalFactor] = field(default_factory=list)
     confirmation_journal: List[JsonDict] = field(default_factory=list)
     confirmation_action_projection: List[JsonDict] = field(default_factory=list)
+    factor_role_judgments: List[FactorRoleJudgment] = field(
+        default_factory=list
+    )
+    factor_role_journal: List[JsonDict] = field(default_factory=list)
+    factor_role_action_projection: List[JsonDict] = field(
+        default_factory=list
+    )
+    factor_role_gaps: List[JsonDict] = field(default_factory=list)
     logical_confirmation_calls: int = 0
     pending_rejudge_journal: Dict[str, List[int]] = field(default_factory=dict)
     seed_count: int = 0
@@ -4860,16 +9089,8 @@ class RecursiveAnalysisState:
     @staticmethod
     def _confirmation_queue_key(
         value: Mapping[str, Any],
-    ) -> Tuple[str, str, str, str]:
-        locator = (
-            str(value.get("hypothesis_id") or ""),
-            str(value.get("candidate_ref") or ""),
-            str(value.get("defect_fingerprint") or ""),
-            str(value.get("seed_binding_identity") or ""),
-        )
-        if not all(locator):
-            raise ValueError("confirmation queue locator is incomplete")
-        return locator
+    ) -> Tuple[str, ...]:
+        return canonical_confirmation_queue_key(value)
 
     def _confirmation_artifact_envelopes(
         self,
@@ -4933,15 +9154,266 @@ class RecursiveAnalysisState:
             )
         return output
 
+    def _validate_factor_assessment_origin(
+        self,
+        value: Mapping[str, Any],
+        *,
+        label: str,
+    ) -> None:
+        if (
+            str(value.get("origin") or "")
+            != "global_candidate_factor_assessment"
+        ):
+            raise ValueError(
+                "{0} must use the canonical Global factor assessment "
+                "origin".format(label)
+            )
+        seed_key = str(value.get("seed_binding_identity") or "")
+        candidate_ref = str(value.get("candidate_ref") or "")
+        builder = self.seed_ledger.get(seed_key)
+        seed_authority = _seed_authority_from_records(
+            item.to_dict() for item in self.seed_ledger.values()
+        )
+        completed_passes = [
+            item
+            for item in _completed_global_passes(
+                self.investigation_journal,
+                seed_authority=seed_authority,
+            )
+            if str(item.get("seed_binding_identity") or "") == seed_key
+        ]
+        if builder is None or len(completed_passes) != 1:
+            raise ValueError(
+                "{0} has no same-seed completed Global judgment".format(label)
+            )
+        completed = completed_passes[0]
+        judgment = completed.get("judgment")
+        if not isinstance(judgment, Mapping):
+            raise ValueError(
+                "{0} has no same-seed completed Global judgment".format(label)
+            )
+        persisted_judgment = {
+            key: copy.deepcopy(item)
+            for key, item in builder.global_judgment.items()
+            if key
+            not in {
+                "schema_version",
+                "validation_envelope",
+                "owner",
+            }
+        }
+        if stable_json(_checkpoint_json(persisted_judgment)) != stable_json(
+            _checkpoint_json(judgment)
+        ):
+            raise ValueError(
+                "{0} contradicts the canonical completed Global "
+                "judgment".format(label)
+            )
+        selected_refs = {
+            str(item)
+            for item in judgment.get("selected_candidate_refs") or ()
+        }
+        assessments = [
+            item
+            for item in judgment.get("assessments") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("candidate_ref") or "") == candidate_ref
+        ]
+        capsules = [
+            item
+            for item in completed.get("candidate_evidence_capsules") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("candidate_ref") or "") == candidate_ref
+        ]
+        if (
+            candidate_ref in selected_refs
+            or len(assessments) != 1
+            or assessments[0].get("causal_role")
+            not in GLOBAL_NON_ROOT_REVIEW_ROLES
+            or not assessments[0].get("causal_path_refs")
+            or len(capsules) != 1
+            or not non_root_factor_candidate_eligible(
+                self.graph,
+                candidate_ref,
+            )
+        ):
+            raise ValueError(
+                "{0} has no reviewable non-selected Global "
+                "assessment".format(label)
+            )
+        assessment = assessments[0]
+        try:
+            capsule = CandidateEvidenceCapsule.from_dict(
+                _checkpoint_json(capsules[0])
+            )
+            capsule_route = _capsule_route_from_validation_source(
+                self.graph,
+                capsule,
+            )
+            validate_candidate_evidence_capsule_against_graph(
+                self.graph,
+                capsule,
+                authoritative_candidates=(
+                    *self.causal_candidates,
+                    capsule_route,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "{0} has no graph-grounded canonical Global capsule: "
+                "{1}".format(label, exc)
+            ) from exc
+        canonical_path = tuple(capsule.downstream_path)
+        expected_evidence_refs = _dedupe_strings(
+            [
+                candidate_ref,
+                *(assessment.get("evidence_refs") or ()),
+                *(judgment.get("decisive_evidence_refs") or ()),
+            ]
+        )
+        request_projection = value.get("request_projection")
+        if request_projection is None:
+            request_projection = value.get("factual_request_projection")
+        projection_facts = (
+            request_projection.get("facts")
+            if isinstance(request_projection, Mapping)
+            else None
+        )
+
+        def projected_refs(items: Any) -> Tuple[str, ...]:
+            if not isinstance(items, list):
+                return ()
+            return tuple(
+                str(
+                    item.get("resolved_ref")
+                    or item.get("canonical_ref")
+                    or item.get("raw_ref")
+                    or ""
+                )
+                for item in items
+                if isinstance(item, Mapping)
+            )
+
+        origin_hypothesis_id = str(completed.get("hypothesis_id") or "")
+        try:
+            expected_requested_by_ref = self.ledger.get(
+                origin_hypothesis_id
+            ).candidate_root_ref
+        except (KeyError, ValueError):
+            expected_requested_by_ref = ""
+        outer_path = tuple(str(ref) for ref in value.get("recursive_path") or ())
+        outer_evidence_refs = tuple(
+            str(ref) for ref in value.get("checked_evidence_refs") or ()
+        )
+        projected_path = (
+            tuple(
+                str(ref)
+                for ref in projection_facts.get("recursive_path") or ()
+            )
+            if isinstance(projection_facts, Mapping)
+            else ()
+        )
+        projected_path_refs = (
+            projected_refs(projection_facts.get("recursive_path_references"))
+            if isinstance(projection_facts, Mapping)
+            else ()
+        )
+        projected_support_refs = (
+            projected_refs(projection_facts.get("supporting_evidence"))
+            if isinstance(projection_facts, Mapping)
+            else ()
+        )
+        projected_opposing_refs = (
+            projected_refs(projection_facts.get("opposing_evidence"))
+            if isinstance(projection_facts, Mapping)
+            else ()
+        )
+        projection_candidate_ref = (
+            str(projection_facts.get("candidate_ref") or "")
+            if isinstance(projection_facts, Mapping)
+            else ""
+        )
+        projection_candidate_reference = (
+            projection_facts.get("candidate_reference")
+            if isinstance(projection_facts, Mapping)
+            else None
+        )
+        projection_defect_state = (
+            projection_facts.get("defect_state")
+            if isinstance(projection_facts, Mapping)
+            else None
+        )
+        projection_is_inconsistent = (
+            request_projection is not None
+            and (
+                not isinstance(projection_facts, Mapping)
+                or projection_candidate_ref != candidate_ref
+                or not isinstance(projection_candidate_reference, Mapping)
+                or str(
+                    projection_candidate_reference.get("resolved_ref") or ""
+                )
+                != candidate_ref
+                or projected_path != canonical_path
+                or projected_path_refs != canonical_path
+                or projected_support_refs != expected_evidence_refs
+                or projected_opposing_refs
+                or not isinstance(projection_defect_state, Mapping)
+                or str(projection_defect_state.get("fingerprint") or "")
+                != str(completed.get("defect_fingerprint") or "")
+            )
+        )
+        if (
+            tuple(assessment.get("causal_path_refs") or ())
+            != canonical_path
+            or (outer_path and outer_path != canonical_path)
+            or (
+                "checked_evidence_refs" in value
+                and outer_evidence_refs != expected_evidence_refs
+            )
+            or (
+                "requested_by_ref" in value
+                and (
+                    not expected_requested_by_ref
+                    or str(value.get("requested_by_ref") or "")
+                    != expected_requested_by_ref
+                )
+            )
+            or projection_is_inconsistent
+        ):
+            raise ValueError(
+                "{0} contradicts canonical Global factor request "
+                "facts".format(label)
+            )
+
     def enqueue_confirmation(self, value: Mapping[str, Any]) -> bool:
         self.validate_confirmation_queue_bound()
+        origin = canonical_confirmation_origin(
+            value.get("origin")
+            or "recursive_introduction_candidate"
+        )
+        value = {
+            **dict(value),
+            "review_scope": str(value.get("review_scope") or "root"),
+            "origin": origin,
+        }
         candidate_ref = str(value.get("candidate_ref") or "")
+        review_scope = str(value.get("review_scope") or "root")
+        is_escalation = is_factor_role_escalation_origin(origin)
         resolved = self.graph.resolve(candidate_ref)
         node = self.graph.nodes.get(resolved or "")
+        candidate_eligible = (
+            non_root_factor_candidate_eligible(
+                self.graph, candidate_ref
+            )
+            if review_scope == "non_root" or is_escalation
+            else authored_root_candidate_eligible(
+                self.graph, candidate_ref
+            )
+        )
         if candidate_ref and (
             resolved != candidate_ref
             or node is None
-            or not authored_root_candidate_eligible(self.graph, candidate_ref)
+            or not candidate_eligible
         ):
             return False
         actual_keys = {str(key) for key in value}
@@ -4963,6 +9435,13 @@ class RecursiveAnalysisState:
                     sorted(extra),
                 )
             )
+        if review_scope not in CONFIRMATION_REVIEW_SCOPES:
+            raise ValueError("confirmation queue review_scope is unsupported")
+        if review_scope == "non_root":
+            self._validate_factor_assessment_origin(
+                value,
+                label="non-root confirmation queue",
+            )
         hypothesis_id = str(value.get("hypothesis_id") or "")
         defect_fingerprint = str(value.get("defect_fingerprint") or "")
         seed_binding_identity = str(value.get("seed_binding_identity") or "")
@@ -4973,7 +9452,7 @@ class RecursiveAnalysisState:
         if (
             resolved != candidate_ref
             or node is None
-            or not authored_root_candidate_eligible(self.graph, candidate_ref)
+            or not candidate_eligible
         ):
             return False
         try:
@@ -5014,15 +9493,50 @@ class RecursiveAnalysisState:
             raise ValueError(
                 "confirmation queue contains a duplicate semantic identity"
             )
-        same_seed_candidates = {
+        same_seed_candidate_entries = [
+            item
+            for item in self.confirmation_queue
+            if str(item.get("seed_binding_identity") or "")
+            == seed_binding_identity
+            and str(item.get("candidate_ref") or "") == candidate_ref
+        ]
+        if same_seed_candidate_entries:
+            if (
+                not is_escalation
+                or len(same_seed_candidate_entries) != 1
+                or str(
+                    same_seed_candidate_entries[0].get(
+                        "review_scope"
+                    )
+                    or "root"
+                )
+                != "non_root"
+                or same_seed_candidate_entries[0].get("status")
+                not in {"completed", "failed"}
+                or not isinstance(
+                    same_seed_candidate_entries[0].get(
+                        "factor_role_judgment"
+                    ),
+                    Mapping,
+                )
+            ):
+                return False
+        same_scope_candidates = {
             str(item.get("candidate_ref") or "")
             for item in self.confirmation_queue
             if str(item.get("seed_binding_identity") or "")
             == seed_binding_identity
+            and str(item.get("review_scope") or "root") == review_scope
+            and not is_factor_role_escalation_origin(
+                item.get("origin")
+            )
         }
-        if candidate_ref in same_seed_candidates:
-            return False
-        if len(same_seed_candidates) >= MAX_ROOT_CONFIRMATION_CANDIDATES:
+        scope_limit = (
+            MAX_ROOT_CONFIRMATION_CANDIDATES
+            if review_scope == "root"
+            else MAX_NON_ROOT_CONFIRMATION_CANDIDATES
+        )
+        if not is_escalation and len(same_scope_candidates) >= scope_limit:
             return False
         queued = copy.deepcopy(dict(value))
         queued["artifact_evidence_envelopes"] = (
@@ -5036,11 +9550,20 @@ class RecursiveAnalysisState:
             for item in self.confirmation_queue:
                 if item.get("status") != "queued":
                     continue
-                request = AgenticRecursiveAnalyzer._build_confirmation_request(
-                    self, item
-                )
-                projection = root_confirmation_request_projection(request)
-                expected_identity = _confirmation_request_identity(request)
+                if str(item.get("review_scope") or "root") == "non_root":
+                    request = (
+                        AgenticRecursiveAnalyzer._build_factor_role_request(
+                            self, item
+                        )
+                    )
+                    projection = factor_role_request_projection(request)
+                    expected_identity = factor_role_request_identity(request)
+                else:
+                    request = AgenticRecursiveAnalyzer._build_persisted_confirmation_request(
+                        self, item
+                    )
+                    projection = root_confirmation_request_projection(request)
+                    expected_identity = _confirmation_request_identity(request)
                 if item is queued and provided_identity and (
                     provided_identity != expected_identity
                 ):
@@ -5065,23 +9588,71 @@ class RecursiveAnalysisState:
         for item in self.confirmation_queue:
             if item.get("status") != "queued":
                 continue
-            request = AgenticRecursiveAnalyzer._build_confirmation_request(
-                self, item
-            )
-            item["factual_request_projection"] = (
-                root_confirmation_request_projection(request)
-            )
-            item["semantic_identity"] = _confirmation_request_identity(request)
+            if str(item.get("review_scope") or "root") == "non_root":
+                path = tuple(
+                    str(ref) for ref in item.get("recursive_path") or ()
+                )
+                path_is_grounded = len(path) >= 2 and all(
+                    self.graph.edge_endpoints_eligible(upstream, downstream)
+                    and has_confirmation_causal_hop(
+                        self.graph.edge_context(upstream, downstream),
+                        default_eligible=True,
+                    )
+                    for upstream, downstream in zip(path, path[1:])
+                )
+                if not path_is_grounded:
+                    projection = copy.deepcopy(
+                        validate_factor_role_request_projection(
+                            item.get("factual_request_projection")
+                        )
+                    )
+                    projection["facts"]["recursive_path"] = list(path)
+                    projection = validate_factor_role_request_projection(
+                        projection
+                    )
+                    item["factual_request_projection"] = projection
+                    item["semantic_identity"] = (
+                        factor_role_request_projection_identity(projection)
+                    )
+                    continue
+                request = AgenticRecursiveAnalyzer._build_factor_role_request(
+                    self, item
+                )
+                item["factual_request_projection"] = (
+                    factor_role_request_projection(request)
+                )
+                item["semantic_identity"] = factor_role_request_identity(
+                    request
+                )
+            else:
+                request = AgenticRecursiveAnalyzer._build_persisted_confirmation_request(
+                    self, item
+                )
+                item["factual_request_projection"] = (
+                    root_confirmation_request_projection(request)
+                )
+                item["semantic_identity"] = _confirmation_request_identity(
+                    request
+                )
 
     def validate_confirmation_queue_bound(self) -> None:
         candidates_by_seed: Dict[str, Set[str]] = {}
-        canonical_keys: List[Tuple[str, str, str, str]] = []
+        candidates_by_seed_scope: Dict[Tuple[str, str], Set[str]] = {}
+        candidate_lifecycles: Dict[
+            Tuple[str, str], Set[str]
+        ] = {}
+        canonical_keys: List[Tuple[str, ...]] = []
         semantic_identities: Set[str] = set()
         for item in self.confirmation_queue:
             seed_binding_identity = str(
                 item.get("seed_binding_identity") or ""
             )
             candidate_ref = str(item.get("candidate_ref") or "")
+            review_scope = str(item.get("review_scope") or "root")
+            if review_scope not in CONFIRMATION_REVIEW_SCOPES:
+                raise ValueError(
+                    "restored confirmation queue review_scope is unsupported"
+                )
             owner = LocalStateOwner.from_dict(item.get("owner"))
             if not seed_binding_identity or not candidate_ref:
                 raise ValueError("restored confirmation queue identity is incomplete")
@@ -5092,19 +9663,33 @@ class RecursiveAnalysisState:
             ):
                 raise ValueError("restored confirmation queue owner is inconsistent")
             candidate = self.graph.nodes.get(candidate_ref)
-            if (
-                candidate is None
-                or not authored_root_candidate_eligible(
+            declared_escalation = is_factor_role_escalation_origin(
+                item.get("origin")
+            )
+            declared_candidate_eligible = (
+                non_root_factor_candidate_eligible(
                     self.graph, candidate_ref
                 )
-            ):
+                if review_scope == "non_root" or declared_escalation
+                else authored_root_candidate_eligible(
+                    self.graph, candidate_ref
+                )
+            )
+            if candidate is None or not declared_candidate_eligible:
                 raise ValueError(
-                    "restored confirmation queue contains a root candidate ineligible for the active revision"
+                    "restored confirmation queue contains a candidate "
+                    "ineligible for its review scope or active revision"
                 )
             is_pending = item.get("status") == "queued"
             terminal_confirmation = None
+            terminal_factor_judgment = None
             if is_pending:
                 _validate_pending_confirmation_identity(item)
+                terminal_disposition = None
+            elif review_scope == "non_root":
+                terminal_factor_judgment = (
+                    _validate_terminal_factor_role_identity(item)
+                )
                 terminal_disposition = None
             else:
                 _validate_terminal_confirmation_identity(item)
@@ -5131,6 +9716,23 @@ class RecursiveAnalysisState:
                             else ""
                         ),
                     )
+                )
+            origin = canonical_confirmation_origin(item.get("origin"))
+            is_escalation = is_factor_role_escalation_origin(origin)
+            candidate = self.graph.nodes.get(candidate_ref)
+            candidate_eligible = (
+                non_root_factor_candidate_eligible(
+                    self.graph, candidate_ref
+                )
+                if review_scope == "non_root" or is_escalation
+                else authored_root_candidate_eligible(
+                    self.graph, candidate_ref
+                )
+            )
+            if candidate is None or not candidate_eligible:
+                raise ValueError(
+                    "restored confirmation queue contains a candidate "
+                    "ineligible for its review scope or active revision"
                 )
             recursive_path = tuple(
                 str(ref) for ref in item.get("recursive_path") or ()
@@ -5174,15 +9776,16 @@ class RecursiveAnalysisState:
                     "confirmation queue projection binding has no canonical "
                     "defect state"
                 )
-            _validate_confirmation_request_projection_binding(
-                item,
-                defect_state=defect_state,
-                analysis_perspective=self.analysis_perspective,
-                ledger=self.ledger,
-                frontier=self.frontier,
-                confirmation=terminal_confirmation,
-                label="confirmation queue",
-            )
+            if review_scope == "root":
+                _validate_confirmation_request_projection_binding(
+                    item,
+                    defect_state=defect_state,
+                    analysis_perspective=self.analysis_perspective,
+                    ledger=self.ledger,
+                    frontier=self.frontier,
+                    confirmation=terminal_confirmation,
+                    label="confirmation queue",
+                )
             if not rejected_snapshot:
                 expected_artifacts = self._confirmation_artifact_envelopes(
                     item
@@ -5200,7 +9803,57 @@ class RecursiveAnalysisState:
                     "confirmation queue factual request projection is missing"
                 )
             semantic_identity = str(item.get("semantic_identity") or "")
-            if rejected_snapshot:
+            if review_scope == "non_root":
+                validate_factor_role_request_projection(stored_projection)
+                self._validate_factor_assessment_origin(
+                    item,
+                    label="factor role queue",
+                )
+                current_factor_request = (
+                    AgenticRecursiveAnalyzer._build_factor_role_request(
+                        self, item
+                    )
+                )
+                expected_projection = factor_role_request_projection(
+                    current_factor_request
+                )
+                if stable_json(
+                    _checkpoint_json(stored_projection)
+                ) != stable_json(_checkpoint_json(expected_projection)):
+                    raise ValueError(
+                        "factor role queue factual request projection changed"
+                    )
+                expected_semantic_identity = factor_role_request_identity(
+                    current_factor_request
+                )
+                if semantic_identity != expected_semantic_identity:
+                    raise ValueError(
+                        "factor role queue contains a non-canonical semantic "
+                        "identity"
+                    )
+                if (
+                    str(item.get("candidate_ref") or "")
+                    != current_factor_request.candidate_ref
+                    or str(item.get("hypothesis_id") or "")
+                    != current_factor_request.hypothesis_id
+                    or str(item.get("hypothesis_semantic_hash") or "")
+                    != current_factor_request.hypothesis_semantic_hash
+                    or str(item.get("defect_fingerprint") or "")
+                    != current_factor_request.defect_state.fingerprint
+                    or str(item.get("seed_binding_identity") or "")
+                    != current_factor_request.seed_binding_identity
+                    or str(item.get("analysis_perspective") or "")
+                    != current_factor_request.analysis_perspective
+                ):
+                    raise ValueError(
+                        "factor role queue outer facts contradict request projection"
+                    )
+                if terminal_factor_judgment is not None:
+                    _validate_factor_role_judgment_binding(
+                        terminal_factor_judgment,
+                        request=current_factor_request,
+                    )
+            elif rejected_snapshot:
                 expected_semantic_identity = (
                     root_confirmation_request_projection_identity(
                         stored_projection
@@ -5215,10 +9868,8 @@ class RecursiveAnalysisState:
                 validate_root_confirmation_request_projection(
                     stored_projection
                 )
-                current_request = (
-                    AgenticRecursiveAnalyzer._build_confirmation_request(
-                        self, item
-                    )
+                current_request = AgenticRecursiveAnalyzer._build_persisted_confirmation_request(
+                    self, item
                 )
                 expected_projection = root_confirmation_request_projection(
                     current_request
@@ -5247,6 +9898,51 @@ class RecursiveAnalysisState:
                             "confirmation queue response does not exactly "
                             "rebind to its current factual request"
                         )
+            if is_escalation:
+                canonical_origin = (
+                    canonical_factor_role_escalation_origin(origin)
+                )
+                matching_factor_actions = [
+                    action
+                    for action in self.factor_role_action_projection
+                    if str(action.get("semantic_key") or "")
+                    == canonical_origin["factor_action_identity"]
+                ]
+                if len(matching_factor_actions) != 1:
+                    raise ValueError(
+                        "factor role escalation queue has no exact source "
+                        "action"
+                    )
+                matching_root_actions = [
+                    action
+                    for action in self.confirmation_action_projection
+                    if str(action.get("request_identity") or "")
+                    == semantic_identity
+                    and is_factor_role_escalation_origin(
+                        action.get("origin")
+                    )
+                ]
+                if is_pending:
+                    if matching_root_actions:
+                        raise ValueError(
+                            "pending factor role escalation already has a "
+                            "terminal root action"
+                        )
+                    canonical_factor_role_escalation_binding(
+                        factor_action_projection=matching_factor_actions[0],
+                        root_queue_entry=item,
+                    )
+                else:
+                    if len(matching_root_actions) != 1:
+                        raise ValueError(
+                            "terminal factor role escalation must bind one "
+                            "root action"
+                        )
+                    canonical_factor_role_escalation_binding(
+                        factor_action_projection=matching_factor_actions[0],
+                        root_queue_entry=item,
+                        root_action_projection=matching_root_actions[0],
+                    )
             if not semantic_identity or semantic_identity in semantic_identities:
                 raise ValueError(
                     "confirmation queue contains a missing, duplicate, or "
@@ -5254,16 +9950,57 @@ class RecursiveAnalysisState:
                 )
             semantic_identities.add(semantic_identity)
             canonical_keys.append(self._confirmation_queue_key(item))
-            candidates = candidates_by_seed.setdefault(seed_binding_identity, set())
-            if candidate_ref in candidates:
+            lifecycle_key = (seed_binding_identity, candidate_ref)
+            lifecycle_kind = (
+                "factor_role_escalation"
+                if is_escalation
+                else review_scope
+            )
+            lifecycles = candidate_lifecycles.setdefault(
+                lifecycle_key, set()
+            )
+            if lifecycle_kind in lifecycles:
                 raise ValueError(
-                    "confirmation queue contains a duplicate candidate for "
-                    "one seed"
+                    "confirmation queue contains a duplicate candidate "
+                    "lifecycle for one seed"
                 )
-            candidates.add(candidate_ref)
-            if len(candidates) > MAX_ROOT_CONFIRMATION_CANDIDATES:
+            lifecycles.add(lifecycle_kind)
+            if len(lifecycles) > 1 and lifecycles != {
+                "non_root",
+                "factor_role_escalation",
+            }:
                 raise ValueError(
-                    "restored confirmation queue exceeds three candidates per seed"
+                    "confirmation queue candidate lifecycles are not an "
+                    "exact factor source and escalation pair"
+                )
+            candidates = candidates_by_seed.setdefault(
+                seed_binding_identity, set()
+            )
+            if not is_escalation:
+                candidates.add(candidate_ref)
+            scoped_candidates = candidates_by_seed_scope.setdefault(
+                (seed_binding_identity, review_scope),
+                set(),
+            )
+            if not is_escalation:
+                scoped_candidates.add(candidate_ref)
+            scope_limit = (
+                MAX_ROOT_CONFIRMATION_CANDIDATES
+                if review_scope == "root"
+                else MAX_NON_ROOT_CONFIRMATION_CANDIDATES
+            )
+            if len(scoped_candidates) > scope_limit:
+                raise ValueError(
+                    "restored confirmation queue exceeds the per-scope "
+                    "candidate limit"
+                )
+            if len(candidates) > (
+                MAX_ROOT_CONFIRMATION_CANDIDATES
+                + MAX_NON_ROOT_CONFIRMATION_CANDIDATES
+            ):
+                raise ValueError(
+                    "restored confirmation queue exceeds the total candidate "
+                    "limit per seed"
                 )
         if (
             len(canonical_keys) != len(set(canonical_keys))
@@ -5539,8 +10276,21 @@ class RecursiveAnalysisState:
         self,
         action_records: Optional[Iterable[Any]] = None,
     ) -> None:
+        if action_records is not None:
+            action_records = tuple(action_records)
+        _validate_global_pagination_journal(
+            self.investigation_journal,
+            action_records=action_records,
+        )
         lifecycle_records = (
-            _validated_global_judge_action_history(tuple(action_records))
+            _validated_global_judge_action_history(action_records)
+            if action_records is not None
+            else {}
+        )
+        page_lifecycle_records = (
+            _validated_global_judge_page_action_history(
+                action_records
+            )
             if action_records is not None
             else {}
         )
@@ -5606,6 +10356,9 @@ class RecursiveAnalysisState:
                         "seed global judgment payload contradicts pass action"
                     )
                 capsules = action.get("candidate_evidence_capsules")
+                context_capsules = action.get(
+                    "evidence_context_capsules"
+                )
                 compression = action.get("candidate_compression")
                 raw_expansion_history = action.get(
                     "evidence_expansion_history"
@@ -5613,6 +10366,9 @@ class RecursiveAnalysisState:
                 envelope = judgment.get("validation_envelope")
                 if (
                     not isinstance(capsules, (list, tuple))
+                    or not isinstance(
+                        context_capsules, (list, tuple)
+                    )
                     or not isinstance(compression, Mapping)
                     or not isinstance(raw_expansion_history, (list, tuple))
                     or not isinstance(envelope, Mapping)
@@ -5635,7 +10391,10 @@ class RecursiveAnalysisState:
                     "trace_health": {
                         "missing_artifact_count": sum(
                             len(capsule.get("missing_evidence_refs") or ())
-                            for capsule in capsules
+                            for capsule in (
+                                *capsules,
+                                *context_capsules,
+                            )
                             if isinstance(capsule, Mapping)
                         ),
                         "candidate_compression": copy.deepcopy(
@@ -5648,8 +10407,14 @@ class RecursiveAnalysisState:
                         if isinstance(item, Mapping)
                         and item.get("status") == "expanded"
                     ],
+                    "restoration_obligations": copy.deepcopy(
+                        list(action.get("restoration_obligations") or ())
+                    ),
                     "candidate_evidence_capsules": copy.deepcopy(
                         list(capsules)
+                    ),
+                    "evidence_context_capsules": copy.deepcopy(
+                        list(context_capsules)
                     ),
                 }
                 if stable_json(_checkpoint_json(envelope)) != stable_json(
@@ -5816,6 +10581,15 @@ class RecursiveAnalysisState:
                     applied.get("candidate_evidence_capsules"),
                 ):
                     completed_mismatches.append("candidate_evidence_capsules")
+                if not same_checkpoint_value(
+                    terminal.get("validation_envelope", {}).get(
+                        "evidence_context_capsules"
+                    ),
+                    applied.get("evidence_context_capsules"),
+                ):
+                    completed_mismatches.append(
+                        "evidence_context_capsules"
+                    )
                 if completed_mismatches:
                     raise ValueError(
                         "completed global Judge action contradicts applied "
@@ -5848,8 +10622,117 @@ class RecursiveAnalysisState:
                 raise ValueError(
                     "failed global Judge action contradicts applied failure"
                 )
+        page_terminal_lifecycles_by_pass: Dict[
+            str, List[JsonDict]
+        ] = {}
+        for records in page_lifecycle_records.values():
+            for index in range(1, len(records), 2):
+                terminal_record = records[index]
+                terminal = terminal_record["payload"]
+                _validate_provider_state(
+                    terminal.get("provider_state"),
+                    self,
+                    cache_identity=str(
+                        terminal.get("provider_state", {}).get(
+                            "cache_identity"
+                        )
+                        or ""
+                    ),
+                    require_accounting_match=False,
+                )
+                page_terminal_lifecycles_by_pass.setdefault(
+                    str(terminal.get("pass_identity") or ""),
+                    [],
+                ).append(terminal_record)
+        mixed_pass_identities = set(
+            terminal_lifecycle_by_pass
+        ).intersection(page_terminal_lifecycles_by_pass)
+        if mixed_pass_identities:
+            raise ValueError(
+                "global Judge pass mixes legacy and page lifecycles"
+            )
         if action_records is not None:
             for pass_identity, applied in passes_by_owner.items():
+                compression = applied.get("candidate_compression")
+                pagination = (
+                    compression.get("candidate_pagination")
+                    if isinstance(compression, Mapping)
+                    and isinstance(
+                        compression.get("candidate_pagination"),
+                        Mapping,
+                    )
+                    else None
+                )
+                if pagination is not None:
+                    page_terminals = (
+                        page_terminal_lifecycles_by_pass.get(
+                            pass_identity
+                        )
+                        or []
+                    )
+                    if not page_terminals:
+                        raise ValueError(
+                            "paginated global pass has no page lifecycle"
+                        )
+                    latest_page_terminals = {
+                        str(record["payload"].get("page_identity") or ""): record
+                        for record in page_terminals
+                    }
+                    if sum(
+                        int(
+                            record["payload"].get(
+                                "physical_request_delta"
+                            )
+                            or 0
+                        )
+                        for record in page_terminals
+                    ) != int(
+                        applied.get("physical_request_delta") or 0
+                    ):
+                        raise ValueError(
+                            "paginated global pass physical accounting "
+                            "does not equal its page terminals"
+                        )
+                    final_page_identity = str(
+                        pagination.get("final_page_identity") or ""
+                    )
+                    if final_page_identity:
+                        matching_final = [
+                            record
+                            for record in latest_page_terminals.values()
+                            if record["payload"].get("page_identity")
+                            == final_page_identity
+                        ]
+                        if (
+                            len(matching_final) != 1
+                            or matching_final[0]["operation"]
+                            != "global_judge_page_completed"
+                            or not same_checkpoint_value(
+                                matching_final[0]["payload"].get(
+                                    "judgment"
+                                ),
+                                applied.get("judgment"),
+                            )
+                        ):
+                            raise ValueError(
+                                "paginated global pass final judgment has "
+                                "no exact final page lifecycle"
+                            )
+                    elif (
+                        applied.get("status") != "completed"
+                        or applied.get("judgment", {}).get("outcome")
+                        != "no_defect"
+                        or any(
+                            record["operation"]
+                            != "global_judge_page_completed"
+                            for record in latest_page_terminals.values()
+                        )
+                    ):
+                        raise ValueError(
+                            "aggregate paginated pass without a final page "
+                            "must be a complete no-defect union"
+                        )
+                    continue
                 requires_lifecycle = (
                     applied.get("status") == "completed"
                     or applied.get("blocker")
@@ -5887,6 +10770,8 @@ class RecursiveAnalysisState:
             "defect_fingerprint",
             "seed_binding_identity",
             "seed_key",
+            "review_scope",
+            "origin",
             "owner",
             "recursive_path",
             "status",
@@ -5908,6 +10793,8 @@ class RecursiveAnalysisState:
                 ),
                 owner=entry.get("owner"),
                 seed_key=str(entry.get("seed_key") or ""),
+                review_scope=str(entry.get("review_scope") or ""),
+                origin=entry.get("origin"),
                 confirmation=parsed,
                 physical_requests_reserved=entry.get(
                     "physical_requests_reserved"
@@ -6053,6 +10940,149 @@ class RecursiveAnalysisState:
                 action_projection,
                 label="completed confirmation actions",
             )
+
+        for entry in self.confirmation_queue:
+            if (
+                isinstance(entry, Mapping)
+                and str(entry.get("review_scope") or "root") == "non_root"
+            ):
+                self._validate_factor_assessment_origin(
+                    entry,
+                    label="factor role queue",
+                )
+
+        factor_journal_projections = []
+        for entry in self.factor_role_journal:
+            journal = _validated_factor_role_journal_entry(entry)
+            projection = {
+                key: copy.deepcopy(journal[key])
+                for key in FACTOR_ROLE_TERMINAL_PROJECTION_KEYS
+            }
+            self._validate_factor_assessment_origin(
+                projection,
+                label="factor role journal",
+            )
+            factor_journal_projections.append(projection)
+        _require_canonical_bijection(
+            (item.to_dict() for item in self.factor_role_judgments),
+            (
+                item["judgment"]
+                for item in factor_journal_projections
+            ),
+            label="factor role journal judgments",
+        )
+        _require_canonical_bijection(
+            factor_journal_projections,
+            (
+                _validated_factor_role_terminal_projection(item)
+                for item in self.factor_role_action_projection
+            ),
+            label="factor role journal action projections",
+        )
+        factor_queue_projections = []
+        for entry in self.confirmation_queue:
+            if (
+                not isinstance(entry, Mapping)
+                or str(entry.get("review_scope") or "root") != "non_root"
+                or entry.get("status") == "queued"
+            ):
+                continue
+            judgment = _validate_terminal_factor_role_identity(entry)
+            matching = [
+                projection
+                for projection in factor_journal_projections
+                if projection["request_identity"]
+                == str(entry.get("semantic_identity") or "")
+            ]
+            if len(matching) != 1:
+                raise ValueError(
+                    "terminal factor role queue contradicts action journal"
+                )
+            canonical_terminal_factor_role_queue_binding(
+                queue_entry=entry,
+                action_projection=matching[0],
+                judgment=judgment,
+            )
+            factor_queue_projections.append(matching[0])
+        _require_canonical_bijection(
+            factor_journal_projections,
+            factor_queue_projections,
+            label="factor role queue actions",
+        )
+        if action_records is not None:
+            started_factor_actions: Dict[str, JsonDict] = {}
+            terminal_factor_actions = []
+            for item in action_records:
+                parsed_action = _validated_factor_role_action_record(item)
+                if parsed_action is None:
+                    continue
+                operation, parsed_projection = parsed_action
+                semantic_key = str(item.get("semantic_key") or "")
+                builder = self.seed_ledger.get(
+                    parsed_projection["seed_binding_identity"]
+                )
+                if (
+                    builder is not None
+                    and "start_ref_active_revision_ineligible"
+                    in builder.blocking_reasons
+                ):
+                    continue
+                if operation == "factor_role_started":
+                    if semantic_key in started_factor_actions:
+                        raise ValueError(
+                            "factor role lifecycle has duplicate started actions"
+                        )
+                    started = parsed_projection
+                    self._validate_factor_assessment_origin(
+                        started,
+                        label="factor role started action",
+                    )
+                    started_factor_actions[semantic_key] = started
+                elif operation in FACTOR_ROLE_ACTION_OPERATIONS:
+                    projection = parsed_projection
+                    self._validate_factor_assessment_origin(
+                        projection,
+                        label="factor role terminal action",
+                    )
+                    started = started_factor_actions.get(semantic_key)
+                    terminal_base = {
+                        key: projection[key]
+                        for key in FACTOR_ROLE_ACTION_BASE_KEYS
+                    }
+                    if started != terminal_base:
+                        raise ValueError(
+                            "factor role terminal action has no matching start"
+                        )
+                    terminal_factor_actions.append(projection)
+            _require_canonical_bijection(
+                factor_journal_projections,
+                terminal_factor_actions,
+                label="completed factor role actions",
+            )
+        expected_factor_gaps = []
+        for projection in factor_journal_projections:
+            judgment = FactorRoleJudgment.from_dict(
+                dict(projection["judgment"])
+            )
+            if (
+                judgment.factor_role != "unknown"
+                or judgment.necessity_status != "unknown"
+            ):
+                continue
+            expected_factor_gaps.append(
+                canonical_factor_role_gap(
+                    judgment=judgment,
+                    action_projection=projection,
+                )
+            )
+        _require_canonical_bijection(
+            expected_factor_gaps,
+            (
+                _validated_factor_role_gap(item)
+                for item in self.factor_role_gaps
+            ),
+            label="factor role gaps",
+        )
         for builder in self.seed_ledger.values():
             if expected_candidate_refs[builder.key] != builder.candidate_refs:
                 raise ValueError(
@@ -6646,6 +11676,14 @@ class RecursiveAnalysisState:
             LocalStateOwner.from_dict(item.get("owner"))
         for item in self.confirmation_journal:
             LocalStateOwner.from_dict(item.get("owner"))
+        for item in self.factor_role_journal:
+            _validated_factor_role_journal_entry(item)
+        for item in self.factor_role_action_projection:
+            _validated_factor_role_terminal_projection(item)
+        for item in self.factor_role_judgments:
+            _validated_factor_role_judgment(item.to_dict())
+        for item in self.factor_role_gaps:
+            _validated_factor_role_gap(item)
         for item in self.investigation_journal:
             if (
                 isinstance(item, Mapping)
@@ -6653,18 +11691,66 @@ class RecursiveAnalysisState:
                 and item.get("seed_ref")
             ):
                 LocalStateOwner.from_dict(item.get("owner"))
+            if (
+                isinstance(item, Mapping)
+                and item.get("kind")
+                == "candidate_cluster_manifest_shadow"
+            ):
+                seed_binding_identity = str(
+                    item.get("seed_binding_identity") or ""
+                )
+                builder = self.seed_ledger.get(
+                    seed_binding_identity
+                )
+                if builder is None:
+                    raise ValueError(
+                        "candidate cluster shadow event has no seed"
+                    )
+                manifest = validate_candidate_cluster_shadow_event(
+                    item,
+                    graph=self.graph,
+                    expected_seed_binding_identity=(
+                        seed_binding_identity
+                    ),
+                )
+                if (
+                    manifest.seed_ref != builder.start_ref
+                    or manifest.defect_fingerprint
+                    != builder.defect_state.fingerprint
+                ):
+                    raise ValueError(
+                        "candidate cluster shadow event contradicts seed"
+                    )
+            if (
+                isinstance(item, Mapping)
+                and item.get("kind")
+                == "candidate_cluster_manifest_rejection"
+            ):
+                _validate_candidate_cluster_manifest_rejection_event(item)
         return {
             "schema": ACTION_STATE_SCHEMA,
             "start_refs": list(self.start_refs),
             "objective": self.objective,
             "analysis_perspective": self.analysis_perspective,
-            "causal_candidates": [item.to_dict() for item in self.causal_candidates],
+            "causal_candidates": [
+                item.to_dict()
+                for item in _canonicalize_candidate_publications(
+                    self.graph,
+                    self.causal_candidates,
+                )
+            ],
             "causal_relations": [item.to_dict() for item in self.causal_relations],
             "step_judgments": [item.to_dict() for item in self.step_judgments],
             "step_action_projection": _checkpoint_json(
                 self.step_action_projection
             ),
-            "introduction_candidates": [item.to_dict() for item in self.introduction_candidates],
+            "introduction_candidates": [
+                item.to_dict()
+                for item in _canonicalize_candidate_publications(
+                    self.graph,
+                    self.introduction_candidates,
+                )
+            ],
             "introduction_bindings": _checkpoint_json(self.introduction_bindings),
             "contributing_conditions": [item.to_dict() for item in self.contributing_conditions],
             "rejected_candidates": [item.to_dict() for item in self.rejected_candidates],
@@ -6694,6 +11780,9 @@ class RecursiveAnalysisState:
             "control_directive_ids": sorted(self.control_directive_ids),
             "confirmation_queue": _checkpoint_json(self.confirmation_queue),
             "confirmation_queue_keys": [list(item) for item in sorted(self.confirmation_queue_keys)],
+            "factor_confirmation_enqueue_gaps": _checkpoint_json(
+                self.factor_confirmation_enqueue_gaps
+            ),
             "confirmations": [item.to_dict() for item in self.confirmations],
             "confirmed_roots": [item.to_dict() for item in self.confirmed_roots],
             "co_roots": [item.to_dict() for item in self.co_roots],
@@ -6702,6 +11791,16 @@ class RecursiveAnalysisState:
             "confirmation_action_projection": _checkpoint_json(
                 self.confirmation_action_projection
             ),
+            "factor_role_judgments": [
+                item.to_dict() for item in self.factor_role_judgments
+            ],
+            "factor_role_journal": _checkpoint_json(
+                self.factor_role_journal
+            ),
+            "factor_role_action_projection": _checkpoint_json(
+                self.factor_role_action_projection
+            ),
+            "factor_role_gaps": _checkpoint_json(self.factor_role_gaps),
             "logical_confirmation_calls": self.logical_confirmation_calls,
             "pending_rejudge_journal": _checkpoint_json(self.pending_rejudge_journal),
             "seed_count": self.seed_count,
@@ -6748,7 +11847,10 @@ class RecursiveAnalysisState:
             raise ValueError(
                 "checkpoint recursive state members do not share one committed transaction"
             )
-        action_payload = dict(action_record["payload"])
+        action_payload = _canonicalize_checkpoint_candidate_payloads(
+            graph,
+            action_record["payload"],
+        )
         _require_exact_checkpoint_keys(
             frontier_payload,
             {"schema", "frontier", "visit_evidence"},
@@ -6784,6 +11886,9 @@ class RecursiveAnalysisState:
                 if "cache_identity" in checkpoint.config
                 else None
             ),
+        )
+        _validated_global_judge_page_action_history(
+            checkpoint.actions
         )
         checkpoint_seed_authority = _seed_authority_from_records(
             action_payload["seed_ledger"]
@@ -6860,6 +11965,31 @@ class RecursiveAnalysisState:
             for hypothesis_id, hypothesis in restored_hypotheses.items()
             if hypothesis_id not in stale_hypothesis_ids
         }
+        active_owned_candidate_refs.update(
+            str(capsule.get("candidate_ref") or "")
+            for seed in action_payload["seed_ledger"]
+            if isinstance(seed, Mapping)
+            and str(seed.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+            for capsule in (
+                (
+                    *(
+                    seed.get("global_judgment", {})
+                    .get("validation_envelope", {})
+                    .get("candidate_evidence_capsules", ())
+                    ),
+                    *(
+                    seed.get("global_judgment", {})
+                    .get("validation_envelope", {})
+                    .get("evidence_context_capsules", ())
+                    ),
+                )
+                if isinstance(seed.get("global_judgment"), Mapping)
+                else ()
+            )
+            if isinstance(capsule, Mapping)
+            and str(capsule.get("candidate_ref") or "")
+        )
         stale_only_candidate_refs = (
             stale_owned_candidate_refs - active_owned_candidate_refs
         )
@@ -6961,7 +12091,7 @@ class RecursiveAnalysisState:
                 CausalCandidate.from_dict(item)
                 for item in action_payload["introduction_candidates"]
             )
-            if authored_root_candidate_eligible(graph, candidate.ref)
+            if non_root_factor_candidate_eligible(graph, candidate.ref)
             and candidate.ref not in stale_only_candidate_refs
         ]
         state.introduction_bindings = [
@@ -7146,7 +12276,15 @@ class RecursiveAnalysisState:
             for item in action_payload["confirmation_queue_keys"]
             if len(item) >= 4 and str(item[3]) not in stale_seed_keys
         }
-        state.validate_confirmation_queue_bound()
+        state.factor_confirmation_enqueue_gaps = [
+            copy.deepcopy(item)
+            for item in action_payload[
+                "factor_confirmation_enqueue_gaps"
+            ]
+            if isinstance(item, Mapping)
+            and str(item.get("seed_binding_identity") or "")
+            not in stale_seed_keys
+        ]
         state.confirmations = [
             confirmation
             for confirmation in (
@@ -7182,12 +12320,24 @@ class RecursiveAnalysisState:
             and str(factor.confirmation.get("hypothesis_id") or "")
             not in stale_hypothesis_ids
         ]
+        escalation_confirmation_identities = {
+            RootConfirmation.from_dict(
+                dict(item["confirmation"])
+            ).confirmation_identity
+            for item in state.confirmation_queue
+            if is_factor_role_escalation_origin(item.get("origin"))
+            and isinstance(item.get("confirmation"), Mapping)
+        }
         for confirmation in state.confirmations:
             node = graph.nodes.get(confirmation.candidate_ref)
             if (
                 node is None
-                or not authored_root_candidate_eligible(
-                    graph, confirmation.candidate_ref
+                or (
+                    not authored_root_candidate_eligible(
+                        graph, confirmation.candidate_ref
+                    )
+                    and confirmation.confirmation_identity
+                    not in escalation_confirmation_identities
                 )
             ):
                 raise ValueError(
@@ -7195,6 +12345,10 @@ class RecursiveAnalysisState:
                 )
         if any(
             not authored_root_candidate_eligible(graph, root.node_ref)
+            and str(
+                root.confirmation.get("confirmation_identity") or ""
+            )
+            not in escalation_confirmation_identities
             for root in (*state.confirmed_roots, *state.co_roots)
         ):
             raise ValueError(
@@ -7214,6 +12368,32 @@ class RecursiveAnalysisState:
             if projection["seed_binding_identity"] in stale_seed_keys:
                 continue
             state.confirmation_action_projection.append(projection)
+        state.factor_role_judgments = [
+            judgment
+            for judgment in (
+                _validated_factor_role_judgment(item)
+                for item in action_payload["factor_role_judgments"]
+            )
+            if judgment.seed_binding_identity not in stale_seed_keys
+        ]
+        state.factor_role_journal = []
+        for item in action_payload["factor_role_journal"]:
+            journal = _validated_factor_role_journal_entry(item)
+            if journal["seed_binding_identity"] in stale_seed_keys:
+                continue
+            state.factor_role_journal.append(journal)
+        state.factor_role_action_projection = []
+        for item in action_payload["factor_role_action_projection"]:
+            projection = _validated_factor_role_terminal_projection(item)
+            if projection["seed_binding_identity"] in stale_seed_keys:
+                continue
+            state.factor_role_action_projection.append(projection)
+        state.factor_role_gaps = []
+        for item in action_payload["factor_role_gaps"]:
+            gap = _validated_factor_role_gap(item)
+            if gap["seed_binding_identity"] in stale_seed_keys:
+                continue
+            state.factor_role_gaps.append(gap)
         state.pending_rejudge_journal = {
             frontier.migrated_visit_key(str(key)): [int(item) for item in values]
             for key, values in dict(action_payload["pending_rejudge_journal"]).items()
@@ -7226,6 +12406,11 @@ class RecursiveAnalysisState:
                 for item in action_payload["seed_ledger"]
             )
         }
+        _quarantine_stale_candidate_cluster_shadows(
+            state.investigation_journal,
+            graph=graph,
+            seed_builders=state.seed_ledger,
+        )
         for builder in state.seed_ledger.values():
             if builder.key not in stale_seed_keys:
                 continue
@@ -7246,10 +12431,38 @@ class RecursiveAnalysisState:
                 if confirmation.status == "confirmed"
                 and confirmation.seed_binding_identity == builder.key
             )
+        restored_non_blocking_confirmation_identities = {
+            RootConfirmation.from_dict(
+                dict(item["confirmation"])
+            ).confirmation_identity
+            for item in state.confirmation_queue
+            if (
+                str(item.get("review_scope") or "root") == "non_root"
+                or is_factor_role_escalation_origin(
+                    item.get("origin")
+                )
+            )
+            and isinstance(item.get("confirmation"), Mapping)
+            and str(item["confirmation"].get("status") or "")
+            == "unknown"
+        }
+        restored_non_blocking_confirmation_identities.update(
+            factor_escalation_outperformed_confirmation_identities(
+                confirmations=state.confirmations,
+                published_roots=(
+                    *state.confirmed_roots,
+                    *state.co_roots,
+                ),
+                confirmation_queue=state.confirmation_queue,
+            )
+        )
         validate_confirmation_ownership(
             state.confirmations,
             state.seed_results(),
             label="restored recursive state",
+            non_blocking_unresolved_confirmation_identities=(
+                restored_non_blocking_confirmation_identities
+            ),
         )
         for builder in state.seed_ledger.values():
             judgment = builder.global_judgment
@@ -7298,6 +12511,7 @@ class RecursiveAnalysisState:
             )
         if state.seed_count != len(state.seed_ledger):
             raise ValueError("checkpoint seed_count contradicts seed ledger")
+        state.validate_confirmation_queue_bound()
         state.provider_state = _validate_provider_state(
             action_payload["provider_state"],
             state,
@@ -7350,12 +12564,32 @@ class RecursiveAnalysisState:
                 evidence_hash="start_ref_active_revision_ineligible",
             )
             state.unresolved_hypothesis_ids.add(hypothesis_id)
+        _validate_shared_judge_action_accounting(
+            checkpoint.actions,
+            max_judge_requests=(
+                int(checkpoint_budgets["max_judge_requests"])
+                if isinstance(checkpoint_budgets, Mapping)
+                and "max_judge_requests" in checkpoint_budgets
+                else None
+            ),
+            cache_identity=str(checkpoint.config["cache_identity"]),
+        )
+        _validate_factor_role_action_lifecycles(
+            checkpoint.actions,
+            stale_seed_keys=stale_seed_keys,
+        )
         if frontier.has_legacy_visit_key_migrations():
-            state.replay_actions = _migrate_checkpoint_journal_records(
+            replay_actions = _migrate_checkpoint_journal_records(
                 checkpoint.actions, frontier
             )
         else:
-            state.replay_actions = copy.deepcopy(checkpoint.latest_actions)
+            replay_actions = copy.deepcopy(checkpoint.latest_actions)
+
+        state.replay_actions = {
+            semantic_key: value
+            for semantic_key, value in replay_actions.items()
+            if _factor_role_action_seed_key(value) not in stale_seed_keys
+        }
         _assert_canonical_published_roots(
             graph,
             confirmations=state.confirmations,
@@ -7364,16 +12598,65 @@ class RecursiveAnalysisState:
             co_roots=state.co_roots,
             analysis_perspective=state.analysis_perspective,
             label="restored recursive state",
+            confirmation_action_projections=(
+                state.confirmation_action_projection
+            ),
+            non_root_conflict_confirmation_identities=(
+                RootConfirmation.from_dict(
+                    dict(item["confirmation"])
+                ).confirmation_identity
+                for item in state.confirmation_queue
+                if str(item.get("review_scope") or "root") == "non_root"
+                and isinstance(item.get("confirmation"), Mapping)
+                and str(item["confirmation"].get("status") or "")
+                == "confirmed"
+                and str(
+                    item["confirmation"].get(
+                        "confirmation_identity"
+                    )
+                    or ""
+                )
+                not in {
+                    str(
+                        root.confirmation.get(
+                            "confirmation_identity"
+                        )
+                        or ""
+                    )
+                    for root in (
+                        *state.confirmed_roots,
+                        *state.co_roots,
+                    )
+                }
+            ),
+        )
+        restored_factor_publications = (
+            _canonical_factor_role_publication_sets(
+                state.factor_role_action_projection
+            )
         )
         _assert_published_non_root_factors(
             graph,
-            confirmations=state.confirmations,
             seed_results=state.seed_results(),
             defect_states=tuple(state.defect_states.values()),
-            contributing_conditions=state.contributing_conditions,
-            amplifying_factors=state.amplifying_factors,
-            rejected_candidates=state.rejected_candidates,
-            analysis_perspective=state.analysis_perspective,
+            contributing_conditions=restored_factor_publications[
+                "contributing_conditions"
+            ],
+            amplifying_factors=restored_factor_publications[
+                "amplifying_factors"
+            ],
+            downstream_materializations=restored_factor_publications[
+                "downstream_materializations"
+            ],
+            rejected_candidates=restored_factor_publications[
+                "rejected_candidates"
+            ],
+            factor_confirmation_gaps=restored_factor_publications[
+                "factor_confirmation_gaps"
+            ],
+            factor_role_action_projections=(
+                state.factor_role_action_projection
+            ),
             label="restored recursive state",
         )
         snapshot_transaction = int(
@@ -7985,6 +13268,11 @@ class RecursiveAnalysisState:
 
         successors: List[AttributionHypothesis] = []
         for candidate in selected:
+            self._remember_candidate(candidate)
+            commitment_cues = candidate_commitment_cue_context(
+                graph=self.graph,
+                current_ref=candidate.ref,
+            )
             if len(self.ledger.snapshot()) >= max_hypotheses:
                 self._increment_budget("hypotheses")
                 self._mark_ref_unresolved(
@@ -7995,22 +13283,26 @@ class RecursiveAnalysisState:
                 )
                 continue
             upstream_defect = item.defect_state.transformed(
-                label="navigation_candidate_semantic_cause",
+                label="candidate_local_process_defect",
                 expected=(
-                    "The recorded semantics at {0} are consistent with avoiding the downstream defect {1}."
+                    "The decision at {0} should use the known evidence and remaining repair window to "
+                    "advance, verify, or correctly reprioritize the required repair, without introducing "
+                    "a defective plan, action choice, false commitment, or responsible non-repair."
                 ).format(candidate.ref, item.defect_state.label),
                 actual=(
-                    "The recorded semantics at {0} are a high-relevance candidate that may contain an "
-                    "upstream assumption or action leading to {1}; defect presence remains unconfirmed."
+                    "The decision at {0} is a retrieval-only candidate that may contain a candidate-local "
+                    "process defect which transformed into the downstream defect {1}; presence remains "
+                    "unconfirmed until independent semantic judgment."
                 ).format(candidate.ref, item.defect_state.label),
                 mechanism=(
-                    "Offline semantic retrieval selected this concrete node for independent LLM defect "
-                    "judgment; ranking is navigation evidence, not a causal verdict."
+                    "Judge an erroneous plan, priority drift, action/commitment mismatch, or responsible "
+                    "non-repair at this node separately from the pre-existing downstream functional defect. "
+                    "Offline retrieval is navigation evidence only and is not a causal verdict."
                 ),
-                scope="navigation_candidate_validation",
+                scope="candidate_local_process_execution",
                 transformation_reason=(
-                    "The progress aggregate is offline routing state, so causal judgment moves to its "
-                    "highest-relevance concrete predecessor."
+                    "The progress aggregate is offline routing state, so the downstream failure is transformed "
+                    "into a candidate-local process-defect hypothesis for independent judgment."
                 ),
             )
             self._remember_defect(upstream_defect)
@@ -8037,7 +13329,12 @@ class RecursiveAnalysisState:
             hypothesis = self.ledger.add_support(
                 hypothesis.hypothesis_id,
                 candidate.ref,
-                "Selected as a bounded progress-navigation candidate; causality is unconfirmed.",
+                (
+                    "Selected as a bounded progress-navigation candidate with "
+                    "a recorded forward-action cue; causality is unconfirmed."
+                    if commitment_cues
+                    else "Selected as a bounded progress-navigation candidate; causality is unconfirmed."
+                ),
                 0.0,
             )
             evidence_refs = tuple(
@@ -8055,16 +13352,61 @@ class RecursiveAnalysisState:
                 evidence_refs=evidence_refs,
                 confidence=0.0,
             )
+            candidate_path = [candidate.ref, *item.downstream_path]
+            process_trajectory = candidate_process_trajectory_context(
+                graph=self.graph,
+                current_ref=candidate.ref,
+                path=candidate_path,
+            )
+            confirmation_path = candidate_path
+            if process_trajectory and item.downstream_path:
+                lifecycle_target = item.downstream_path[-1]
+                lifecycle_evidence_refs = tuple(
+                    dict.fromkeys(
+                        [
+                            candidate.ref,
+                            *(
+                                str(summary.get("episode_ref") or "")
+                                for summary in process_trajectory.get(
+                                    "episode_summaries"
+                                )
+                                or ()
+                                if isinstance(summary, Mapping)
+                                and str(summary.get("episode_ref") or "")
+                            ),
+                            lifecycle_target,
+                        ]
+                    )
+                )
+                self.graph.add_offline_process_lifecycle_edge(
+                    candidate.ref,
+                    lifecycle_target,
+                    evidence_refs=lifecycle_evidence_refs,
+                )
+                evidence_refs = tuple(
+                    dict.fromkeys(
+                        [*evidence_refs, *lifecycle_evidence_refs]
+                    )
+                )
+                confirmation_path = [candidate.ref, lifecycle_target]
             predecessor = FrontierItem.create(
                 node_ref=candidate.ref,
                 defect_state=upstream_defect,
-                downstream_path=[candidate.ref, *item.downstream_path],
+                downstream_path=confirmation_path,
                 hypothesis_id=hypothesis.hypothesis_id,
                 hypothesis_semantic_hash=hypothesis.semantic_hash,
                 seed_binding_identity=hypothesis.seed_binding_identity,
                 depth=item.depth + 1,
-                candidate_source="navigation_semantic_hypothesis",
-                priority=max(candidate.score, 0.0),
+                candidate_source=(
+                    "navigation_commitment_cue"
+                    if commitment_cues
+                    else "navigation_semantic_hypothesis"
+                ),
+                priority=(
+                    1.0
+                    if commitment_cues
+                    else min(max(candidate.score, 0.0), 0.99)
+                ),
                 checked_evidence_refs=list(evidence_refs),
                 graph_position=graph_position(candidate.ref),
             )
@@ -8121,7 +13463,9 @@ class RecursiveAnalysisState:
         )
         self.frontier.mark_completed(item, "unresolved:{0}".format(reason))
 
-    def build_report(self, *, judge: CausalJudge) -> RecursiveAttributionReport:
+    def build_report(
+        self, *, judge: CausalJudge, fusion_mode: str = "off"
+    ) -> RecursiveAttributionReport:
         self.finalize_pending_rejudges()
         self.validate_confirmation_queue_bound()
         self._validate_local_state_owners()
@@ -8159,11 +13503,18 @@ class RecursiveAnalysisState:
         unresolved_hypotheses = [by_id[item] for item in sorted(unresolved_ids) if item in by_id]
         candidate_seen: Set[Tuple[str, str, str]] = set()
         causal_candidates: List[CausalCandidate] = []
-        for candidate in self.causal_candidates:
+        for candidate in _canonicalize_candidate_publications(
+            self.graph,
+            self.causal_candidates,
+        ):
             key = _candidate_key(candidate)
             if key not in candidate_seen:
                 candidate_seen.add(key)
                 causal_candidates.append(candidate)
+        introduction_candidates = _canonicalize_candidate_publications(
+            self.graph,
+            self.introduction_candidates,
+        )
         merged = {
             key: tuple(sorted(refs))
             for key, refs in sorted(self.visit_evidence.items())
@@ -8184,6 +13535,125 @@ class RecursiveAnalysisState:
             *completed_global_passes,
             *failed_global_passes,
         ]
+        global_page_events = [
+            event
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_page"
+        ]
+        completed_page_events = [
+            event
+            for event in global_page_events
+            if event.get("status") == "completed"
+            and isinstance(event.get("judgment"), Mapping)
+        ]
+        paged_seed_bindings = {
+            str(event.get("seed_binding_identity") or "")
+            for event in completed_page_events
+        }
+        terminal_pass_seed_bindings = {
+            str(event.get("seed_binding_identity") or "")
+            for event in global_passes
+        }
+        retained_page_judgments = [
+            _owned_payload(event["judgment"], event["owner"])
+            for event in completed_page_events
+            if isinstance(event.get("owner"), Mapping)
+        ]
+        retained_pass_judgments = [
+            _owned_payload(event["judgment"], event["owner"])
+            for event in completed_global_passes
+            if isinstance(event.get("judgment"), Mapping)
+            and str(event.get("seed_binding_identity") or "")
+            not in paged_seed_bindings
+        ]
+        active_plan_by_seed = {
+            str(event.get("seed_binding_identity") or ""): str(
+                event.get("active_plan_identity") or ""
+            )
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_convergence"
+            and event.get("status")
+            in {"page_failure", "final_page_failure", "interrupted"}
+        }
+        unresolved_page_refs = []
+        completed_page_ids = {
+            str(event.get("page_identity") or "")
+            for event in completed_page_events
+        }
+        for event in self.investigation_journal:
+            if not isinstance(event, Mapping) or event.get("kind") != "global_candidate_page_plan":
+                continue
+            if active_plan_by_seed.get(
+                str(event.get("seed_binding_identity") or "")
+            ) != str(event.get("plan_identity") or ""):
+                continue
+            plan = event.get("plan")
+            for page in plan.get("pages", ()) if isinstance(plan, Mapping) else ():
+                page_identity = str(page.get("identity") or "") if isinstance(page, Mapping) else ""
+                if page_identity and page_identity not in completed_page_ids:
+                    unresolved_page_refs.append(page_identity)
+        unresolved_page_refs = list(dict.fromkeys(unresolved_page_refs))
+        global_mode_exercised = bool(global_passes) or any(
+            isinstance(item, Mapping)
+            and item.get("kind") == "global_candidate_gate"
+            for item in self.investigation_journal
+        ) or bool(completed_page_events) or bool(unresolved_page_refs)
+        factor_publications = _canonical_factor_role_publication_sets(
+            self.factor_role_action_projection
+        )
+        factor_confirmation_gaps = factor_publications[
+            "factor_confirmation_gaps"
+        ]
+        factor_actions_by_identity = {
+            str(item.get("semantic_key") or ""): item
+            for item in self.factor_role_action_projection
+        }
+        factor_role_escalation_gaps: List[JsonDict] = []
+        for root_action in self.confirmation_action_projection:
+            if not is_factor_role_escalation_origin(
+                root_action.get("origin")
+            ):
+                continue
+            origin = canonical_factor_role_escalation_origin(
+                root_action["origin"]
+            )
+            factor_action = factor_actions_by_identity.get(
+                origin["factor_action_identity"]
+            )
+            matching_queue = [
+                item
+                for item in self.confirmation_queue
+                if str(item.get("semantic_identity") or "")
+                == str(root_action.get("request_identity") or "")
+                and item.get("origin") == origin
+            ]
+            if factor_action is None or len(matching_queue) != 1:
+                raise ValueError(
+                    "factor role escalation report projection has no exact "
+                    "source action or root queue"
+                )
+            confirmation = RootConfirmation.from_dict(
+                dict(root_action["confirmation"])
+            )
+            if confirmation.status in {"rejected", "unknown"}:
+                factor_role_escalation_gaps.append(
+                    canonical_factor_role_escalation_gap(
+                        factor_action_projection=factor_action,
+                        root_queue_entry=matching_queue[0],
+                        root_action_projection=root_action,
+                    )
+                )
+        factor_confirmation_conflicts: List[JsonDict] = []
+        confirmation_scope_counts = {
+            scope: sum(
+                1
+                for queued in self.confirmation_queue
+                if str(queued.get("review_scope") or "root") == scope
+            )
+            for scope in ("root", "non_root")
+        }
         expansion_reasons = []
         for item in completed_global_passes:
             judgment = item.get("judgment")
@@ -8197,10 +13667,180 @@ class RecursiveAnalysisState:
                             "owner": copy.deepcopy(item.get("owner")),
                         }
                     )
+        obligation_gaps_by_identity = {
+            gap.identity: gap
+            for candidate in causal_candidates
+            for gap in obligation_gaps_for_candidate(candidate)
+        }
+        triage_page_events = [
+            event
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "candidate_cluster_triage_page"
+        ]
+        triage_expansion_events = [
+            event
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "candidate_cluster_expansion"
+        ]
+        triage_expansion_seed_bindings = {
+            str(event.get("seed_binding_identity") or "")
+            for event in triage_expansion_events
+        }
+        orphan_triage_projections: List[Mapping[str, Any]] = []
+        orphan_projection_seeds: Set[str] = set()
+        triage_projection_sources = (
+            *global_passes,
+            *global_page_events,
+            *(
+                event
+                for event in self.investigation_journal
+                if isinstance(event, Mapping)
+                and event.get("kind") == "global_candidate_page_plan"
+                and event.get("page_phase") == "initial"
+            ),
+        )
+        for event in triage_projection_sources:
+            seed_binding_identity = str(
+                event.get("seed_binding_identity") or ""
+            )
+            compression = event.get("candidate_compression")
+            projection = (
+                compression.get("candidate_cluster_triage")
+                if isinstance(compression, Mapping)
+                else None
+            )
+            if (
+                seed_binding_identity
+                and seed_binding_identity
+                not in triage_expansion_seed_bindings
+                and seed_binding_identity not in orphan_projection_seeds
+                and isinstance(projection, Mapping)
+            ):
+                orphan_projection_seeds.add(seed_binding_identity)
+                orphan_triage_projections.append(projection)
+        directory_physical_request_count = sum(
+            int(event.get("physical_request_delta") or 0)
+            for event in triage_page_events
+        )
+        triaged_seed_bindings = {
+            str(event.get("seed_binding_identity") or "")
+            for event in triage_expansion_events
+        }
+        initial_plan_seed_bindings = {
+            str(event.get("seed_binding_identity") or "")
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_page_plan"
+            and event.get("page_phase") == "initial"
+        }
+        direct_triaged_strict_passes = [
+            event
+            for event in global_passes
+            if str(event.get("seed_binding_identity") or "")
+            in triaged_seed_bindings
+            and str(event.get("seed_binding_identity") or "")
+            not in initial_plan_seed_bindings
+        ]
+        strict_initial_logical_page_count = sum(
+            len(event.get("plan", {}).get("pages") or ())
+            for event in self.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_page_plan"
+            and event.get("page_phase") == "initial"
+        ) + len(direct_triaged_strict_passes)
+        strict_physical_request_count = sum(
+            int(event.get("physical_request_delta") or 0)
+            for event in global_page_events
+        ) + sum(
+            int(event.get("physical_request_delta") or 0)
+            for event in direct_triaged_strict_passes
+        )
+        triage_fallback_reasons = tuple(
+            dict.fromkeys(
+                str(value.get("fallback_reason") or "")
+                for value in (
+                    *triage_expansion_events,
+                    *orphan_triage_projections,
+                )
+                if str(value.get("fallback_reason") or "")
+            )
+        )
+        coverage_proof_identities = tuple(
+            dict.fromkeys(
+                str(event.get("coverage_proof_identity") or "")
+                for event in triage_expansion_events
+                if str(event.get("coverage_proof_identity") or "")
+            )
+        )
+        candidate_cluster_triage_metrics = {
+            "offered_original_candidate_count": sum(
+                int(
+                    event.get("offered_original_candidate_count") or 0
+                )
+                for event in triage_expansion_events
+            ) + sum(
+                int(
+                    projection.get("offered_original_candidate_count")
+                    or 0
+                )
+                for projection in orphan_triage_projections
+            ),
+            "cluster_count": sum(
+                int(event.get("cluster_count") or 0)
+                for event in triage_expansion_events
+            ) + sum(
+                int(projection.get("cluster_count") or 0)
+                for projection in orphan_triage_projections
+            ),
+            "directory_logical_page_count": sum(
+                int(event.get("directory_logical_page_count") or 0)
+                for event in triage_expansion_events
+            ) + sum(
+                int(
+                    projection.get("directory_logical_page_count") or 0
+                )
+                for projection in orphan_triage_projections
+            ),
+            "directory_physical_request_count": (
+                directory_physical_request_count
+            ),
+            "expanded_original_candidate_count": sum(
+                int(
+                    event.get("expanded_original_candidate_count") or 0
+                )
+                for event in triage_expansion_events
+            ) + sum(
+                int(
+                    projection.get("expanded_original_candidate_count")
+                    or 0
+                )
+                for projection in orphan_triage_projections
+            ),
+            "strict_initial_logical_page_count": (
+                strict_initial_logical_page_count
+            ),
+            "strict_physical_request_count": strict_physical_request_count,
+            "total_physical_request_count": (
+                directory_physical_request_count
+                + strict_physical_request_count
+            ),
+            "fallback_reason": (
+                triage_fallback_reasons[0]
+                if len(triage_fallback_reasons) == 1
+                else "|".join(triage_fallback_reasons)
+            ),
+            "coverage_proof_identity": (
+                coverage_proof_identities[0]
+                if len(coverage_proof_identities) == 1
+                else "|".join(coverage_proof_identities)
+            ),
+        }
         metadata = {
             "analysis": (
                 "retrieval_global_recursive_fusion"
-                if global_passes
+                if global_mode_exercised
                 else "agentic_recursive_semantic_taint"
             ),
             "behavior_impact": "none_offline_analysis_only",
@@ -8229,25 +13869,42 @@ class RecursiveAnalysisState:
                 list(item)
                 for item in sorted(self.confirmation_queue_keys)
             ],
+            "confirmation_scope_counts": confirmation_scope_counts,
             "confirmation_journal": list(self.confirmation_journal),
             "confirmation_action_projection": copy.deepcopy(
                 self.confirmation_action_projection
+            ),
+            "factor_role_judgments": [
+                item.to_dict() for item in self.factor_role_judgments
+            ],
+            "factor_role_journal": copy.deepcopy(
+                self.factor_role_journal
+            ),
+            "factor_role_action_projections": copy.deepcopy(
+                self.factor_role_action_projection
+            ),
+            "factor_role_gaps": copy.deepcopy(self.factor_role_gaps),
+            "factor_role_escalation_gaps": copy.deepcopy(
+                factor_role_escalation_gaps
+            ),
+            "factor_confirmation_gaps": factor_confirmation_gaps,
+            "factor_confirmation_conflicts": (
+                factor_confirmation_conflicts
+            ),
+            "factor_confirmation_enqueue_gaps": copy.deepcopy(
+                self.factor_confirmation_enqueue_gaps
             ),
             "step_action_projection": copy.deepcopy(
                 self.step_action_projection
             ),
             "logical_confirmation_call_count": self.logical_confirmation_calls,
-            "fusion_mode": "retrieval-global" if global_passes else "off",
+            "fusion_mode": fusion_mode,
             "global_candidate_pass_count": len(
                 completed_global_passes
             ) + len(failed_global_passes),
             "global_candidate_judgments": [
-                {
-                    **copy.deepcopy(item.get("judgment")),
-                    "owner": copy.deepcopy(item.get("owner")),
-                }
-                for item in completed_global_passes
-                if isinstance(item.get("judgment"), Mapping)
+                *retained_page_judgments,
+                *retained_pass_judgments,
             ],
             "candidate_compression": [
                 {
@@ -8257,18 +13914,30 @@ class RecursiveAnalysisState:
                 for item in completed_global_passes
                 if isinstance(item.get("candidate_compression"), Mapping)
             ],
+            "obligation_gap_candidate_audit": obligation_gap_candidate_audit(
+                tuple(obligation_gaps_by_identity.values())
+            ),
             "recursive_expansion_reasons": expansion_reasons,
             "global_candidate_failures": [
                 _global_failure_projection_from_action(item)
                 for item in failed_global_passes
             ],
+            "unresolved_page_refs": unresolved_page_refs,
+            "candidate_cluster_triage_metrics": (
+                candidate_cluster_triage_metrics
+            ),
             "global_judge_physical_request_count": sum(
                 int(item.get("physical_request_delta") or 0)
                 for item in (
                     *completed_global_passes,
                     *failed_global_passes,
                 )
-            ),
+            ) + sum(
+                int(event.get("physical_request_delta") or 0)
+                for event in global_page_events
+                if str(event.get("seed_binding_identity") or "")
+                not in terminal_pass_seed_bindings
+            ) + directory_physical_request_count,
         }
         return RecursiveAttributionReport(
             case_id=self.graph.case_id,
@@ -8281,13 +13950,22 @@ class RecursiveAnalysisState:
             causal_relations=tuple(self.causal_relations),
             step_judgments=tuple(self.step_judgments),
             hypotheses=tuple(hypotheses),
-            introduction_candidates=tuple(self.introduction_candidates),
+            introduction_candidates=introduction_candidates,
             confirmations=tuple(self.confirmations),
             confirmed_roots=tuple(self.confirmed_roots),
             co_roots=tuple(self.co_roots),
-            contributing_conditions=tuple(self.contributing_conditions),
-            amplifying_factors=tuple(self.amplifying_factors),
-            rejected_candidates=tuple(self.rejected_candidates),
+            contributing_conditions=factor_publications[
+                "contributing_conditions"
+            ],
+            amplifying_factors=factor_publications[
+                "amplifying_factors"
+            ],
+            downstream_materializations=factor_publications[
+                "downstream_materializations"
+            ],
+            rejected_candidates=factor_publications[
+                "rejected_candidates"
+            ],
             unresolved_hypotheses=tuple(unresolved_hypotheses),
             taint_paths=tuple(dict.fromkeys(self.taint_paths)),
             visited_order=_dedupe_strings(self.visited_order),
@@ -8431,12 +14109,78 @@ class GlobalEvidenceExpansionLoopResult:
     expansion_history: Tuple[EvidenceExpansionResult, ...]
     blocker: str = ""
     blocker_detail: str = ""
+    judge_diagnostic_calls: Tuple[JsonDict, ...] = ()
+
+
+@dataclass(frozen=True)
+class GlobalJudgePageExecutionResult:
+    status: str
+    request: GlobalCandidateJudgeRequest
+    physical_requests: int
+    physical_request_exact: bool
+    judgment: Optional[GlobalCandidateJudgment] = None
+    expansion_history: Tuple[EvidenceExpansionResult, ...] = ()
+    blocker: str = ""
+    blocker_detail: str = ""
+    judge_diagnostics: Mapping[str, Any] = field(
+        default_factory=_global_judge_call_diagnostics
+    )
+
+    def __post_init__(self) -> None:
+        if self.status not in {"completed", "failed"}:
+            raise ValueError("unsupported global Judge page status")
+        if (
+            type(self.physical_requests) is not int
+            or self.physical_requests < 0
+            or type(self.physical_request_exact) is not bool
+        ):
+            raise ValueError(
+                "global Judge page result accounting is invalid"
+            )
+        if self.status == "completed":
+            if (
+                not isinstance(self.judgment, GlobalCandidateJudgment)
+                or self.physical_request_exact is not True
+                or (
+                    self.judgment.outcome == "needs_expansion"
+                    and (not self.blocker or not self.blocker_detail)
+                )
+                or (
+                    self.judgment.outcome != "needs_expansion"
+                    and (self.blocker or self.blocker_detail)
+                )
+            ):
+                raise ValueError(
+                    "completed global Judge page result is invalid"
+                )
+        elif (
+            self.judgment is not None
+            or not self.blocker
+            or not self.blocker_detail
+        ):
+            raise ValueError("failed global Judge page result is invalid")
+        object.__setattr__(
+            self,
+            "judge_diagnostics",
+            _validate_global_judge_call_diagnostics(
+                self.judge_diagnostics
+            ),
+        )
 
 
 class GlobalJudgeLoopValidationError(ValueError):
-    def __init__(self, message: str, *, physical_requests: int):
+    def __init__(
+        self,
+        message: str,
+        *,
+        physical_requests: int,
+        diagnostics: Optional[Mapping[str, Any]] = None,
+    ):
         super().__init__(message)
         self.physical_requests = physical_requests
+        self.diagnostics = _validate_global_judge_call_diagnostics(
+            diagnostics or _global_judge_call_diagnostics()
+        )
 
 
 class AgenticRecursiveAnalyzer:
@@ -8457,6 +14201,19 @@ class AgenticRecursiveAnalyzer:
         stop_requested: Optional[Callable[[], bool]] = None,
         fusion_mode: str = "off",
     ) -> None:
+        if fusion_mode not in {"off", "retrieval-global"}:
+            raise ValueError("unsupported fusion_mode: {0}".format(fusion_mode))
+        if checkpoint_config is not None:
+            runtime_identity = checkpoint_config.get("runtime_identity")
+            checkpoint_fusion_mode = (
+                runtime_identity.get("fusion_mode")
+                if isinstance(runtime_identity, Mapping)
+                else None
+            )
+            if checkpoint_fusion_mode != fusion_mode:
+                raise CheckpointCompatibilityError(
+                    "analyzer fusion_mode contradicts checkpoint runtime identity"
+                )
         self.judge = judge
         self.retriever = retriever or SemanticPredecessorRetriever()
         self.tools = tools
@@ -8466,8 +14223,6 @@ class AgenticRecursiveAnalyzer:
         self.max_investigation_rounds = max(0, int(max_investigation_rounds))
         self.max_artifact_bytes = max(0, int(max_artifact_bytes))
         self.max_judge_requests = max(0, int(max_judge_requests))
-        if fusion_mode not in {"off", "retrieval-global"}:
-            raise ValueError("unsupported fusion_mode: {0}".format(fusion_mode))
         self.fusion_mode = fusion_mode
         if checkpoint is not None and checkpoint_config is None:
             raise ValueError("checkpoint_config is required with checkpoint")
@@ -8532,6 +14287,8 @@ class AgenticRecursiveAnalyzer:
                 or queued.get("seed_binding_identity")
                 or ""
             ),
+            review_scope=str(queued.get("review_scope") or ""),
+            origin=queued.get("origin"),
             confirmation=confirmation,
             physical_requests_reserved=physical_requests_reserved,
             physical_request_delta=physical_request_delta,
@@ -8562,6 +14319,579 @@ class AgenticRecursiveAnalyzer:
         self._checkpoint_action(operation, semantic_key, payload)
         self._record_confirmation(state, queued, confirmation, projection)
 
+    def _persist_factor_role_action(
+        self,
+        state: RecursiveAnalysisState,
+        queued: JsonDict,
+        judgment: FactorRoleJudgment,
+        *,
+        operation: str,
+        physical_requests_reserved: int,
+        physical_request_delta: int,
+        physical_request_exact: bool,
+        failure_classification: str,
+        provider_state: Mapping[str, Any],
+    ) -> None:
+        request_identity = str(queued.get("semantic_identity") or "")
+        semantic_key = "factor_role:{0}".format(request_identity)
+        defect_state = state.defect_states.get(
+            str(queued.get("defect_fingerprint") or "")
+        )
+        candidate_node = state.graph.nodes.get(
+            str(queued.get("candidate_ref") or "")
+        )
+        if defect_state is None or candidate_node is None:
+            raise ValueError(
+                "factor role action has no internal active failure owner"
+            )
+        active_role_binding = self._active_failure_role_binding_for_request(
+            state,
+            queued=queued,
+            defect_state=defect_state,
+            candidate_node=candidate_node,
+            seed_builder=state.seed_ledger.get(
+                str(
+                    queued.get("seed_key")
+                    or queued.get("seed_binding_identity")
+                    or ""
+                )
+            ),
+            factor_judgment=judgment,
+        )
+        projection = _factor_role_terminal_projection(
+            operation=operation,
+            semantic_key=semantic_key,
+            owner=queued.get("owner"),
+            origin=queued.get("origin"),
+            request_projection=queued.get("factual_request_projection"),
+            request_identity=request_identity,
+            physical_requests_reserved=physical_requests_reserved,
+            physical_request_delta=physical_request_delta,
+            physical_request_exact=physical_request_exact,
+            judgment=judgment,
+            failure_classification=failure_classification,
+            active_role_binding=(
+                active_role_binding.to_dict()
+                if active_role_binding is not None
+                else None
+            ),
+            queue_binding={
+                "seed_key": queued.get("seed_key"),
+                "requested_by_ref": queued.get("requested_by_ref"),
+                "recursive_path": copy.deepcopy(
+                    queued.get("recursive_path")
+                ),
+                "checked_evidence_refs": copy.deepcopy(
+                    queued.get("checked_evidence_refs")
+                ),
+                "task_obligations": copy.deepcopy(
+                    queued.get("task_obligations")
+                ),
+                "artifact_evidence_envelopes": copy.deepcopy(
+                    queued.get("artifact_evidence_envelopes")
+                ),
+            },
+        )
+        payload = {
+            "status": (
+                "completed"
+                if operation == "factor_role_completed"
+                else "failed"
+            ),
+            "physical_requests_reserved": physical_requests_reserved,
+            "physical_request_delta": physical_request_delta,
+            "physical_request_exact": physical_request_exact,
+            "judgment": judgment.to_dict(),
+            "action_projection": projection,
+            "provider_state": copy.deepcopy(dict(provider_state)),
+        }
+        self._checkpoint_action(operation, semantic_key, payload)
+        self._record_factor_role_judgment(
+            state,
+            queued,
+            judgment,
+            projection,
+        )
+
+    def _record_factor_role_judgment(
+        self,
+        state: RecursiveAnalysisState,
+        queued: JsonDict,
+        judgment: FactorRoleJudgment,
+        projection: Mapping[str, Any],
+    ) -> None:
+        canonical_projection = _validated_factor_role_terminal_projection(
+            projection
+        )
+        request = _factor_role_request_from_projection(
+            canonical_projection["request_projection"]
+        )
+        canonical_judgment = _validate_factor_role_judgment_binding(
+            judgment,
+            request=request,
+        )
+        if (
+            str(queued.get("review_scope") or "") != "non_root"
+            or str(queued.get("semantic_identity") or "")
+            != canonical_projection["request_identity"]
+            or queued.get("factual_request_projection")
+            != canonical_projection["request_projection"]
+            or queued.get("owner") != canonical_projection["owner"]
+            or queued.get("origin") != canonical_projection["origin"]
+        ):
+            raise ValueError(
+                "factor role queue contradicts terminal action projection"
+            )
+        queue_status = (
+            "completed"
+            if canonical_projection["operation"] == "factor_role_completed"
+            else "failed"
+        )
+        queued["status"] = queue_status
+        queued["factor_role_judgment"] = canonical_judgment.to_dict()
+        queued["response_identity"] = canonical_judgment.judgment_identity
+        queued["failure_classification"] = canonical_projection[
+            "failure_classification"
+        ]
+        canonical_terminal_factor_role_queue_binding(
+            queue_entry=queued,
+            action_projection=canonical_projection,
+            judgment=canonical_judgment,
+        )
+        state.factor_role_judgments.append(canonical_judgment)
+        state.factor_role_action_projection.append(canonical_projection)
+        state.factor_role_journal.append(
+            {
+                **copy.deepcopy(canonical_projection),
+                "status": queue_status,
+            }
+        )
+        if canonical_judgment.necessity_status == "unknown":
+            state.factor_role_gaps.append(
+                canonical_factor_role_gap(
+                    judgment=canonical_judgment,
+                    action_projection=canonical_projection,
+                )
+            )
+        if (
+            canonical_projection["operation"]
+            == "factor_role_completed"
+            and canonical_judgment.necessity_status == "necessary"
+            and canonical_judgment.factor_role == "unknown"
+        ):
+            self._enqueue_factor_role_escalation(
+                state,
+                source_queue=queued,
+                judgment=canonical_judgment,
+                action_projection=canonical_projection,
+            )
+
+    def _enqueue_factor_role_escalation(
+        self,
+        state: RecursiveAnalysisState,
+        *,
+        source_queue: Mapping[str, Any],
+        judgment: FactorRoleJudgment,
+        action_projection: Mapping[str, Any],
+    ) -> bool:
+        canonical_judgment = FactorRoleJudgment.from_dict(
+            judgment.to_dict()
+        )
+        canonical_action = _validated_factor_role_terminal_projection(
+            action_projection
+        )
+        if (
+            canonical_action["operation"] != "factor_role_completed"
+            or canonical_judgment.necessity_status != "necessary"
+            or canonical_judgment.factor_role != "unknown"
+            or canonical_action["judgment"]
+            != canonical_judgment.to_dict()
+            or str(source_queue.get("review_scope") or "")
+            != "non_root"
+            or str(source_queue.get("status") or "") != "completed"
+        ):
+            raise ValueError(
+                "factor role escalation requires one completed necessary "
+                "source action"
+            )
+        origin = {
+            "kind": "factor_role_escalation",
+            "factor_action_identity": canonical_action["semantic_key"],
+            "factor_judgment_identity": (
+                canonical_judgment.judgment_identity
+            ),
+            "factor_request_identity": (
+                canonical_judgment.request_identity
+            ),
+        }
+        canonical_origin = canonical_factor_role_escalation_origin(
+            origin
+        )
+        existing = [
+            item
+            for item in state.confirmation_queue
+            if is_factor_role_escalation_origin(item.get("origin"))
+            and canonical_factor_role_escalation_origin(
+                item["origin"]
+            )["factor_action_identity"]
+            == canonical_action["semantic_key"]
+        ]
+        if existing:
+            if len(existing) != 1:
+                raise ValueError(
+                    "factor role action has multiple root escalations"
+                )
+            matching_root_actions = [
+                action
+                for action in state.confirmation_action_projection
+                if str(action.get("request_identity") or "")
+                == str(existing[0].get("semantic_identity") or "")
+                and action.get("origin") == canonical_origin
+            ]
+            canonical_factor_role_escalation_binding(
+                factor_action_projection=canonical_action,
+                root_queue_entry=existing[0],
+                root_action_projection=(
+                    matching_root_actions[0]
+                    if len(matching_root_actions) == 1
+                    else None
+                ),
+            )
+            if len(matching_root_actions) > 1:
+                raise ValueError(
+                    "factor role action was consumed by multiple root "
+                    "actions"
+                )
+            return False
+
+        queued = {
+            "hypothesis_id": canonical_judgment.hypothesis_id,
+            "hypothesis_semantic_hash": (
+                canonical_judgment.hypothesis_semantic_hash
+            ),
+            "candidate_ref": canonical_judgment.candidate_ref,
+            "defect_fingerprint": (
+                canonical_judgment.defect_fingerprint
+            ),
+            "seed_binding_identity": (
+                canonical_judgment.seed_binding_identity
+            ),
+            "status": "queued",
+            "owner": copy.deepcopy(canonical_action["owner"]),
+            "analysis_perspective": (
+                canonical_judgment.analysis_perspective
+            ),
+            "review_scope": "root",
+            "origin": canonical_origin,
+            "seed_key": source_queue.get("seed_key"),
+            "requested_by_ref": source_queue.get("requested_by_ref"),
+            "recursive_path": copy.deepcopy(
+                source_queue.get("recursive_path")
+            ),
+            "checked_evidence_refs": copy.deepcopy(
+                source_queue.get("checked_evidence_refs")
+            ),
+            "task_obligations": copy.deepcopy(
+                source_queue.get("task_obligations")
+            ),
+        }
+        if not state.enqueue_confirmation(queued):
+            raise ValueError(
+                "completed necessary FactorRole action could not enqueue "
+                "its root escalation"
+            )
+        created = [
+            item
+            for item in state.confirmation_queue
+            if item.get("origin") == canonical_origin
+        ]
+        if len(created) != 1:
+            raise ValueError(
+                "factor role escalation queue creation is not one-to-one"
+            )
+        canonical_factor_role_escalation_binding(
+            factor_action_projection=canonical_action,
+            root_queue_entry=created[0],
+        )
+        return True
+
+    def _judge_queued_factor_role(
+        self,
+        state: RecursiveAnalysisState,
+        queued: JsonDict,
+    ) -> None:
+        state._validate_factor_assessment_origin(
+            queued,
+            label="factor role dispatch",
+        )
+        request = self._build_factor_role_request(state, queued)
+        self._validate_factor_role_request_graph_eligibility(
+            state,
+            request,
+        )
+        request_projection = factor_role_request_projection(request)
+        request_identity = factor_role_request_identity(request)
+        if (
+            queued.get("factual_request_projection") != request_projection
+            or str(queued.get("semantic_identity") or "")
+            != request_identity
+        ):
+            raise ValueError(
+                "queued factor role factual request identity changed"
+            )
+        semantic_key = "factor_role:{0}".format(request_identity)
+        replay_action = self._replay_action(state, semantic_key)
+        if replay_action is not None:
+            operation = str(replay_action.get("operation") or "")
+            if operation in FACTOR_ROLE_ACTION_OPERATIONS:
+                projection = _factor_role_projection_from_record(
+                    replay_action
+                )
+                if (
+                    projection["request_identity"] != request_identity
+                    or projection["request_projection"]
+                    != request_projection
+                ):
+                    raise ValueError(
+                        "factor role replay request does not match queued facts"
+                    )
+                payload = replay_action["payload"]
+                provider = (
+                    self._prevalidate_completed_replay_provider_state(
+                        state,
+                        payload,
+                        projection,
+                    )
+                )
+                if projection["physical_request_exact"]:
+                    state.judge_requests += (
+                        projection["physical_request_delta"]
+                        - projection["physical_requests_reserved"]
+                    )
+                else:
+                    state.judge_request_uncertainty_count += 1
+                self._apply_validated_provider_result_state(
+                    state,
+                    provider,
+                )
+                self._record_factor_role_judgment(
+                    state,
+                    queued,
+                    FactorRoleJudgment.from_dict(
+                        dict(projection["judgment"])
+                    ),
+                    projection,
+                )
+                return
+            if operation == "factor_role_started":
+                started = _factor_role_started_projection_from_record(
+                    replay_action
+                )
+                if (
+                    started["request_identity"] != request_identity
+                    or started["request_projection"] != request_projection
+                ):
+                    raise ValueError(
+                        "started factor role replay request does not match "
+                        "queued facts"
+                    )
+                state.judge_request_uncertainty_count += 1
+                judgment = _synthetic_unknown_factor_role(
+                    request,
+                    reason=(
+                        "factor_role_interrupted: the prior in-flight factor "
+                        "review is not repeated"
+                    ),
+                )
+                self._persist_factor_role_action(
+                    state,
+                    queued,
+                    judgment,
+                    operation="factor_role_failed",
+                    physical_requests_reserved=started[
+                        "physical_requests_reserved"
+                    ],
+                    physical_request_delta=0,
+                    physical_request_exact=False,
+                    failure_classification="interrupted",
+                    provider_state=self._capture_provider_result_state(
+                        state
+                    ),
+                )
+                return
+            raise ValueError("factor role replay action kind is unsupported")
+        bounded_judge = isinstance(self.judge, BoundedJudgeCapability)
+        offline_judge = isinstance(self.judge, OfflineJudgeCapability)
+        remaining = max(0, self.max_judge_requests - state.judge_requests)
+        reserved_requests = remaining if bounded_judge else 0
+        base = _factor_role_action_base(
+            owner=queued.get("owner"),
+            origin=queued.get("origin"),
+            request_projection=request_projection,
+            request_identity=request_identity,
+            physical_requests_reserved=reserved_requests,
+        )
+        state.logical_judge_calls += 1
+        state.judge_requests += reserved_requests
+        self._checkpoint_state(state, semantic_key)
+        self._checkpoint_action(
+            "factor_role_started",
+            semantic_key,
+            base,
+        )
+
+        def fail_accounting_breach(
+            reported_requests: int,
+            *,
+            cause: Optional[BaseException] = None,
+        ) -> None:
+            state.judge_requests += reported_requests - reserved_requests
+            judgment = _synthetic_unknown_factor_role(
+                request,
+                reason=(
+                    "factor_role_accounting_breach: bounded Judge reported "
+                    "{0} physical requests with allowance {1}"
+                ).format(reported_requests, remaining),
+            )
+            self._persist_factor_role_action(
+                state,
+                queued,
+                judgment,
+                operation="factor_role_failed",
+                physical_requests_reserved=reserved_requests,
+                physical_request_delta=reported_requests,
+                physical_request_exact=True,
+                failure_classification="accounting_breach",
+                provider_state=self._capture_provider_result_state(state),
+            )
+            error = FactorRoleAccountingError(
+                reported_requests=reported_requests,
+                allowed_requests=remaining,
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
+
+        physical_delta = 0
+        physical_exact = True
+        operation = "factor_role_completed"
+        failure_classification = "none"
+        judge_value_returned = False
+        try:
+            if bounded_judge:
+                result = self.judge.judge_factor_role_bounded(
+                    request,
+                    max_physical_requests=remaining,
+                )
+                if not isinstance(result, BoundedJudgeCallResult):
+                    raise TypeError(
+                        "bounded factor Judge must return BoundedJudgeCallResult"
+                )
+                physical_delta = result.physical_requests
+                if physical_delta > remaining:
+                    fail_accounting_breach(physical_delta)
+                raw = result.value
+                judge_value_returned = True
+            elif offline_judge:
+                raw = self.judge.judge_factor_role_offline(request)
+                judge_value_returned = True
+            else:
+                operation = "factor_role_failed"
+                failure_classification = "capability_error"
+                raw = _synthetic_unknown_factor_role(
+                    request,
+                    reason=(
+                        "factor_role_budget_unenforceable: Judge has no "
+                        "explicit bounded or offline capability"
+                    ),
+                )
+            if not isinstance(raw, FactorRoleJudgment):
+                raise TypeError(
+                    "factor Judge returned {0}, expected FactorRoleJudgment".format(
+                        type(raw).__name__
+                    )
+                )
+            judgment = _validate_factor_role_judgment_binding(
+                raw,
+                request=request,
+            )
+        except FactorRoleAccountingError:
+            raise
+        except BoundedJudgeCallError as exc:
+            if exc.physical_requests > reserved_requests:
+                fail_accounting_breach(
+                    exc.physical_requests,
+                    cause=exc,
+                )
+            physical_delta = exc.physical_requests
+            operation = "factor_role_failed"
+            failure_classification = "bounded_provider_failure"
+            judgment = _synthetic_unknown_factor_role(
+                request,
+                reason="factor_role_failed: {0}: {1}".format(
+                    type(exc).__name__,
+                    exc,
+                ),
+            )
+        except (JudgeProviderError, JudgeProviderUnavailable) as exc:
+            operation = "factor_role_failed"
+            failure_classification = "provider_failure"
+            if bounded_judge:
+                physical_delta = reserved_requests
+                physical_exact = False
+            judgment = _synthetic_unknown_factor_role(
+                request,
+                reason="factor_role_failed: {0}: {1}".format(
+                    type(exc).__name__,
+                    exc,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            operation = "factor_role_failed"
+            failure_classification = (
+                "judgment_invalid"
+                if judge_value_returned
+                else "provider_failure"
+            )
+            if bounded_judge and not judge_value_returned:
+                physical_delta = reserved_requests
+                physical_exact = False
+            judgment = _synthetic_unknown_factor_role(
+                request,
+                reason="factor_role_failed: {0}: {1}".format(
+                    type(exc).__name__,
+                    exc,
+                ),
+            )
+        except Exception as exc:
+            operation = "factor_role_failed"
+            failure_classification = "capability_error"
+            if bounded_judge:
+                physical_delta = reserved_requests
+                physical_exact = False
+            judgment = _synthetic_unknown_factor_role(
+                request,
+                reason="factor_role_capability_error: {0}: {1}".format(
+                    type(exc).__name__,
+                    exc,
+                ),
+            )
+        if physical_exact:
+            state.judge_requests += physical_delta - reserved_requests
+        else:
+            state.judge_request_uncertainty_count += 1
+        self._persist_factor_role_action(
+            state,
+            queued,
+            judgment,
+            operation=operation,
+            physical_requests_reserved=reserved_requests,
+            physical_request_delta=physical_delta,
+            physical_request_exact=physical_exact,
+            failure_classification=failure_classification,
+            provider_state=self._capture_provider_result_state(state),
+        )
+
     def _validate_terminal_confirmation_for_action(
         self,
         state: RecursiveAnalysisState,
@@ -8591,11 +14921,20 @@ class AgenticRecursiveAnalyzer:
             label=label,
         )
         node = state.graph.nodes.get(confirmation.candidate_ref)
-        if (
-            node is None
-            or not authored_root_candidate_eligible(
+        is_escalation = is_factor_role_escalation_origin(
+            queued.get("origin")
+        )
+        candidate_eligible = authored_root_candidate_eligible(
+            state.graph, confirmation.candidate_ref
+        ) or (
+            is_escalation
+            and non_root_factor_candidate_eligible(
                 state.graph, confirmation.candidate_ref
             )
+        )
+        if (
+            node is None
+            or not candidate_eligible
         ):
             raise ValueError(
                 "{0} candidate is ineligible for the active revision".format(
@@ -8630,9 +14969,11 @@ class AgenticRecursiveAnalyzer:
                 ],
                 label=label,
             )
-            current_request = self._build_confirmation_request(
-                state,
-                queued,
+            current_request = (
+                self._build_persisted_confirmation_request(state, queued)
+                if confirmation.status == "unknown"
+                and projection["operation"] == "confirmation_failed"
+                else self._build_confirmation_request(state, queued)
             )
             rebound_confirmation = bind_root_confirmation(
                 confirmation,
@@ -8680,13 +15021,34 @@ class AgenticRecursiveAnalyzer:
             cache_identity=str(self.checkpoint_config["cache_identity"]),
         )
         circuit = payload["circuit"]
-        target = _judge_transport(self.judge)
-        target.provider_circuit_open = bool(circuit["open"])
-        target.provider_circuit_reason = str(circuit["reason"])
-        target.consecutive_provider_errors = int(
-            circuit["consecutive_provider_errors"]
+        historical = (
+            _provider_failure_snapshot(circuit)
+            if _circuit_has_failure_history(circuit)
+            else copy.deepcopy(payload["previous_failure"])
         )
+        resumed_payload = copy.deepcopy(payload)
+        resumed_payload["previous_failure"] = historical
+        resumed_payload["circuit"] = _empty_provider_circuit(
+            int(circuit["provider_error_threshold"])
+        )
+        resumed_unsigned = {
+            key: resumed_payload[key]
+            for key in resumed_payload
+            if key != "identity"
+        }
+        resumed_payload["identity"] = hashlib.sha256(
+            stable_json(resumed_unsigned).encode("utf-8")
+        ).hexdigest()
+        state.provider_state = resumed_payload
+        target = _judge_transport(self.judge)
+        target.provider_circuit_open = False
+        target.provider_circuit_reason = ""
+        target.consecutive_provider_errors = 0
         target.provider_error_threshold = int(circuit["provider_error_threshold"])
+        target.provider_circuit_disposition = None
+        target.provider_circuit_first_request = 0
+        target.provider_circuit_first_failure_at = ""
+        target.provider_circuit_previous_failure = copy.deepcopy(historical)
 
     def _capture_provider_result_state(self, state: RecursiveAnalysisState) -> JsonDict:
         return _provider_state_payload(
@@ -8720,6 +15082,16 @@ class AgenticRecursiveAnalyzer:
             circuit["consecutive_provider_errors"]
         )
         target.provider_error_threshold = int(circuit["provider_error_threshold"])
+        target.provider_circuit_disposition = (
+            provider_failure_disposition_from_value(circuit["disposition"])
+        )
+        target.provider_circuit_first_request = int(circuit["first_request"])
+        target.provider_circuit_first_failure_at = str(
+            circuit["first_failure_at"]
+        )
+        target.provider_circuit_previous_failure = copy.deepcopy(
+            provider["previous_failure"]
+        )
 
     def _prevalidate_completed_replay_provider_state(
         self,
@@ -8801,6 +15173,7 @@ class AgenticRecursiveAnalyzer:
         }
         physical_requests = 0
         completed_expansion_rounds = 0
+        judge_diagnostic_calls: List[JsonDict] = []
 
         while True:
             remaining = max_physical_requests - physical_requests
@@ -8815,6 +15188,9 @@ class AgenticRecursiveAnalyzer:
                         "The Global Judge request budget was exhausted before "
                         "the expanded evidence could be re-evaluated."
                     ),
+                    judge_diagnostic_calls=tuple(
+                        judge_diagnostic_calls
+                    ),
                 )
             try:
                 result = self.judge.judge_candidates_bounded(
@@ -8822,22 +15198,65 @@ class AgenticRecursiveAnalyzer:
                     max_physical_requests=remaining,
                 )
             except BoundedJudgeCallError as exc:
+                error_diagnostics = (
+                    validate_global_judge_diagnostics(
+                        _checkpoint_json(exc.diagnostics)
+                    )
+                    if exc.diagnostics
+                    else global_judge_diagnostics()
+                )
+                failed_calls = [
+                    *judge_diagnostic_calls,
+                    {
+                        "request_identity": (
+                            _global_judge_request_identity(
+                                current_request
+                            )
+                        ),
+                        "diagnostics": error_diagnostics,
+                    },
+                ]
                 raise BoundedJudgeCallError(
                     str(exc),
                     physical_requests=physical_requests
                     + exc.physical_requests,
+                    diagnostics=_global_judge_call_diagnostics(
+                        failed_calls
+                    ),
                 ) from exc
             if not isinstance(result, BoundedJudgeCallResult):
                 raise GlobalJudgeLoopValidationError(
                     "global Judge must return BoundedJudgeCallResult",
                     physical_requests=physical_requests,
+                    diagnostics=_global_judge_call_diagnostics(
+                        judge_diagnostic_calls
+                    ),
                 )
             if result.physical_requests > remaining:
                 raise GlobalJudgeLoopValidationError(
                     "global Judge exceeded its physical request allowance",
                     physical_requests=physical_requests,
+                    diagnostics=_global_judge_call_diagnostics(
+                        judge_diagnostic_calls
+                    ),
                 )
             physical_requests += result.physical_requests
+            judge_diagnostic_calls.append(
+                {
+                    "request_identity": (
+                        _global_judge_request_identity(
+                            current_request
+                        )
+                    ),
+                    "diagnostics": (
+                        validate_global_judge_diagnostics(
+                            _checkpoint_json(result.diagnostics)
+                        )
+                        if result.diagnostics
+                        else global_judge_diagnostics()
+                    ),
+                }
+            )
             judgment = result.value
             try:
                 if not isinstance(judgment, GlobalCandidateJudgment):
@@ -8853,6 +15272,9 @@ class AgenticRecursiveAnalyzer:
                 raise GlobalJudgeLoopValidationError(
                     "{0}: {1}".format(type(exc).__name__, exc),
                     physical_requests=physical_requests,
+                    diagnostics=_global_judge_call_diagnostics(
+                        judge_diagnostic_calls
+                    ),
                 ) from exc
 
             if judgment.outcome != "needs_expansion":
@@ -8861,6 +15283,9 @@ class AgenticRecursiveAnalyzer:
                     judgment=judgment,
                     physical_requests=physical_requests,
                     expansion_history=tuple(expansion_history),
+                    judge_diagnostic_calls=tuple(
+                        judge_diagnostic_calls
+                    ),
                 )
             if (
                 completed_expansion_rounds
@@ -8876,6 +15301,9 @@ class AgenticRecursiveAnalyzer:
                         "The Global Judge still requested evidence after "
                         "{0} bounded expansion rounds."
                     ).format(GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS),
+                    judge_diagnostic_calls=tuple(
+                        judge_diagnostic_calls
+                    ),
                 )
 
             round_nodes = 0
@@ -8905,6 +15333,9 @@ class AgenticRecursiveAnalyzer:
                             requested.get("context_kind"),
                             GLOBAL_EVIDENCE_EXPANSION_MAX_NODES,
                             GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES,
+                        ),
+                        judge_diagnostic_calls=tuple(
+                            judge_diagnostic_calls
                         ),
                     )
                 expansion_request = EvidenceExpansionRequest(
@@ -8962,8 +15393,2347 @@ class AgenticRecursiveAnalyzer:
                         round_failed.request.context_kind,
                         round_failed.rejection_reason,
                     ),
+                    judge_diagnostic_calls=tuple(
+                        judge_diagnostic_calls
+                    ),
                 )
             completed_expansion_rounds += 1
+
+    def _execute_global_judge_page(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        graph: TraceGraph,
+        builder: SeedAttributionBuilder,
+        item: FrontierItem,
+        candidates: Sequence[CausalCandidate],
+        request: GlobalCandidateJudgeRequest,
+        candidate_compression: Mapping[str, Any],
+        plan: CandidatePagePlan,
+        page: CandidatePage,
+        page_phase: str,
+    ) -> GlobalJudgePageExecutionResult:
+        remaining = max(
+            0, self.max_judge_requests - state.judge_requests
+        )
+        reserved = min(
+            remaining,
+            GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+        )
+        if reserved == 0:
+            return self._record_global_judge_page_without_request(
+                state=state,
+                builder=builder,
+                item=item,
+                request=request,
+                candidate_compression=candidate_compression,
+                plan=plan,
+                page=page,
+                page_phase=page_phase,
+                physical_requests_reserved=0,
+                blocker="judge_request_budget_exhausted",
+                detail=(
+                    "The Global Judge physical request budget is exhausted "
+                    "before this candidate page can start."
+                ),
+            )
+        action_key = _global_judge_page_action_key(
+            _global_pass_identity(builder.key),
+            page.identity,
+        )
+        replay_action = self._replay_action(state, action_key)
+        if (
+            replay_action is not None
+            and replay_action.get("operation") == "global_judge_page_failed"
+        ):
+            replay_action = None
+        if replay_action is not None:
+            payload = _validated_global_judge_page_action(
+                replay_action,
+                builder=builder,
+                item=item,
+                request=request,
+                candidate_compression=candidate_compression,
+                plan=plan,
+                page=page,
+                page_phase=page_phase,
+                expected_physical_requests_reserved=reserved,
+            )
+            if (
+                replay_action["operation"]
+                == "global_judge_page_started"
+            ):
+                state.logical_judge_calls += 1
+                state.judge_requests += reserved
+                state.judge_request_uncertainty_count += 1
+                blocker = "global_judge_page_interrupted"
+                detail = (
+                    "The prior process ended after durably recording this "
+                    "candidate page request but before a terminal result; "
+                    "the page request is not repeated."
+                )
+                failed_payload = {
+                    **payload,
+                    "status": "failed",
+                    "physical_request_delta": reserved,
+                    "physical_request_exact": False,
+                    "blocker": blocker,
+                    "detail": detail,
+                    "judge_diagnostics": (
+                        _global_judge_call_diagnostics()
+                    ),
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "global_judge_page_failed",
+                    action_key,
+                    failed_payload,
+                )
+                return GlobalJudgePageExecutionResult(
+                    status="failed",
+                    request=request,
+                    physical_requests=reserved,
+                    physical_request_exact=False,
+                    blocker=blocker,
+                    blocker_detail=detail,
+                    judge_diagnostics=failed_payload[
+                        "judge_diagnostics"
+                    ],
+                )
+            provider_state = self._prevalidate_global_replay_provider_state(
+                state,
+                payload,
+            )
+            state.logical_judge_calls += 1
+            state.judge_requests += payload[
+                "physical_request_delta"
+            ]
+            if not payload["physical_request_exact"]:
+                state.judge_request_uncertainty_count += 1
+            self._apply_validated_provider_result_state(
+                state, provider_state
+            )
+            if (
+                replay_action["operation"]
+                == "global_judge_page_failed"
+            ):
+                return GlobalJudgePageExecutionResult(
+                    status="failed",
+                    request=request,
+                    physical_requests=payload[
+                        "physical_request_delta"
+                    ],
+                    physical_request_exact=payload[
+                        "physical_request_exact"
+                    ],
+                    blocker=str(payload["blocker"]),
+                    blocker_detail=str(payload["detail"]),
+                    judge_diagnostics=payload[
+                        "judge_diagnostics"
+                    ],
+                )
+            final_request = (
+                global_candidate_request_from_validation_envelope(
+                    payload["final_validation_envelope"],
+                    graph=graph,
+                    authoritative_candidates=candidates,
+                    authoritative_objective=state.objective,
+                )
+            )
+            judgment = validate_global_candidate_payload(
+                payload["judgment"],
+                request=final_request,
+            )
+            expansion_history = tuple(
+                EvidenceExpansionResult.from_dict(value)
+                for value in payload["evidence_expansion_history"]
+            )
+            terminal = _validated_global_expansion_terminal(
+                payload["expansion_terminal"],
+                judgment=judgment,
+            )
+            return GlobalJudgePageExecutionResult(
+                status="completed",
+                request=final_request,
+                physical_requests=payload[
+                    "physical_request_delta"
+                ],
+                physical_request_exact=True,
+                judgment=judgment,
+                expansion_history=expansion_history,
+                blocker=terminal["blocker"],
+                blocker_detail=terminal["detail"],
+                judge_diagnostics=payload[
+                    "judge_diagnostics"
+                ],
+            )
+
+        started_payload = _global_judge_page_action_base(
+            builder=builder,
+            item=item,
+            request=request,
+            candidate_compression=candidate_compression,
+            plan=plan,
+            page=page,
+            page_phase=page_phase,
+            physical_requests_reserved=reserved,
+        )
+        self._checkpoint_action(
+            "global_judge_page_started",
+            action_key,
+            started_payload,
+        )
+        state.logical_judge_calls += 1
+        try:
+            loop_result = self._run_global_evidence_expansion_loop(
+                graph=graph,
+                initial_request=request,
+                candidates=candidates,
+                max_physical_requests=reserved,
+            )
+        except (BoundedJudgeCallError, GlobalJudgeLoopValidationError) as exc:
+            physical_delta = exc.physical_requests
+            if physical_delta > reserved:
+                raise ValueError(
+                    "Global Judge page failure exceeded its reserved "
+                    "request allowance"
+                ) from exc
+            state.judge_requests += physical_delta
+            blocker = (
+                "global_judge_page_bounded_failure"
+                if isinstance(exc, BoundedJudgeCallError)
+                else "global_judge_page_output_invalid"
+            )
+            detail = "{0}: {1}".format(type(exc).__name__, exc)
+            failure_diagnostics = (
+                _validate_global_judge_call_diagnostics(
+                    _checkpoint_json(exc.diagnostics)
+                )
+                if getattr(exc, "diagnostics", None)
+                else _global_judge_call_diagnostics()
+            )
+            failed_payload = {
+                **started_payload,
+                "status": "failed",
+                "physical_request_delta": physical_delta,
+                "physical_request_exact": True,
+                "blocker": blocker,
+                "detail": detail,
+                "judge_diagnostics": failure_diagnostics,
+                "provider_state": self._capture_provider_result_state(
+                    state
+                ),
+            }
+            self._checkpoint_action(
+                "global_judge_page_failed",
+                action_key,
+                failed_payload,
+            )
+            return GlobalJudgePageExecutionResult(
+                status="failed",
+                request=request,
+                physical_requests=physical_delta,
+                physical_request_exact=True,
+                blocker=blocker,
+                blocker_detail=detail,
+                judge_diagnostics=failure_diagnostics,
+            )
+        except Exception as exc:
+            state.judge_requests += reserved
+            state.judge_request_uncertainty_count += 1
+            blocker = "global_judge_page_interrupted"
+            detail = (
+                "The Global Judge page ended without exact physical "
+                "request accounting and is treated as interrupted: "
+                "{0}: {1}"
+            ).format(type(exc).__name__, exc)
+            failed_payload = {
+                **started_payload,
+                "status": "failed",
+                "physical_request_delta": reserved,
+                "physical_request_exact": False,
+                "blocker": blocker,
+                "detail": detail,
+                "judge_diagnostics": (
+                    _global_judge_call_diagnostics()
+                ),
+                "provider_state": self._capture_provider_result_state(
+                    state
+                ),
+            }
+            self._checkpoint_action(
+                "global_judge_page_failed",
+                action_key,
+                failed_payload,
+            )
+            return GlobalJudgePageExecutionResult(
+                status="failed",
+                request=request,
+                physical_requests=reserved,
+                physical_request_exact=False,
+                blocker=blocker,
+                blocker_detail=detail,
+                judge_diagnostics=failed_payload[
+                    "judge_diagnostics"
+                ],
+            )
+
+        final_request = loop_result.request
+        judgment = loop_result.judgment
+        state.judge_requests += loop_result.physical_requests
+        completed_payload = {
+            **started_payload,
+            "status": "completed",
+            "physical_request_delta": loop_result.physical_requests,
+            "physical_request_exact": True,
+            "judgment": judgment.to_dict(),
+            "final_validation_envelope": (
+                final_request.validation_envelope()
+            ),
+            "evidence_expansion_history": [
+                value.to_dict()
+                for value in loop_result.expansion_history
+            ],
+            "expansion_terminal": {
+                "blocker": loop_result.blocker,
+                "detail": loop_result.blocker_detail,
+            },
+            "judge_diagnostics": (
+                _global_judge_call_diagnostics(
+                    loop_result.judge_diagnostic_calls
+                )
+            ),
+            "provider_state": self._capture_provider_result_state(
+                state
+            ),
+        }
+        self._checkpoint_action(
+            "global_judge_page_completed",
+            action_key,
+            completed_payload,
+        )
+        return GlobalJudgePageExecutionResult(
+            status="completed",
+            request=final_request,
+            physical_requests=loop_result.physical_requests,
+            physical_request_exact=True,
+            judgment=judgment,
+            expansion_history=loop_result.expansion_history,
+            blocker=loop_result.blocker,
+            blocker_detail=loop_result.blocker_detail,
+            judge_diagnostics=completed_payload[
+                "judge_diagnostics"
+            ],
+        )
+
+    def _record_global_judge_page_without_request(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        builder: SeedAttributionBuilder,
+        item: FrontierItem,
+        request: GlobalCandidateJudgeRequest,
+        candidate_compression: Mapping[str, Any],
+        plan: CandidatePagePlan,
+        page: CandidatePage,
+        page_phase: str,
+        physical_requests_reserved: int,
+        blocker: str,
+        detail: str,
+    ) -> GlobalJudgePageExecutionResult:
+        action_key = _global_judge_page_action_key(
+            _global_pass_identity(builder.key),
+            page.identity,
+        )
+        started_payload = _global_judge_page_action_base(
+            builder=builder,
+            item=item,
+            request=request,
+            candidate_compression=candidate_compression,
+            plan=plan,
+            page=page,
+            page_phase=page_phase,
+            physical_requests_reserved=physical_requests_reserved,
+        )
+        self._checkpoint_action(
+            "global_judge_page_started",
+            action_key,
+            started_payload,
+        )
+        state.logical_judge_calls += 1
+        diagnostics = _global_judge_call_diagnostics()
+        failed_payload = {
+            **started_payload,
+            "status": "failed",
+            "physical_request_delta": 0,
+            "physical_request_exact": True,
+            "blocker": blocker,
+            "detail": detail,
+            "judge_diagnostics": diagnostics,
+            "provider_state": self._capture_provider_result_state(state),
+        }
+        self._checkpoint_action(
+            "global_judge_page_failed",
+            action_key,
+            failed_payload,
+        )
+        return GlobalJudgePageExecutionResult(
+            status="failed",
+            request=request,
+            physical_requests=0,
+            physical_request_exact=True,
+            blocker=blocker,
+            blocker_detail=detail,
+            judge_diagnostics=diagnostics,
+        )
+
+    def _run_candidate_cluster_triage(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        graph: TraceGraph,
+        builder: SeedAttributionBuilder,
+        item: FrontierItem,
+        candidates: Sequence[CausalCandidate],
+        capsules: Sequence[CandidateEvidenceCapsule],
+        source_selection_identity: str,
+    ) -> Tuple[Tuple[CandidateEvidenceCapsule, ...], JsonDict]:
+        original_capsules = tuple(capsules)
+        base_projection: JsonDict = {
+            "offered_original_candidate_count": len(original_capsules),
+            "cluster_count": 0,
+            "directory_logical_page_count": 0,
+            "directory_physical_request_count": 0,
+            "expanded_original_candidate_count": len(original_capsules),
+            "fallback_reason": "",
+            "coverage_proof_identity": "",
+        }
+        strict_fallback_page_count = (
+            len(original_capsules) + CANDIDATE_PAGE_SIZE - 1
+        ) // CANDIDATE_PAGE_SIZE
+        strict_fallback_request_reserve = (
+            strict_fallback_page_count
+            * GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+        )
+        directory_budget_ceiling = max(
+            0,
+            self.max_judge_requests - strict_fallback_request_reserve,
+        )
+        if state.judge_requests >= directory_budget_ceiling:
+            return original_capsules, {
+                **base_projection,
+                "fallback_reason": (
+                    "directory_optional_budget_unavailable"
+                ),
+            }
+        shadow_events = [
+            event
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "candidate_cluster_manifest_shadow"
+            and event.get("seed_binding_identity") == builder.key
+        ]
+        if len(shadow_events) != 1:
+            return original_capsules, {
+                **base_projection,
+                "fallback_reason": (
+                    "manifest_missing"
+                    if not shadow_events
+                    else "manifest_duplicate_or_conflicting"
+                ),
+            }
+        manifest_validated = False
+        try:
+            manifest = validate_candidate_cluster_shadow_event(
+                shadow_events[0],
+                graph=graph,
+                expected_seed_binding_identity=builder.key,
+                expected_source_selection_identity=(
+                    source_selection_identity
+                ),
+            )
+            manifest_validated = True
+            if (
+                manifest.seed_ref != builder.start_ref
+                or manifest.defect_fingerprint
+                != builder.defect_state.fingerprint
+            ):
+                state.investigation_journal.remove(shadow_events[0])
+                raise ValueError("candidate cluster manifest seed is stale")
+            eligible_candidates_by_ref = {
+                candidate.ref: candidate for candidate in candidates
+            }
+            if set(eligible_candidates_by_ref) != {
+                capsule.candidate_ref for capsule in original_capsules
+            }:
+                raise ValueError(
+                    "candidate cluster originals do not match eligible candidates"
+                )
+            request = build_candidate_cluster_triage_request(
+                manifest=manifest,
+                eligible_candidates=tuple(
+                    eligible_candidates_by_ref[capsule.candidate_ref]
+                    for capsule in original_capsules
+                ),
+            )
+            pages = build_cluster_triage_page_requests(
+                request=request,
+                manifest=manifest,
+                eligible_capsules=original_capsules,
+                active_defect=builder.defect_state,
+                objective=state.objective,
+                analysis_perspective=state.analysis_perspective,
+            )
+        except Exception as exc:
+            if not manifest_validated:
+                state.investigation_journal.remove(shadow_events[0])
+            return original_capsules, {
+                **base_projection,
+                "fallback_reason": "manifest_or_request_validation_failed:{0}".format(
+                    type(exc).__name__
+                ),
+            }
+
+        bindings = {
+            "seed_binding_identity": builder.key,
+            "source_selection_identity": manifest.source_selection_identity,
+            "manifest_identity": manifest.manifest_identity,
+            "request_identity": request.request_identity,
+        }
+        base_projection.update(
+            {
+                "cluster_count": len(request.cluster_ids),
+                "directory_logical_page_count": len(pages),
+            }
+        )
+        plan_event = _candidate_cluster_triage_event(
+            "candidate_cluster_triage_plan",
+            **bindings,
+            payload={
+                "status": "planned",
+                "request": request.to_dict(),
+                "pages": [page.to_dict() for page in pages],
+                "behavior_impact": "none_offline_analysis_only",
+            },
+        )
+        matching_plan_events = [
+            event
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "candidate_cluster_triage_plan"
+            and event.get("request_identity") == request.request_identity
+        ]
+        if not matching_plan_events:
+            state.investigation_journal.append(plan_event)
+            self._checkpoint_state(
+                state,
+                "cluster-triage:plan:{0}".format(request.request_identity),
+            )
+        elif len(matching_plan_events) != 1 or matching_plan_events[0] != plan_event:
+            return original_capsules, {
+                **base_projection,
+                "fallback_reason": "directory_plan_invalid",
+            }
+
+        def persist_terminal_page(
+            *,
+            page: ClusterTriagePageRequest,
+            status: str,
+            physical_requests_reserved: int,
+            physical_request_delta: int,
+            physical_request_exact: bool,
+            judgment: Optional[ClusterTriageJudgment] = None,
+            diagnostics: Optional[Mapping[str, Any]] = None,
+            blocker: str = "",
+            detail: str = "",
+        ) -> JsonDict:
+            payload: JsonDict = {
+                "status": status,
+                "page_identity": page.page_identity,
+                "page_index": page.page_index,
+                "page_count": page.page_count,
+                "page_request": page.to_dict(),
+                "physical_requests_reserved": physical_requests_reserved,
+                "physical_request_delta": physical_request_delta,
+                "physical_request_exact": physical_request_exact,
+                "judgment_identity": (
+                    judgment.judgment_identity
+                    if judgment is not None
+                    else ""
+                ),
+                "provider_diagnostics": copy.deepcopy(
+                    dict(diagnostics or {})
+                ),
+                "blocker": blocker,
+                "detail": detail,
+                "behavior_impact": "none_offline_analysis_only",
+            }
+            if judgment is not None:
+                payload["judgment"] = judgment.to_dict()
+            event = _candidate_cluster_triage_event(
+                "candidate_cluster_triage_page",
+                **bindings,
+                payload=payload,
+            )
+            state.investigation_journal.append(event)
+            self._checkpoint_state(
+                state,
+                "cluster-triage:page:{0}".format(page.page_identity),
+            )
+            return event
+
+        def persist_plan(
+            *,
+            decision: Optional[Any],
+            fallback_reason: str,
+        ) -> Tuple[Tuple[CandidateEvidenceCapsule, ...], JsonDict]:
+            plan = safe_build_candidate_cluster_triage_plan(
+                request=request,
+                decision=decision,
+                manifest=manifest,
+            )
+            effective_fallback = fallback_reason or plan.fallback_reason
+            result_event = _candidate_cluster_triage_event(
+                "candidate_cluster_triage_result",
+                **bindings,
+                payload={
+                    "status": (
+                        "fallback" if effective_fallback else "completed"
+                    ),
+                    "decision_identity": plan.decision_identity,
+                    "decision": (
+                        decision.to_dict()
+                        if isinstance(decision, CandidateClusterTriageDecision)
+                        else None
+                    ),
+                    "fallback_reason": effective_fallback,
+                    "behavior_impact": "none_offline_analysis_only",
+                },
+            )
+            expansion_event = _candidate_cluster_triage_event(
+                "candidate_cluster_expansion",
+                **bindings,
+                payload={
+                    "status": (
+                        "fallback" if effective_fallback else "completed"
+                    ),
+                    "mode": (
+                        "fallback_full_paging"
+                        if effective_fallback
+                        else "coverage_proven_expansion"
+                    ),
+                    "plan": plan.to_dict(),
+                    "plan_identity": plan.plan_identity,
+                    "coverage_proof_identity": (
+                        plan.coverage_proof.proof_identity
+                    ),
+                    "fallback_reason": effective_fallback,
+                    "offered_original_candidate_count": len(
+                        original_capsules
+                    ),
+                    "cluster_count": len(request.cluster_ids),
+                    "directory_logical_page_count": len(pages),
+                    "expanded_original_candidate_count": len(
+                        plan.expanded_candidate_refs
+                    ),
+                    "behavior_impact": "none_offline_analysis_only",
+                },
+            )
+            appended = False
+            for expected_event in (result_event, expansion_event):
+                existing_events = [
+                    event
+                    for event in state.investigation_journal
+                    if isinstance(event, Mapping)
+                    and event.get("kind") == expected_event["kind"]
+                    and event.get("request_identity")
+                    == request.request_identity
+                ]
+                if not existing_events:
+                    state.investigation_journal.append(expected_event)
+                    appended = True
+                    continue
+                if (
+                    len(existing_events) != 1
+                    or existing_events[0] != expected_event
+                ):
+                    return original_capsules, {
+                        **base_projection,
+                        "fallback_reason": (
+                            "persisted_triage_result_or_expansion_invalid"
+                        ),
+                    }
+            if appended:
+                self._checkpoint_state(
+                    state,
+                    "cluster-triage:expansion:{0}".format(
+                        plan.plan_identity
+                    ),
+                )
+            capsule_by_ref = {
+                capsule.candidate_ref: capsule
+                for capsule in original_capsules
+            }
+            expanded = tuple(
+                capsule_by_ref[ref]
+                for ref in plan.expanded_candidate_refs
+            )
+            return expanded, {
+                **base_projection,
+                "expanded_original_candidate_count": len(expanded),
+                "fallback_reason": effective_fallback,
+                "coverage_proof_identity": (
+                    plan.coverage_proof.proof_identity
+                ),
+            }
+
+        recorded_page_events = [
+            event
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "candidate_cluster_triage_page"
+            and event.get("seed_binding_identity") == builder.key
+        ]
+        canonical_page_identities = {
+            page.page_identity for page in pages
+        }
+        if any(
+            event.get("source_selection_identity")
+            != manifest.source_selection_identity
+            or event.get("manifest_identity")
+            != manifest.manifest_identity
+            or event.get("request_identity") != request.request_identity
+            or event.get("page_identity") not in canonical_page_identities
+            for event in recorded_page_events
+        ):
+            return persist_plan(
+                decision=None,
+                fallback_reason="directory_page_set_invalid",
+            )
+
+        if not callable(
+            getattr(
+                self.judge,
+                "triage_candidate_cluster_page_bounded",
+                None,
+            )
+        ):
+            return persist_plan(
+                decision=None,
+                fallback_reason="cluster_triage_capability_missing",
+            )
+
+        judgments: List[ClusterTriageJudgment] = []
+        for page in pages:
+            action_key = _candidate_cluster_triage_page_action_key(
+                request.request_identity,
+                page.page_identity,
+            )
+            replay_action = self._replay_action(state, action_key)
+            terminal_action: Optional[
+                Tuple[
+                    str,
+                    JsonDict,
+                    Optional[ClusterTriageJudgment],
+                ]
+            ] = None
+            if replay_action is not None:
+                try:
+                    terminal_action = (
+                        _validated_candidate_cluster_triage_terminal_action(
+                            replay_action,
+                            page=page,
+                            **bindings,
+                        )
+                    )
+                except Exception:
+                    terminal_action = None
+            existing_page_events = [
+                event
+                for event in state.investigation_journal
+                if isinstance(event, Mapping)
+                and event.get("kind") == "candidate_cluster_triage_page"
+                and event.get("request_identity")
+                == request.request_identity
+                and event.get("page_identity") == page.page_identity
+            ]
+            if existing_page_events:
+                try:
+                    if len(existing_page_events) != 1:
+                        raise ValueError(
+                            "directory page lifecycle is duplicated"
+                        )
+                    event = _validate_candidate_cluster_triage_event(
+                        existing_page_events[0],
+                        expected_kind="candidate_cluster_triage_page",
+                        **bindings,
+                    )
+                    expected_keys = {
+                        "kind",
+                        "event_schema",
+                        "seed_binding_identity",
+                        "source_selection_identity",
+                        "manifest_identity",
+                        "request_identity",
+                        "status",
+                        "page_identity",
+                        "page_index",
+                        "page_count",
+                        "page_request",
+                        "physical_requests_reserved",
+                        "physical_request_delta",
+                        "physical_request_exact",
+                        "judgment_identity",
+                        "judgment",
+                        "provider_diagnostics",
+                        "blocker",
+                        "detail",
+                        "behavior_impact",
+                        "content_identity",
+                    }
+                    if set(event) != expected_keys:
+                        raise ValueError(
+                            "completed directory page event schema is invalid"
+                        )
+                    judgment = ClusterTriageJudgment.from_dict(
+                        event["judgment"]
+                    )
+                    if (
+                        event["status"] != "completed"
+                        or event["page_identity"] != page.page_identity
+                        or event["page_index"] != page.page_index
+                        or event["page_count"] != page.page_count
+                        or event["page_request"] != page.to_dict()
+                        or event["physical_request_exact"] is not True
+                        or event["judgment_identity"]
+                        != judgment.judgment_identity
+                        or judgment.page_identity != page.page_identity
+                        or event["blocker"]
+                        or event["detail"]
+                    ):
+                        raise ValueError(
+                            "completed directory page event is stale"
+                        )
+                    if terminal_action is None:
+                        raise ValueError(
+                            "directory page has no authoritative terminal"
+                        )
+                    operation, terminal_payload, terminal_judgment = (
+                        terminal_action
+                    )
+                    if (
+                        operation
+                        != "candidate_cluster_triage_page_completed"
+                        or terminal_judgment is None
+                        or terminal_judgment != judgment
+                        or event["status"] != terminal_payload["status"]
+                        or event["physical_requests_reserved"]
+                        != terminal_payload["physical_requests_reserved"]
+                        or event["physical_request_delta"]
+                        != terminal_payload["physical_request_delta"]
+                        or event["physical_request_exact"]
+                        != terminal_payload["physical_request_exact"]
+                        or event["judgment_identity"]
+                        != terminal_payload["judgment_identity"]
+                        or event["judgment"]
+                        != terminal_payload["judgment"]
+                        or event["provider_diagnostics"]
+                        != terminal_payload["provider_diagnostics"]
+                        or event["blocker"]
+                        != terminal_payload["blocker"]
+                        or event["detail"] != terminal_payload["detail"]
+                    ):
+                        raise ValueError(
+                            "directory page contradicts its durable terminal"
+                        )
+                except Exception:
+                    state.investigation_journal = [
+                        item
+                        for item in state.investigation_journal
+                        if not (
+                            isinstance(item, Mapping)
+                            and item.get("request_identity")
+                            == request.request_identity
+                            and item.get("kind")
+                            in {
+                                "candidate_cluster_triage_page",
+                                "candidate_cluster_triage_result",
+                                "candidate_cluster_expansion",
+                            }
+                        )
+                    ]
+                    if terminal_action is not None:
+                        operation, terminal_payload, terminal_judgment = (
+                            terminal_action
+                        )
+                        persist_terminal_page(
+                            page=page,
+                            status=str(terminal_payload["status"]),
+                            physical_requests_reserved=terminal_payload[
+                                "physical_requests_reserved"
+                            ],
+                            physical_request_delta=terminal_payload[
+                                "physical_request_delta"
+                            ],
+                            physical_request_exact=terminal_payload[
+                                "physical_request_exact"
+                            ],
+                            judgment=(
+                                terminal_judgment
+                                if operation
+                                == "candidate_cluster_triage_page_completed"
+                                else None
+                            ),
+                            diagnostics=terminal_payload[
+                                "provider_diagnostics"
+                            ],
+                            blocker=str(terminal_payload["blocker"]),
+                            detail=str(terminal_payload["detail"]),
+                        )
+                    return persist_plan(
+                        decision=None,
+                        fallback_reason=(
+                            "directory_page_terminal_conflict"
+                            if terminal_action is not None
+                            else "directory_page_lifecycle_unproven"
+                        ),
+                    )
+                judgments.append(judgment)
+                continue
+            reserved = min(
+                max(0, directory_budget_ceiling - state.judge_requests),
+                GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+            )
+            started_payload = {
+                "status": "started",
+                **bindings,
+                "page_identity": page.page_identity,
+                "page_index": page.page_index,
+                "page_count": page.page_count,
+                "page_request": page.to_dict(),
+                "physical_requests_reserved": reserved,
+            }
+            if (
+                replay_action is not None
+                and replay_action.get("operation")
+                in {
+                    "candidate_cluster_triage_page_completed",
+                    "candidate_cluster_triage_page_failed",
+                }
+            ):
+                operation = str(replay_action["operation"])
+                payload = replay_action.get("payload")
+                provider_state: Optional[JsonDict] = None
+                physical_delta = reserved
+                physical_exact = False
+                terminal_valid = False
+                judgment: Optional[ClusterTriageJudgment] = None
+                try:
+                    if str(replay_action.get("semantic_key") or "") != action_key:
+                        raise ValueError(
+                            "directory terminal replay key is invalid"
+                        )
+                    if not isinstance(payload, Mapping):
+                        raise ValueError(
+                            "directory terminal replay payload is invalid"
+                        )
+                    common_terminal_keys = set(started_payload) | {
+                        "physical_request_delta",
+                        "physical_request_exact",
+                        "provider_diagnostics",
+                        "blocker",
+                        "detail",
+                        "provider_state",
+                    }
+                    expected_keys = (
+                        common_terminal_keys
+                        | {"judgment_identity", "judgment"}
+                        if operation
+                        == "candidate_cluster_triage_page_completed"
+                        else common_terminal_keys
+                    )
+                    if set(payload) != expected_keys:
+                        raise ValueError(
+                            "directory terminal replay schema is invalid"
+                        )
+                    expected_base = {
+                        **started_payload,
+                        "status": (
+                            "completed"
+                            if operation
+                            == "candidate_cluster_triage_page_completed"
+                            else "failed"
+                        ),
+                    }
+                    actual_base = {
+                        key: copy.deepcopy(payload[key])
+                        for key in started_payload
+                    }
+                    if stable_json(_checkpoint_json(actual_base)) != stable_json(
+                        _checkpoint_json(expected_base)
+                    ):
+                        raise ValueError(
+                            "directory terminal replay request is stale"
+                        )
+                    physical_delta = payload["physical_request_delta"]
+                    physical_exact = payload["physical_request_exact"]
+                    if (
+                        type(physical_delta) is not int
+                        or physical_delta < 0
+                        or physical_delta > reserved
+                        or type(physical_exact) is not bool
+                        or not isinstance(
+                            payload["provider_diagnostics"], Mapping
+                        )
+                    ):
+                        raise ValueError(
+                            "directory terminal replay accounting is invalid"
+                        )
+                    provider_state = self._prevalidate_global_replay_provider_state(
+                        state,
+                        payload,
+                    )
+                    if operation == "candidate_cluster_triage_page_completed":
+                        if (
+                            physical_exact is not True
+                            or payload["blocker"]
+                            or payload["detail"]
+                        ):
+                            raise ValueError(
+                                "completed directory terminal is not exact"
+                            )
+                        judgment = ClusterTriageJudgment.from_dict(
+                            payload["judgment"]
+                        )
+                        if (
+                            judgment.to_dict() != payload["judgment"]
+                            or payload["judgment_identity"]
+                            != judgment.judgment_identity
+                            or judgment.page_identity != page.page_identity
+                            or judgment.request_identity
+                            != request.request_identity
+                            or judgment.partition_identity
+                            != page.partition_identity
+                            or judgment.page_index != page.page_index
+                            or judgment.page_count != page.page_count
+                        ):
+                            raise ValueError(
+                                "completed directory judgment is stale"
+                            )
+                    elif (
+                        not payload["blocker"]
+                        or not payload["detail"]
+                        or (
+                            not physical_exact
+                            and physical_delta != reserved
+                        )
+                    ):
+                        raise ValueError(
+                            "failed directory terminal is invalid"
+                        )
+                    terminal_valid = True
+                except Exception:
+                    if isinstance(payload, Mapping):
+                        candidate_delta = payload.get(
+                            "physical_request_delta"
+                        )
+                        candidate_exact = payload.get(
+                            "physical_request_exact"
+                        )
+                        if (
+                            type(candidate_delta) is int
+                            and 0 <= candidate_delta <= reserved
+                            and type(candidate_exact) is bool
+                        ):
+                            try:
+                                provider_state = (
+                                    self._prevalidate_global_replay_provider_state(
+                                        state,
+                                        payload,
+                                    )
+                                )
+                                physical_delta = candidate_delta
+                                physical_exact = candidate_exact
+                            except Exception:
+                                provider_state = None
+                    if provider_state is None:
+                        physical_delta = reserved
+                        physical_exact = False
+
+                state.logical_judge_calls += 1
+                state.judge_requests += physical_delta
+                if not physical_exact:
+                    state.judge_request_uncertainty_count += 1
+                if provider_state is not None:
+                    self._apply_validated_provider_result_state(
+                        state,
+                        provider_state,
+                    )
+                if not terminal_valid:
+                    blocker = "directory_terminal_replay_invalid"
+                    persist_terminal_page(
+                        page=page,
+                        status="failed",
+                        physical_requests_reserved=reserved,
+                        physical_request_delta=physical_delta,
+                        physical_request_exact=physical_exact,
+                        blocker=blocker,
+                        detail=(
+                            "The durable directory terminal did not exactly "
+                            "bind a complete canonical page judgment."
+                        ),
+                    )
+                    return persist_plan(
+                        decision=None,
+                        fallback_reason=blocker,
+                    )
+                if operation == "candidate_cluster_triage_page_failed":
+                    persist_terminal_page(
+                        page=page,
+                        status="failed",
+                        physical_requests_reserved=reserved,
+                        physical_request_delta=physical_delta,
+                        physical_request_exact=physical_exact,
+                        diagnostics=payload["provider_diagnostics"],
+                        blocker=str(payload["blocker"]),
+                        detail=str(payload["detail"]),
+                    )
+                    return persist_plan(
+                        decision=None,
+                        fallback_reason=str(payload["blocker"]),
+                    )
+                assert judgment is not None
+                judgments.append(judgment)
+                persist_terminal_page(
+                    page=page,
+                    status="completed",
+                    physical_requests_reserved=reserved,
+                    physical_request_delta=physical_delta,
+                    physical_request_exact=True,
+                    judgment=judgment,
+                    diagnostics=payload["provider_diagnostics"],
+                )
+                continue
+            if (
+                replay_action is not None
+                and replay_action.get("operation")
+                == "candidate_cluster_triage_page_started"
+            ):
+                if stable_json(
+                    _checkpoint_json(replay_action.get("payload"))
+                ) != stable_json(_checkpoint_json(started_payload)):
+                    return persist_plan(
+                        decision=None,
+                        fallback_reason="directory_started_replay_stale",
+                    )
+                state.logical_judge_calls += 1
+                state.judge_requests += reserved
+                state.judge_request_uncertainty_count += 1
+                blocker = "candidate_cluster_triage_interrupted"
+                detail = (
+                    "The prior process ended after durably recording this "
+                    "directory page request without an exact terminal; the "
+                    "page request is not repeated."
+                )
+                terminal_payload = {
+                    **started_payload,
+                    "status": "failed",
+                    "physical_request_delta": reserved,
+                    "physical_request_exact": False,
+                    "provider_diagnostics": {},
+                    "blocker": blocker,
+                    "detail": detail,
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "candidate_cluster_triage_page_failed",
+                    action_key,
+                    terminal_payload,
+                )
+                persist_terminal_page(
+                    page=page,
+                    status="failed",
+                    physical_requests_reserved=reserved,
+                    physical_request_delta=reserved,
+                    physical_request_exact=False,
+                    blocker=blocker,
+                    detail=detail,
+                )
+                return persist_plan(
+                    decision=None,
+                    fallback_reason=blocker,
+                )
+            self._checkpoint_action(
+                "candidate_cluster_triage_page_started",
+                action_key,
+                started_payload,
+            )
+            state.logical_judge_calls += 1
+            if self.stop_requested() or reserved == 0:
+                blocker = (
+                    "candidate_cluster_triage_interrupted"
+                    if self.stop_requested()
+                    else "judge_request_budget_exhausted"
+                )
+                terminal_payload = {
+                    **started_payload,
+                    "status": "failed",
+                    "physical_request_delta": 0,
+                    "physical_request_exact": True,
+                    "provider_diagnostics": {},
+                    "blocker": blocker,
+                    "detail": (
+                        "Cluster triage stopped before the directory page request."
+                    ),
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "candidate_cluster_triage_page_failed",
+                    action_key,
+                    terminal_payload,
+                )
+                persist_terminal_page(
+                    page=page,
+                    status="failed",
+                    physical_requests_reserved=reserved,
+                    physical_request_delta=0,
+                    physical_request_exact=True,
+                    blocker=blocker,
+                    detail=terminal_payload["detail"],
+                )
+                return persist_plan(
+                    decision=None,
+                    fallback_reason=blocker,
+                )
+            try:
+                call = self.judge.triage_candidate_cluster_page_bounded(
+                    page,
+                    max_physical_requests=reserved,
+                )
+                if (
+                    not isinstance(call, BoundedJudgeCallResult)
+                    or not isinstance(call.value, ClusterTriageJudgment)
+                    or call.value.page_identity != page.page_identity
+                    or call.physical_requests < 0
+                    or call.physical_requests > reserved
+                ):
+                    raise ValueError(
+                        "cluster triage page result is not exactly bound"
+                    )
+            except BoundedJudgeCallError as exc:
+                physical_delta = exc.physical_requests
+                if physical_delta < 0 or physical_delta > reserved:
+                    raise ValueError(
+                        "cluster triage failure exceeded its reservation"
+                    ) from exc
+                state.judge_requests += physical_delta
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
+                terminal_payload = {
+                    **started_payload,
+                    "status": "failed",
+                    "physical_request_delta": physical_delta,
+                    "physical_request_exact": True,
+                    "provider_diagnostics": copy.deepcopy(
+                        dict(exc.diagnostics)
+                    ),
+                    "blocker": "candidate_cluster_triage_bounded_failure",
+                    "detail": detail,
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "candidate_cluster_triage_page_failed",
+                    action_key,
+                    terminal_payload,
+                )
+                persist_terminal_page(
+                    page=page,
+                    status="failed",
+                    physical_requests_reserved=reserved,
+                    physical_request_delta=physical_delta,
+                    physical_request_exact=True,
+                    diagnostics=exc.diagnostics,
+                    blocker=terminal_payload["blocker"],
+                    detail=detail,
+                )
+                return persist_plan(
+                    decision=None,
+                    fallback_reason=terminal_payload["blocker"],
+                )
+            except Exception as exc:
+                state.judge_requests += reserved
+                state.judge_request_uncertainty_count += 1
+                detail = "{0}: {1}".format(type(exc).__name__, exc)
+                terminal_payload = {
+                    **started_payload,
+                    "status": "failed",
+                    "physical_request_delta": reserved,
+                    "physical_request_exact": False,
+                    "provider_diagnostics": {},
+                    "blocker": "candidate_cluster_triage_interrupted",
+                    "detail": detail,
+                    "provider_state": self._capture_provider_result_state(
+                        state
+                    ),
+                }
+                self._checkpoint_action(
+                    "candidate_cluster_triage_page_failed",
+                    action_key,
+                    terminal_payload,
+                )
+                persist_terminal_page(
+                    page=page,
+                    status="failed",
+                    physical_requests_reserved=reserved,
+                    physical_request_delta=reserved,
+                    physical_request_exact=False,
+                    blocker=terminal_payload["blocker"],
+                    detail=detail,
+                )
+                return persist_plan(
+                    decision=None,
+                    fallback_reason=terminal_payload["blocker"],
+                )
+            state.judge_requests += call.physical_requests
+            judgments.append(call.value)
+            terminal_payload = {
+                **started_payload,
+                "status": "completed",
+                "physical_request_delta": call.physical_requests,
+                "physical_request_exact": True,
+                "judgment_identity": call.value.judgment_identity,
+                "judgment": call.value.to_dict(),
+                "provider_diagnostics": copy.deepcopy(
+                    dict(call.diagnostics)
+                ),
+                "blocker": "",
+                "detail": "",
+                "provider_state": self._capture_provider_result_state(state),
+            }
+            self._checkpoint_action(
+                "candidate_cluster_triage_page_completed",
+                action_key,
+                terminal_payload,
+            )
+            persist_terminal_page(
+                page=page,
+                status="completed",
+                physical_requests_reserved=reserved,
+                physical_request_delta=call.physical_requests,
+                physical_request_exact=True,
+                judgment=call.value,
+                diagnostics=call.diagnostics,
+            )
+
+        try:
+            decision = merge_cluster_triage_judgments(
+                request=request,
+                manifest=manifest,
+                eligible_capsules=original_capsules,
+                active_defect=builder.defect_state,
+                objective=state.objective,
+                analysis_perspective=state.analysis_perspective,
+                pages=pages,
+                judgments=tuple(judgments),
+            )
+        except Exception as exc:
+            return persist_plan(
+                decision=None,
+                fallback_reason="directory_merge_failed:{0}".format(
+                    type(exc).__name__
+                ),
+            )
+        return persist_plan(decision=decision, fallback_reason="")
+
+    def _run_paginated_global_candidate_pass(
+        self,
+        *,
+        state: RecursiveAnalysisState,
+        graph: TraceGraph,
+        builder: SeedAttributionBuilder,
+        item: FrontierItem,
+        seed_items: Sequence[FrontierItem],
+        candidates: Sequence[CausalCandidate],
+        capsules: Sequence[CandidateEvidenceCapsule],
+        evidence_context_capsules: Sequence[
+            CandidateEvidenceCapsule
+        ],
+        candidate_compression: Mapping[str, Any],
+        restoration_obligations: Sequence[RestorationObligation] = (),
+    ) -> None:
+        candidate_by_ref = {
+            candidate.ref: candidate for candidate in candidates
+        }
+        capsule_by_ref = {
+            capsule.candidate_ref: capsule for capsule in capsules
+        }
+        evidence_context_capsules = tuple(
+            evidence_context_capsules
+        )
+        evidence_context_refs = {
+            capsule.candidate_ref
+            for capsule in evidence_context_capsules
+        }
+        evidence_context_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.ref in evidence_context_refs
+        )
+        original_candidate_refs = tuple(
+            capsule.candidate_ref for capsule in capsules
+        )
+        pass_identity = _global_pass_identity(builder.key)
+        page_outcomes_by_identity: Dict[str, CandidatePageOutcome] = {}
+        page_judgments_by_identity: Dict[
+            str, GlobalCandidateJudgment
+        ] = {}
+        page_results: List[GlobalJudgePageExecutionResult] = []
+        round_summaries: List[CandidateRoundSummary] = []
+        failed_pages: List[JsonDict] = []
+        seen_finalist_sets: List[Tuple[str, ...]] = []
+        retained_factor_refs: List[str] = []
+        current_refs = original_candidate_refs
+        final_result: Optional[GlobalJudgePageExecutionResult] = None
+        final_plan: Optional[CandidatePagePlan] = None
+        final_page: Optional[CandidatePage] = None
+        convergence_status = "inconclusive"
+        prior_convergence = [
+            event
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_convergence"
+            and event.get("seed_binding_identity") == builder.key
+        ]
+        if prior_convergence:
+            prior_statuses = {
+                str(event.get("status") or "") for event in prior_convergence
+            }
+            state.investigation_journal = [
+                event
+                for event in state.investigation_journal
+                if not (
+                    isinstance(event, Mapping)
+                    and event.get("kind") == "global_candidate_convergence"
+                    and event.get("seed_binding_identity") == builder.key
+                )
+            ]
+            for status in prior_statuses:
+                builder.blocking_reasons.discard(
+                    "global_candidate_pagination_{0}".format(status)
+                )
+            prior_failed_pages = [
+                event
+                for event in state.investigation_journal
+                if isinstance(event, Mapping)
+                and event.get("kind") == "global_candidate_page"
+                and event.get("seed_binding_identity") == builder.key
+                and event.get("status") == "failed"
+            ]
+            prior_failure_detail = "; ".join(
+                "{0}: {1}".format(
+                    event.get("blocker"), event.get("detail")
+                )
+                for event in prior_failed_pages
+            )
+            if prior_failure_detail:
+                builder.missing_evidence.discard(prior_failure_detail)
+            builder.missing_evidence.discard(
+                "Signal interruption left the active Global Judge page plan incomplete."
+            )
+            state.unresolved_refs = [
+                ref for ref in state.unresolved_refs if ref != builder.start_ref
+            ]
+
+        def request_for(
+            *,
+            refs: Sequence[str],
+            page: CandidatePage,
+            plan: CandidatePagePlan,
+            phase: str,
+        ) -> Tuple[
+            GlobalCandidateJudgeRequest,
+            Tuple[CausalCandidate, ...],
+            Tuple[CandidateEvidenceCapsule, ...],
+            JsonDict,
+        ]:
+            page_capsules = tuple(capsule_by_ref[ref] for ref in refs)
+            page_candidates = tuple(
+                candidate_by_ref[ref] for ref in refs
+            )
+            authoritative_candidates = (
+                *page_candidates,
+                *evidence_context_candidates,
+            )
+            page_compression = _global_page_candidate_compression(
+                graph=graph,
+                capsules=page_capsules,
+                full_candidate_compression=candidate_compression,
+                plan=plan,
+                page=page,
+                page_phase=phase,
+            )
+            request = GlobalCandidateJudgeRequest(
+                case_id=graph.case_id,
+                objective=state.objective,
+                analysis_perspective=state.analysis_perspective,
+                seed_ref=builder.start_ref,
+                active_defect=builder.defect_state,
+                active_focus_text=builder.defect_state.actual,
+                active_focus_text_hash=active_focus_text_sha256(
+                    builder.defect_state.actual
+                ),
+                start_refs=(builder.start_ref,),
+                capsules=page_capsules,
+                restoration_obligations=tuple(
+                    restoration_obligations
+                ),
+                evidence_context_capsules=(
+                    evidence_context_capsules
+                ),
+                trace_health={
+                    "missing_artifact_count": sum(
+                        len(capsule.missing_evidence_refs)
+                        for capsule in (
+                            *page_capsules,
+                            *evidence_context_capsules,
+                        )
+                    ),
+                    "candidate_compression": page_compression,
+                },
+            )
+            validate_global_candidate_request_against_graph(
+                graph,
+                request,
+                authoritative_candidates=authoritative_candidates,
+                authoritative_objective=state.objective,
+            )
+            return (
+                request,
+                authoritative_candidates,
+                page_capsules,
+                page_compression,
+            )
+
+        for round_index in range(
+            GLOBAL_CANDIDATE_MAX_COMPARISON_ROUNDS
+        ):
+            round_capsules = tuple(
+                capsule_by_ref[ref] for ref in current_refs
+            )
+            plan = build_candidate_page_plan(
+                seed_ref=builder.start_ref,
+                defect_fingerprint=builder.defect_state.fingerprint,
+                capsules=round_capsules,
+                round_index=round_index,
+            )
+            phase = "initial" if round_index == 0 else "comparison"
+            plan_identity = plan.identity
+            if not any(
+                isinstance(event, Mapping)
+                and event.get("kind")
+                == "global_candidate_page_plan"
+                and event.get("plan_identity") == plan_identity
+                for event in state.investigation_journal
+            ):
+                state.investigation_journal.append(
+                    {
+                        "kind": "global_candidate_page_plan",
+                        "status": "planned",
+                        "seed_binding_identity": builder.key,
+                        "seed_ref": builder.start_ref,
+                        "defect_fingerprint": (
+                            builder.defect_state.fingerprint
+                        ),
+                        "plan_identity": plan_identity,
+                        "page_phase": phase,
+                        "plan": plan.to_dict(),
+                        "behavior_impact": (
+                            "none_offline_analysis_only"
+                        ),
+                    }
+                )
+                self._checkpoint_state(
+                    state,
+                    "global:page-plan:{0}".format(plan_identity),
+                )
+
+            round_outcomes: List[CandidatePageOutcome] = []
+            round_failed = False
+            all_round_judgments: List[
+                GlobalCandidateJudgment
+            ] = []
+            for page in plan.pages:
+                if self.stop_requested():
+                    completed_page_ids = {
+                        str(event.get("page_identity") or "")
+                        for event in state.investigation_journal
+                        if isinstance(event, Mapping)
+                        and event.get("kind") == "global_candidate_page"
+                        and event.get("seed_binding_identity") == builder.key
+                        and event.get("status") == "completed"
+                    }
+                    unfinished_page_ids = [
+                        candidate_page.identity
+                        for candidate_page in plan.pages
+                        if candidate_page.identity not in completed_page_ids
+                    ]
+                    builder.mark_unresolved(
+                        "global_candidate_pagination_interrupted",
+                        "Signal interruption left the active Global Judge page plan incomplete.",
+                    )
+                    state.unresolved_refs.append(builder.start_ref)
+                    matching_page_events = [
+                        event
+                        for event in state.investigation_journal
+                        if isinstance(event, Mapping)
+                        and event.get("kind") == "global_candidate_page"
+                        and event.get("seed_binding_identity") == builder.key
+                    ]
+                    state.investigation_journal.append(
+                        {
+                            "kind": "global_candidate_convergence",
+                            "status": "interrupted",
+                            "seed_binding_identity": builder.key,
+                            "seed_ref": builder.start_ref,
+                            "defect_fingerprint": builder.defect_state.fingerprint,
+                            "active_plan_identity": plan.identity,
+                            "round_count": len(round_summaries),
+                            "completed_page_count": sum(
+                                event.get("status") == "completed"
+                                for event in matching_page_events
+                            ),
+                            "failed_page_count": sum(
+                                event.get("status") == "failed"
+                                for event in matching_page_events
+                            ),
+                            "supported_finalist_refs": list(current_refs),
+                            "unresolved_refs": unfinished_page_ids,
+                            "physical_request_delta": sum(
+                                int(event.get("physical_request_delta") or 0)
+                                for event in matching_page_events
+                            ),
+                            "behavior_impact": "none_offline_analysis_only",
+                        }
+                    )
+                    self._checkpoint_state(
+                        state,
+                        "global:page-interrupted:{0}".format(
+                            page.identity
+                        ),
+                    )
+                    return
+                (
+                    request,
+                    page_candidates,
+                    page_capsules,
+                    page_compression,
+                ) = request_for(
+                    refs=page.candidate_refs,
+                    page=page,
+                    plan=plan,
+                    phase=phase,
+                )
+                existing_events = [
+                    event
+                    for event in state.investigation_journal
+                    if isinstance(event, Mapping)
+                    and event.get("kind") == "global_candidate_page"
+                    and event.get("page_identity") == page.identity
+                ]
+                existing_event = next(
+                    (
+                        event
+                        for event in reversed(existing_events)
+                        if event.get("status") == "completed"
+                        and isinstance(event.get("judgment"), Mapping)
+                    ),
+                    None,
+                )
+                if existing_event is not None:
+                    judgment = validate_global_candidate_payload(
+                        existing_event["judgment"],
+                        request=request,
+                    )
+                    outcome = build_candidate_page_outcome(
+                        page=page,
+                        judgment=judgment,
+                        root_eligible_candidate_refs=(
+                            request.open_authored_root_candidate_refs
+                        ),
+                    )
+                    page_outcomes_by_identity[
+                        page.identity
+                    ] = outcome
+                    page_judgments_by_identity[
+                        page.identity
+                    ] = judgment
+                    round_outcomes.append(outcome)
+                    all_round_judgments.append(judgment)
+                    continue
+                prior_budget_failure = next(
+                    (
+                        event
+                        for event in reversed(existing_events)
+                        if event.get("status") == "failed"
+                        and event.get("blocker")
+                        == "judge_request_budget_exhausted"
+                    ),
+                    None,
+                )
+                if (
+                    prior_budget_failure is not None
+                    and state.judge_requests >= self.max_judge_requests
+                ):
+                    round_failed = True
+                    failed_pages.append(
+                        copy.deepcopy(dict(prior_budget_failure))
+                    )
+                    break
+
+                execution = self._execute_global_judge_page(
+                    state=state,
+                    graph=graph,
+                    builder=builder,
+                    item=item,
+                    candidates=page_candidates,
+                    request=request,
+                    candidate_compression=page_compression,
+                    plan=plan,
+                    page=page,
+                    page_phase=phase,
+                )
+                page_results.append(execution)
+                event: JsonDict = {
+                    "kind": "global_candidate_page",
+                    "status": execution.status,
+                    "seed_binding_identity": builder.key,
+                    "seed_ref": builder.start_ref,
+                    "defect_fingerprint": (
+                        builder.defect_state.fingerprint
+                    ),
+                    "plan_identity": plan.identity,
+                    "round_index": page.round_index,
+                    "page_index": page.page_index,
+                    "page_identity": page.identity,
+                    "page_phase": phase,
+                    "candidate_refs": list(page.candidate_refs),
+                    "candidate_count": len(page.candidate_refs),
+                    "request_identity": (
+                        _global_judge_request_identity(
+                            execution.request
+                        )
+                    ),
+                    "validation_envelope": (
+                        execution.request.validation_envelope()
+                    ),
+                    "candidate_compression": copy.deepcopy(
+                        dict(page_compression)
+                    ),
+                    "physical_request_delta": (
+                        execution.physical_requests
+                    ),
+                    "physical_request_exact": (
+                        execution.physical_request_exact
+                    ),
+                    "owner": _global_pass_owner(builder).to_dict(),
+                    "judge_diagnostics": copy.deepcopy(
+                        dict(execution.judge_diagnostics)
+                    ),
+                    "behavior_impact": (
+                        "none_offline_analysis_only"
+                    ),
+                }
+                if execution.status == "completed":
+                    judgment = execution.judgment
+                    assert judgment is not None
+                    outcome = build_candidate_page_outcome(
+                        page=page,
+                        judgment=judgment,
+                        root_eligible_candidate_refs=(
+                            execution.request.open_authored_root_candidate_refs
+                        ),
+                    )
+                    page_outcomes_by_identity[page.identity] = outcome
+                    page_judgments_by_identity[
+                        page.identity
+                    ] = judgment
+                    round_outcomes.append(outcome)
+                    all_round_judgments.append(judgment)
+                    event.update(
+                        {
+                            "judgment": judgment.to_dict(),
+                            "page_outcome": outcome.to_dict(),
+                            "evidence_expansion_history": [
+                                value.to_dict()
+                                for value in (
+                                    execution.expansion_history
+                                )
+                            ],
+                            "expansion_terminal": {
+                                "blocker": execution.blocker,
+                                "detail": (
+                                    execution.blocker_detail
+                                ),
+                            },
+                        }
+                    )
+                else:
+                    round_failed = True
+                    event.update(
+                        {
+                            "blocker": execution.blocker,
+                            "detail": execution.blocker_detail,
+                        }
+                    )
+                    failed_pages.append(copy.deepcopy(event))
+                state.investigation_journal.append(event)
+                self._checkpoint_state(
+                    state,
+                    "global:page:{0}".format(page.identity),
+                )
+                if (
+                    _provider_circuit(self.judge).get("open")
+                    or execution.blocker
+                    == "judge_request_budget_exhausted"
+                ):
+                    break
+
+            if round_failed or len(round_outcomes) != len(plan.pages):
+                convergence_status = "page_failure"
+                break
+            summary = summarize_candidate_round(
+                round_index=round_index,
+                page_outcomes=tuple(round_outcomes),
+                finalist_soft_limit=DEFAULT_FINALIST_SOFT_LIMIT,
+            )
+            round_summaries.append(summary)
+            for factor_ref in summary.non_root_factor_refs:
+                if factor_ref not in retained_factor_refs:
+                    retained_factor_refs.append(factor_ref)
+            if not any(
+                isinstance(event, Mapping)
+                and event.get("kind") == "global_candidate_round_summary"
+                and event.get("round_summary", {}).get("identity")
+                == summary.identity
+                for event in state.investigation_journal
+            ):
+                state.investigation_journal.append({
+                    "kind": "global_candidate_round_summary",
+                    "status": "completed",
+                    "seed_binding_identity": builder.key,
+                    "seed_ref": builder.start_ref,
+                    "defect_fingerprint": (
+                        builder.defect_state.fingerprint
+                    ),
+                    "plan_identity": plan.identity,
+                    "round_summary": summary.to_dict(),
+                    "behavior_impact": (
+                        "none_offline_analysis_only"
+                    ),
+                })
+                self._checkpoint_state(
+                    state,
+                    "global:round:{0}".format(summary.identity),
+                )
+            if summary.unresolved_root_hypothesis_refs:
+                convergence_status = "unresolved_candidates"
+                break
+            finalists = summary.finalist_candidate_refs
+            if not finalists:
+                if (
+                    round_index == 0
+                    and all(
+                        judgment.outcome == "no_defect"
+                        for judgment in all_round_judgments
+                    )
+                ):
+                    full_request = GlobalCandidateJudgeRequest(
+                        case_id=graph.case_id,
+                        objective=state.objective,
+                        analysis_perspective=(
+                            state.analysis_perspective
+                        ),
+                        seed_ref=builder.start_ref,
+                        active_defect=builder.defect_state,
+                        active_focus_text=(
+                            builder.defect_state.actual
+                        ),
+                        active_focus_text_hash=(
+                            active_focus_text_sha256(
+                                builder.defect_state.actual
+                            )
+                        ),
+                        start_refs=(builder.start_ref,),
+                        capsules=tuple(capsules),
+                        restoration_obligations=tuple(
+                            restoration_obligations
+                        ),
+                        evidence_context_capsules=(
+                            evidence_context_capsules
+                        ),
+                        trace_health={
+                            "missing_artifact_count": sum(
+                                len(
+                                    capsule.missing_evidence_refs
+                                )
+                                for capsule in (
+                                    *capsules,
+                                    *evidence_context_capsules,
+                                )
+                            ),
+                            "candidate_compression": copy.deepcopy(
+                                dict(candidate_compression)
+                            ),
+                        },
+                    )
+                    aggregate = (
+                        _aggregate_no_defect_page_judgments(
+                            request=full_request,
+                            judgments=all_round_judgments,
+                        )
+                    )
+                    final_result = GlobalJudgePageExecutionResult(
+                        status="completed",
+                        request=full_request,
+                        physical_requests=0,
+                        physical_request_exact=True,
+                        judgment=aggregate,
+                    )
+                    convergence_status = "no_defect"
+                else:
+                    convergence_status = "no_supported_finalists"
+                break
+
+            final_factor_refs = tuple(
+                ref
+                for ref in retained_factor_refs
+                if ref not in finalists
+            )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES]
+            if (
+                len(finalists) + len(final_factor_refs)
+                <= CANDIDATE_PAGE_SIZE
+            ):
+                final_round_index = round_index + 1
+                final_refs = (
+                    *finalists,
+                    *final_factor_refs,
+                )
+                final_capsules = tuple(
+                    capsule_by_ref[ref] for ref in final_refs
+                )
+                final_plan = build_candidate_page_plan(
+                    seed_ref=builder.start_ref,
+                    defect_fingerprint=(
+                        builder.defect_state.fingerprint
+                    ),
+                    capsules=final_capsules,
+                    round_index=final_round_index,
+                )
+                final_page = final_plan.pages[0]
+                if not any(
+                    isinstance(event, Mapping)
+                    and event.get("kind")
+                    == "global_candidate_page_plan"
+                    and event.get("plan_identity")
+                    == final_plan.identity
+                    for event in state.investigation_journal
+                ):
+                    state.investigation_journal.append(
+                        {
+                            "kind": "global_candidate_page_plan",
+                            "status": "planned",
+                            "seed_binding_identity": builder.key,
+                            "seed_ref": builder.start_ref,
+                            "defect_fingerprint": (
+                                builder.defect_state.fingerprint
+                            ),
+                            "plan_identity": final_plan.identity,
+                            "page_phase": "final",
+                            "plan": final_plan.to_dict(),
+                            "behavior_impact": (
+                                "none_offline_analysis_only"
+                            ),
+                        }
+                    )
+                    self._checkpoint_state(
+                        state,
+                        "global:page-plan:{0}".format(
+                            final_plan.identity
+                        ),
+                    )
+                final_plan_interrupted = self.stop_requested()
+                (
+                    final_request,
+                    final_candidates,
+                    _,
+                    final_compression,
+                ) = request_for(
+                    refs=final_refs,
+                    page=final_page,
+                    plan=final_plan,
+                    phase="final",
+                )
+                if final_plan_interrupted:
+                    final_result = (
+                        self._record_global_judge_page_without_request(
+                            state=state,
+                            builder=builder,
+                            item=item,
+                            request=final_request,
+                            candidate_compression=final_compression,
+                            plan=final_plan,
+                            page=final_page,
+                            page_phase="final",
+                            physical_requests_reserved=min(
+                                max(
+                                    0,
+                                    self.max_judge_requests
+                                    - state.judge_requests,
+                                ),
+                                GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+                            ),
+                            blocker="global_judge_page_interrupted",
+                            detail=(
+                                "Signal interruption arrived after the final "
+                                "page plan was durable and before its Provider "
+                                "request started."
+                            ),
+                        )
+                    )
+                else:
+                    final_result = self._execute_global_judge_page(
+                        state=state,
+                        graph=graph,
+                        builder=builder,
+                        item=item,
+                        candidates=final_candidates,
+                        request=final_request,
+                        candidate_compression=final_compression,
+                        plan=final_plan,
+                        page=final_page,
+                        page_phase="final",
+                    )
+                page_results.append(final_result)
+                final_event: JsonDict = {
+                    "kind": "global_candidate_page",
+                    "status": final_result.status,
+                    "seed_binding_identity": builder.key,
+                    "seed_ref": builder.start_ref,
+                    "defect_fingerprint": (
+                        builder.defect_state.fingerprint
+                    ),
+                    "plan_identity": final_plan.identity,
+                    "round_index": final_page.round_index,
+                    "page_index": final_page.page_index,
+                    "page_identity": final_page.identity,
+                    "page_phase": "final",
+                    "candidate_refs": list(final_page.candidate_refs),
+                    "candidate_count": len(final_page.candidate_refs),
+                    "request_identity": (
+                        _global_judge_request_identity(
+                            final_result.request
+                        )
+                    ),
+                    "validation_envelope": (
+                        final_result.request.validation_envelope()
+                    ),
+                    "candidate_compression": copy.deepcopy(
+                        dict(final_compression)
+                    ),
+                    "physical_request_delta": (
+                        final_result.physical_requests
+                    ),
+                    "physical_request_exact": (
+                        final_result.physical_request_exact
+                    ),
+                    "owner": _global_pass_owner(builder).to_dict(),
+                    "judge_diagnostics": copy.deepcopy(
+                        dict(final_result.judge_diagnostics)
+                    ),
+                    "behavior_impact": (
+                        "none_offline_analysis_only"
+                    ),
+                }
+                if final_result.status == "completed":
+                    assert final_result.judgment is not None
+                    final_page_outcome = build_candidate_page_outcome(
+                        page=final_page,
+                        judgment=final_result.judgment,
+                        root_eligible_candidate_refs=(
+                            final_result.request.open_authored_root_candidate_refs
+                        ),
+                    )
+                    final_event.update(
+                        {
+                            "judgment": (
+                                final_result.judgment.to_dict()
+                            ),
+                            "page_outcome": (
+                                final_page_outcome.to_dict()
+                            ),
+                            "evidence_expansion_history": [
+                                value.to_dict()
+                                for value in (
+                                    final_result.expansion_history
+                                )
+                            ],
+                            "expansion_terminal": {
+                                "blocker": final_result.blocker,
+                                "detail": (
+                                    final_result.blocker_detail
+                                ),
+                            },
+                        }
+                    )
+                    convergence_status = (
+                        "final_judgment_completed"
+                    )
+                else:
+                    final_event.update(
+                        {
+                            "blocker": final_result.blocker,
+                            "detail": final_result.blocker_detail,
+                        }
+                    )
+                    failed_pages.append(copy.deepcopy(final_event))
+                    convergence_status = (
+                        "interrupted"
+                        if final_plan_interrupted
+                        else "final_page_failure"
+                    )
+                state.investigation_journal.append(final_event)
+                self._checkpoint_state(
+                    state,
+                    "global:page:{0}".format(final_page.identity),
+                )
+                break
+
+            if finalists in seen_finalist_sets:
+                convergence_status = "stalled"
+                current_refs = finalists
+                break
+            seen_finalist_sets.append(finalists)
+            current_refs = finalists
+        else:
+            convergence_status = "round_budget_exhausted"
+
+        total_physical_requests = sum(
+            int(event.get("physical_request_delta") or 0)
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind") == "global_candidate_page"
+            and event.get("seed_binding_identity") == builder.key
+        )
+        state.investigation_journal.append(
+            {
+                "kind": "global_candidate_convergence",
+                "status": convergence_status,
+                "seed_binding_identity": builder.key,
+                "seed_ref": builder.start_ref,
+                "defect_fingerprint": (
+                    builder.defect_state.fingerprint
+                ),
+                "active_plan_identity": (
+                    final_plan.identity if final_plan is not None else plan.identity
+                ),
+                "round_count": len(round_summaries),
+                "completed_page_count": sum(
+                    1
+                    for event in state.investigation_journal
+                    if isinstance(event, Mapping)
+                    and event.get("kind")
+                    == "global_candidate_page"
+                    and event.get("seed_binding_identity")
+                    == builder.key
+                    and event.get("status") == "completed"
+                ),
+                "failed_page_count": sum(
+                    1
+                    for event in state.investigation_journal
+                    if isinstance(event, Mapping)
+                    and event.get("kind") == "global_candidate_page"
+                    and event.get("seed_binding_identity") == builder.key
+                    and event.get("status") == "failed"
+                ),
+                "supported_finalist_refs": list(current_refs),
+                "unresolved_refs": (
+                    [final_page.identity]
+                    if convergence_status == "interrupted"
+                    and final_page is not None
+                    else list(
+                        round_summaries[
+                            -1
+                        ].unresolved_root_hypothesis_refs
+                    )
+                    if round_summaries
+                    else list(current_refs)
+                ),
+                "physical_request_delta": total_physical_requests,
+                "behavior_impact": "none_offline_analysis_only",
+            }
+        )
+
+        if (
+            final_result is None
+            or final_result.status != "completed"
+            or final_result.judgment is None
+        ):
+            missing = [
+                (
+                    "{0}: {1}".format(
+                        event.get("blocker"),
+                        event.get("detail"),
+                    )
+                )
+                for event in failed_pages
+            ] or [
+                "Global candidate pagination did not reach a final judgment: "
+                + convergence_status
+            ]
+            builder.mark_unresolved(
+                "global_candidate_pagination_{0}".format(
+                    convergence_status
+                ),
+                "; ".join(missing),
+            )
+            state.unresolved_refs.append(builder.start_ref)
+            self._checkpoint_state(
+                state,
+                "global:pagination-incomplete:{0}".format(
+                    pass_identity
+                ),
+            )
+            return
+
+        judgment = final_result.judgment
+        final_request = final_result.request
+        final_capsules = final_request.capsules
+        final_candidates = tuple(
+            candidate_by_ref[capsule.candidate_ref]
+            for capsule in final_capsules
+        )
+        final_authoritative_candidates = (
+            *final_candidates,
+            *evidence_context_candidates,
+        )
+        pagination_projection = {
+            "schema": "global-candidate-pagination-summary/v1",
+            "page_size": CANDIDATE_PAGE_SIZE,
+            "page_physical_request_cap": (
+                GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
+            ),
+            "round_count": len(round_summaries),
+            "page_count": sum(
+                len(
+                    event.get("plan", {}).get("pages") or ()
+                )
+                for event in state.investigation_journal
+                if isinstance(event, Mapping)
+                and event.get("kind")
+                == "global_candidate_page_plan"
+                and event.get("seed_binding_identity") == builder.key
+            ),
+            "convergence_status": convergence_status,
+            "final_page_identity": (
+                final_page.identity if final_page is not None else ""
+            ),
+            "original_candidate_count": len(capsules),
+            "final_candidate_count": len(final_capsules),
+        }
+        request_compression = final_request.trace_health.get(
+            "candidate_compression"
+        )
+        final_compression = copy.deepcopy(
+            dict(
+                request_compression
+                if isinstance(request_compression, Mapping)
+                else candidate_compression
+            )
+        )
+        if len(final_capsules) != len(capsules):
+            final_compression["initial_candidate_compression"] = (
+                copy.deepcopy(dict(candidate_compression))
+            )
+        final_compression["candidate_pagination"] = (
+            pagination_projection
+        )
+        final_request = replace(
+            final_request,
+            trace_health={
+                **copy.deepcopy(dict(final_request.trace_health)),
+                "candidate_compression": final_compression,
+            },
+        )
+        validate_global_candidate_request_against_graph(
+            graph,
+            final_request,
+            authoritative_candidates=final_authoritative_candidates,
+            authoritative_objective=state.objective,
+        )
+        judgment = validate_global_candidate_payload(
+            judgment.to_dict(),
+            request=final_request,
+        )
+        owner = _global_pass_owner(builder)
+        event = {
+            "kind": "global_candidate_pass",
+            "status": "completed",
+            "pass_identity": pass_identity,
+            "seed_binding_identity": builder.key,
+            "seed_ref": builder.start_ref,
+            "defect_fingerprint": builder.defect_state.fingerprint,
+            "hypothesis_id": item.hypothesis_id,
+            "visit_key": item.visit_key,
+            "owner": owner.to_dict(),
+            "physical_request_delta": total_physical_requests,
+            "candidate_compression": final_compression,
+            "restoration_obligations": [
+                obligation.to_dict()
+                for obligation in final_request.restoration_obligations
+            ],
+            "candidate_evidence_capsules": [
+                capsule.to_dict() for capsule in final_capsules
+            ],
+            "evidence_context_capsules": [
+                capsule.to_dict()
+                for capsule in final_request.evidence_context_capsules
+            ],
+            "evidence_expansion_history": [
+                value.to_dict()
+                for value in final_result.expansion_history
+            ],
+            "expansion_terminal": {
+                "blocker": final_result.blocker,
+                "detail": final_result.blocker_detail,
+            },
+            "judgment": judgment.to_dict(),
+            "behavior_impact": "none_offline_analysis_only",
+        }
+        state.investigation_journal.append(event)
+        self._apply_global_candidate_judgment(
+            state=state,
+            item=item,
+            seed_items=seed_items,
+            candidates=final_candidates,
+            capsules=final_capsules,
+            judgment=judgment,
+            request=final_request,
+            expansion_history=final_result.expansion_history,
+            terminal_blocker=final_result.blocker,
+            terminal_blocker_detail=(
+                final_result.blocker_detail
+            ),
+        )
+        self._checkpoint_state(
+            state, "global:after:{0}".format(pass_identity)
+        )
 
     def _run_global_candidate_prepass(
         self, state: RecursiveAnalysisState, graph: TraceGraph
@@ -9110,35 +17880,252 @@ class AgenticRecursiveAnalyzer:
             hypothesis = state.ledger.get(item.hypothesis_id)
             if hypothesis.status not in {"active", "supported"}:
                 continue
+            candidate_funnel: Optional[JsonDict] = None
             try:
-                candidates, paths = self._global_candidate_pool(
+                candidates, paths, candidate_funnel = self._global_candidate_pool(
                     state, graph, item
                 )
-                capsules = build_candidate_evidence_capsules(
+                restoration_obligations = (
+                    _restoration_obligations_for_active_seed(
+                        graph,
+                        seed_ref=active_seed_ref,
+                        defect_state=builder.defect_state,
+                    )
+                )
+                episode_facts_by_ref = {
+                    str(entry.get("ref") or ""): {
+                        "episode_key": str(
+                            entry.get("episode_key") or "fallback"
+                        ),
+                        "episode_role": str(
+                            entry.get("episode_role") or "other"
+                        ),
+                        "grounded_hops": int(
+                            entry.get("grounded_hops") or 0
+                        ),
+                    }
+                    for entry in (
+                        candidate_funnel.get("candidate_audit") or ()
+                        if isinstance(candidate_funnel, Mapping)
+                        else ()
+                    )
+                    if isinstance(entry, Mapping)
+                    and str(entry.get("ref") or "")
+                }
+                for candidate in candidates:
+                    episode_facts_by_ref.setdefault(
+                        candidate.ref,
+                        {
+                            "episode_key": "fallback",
+                            "episode_role": "other",
+                            "grounded_hops": max(
+                                0,
+                                len(paths.get(candidate.ref, ())) - 1,
+                            ),
+                        },
+                    )
+                selected_capsules = build_candidate_evidence_capsules(
                     graph=graph,
                     candidates=candidates,
                     defect_state=item.defect_state,
                     downstream_paths=paths,
                     start_refs=(active_seed_ref,),
+                    restoration_obligations=restoration_obligations,
+                    episode_facts_by_ref=episode_facts_by_ref,
                 )
-                if not capsules:
-                    raise ValueError("candidate evidence capsules are empty")
+                assessment_refs = (
+                    {
+                        str(entry.get("ref") or "")
+                        for entry in candidate_funnel[
+                            "candidate_audit"
+                        ]
+                        if entry.get("disposition") == "offered"
+                    }
+                    if isinstance(candidate_funnel, Mapping)
+                    else {
+                        capsule.candidate_ref
+                        for capsule in selected_capsules
+                    }
+                )
+                capsules = tuple(
+                    capsule
+                    for capsule in selected_capsules
+                    if capsule.candidate_ref in assessment_refs
+                )
+                evidence_context_capsules = tuple(
+                    capsule
+                    for capsule in selected_capsules
+                    if capsule.candidate_ref not in assessment_refs
+                )
+                assessment_candidates = tuple(
+                    candidate
+                    for candidate in candidates
+                    if candidate.ref in assessment_refs
+                )
             except Exception as exc:
+                candidate_compression = None
+                if candidate_funnel is not None:
+                    candidate_compression = candidate_compression_with_funnel(
+                        candidate_compression_metrics(graph, ()),
+                        candidate_funnel,
+                    )
                 fail_seed(
                     builder=builder,
                     items=seed_items,
                     blocker="global_candidate_capsule_failure",
                     detail="{0}: {1}".format(type(exc).__name__, exc),
+                    candidate_compression=candidate_compression,
                 )
                 terminal_pass_identities.add(pass_identity)
                 continue
             for candidate in candidates:
                 state._remember_candidate(candidate)
-            metrics = candidate_compression_metrics(graph, capsules)
+            metrics = candidate_compression_with_funnel(
+                candidate_compression_metrics(
+                    graph,
+                    selected_capsules,
+                ),
+                candidate_funnel,
+            )
+            triage_projection: Optional[JsonDict] = None
+            if not capsules:
+                gate_identity = (
+                    builder.start_ref,
+                    builder.defect_state.fingerprint,
+                    "no_assessment_eligible_candidates",
+                )
+                already_recorded = any(
+                    isinstance(event, Mapping)
+                    and event.get("kind") == "global_candidate_gate"
+                    and (
+                        str(event.get("seed_ref") or ""),
+                        str(event.get("defect_fingerprint") or ""),
+                        str(event.get("reason") or ""),
+                    )
+                    == gate_identity
+                    for event in state.investigation_journal
+                )
+                if not already_recorded:
+                    state.investigation_journal.append(
+                        {
+                            "kind": "global_candidate_gate",
+                            "status": "bypassed",
+                            "seed_ref": builder.start_ref,
+                            "defect_fingerprint": (
+                                builder.defect_state.fingerprint
+                            ),
+                            "reason": (
+                                "no_assessment_eligible_candidates"
+                            ),
+                            "candidate_compression": copy.deepcopy(
+                                metrics
+                            ),
+                            "fallback": "recursive_backward_taint",
+                            "behavior_impact": (
+                                "none_offline_analysis_only"
+                            ),
+                        }
+                    )
+                    self._checkpoint_state(
+                        state,
+                        "global:gate:{0}:{1}".format(
+                            builder.start_ref,
+                            builder.defect_state.fingerprint,
+                        ),
+                    )
+                continue
+            if len(capsules) > CANDIDATE_PAGE_SIZE:
+                capsules, triage_projection = (
+                    self._run_candidate_cluster_triage(
+                        state=state,
+                        graph=graph,
+                        builder=builder,
+                        item=item,
+                        candidates=assessment_candidates,
+                        capsules=capsules,
+                        source_selection_identity=(
+                            str(
+                                candidate_funnel.get("selection_identity")
+                                or ""
+                            )
+                            if isinstance(candidate_funnel, Mapping)
+                            else ""
+                        ),
+                    )
+                )
+                metrics = {
+                    **copy.deepcopy(dict(metrics)),
+                    "candidate_cluster_triage": copy.deepcopy(
+                        triage_projection
+                    ),
+                }
+                expanded_refs = {
+                    capsule.candidate_ref for capsule in capsules
+                }
+                assessment_candidates = tuple(
+                    candidate
+                    for candidate in assessment_candidates
+                    if candidate.ref in expanded_refs
+                )
+                if not capsules:
+                    gate_reason = "cluster_triage_no_expanded_candidates"
+                    state.investigation_journal.append(
+                        {
+                            "kind": "global_candidate_gate",
+                            "status": "bypassed",
+                            "seed_ref": builder.start_ref,
+                            "defect_fingerprint": (
+                                builder.defect_state.fingerprint
+                            ),
+                            "reason": gate_reason,
+                            "candidate_compression": copy.deepcopy(metrics),
+                            "fallback": "recursive_backward_taint",
+                            "behavior_impact": (
+                                "none_offline_analysis_only"
+                            ),
+                        }
+                    )
+                    self._checkpoint_state(
+                        state,
+                        "global:gate:{0}:{1}".format(
+                            builder.start_ref,
+                            builder.defect_state.fingerprint,
+                        ),
+                    )
+                    continue
+            if len(capsules) > CANDIDATE_PAGE_SIZE:
+                self._run_paginated_global_candidate_pass(
+                    state=state,
+                    graph=graph,
+                    builder=builder,
+                    item=item,
+                    seed_items=seed_items,
+                    candidates=candidates,
+                    capsules=capsules,
+                    evidence_context_capsules=(
+                        evidence_context_capsules
+                    ),
+                    candidate_compression=metrics,
+                    restoration_obligations=restoration_obligations,
+                )
+                if any(
+                    isinstance(event, Mapping)
+                    and event.get("kind")
+                    == "global_candidate_pass"
+                    and event.get("pass_identity") == pass_identity
+                    for event in state.investigation_journal
+                ):
+                    terminal_pass_identities.add(pass_identity)
+                continue
             fusion_payload = metrics.get("global_fusion_payload")
             if (
                 isinstance(fusion_payload, Mapping)
                 and fusion_payload.get("eligible") is False
+                and not (
+                    isinstance(triage_projection, Mapping)
+                    and not triage_projection.get("fallback_reason")
+                    and triage_projection.get("coverage_proof_identity")
+                )
             ):
                 gate_identity = (
                     builder.start_ref,
@@ -9198,10 +18185,14 @@ class AgenticRecursiveAnalyzer:
                     ),
                     start_refs=(active_seed_ref,),
                     capsules=capsules,
+                    restoration_obligations=restoration_obligations,
+                    evidence_context_capsules=(
+                        evidence_context_capsules
+                    ),
                     trace_health={
                         "missing_artifact_count": sum(
                             len(capsule.missing_evidence_refs)
-                            for capsule in capsules
+                            for capsule in selected_capsules
                         ),
                         "candidate_compression": metrics,
                     },
@@ -9209,7 +18200,18 @@ class AgenticRecursiveAnalyzer:
                 validate_global_candidate_request_against_graph(
                     graph,
                     request,
-                    authoritative_candidates=candidates,
+                    authoritative_candidates=(
+                        *assessment_candidates,
+                        *(
+                            candidate
+                            for candidate in candidates
+                            if candidate.ref
+                            in {
+                                capsule.candidate_ref
+                                for capsule in evidence_context_capsules
+                            }
+                        ),
+                    ),
                     authoritative_objective=state.objective,
                 )
             except Exception as exc:
@@ -9569,8 +18571,16 @@ class AgenticRecursiveAnalyzer:
                 "owner": owner.to_dict(),
                 "physical_request_delta": physical_delta,
                 "candidate_compression": metrics,
+                "restoration_obligations": [
+                    obligation.to_dict()
+                    for obligation in final_request.restoration_obligations
+                ],
                 "candidate_evidence_capsules": [
                     capsule.to_dict() for capsule in capsules
+                ],
+                "evidence_context_capsules": [
+                    capsule.to_dict()
+                    for capsule in evidence_context_capsules
                 ],
                 "evidence_expansion_history": [
                     value.to_dict() for value in expansion_history
@@ -9588,7 +18598,7 @@ class AgenticRecursiveAnalyzer:
                 state=state,
                 item=item,
                 seed_items=seed_items,
-                candidates=candidates,
+                candidates=assessment_candidates,
                 capsules=capsules,
                 judgment=judgment,
                 request=final_request,
@@ -9605,7 +18615,66 @@ class AgenticRecursiveAnalyzer:
         state: RecursiveAnalysisState,
         graph: TraceGraph,
         item: FrontierItem,
-    ) -> Tuple[List[CausalCandidate], Dict[str, Tuple[str, ...]]]:
+    ) -> Tuple[
+        List[CausalCandidate],
+        Dict[str, Tuple[str, ...]],
+        JsonDict,
+    ]:
+        related_existing = []
+        active_path = set(item.downstream_path)
+        for candidate in state.causal_candidates:
+            target = str(candidate.edge.get("to_ref") or "")
+            if candidate.ref in active_path or target in active_path:
+                related_existing.append(candidate)
+        anchor_paths: Dict[str, Tuple[str, ...]] = {
+            item.node_ref: item.downstream_path,
+        }
+        for candidate in related_existing:
+            grounded_path = _grounded_downstream_path(
+                graph,
+                candidate.ref,
+                item.downstream_path,
+            )
+            if not grounded_path:
+                continue
+            joined_at = grounded_path[-1]
+            offset = item.downstream_path.index(joined_at)
+            anchor_paths.setdefault(
+                candidate.ref,
+                (
+                    *grounded_path,
+                    *item.downstream_path[offset + 1 :],
+                ),
+            )
+        (
+            grounded_upstream,
+            grounded_hops_by_ref,
+            grounded_paths_by_ref,
+        ) = self._global_grounded_upstream_closure(
+            graph,
+            anchor_paths,
+        )
+        grounded_decision_refs = tuple(
+            sorted(
+                (
+                    ref
+                    for ref, grounded_hops in grounded_hops_by_ref.items()
+                    if grounded_hops >= 2
+                    and graph.nodes[ref].event_type.strip().lower()
+                    == "decision"
+                ),
+                key=lambda ref: (-graph.position(ref), ref),
+            )
+        )
+        omission_candidates = obligation_gap_causal_candidates(graph)
+        grounded_decision_refs = tuple(
+            dict.fromkeys(
+                (
+                    *(candidate.ref for candidate in omission_candidates),
+                    *grounded_decision_refs,
+                )
+            )
+        )
         retrieved = self.retriever.retrieve(
             graph,
             item.node_ref,
@@ -9617,23 +18686,21 @@ class AgenticRecursiveAnalyzer:
         decisive_evidence = self._global_decisive_evidence_candidates(
             graph, item
         )
-        related_existing = []
-        active_path = set(item.downstream_path)
-        for candidate in state.causal_candidates:
-            target = str(candidate.edge.get("to_ref") or "")
-            if candidate.ref in active_path or target in active_path:
-                related_existing.append(candidate)
         authored_siblings = self._global_authored_decision_siblings(
             graph,
             [*related_existing, *retrieved],
         )
-        ordered = [
+        primary = [
+            *omission_candidates,
             *related_existing,
             *retrieved,
             *authored_siblings,
             *decisive_evidence,
         ]
-        selected: Dict[str, CausalCandidate] = {}
+        ordered = [
+            *primary,
+            *grounded_upstream,
+        ]
         routes_by_ref: Dict[str, List[CausalCandidate]] = {}
         refs: List[str] = []
         sibling_seed_refs = {
@@ -9651,29 +18718,358 @@ class AgenticRecursiveAnalyzer:
                 refs.append(resolved)
                 routes_by_ref[resolved] = []
             routes_by_ref[resolved].append(candidate)
-        for ref in refs:
-            selected[ref] = canonical_candidate_route(
-                graph, ref, routes_by_ref[ref]
-            )
-        paths: Dict[str, Tuple[str, ...]] = {}
-        for ref in refs:
-            grounded_path = _grounded_downstream_path(
-                graph,
-                ref,
-                item.downstream_path,
-            )
-            if grounded_path:
-                joined_at = grounded_path[-1]
-                offset = item.downstream_path.index(joined_at)
-                paths[ref] = (
-                    *grounded_path,
-                    *item.downstream_path[offset + 1 :],
+        canonical_candidates = [
+            canonical_candidate_route(graph, ref, routes_by_ref[ref])
+            for ref in refs
+        ]
+        active_seed_ref = (
+            item.downstream_path[-1]
+            if item.downstream_path
+            else item.node_ref
+        )
+        candidate_paths = {}
+        for candidate in canonical_candidates:
+            omission_gap = obligation_gap_for_candidate(candidate)
+            if omission_gap is not None:
+                edge = omission_gap.offline_path_provenance[0]
+                candidate_paths[candidate.ref] = (
+                    str(edge["from_ref"]),
+                    str(edge["to_ref"]),
                 )
-            elif ref == item.node_ref:
-                paths[ref] = item.downstream_path
-            else:
-                paths[ref] = (ref,)
-        return [selected[ref] for ref in refs], paths
+                continue
+            candidate_paths[candidate.ref] = _materialize_process_lifecycle_path(
+                graph,
+                candidate,
+                active_path=item.downstream_path,
+            )
+        ineligible_reasons = {
+            ref: NO_ACTIVE_SEED_CAUSAL_PATH
+            for ref, path in candidate_paths.items()
+            if len(path) < 2
+            and obligation_gap_for_candidate(
+                next(
+                    candidate
+                    for candidate in canonical_candidates
+                    if candidate.ref == ref
+                )
+            )
+            is None
+        }
+        selection = select_global_candidates(
+            graph,
+            canonical_candidates,
+            grounded_decision_refs=grounded_decision_refs,
+            candidate_paths=candidate_paths,
+            ineligible_reasons=ineligible_reasons,
+        )
+        selection_payload = selection.to_dict()
+        suppressed_seed_bindings = (
+            _quarantine_stale_candidate_cluster_shadows(
+                state.investigation_journal,
+                graph=graph,
+                seed_builders=state.seed_ledger,
+            )
+        )
+        shadow_events = tuple(
+            event
+            for event in state.investigation_journal
+            if isinstance(event, Mapping)
+            and event.get("kind")
+            == "candidate_cluster_manifest_shadow"
+            and event.get("seed_binding_identity")
+            == item.seed_binding_identity
+        )
+        if item.seed_binding_identity in suppressed_seed_bindings:
+            state.investigation_journal = [
+                event
+                for event in state.investigation_journal
+                if event not in shadow_events
+            ]
+        else:
+            cluster_manifest = build_candidate_cluster_manifest(
+                graph=graph,
+                candidates=selection.discovered,
+                candidate_paths=candidate_paths,
+                candidate_audit=selection_payload["candidate_audit"],
+                source_selection_identity=selection.selection_identity,
+                seed_ref=active_seed_ref,
+                defect_fingerprint=item.defect_state.fingerprint,
+                restoration_obligations=(
+                    _restoration_obligations_for_active_seed(
+                        graph,
+                        seed_ref=active_seed_ref,
+                        defect_state=item.defect_state,
+                    )
+                ),
+            )
+            for event in shadow_events:
+                prior_manifest = validate_candidate_cluster_shadow_event(
+                    event,
+                    graph=graph,
+                    expected_seed_binding_identity=(
+                        item.seed_binding_identity
+                    ),
+                    expected_source_selection_identity=(
+                        selection.selection_identity
+                    ),
+                )
+                if (
+                    prior_manifest.manifest_identity
+                    != cluster_manifest.manifest_identity
+                ):
+                    raise ValueError(
+                        "candidate cluster shadow determinism conflict for "
+                        "the same source selection"
+                    )
+            if not shadow_events:
+                state.investigation_journal.append(
+                    build_candidate_cluster_shadow_event(
+                        manifest=cluster_manifest,
+                        seed_binding_identity=item.seed_binding_identity,
+                    )
+                )
+        selected = [
+            *selection.offered,
+            *selection.evidence_context,
+        ]
+        paths = {
+            candidate.ref: (
+                candidate_paths[candidate.ref]
+                or (candidate.ref,)
+            )
+            for candidate in selected
+        }
+        return selected, paths, selection_payload
+
+    def _global_grounded_upstream_candidates(
+        self,
+        graph: TraceGraph,
+        item: FrontierItem,
+        *,
+        limit: int = GLOBAL_GROUNDED_DISCOVERY_MAX_NODES,
+        max_depth: int = GLOBAL_GROUNDED_DISCOVERY_MAX_DEPTH,
+    ) -> List[CausalCandidate]:
+        candidates, _ = self._global_grounded_upstream_discovery(
+            graph,
+            item,
+            limit=limit,
+            max_depth=max_depth,
+        )
+        return candidates
+
+    def _global_grounded_upstream_discovery(
+        self,
+        graph: TraceGraph,
+        item: FrontierItem,
+        *,
+        limit: int = GLOBAL_GROUNDED_DISCOVERY_MAX_NODES,
+        max_depth: int = GLOBAL_GROUNDED_DISCOVERY_MAX_DEPTH,
+    ) -> Tuple[List[CausalCandidate], Dict[str, int]]:
+        candidates, grounded_hops_by_ref, _ = (
+            self._global_grounded_upstream_closure(
+                graph,
+                {item.node_ref: item.downstream_path},
+                limit=limit,
+                max_depth=max_depth,
+            )
+        )
+        return candidates, grounded_hops_by_ref
+
+    def _global_grounded_upstream_closure(
+        self,
+        graph: TraceGraph,
+        anchor_paths: Mapping[str, Sequence[str]],
+        *,
+        limit: int = GLOBAL_GROUNDED_DISCOVERY_MAX_NODES,
+        scan_limit: int = GLOBAL_GROUNDED_SCAN_MAX_EDGES,
+        max_depth: int = GLOBAL_GROUNDED_DISCOVERY_MAX_DEPTH,
+    ) -> Tuple[
+        List[CausalCandidate],
+        Dict[str, int],
+        Dict[str, Tuple[str, ...]],
+    ]:
+        maximum = min(
+            GLOBAL_GROUNDED_DISCOVERY_MAX_NODES,
+            max(0, int(limit)),
+        )
+        maximum_depth = min(
+            GLOBAL_GROUNDED_DISCOVERY_MAX_DEPTH,
+            max(0, int(max_depth)),
+        )
+        maximum_scan = min(
+            GLOBAL_GROUNDED_SCAN_MAX_EDGES,
+            max(0, int(scan_limit)),
+        )
+        anchor_queues = []
+        seen = set()
+        for raw_ref, raw_path in anchor_paths.items():
+            ref = graph.resolve(raw_ref) or str(raw_ref)
+            path = tuple(
+                graph.resolve(value) or str(value)
+                for value in raw_path
+                if str(value)
+            )
+            if not ref or ref in seen or not path:
+                continue
+            seen.add(ref)
+            anchor_queues.append(
+                deque(
+                    [
+                        (
+                            ref,
+                            0,
+                            path,
+                            None,
+                            0,
+                        )
+                    ]
+                )
+            )
+        discovered: List[CausalCandidate] = []
+        grounded_hops_by_ref: Dict[str, int] = {}
+        grounded_paths_by_ref: Dict[str, Tuple[str, ...]] = {}
+        active_anchors = list(range(len(anchor_queues)))
+        anchor_cursor = 0
+        scanned_edges = 0
+        while active_anchors and scanned_edges < maximum_scan:
+            anchor_index = active_anchors[anchor_cursor]
+            queue = anchor_queues[anchor_index]
+            inspected = False
+            while queue and not inspected:
+                (
+                    target_ref,
+                    grounded_hops,
+                    anchor_path,
+                    predecessor_edges,
+                    edge_cursor,
+                ) = queue.popleft()
+                if grounded_hops >= maximum_depth:
+                    continue
+                edges = (
+                    tuple(graph.semantic_predecessor_edges(target_ref))
+                    if predecessor_edges is None
+                    else predecessor_edges
+                )
+                if edge_cursor >= len(edges):
+                    continue
+                edge = edges[edge_cursor]
+                scanned_edges += 1
+                inspected = True
+                if edge_cursor + 1 < len(edges):
+                    continuation = (
+                        target_ref,
+                        grounded_hops,
+                        anchor_path,
+                        edges,
+                        edge_cursor + 1,
+                    )
+                else:
+                    continuation = None
+                raw_ref = str(edge.get("ref") or "")
+                ref = graph.resolve(raw_ref) or raw_ref
+                node = graph.nodes.get(ref)
+                if (
+                    not ref
+                    or ref in seen
+                    or node is None
+                    or is_navigation_node(node)
+                    or not graph.active_revision_evidence_eligible(ref)
+                    or not is_confirmation_causal_edge(
+                        edge,
+                        default_eligible=False,
+                    )
+                ):
+                    if continuation is not None:
+                        queue.append(continuation)
+                    continue
+                seen.add(ref)
+                next_hops = grounded_hops + 1
+                queue.append(
+                    (
+                        ref,
+                        next_hops,
+                        anchor_path,
+                        None,
+                        0,
+                    )
+                )
+                if continuation is not None:
+                    queue.append(continuation)
+                evidence_refs = tuple(
+                    str(value)
+                    for value in edge.get("evidence_refs") or (ref,)
+                    if str(value)
+                )
+                discovered.append(
+                    CausalCandidate(
+                        ref=ref,
+                        node=node,
+                        source="global_grounded_upstream_closure",
+                        edge=edge,
+                        score=float(edge.get("confidence") or 0.0),
+                        evidence_refs=evidence_refs,
+                    )
+                )
+                path = _grounded_downstream_path(
+                    graph,
+                    ref,
+                    anchor_path,
+                )
+                if path:
+                    joined_at = path[-1]
+                    offset = anchor_path.index(joined_at)
+                    full_path = (
+                        *path,
+                        *anchor_path[offset + 1 :],
+                    )
+                    grounded_paths_by_ref[ref] = full_path
+                    grounded_hops_by_ref[ref] = len(full_path) - 1
+                else:
+                    grounded_hops_by_ref[ref] = (
+                        next_hops + len(anchor_path) - 1
+                    )
+            if not queue:
+                active_anchors.pop(anchor_cursor)
+                if active_anchors:
+                    anchor_cursor %= len(active_anchors)
+                continue
+            anchor_cursor = (anchor_cursor + 1) % len(active_anchors)
+
+        priority_decisions = sorted(
+            (
+                candidate
+                for candidate in discovered
+                if grounded_hops_by_ref.get(candidate.ref, 0) >= 2
+                and candidate.node.event_type.strip().lower() == "decision"
+            ),
+            key=lambda candidate: (
+                -graph.position(candidate.ref),
+                candidate.ref,
+            ),
+        )[:64]
+        priority_refs = {candidate.ref for candidate in priority_decisions}
+        selected = [
+            *priority_decisions,
+            *(
+                candidate
+                for candidate in discovered
+                if candidate.ref not in priority_refs
+            ),
+        ][:maximum]
+        selected_refs = {candidate.ref for candidate in selected}
+        return (
+            selected,
+            {
+                ref: hops
+                for ref, hops in grounded_hops_by_ref.items()
+                if ref in selected_refs
+            },
+            {
+                ref: path
+                for ref, path in grounded_paths_by_ref.items()
+                if ref in selected_refs
+            },
+        )
 
     def _global_authored_decision_siblings(
         self,
@@ -9937,6 +19333,7 @@ class AgenticRecursiveAnalyzer:
                         ),
                         "analysis_perspective": state.analysis_perspective,
                         "status": "queued",
+                        "review_scope": "root",
                         "origin": "global_candidate_judgment",
                         "seed_key": seed_builder.key if seed_builder else "",
                         "owner": LocalStateOwner.create(
@@ -9958,6 +19355,180 @@ class AgenticRecursiveAnalyzer:
                         "confirmation_enqueue_failed",
                         "The selected candidate could not be queued for independent confirmation.",
                         seed_key=seed_builder.key,
+                    )
+
+            non_root_role_priority = {
+                "contributing_condition": 0,
+                "amplifying_factor": 1,
+                "outcome_evidence": 2,
+                "unrelated": 3,
+            }
+            non_root_assessments = sorted(
+                (
+                    assessment
+                    for assessment in judgment.assessments
+                    if assessment.candidate_ref
+                    not in judgment.selected_candidate_refs
+                    and assessment.causal_role
+                    in GLOBAL_NON_ROOT_REVIEW_ROLES
+                    and assessment.causal_path_refs
+                    and assessment.candidate_ref in candidate_by_ref
+                    and assessment.candidate_ref in capsule_by_ref
+                    and non_root_factor_candidate_eligible(
+                        state.graph, assessment.candidate_ref
+                    )
+                ),
+                key=lambda assessment: (
+                    non_root_role_priority[assessment.causal_role],
+                    -assessment.confidence,
+                    len(assessment.causal_path_refs),
+                    assessment.candidate_ref,
+                ),
+            )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES]
+            for assessment in non_root_assessments:
+                candidate_ref = assessment.candidate_ref
+                candidate = candidate_by_ref[candidate_ref]
+                capsule = capsule_by_ref[candidate_ref]
+                hypothesis = state.ledger.create(
+                    (
+                        "Independently classify the causal role of {0} for "
+                        "{1}."
+                    ).format(candidate_ref, item.defect_state.label),
+                    candidate_ref,
+                    item.defect_state,
+                    seed_binding_identity=seed_builder.key if seed_builder else "",
+                )
+                state._bind_hypothesis_to_seed(
+                    hypothesis.hypothesis_id, seed_builder
+                )
+                support_refs = _dedupe_strings(
+                    [
+                        candidate_ref,
+                        *assessment.evidence_refs,
+                        *judgment.decisive_evidence_refs,
+                    ]
+                )
+                for evidence_ref in support_refs:
+                    if state.graph.resolve(evidence_ref):
+                        state.ledger.add_support(
+                            hypothesis.hypothesis_id,
+                            evidence_ref,
+                            (
+                                "The Global comparison selected this candidate "
+                                "for blind causal-role review."
+                            ),
+                            max(assessment.confidence, 0.01),
+                        )
+                hypothesis = state.ledger.get(hypothesis.hypothesis_id)
+                binding_key = (
+                    candidate_ref,
+                    item.defect_state.fingerprint,
+                    hypothesis.semantic_hash,
+                    hypothesis.seed_binding_identity,
+                )
+                if binding_key not in state.introduction_binding_keys:
+                    state.introduction_binding_keys.add(binding_key)
+                    state.introduction_bindings.append(
+                        {
+                            "candidate_ref": candidate_ref,
+                            "defect_state_id": item.defect_state.defect_state_id,
+                            "defect_fingerprint": item.defect_state.fingerprint,
+                            "hypothesis_id": hypothesis.hypothesis_id,
+                            "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                            "seed_binding_identity": (
+                                hypothesis.seed_binding_identity
+                            ),
+                            "origin": "global_candidate_factor_assessment",
+                            "seed_key": (
+                                seed_builder.key if seed_builder else ""
+                            ),
+                        }
+                    )
+                state._remember_candidate(candidate)
+                enqueued = state.enqueue_confirmation(
+                    {
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "hypothesis_semantic_hash": hypothesis.semantic_hash,
+                        "candidate_ref": candidate_ref,
+                        "defect_fingerprint": item.defect_state.fingerprint,
+                        "seed_binding_identity": (
+                            hypothesis.seed_binding_identity
+                        ),
+                        "requested_by_ref": item.node_ref,
+                        "recursive_path": list(capsule.downstream_path),
+                        "checked_evidence_refs": list(support_refs),
+                        "task_obligations": task_obligations(
+                            state.graph, state.objective
+                        ),
+                        "analysis_perspective": state.analysis_perspective,
+                        "status": "queued",
+                        "review_scope": "non_root",
+                        "origin": "global_candidate_factor_assessment",
+                        "seed_key": seed_builder.key if seed_builder else "",
+                        "owner": LocalStateOwner.create(
+                            seed_binding_identity=(
+                                hypothesis.seed_binding_identity
+                            ),
+                            hypothesis_id=hypothesis.hypothesis_id,
+                            visit_key=semantic_visit_key(
+                                candidate_ref,
+                                item.defect_state,
+                                hypothesis.semantic_hash,
+                                hypothesis.seed_binding_identity,
+                            ),
+                            occurrence_key="confirmation_queue",
+                        ).to_dict(),
+                    }
+                )
+                if not enqueued:
+                    enqueue_gap = {
+                        "candidate_ref": candidate_ref,
+                        "defect_fingerprint": (
+                            item.defect_state.fingerprint
+                        ),
+                        "seed_binding_identity": (
+                            hypothesis.seed_binding_identity
+                        ),
+                        "causal_role": assessment.causal_role,
+                        "reason": (
+                            "The bounded non-root confirmation queue rejected "
+                            "the candidate before independent review."
+                        ),
+                        "origin": (
+                            "global_candidate_factor_assessment"
+                        ),
+                    }
+                    gap_identity = (
+                        candidate_ref,
+                        item.defect_state.fingerprint,
+                        hypothesis.seed_binding_identity,
+                    )
+                    if not any(
+                        (
+                            str(existing.get("candidate_ref") or ""),
+                            str(
+                                existing.get("defect_fingerprint")
+                                or ""
+                            ),
+                            str(
+                                existing.get("seed_binding_identity")
+                                or ""
+                            ),
+                        )
+                        == gap_identity
+                        for existing in (
+                            state.factor_confirmation_enqueue_gaps
+                        )
+                    ):
+                        state.factor_confirmation_enqueue_gaps.append(
+                            enqueue_gap
+                        )
+                    state.ledger.reject(
+                        hypothesis.hypothesis_id,
+                        (
+                            "The bounded non-root confirmation queue rejected "
+                            "the candidate before independent review."
+                        ),
                     )
 
         for seed_item in bound_seed_items.values():
@@ -10018,6 +19589,12 @@ class AgenticRecursiveAnalyzer:
         if not requested_starts:
             requested_starts = tuple(analysis_graph.default_start_refs())
         restored_checkpoint: Optional[CheckpointState] = None
+        completed_replay_proof: Optional[
+            CompletedCheckpointReplayProof
+        ] = None
+        completed_migration_decision: Optional[
+            CompletedCheckpointMigrationDecision
+        ] = None
         if self.checkpoint is not None:
             checkpoint_budgets = self.checkpoint_config.get("budgets")
             runtime_budgets = {
@@ -10043,10 +19620,31 @@ class AgenticRecursiveAnalyzer:
                         "checkpoint budget {0} must match the analyzer "
                         "runtime budget".format(budget_name)
                     )
-            self.checkpoint.initialize(self.checkpoint_config)
-            restored_checkpoint = self.checkpoint.restore(
-                expected_config=self.checkpoint_config
-            )
+            if isinstance(self.checkpoint, CheckpointBundle):
+                if self.checkpoint.manifest_path.exists():
+                    replay = self.checkpoint.restore_for_replay(
+                        expected_config=self.checkpoint_config,
+                        expected_lineage=analysis_graph.message_lineage,
+                    )
+                    if replay.state.final_report is None:
+                        self.checkpoint.initialize(self.checkpoint_config)
+                        replay = self.checkpoint.restore_for_replay(
+                            expected_config=self.checkpoint_config,
+                            expected_lineage=analysis_graph.message_lineage,
+                        )
+                else:
+                    self.checkpoint.initialize(self.checkpoint_config)
+                    replay = self.checkpoint.restore_for_replay(
+                        expected_config=self.checkpoint_config,
+                        expected_lineage=analysis_graph.message_lineage,
+                    )
+                restored_checkpoint = replay.state
+                completed_replay_proof = replay.replay_proof
+            else:
+                self.checkpoint.initialize(self.checkpoint_config)
+                restored_checkpoint = self.checkpoint.restore(
+                    expected_config=self.checkpoint_config
+                )
             _validated_global_judge_action_history(
                 restored_checkpoint.actions,
                 max_judge_requests=int(
@@ -10058,32 +19656,46 @@ class AgenticRecursiveAnalyzer:
                     restored_checkpoint.config.get("cache_identity") or ""
                 ),
             )
+            _validated_global_judge_page_action_history(
+                restored_checkpoint.actions
+            )
             final_report = restored_checkpoint.final_report
             if final_report is not None:
                 validate_modern_report_shape(final_report)
                 final_report = _quarantine_stale_seed_report_payload(
                     analysis_graph, final_report
                 )
-                stale_report_starts = {
-                    analysis_graph.resolve(str(item.get("start_ref") or ""))
-                    or str(item.get("start_ref") or "")
-                    for item in final_report.get("seed_results") or ()
-                    if isinstance(item, Mapping)
-                    and str(item.get("outcome") or "") == "evidence_gap"
-                    and "start_ref_active_revision_ineligible"
-                    in (item.get("blocking_reasons") or ())
-                }
-                analysis_graph.assert_evidence_eligible_references(
+                _assert_report_checkpoint_evidence(
+                    analysis_graph,
                     final_report,
                     label="restored completed report",
-                    allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(final_report)
+                legacy_classification = (
+                    classify_legacy_projection_shape(
+                        report.investigation_journal,
+                        report.metadata,
+                    )
+                )
+                if isinstance(
+                    legacy_classification,
+                    LegacyProjectionRequired,
+                ):
+                    if completed_replay_proof is None:
+                        raise ValueError(
+                            "legacy completed report lacks replay proof"
+                        )
+                    completed_migration_decision = (
+                        completed_replay_proof.derive_migration_decision(
+                            legacy_classification
+                        )
+                    )
                 validate_recursive_report_against_graph(
                     analysis_graph,
                     report,
                     label="restored completed report",
                     action_records=restored_checkpoint.actions,
+                    migration_decision=completed_migration_decision,
                 )
                 if restored_checkpoint.tail_repair_count:
                     metadata = dict(report.metadata)
@@ -10103,26 +19715,26 @@ class AgenticRecursiveAnalyzer:
                 and isinstance(pending_action.get("payload"), Mapping)
                 and pending_action["payload"].get("interrupted")
             )
+            pending_metadata = (
+                pending_report.get("metadata")
+                if isinstance(pending_report, Mapping)
+                else None
+            )
+            pending_requires_page_resume = bool(
+                isinstance(pending_metadata, Mapping)
+                and pending_metadata.get("unresolved_page_refs")
+            )
             if pending_report is not None and (
                 not pending_interrupted or self.checkpoint.output_commit_path.exists()
-            ):
+            ) and not pending_requires_page_resume:
                 validate_modern_report_shape(pending_report)
                 pending_report = _quarantine_stale_seed_report_payload(
                     analysis_graph, pending_report
                 )
-                stale_report_starts = {
-                    analysis_graph.resolve(str(item.get("start_ref") or ""))
-                    or str(item.get("start_ref") or "")
-                    for item in pending_report.get("seed_results") or ()
-                    if isinstance(item, Mapping)
-                    and str(item.get("outcome") or "") == "evidence_gap"
-                    and "start_ref_active_revision_ineligible"
-                    in (item.get("blocking_reasons") or ())
-                }
-                analysis_graph.assert_evidence_eligible_references(
+                _assert_report_checkpoint_evidence(
+                    analysis_graph,
                     pending_report,
                     label="restored pending report",
-                    allowed_ineligible_refs=stale_report_starts,
                 )
                 report = RecursiveAttributionReport.from_dict(pending_report)
                 validate_recursive_report_against_graph(
@@ -10198,6 +19810,11 @@ class AgenticRecursiveAnalyzer:
                 )
                 self._checkpoint_state(state, "analysis:interrupted")
                 break
+            if _provider_circuit(self.judge).get("open"):
+                self._checkpoint_state(
+                    state, "analysis:provider_circuit_open"
+                )
+                break
             self._checkpoint_state(state, "analysis:before_frontier_pop")
             item = state.frontier.pop()
             state.processed_items += 1
@@ -10249,11 +19866,18 @@ class AgenticRecursiveAnalyzer:
                 )
                 continue
             try:
+                retrieval_limit = (
+                    NAVIGATION_ROUTE_CANDIDATE_LIMIT
+                    if current_node is not None
+                    and is_navigation_node(current_node)
+                    else 24
+                )
                 retrieved_candidates = self.retriever.retrieve(
                     analysis_graph,
                     item.node_ref,
                     item.defect_state,
                     state.ledger.get(item.hypothesis_id),
+                    limit=retrieval_limit,
                     allow_semantic_fallback=True,
                 )
                 retrieved_candidates = [
@@ -10276,7 +19900,7 @@ class AgenticRecursiveAnalyzer:
             if current_node is not None and is_navigation_node(current_node):
                 state.route_navigation_candidates(
                     item,
-                    candidates,
+                    retrieved_candidates,
                     graph_position=analysis_graph.position,
                     max_hypotheses=self.max_hypotheses,
                 )
@@ -10695,7 +20319,11 @@ class AgenticRecursiveAnalyzer:
                 max_hypotheses=self.max_hypotheses,
             )
 
-        if state.frontier and not interrupted:
+        if (
+            state.frontier
+            and not interrupted
+            and not _provider_circuit(self.judge).get("open")
+        ):
             while state.frontier:
                 item = state.frontier.pop()
                 state.complete_rejudge(
@@ -10730,7 +20358,7 @@ class AgenticRecursiveAnalyzer:
                 "SIGINT or SIGTERM requested graceful attribution shutdown before confirmation.",
             )
             self._checkpoint_state(state, "analysis:interrupted_before_confirmation")
-        report = state.build_report(judge=self.judge)
+        report = state.build_report(judge=self.judge, fusion_mode=self.fusion_mode)
         from .trace_improvement import build_recursive_trace_improvement_report
 
         metadata = dict(report.metadata)
@@ -10756,11 +20384,17 @@ class AgenticRecursiveAnalyzer:
             report,
             label="final attribution report",
         )
+        report_payload = report.to_dict()
+        _assert_report_checkpoint_evidence(
+            analysis_graph,
+            report_payload,
+            label="fresh completed report",
+        )
         self._checkpoint_state(state, "analysis:final_state")
         self._checkpoint_action(
             "analysis_ready",
             "analysis:result",
-            {"report": report.to_dict(), "interrupted": interrupted},
+            {"report": report_payload, "interrupted": interrupted},
         )
         if self.checkpoint is not None:
             self.checkpoint.flush_all()
@@ -10775,6 +20409,20 @@ class AgenticRecursiveAnalyzer:
                 break
             queued = pending_confirmations.pop(0)
             state._confirmation_queue_key(queued)
+            if str(queued.get("review_scope") or "root") == "non_root":
+                self._judge_queued_factor_role(state, queued)
+                pending_keys = {
+                    state._confirmation_queue_key(item)
+                    for item in pending_confirmations
+                }
+                pending_confirmations.extend(
+                    item
+                    for item in state.confirmation_queue
+                    if item.get("status") == "queued"
+                    and state._confirmation_queue_key(item)
+                    not in pending_keys
+                )
+                continue
             queued_identity = str(queued.get("semantic_identity") or "")
             confirmation_action_key = "confirmation:{0}".format(
                 queued_identity
@@ -10861,11 +20509,40 @@ class AgenticRecursiveAnalyzer:
                     evidence_disposition=terminal_disposition,
                 )
                 continue
+            diagnostic_request: Optional[RootConfirmationRequest] = None
             try:
-                request = self._build_confirmation_request(state, queued)
-                self._validate_confirmation_request_graph_eligibility(
-                    state, request
+                diagnostic_request = AgenticRecursiveAnalyzer._build_confirmation_request(
+                    state,
+                    queued,
+                    diagnostic_only=True,
                 )
+                self._validate_confirmation_request_graph_eligibility(
+                    state, diagnostic_request
+                )
+                request = self._build_confirmation_request(state, queued)
+                if not is_factor_role_escalation_origin(
+                    queued.get("origin")
+                ):
+                    candidate_node = state.graph.nodes.get(
+                        request.candidate_ref
+                    )
+                    if candidate_node is None:
+                        raise ValueError(
+                            "confirmation candidate is absent from the active graph"
+                        )
+                    self._active_failure_role_binding_for_request(
+                        state,
+                        queued=queued,
+                        defect_state=request.defect_state,
+                        candidate_node=candidate_node,
+                        seed_builder=state.seed_ledger.get(
+                            str(
+                                queued.get("seed_key")
+                                or queued.get("seed_binding_identity")
+                                or ""
+                            )
+                        ),
+                    )
                 preflight_root_confirmation_request(request)
                 factual_projection = root_confirmation_request_projection(
                     request
@@ -10885,28 +20562,40 @@ class AgenticRecursiveAnalyzer:
                         "queued confirmation factual request identity changed"
                     )
             except (KeyError, TypeError, ValueError) as exc:
-                confirmation = RootConfirmation(
-                    candidate_ref=str(queued.get("candidate_ref") or ""),
-                    status="unknown",
-                    counterfactual=confirmation_counterfactual_for(
-                        str(queued.get("candidate_ref") or ""), "unknown"
-                    ),
-                    reason="confirmation_request_ineligible: {0}: {1}".format(
-                        type(exc).__name__, exc
-                    ),
-                    counterfactual_status="unknown",
-                    hypothesis_id=str(queued.get("hypothesis_id") or ""),
-                    hypothesis_semantic_hash=str(
-                        queued.get("hypothesis_semantic_hash") or ""
-                    ),
-                    defect_fingerprint=str(queued.get("defect_fingerprint") or ""),
-                    recursive_path=tuple(queued.get("recursive_path") or ()),
-                    seed_binding_identity=str(
-                        queued.get("seed_binding_identity") or ""
-                    ),
-                    analysis_perspective=str(
-                        queued.get("analysis_perspective") or ""
-                    ),
+                reason = "confirmation_request_ineligible: {0}: {1}".format(
+                    type(exc).__name__, exc
+                )
+                confirmation = (
+                    _synthetic_unknown_confirmation(
+                        diagnostic_request,
+                        reason=reason,
+                    )
+                    if diagnostic_request is not None
+                    else RootConfirmation(
+                        candidate_ref=str(queued.get("candidate_ref") or ""),
+                        status="unknown",
+                        counterfactual=confirmation_counterfactual_for(
+                            str(queued.get("candidate_ref") or ""), "unknown"
+                        ),
+                        reason=reason,
+                        counterfactual_status="unknown",
+                        hypothesis_id=str(queued.get("hypothesis_id") or ""),
+                        hypothesis_semantic_hash=str(
+                            queued.get("hypothesis_semantic_hash") or ""
+                        ),
+                        defect_fingerprint=str(
+                            queued.get("defect_fingerprint") or ""
+                        ),
+                        recursive_path=tuple(
+                            queued.get("recursive_path") or ()
+                        ),
+                        seed_binding_identity=str(
+                            queued.get("seed_binding_identity") or ""
+                        ),
+                        analysis_perspective=str(
+                            queued.get("analysis_perspective") or ""
+                        ),
+                    )
                 )
                 self._persist_confirmation_action(
                     state,
@@ -10973,6 +20662,10 @@ class AgenticRecursiveAnalyzer:
                     replay_action,
                     request=request,
                     request_identity=request_identity,
+                    review_scope=str(
+                        queued.get("review_scope") or ""
+                    ),
+                    origin=queued.get("origin"),
                 )
                 reserved_requests = replay_payload.get(
                     "physical_requests_reserved"
@@ -11048,6 +20741,10 @@ class AgenticRecursiveAnalyzer:
                         "hypothesis_id": request.hypothesis_id,
                         "request_identity": request_identity,
                         "physical_requests_reserved": reserved_requests,
+                        "review_scope": str(
+                            queued.get("review_scope") or ""
+                        ),
+                        "origin": copy.deepcopy(queued.get("origin")),
                     },
                 )
             physical_delta = 0
@@ -11166,6 +20863,42 @@ class AgenticRecursiveAnalyzer:
                         ).format(final_disposition["rejection_reason"]),
                     )
                     terminal_operation = "confirmation_failed"
+                if (
+                    confirmation.status == "confirmed"
+                    and is_factor_role_escalation_origin(
+                        queued.get("origin")
+                    )
+                ):
+                    candidate_node = state.graph.nodes.get(
+                        confirmation.candidate_ref
+                    )
+                    try:
+                        if candidate_node is None:
+                            raise ValueError(
+                                "escalation candidate is absent from the active graph"
+                            )
+                        self._active_failure_role_binding_for_request(
+                            state,
+                            queued=queued,
+                            defect_state=request.defect_state,
+                            candidate_node=candidate_node,
+                            seed_builder=state.seed_ledger.get(
+                                str(
+                                    queued.get("seed_key")
+                                    or queued.get("seed_binding_identity")
+                                    or ""
+                                )
+                            ),
+                            confirmation=confirmation,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        confirmation = _synthetic_unknown_confirmation(
+                            request,
+                            reason=(
+                                "active_failure_role_incompatible: {0}: {1}"
+                            ).format(type(exc).__name__, exc),
+                        )
+                        terminal_operation = "confirmation_failed"
             if replayed_confirmation is None:
                 self._persist_confirmation_action(
                     state,
@@ -11227,6 +20960,54 @@ class AgenticRecursiveAnalyzer:
         confirmations = {
             item.confirmation_identity: item for item in state.confirmations
         }
+        review_scope_by_identity: Dict[str, str] = {}
+        terminal_factor_identities: Set[str] = set()
+        factor_escalation_identities: Set[str] = set()
+        for item in state.confirmation_queue:
+            if not isinstance(item, Mapping):
+                continue
+            scope = str(item.get("review_scope") or "root")
+            if isinstance(item.get("confirmation"), Mapping):
+                queue_confirmation_identity = (
+                    RootConfirmation.from_dict(
+                        dict(item["confirmation"])
+                    ).confirmation_identity
+                )
+            else:
+                queue_confirmation_identity = confirmation_identity_for(
+                    hypothesis_id=str(item.get("hypothesis_id") or ""),
+                    hypothesis_semantic_hash=str(
+                        item.get("hypothesis_semantic_hash") or ""
+                    ),
+                    candidate_ref=str(item.get("candidate_ref") or ""),
+                    defect_fingerprint=str(
+                        item.get("defect_fingerprint") or ""
+                    ),
+                    recursive_path=tuple(
+                        str(ref)
+                        for ref in item.get("recursive_path") or ()
+                    ),
+                    seed_binding_identity=str(
+                        item.get("seed_binding_identity") or ""
+                    ),
+                )
+            review_scope_by_identity[queue_confirmation_identity] = scope
+            if is_factor_role_escalation_origin(item.get("origin")):
+                factor_escalation_identities.add(
+                    queue_confirmation_identity
+                )
+            if (
+                scope == "non_root"
+                and item.get("status") in {"completed", "failed"}
+                and isinstance(item.get("factor_role_judgment"), Mapping)
+            ):
+                terminal_factor_identities.add(
+                    queue_confirmation_identity
+                )
+        published_root_identities = {
+            str(item.confirmation.get("confirmation_identity") or "")
+            for item in state.confirmed_roots
+        }
         blocked_identities: Set[str] = set()
         reasons: Dict[str, Set[str]] = {}
 
@@ -11251,6 +21032,7 @@ class AgenticRecursiveAnalyzer:
                 (identity, confirmation)
                 for identity, confirmation in confirmations.items()
                 if confirmation.status == "confirmed"
+                and identity in published_root_identities
             ),
             key=lambda item: item[0],
         )
@@ -11274,7 +21056,10 @@ class AgenticRecursiveAnalyzer:
                     block(right_identity, "confirmed_competitor_graph_inconsistent")
 
         for source_identity, source in sorted(confirmations.items()):
-            if source.status != "confirmed":
+            if (
+                source.status != "confirmed"
+                or source_identity not in published_root_identities
+            ):
                 continue
             for comparison in source.competitor_comparisons:
                 target_identity = str(
@@ -11301,14 +21086,47 @@ class AgenticRecursiveAnalyzer:
                         block(source_identity, "co_root_lacks_independent_confirmation")
                     continue
                 if target is None:
+                    if target_identity in terminal_factor_identities:
+                        continue
                     block(source_identity, "competitor_confirmation_missing")
                     continue
                 if not is_definitive_confirmation(target):
+                    if (
+                        status in {"outperformed", "rejected"}
+                        and (
+                            review_scope_by_identity.get(target_identity)
+                            == "non_root"
+                            or target_identity
+                            in factor_escalation_identities
+                            or (
+                                source_identity
+                                in factor_escalation_identities
+                                and target_identity
+                                not in published_root_identities
+                            )
+                        )
+                    ):
+                        continue
                     block(source_identity, "competitor_confirmation_unresolved")
                     continue
                 if target.status == "rejected":
                     if status not in {"outperformed", "rejected"}:
                         block(source_identity, "rejected_competitor_relation_conflict")
+                    continue
+                if (
+                    (
+                        review_scope_by_identity.get(target_identity)
+                        == "non_root"
+                        or target_identity
+                        in factor_escalation_identities
+                    )
+                    and target_identity not in published_root_identities
+                ):
+                    if status not in {"outperformed", "rejected"}:
+                        block(
+                            source_identity,
+                            "non_root_confirmation_role_conflict",
+                        )
                     continue
 
                 reciprocal = comparison_to(target, source_identity)
@@ -11322,6 +21140,7 @@ class AgenticRecursiveAnalyzer:
                     block(target_identity, "confirmed_competitor_relation_conflict")
 
         if not blocked_identities:
+            self._resolve_outperformed_root_confirmation_gaps(state)
             return
         retained: List[ConfirmedRoot] = []
         for root in state.confirmed_roots:
@@ -11352,6 +21171,127 @@ class AgenticRecursiveAnalyzer:
                     ", ".join(sorted(reasons.get(identity, ()))),
                 )
         state.confirmed_roots = retained
+        self._resolve_outperformed_root_confirmation_gaps(state)
+
+    @staticmethod
+    def _resolve_outperformed_root_confirmation_gaps(
+        state: RecursiveAnalysisState,
+    ) -> None:
+        resolved_identities = (
+            factor_escalation_outperformed_confirmation_identities(
+                confirmations=state.confirmations,
+                published_roots=(
+                    *state.confirmed_roots,
+                    *state.co_roots,
+                ),
+                confirmation_queue=state.confirmation_queue,
+            )
+        )
+        if not resolved_identities:
+            return
+
+        confirmations_by_identity = {
+            item.confirmation_identity: item
+            for item in state.confirmations
+        }
+        queue_by_confirmation_identity: Dict[
+            str, List[Mapping[str, Any]]
+        ] = {}
+        for queued in state.confirmation_queue:
+            raw_confirmation = queued.get("confirmation")
+            if not isinstance(raw_confirmation, Mapping):
+                continue
+            identity = RootConfirmation.from_dict(
+                dict(raw_confirmation)
+            ).confirmation_identity
+            queue_by_confirmation_identity.setdefault(
+                identity, []
+            ).append(queued)
+
+        remaining_blocking_seeds: Set[str] = set()
+        for identity, confirmation in confirmations_by_identity.items():
+            if (
+                identity in resolved_identities
+                or is_definitive_confirmation(confirmation)
+            ):
+                continue
+            matching_queue = queue_by_confirmation_identity.get(
+                identity, ()
+            )
+            if (
+                len(matching_queue) == 1
+                and str(
+                    matching_queue[0].get("review_scope") or "root"
+                )
+                == "root"
+                and not is_factor_role_escalation_origin(
+                    matching_queue[0].get("origin")
+                )
+            ):
+                remaining_blocking_seeds.add(
+                    confirmation.seed_binding_identity
+                )
+
+        resolved_hypothesis_ids: Set[str] = set()
+        resolved_candidate_refs: Set[str] = set()
+        for identity in resolved_identities:
+            confirmation = confirmations_by_identity[identity]
+            matching_queue = queue_by_confirmation_identity[identity]
+            hypothesis_id = str(
+                matching_queue[0].get("hypothesis_id") or ""
+            )
+            if hypothesis_id:
+                resolved_hypothesis_ids.add(hypothesis_id)
+                state.introduction_hypothesis_ids.discard(
+                    hypothesis_id
+                )
+                state.unresolved_hypothesis_ids.discard(
+                    hypothesis_id
+                )
+            resolved_candidate_refs.add(confirmation.candidate_ref)
+            builder = state.seed_ledger.get(
+                confirmation.seed_binding_identity
+            )
+            if builder is None:
+                continue
+            builder.missing_evidence.discard(confirmation.reason)
+            if (
+                confirmation.seed_binding_identity
+                not in remaining_blocking_seeds
+            ):
+                builder.blocking_reasons.discard(
+                    "root_confirmation_unknown"
+                )
+                builder.blocking_reasons.discard(
+                    "root_confirmation_unresolved"
+                )
+
+        state.unresolved_branches = [
+            item
+            for item in state.unresolved_branches
+            if not (
+                str(item.get("hypothesis_id") or "")
+                in resolved_hypothesis_ids
+                and str(item.get("reason") or "")
+                in {
+                    "root_confirmation_unknown",
+                    "root_confirmation_unresolved",
+                }
+            )
+        ]
+        retained_unresolved_refs = {
+            str(item.get("node_ref") or "")
+            for item in state.unresolved_branches
+        }
+        state.unresolved_refs = [
+            ref
+            for ref in state.unresolved_refs
+            if (
+                ref not in resolved_candidate_refs
+                or ref in retained_unresolved_refs
+            )
+        ]
+        state.refresh_pending_confirmation_request_identities()
 
     @staticmethod
     def _confirmation_hypothesis_status_at_request(
@@ -11402,9 +21342,9 @@ class AgenticRecursiveAnalyzer:
             request.recursive_path, request.recursive_path[1:]
         ):
             edges = state.graph.edge_context(upstream, downstream)
-            if not any(
-                is_confirmation_causal_edge(edge, default_eligible=True)
-                for edge in edges
+            if not has_confirmation_causal_hop(
+                edges,
+                default_eligible=True,
             ):
                 raise ValueError(
                     "queued confirmation path lacks a grounded non-temporal "
@@ -11412,8 +21352,175 @@ class AgenticRecursiveAnalyzer:
                 )
 
     @staticmethod
+    def _validate_factor_role_request_graph_eligibility(
+        state: RecursiveAnalysisState,
+        request: FactorRoleRequest,
+    ) -> None:
+        for upstream, downstream in zip(
+            request.recursive_path, request.recursive_path[1:]
+        ):
+            edges = state.graph.edge_context(upstream, downstream)
+            if (
+                not state.graph.edge_endpoints_eligible(
+                    upstream,
+                    downstream,
+                )
+                or not has_confirmation_causal_hop(
+                    edges,
+                    default_eligible=True,
+                )
+            ):
+                raise ValueError(
+                    "factor role path lacks a grounded causal edge: "
+                    "{0}->{1}".format(upstream, downstream)
+                )
+
+    @staticmethod
+    def _active_failure_role_binding_for_request(
+        state: RecursiveAnalysisState,
+        *,
+        queued: Mapping[str, Any],
+        defect_state: DefectState,
+        candidate_node: TraceNode,
+        seed_builder: Optional[SeedAttributionBuilder],
+        factor_judgment: Optional[FactorRoleJudgment] = None,
+        confirmation: Optional[RootConfirmation] = None,
+    ) -> Optional[ActiveFailureRoleBinding]:
+        candidate_ref = str(queued.get("candidate_ref") or "")
+        review_scope = str(queued.get("review_scope") or "root")
+        is_escalation = is_factor_role_escalation_origin(
+            queued.get("origin")
+        )
+        assessment = next(
+            (
+                item
+                for item in (
+                    seed_builder.global_judgment.get("assessments") or ()
+                    if seed_builder is not None
+                    and isinstance(seed_builder.global_judgment, Mapping)
+                    else ()
+                )
+                if isinstance(item, Mapping)
+                and str(item.get("candidate_ref") or "")
+                == candidate_ref
+            ),
+            {},
+        )
+        candidate_phase = str(
+            assessment.get("candidate_phase")
+            or candidate_node.data.get("phase")
+            or "intermediate"
+        )
+        comparative_role = str(
+            assessment.get("causal_role")
+            or (
+                "root_candidate"
+                if review_scope == "root"
+                else "contributing_condition"
+            )
+        )
+        failure_mode = str(
+            assessment.get("failure_mode")
+            or (
+                "positive_introduction"
+                if review_scope == "root"
+                else "omission_enabling_condition"
+            )
+        )
+        if review_scope == "non_root" and factor_judgment is not None:
+            causal_role = active_failure_factor_role_for(
+                factor_judgment.factor_role
+            )
+            if causal_role is None:
+                return None
+        else:
+            semantic_facts: Any = candidate_node.data
+            if is_escalation and confirmation is not None:
+                semantic_facts = {
+                    **copy.deepcopy(dict(candidate_node.data)),
+                    "independent_confirmation_facts": {
+                        "excerpt": confirmation.excerpt,
+                        "reason": confirmation.reason,
+                        "counterfactual": confirmation.counterfactual,
+                        "factor_mechanism": confirmation.factor_mechanism,
+                    },
+                }
+                comparative_role = "root_candidate"
+                failure_mode = "positive_introduction"
+            causal_role = active_failure_causal_role_for(
+                candidate_ref=candidate_ref,
+                component=candidate_node.component,
+                event_type=candidate_node.event_type,
+                candidate_phase=candidate_phase,
+                failure_mode=failure_mode,
+                comparative_role=comparative_role,
+                candidate_facts=semantic_facts,
+            )
+        signature = active_failure_signature_for(
+            defect_state,
+            seed_ref=(
+                seed_builder.start_ref
+                if seed_builder is not None
+                else str(queued.get("requested_by_ref") or "")
+            ),
+            seed_facts=(
+                state.graph.nodes[
+                    seed_builder.start_ref
+                    if seed_builder is not None
+                    else str(queued.get("requested_by_ref") or "")
+                ].data
+                if (
+                    seed_builder is not None
+                    and seed_builder.start_ref in state.graph.nodes
+                )
+                or (
+                    seed_builder is None
+                    and str(queued.get("requested_by_ref") or "")
+                    in state.graph.nodes
+                )
+                else None
+            ),
+        )
+        disposition = "root" if review_scope == "root" else "factor"
+        return ActiveFailureRoleBinding.create(
+            candidate_ref=candidate_ref,
+            seed_ref=str(signature["seed_ref"]),
+            failure_signature=str(signature["signature_id"]),
+            defect_fingerprint=str(signature["fingerprint"]),
+            failure_identity_source=str(signature["identity_source"]),
+            failure_kind=str(signature["kind"]),
+            causal_role=causal_role,
+            disposition=disposition,
+            counterfactual_prevention_signatures=(
+                (str(signature["signature_id"]),)
+                if disposition == "root"
+                else ()
+            ),
+        )
+
+    @staticmethod
+    def _build_persisted_confirmation_request(
+        state: RecursiveAnalysisState,
+        queued: Mapping[str, Any],
+    ) -> RootConfirmationRequest:
+        try:
+            return AgenticRecursiveAnalyzer._build_confirmation_request(
+                state,
+                queued,
+            )
+        except ValueError:
+            return AgenticRecursiveAnalyzer._build_confirmation_request(
+                state,
+                queued,
+                diagnostic_only=True,
+            )
+
+    @staticmethod
     def _build_confirmation_request(
-        state: RecursiveAnalysisState, queued: Mapping[str, Any]
+        state: RecursiveAnalysisState,
+        queued: Mapping[str, Any],
+        *,
+        diagnostic_only: bool = False,
     ) -> RootConfirmationRequest:
         if "artifact_evidence_envelopes" not in queued:
             queue_key = state._confirmation_queue_key(queued)
@@ -11429,6 +21536,10 @@ class AgenticRecursiveAnalyzer:
         candidate_ref = str(queued.get("candidate_ref") or "")
         fingerprint = str(queued.get("defect_fingerprint") or "")
         seed_binding_identity = str(queued.get("seed_binding_identity") or "")
+        review_scope = str(queued.get("review_scope") or "root")
+        is_escalation = is_factor_role_escalation_origin(
+            queued.get("origin")
+        )
         hypothesis = state.ledger.get(hypothesis_id)
         if (
             hypothesis.candidate_root_ref != candidate_ref
@@ -11463,11 +21574,18 @@ class AgenticRecursiveAnalyzer:
         if defect_state is None:
             raise ValueError("queued confirmation defect state is unavailable")
         node = state.graph.nodes.get(candidate_ref)
-        if (
-            node is None
-            or not authored_root_candidate_eligible(
+        candidate_eligible = (
+            non_root_factor_candidate_eligible(
                 state.graph, candidate_ref
             )
+            if review_scope == "non_root" or is_escalation
+            else authored_root_candidate_eligible(
+                state.graph, candidate_ref
+            )
+        )
+        if (
+            node is None
+            or not candidate_eligible
         ):
             raise ValueError(
                 "queued confirmation candidate is ineligible for the active revision"
@@ -11564,6 +21682,34 @@ class AgenticRecursiveAnalyzer:
         supporting_refs.extend(item.ref for item in hypothesis.supporting_evidence)
         supporting_refs.extend(queued.get("checked_evidence_refs") or ())
         opposing_refs = [item.ref for item in hypothesis.opposing_evidence]
+        seed_builder = next(
+            (
+                item
+                for item in state.seed_ledger.values()
+                if item.key == seed_binding_identity
+            ),
+            None,
+        )
+        global_open_root_refs = {
+            str(ref)
+            for assessment in (
+                seed_builder.global_judgment.get("assessments", ())
+                if seed_builder is not None
+                and isinstance(seed_builder.global_judgment, Mapping)
+                else ()
+            )
+            if isinstance(assessment, Mapping)
+            for ref in assessment.get("compared_candidate_refs", ())
+            if str(ref)
+        }
+        published_root_refs = {
+            item.node_ref
+            for item in (*state.confirmed_roots, *state.co_roots)
+            if str(
+                item.confirmation.get("seed_binding_identity") or ""
+            )
+            == seed_binding_identity
+        }
         competitors: List[JsonDict] = []
         for value in state.ledger.snapshot():
             if value.get("hypothesis_id") == hypothesis_id:
@@ -11601,7 +21747,34 @@ class AgenticRecursiveAnalyzer:
                 raise ValueError("competing hypothesis candidate is unresolved")
             if str(competitor_binding.get("candidate_ref") or "") != resolved:
                 continue
-            if resolved in path[1:]:
+            queued_competitor = next(
+                (
+                    item
+                    for item in state.confirmation_queue
+                    if str(item.get("hypothesis_id") or "")
+                    == competitor_hypothesis_id
+                    and str(item.get("candidate_ref") or "") == resolved
+                    and str(item.get("defect_fingerprint") or "")
+                    == competitor_fingerprint
+                    and str(item.get("seed_binding_identity") or "")
+                    == competitor_seed_binding_identity
+                ),
+                None,
+            )
+            if review_scope == "non_root" and (
+                queued_competitor is None
+                or str(queued_competitor.get("review_scope") or "root")
+                != "root"
+                or resolved not in published_root_refs
+            ):
+                continue
+            if (
+                review_scope == "root"
+                and global_open_root_refs
+                and resolved not in global_open_root_refs
+            ):
+                continue
+            if review_scope == "root" and resolved in path[1:]:
                 continue
             support = value.get("supporting_evidence") or []
             opposition = value.get("opposing_evidence") or []
@@ -11647,19 +21820,6 @@ class AgenticRecursiveAnalyzer:
             competitor_defect = state.defect_states.get(competitor_fingerprint)
             if competitor_defect is None:
                 raise ValueError("competing hypothesis defect is unresolved")
-            queued_competitor = next(
-                (
-                    item
-                    for item in state.confirmation_queue
-                    if str(item.get("hypothesis_id") or "") == competitor_hypothesis_id
-                    and str(item.get("candidate_ref") or "") == resolved
-                    and str(item.get("defect_fingerprint") or "")
-                    == competitor_fingerprint
-                    and str(item.get("seed_binding_identity") or "")
-                    == competitor_seed_binding_identity
-                ),
-                None,
-            )
             competitor_node = state.graph.nodes.get(resolved)
             if (
                 queued_competitor is None
@@ -11769,6 +21929,87 @@ class AgenticRecursiveAnalyzer:
         obligations = list(
             state.graph.sanitize_judge_visible_payload(obligations)
         )
+        active_failure_seed_ref = (
+            seed_builder.start_ref
+            if seed_builder is not None
+            else str(queued.get("requested_by_ref") or "")
+        )
+        contextual_path_references = []
+        contextual_edges = []
+        for ref in path:
+            path_node = state.graph.nodes.get(ref)
+            if path_node is None or not state.graph.active_revision_evidence_eligible(
+                ref
+            ):
+                raise ValueError(
+                    "active failure factual context contains an unresolved "
+                    "or revision-ineligible ref"
+                )
+            contextual_path_references.append(
+                {
+                    "raw_ref": ref,
+                    "resolved_ref": ref,
+                    "resolution_status": "resolved",
+                    "revision_provenance_status": "valid",
+                    "provenance_class": "recorded",
+                    "node": state.graph.hydrate_node(ref).compact(),
+                }
+            )
+        for source_ref, target_ref in zip(path, path[1:]):
+            contextual_edges.extend(
+                state.graph.sanitize_judge_visible_payload(
+                    state.graph.edge_context(source_ref, target_ref)
+                )
+            )
+        factual_context = (
+            build_active_failure_factual_context(
+                defect_state=defect_state,
+                seed_ref=active_failure_seed_ref,
+                candidate_entries=(
+                    {
+                        "candidate_ref": candidate_ref,
+                        "candidate_node": state.graph.hydrate_node(
+                            candidate_ref
+                        ).compact(),
+                        "path_refs": list(path),
+                        "path_references": contextual_path_references,
+                        "edges": contextual_edges,
+                    },
+                ),
+                obligations=obligations,
+                competitors=(
+                    {
+                        "hypothesis_id": str(
+                            competitor.get("hypothesis_id") or ""
+                        ),
+                        "candidate_ref": str(
+                            competitor.get("candidate_reference", {}).get(
+                                "resolved_ref"
+                            )
+                            if isinstance(
+                                competitor.get("candidate_reference"),
+                                Mapping,
+                            )
+                            else ""
+                        ),
+                        "status": str(competitor.get("status") or ""),
+                    }
+                    for competitor in competitors
+                ),
+            )
+            if (
+                not diagnostic_only
+                and active_failure_seed_ref
+                and len(path) >= 2
+            )
+            else {}
+        )
+        process_factual_context = _process_confirmation_factual_context(
+            graph=state.graph,
+            candidate_ref=candidate_ref,
+            path=path,
+            defect_state=defect_state,
+        )
         return RootConfirmationRequest(
             candidate_ref=candidate_ref,
             defect_state=defect_state,
@@ -11783,6 +22024,85 @@ class AgenticRecursiveAnalyzer:
             hypothesis_id=hypothesis_id,
             hypothesis_semantic_hash=hypothesis.semantic_hash,
             seed_binding_identity=seed_binding_identity,
+            factual_context=factual_context,
+            process_factual_context=process_factual_context,
+        )
+
+    @staticmethod
+    def _build_factor_role_request(
+        state: RecursiveAnalysisState,
+        queued: Mapping[str, Any],
+    ) -> FactorRoleRequest:
+        if str(queued.get("review_scope") or "root") != "non_root":
+            raise ValueError(
+                "factor role request requires a non_root queue entry"
+            )
+        factual = AgenticRecursiveAnalyzer._build_confirmation_request(
+            state,
+            queued,
+        )
+        summaries = []
+        seen_confirmation_identities: Set[str] = set()
+        for published in (*state.confirmed_roots, *state.co_roots):
+            confirmation = RootConfirmation.from_dict(
+                dict(published.confirmation)
+            )
+            if (
+                confirmation.status != "confirmed"
+                or confirmation.factor_role != "necessary_cause"
+                or confirmation.seed_binding_identity
+                != factual.seed_binding_identity
+                or confirmation.defect_fingerprint
+                != factual.defect_state.fingerprint
+                or confirmation.candidate_ref == factual.candidate_ref
+                or confirmation.confirmation_identity
+                in seen_confirmation_identities
+            ):
+                continue
+            seen_confirmation_identities.add(
+                confirmation.confirmation_identity
+            )
+            summaries.append(
+                {
+                    "schema": "factor-role-root-evidence-summary/v2",
+                    "candidate_ref": confirmation.candidate_ref,
+                    "hypothesis_id": confirmation.hypothesis_id,
+                    "hypothesis_semantic_hash": (
+                        confirmation.hypothesis_semantic_hash
+                    ),
+                    "confirmation_identity": (
+                        confirmation.confirmation_identity
+                    ),
+                    "defect_fingerprint": confirmation.defect_fingerprint,
+                    "seed_binding_identity": (
+                        confirmation.seed_binding_identity
+                    ),
+                    "reason": confirmation.reason,
+                    "evidence_refs": list(confirmation.evidence_refs),
+                    "recursive_path": list(confirmation.recursive_path),
+                }
+            )
+        summaries.sort(
+            key=lambda item: (
+                str(item["candidate_ref"]),
+                str(item["confirmation_identity"]),
+            )
+        )
+        return FactorRoleRequest(
+            candidate_ref=factual.candidate_ref,
+            defect_state=factual.defect_state,
+            recursive_path=factual.recursive_path,
+            candidate_reference=factual.candidate_reference,
+            recursive_path_references=factual.recursive_path_references,
+            supporting_evidence=factual.supporting_evidence,
+            opposing_evidence=factual.opposing_evidence,
+            task_obligations=factual.task_obligations,
+            confirmed_root_summaries=tuple(summaries),
+            hypothesis_id=factual.hypothesis_id,
+            hypothesis_semantic_hash=factual.hypothesis_semantic_hash,
+            seed_binding_identity=factual.seed_binding_identity,
+            analysis_perspective=factual.analysis_perspective,
+            factual_context=factual.factual_context,
         )
 
     def _record_confirmation(
@@ -11806,6 +22126,63 @@ class AgenticRecursiveAnalyzer:
             projection,
         )
 
+    @staticmethod
+    def _non_root_confirmation_has_mutual_co_root_support(
+        state: RecursiveAnalysisState,
+        confirmation: RootConfirmation,
+    ) -> bool:
+        published_roots = []
+        seen_identities: Set[str] = set()
+        for root in (*state.confirmed_roots, *state.co_roots):
+            root_confirmation = RootConfirmation.from_dict(
+                dict(root.confirmation)
+            )
+            if (
+                root_confirmation.seed_binding_identity
+                != confirmation.seed_binding_identity
+                or root_confirmation.confirmation_identity
+                in seen_identities
+            ):
+                continue
+            seen_identities.add(root_confirmation.confirmation_identity)
+            published_roots.append(root_confirmation)
+        if not published_roots:
+            return False
+
+        for root_confirmation in published_roots:
+            candidate_comparison = next(
+                (
+                    item
+                    for item in confirmation.competitor_comparisons
+                    if str(item.get("confirmation_identity") or "")
+                    == root_confirmation.confirmation_identity
+                ),
+                None,
+            )
+            root_comparison = next(
+                (
+                    item
+                    for item in root_confirmation.competitor_comparisons
+                    if str(item.get("confirmation_identity") or "")
+                    == confirmation.confirmation_identity
+                ),
+                None,
+            )
+            if (
+                not isinstance(candidate_comparison, Mapping)
+                or not isinstance(root_comparison, Mapping)
+                or str(candidate_comparison.get("status") or "") != "co_root"
+                or str(root_comparison.get("status") or "") != "co_root"
+                or candidate_comparison.get(
+                    "requires_independent_confirmation"
+                )
+                is not True
+                or root_comparison.get("requires_independent_confirmation")
+                is not True
+            ):
+                return False
+        return True
+
     def _record_validated_confirmation(
         self,
         state: RecursiveAnalysisState,
@@ -11826,9 +22203,55 @@ class AgenticRecursiveAnalyzer:
             or state.hypothesis_seed_keys.get(hypothesis_id, "")
         )
         seed_builder = state.seed_ledger.get(seed_key)
+        active_role_binding = (
+            self._active_failure_role_binding_for_request(
+                state,
+                queued=queued,
+                defect_state=state.defect_states[
+                    confirmation.defect_fingerprint
+                ],
+                candidate_node=node,
+                seed_builder=seed_builder,
+                confirmation=confirmation,
+            )
+            if confirmation.status == "confirmed"
+            else None
+        )
         owner = LocalStateOwner.from_dict(queued.get("owner"))
+        review_scope = str(queued.get("review_scope") or "root")
+        is_escalation = is_factor_role_escalation_origin(
+            queued.get("origin")
+        )
+        escalation_has_published_root = (
+            is_escalation
+            and any(
+                RootConfirmation.from_dict(
+                    dict(root.confirmation)
+                ).seed_binding_identity
+                == confirmation.seed_binding_identity
+                for root in (*state.confirmed_roots, *state.co_roots)
+            )
+        )
+        requires_mutual_root_support = (
+            review_scope == "non_root"
+            or escalation_has_published_root
+        )
+        confirmed_counts_as_root = not (
+            requires_mutual_root_support
+            and confirmation.status == "confirmed"
+            and not self._non_root_confirmation_has_mutual_co_root_support(
+                state, confirmation
+            )
+        )
         if seed_builder is not None:
-            seed_builder.record_confirmation(confirmation, owner)
+            seed_builder.record_confirmation(
+                confirmation,
+                owner,
+                unresolved_blocks_seed=(
+                    review_scope == "root" and not is_escalation
+                ),
+                confirmed_counts_as_root=confirmed_counts_as_root,
+            )
         state.confirmations.append(confirmation)
         state.confirmation_journal.append(
             {
@@ -11838,6 +22261,10 @@ class AgenticRecursiveAnalyzer:
                 "defect_fingerprint": confirmation.defect_fingerprint,
                 "seed_binding_identity": confirmation.seed_binding_identity,
                 "seed_key": seed_key,
+                "review_scope": str(
+                    queued.get("review_scope") or "root"
+                ),
+                "origin": copy.deepcopy(queued.get("origin")),
                 "owner": owner.to_dict(),
                 "recursive_path": list(confirmation.recursive_path),
                 "status": confirmation.status,
@@ -11867,6 +22294,19 @@ class AgenticRecursiveAnalyzer:
         )
         state.confirmation_action_projection.append(projection)
         if confirmation.status == "confirmed":
+            if not confirmed_counts_as_root:
+                hypothesis = state.ledger.get(hypothesis_id)
+                if hypothesis.status in {"active", "supported"}:
+                    state.ledger.reject(
+                        hypothesis_id,
+                        (
+                            "Independent non-root confirmation claimed a "
+                            "necessary-cause role without mutual co-root "
+                            "support."
+                        ),
+                    )
+                state.refresh_pending_confirmation_request_identities()
+                return
             state.introduction_hypothesis_ids.discard(hypothesis_id)
             state.unresolved_hypothesis_ids.discard(hypothesis_id)
             defect_state = state.defect_states[confirmation.defect_fingerprint]
@@ -11880,11 +22320,36 @@ class AgenticRecursiveAnalyzer:
                     defect_state=defect_state,
                     candidate_node=node,
                     seed_start_ref=seed_builder.start_ref,
+                    active_role_binding=active_role_binding,
+                    request_projection=projection[
+                        "factual_request_projection"
+                    ],
                 )
             )
             state.refresh_pending_confirmation_request_identities()
             return
         if not is_definitive_confirmation(confirmation):
+            if (
+                str(queued.get("review_scope") or "root")
+                == "non_root"
+                or is_escalation
+            ):
+                hypothesis = state.ledger.get(hypothesis_id)
+                if hypothesis.status in {"active", "supported"}:
+                    state.ledger.reject(
+                        hypothesis_id,
+                        (
+                            "Independent factor-root escalation remained "
+                            "unknown."
+                            if is_escalation
+                            else (
+                                "Independent non-root causal-role "
+                                "confirmation remained unknown."
+                            )
+                        ),
+                    )
+                state.refresh_pending_confirmation_request_identities()
+                return
             state.unresolved_hypothesis_ids.add(hypothesis_id)
             if confirmation.candidate_ref not in state.unresolved_refs:
                 state.unresolved_refs.append(confirmation.candidate_ref)
@@ -11913,22 +22378,6 @@ class AgenticRecursiveAnalyzer:
             hypothesis = state.ledger.get(hypothesis_id)
             if hypothesis.status in {"active", "supported"}:
                 state.ledger.reject(hypothesis_id, confirmation.reason)
-            if confirmation.factor_role in {
-                "contributing_condition",
-                "amplifying_factor",
-            }:
-                factor = canonical_causal_factor_publication(
-                    confirmation=confirmation,
-                    analysis_perspective=state.analysis_perspective,
-                )
-                if confirmation.factor_role == "amplifying_factor":
-                    state.amplifying_factors.append(factor)
-                else:
-                    state.contributing_conditions.append(factor)
-            else:
-                state.rejected_candidates.append(
-                    canonical_rejected_candidate_publication(confirmation)
-                )
             pending_alternatives = [
                 item
                 for item in state.confirmation_queue
@@ -12326,6 +22775,7 @@ class AgenticRecursiveAnalyzer:
                         ),
                         "analysis_perspective": state.analysis_perspective,
                         "status": "queued",
+                        "review_scope": "root",
                         "seed_key": state.hypothesis_seed_keys.get(
                             hypothesis_id, ""
                         ),

@@ -54,6 +54,15 @@ def _configure_nonzero_completed_action(action, state, *, delta=3):
         "reason": "persisted replay circuit",
         "consecutive_provider_errors": 4,
         "provider_error_threshold": 9,
+        "disposition": {
+            "retryable": True,
+            "category": "http_retryable",
+            "status_code": 503,
+            "error_code": "service_unavailable",
+            "reason": "persisted replay circuit",
+        },
+        "first_request": 1,
+        "first_failure_at": "2026-07-31T00:00:00Z",
     }
     provider["accounting"] = {
         "judge_requests": state.judge_requests + delta,

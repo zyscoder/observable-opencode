@@ -197,6 +197,14 @@ def no_defect_payload_from_prompt(prompt: str) -> dict:
                 "causal_role": (
                     "exculpatory_evidence" if index == 0 else "unrelated"
                 ),
+                "responsibility": "none",
+                "candidate_phase": "intermediate",
+                "obligation_status_before": "unknown",
+                "obligation_status_after": "unknown",
+                "repair_window_effect": "remained_open",
+                "failure_mode": "none",
+                "obligation_refs": [],
+                "contribution_mechanism": None,
                 "reason": "Grounded evidence refutes the active defect.",
                 "evidence_refs": [candidate_ref],
                 "confidence": 0.9,
@@ -858,7 +866,7 @@ class CanonicalPendingConfirmationIdentityTest(unittest.TestCase):
         self.assertTrue(state.enqueue_confirmation(queued))
         self.assertTrue(
             state.confirmation_queue[0]["semantic_identity"].startswith(
-                "confirmation_request:v3:"
+                "confirmation_request:v4:"
             )
         )
 
@@ -981,10 +989,10 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
         )
 
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v8")
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v9",
+            "global-candidate-judgment/v11",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,
@@ -998,13 +1006,13 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "confirmation-request-identity/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v20")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v22")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

@@ -37,6 +37,7 @@ from trace_attribution.recursive_analyzer import (
 )
 from tools.trace_attribution.tests.test_recursive_analyzer import (
     ConfirmingScriptedJudge,
+    FusionScriptedJudge,
     observed_trace,
     relation,
     step,
@@ -159,30 +160,31 @@ def _run_co_roots(
 def _run_non_root(role: str):
     trace = observed_trace(branching=True)
     graph = TraceGraph.from_trace(trace)
-    judge = ConfirmingScriptedJudge(
-        {
-            "record:change": step(
-                "record:change",
-                predecessors=(
-                    relation("record:context", "same_defect_propagation"),
+    judge = FusionScriptedJudge(
+        global_outcome="candidate_roots",
+        selected_candidate_refs=("record:decision",),
+        global_non_root_roles={"record:context": role},
+        factor_roles={"record:context": role},
+        confirmations={
+            "record:decision": RootConfirmation.confirmed(
+                "record:decision",
+                excerpt=(
+                    "Implement only the methods found in the first search."
                 ),
-            ),
-            "record:context": _confirmation_step,
-        },
-        {
-            "record:context": RootConfirmation.rejected(
-                "record:context",
-                "The context is not the necessary root.",
-                evidence_refs=[
-                    "record:context",
-                    "record:change",
-                    "record:observed_defect",
-                ],
-                factor_role=role,
+                reason="The decision was independently necessary.",
+                counterfactual=confirmation_counterfactual_for(
+                    "record:decision",
+                    "confirmed",
+                ),
+                confidence=0.9,
+                evidence_refs=["record:decision"],
             ),
         },
     )
-    report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+    report = AgenticRecursiveAnalyzer(
+        judge=judge,
+        fusion_mode="retrieval-global",
+    ).analyze(
         graph,
         start_refs=("record:observed_defect",),
         objective="Classify the candidate's causal role.",
@@ -222,6 +224,13 @@ def _coordinated_root_mutation(
         if item["node_ref"] == root["node_ref"]
         and item["observed_defect_refs"] == root["observed_defect_refs"]
     )
+    if field == "provenance" and isinstance(value, dict):
+        value = {
+            **copy.deepcopy(value),
+            "active_role_binding": copy.deepcopy(
+                root["provenance"]["active_role_binding"]
+            ),
+        }
     root[field] = copy.deepcopy(value)
     if field in legacy:
         legacy[field] = copy.deepcopy(value)
@@ -336,7 +345,12 @@ class PerSeedRootPublicationTest(unittest.TestCase):
         ) in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 graph = TraceGraph.from_trace(trace)
-                config = shared_root_checkpoint_config(trace, objective, start_refs)
+                config = shared_root_checkpoint_config(
+                    trace,
+                    objective,
+                    start_refs,
+                    fusion_mode="off",
+                )
                 if perspective:
                     config = {
                         **config,
@@ -516,7 +530,10 @@ class PerSeedRootPublicationTest(unittest.TestCase):
                     "provenance",
                     lambda payload: payload["confirmed_roots"][0].__setitem__(
                         "provenance",
-                        {"publication_contract": "forged"},
+                        {
+                            **payload["confirmed_roots"][0]["provenance"],
+                            "publication_contract": "forged",
+                        },
                     ),
                 ),
             ):
@@ -690,20 +707,20 @@ class Fix39PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v9",
+            "recursive-attribution-output/v15",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v18",
+            "recursive-analysis-actions/v25",
         )
 
 

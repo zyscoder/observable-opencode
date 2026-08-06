@@ -8,13 +8,22 @@ type StatusEntry = {
   path: string
 }
 
+type FileMetadata = {
+  kind: "file" | "directory" | "symlink" | "other" | "missing"
+  size?: number
+  mode?: number
+  mtime_ms?: number
+}
+
 export type RepositorySnapshot = {
   available: boolean
+  content_mode?: "index_only"
   root?: string
   head?: string
   status?: string
   fingerprint?: string
   file_hashes?: Record<string, string>
+  file_metadata?: Record<string, FileMetadata>
   entries?: StatusEntry[]
 }
 
@@ -65,11 +74,46 @@ function fileHash(root: string, file: string) {
   if (relative.startsWith("..") || path.isAbsolute(relative)) return "outside_repository"
   try {
     const stat = fs.lstatSync(target)
-    if (stat.isSymbolicLink()) return `symlink:${fs.readlinkSync(target)}`
+    if (stat.isSymbolicLink()) {
+      const targetDigest = createHash("sha256").update(fs.readlinkSync(target)).digest("hex")
+      return `symlink_sha256:${targetDigest}`
+    }
     if (!stat.isFile()) return `non_file:${stat.mode}`
-    return createHash("sha256").update(fs.readFileSync(target)).digest("hex")
+    const digest = createHash("sha256")
+    const fd = fs.openSync(target, "r")
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    try {
+      let bytesRead = 0
+      do {
+        bytesRead = fs.readSync(fd, buffer, 0, buffer.byteLength, null)
+        if (bytesRead) digest.update(buffer.subarray(0, bytesRead))
+      } while (bytesRead)
+    } finally {
+      fs.closeSync(fd)
+    }
+    return digest.digest("hex")
   } catch {
     return "deleted"
+  }
+}
+
+function fileMetadata(root: string, file: string): FileMetadata {
+  const target = path.resolve(root, file)
+  const relative = path.relative(root, target)
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return { kind: "missing" }
+  try {
+    const stat = fs.lstatSync(target)
+    const common = {
+      size: stat.size,
+      mode: stat.mode,
+      mtime_ms: stat.mtimeMs,
+    }
+    if (stat.isSymbolicLink()) return { ...common, kind: "symlink" }
+    if (stat.isFile()) return { ...common, kind: "file" }
+    if (stat.isDirectory()) return { ...common, kind: "directory" }
+    return { ...common, kind: "other" }
+  } catch {
+    return { kind: "missing" }
   }
 }
 
@@ -106,14 +150,17 @@ export function captureRepositorySnapshot(cwd: string): RepositorySnapshot {
   if (rawStatus === undefined) return { available: false, root, head }
   const entries = parseStatus(rawStatus)
   const fileHashes = Object.fromEntries(entries.map((item) => [item.path, fileHash(root, item.path)]))
+  const fileMetadataIndex = Object.fromEntries(entries.map((item) => [item.path, fileMetadata(root, item.path)]))
   const fingerprint = createHash("sha256").update(JSON.stringify({ head, fileHashes })).digest("hex")
   return {
     available: true,
+    content_mode: "index_only",
     root,
     head,
     status: entries.map((item) => `${item.code} ${item.path}`).join("\n"),
     fingerprint,
     file_hashes: fileHashes,
+    file_metadata: fileMetadataIndex,
     entries,
   }
 }

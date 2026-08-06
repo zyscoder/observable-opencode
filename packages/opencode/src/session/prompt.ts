@@ -1664,6 +1664,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           },
         })
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        if (!session.parentID) CaseTrace.setSessionID(input.sessionID)
         yield* revert.cleanup(session)
         const message = yield* createUserMessage(input)
         const userMessageNode = CaseTrace.promptAssembly({

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from trace_attribution.candidate_budget import select_global_candidates
 from trace_attribution.causal_state import CausalCandidate, DefectState
 from trace_attribution import evidence_capsule
 from trace_attribution.evidence_capsule import (
@@ -14,10 +15,52 @@ from trace_attribution.evidence_capsule import (
     build_candidate_evidence_capsules,
     candidate_compression_metrics,
     validate_candidate_evidence_capsule_against_graph,
+    validate_candidate_funnel,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
 from trace_attribution.models import stable_json
+from trace_attribution.recursive_analyzer import (
+    _capsule_route_from_validation_source,
+)
+from trace_attribution.restoration_obligation import RestorationObligation
+
+
+def legacy_candidate_funnel(payload, schema):
+    funnel = copy.deepcopy(payload)
+    funnel["schema"] = schema
+    for key in (
+        "evidence_context_count",
+        "evidence_context_refs",
+        "context_reasons",
+        "reserved_episode_refs",
+    ):
+        funnel.pop(key)
+    for counts in funnel["counts_by_category"].values():
+        counts.pop("evidence_context")
+    for entry in funnel["candidate_audit"]:
+        entry.pop("context_rank")
+        entry.pop("assessment_eligible")
+        for key in (
+            "grounded_hops",
+            "episode_key",
+            "episode_role",
+            "reserve_rank",
+            "reserve_disposition",
+            "reserve_reason",
+        ):
+            entry.pop(key)
+    if schema == "candidate-budget-funnel/v1":
+        funnel.pop("grounded_decision_refs")
+    unsigned = {
+        key: value
+        for key, value in funnel.items()
+        if key != "selection_identity"
+    }
+    funnel["selection_identity"] = hashlib.sha256(
+        stable_json(unsigned).encode("utf-8")
+    ).hexdigest()
+    return funnel
 
 
 def sample_graph(
@@ -252,15 +295,161 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "candidate identity"):
                     CandidateEvidenceCapsule.from_dict(payload)
 
-    def test_capsule_v7_round_trip_rejects_stale_v6_identity(self):
+    def test_capsule_v8_round_trip_rejects_stale_v7_identity(self):
         payload = self._decision_capsule().to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v7")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v8")
         self.assertEqual(CandidateEvidenceCapsule.from_dict(payload).to_dict(), payload)
 
-        payload["schema_version"] = "candidate-evidence-capsule/v6"
+        payload["schema_version"] = "candidate-evidence-capsule/v7"
         with self.assertRaisesRegex(ValueError, "schema mismatch"):
             CandidateEvidenceCapsule.from_dict(payload)
+
+    def test_capsule_round_trip_preserves_self_ref_diagnostic_fallback(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "capsule-self-ref-fallback",
+                "records": [
+                    {
+                        "record_id": "context",
+                        "component": "context",
+                        "event_type": "context.snapshot",
+                        "data": {"text": "The compatibility contract."},
+                    },
+                    {
+                        "record_id": "change",
+                        "component": "processor",
+                        "event_type": "change",
+                        "data": {"summary": "The implementation change."},
+                    },
+                    {
+                        "record_id": "defect",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "data": {"actual": "The required behavior is absent."},
+                    },
+                ],
+                "dataflow_edges": [
+                    {
+                        "from": {"type": "record", "id": "context"},
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "context_available_to_change",
+                        "evidence_type": "confirmed",
+                        "confidence": 0.8,
+                        "eligible_for_attribution": True,
+                    },
+                    {
+                        "from": {"type": "record", "id": "change"},
+                        "to": {"type": "record", "id": "defect"},
+                        "relation": "change_exposed_by_evaluation",
+                        "evidence_type": "confirmed",
+                        "confidence": 1.0,
+                        "eligible_for_attribution": True,
+                    },
+                ],
+            }
+        )
+        candidate = CausalCandidate(
+            ref="record:context",
+            node=graph.nodes["record:context"],
+            source="confirmed_edge",
+            edge=graph.edge_context(
+                "record:context", "record:change"
+            )[0],
+            score=0.9,
+        )
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:context": (
+                    "record:context",
+                    "record:change",
+                    "record:defect",
+                )
+            },
+            start_refs=("record:defect",),
+        )[0]
+        replayed_route = _capsule_route_from_validation_source(
+            graph,
+            capsule,
+        )
+        self.assertEqual(replayed_route.evidence_refs, ())
+
+        validate_candidate_evidence_capsule_against_graph(
+            graph,
+            CandidateEvidenceCapsule.from_dict(capsule.to_dict()),
+            authoritative_candidates=(replayed_route,),
+        )
+
+    def test_capsule_v8_binds_applicable_obligation_and_episode_facts(self):
+        graph = sample_graph()
+        obligation = RestorationObligation.create(
+            obligation_id="restore-sigint-cleanup",
+            kind="observed_defect_remediation",
+            baseline_state="preexisting_missing",
+            required_end_state="cleanup completes after SIGINT",
+            required_capabilities=("signal_cleanup",),
+            scope_refs=("record:decision",),
+            acceptance_evidence_refs=("record:observed_defect",),
+            provenance={
+                "source": "external_quality_review",
+                "source_refs": ("record:observed_defect",),
+                "derivation": "reviewed active defect",
+            },
+        )
+
+        capsule = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[self._decision_candidate(graph)],
+            defect_state=DefectState.create(
+                label="sigint_cleanup_interrupted",
+                expected="cleanup completes",
+                actual="cleanup interrupted",
+                mechanism="cancellation mismatch",
+                scope="task_quality",
+            ),
+            downstream_paths={
+                "record:decision": (
+                    "record:decision",
+                    "record:observed_defect",
+                )
+            },
+            start_refs=("record:observed_defect",),
+            restoration_obligations=(obligation,),
+            episode_facts_by_ref={
+                "record:decision": {
+                    "episode_key": "episode:v1:test",
+                    "episode_role": "authored_plan",
+                    "grounded_hops": 1,
+                }
+            },
+        )[0]
+        payload = capsule.to_dict()
+
+        self.assertEqual(
+            payload["restoration_obligations"],
+            [obligation.to_dict()],
+        )
+        self.assertEqual(
+            payload["episode_facts"],
+            {
+                "episode_key": "episode:v1:test",
+                "episode_role": "authored_plan",
+                "grounded_hops": 1,
+            },
+        )
+        self.assertEqual(
+            CandidateEvidenceCapsule.from_dict(payload),
+            capsule,
+        )
 
     def test_synthetic_route_requires_exact_navigation_only_fact(self):
         _, _, capsule = self._synthetic_prompt_capsule()
@@ -790,7 +979,7 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         graph = sample_graph()
         payload = self._decision_capsule(graph).to_dict()
 
-        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v7")
+        self.assertEqual(payload["schema_version"], "candidate-evidence-capsule/v8")
         self.assertEqual(
             set(payload["validation_source"]),
             {
@@ -1466,6 +1655,281 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         self.assertEqual(metrics["candidate_node_reduction_ratio"], 0.8)
         self.assertGreater(metrics["capsule_bytes"], 0)
 
+    def test_compression_metrics_optionally_persists_a_validated_funnel(self):
+        graph = sample_graph()
+        defect = DefectState.create(
+            label="sigint_cleanup_interrupted",
+            expected="cleanup completes",
+            actual="cleanup interrupted",
+            mechanism="cancellation mismatch",
+            scope="task_quality",
+        )
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="semantic_fallback",
+            score=0.8,
+        )
+        capsules = build_candidate_evidence_capsules(
+            graph=graph,
+            candidates=[candidate],
+            defect_state=defect,
+            downstream_paths={},
+            start_refs=("record:observed_defect",),
+        )
+        funnel = select_global_candidates(
+            graph,
+            [candidate],
+        ).to_dict()
+
+        legacy_metrics = candidate_compression_metrics(graph, capsules)
+        metrics = candidate_compression_metrics(
+            graph,
+            capsules,
+            candidate_funnel=funnel,
+        )
+        funnel["policy"]["total_limit"] = 0
+
+        self.assertNotIn("candidate_funnel", legacy_metrics)
+        self.assertEqual(
+            set(metrics),
+            set(legacy_metrics) | {"candidate_funnel"},
+        )
+        self.assertEqual(
+            metrics["candidate_funnel"]["schema"],
+            "candidate-budget-funnel/v4",
+        )
+        self.assertEqual(
+            metrics["candidate_funnel"]["policy"]["total_limit"], 24)
+
+    def test_funnel_validation_preserves_explicit_grounded_decision_quality_order(
+        self,
+    ):
+        graph = sample_graph()
+        decisions = tuple(
+            CausalCandidate(
+                ref="record:decision-{0}".format(index),
+                node=graph.nodes["record:decision"],
+                source="confirmed_edge",
+            )
+            for index in range(5)
+        )
+        quality_order = tuple(
+            candidate.ref for candidate in reversed(decisions)
+        )
+        funnel = select_global_candidates(
+            graph,
+            decisions,
+            grounded_decision_refs=quality_order,
+        ).to_dict()
+
+        validated = validate_candidate_funnel(funnel)
+
+        self.assertEqual(
+            validated["grounded_decision_refs"],
+            list(quality_order),
+        )
+        self.assertEqual(
+            validated["reserved_grounded_decision_refs"],
+            list(quality_order[:4]),
+        )
+
+    def test_compression_metrics_restores_a_signed_legacy_v1_funnel(self):
+        graph = sample_graph()
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        legacy_funnel = legacy_candidate_funnel(
+            select_global_candidates(
+                graph,
+                [candidate],
+            ).to_dict(),
+            "candidate-budget-funnel/v1",
+        )
+
+        metrics = candidate_compression_metrics(
+            graph,
+            (),
+            candidate_funnel=legacy_funnel,
+        )
+
+        self.assertEqual(
+            metrics["candidate_funnel"]["schema"],
+            "candidate-budget-funnel/v1",
+        )
+        self.assertNotIn(
+            "grounded_decision_refs",
+            metrics["candidate_funnel"],
+        )
+
+    def test_compression_metrics_restores_a_signed_legacy_v2_funnel(self):
+        graph = sample_graph()
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        legacy_funnel = legacy_candidate_funnel(
+            select_global_candidates(
+                graph,
+                [candidate],
+            ).to_dict(),
+            "candidate-budget-funnel/v2",
+        )
+
+        metrics = candidate_compression_metrics(
+            graph,
+            (),
+            candidate_funnel=legacy_funnel,
+        )
+
+        self.assertEqual(
+            metrics["candidate_funnel"]["schema"],
+            "candidate-budget-funnel/v2",
+        )
+
+    def test_legacy_v1_funnel_rejects_a_resigned_count_mismatch(self):
+        graph = sample_graph()
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        legacy_funnel = legacy_candidate_funnel(
+            select_global_candidates(
+                graph,
+                [candidate],
+            ).to_dict(),
+            "candidate-budget-funnel/v1",
+        )
+        legacy_funnel["discovered_count"] = 2
+        unsigned = {
+            key: value
+            for key, value in legacy_funnel.items()
+            if key != "selection_identity"
+        }
+        legacy_funnel["selection_identity"] = hashlib.sha256(
+            stable_json(unsigned).encode("utf-8")
+        ).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "counts"):
+            candidate_compression_metrics(
+                graph,
+                (),
+                candidate_funnel=legacy_funnel,
+            )
+
+    def test_compression_metrics_rejects_a_non_schema_candidate_funnel(self):
+        graph = sample_graph()
+
+        with self.assertRaisesRegex(ValueError, "candidate_funnel"):
+            candidate_compression_metrics(
+                graph,
+                (),
+                candidate_funnel={"selection_identity": "not-a-funnel"},
+            )
+
+    def test_compression_metrics_rejects_offered_count_above_declared_limit(self):
+        graph = sample_graph()
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        funnel = legacy_candidate_funnel(
+            select_global_candidates(
+                graph,
+                [candidate],
+            ).to_dict(),
+            "candidate-budget-funnel/v1",
+        )
+        funnel["policy"]["total_limit"] = 0
+        unsigned = {
+            key: value
+            for key, value in funnel.items()
+            if key != "selection_identity"
+        }
+        funnel["selection_identity"] = hashlib.sha256(
+            stable_json(unsigned).encode("utf-8")
+        ).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "exceeds its policy"):
+            candidate_compression_metrics(
+                graph,
+                (),
+                candidate_funnel=funnel,
+            )
+
+    def test_v2_funnel_rejects_resigned_policy_outside_discovered_count_tier(self):
+        graph = sample_graph()
+        candidates = [
+            CausalCandidate(
+                ref="record:synthetic_{0:02d}".format(index),
+                node=graph.nodes["record:decision"],
+                source="semantic_fallback",
+            )
+            for index in range(30)
+        ]
+        funnel = select_global_candidates(
+            graph,
+            candidates,
+        ).to_dict()
+        funnel["policy"] = {
+            "total_limit": 24,
+            "grounded_decision_reserve": 0,
+        }
+        unsigned = {
+            key: value
+            for key, value in funnel.items()
+            if key != "selection_identity"
+        }
+        funnel["selection_identity"] = hashlib.sha256(
+            stable_json(unsigned).encode("utf-8")
+        ).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "quality-first policy"):
+            validate_candidate_funnel(funnel)
+
+    def test_compression_metrics_replays_reserved_then_discovered_order(self):
+        graph = sample_graph()
+        ordinary = CausalCandidate(
+            ref="record:tool_call",
+            node=graph.nodes["record:tool_call"],
+            source="confirmed_edge",
+        )
+        decision = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        funnel = select_global_candidates(
+            graph,
+            [ordinary, decision],
+            grounded_decision_refs=[decision.ref],
+        ).to_dict()
+        first, second = funnel["candidate_audit"]
+        first["offered_rank"], second["offered_rank"] = (
+            second["offered_rank"],
+            first["offered_rank"],
+        )
+        unsigned = {
+            key: value
+            for key, value in funnel.items()
+            if key != "selection_identity"
+        }
+        funnel["selection_identity"] = hashlib.sha256(
+            stable_json(unsigned).encode("utf-8")
+        ).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "selection algorithm"):
+            candidate_compression_metrics(
+                graph,
+                (),
+                candidate_funnel=funnel,
+            )
+
     def test_global_fusion_payload_gate_rejects_oversized_negative_compression(self):
         eligible = evidence_capsule.global_fusion_payload_decision(
             {
@@ -1477,14 +1941,23 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         oversized = evidence_capsule.global_fusion_payload_decision(
             {
                 "trace_json_bytes": 1_591,
-                "capsule_bytes": 38_966,
+                "capsule_bytes": 77_932,
                 "open_root_candidate_count": 4,
             }
+        )
+        oversized_but_compressed = (
+            evidence_capsule.global_fusion_payload_decision(
+                {
+                    "trace_json_bytes": 45_915_863,
+                    "capsule_bytes": 1_690_498,
+                    "open_root_candidate_count": 29,
+                }
+            )
         )
         bounded_matrix = evidence_capsule.global_fusion_payload_decision(
             {
                 "trace_json_bytes": 1_591,
-                "capsule_bytes": 38_966,
+                "capsule_bytes": 77_932,
                 "open_root_candidate_count": 1,
             }
         )
@@ -1498,6 +1971,11 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
         )
         self.assertGreater(
             oversized["capsule_to_trace_expansion_ratio"], 20.0
+        )
+        self.assertFalse(oversized_but_compressed["eligible"])
+        self.assertEqual(
+            oversized_but_compressed["reason"],
+            "oversized_dense_root_matrix",
         )
         self.assertTrue(bounded_matrix["eligible"])
         self.assertEqual(

@@ -14,6 +14,8 @@ from .graph import (
 )
 from .models import TraceNode, stable_json
 from .progress import active_progress_navigation_window
+from .reconstruction import reconstruct_obligation_gap_candidates
+from .restoration_obligation import ObligationGapCandidate
 
 
 SIBLING_REFERENCE_KEYS = (
@@ -62,6 +64,7 @@ EVIDENCE_ONLY_EVENT_TYPES = (
 )
 ROOT_INELIGIBLE_EVENT_TYPES = EVIDENCE_ONLY_EVENT_TYPES | frozenset(
     {
+        "agent.lifecycle",
         "context.pack",
         "run.start",
     }
@@ -73,6 +76,115 @@ GLOBAL_ROOT_INELIGIBLE_EVENT_TYPES = frozenset(
     }
 )
 MATERIALIZED_RESULT_EVENT_TYPES = frozenset({"change"})
+
+
+def obligation_gap_causal_candidates(
+    graph: TraceGraph,
+) -> Tuple[CausalCandidate, ...]:
+    """Project immutable omission facts as navigation-only causal candidates."""
+    output = []
+    for gap in reconstruct_obligation_gap_candidates(graph):
+        node = graph.nodes.get(gap.decision_ref)
+        if node is None or not graph.active_revision_evidence_eligible(gap.decision_ref):
+            continue
+        if gap.offline_path_provenance:
+            offline_edge = dict(gap.offline_path_provenance[0])
+        else:
+            failure_path = next(
+                (
+                    path
+                    for path in gap.confirmed_path_provenance
+                    if path[-1]
+                    in gap.downstream_failure_signature_refs
+                ),
+                (),
+            )
+            if not failure_path:
+                continue
+            offline_edge = {
+                "from_ref": gap.decision_ref,
+                "to_ref": failure_path[-1],
+                "relation": "authored_obligation_gap_confirmed_path",
+                "evidence_type": "confirmed_path_provenance",
+                "evidence_refs": list(gap.evidence_refs),
+                "eligible_for_attribution": True,
+                "confirmed_fact": True,
+                "inference_method": gap.reconstruction_rule,
+                "edge_origin": "trace.confirmed_path_provenance",
+            }
+        offline_edge["evidence_refs"] = list(offline_edge["evidence_refs"])
+        offline_edge["retrieval_candidate"] = True
+        offline_edge["obligation_gap"] = gap.to_dict()
+        output.append(
+            CausalCandidate(
+                ref=gap.decision_ref,
+                node=node,
+                source="obligation_gap_reconstruction",
+                edge=offline_edge,
+                score=1.0,
+                evidence_refs=gap.evidence_refs,
+            )
+        )
+    return tuple(
+        sorted(
+            output,
+            key=lambda item: (
+                str(item.edge["obligation_gap"]["identity"]),
+                item.ref,
+            ),
+        )
+    )
+
+
+def obligation_gap_for_candidate(
+    candidate: CausalCandidate,
+) -> Optional[ObligationGapCandidate]:
+    if candidate.source != "obligation_gap_reconstruction":
+        return None
+    raw_gap = candidate.to_dict().get("edge", {}).get("obligation_gap")
+    try:
+        gap = ObligationGapCandidate.from_dict(raw_gap)
+    except (TypeError, ValueError):
+        return None
+    if (
+        gap.decision_ref != candidate.ref
+        or (
+            candidate.edge.get("evidence_type")
+            == "offline_reconstruction"
+            and candidate.edge.get("confirmed_fact") is not False
+        )
+        or (
+            candidate.edge.get("evidence_type")
+            == "confirmed_path_provenance"
+            and candidate.edge.get("confirmed_fact") is not True
+        )
+        or candidate.edge.get("evidence_type")
+        not in {"offline_reconstruction", "confirmed_path_provenance"}
+    ):
+        return None
+    return gap
+
+
+def obligation_gaps_for_candidate(
+    candidate: CausalCandidate,
+) -> Tuple[ObligationGapCandidate, ...]:
+    output = []
+    direct = obligation_gap_for_candidate(candidate)
+    if direct is not None:
+        output.append(direct)
+    raw_enrichments = candidate.to_dict().get("edge", {}).get(
+        "attribution_only_obligation_gaps"
+    )
+    if isinstance(raw_enrichments, (list, tuple)):
+        for raw_gap in raw_enrichments:
+            try:
+                gap = ObligationGapCandidate.from_dict(raw_gap)
+            except (TypeError, ValueError):
+                continue
+            if gap.decision_ref == candidate.ref:
+                output.append(gap)
+    unique = {gap.identity: gap for gap in output}
+    return tuple(unique[key] for key in sorted(unique))
 
 
 class SemanticPredecessorRetriever:
@@ -397,10 +509,39 @@ def canonicalize_ranked_candidates(
             order.append(resolved)
             routes_by_ref[resolved] = []
         routes_by_ref[resolved].append(candidate)
-    return [
-        canonical_candidate_route(graph, ref, routes_by_ref[ref])
-        for ref in order[:limit]
-    ]
+    output = []
+    for ref in order:
+        routes = routes_by_ref[ref]
+        gaps_by_identity = {
+            gap.identity: gap
+            for route in routes
+            for gap in (obligation_gap_for_candidate(route),)
+            if gap is not None
+        }
+        canonical = canonical_candidate_route(graph, ref, routes)
+        if canonical.source == "confirmed_edge" or not gaps_by_identity:
+            output.append(canonical)
+            continue
+        non_gap_routes = [
+            route
+            for route in routes
+            if obligation_gap_for_candidate(route) is None
+        ]
+        for identity in sorted(gaps_by_identity):
+            gap_routes = [
+                route
+                for route in routes
+                for gap in (obligation_gap_for_candidate(route),)
+                if gap is not None and gap.identity == identity
+            ]
+            output.append(
+                canonical_candidate_route(
+                    graph,
+                    ref,
+                    (*gap_routes, *non_gap_routes),
+                )
+            )
+    return output[:limit]
 
 
 def canonical_candidate_route(
@@ -411,7 +552,20 @@ def canonical_candidate_route(
     """Choose stable route facts while retaining score only for ref ranking."""
     if not routes:
         raise ValueError("candidate route group cannot be empty")
-    recorded_routes: List[Tuple[int, str, Mapping[str, Any]]] = []
+    obligation_gap_routes = [
+        (gap.identity, route, gap)
+        for route in routes
+        for gap in (obligation_gap_for_candidate(route),)
+        if gap is not None
+    ]
+    all_obligation_gaps = {
+        gap.identity: gap
+        for route in routes
+        for gap in obligation_gaps_for_candidate(route)
+    }
+    recorded_routes: List[
+        Tuple[int, str, Mapping[str, Any], CausalCandidate]
+    ] = []
     for route in routes:
         target_ref = graph.resolve(str(route.edge.get("to_ref") or ""))
         if not target_ref:
@@ -424,16 +578,68 @@ def canonical_candidate_route(
                 and evidence_type
                 == str(route.edge.get("evidence_type") or "")
             ):
-                confirmed = evidence_type in {"confirmed", "content_matched"}
+                confirmed = (
+                    route.source == "confirmed_edge"
+                    or evidence_type in {"confirmed", "content_matched"}
+                )
                 recorded_routes.append(
                     (
                         0 if confirmed else 1,
                         "confirmed_edge" if confirmed else "attribution_edge",
                         edge,
+                        route,
                     )
                 )
+    confirmed_recorded_routes = [
+        item for item in recorded_routes if item[0] == 0
+    ]
+    if confirmed_recorded_routes:
+        _, source, edge, canonical = min(
+            confirmed_recorded_routes,
+            key=lambda item: (
+                str(item[2].get("relation") or ""),
+                stable_json(item[2]),
+            ),
+        )
+        enriched_edge = dict(edge)
+        if all_obligation_gaps:
+            enriched_edge["attribution_only_obligation_gaps"] = [
+                all_obligation_gaps[identity].to_dict()
+                for identity in sorted(all_obligation_gaps)
+            ]
+        return CausalCandidate(
+            ref=resolved_ref,
+            node=canonical.node,
+            source=source,
+            edge=enriched_edge,
+            score=max(
+                item[3].score for item in confirmed_recorded_routes
+            ),
+            evidence_refs=canonical.evidence_refs,
+        )
+    if obligation_gap_routes:
+        _, canonical, _ = min(
+            obligation_gap_routes,
+            key=lambda item: (item[0], stable_json(item[1].edge)),
+        )
+        enriched_edge = dict(canonical.edge)
+        enriched_edge["attribution_only_obligation_gaps"] = [
+            all_obligation_gaps[identity].to_dict()
+            for identity in sorted(all_obligation_gaps)
+        ]
+        return CausalCandidate(
+            ref=resolved_ref,
+            node=canonical.node,
+            source=canonical.source,
+            edge=enriched_edge,
+            score=max(
+                route.score
+                for _, route, _ in obligation_gap_routes
+            ),
+            evidence_refs=canonical.evidence_refs,
+        )
     if recorded_routes:
-        _, source, edge = min(
+        _, source, edge, canonical = min(
             recorded_routes,
             key=lambda item: (
                 item[0],
@@ -441,7 +647,6 @@ def canonical_candidate_route(
                 stable_json(item[2]),
             ),
         )
-        canonical = routes[0]
         return CausalCandidate(
             ref=resolved_ref,
             node=canonical.node,
@@ -665,6 +870,22 @@ def authored_root_candidate_eligible(graph: TraceGraph, ref: str) -> bool:
         and node is not None
         and graph.active_revision_evidence_eligible(resolved)
         and root_candidate_eligible(node)
+    )
+
+
+def non_root_factor_candidate_eligible(
+    graph: TraceGraph, ref: str
+) -> bool:
+    """Allow active grounded observations to receive an independent factor role."""
+    resolved = graph.resolve(ref)
+    node = graph.nodes.get(resolved or "")
+    return bool(
+        resolved
+        and resolved == ref
+        and node is not None
+        and graph.active_revision_evidence_eligible(resolved)
+        and not is_navigation_node(node)
+        and node.event_type.strip().lower() != "run.start"
     )
 
 

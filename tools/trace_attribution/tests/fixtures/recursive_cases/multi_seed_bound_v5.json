@@ -1,0 +1,272 @@
+{
+  "case_id": "multi-seed-bound-v5",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "manifest": {
+    "case_id": "multi-seed-bound-v5",
+    "run_id": "multi-seed-bound-v5-run",
+    "subject_revision": "git:multi-seed-bound-v5",
+    "subject_revision_provenance": {
+      "method": "case_trace_config",
+      "source": "CaseTraceConfig.subjectRevision",
+      "bound_at": "case_start",
+      "case_id": "multi-seed-bound-v5",
+      "run_id": "multi-seed-bound-v5-run"
+    }
+  },
+  "records": [
+    {
+      "record_id": "prompt",
+      "component": "prompt",
+      "event_type": "prompt.assembly",
+      "data": {
+        "text": "Implement complete request validation and repair the existing retry defect."
+      }
+    },
+    {
+      "record_id": "agent_scope_decision",
+      "component": "processor",
+      "event_type": "decision",
+      "source_refs": ["record:prompt"],
+      "data": {
+        "rationale": "Only validate the first request field to finish quickly.",
+        "chosen_action": "implement_partial_validation"
+      }
+    },
+    {
+      "record_id": "agent_partial_change",
+      "component": "tool",
+      "event_type": "change",
+      "source_refs": ["record:agent_scope_decision"],
+      "data": {
+        "files": ["service/validation.py"],
+        "summary": "Validated only the first request field."
+      }
+    },
+    {
+      "record_id": "baseline_retry_defect",
+      "component": "repository",
+      "event_type": "repository.fact",
+      "source_refs": ["record:prompt"],
+      "data": {
+        "path": "service/retry.py",
+        "fact": "The baseline retries permanent failures forever."
+      }
+    },
+    {
+      "record_id": "skip_baseline_repair",
+      "component": "processor",
+      "event_type": "decision",
+      "source_refs": ["record:baseline_retry_defect"],
+      "data": {
+        "rationale": "Leave retry behavior unchanged because it predates this task.",
+        "chosen_action": "skip_required_baseline_repair"
+      }
+    },
+    {
+      "record_id": "shared_timeout",
+      "component": "harness",
+      "event_type": "run.interruption",
+      "data": {
+        "reason": "The validation and retry checks exhausted the shared case deadline."
+      }
+    },
+    {
+      "record_id": "observed_agent_scope_loss",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "source_refs": [
+        "record:agent_partial_change",
+        "record:shared_timeout"
+      ],
+      "data": {
+        "subject_revision": "git:multi-seed-bound-v5",
+        "revision_provenance_status": "valid",
+        "failure_type": "partial_request_validation",
+        "expected": "Every request field is validated.",
+        "actual": "Only the first request field is validated.",
+        "mechanism": "The Agent narrowed the implementation scope.",
+        "scope": "request_validation"
+      }
+    },
+    {
+      "record_id": "observed_baseline_failure",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "source_refs": [
+        "record:skip_baseline_repair",
+        "record:shared_timeout"
+      ],
+      "data": {
+        "subject_revision": "git:multi-seed-bound-v5",
+        "revision_provenance_status": "valid",
+        "failure_type": "permanent_failure_retry_loop",
+        "expected": "Permanent failures stop after the configured retry limit.",
+        "actual": "The pre-existing infinite retry remains unrepaired.",
+        "mechanism": "The Agent declined to repair a baseline defect required by the task.",
+        "scope": "retry_control"
+      }
+    }
+  ],
+  "dataflow_edges": [],
+  "human_labels": {
+    "schema_version": "recursive-attribution-labels/v5",
+    "case_id": "multi-seed-bound-v5",
+    "source_binding": {
+      "trace_sha256": "sha256:5c104155bd853587fd73f145340fb39ac0216791144473a776241dd0e627a410",
+      "review_sha256": "",
+      "evaluation_sha256": [],
+      "effective_trace_sha256": "sha256:5c104155bd853587fd73f145340fb39ac0216791144473a776241dd0e627a410",
+      "subject_revision": "git:multi-seed-bound-v5",
+      "revision_provenance_status": "valid"
+    },
+    "seeds": [
+      {
+        "defect_id": "agent-introduced-scope-loss",
+        "start_ref": "record:observed_agent_scope_loss",
+        "defect_fingerprint": "89a849120090bd37d6ec",
+        "seed_binding_identity": "seed:40fa397fcb54019ed177c763",
+        "seed_semantic_anchor_id": "semantic_anchor:v2:2c2b8216d4939bafd2c4a4a6",
+        "seed_semantic_occurrence_id": "semantic_occurrence:v1:fa72a8f38e907d20c0a3b170",
+        "seed_source_bindings": [
+          {
+            "source_kind": "raw_trace",
+            "source_index": 0,
+            "source_sha256": "sha256:5c104155bd853587fd73f145340fb39ac0216791144473a776241dd0e627a410"
+          }
+        ],
+        "defect_origin_kind": "introduced_by_agent",
+        "expected_outcome": "confirmed_root",
+        "roots": [
+          {
+            "node_ref": "record:agent_scope_decision",
+            "semantic_anchor_id": "semantic_anchor:v2:af0adda37a4c5e11da812915",
+            "semantic_occurrence_id": "semantic_occurrence:v1:5c64e29e05a9eb4ae9393290"
+          }
+        ],
+        "conditions": [],
+        "amplifiers": [],
+        "materializations": [],
+        "unrelated": [],
+        "forbidden_roots": [],
+        "allowed_unresolved_outcomes": []
+      },
+      {
+        "defect_id": "baseline-existing-unrepaired",
+        "start_ref": "record:observed_baseline_failure",
+        "defect_fingerprint": "ea3767a2dbb1dfb9fc06",
+        "seed_binding_identity": "seed:69da091c456351de9ff86507",
+        "seed_semantic_anchor_id": "semantic_anchor:v2:64bf513ff40ffd90eb166f85",
+        "seed_semantic_occurrence_id": "semantic_occurrence:v1:5d84146a919a33698aabd8a2",
+        "seed_source_bindings": [
+          {
+            "source_kind": "raw_trace",
+            "source_index": 0,
+            "source_sha256": "sha256:5c104155bd853587fd73f145340fb39ac0216791144473a776241dd0e627a410"
+          }
+        ],
+        "defect_origin_kind": "baseline_existing_unrepaired",
+        "expected_outcome": "confirmed_root",
+        "roots": [
+          {
+            "node_ref": "record:skip_baseline_repair",
+            "semantic_anchor_id": "semantic_anchor:v2:3b05e1c110484e2976528f34",
+            "semantic_occurrence_id": "semantic_occurrence:v1:f12d9f68a6892cd07738d99e"
+          }
+        ],
+        "conditions": [],
+        "amplifiers": [],
+        "materializations": [],
+        "unrelated": [],
+        "forbidden_roots": [],
+        "allowed_unresolved_outcomes": []
+      }
+    ],
+    "case_shared_factors": [
+      {
+        "factor_role": "amplifying_factor",
+        "seed_binding_identities": [
+          "seed:40fa397fcb54019ed177c763",
+          "seed:69da091c456351de9ff86507"
+        ],
+        "node_ref": "record:shared_timeout",
+        "semantic_anchor_id": "semantic_anchor:v2:d72e5617c879712fbca7ed60",
+        "semantic_occurrence_id": "semantic_occurrence:v1:1dcc89e1cd915b5af2e9195d"
+      }
+    ]
+  },
+  "scripted_analysis": {
+    "start_refs": [
+      "record:observed_agent_scope_loss",
+      "record:observed_baseline_failure"
+    ],
+    "steps": {
+      "record:observed_agent_scope_loss": {
+        "status": "present",
+        "predecessors": [
+          {
+            "ref": "record:agent_partial_change",
+            "relation": "same_defect_propagation"
+          },
+          {
+            "ref": "record:shared_timeout",
+            "relation": "same_defect_propagation"
+          }
+        ]
+      },
+      "record:agent_partial_change": {
+        "status": "present",
+        "predecessors": [
+          {
+            "ref": "record:agent_scope_decision",
+            "relation": "same_defect_propagation"
+          }
+        ]
+      },
+      "record:agent_scope_decision": {
+        "status": "present",
+        "candidate_introduction": true,
+        "predecessors": []
+      },
+      "record:observed_baseline_failure": {
+        "status": "present",
+        "predecessors": [
+          {
+            "ref": "record:skip_baseline_repair",
+            "relation": "same_defect_propagation"
+          },
+          {
+            "ref": "record:shared_timeout",
+            "relation": "same_defect_propagation"
+          }
+        ]
+      },
+      "record:skip_baseline_repair": {
+        "status": "present",
+        "candidate_introduction": true,
+        "predecessors": []
+      },
+      "record:shared_timeout": {
+        "status": "present",
+        "candidate_introduction": true,
+        "predecessors": []
+      }
+    },
+    "confirmations": {
+      "record:agent_scope_decision": {
+        "status": "confirmed",
+        "factor_role": "necessary_cause",
+        "confidence": 0.98
+      },
+      "record:skip_baseline_repair": {
+        "status": "confirmed",
+        "factor_role": "necessary_cause",
+        "confidence": 0.97
+      },
+      "record:shared_timeout": {
+        "status": "rejected",
+        "factor_role": "amplifying_factor",
+        "confidence": 0.93
+      }
+    }
+  }
+}

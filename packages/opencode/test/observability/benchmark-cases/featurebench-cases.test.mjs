@@ -75,6 +75,49 @@ test("agent prompt contains the official task but never exposes mask or test pat
   assert.doesNotMatch(prompt, /questions\.json/)
 })
 
+test("trace subject revision binds the exact masked FeatureBench baseline", () => {
+  const row = {
+    instance_id: "owner__repo.abc.case.def.lv1",
+    base_commit: "a".repeat(40),
+    patch: "masked source patch\n",
+  }
+
+  const revision = featureBenchRunner.featureBenchSubjectRevision(row)
+
+  assert.equal(
+    revision,
+    `featurebench:${row.instance_id}:${row.base_commit}:mask:${crypto
+      .createHash("sha256")
+      .update(row.patch)
+      .digest("hex")}`,
+  )
+})
+
+test("noninteractive benchmark config denies external directory approval deadlocks", () => {
+  const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-config-"))
+
+  const configFile = featureBenchRunner.writeNoninteractiveBenchmarkConfig(configRoot)
+
+  assert.equal(configFile, path.join(configRoot, "opencode", "opencode.json"))
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), {
+    $schema: "https://opencode.ai/config.json",
+    permission: {
+      external_directory: "deny",
+    },
+  })
+})
+
+test("runner rejects binaries that cannot bind trace subject revisions", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-binary-capability-"))
+  const currentBinary = path.join(directory, "current-opencode")
+  const legacyBinary = path.join(directory, "legacy-opencode")
+  fs.writeFileSync(currentBinary, "binary\0OPENCODE_TRACE_SUBJECT_REVISION\0payload")
+  fs.writeFileSync(legacyBinary, "binary\0legacy-trace-only\0payload")
+
+  assert.equal(featureBenchRunner.binarySupportsSubjectRevision(currentBinary), true)
+  assert.equal(featureBenchRunner.binarySupportsSubjectRevision(legacyBinary), false)
+})
+
 test("official evaluation is explicitly not run when Docker is unavailable", () => {
   assert.deepEqual(officialEvaluationStatus({ dockerAvailable: false }), {
     status: "not_run",
@@ -87,7 +130,10 @@ test("HTTP case requests do not inherit global fetch's hidden response-header ti
   assert.equal(typeof featureBenchRunner.postJson, "function")
   const server = createServer((_request, response) => {
     setTimeout(() => {
-      response.writeHead(200, { "content-type": "application/json" })
+      response.writeHead(200, {
+        "content-type": "application/json",
+        connection: "close",
+      })
       response.end('{"ok":true}')
     }, 20)
   })
@@ -95,10 +141,6 @@ test("HTTP case requests do not inherit global fetch's hidden response-header ti
   const address = server.address()
   assert.ok(address && typeof address === "object")
 
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => {
-    throw new TypeError("simulated fetch transport timeout")
-  }
   try {
     const result = await featureBenchRunner.postJson(
       `http://127.0.0.1:${address.port}/long-agent-turn`,
@@ -107,8 +149,28 @@ test("HTTP case requests do not inherit global fetch's hidden response-header ti
     )
     assert.deepEqual(result, { ok: true })
   } finally {
+    server.close()
+    server.closeAllConnections?.()
+    assert.equal(server.listening, false)
+  }
+
+  const originalFetch = globalThis.fetch
+  let fetchCalls = 0
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    throw new TypeError("simulated fetch transport timeout")
+  }
+  try {
+    await assert.rejects(
+      featureBenchRunner.postJson(
+        "http://127.0.0.1:1/no-global-fetch",
+        { prompt: "do not use fetch" },
+        100,
+      ),
+    )
+    assert.equal(fetchCalls, 0)
+  } finally {
     globalThis.fetch = originalFetch
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
   }
 })
 
@@ -122,6 +184,10 @@ test("runner waits for trace finalization after the server process exits", async
 
   assert.equal(result, traceFile)
   assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).status, "success")
+})
+
+test("runner allows large traces enough time to finalize after a signal", () => {
+  assert.equal(featureBenchRunner.DEFAULT_CHILD_EXIT_TIMEOUT_MS, 5 * 60_000)
 })
 
 test("runner forwards a parent signal once and waits for child trace publication", async () => {

@@ -115,3 +115,25 @@ test("does not expose stderr writer failures", () => {
     rmSync(caseDir, { recursive: true, force: true })
   }
 })
+
+test("does not expose asynchronous stderr writer rejections", async () => {
+  const caseDir = createCaseDir()
+  const traceFile = path.join(caseDir, "trace.json")
+
+  try {
+    writeFileSync(traceFile, "{}")
+    const publication = collectTracePublication({
+      caseID: "case_async_writer_failure",
+      status: "failed",
+      caseDir,
+      traceFile,
+    })
+
+    expect(() =>
+      reportTracePublication(publication!, () => Promise.reject(new Error("async writer failed"))),
+    ).not.toThrow()
+    await Bun.sleep(0)
+  } finally {
+    rmSync(caseDir, { recursive: true, force: true })
+  }
+})

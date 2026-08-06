@@ -1,14 +1,25 @@
 import type { ProvenanceTraceView, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "./case-trace"
 import { TRACE_VERSION } from "./trace-semantic-contract"
 
-function escapeHtml(input: unknown) {
-  return String(input ?? "")
+export type ProvenanceTraceHtmlChunkOptions = {
+  maxChunkBytes?: number
+  artifactSnapshotPaths?: ReadonlyMap<string, string>
+}
+
+const artifactPathPolicies = new WeakMap<Map<string, TraceArtifact>, ReadonlyMap<string, string>>()
+
+export const VIEWER_STRING_BUDGET = 8192
+
+export function escapeViewerHtml(input: unknown, limit = VIEWER_STRING_BUDGET) {
+  return boundedViewerText(input, limit)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;")
 }
+
+const escapeHtml = escapeViewerHtml
 
 function preview(input: unknown, limit = 260): string {
   if (input === undefined || input === null) return ""
@@ -17,36 +28,118 @@ function preview(input: unknown, limit = 260): string {
   if (typeof input === "object") {
     const value = input as Record<string, unknown>
     if (typeof value.preview === "string") return value.preview.slice(0, limit)
-    if (value.value !== undefined) return String(value.value).slice(0, limit)
+    if (value.value !== undefined) return boundedViewerText(value.value, limit)
   }
-  try {
-    return JSON.stringify(input).slice(0, limit)
-  } catch {
-    return String(input).slice(0, limit)
-  }
+  return pretty(input, limit).replaceAll("\n", " ").slice(0, limit)
 }
 
 function pretty(input: unknown, limit = 4200): string {
   if (input === undefined || input === null || input === "") return "-"
   if (typeof input === "string") return trimText(input, limit)
   if (typeof input === "number" || typeof input === "boolean") return String(input)
-  try {
-    const seen = new WeakSet<object>()
-    const text = JSON.stringify(
-      input,
-      (_key, value) => {
-        if (typeof value === "object" && value !== null) {
-          if (seen.has(value)) return "[Circular]"
-          seen.add(value)
-        }
-        return value
-      },
-      2,
-    )
-    return trimText(text, limit)
-  } catch {
-    return trimText(String(input), limit)
+  const budget = Math.max(32, Math.floor(limit))
+  const parts: string[] = []
+  let length = 0
+  let truncated = false
+  const stack = new WeakSet<object>()
+  const append = (value: string) => {
+    if (!value || length >= budget) {
+      if (value) truncated = true
+      return
+    }
+    const available = budget - length
+    if (value.length > available) {
+      parts.push(value.slice(0, available))
+      length = budget
+      truncated = true
+      return
+    }
+    parts.push(value)
+    length += value.length
   }
+  const quoted = (value: string) => {
+    append('"')
+    for (let index = 0; index < value.length && length < budget - 1; index++) {
+      const code = value.charCodeAt(index)
+      if (code === 0x22) append('\\"')
+      else if (code === 0x5c) append("\\\\")
+      else if (code === 0x08) append("\\b")
+      else if (code === 0x0c) append("\\f")
+      else if (code === 0x0a) append("\\n")
+      else if (code === 0x0d) append("\\r")
+      else if (code === 0x09) append("\\t")
+      else if (code < 0x20) append(`\\u${code.toString(16).padStart(4, "0")}`)
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(index + 1)
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          append(value.slice(index, index + 2))
+          index += 1
+        } else {
+          append(`\\u${code.toString(16).padStart(4, "0")}`)
+        }
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        append(`\\u${code.toString(16).padStart(4, "0")}`)
+      } else append(value[index]!)
+      if (length >= budget) truncated = true
+    }
+    if (length < budget) append('"')
+    if (length >= budget || value.length > Math.max(0, budget - length)) truncated = true
+  }
+  const visit = (value: unknown, depth: number) => {
+    if (length >= budget) {
+      truncated = true
+      return
+    }
+    if (value === null) return append("null")
+    if (value === undefined) return append("undefined")
+    if (typeof value === "string") return quoted(value)
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint")
+      return append(String(value))
+    if (typeof value === "function") return append(`[Function ${value.name || "anonymous"}]`)
+    if (typeof value === "symbol") return append(String(value))
+    if (depth >= 12) {
+      truncated = true
+      return append("[Max depth]")
+    }
+    if (stack.has(value)) return append("[Circular]")
+    stack.add(value)
+    try {
+      if (Array.isArray(value)) {
+        append("[")
+        for (let index = 0; index < value.length && length < budget; index++) {
+          if (index) append(", ")
+          visit(value[index], depth + 1)
+        }
+        if (length < budget) append("]")
+        else if (value.length) truncated = true
+        return
+      }
+      append("{")
+      let first = true
+      for (const key in value as Record<string, unknown>) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+        if (length >= budget) {
+          truncated = true
+          break
+        }
+        if (!first) append(", ")
+        first = false
+        quoted(key)
+        append(": ")
+        try {
+          visit((value as Record<string, unknown>)[key], depth + 1)
+        } catch {
+          append("[Unavailable]")
+        }
+      }
+      if (length < budget) append("}")
+    } finally {
+      stack.delete(value)
+    }
+  }
+  visit(input, 0)
+  const text = parts.join("")
+  return truncated ? `${text}\n... [truncated by preview budget]` : text
 }
 
 function trimText(input: string, limit: number) {
@@ -54,20 +147,80 @@ function trimText(input: string, limit: number) {
   return `${input.slice(0, limit)}\n... [truncated ${input.length - limit} chars]`
 }
 
+export function boundedViewerText(input: unknown, limit = VIEWER_STRING_BUDGET): string {
+  const budget = Math.max(1, Math.floor(limit))
+  if (input === undefined || input === null) return ""
+  if (typeof input === "string") return trimText(input, budget)
+  if (typeof input === "number" || typeof input === "boolean" || typeof input === "bigint") return String(input)
+  return pretty(input, budget)
+}
+
+export function boundedViewerJoin(
+  values: readonly unknown[],
+  separator = ", ",
+  limit = VIEWER_STRING_BUDGET,
+): string {
+  const budget = Math.max(1, Math.floor(limit))
+  const parts: string[] = []
+  let length = 0
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue
+    const prefix = parts.length ? separator : ""
+    const available = budget - length - prefix.length
+    if (available <= 0) break
+    const part = boundedViewerText(value, available)
+    parts.push(prefix + part)
+    length += prefix.length + part.length
+    if (length >= budget || part.includes("... [truncated")) break
+  }
+  return parts.join("")
+}
+
+export function safeArtifactRelativePath(input: unknown) {
+  if (
+    typeof input !== "string" ||
+    !input ||
+    input.length > VIEWER_STRING_BUDGET ||
+    input.includes("\0")
+  )
+    return undefined
+  const candidate = input.replaceAll("\\", "/")
+  if (candidate.startsWith("/") || /^[a-zA-Z]:\//.test(candidate)) return undefined
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(candidate)) return undefined
+  if (/%(?:2e|2f|5c)/i.test(candidate)) return undefined
+  const segments = candidate.split("/")
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined
+  if (segments[0] !== "artifacts" || segments.length < 2) return undefined
+  return segments.join("/")
+}
+
+function artifactPathMarkup(artifact: TraceArtifact, artifacts: Map<string, TraceArtifact>) {
+  const safePath = safeArtifactRelativePath(artifact.path)
+  const snapshotPath = safePath ? artifactPathPolicies.get(artifacts)?.get(safePath) : undefined
+  const id = boundedViewerText(artifact.artifact_id, 520)
+  if (!snapshotPath) {
+    return `<span class="muted" title="Artifact unavailable">Artifact unavailable: <code>${escapeHtml(id)}</code></span>`
+  }
+  return `<a href="${escapeHtml(snapshotPath)}"><code>${escapeHtml(id)}</code></a>`
+}
+
 function artifactLinks(ids: string[] | undefined, artifacts: Map<string, TraceArtifact>) {
   if (!ids?.length) return `<span class="muted">-</span>`
   return ids
     .map((id) => {
-      const artifact = artifacts.get(id)
-      if (!artifact) return `<code>${escapeHtml(id)}</code>`
-      return `<a href="${escapeHtml(artifact.path)}"><code>${escapeHtml(id)}</code></a>`
+      const boundedID = boundedViewerText(id, 520)
+      const artifact = artifacts.get(boundedID)
+      if (!artifact) return `<code>${escapeHtml(boundedID)}</code>`
+      return artifactPathMarkup(artifact, artifacts)
     })
     .join(" ")
 }
 
 function sourceLocationLabel(location: Record<string, unknown>) {
-  const target =
-    typeof location.uri === "string" ? location.uri : typeof location.path === "string" ? location.path : ""
+  const target = boundedViewerText(
+    typeof location.uri === "string" ? location.uri : typeof location.path === "string" ? location.path : "",
+    640,
+  )
   const start = typeof location.line_start === "number" ? location.line_start : undefined
   const end = typeof location.line_end === "number" ? location.line_end : undefined
   if (!target) return ""
@@ -79,7 +232,7 @@ function sourceLocations(record: ProvenanceRecord) {
   if (!record.source_locations?.length) return `<span class="muted">-</span>`
   return record.source_locations
     .map((location) => {
-      const target = location.uri ?? location.path ?? "-"
+      const target = boundedViewerText(location.uri ?? location.path ?? "-", 640)
       const line =
         location.line_start === undefined
           ? ""
@@ -102,13 +255,13 @@ function typedResources(record: ProvenanceRecord) {
   if (!resources.length) return `<span class="muted">-</span>`
   return resources
     .map((resource) => {
-      const label = [resource.type, resource.key, resource.name, resource.uri].filter(Boolean).join(" ")
+      const label = boundedViewerJoin([resource.type, resource.key, resource.name, resource.uri], " ", 520)
       const location =
         resource.source_location && typeof resource.source_location === "object"
           ? sourceLocationLabel(resource.source_location as Record<string, unknown>)
           : ""
       return `<div class="typed-resource">
-        <code>${escapeHtml(label || JSON.stringify(resource))}</code>
+        <code>${escapeHtml(label || pretty(resource, 520))}</code>
         ${resource.fact ? `<div class="fact-text">${escapeHtml(resource.fact)}</div>` : ""}
         ${location ? `<div class="muted">${escapeHtml(location)}</div>` : ""}
       </div>`
@@ -152,143 +305,133 @@ function formatTokens(usage: TraceTokenUsage | undefined) {
 }
 
 function recordLabel(record: ProvenanceRecord) {
-  return (
-    record.title || record.data?.tool_name || record.data?.model_id || record.data?.response_role || record.record_id
+  return boundedViewerText(
+    record.title || record.data?.tool_name || record.data?.model_id || record.data?.response_role || record.record_id,
+    520,
   )
+}
+
+function summaryField(prefix: string, value: unknown, limit = 160) {
+  if (value === undefined || value === null || value === "") return ""
+  return prefix + boundedViewerText(value, Math.max(1, limit - prefix.length))
+}
+
+function summaryParts(values: readonly unknown[]) {
+  return boundedViewerJoin(values, " | ", 520)
 }
 
 function recordSummary(record: ProvenanceRecord) {
   const data = record.data ?? {}
   if (record.event_type === "decision") {
-    return [
-      data.decision_type ? `type=${String(data.decision_type)}` : "",
-      data.intent ? `intent=${String(data.intent)}` : "",
-      data.chosen_action ? `action=${String(data.chosen_action)}` : "",
+    return summaryParts([
+      summaryField("type=", data.decision_type),
+      summaryField("intent=", data.intent),
+      summaryField("action=", data.chosen_action),
       preview(data.rationale, 160),
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    ])
   }
   if (record.event_type === "prompt.assembly") {
-    return [data.stage ? `stage=${String(data.stage)}` : "", preview(data.output ?? data.parts ?? data.input, 180)]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([summaryField("stage=", data.stage), preview(data.output ?? data.parts ?? data.input, 180)])
   }
   if (record.event_type === "context.transform") {
-    return [
-      data.stage ? `stage=${String(data.stage)}` : "",
-      data.agent ? `agent=${String(data.agent)}` : "",
-      data.model_id ? `model=${String(data.model_id)}` : "",
+    return summaryParts([
+      summaryField("stage=", data.stage),
+      summaryField("agent=", data.agent),
+      summaryField("model=", data.model_id),
       preview(data.transforms, 160),
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    ])
   }
   if (record.event_type === "loop.decision") {
-    return [
-      data.decision ? `decision=${String(data.decision)}` : "",
-      data.reason ? `reason=${String(data.reason)}` : "",
-      data.agent ? `agent=${String(data.agent)}` : "",
-      data.part_count !== undefined ? `parts=${String(data.part_count)}` : "",
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([
+      summaryField("decision=", data.decision),
+      summaryField("reason=", data.reason),
+      summaryField("agent=", data.agent),
+      summaryField("parts=", data.part_count),
+    ])
   }
   if (record.event_type === "response.output") {
-    return [data.response_role ? `role=${String(data.response_role)}` : "", preview(data.text, 160)]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([summaryField("role=", data.response_role), preview(data.text, 160)])
   }
   if (record.event_type === "response.claim") {
-    return [
-      data.claim_format ? `format=${String(data.claim_format)}` : "",
-      data.support_level ? `support=${String(data.support_level)}` : "",
-      Array.isArray(data.quality_flags) && data.quality_flags.length ? `flags=${data.quality_flags.join(",")}` : "",
+    return summaryParts([
+      summaryField("format=", data.claim_format),
+      summaryField("support=", data.support_level),
+      Array.isArray(data.quality_flags)
+        ? summaryField("flags=", boundedViewerJoin(data.quality_flags, ",", 160))
+        : "",
       preview(data.text, 160),
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    ])
   }
   if (record.event_type === "claim.support_assessment") {
-    return [
-      data.support_level ? `support=${String(data.support_level)}` : "",
-      Array.isArray(data.quality_flags) && data.quality_flags.length ? `flags=${data.quality_flags.join(",")}` : "",
-      Array.isArray(data.tool_failure_dependency_refs) && data.tool_failure_dependency_refs.length
-        ? `tool_failures=${data.tool_failure_dependency_refs.join(",")}`
+    return summaryParts([
+      summaryField("support=", data.support_level),
+      Array.isArray(data.quality_flags)
+        ? summaryField("flags=", boundedViewerJoin(data.quality_flags, ",", 160))
         : "",
-      data.match_score !== undefined ? `match=${String(data.match_score)}` : "",
-    ]
-      .filter(Boolean)
-      .join(" | ")
+      Array.isArray(data.tool_failure_dependency_refs) && data.tool_failure_dependency_refs.length
+        ? summaryField("tool_failures=", boundedViewerJoin(data.tool_failure_dependency_refs, ",", 160))
+        : "",
+      summaryField("match=", data.match_score),
+    ])
   }
   if (record.event_type === "llm.call") {
-    return [data.provider_id, data.model_id, formatTokens(record.token_usage)].filter(Boolean).join(" | ")
+    return summaryParts([data.provider_id, data.model_id, formatTokens(record.token_usage)])
   }
   if (record.event_type === "llm.turn") {
-    return [
-      data.agent_role ? `role=${String(data.agent_role)}` : "",
-      data.agent ? `agent=${String(data.agent)}` : "",
-      data.provider_id && data.model_id ? `${String(data.provider_id)}/${String(data.model_id)}` : "",
-      data.finish_reason ? `finish=${String(data.finish_reason)}` : "",
+    return summaryParts([
+      summaryField("role=", data.agent_role),
+      summaryField("agent=", data.agent),
+      data.provider_id && data.model_id ? boundedViewerJoin([data.provider_id, data.model_id], "/", 160) : "",
+      summaryField("finish=", data.finish_reason),
       formatTokens(record.token_usage),
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    ])
   }
   if (record.event_type === "agent.lifecycle") {
-    return [data.phase ? `phase=${String(data.phase)}` : "", preview(data.summary, 180)].filter(Boolean).join(" | ")
+    return summaryParts([summaryField("phase=", data.phase), preview(data.summary, 180)])
   }
   if (record.event_type === "exit.gate") {
-    return [
-      data.decision ? `decision=${String(data.decision)}` : "",
-      data.reason ? `reason=${String(data.reason)}` : "",
-      data.continuation_source ? `source=${String(data.continuation_source)}` : "",
-      data.needs_compaction !== undefined ? `compact=${String(data.needs_compaction)}` : "",
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([
+      summaryField("decision=", data.decision),
+      summaryField("reason=", data.reason),
+      summaryField("source=", data.continuation_source),
+      summaryField("compact=", data.needs_compaction),
+    ])
   }
   if (record.event_type === "evidence.semantic_fact" || record.event_type === "evidence.fact") {
-    return [data.source, data.category, preview(data.summary, 160)].filter(Boolean).join(" | ")
+    return summaryParts([data.source, data.category, preview(data.summary, 160)])
   }
   if (record.event_type === "execution.observation") {
-    return [data.source, data.category, preview(data.summary, 160)].filter(Boolean).join(" | ")
+    return summaryParts([data.source, data.category, preview(data.summary, 160)])
   }
   if (record.event_type === "task.plan_state") {
-    return [data.source, data.category, preview(data.plan_items, 160)].filter(Boolean).join(" | ")
+    return summaryParts([data.source, data.category, preview(data.plan_items, 160)])
   }
   if (record.event_type === "tool.call" || record.event_type === "tool.result" || record.event_type === "mcp.call") {
-    return [data.tool_name, data.server, data.name, data.request_status, preview(data.output, 120)]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([data.tool_name, data.server, data.name, data.request_status, preview(data.output, 120)])
   }
   if (record.event_type === "tool.error") {
-    return [data.tool_name, data.error_kind, preview(data.error_message ?? data.error, 160)].filter(Boolean).join(" | ")
+    return summaryParts([data.tool_name, data.error_kind, preview(data.error_message ?? data.error, 160)])
   }
   if (record.event_type === "context.compaction") {
-    return [
+    return summaryParts([
       data.algorithm,
       data.reason,
-      data.token_estimate_before !== undefined ? `before=${String(data.token_estimate_before)}` : "",
-      data.token_estimate_after !== undefined ? `after=${String(data.token_estimate_after)}` : "",
-      data.retention_ratio !== undefined ? `retention=${String(data.retention_ratio)}` : "",
+      summaryField("before=", data.token_estimate_before),
+      summaryField("after=", data.token_estimate_after),
+      summaryField("retention=", data.retention_ratio),
       Array.isArray(data.compression_loss_risks) && data.compression_loss_risks.length
-        ? `risks=${data.compression_loss_risks.join(",")}`
+        ? summaryField("risks=", boundedViewerJoin(data.compression_loss_risks, ",", 160))
         : "",
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    ])
   }
   if (record.event_type === "context.compaction_check") {
-    return [
-      data.trigger_reason ? `reason=${String(data.trigger_reason)}` : "",
-      data.overflow !== undefined ? `overflow=${String(data.overflow)}` : "",
-      data.token_estimate !== undefined ? `tokens=${String(data.token_estimate)}` : "",
-      data.context_limit !== undefined ? `limit=${String(data.context_limit)}` : "",
-      data.selected_algorithm ? `algorithm=${String(data.selected_algorithm)}` : "",
-    ]
-      .filter(Boolean)
-      .join(" | ")
+    return summaryParts([
+      summaryField("reason=", data.trigger_reason),
+      summaryField("overflow=", data.overflow),
+      summaryField("tokens=", data.token_estimate),
+      summaryField("limit=", data.context_limit),
+      summaryField("algorithm=", data.selected_algorithm),
+    ])
   }
   return preview(data.summary ?? data.output ?? data.text ?? data, 180)
 }
@@ -345,7 +488,7 @@ function hasSemanticFacts(record: ProvenanceRecord) {
 function componentStats(trace: ProvenanceTraceView) {
   const stats = new Map<string, { records: number; duration: number; tokens: number }>()
   for (const record of trace.records) {
-    const key = record.component ?? "unknown"
+    const key = boundedViewerText(record.component ?? "unknown", 80)
     const current = stats.get(key) ?? { records: 0, duration: 0, tokens: 0 }
     current.records += 1
     current.duration += record.duration_ms ?? 0
@@ -388,7 +531,7 @@ function renderOverview(trace: ProvenanceTraceView) {
   </section>`
 }
 
-function renderTraceHealth(trace: ProvenanceTraceView) {
+function* renderTraceHealth(trace: ProvenanceTraceView) {
   const health = trace.metrics.trace_health
   const compactionFlags = Object.entries(health.compaction_quality_flags ?? {})
   const issueSeverity = health.issues.some((issue) => issue.severity === "error")
@@ -457,7 +600,7 @@ function renderTraceHealth(trace: ProvenanceTraceView) {
     ["Missing Compaction Check", health.compaction_check_missing ?? 0, "Compactions without a check record."],
   ] as const
 
-  return `<section id="trace-health">
+  yield `<section id="trace-health">
     <div class="section-title">
       <h2>Trace Health</h2>
       <span class="status-pill ${issueSeverity}">${health.issues.length} issues</span>
@@ -475,25 +618,23 @@ function renderTraceHealth(trace: ProvenanceTraceView) {
     </div>
     <div class="health-details">
       <div>
-        <h3>Compaction Quality Flags</h3>
-        ${
-          compactionFlags.length
-            ? `<div class="flag-list">${compactionFlags
-                .map(
-                  ([flag, count]) =>
-                    `<span class="flag"><code>${escapeHtml(flag)}</code><strong>${escapeHtml(count)}</strong></span>`,
-                )
-                .join("")}</div>`
-            : `<div class="empty">No compaction quality flags.</div>`
-        }
-      </div>
+        <h3>Compaction Quality Flags</h3>`
+  if (compactionFlags.length) {
+    yield `<div class="flag-list">`
+    for (const [flag, count] of compactionFlags) {
+      yield `<span class="flag"><code>${escapeHtml(flag)}</code><strong>${escapeHtml(count)}</strong></span>`
+    }
+    yield `</div>`
+  } else {
+    yield `<div class="empty">No compaction quality flags.</div>`
+  }
+  yield `</div>
       <div>
-        <h3>Quality Issues</h3>
-        ${
-          health.issues.length
-            ? `<div class="issue-list">${health.issues
-                .map(
-                  (issue) => `<article class="issue-row">
+        <h3>Quality Issues</h3>`
+  if (health.issues.length) {
+    yield `<div class="issue-list">`
+    for (const issue of health.issues) {
+      yield `<article class="issue-row">
                     <div>
                       <span class="severity ${escapeHtml(issue.severity)}">${escapeHtml(issue.severity)}</span>
                       <strong>${escapeHtml(issue.kind)}</strong>
@@ -504,29 +645,32 @@ function renderTraceHealth(trace: ProvenanceTraceView) {
                       ${issue.event_type ? `<span>event <code>${escapeHtml(issue.event_type)}</code></span>` : ""}
                       ${issue.count !== undefined ? `<span>count ${escapeHtml(issue.count)}</span>` : ""}
                     </div>
-                  </article>`,
-                )
-                .join("")}</div>`
-            : `<div class="empty">No trace health issues.</div>`
-        }
+                  </article>`
+    }
+    yield `</div>`
+  } else {
+    yield `<div class="empty">No trace health issues.</div>`
+  }
+  yield `
       </div>
     </div>
   </section>`
 }
 
-function renderAgentFlow(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderAgentFlow(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="agent-flow"><h2>Agent Flow</h2><div class="empty">No records.</div></section>`
-  return `<section id="agent-flow">
+  if (!records.length) {
+    yield `<section id="agent-flow"><h2>Agent Flow</h2><div class="empty">No records.</div></section>`
+    return
+  }
+  yield `<section id="agent-flow">
     <div class="section-title">
       <h2>Agent Flow</h2>
       <span class="muted">All ${records.length} records are shown.</span>
     </div>
-    <div class="flow-list">
-      ${records
-        .map(
-          (record, index) => `<article class="flow-row">
+    <div class="flow-list">`
+  for (const [index, record] of records.entries()) {
+    yield `<article class="flow-row">
             <div class="flow-index">
               <span>${index + 1}</span>
               <code>${escapeHtml(`${record.time_ms}ms`)}</code>
@@ -547,33 +691,33 @@ function renderAgentFlow(trace: ProvenanceTraceView, artifacts: Map<string, Trac
                 ${record.artifact_refs?.length ? `<span>artifacts ${artifactLinks(record.artifact_refs, artifacts)}</span>` : ""}
               </div>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderDataflow(trace: ProvenanceTraceView) {
-  if (!trace.dataflow_edges.length) return `<div class="empty">No dataflow edges.</div>`
-  return `<div class="table-scroll"><table>
+function* renderDataflow(trace: ProvenanceTraceView) {
+  if (!trace.dataflow_edges.length) {
+    yield `<div class="empty">No dataflow edges.</div>`
+    return
+  }
+  yield `<div class="table-scroll"><table>
     <thead><tr><th>Relation</th><th>From</th><th>To</th><th>Label</th></tr></thead>
-    <tbody>
-      ${trace.dataflow_edges
-        .map(
-          (edge) => `<tr>
+    <tbody>`
+  for (const edge of trace.dataflow_edges) {
+    yield `<tr>
             <td>${escapeHtml(edge.relation)}</td>
             <td><code>${escapeHtml(edge.from.type)}:${escapeHtml(edge.from.id)}</code></td>
             <td><code>${escapeHtml(edge.to.type)}:${escapeHtml(edge.to.id)}</code></td>
             <td>${escapeHtml(edge.label ?? "")}</td>
-          </tr>`,
-        )
-        .join("")}
-    </tbody>
+          </tr>`
+  }
+  yield `</tbody>
   </table></div>`
 }
 
-function renderSemanticPipeline(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderSemanticPipeline(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const pipelineTypes = new Set([
     "run.start",
     "case.completed",
@@ -605,17 +749,18 @@ function renderSemanticPipeline(trace: ProvenanceTraceView, artifacts: Map<strin
   const records = trace.records
     .filter((record) => pipelineTypes.has(record.event_type))
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="semantic-pipeline"><h2>Semantic Pipeline</h2><div class="empty">No semantic pipeline records.</div></section>`
-  return `<section id="semantic-pipeline">
+  if (!records.length) {
+    yield `<section id="semantic-pipeline"><h2>Semantic Pipeline</h2><div class="empty">No semantic pipeline records.</div></section>`
+    return
+  }
+  yield `<section id="semantic-pipeline">
     <div class="section-title">
       <h2>Semantic Pipeline</h2>
       <span class="muted">User request, context transformations, model calls, decisions, tools, subagents, and outputs.</span>
     </div>
-    <div class="pipeline">
-      ${records
-        .map(
-          (record, index) => `<article class="pipeline-card">
+    <div class="pipeline">`
+  for (const [index, record] of records.entries()) {
+    yield `<article class="pipeline-card">
             <div class="pipeline-index">${index + 1}</div>
             <div class="pipeline-body">
               <div class="flow-head">
@@ -639,17 +784,16 @@ function renderSemanticPipeline(trace: ProvenanceTraceView, artifacts: Map<strin
                 <span>id <code>${escapeHtml(record.record_id)}</code></span>
                 <span>${escapeHtml(`${record.time_ms}ms`)}</span>
                 ${record.artifact_refs?.length ? `<span>artifacts ${artifactLinks(record.artifact_refs, artifacts)}</span>` : ""}
-                ${record.source_refs?.length ? `<span>sources <code>${escapeHtml(record.source_refs.join(", "))}</code></span>` : ""}
+                ${record.source_refs?.length ? `<span>sources <code>${escapeHtml(boundedViewerJoin(record.source_refs))}</code></span>` : ""}
               </div>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderIoInspector(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderIoInspector(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter((record) =>
     [
       "prompt.assembly",
@@ -676,17 +820,18 @@ function renderIoInspector(trace: ProvenanceTraceView, artifacts: Map<string, Tr
       "claim.support_assessment",
     ].includes(record.event_type),
   )
-  if (!records.length)
-    return `<section id="io-inspector"><h2>IO Inspector</h2><div class="empty">No IO records.</div></section>`
-  return `<section id="io-inspector">
+  if (!records.length) {
+    yield `<section id="io-inspector"><h2>IO Inspector</h2><div class="empty">No IO records.</div></section>`
+    return
+  }
+  yield `<section id="io-inspector">
     <div class="section-title">
       <h2>IO Inspector</h2>
       <span class="muted">Inputs and outputs are scrollable so large payloads stay inspectable.</span>
     </div>
-    <div class="io-list">
-      ${records
-        .map(
-          (record) => `<article class="io-record">
+    <div class="io-list">`
+  for (const record of records) {
+    yield `<article class="io-record">
             <div class="io-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
@@ -706,26 +851,26 @@ function renderIoInspector(trace: ProvenanceTraceView, artifacts: Map<string, Tr
                 <div class="refs">refs ${artifactLinks(record.output_refs ?? record.artifact_refs, artifacts)}</div>
               </div>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderSemanticFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderSemanticFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(hasSemanticFacts)
-  if (!records.length)
-    return `<section id="semantic-facts"><h2>Semantic Facts</h2><div class="empty">No semantic facts.</div></section>`
-  return `<section id="semantic-facts">
+  if (!records.length) {
+    yield `<section id="semantic-facts"><h2>Semantic Facts</h2><div class="empty">No semantic facts.</div></section>`
+    return
+  }
+  yield `<section id="semantic-facts">
     <div class="section-title">
       <h2>Semantic Facts</h2>
       <span class="muted">Typed resources, source references, final response facts, and loop decisions.</span>
     </div>
-    <div class="fact-list">
-      ${records
-        .map(
-          (record) => `<article class="fact-card">
+    <div class="fact-list">`
+  for (const record of records) {
+    yield `<article class="fact-card">
             <div class="fact-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               <strong>${escapeHtml(recordLabel(record))}</strong>
@@ -743,7 +888,7 @@ function renderSemanticFacts(trace: ProvenanceTraceView, artifacts: Map<string, 
               </div>
               <div>
                 <div class="label">Source Refs</div>
-                <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+                <div class="refs">${escapeHtml(boundedViewerJoin(record.source_refs ?? []) || "-")}</div>
               </div>
               <div>
                 <div class="label">Artifacts</div>
@@ -751,31 +896,31 @@ function renderSemanticFacts(trace: ProvenanceTraceView, artifacts: Map<string, 
               </div>
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderLlmTurns(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderLlmTurns(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "llm.turn")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="llm-turns"><h2>LLM Turns</h2><div class="empty">No LLM turn records.</div></section>`
-  return `<section id="llm-turns">
+  if (!records.length) {
+    yield `<section id="llm-turns"><h2>LLM Turns</h2><div class="empty">No LLM turn records.</div></section>`
+    return
+  }
+  yield `<section id="llm-turns">
     <div class="section-title">
       <h2>LLM Turns</h2>
       <span class="muted">Normalized provider turns. Title/background turns are marked by role.</span>
     </div>
-    <div class="fact-list">
-      ${records
-        .map(
-          (record) => `<article class="fact-card">
+    <div class="fact-list">`
+  for (const record of records) {
+    yield `<article class="fact-card">
             <div class="fact-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
-              <span class="component">${escapeHtml(String(record.data?.agent_role ?? "unknown"))}</span>
+              <span class="component">${escapeHtml(record.data?.agent_role ?? "unknown")}</span>
               ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
               <strong>${escapeHtml(recordLabel(record))}</strong>
               <code>${escapeHtml(record.record_id)}</code>
@@ -787,28 +932,28 @@ function renderLlmTurns(trace: ProvenanceTraceView, artifacts: Map<string, Trace
               ${record.artifact_refs?.length ? `<span>artifacts ${artifactLinks(record.artifact_refs, artifacts)}</span>` : ""}
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 2200))}</pre>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderLifecycle(trace: ProvenanceTraceView) {
+function* renderLifecycle(trace: ProvenanceTraceView) {
   const records = trace.records
     .filter((record) => record.event_type === "agent.lifecycle" || record.event_type === "exit.gate")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="lifecycle"><h2>Lifecycle And Exit Gates</h2><div class="empty">No lifecycle records.</div></section>`
-  return `<section id="lifecycle">
+  if (!records.length) {
+    yield `<section id="lifecycle"><h2>Lifecycle And Exit Gates</h2><div class="empty">No lifecycle records.</div></section>`
+    return
+  }
+  yield `<section id="lifecycle">
     <div class="section-title">
       <h2>Lifecycle And Exit Gates</h2>
       <span class="muted">Turn milestones, compaction decisions, and non-interactive exit decisions.</span>
     </div>
-    <div class="flow-list">
-      ${records
-        .map(
-          (record, index) => `<article class="flow-row">
+    <div class="flow-list">`
+  for (const [index, record] of records.entries()) {
+    yield `<article class="flow-row">
             <div class="flow-index"><span>${index + 1}</span><code>${escapeHtml(`${record.time_ms}ms`)}</code></div>
             <div class="flow-main">
               <div class="flow-head">
@@ -819,28 +964,28 @@ function renderLifecycle(trace: ProvenanceTraceView) {
               <div class="flow-summary">${escapeHtml(recordSummary(record))}</div>
               <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderSubagents(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderSubagents(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "subagent.call" || record.data?.agent_role === "subagent")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="subagents"><h2>Subagents</h2><div class="empty">No subagent records.</div></section>`
-  return `<section id="subagents">
+  if (!records.length) {
+    yield `<section id="subagents"><h2>Subagents</h2><div class="empty">No subagent records.</div></section>`
+    return
+  }
+  yield `<section id="subagents">
     <div class="section-title">
       <h2>Subagents</h2>
       <span class="muted">Delegated prompts, child turns, returned output, and child trace refs.</span>
     </div>
-    <div class="io-list">
-      ${records
-        .map(
-          (record) => `<article class="io-record">
+    <div class="io-list">`
+  for (const record of records) {
+    yield `<article class="io-record">
             <div class="io-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               ${record.status ? `<span class="status">${escapeHtml(record.status)}</span>` : ""}
@@ -872,28 +1017,28 @@ function renderSubagents(trace: ProvenanceTraceView, artifacts: Map<string, Trac
                 <div class="refs">refs ${artifactLinks(record.output_refs ?? record.artifact_refs, artifacts)}</div>
               </div>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderEvidenceFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderEvidenceFacts(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "evidence.semantic_fact" || record.event_type === "evidence.fact")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="evidence-facts"><h2>Semantic Evidence</h2><div class="empty">No semantic evidence records.</div></section>`
-  return `<section id="evidence-facts">
+  if (!records.length) {
+    yield `<section id="evidence-facts"><h2>Semantic Evidence</h2><div class="empty">No semantic evidence records.</div></section>`
+    return
+  }
+  yield `<section id="evidence-facts">
     <div class="section-title">
       <h2>Semantic Evidence</h2>
       <span class="muted">Stable facts extracted from tools, MCP, skills, verification, and subagents.</span>
     </div>
-    <div class="fact-list">
-      ${records
-        .map(
-          (record) => `<article class="fact-card">
+    <div class="fact-list">`
+  for (const record of records) {
+    yield `<article class="fact-card">
             <div class="fact-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
@@ -908,7 +1053,7 @@ function renderEvidenceFacts(trace: ProvenanceTraceView, artifacts: Map<string, 
               </div>
               <div>
                 <div class="label">Source Refs</div>
-                <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+                <div class="refs">${escapeHtml(boundedViewerJoin(record.source_refs ?? []) || "-")}</div>
               </div>
               <div>
                 <div class="label">Source Locations</div>
@@ -924,28 +1069,28 @@ function renderEvidenceFacts(trace: ProvenanceTraceView, artifacts: Map<string, 
               </div>
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 2400))}</pre>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderExecutionObservations(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderExecutionObservations(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records
     .filter((record) => record.event_type === "execution.observation" || record.event_type === "task.plan_state")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="execution-observations"><h2>Execution Observations</h2><div class="empty">No routine execution observations.</div></section>`
-  return `<section id="execution-observations">
+  if (!records.length) {
+    yield `<section id="execution-observations"><h2>Execution Observations</h2><div class="empty">No routine execution observations.</div></section>`
+    return
+  }
+  yield `<section id="execution-observations">
     <div class="section-title">
       <h2>Execution Observations</h2>
       <span class="muted">Routine tool observations and plan states kept separate from semantic evidence.</span>
     </div>
-    <div class="fact-list">
-      ${records
-        .map(
-          (record) => `<article class="fact-card">
+    <div class="fact-list">`
+  for (const record of records) {
+    yield `<article class="fact-card">
             <div class="fact-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
@@ -956,7 +1101,7 @@ function renderExecutionObservations(trace: ProvenanceTraceView, artifacts: Map<
             <div class="fact-grid">
               <div>
                 <div class="label">Source Refs</div>
-                <div class="refs">${escapeHtml((record.source_refs ?? []).join(", ") || "-")}</div>
+                <div class="refs">${escapeHtml(boundedViewerJoin(record.source_refs ?? []) || "-")}</div>
               </div>
               <div>
                 <div class="label">Artifacts</div>
@@ -964,25 +1109,26 @@ function renderExecutionObservations(trace: ProvenanceTraceView, artifacts: Map<
               </div>
             </div>
             <pre class="semantic-data">${escapeHtml(pretty(record.data, 1800))}</pre>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
+function* renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
   const assessments = new Map(
     trace.records
       .filter((record) => record.event_type === "claim.support_assessment")
-      .map((record) => [String(record.data?.claim_id ?? ""), record]),
+      .map((record) => [boundedViewerText(record.data?.claim_id ?? "", 520), record]),
   )
   const records = trace.records
     .filter((record) => record.event_type === "response.claim")
     .toSorted((a, b) => a.time_ms - b.time_ms)
-  if (!records.length)
-    return `<section id="claim-evidence-matrix"><h2>Claim Evidence Matrix</h2><div class="empty">No response claim records.</div></section>`
-  return `<section id="claim-evidence-matrix">
+  if (!records.length) {
+    yield `<section id="claim-evidence-matrix"><h2>Claim Evidence Matrix</h2><div class="empty">No response claim records.</div></section>`
+    return
+  }
+  yield `<section id="claim-evidence-matrix">
     <div class="section-title">
       <h2>Claim Evidence Matrix</h2>
       <span class="muted">Final-answer claims mapped to direct evidence, context, and execution refs.</span>
@@ -1007,10 +1153,9 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
             <th>Execution</th>
           </tr>
         </thead>
-        <tbody>
-          ${records
-            .map((record) => {
-              const data = record.data ?? {}
+        <tbody>`
+  for (const record of records) {
+    const data = record.data ?? {}
               const direct = Array.isArray(data.direct_evidence_refs) ? data.direct_evidence_refs : []
               const matched = Array.isArray(data.matched_evidence_refs) ? data.matched_evidence_refs : []
               const reasons = Array.isArray(data.match_reasons) ? data.match_reasons : []
@@ -1019,7 +1164,7 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
               const context = Array.isArray(data.context_refs) ? data.context_refs : []
               const execution = Array.isArray(data.execution_refs) ? data.execution_refs : []
               const flags = Array.isArray(data.quality_flags) ? data.quality_flags : []
-              const assessment = assessments.get(String(data.claim_id ?? ""))
+              const assessment = assessments.get(boundedViewerText(data.claim_id ?? "", 520))
               const assessmentData = assessment?.data ?? {}
               const missingEvidence = Array.isArray(assessmentData.missing_evidence_types)
                 ? assessmentData.missing_evidence_types
@@ -1031,31 +1176,30 @@ function renderClaimEvidenceMatrix(trace: ProvenanceTraceView) {
                 ? `<div class="muted">${escapeHtml(preview(data.canonical_text, 420))}</div>`
                 : ""
               const tableSubject = data.table_subject ? `<br/><code>${escapeHtml(data.table_subject)}</code>` : ""
-              return `<tr>
+    yield `<tr>
                 <td><div class="claim-text">${escapeHtml(preview(data.text, 520))}</div>${canonical}<code>${escapeHtml(record.record_id)}</code></td>
                 <td><code>${escapeHtml(data.claim_format ?? "-")}</code>${tableSubject}</td>
                 <td><span class="status">${escapeHtml(data.support_level ?? "-")}</span></td>
                 <td>${flags.length ? flags.map((flag) => `<code>${escapeHtml(flag)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
-                <td><div class="refs">${escapeHtml(matched.join(", ") || "-")}</div></td>
-                <td><code>${escapeHtml(assessment?.record_id ?? "-")}</code><br/><span class="muted">${escapeHtml(missingEvidence.join(", ") || "-")}</span></td>
-                <td><div class="refs">${escapeHtml(toolFailures.join(", ") || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(matched) || "-")}</div></td>
+                <td><code>${escapeHtml(assessment?.record_id ?? "-")}</code><br/><span class="muted">${escapeHtml(boundedViewerJoin(missingEvidence) || "-")}</span></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(toolFailures) || "-")}</div></td>
                 <td><code>${escapeHtml(data.match_strategy ?? "-")}</code><br/><span class="muted">${escapeHtml(data.match_score ?? "-")}</span></td>
                 <td>${reasons.length ? reasons.map((reason) => `<code>${escapeHtml(reason)}</code>`).join(" ") : `<span class="muted">-</span>`}</td>
-                <td><div class="refs">${escapeHtml(candidates.join(", ") || "-")}</div></td>
-                <td><div class="refs">${escapeHtml(direct.join(", ") || "-")}</div></td>
-                <td><div class="refs">${escapeHtml(legacy.join(", ") || "-")}</div></td>
-                <td><div class="refs">${escapeHtml(context.join(", ") || "-")}</div></td>
-                <td><div class="refs">${escapeHtml(execution.join(", ") || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(candidates) || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(direct) || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(legacy) || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(context) || "-")}</div></td>
+                <td><div class="refs">${escapeHtml(boundedViewerJoin(execution) || "-")}</div></td>
               </tr>`
-            })
-            .join("")}
-        </tbody>
+  }
+  yield `</tbody>
       </table>
     </div>
   </section>`
 }
 
-function renderContextAndCompaction(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
+function* renderContextAndCompaction(trace: ProvenanceTraceView, artifacts: Map<string, TraceArtifact>) {
   const records = trace.records.filter(
     (record) =>
       record.event_type === "context.pack" ||
@@ -1063,17 +1207,18 @@ function renderContextAndCompaction(trace: ProvenanceTraceView, artifacts: Map<s
       record.event_type === "context.compaction" ||
       record.component === "context",
   )
-  if (!records.length)
-    return `<section id="context-compaction"><h2>Context And Compaction</h2><div class="muted">Context Ledger</div><div class="empty">No context or compaction records.</div></section>`
-  return `<section id="context-compaction">
+  if (!records.length) {
+    yield `<section id="context-compaction"><h2>Context And Compaction</h2><div class="muted">Context Ledger</div><div class="empty">No context or compaction records.</div></section>`
+    return
+  }
+  yield `<section id="context-compaction">
     <div class="section-title">
       <h2>Context And Compaction</h2>
       <span class="muted">Context Ledger. Context construction, compaction inputs, outputs, and stored large payloads.</span>
     </div>
-    <div class="context-list">
-      ${records
-        .map(
-          (record) => `<article class="context-card">
+    <div class="context-list">`
+  for (const record of records) {
+    yield `<article class="context-card">
             <div class="flow-head">
               <span class="kind">${escapeHtml(record.event_type)}</span>
               ${record.component ? `<span class="component">${escapeHtml(record.component)}</span>` : ""}
@@ -1093,37 +1238,45 @@ function renderContextAndCompaction(trace: ProvenanceTraceView, artifacts: Map<s
                 <div class="refs">refs ${artifactLinks(record.output_refs ?? record.artifact_refs, artifacts)}</div>
               </div>
             </div>
-          </article>`,
-        )
-        .join("")}
-    </div>
+          </article>`
+  }
+  yield `</div>
   </section>`
 }
 
-function renderArtifacts(trace: ProvenanceTraceView) {
-  if (!trace.artifacts.length) return `<div class="empty">No artifacts.</div>`
-  return `<div class="table-scroll"><table>
+function* renderArtifacts(trace: ProvenanceTraceView, artifactSnapshotPaths: ReadonlyMap<string, string>) {
+  if (!trace.artifacts.length) {
+    yield `<div class="empty">No artifacts.</div>`
+    return
+  }
+  yield `<div class="table-scroll"><table>
     <thead><tr><th>Artifact</th><th>Label</th><th>Length</th><th>Occurrences</th><th>Path</th></tr></thead>
-    <tbody>
-      ${trace.artifacts
-        .map(
-          (artifact) => `<tr>
-            <td><code>${escapeHtml(artifact.artifact_id)}</code></td>
+    <tbody>`
+  for (const artifact of trace.artifacts) {
+    const safePath = safeArtifactRelativePath(artifact.path)
+    const snapshotPath = safePath ? artifactSnapshotPaths.get(safePath) : undefined
+    yield `<tr>
+            <td><code>${escapeHtml(boundedViewerText(artifact.artifact_id, 520))}</code></td>
             <td>${escapeHtml(artifact.label ?? "")}</td>
             <td>${artifact.length}</td>
             <td>${artifact.occurrences ?? 1}</td>
-            <td><a href="${escapeHtml(artifact.path)}">${escapeHtml(artifact.path)}</a></td>
-          </tr>`,
-        )
-        .join("")}
-    </tbody>
+            <td>${snapshotPath ? `<a href="${escapeHtml(snapshotPath)}">${escapeHtml(snapshotPath)}</a>` : `<span class="muted" title="Artifact unavailable">Artifact unavailable</span>`}</td>
+          </tr>`
+  }
+  yield `</tbody>
   </table></div>`
 }
 
-export function renderProvenanceTraceHtml(trace: ProvenanceTraceView) {
-  const artifacts = new Map(trace.artifacts.map((artifact) => [artifact.artifact_id, artifact]))
+function* provenanceTraceHtmlSemanticChunks(
+  trace: ProvenanceTraceView,
+  options: ProvenanceTraceHtmlChunkOptions,
+): Generator<string> {
+  const artifacts = new Map<string, TraceArtifact>()
+  for (const artifact of trace.artifacts) artifacts.set(boundedViewerText(artifact.artifact_id, 520), artifact)
+  const artifactSnapshotPaths = options.artifactSnapshotPaths ?? new Map<string, string>()
+  artifactPathPolicies.set(artifacts, artifactSnapshotPaths)
 
-  return `<!doctype html>
+  yield `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -1255,29 +1408,68 @@ export function renderProvenanceTraceHtml(trace: ProvenanceTraceView) {
       </nav>
     </div>
   </header>
-  <main>
-    ${renderOverview(trace)}
-    ${renderTraceHealth(trace)}
-    ${renderSemanticPipeline(trace, artifacts)}
-    ${renderLlmTurns(trace, artifacts)}
-    ${renderLifecycle(trace)}
-    ${renderSubagents(trace, artifacts)}
-    ${renderClaimEvidenceMatrix(trace)}
-    ${renderEvidenceFacts(trace, artifacts)}
-    ${renderExecutionObservations(trace, artifacts)}
-    ${renderAgentFlow(trace, artifacts)}
-    <section id="component-dataflow">
-      <h2>Component Dataflow</h2>
-      ${renderDataflow(trace)}
-    </section>
-    ${renderIoInspector(trace, artifacts)}
-    ${renderSemanticFacts(trace, artifacts)}
-    ${renderContextAndCompaction(trace, artifacts)}
-    <section id="artifacts">
-      <h2>Artifacts</h2>
-      ${renderArtifacts(trace)}
-    </section>
+  <main>`
+  yield renderOverview(trace)
+  yield* renderTraceHealth(trace)
+  yield* renderSemanticPipeline(trace, artifacts)
+  yield* renderLlmTurns(trace, artifacts)
+  yield* renderLifecycle(trace)
+  yield* renderSubagents(trace, artifacts)
+  yield* renderClaimEvidenceMatrix(trace)
+  yield* renderEvidenceFacts(trace, artifacts)
+  yield* renderExecutionObservations(trace, artifacts)
+  yield* renderAgentFlow(trace, artifacts)
+  yield `<section id="component-dataflow">
+      <h2>Component Dataflow</h2>`
+  yield* renderDataflow(trace)
+  yield `</section>`
+  yield* renderIoInspector(trace, artifacts)
+  yield* renderSemanticFacts(trace, artifacts)
+  yield* renderContextAndCompaction(trace, artifacts)
+  yield `<section id="artifacts">
+      <h2>Artifacts</h2>`
+  yield* renderArtifacts(trace, artifactSnapshotPaths)
+  yield `</section>`
+  yield `
   </main>
 </body>
 </html>`
+}
+
+function utf8CodePointBytes(input: string) {
+  const codePoint = input.codePointAt(0) ?? 0
+  if (codePoint <= 0x7f) return 1
+  if (codePoint <= 0x7ff) return 2
+  if (codePoint <= 0xffff) return 3
+  return 4
+}
+
+function* boundedUtf8Chunks(chunks: Iterable<string>, maxChunkBytes: number): Generator<string> {
+  for (const chunk of chunks) {
+    let output = ""
+    let outputBytes = 0
+    for (const character of chunk) {
+      const characterBytes = utf8CodePointBytes(character)
+      if (output && outputBytes + characterBytes > maxChunkBytes) {
+        yield output
+        output = ""
+        outputBytes = 0
+      }
+      output += character
+      outputBytes += characterBytes
+    }
+    if (output) yield output
+  }
+}
+
+export function* provenanceTraceHtmlChunks(
+  trace: ProvenanceTraceView,
+  options: ProvenanceTraceHtmlChunkOptions = {},
+): Generator<string> {
+  const maxChunkBytes = Math.max(4, Math.floor(options.maxChunkBytes ?? 256 * 1024))
+  yield* boundedUtf8Chunks(provenanceTraceHtmlSemanticChunks(trace, options), maxChunkBytes)
+}
+
+export function renderProvenanceTraceHtml(trace: ProvenanceTraceView) {
+  return [...provenanceTraceHtmlChunks(trace)].join("")
 }

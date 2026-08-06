@@ -2,13 +2,19 @@ import math
 import unittest
 from dataclasses import replace
 
+from trace_attribution.candidate_budget import select_global_candidates
+from trace_attribution.causal_judge import (
+    factor_role_request_projection_identity,
+)
 from trace_attribution.causal_state import (
+    ActiveFailureRoleBinding,
     AttributionHypothesis,
     CausalCandidate,
     CausalFactor,
     CausalStepJudgment,
     ConfirmedRoot,
     DefectState,
+    FactorRoleJudgment,
     FrontierItem,
     HypothesisEvidence,
     LocalStateOwner,
@@ -17,10 +23,10 @@ from trace_attribution.causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
-    canonical_causal_factor_publication,
+    active_failure_signature_for,
     canonical_confirmed_root_publication,
+    canonical_factor_role_publication,
     canonical_ranked_root_publications,
-    canonical_rejected_candidate_publication,
     confirmation_counterfactual_for,
     seed_binding_identity_for,
     semantic_visit_key,
@@ -198,48 +204,190 @@ def confirmation_seed_fields(*confirmations, outcome="inconclusive"):
     }
 
 
-def factor_bundle(*, role="contributing_condition"):
+def factor_bundle(
+    *,
+    role="contributing_condition",
+    analysis_perspective="State publication test.",
+):
     node_ref = "record:context"
     target_ref = "record:decision"
     path = (node_ref, target_ref)
-    confirmation = replace(
-        RootConfirmation.rejected(
-            node_ref,
-            "The candidate is a causal factor but not a necessary root.",
-            evidence_refs=[node_ref, target_ref],
-            factor_role=role,
-        ),
-        hypothesis_id="hyp:factor",
-        hypothesis_semantic_hash="semantic:factor",
-        defect_fingerprint=sample_defect_state().fingerprint,
-        confidence=0.7,
-        recursive_path=path,
-        seed_binding_identity=seed_binding_identity_for(
-            path[-1], sample_defect_state().fingerprint
-        ),
-        factor_mechanism={
-            "mechanism_type": (
-                "amplification" if role == "amplifying_factor" else "enabling_condition"
-            ),
+    defect_state = sample_defect_state()
+    active_failure_signature = active_failure_signature_for(
+        defect_state,
+        seed_ref=path[-1],
+    )
+    seed_binding = seed_binding_identity_for(
+        path[-1], defect_state.fingerprint
+    )
+    request_projection = {
+        "schema": "factor-role-request-projection/v1",
+        "facts": {
+            "candidate_ref": node_ref,
+            "defect_state": defect_state.to_dict(),
+            "recursive_path": list(path),
+            "candidate_reference": {"ref": node_ref},
+            "recursive_path_references": [
+                {"ref": ref} for ref in path
+            ],
+            "supporting_evidence": [{"ref": node_ref}],
+            "opposing_evidence": [],
+            "task_obligations": [],
+            "confirmed_root_summaries": [],
+            "hypothesis_id": "hyp:factor",
+            "hypothesis_semantic_hash": "semantic:factor",
+            "seed_binding_identity": seed_binding,
+            "analysis_perspective": analysis_perspective,
+        },
+    }
+    request_identity = factor_role_request_projection_identity(
+        request_projection
+    )
+    mechanism_type = {
+        "contributing_condition": "enabling_condition",
+        "amplifying_factor": "amplification",
+    }.get(role)
+    mechanism = (
+        {
+            "schema": "factor-role-mechanism/v1",
+            "mechanism_type": mechanism_type,
             "source_ref": node_ref,
             "target_ref": target_ref,
-            "effect": "The candidate changes the downstream defect conditions.",
-        },
+            "effect": "The candidate changes downstream defect conditions.",
+        }
+        if mechanism_type is not None
+        else {}
     )
-    factor = canonical_causal_factor_publication(
-        confirmation=confirmation,
-        analysis_perspective="",
-    )
-    rejected = RejectedCandidate(
-        node_ref=node_ref,
-        reason=confirmation.reason,
-        evidence_refs=confirmation.evidence_refs,
-        hypothesis_id=confirmation.hypothesis_id,
+    judgment = FactorRoleJudgment(
+        candidate_ref=node_ref,
+        necessity_status="not_necessary",
+        factor_role=role,
+        reason="The candidate is a factor but not a necessary root.",
+        confidence=0.7,
+        evidence_refs=(node_ref, target_ref),
         recursive_path=path,
-        confirmation_status="rejected",
-        confirmation=confirmation.to_dict(),
+        factor_mechanism=mechanism,
+        counterfactual={
+            "schema": "factor-role-counterfactual/v1",
+            "intervention_ref": node_ref,
+            "intervention_kind": (
+                "replace_with_semantically_correct_behavior"
+            ),
+            "predicted_effect": {
+                "contributing_condition": "reduces_defect_likelihood",
+                "amplifying_factor": "reduces_defect_severity",
+                "unrelated": "no_grounded_causal_influence_established",
+            }[role],
+        },
+        hypothesis_id="hyp:factor",
+        hypothesis_semantic_hash="semantic:factor",
+        defect_fingerprint=defect_state.fingerprint,
+        seed_binding_identity=seed_binding,
+        analysis_perspective=analysis_perspective,
+        request_identity=request_identity,
     )
-    return confirmation, factor, rejected
+    owner = LocalStateOwner.create(
+        seed_binding_identity=seed_binding,
+        hypothesis_id=judgment.hypothesis_id,
+        visit_key="visit:factor-publication",
+        occurrence_key="confirmation_queue",
+    ).to_dict()
+    action = {
+        "operation": "factor_role_completed",
+        "semantic_key": "factor_role:{0}".format(request_identity),
+        "owner": owner,
+        "origin": "global_candidate_factor_assessment",
+        "candidate_ref": judgment.candidate_ref,
+        "hypothesis_id": judgment.hypothesis_id,
+        "defect_fingerprint": judgment.defect_fingerprint,
+        "seed_binding_identity": judgment.seed_binding_identity,
+        "request_projection": request_projection,
+        "request_identity": request_identity,
+        "physical_requests_reserved": 1,
+        "physical_request_delta": 1,
+        "physical_request_exact": True,
+        "judgment": judgment.to_dict(),
+        "judgment_identity": judgment.judgment_identity,
+        "failure_classification": "none",
+        "active_role_binding": (
+            None
+            if role == "unrelated"
+            else ActiveFailureRoleBinding.create(
+                candidate_ref=judgment.candidate_ref,
+                seed_ref=judgment.recursive_path[-1],
+                failure_signature=active_failure_signature[
+                    "signature_id"
+                ],
+                defect_fingerprint=active_failure_signature[
+                    "fingerprint"
+                ],
+                failure_identity_source=active_failure_signature[
+                    "identity_source"
+                ],
+                failure_kind=active_failure_signature["kind"],
+                causal_role="amplifying_condition",
+                disposition="factor",
+            ).to_dict()
+        ),
+        "queue_binding": {
+            "seed_key": judgment.seed_binding_identity,
+            "requested_by_ref": judgment.candidate_ref,
+            "recursive_path": list(judgment.recursive_path),
+            "checked_evidence_refs": [judgment.candidate_ref],
+            "task_obligations": [],
+            "artifact_evidence_envelopes": [],
+        },
+    }
+    publication = canonical_factor_role_publication(
+        judgment=judgment,
+        request_projection=request_projection,
+        action_projection=action,
+    )
+    metadata = {
+        "confirmation_queue": [
+            {
+                "hypothesis_id": judgment.hypothesis_id,
+                "hypothesis_semantic_hash": (
+                    judgment.hypothesis_semantic_hash
+                ),
+                "candidate_ref": judgment.candidate_ref,
+                "defect_fingerprint": judgment.defect_fingerprint,
+                "seed_binding_identity": judgment.seed_binding_identity,
+                "semantic_identity": request_identity,
+                "status": "completed",
+                "owner": owner,
+                "analysis_perspective": judgment.analysis_perspective,
+                "artifact_evidence_envelopes": [],
+                "factual_request_projection": request_projection,
+                "review_scope": "non_root",
+                "origin": "global_candidate_factor_assessment",
+                "seed_key": judgment.seed_binding_identity,
+                "requested_by_ref": judgment.candidate_ref,
+                "recursive_path": list(judgment.recursive_path),
+                "checked_evidence_refs": [judgment.candidate_ref],
+                "task_obligations": [],
+                "factor_role_judgment": judgment.to_dict(),
+                "response_identity": judgment.judgment_identity,
+                "failure_classification": "none",
+            }
+        ],
+        "confirmation_queue_keys": [
+            [
+                judgment.hypothesis_id,
+                judgment.candidate_ref,
+                judgment.defect_fingerprint,
+                judgment.seed_binding_identity,
+            ]
+        ],
+        "factor_role_judgments": [judgment.to_dict()],
+        "factor_role_journal": [{**action, "status": "completed"}],
+        "factor_role_action_projections": [action],
+        "factor_role_gaps": [],
+        "factor_confirmation_gaps": [],
+        "factor_confirmation_conflicts": [],
+        "factor_confirmation_enqueue_gaps": [],
+    }
+    return judgment, publication, metadata
 
 
 def reciprocal_root_pair(*, identical_legacy_projection):
@@ -305,6 +453,117 @@ def ranked_root_pair(first, second):
 
 
 class CausalStateTest(unittest.TestCase):
+    def test_report_ignores_application_owned_candidate_funnel_payloads(self):
+        defect_state = sample_defect_state()
+        seed = report_seed("no_defect", defect_state=defect_state)
+        report = RecursiveAttributionReport(
+            case_id="application-owned-candidate-funnel",
+            objective="Preserve decision payloads.",
+            start_refs=[seed.start_ref],
+            seed_results=[seed],
+            metadata={
+                "decision": {
+                    "data": {
+                        "candidate_funnel": {"application": "owned"},
+                    },
+                },
+            },
+        )
+
+        restored = RecursiveAttributionReport.from_dict(report.to_dict())
+
+        self.assertEqual(
+            restored.metadata["decision"]["data"]["candidate_funnel"],
+            {"application": "owned"},
+        )
+
+    def test_report_rejects_invalid_candidate_funnel_in_global_gate(self):
+        defect_state = sample_defect_state()
+        seed = report_seed("no_defect", defect_state=defect_state)
+        report = RecursiveAttributionReport(
+            case_id="global-gate-candidate-funnel",
+            objective="Validate global gate audit facts.",
+            start_refs=[seed.start_ref],
+            seed_results=[seed],
+        )
+        forged = report.to_dict()
+        forged["investigation_journal"] = [
+            {
+                "kind": "global_candidate_gate",
+                "status": "bypassed",
+                "candidate_compression": {
+                    "candidate_funnel": {"application": "forged"},
+                },
+            },
+        ]
+
+        with self.assertRaisesRegex(ValueError, "candidate_funnel"):
+            RecursiveAttributionReport.from_dict(forged)
+
+    def test_report_round_trip_preserves_candidate_funnel_selection_identity(self):
+        class CandidateFunnelGraph:
+            def resolve(self, ref):
+                return ref
+
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=TraceNode(
+                ref="record:decision",
+                record_id="decision",
+                component="agent",
+                event_type="decision",
+            ),
+            source="confirmed_edge",
+        )
+        funnel = select_global_candidates(
+            CandidateFunnelGraph(),
+            [candidate],
+        ).to_dict()
+        defect_state = sample_defect_state()
+        seed = report_seed("no_defect", defect_state=defect_state)
+        owner = LocalStateOwner.create(
+            seed_binding_identity=seed_binding_identity_for(
+                seed.start_ref,
+                defect_state.fingerprint,
+            ),
+            hypothesis_id="global:candidate-funnel",
+            visit_key="global:candidate-funnel",
+            occurrence_key="candidate_compression",
+        )
+        report = RecursiveAttributionReport(
+            case_id="candidate-funnel-round-trip",
+            objective="Preserve candidate budget audit facts.",
+            start_refs=[seed.start_ref],
+            seed_results=[seed],
+            metadata={
+                "candidate_compression": [
+                    {
+                        "candidate_funnel": funnel,
+                        "owner": owner.to_dict(),
+                    },
+                ],
+            },
+        )
+
+        restored = RecursiveAttributionReport.from_dict(report.to_dict())
+
+        self.assertEqual(
+            restored.metadata["candidate_compression"][0]["candidate_funnel"][
+                "selection_identity"
+            ],
+            funnel["selection_identity"],
+        )
+
+        forged = report.to_dict()
+        forged["metadata"]["candidate_compression"][0]["candidate_funnel"][
+            "selection_identity"
+        ] = "0" * 64
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate_funnel selection_identity",
+        ):
+            RecursiveAttributionReport.from_dict(forged)
+
     def test_legacy_projection_deduplicates_identical_visible_roots(self):
         first, second, first_confirmation, second_confirmation = reciprocal_root_pair(
             identical_legacy_projection=True
@@ -350,36 +609,62 @@ class CausalStateTest(unittest.TestCase):
         )
 
     def test_factor_identity_cannot_also_be_a_rejected_candidate(self):
-        confirmation, factor, rejected = factor_bundle()
+        judgment, factor, metadata = factor_bundle()
 
         with self.assertRaisesRegex(
             ValueError,
-            "factor.*rejected|role conflict|confirmation role|grounded role",
+            "rejected candidates|role identity",
         ):
             RecursiveAttributionReport(
                 case_id="factor-overlap",
                 objective="Find roots.",
-                **confirmation_seed_fields(confirmation),
-                confirmations=[confirmation],
+                start_refs=["record:decision"],
+                seed_results=[
+                    report_seed(
+                        "inconclusive",
+                        start_ref="record:decision",
+                    )
+                ],
+                analysis_perspective=judgment.analysis_perspective,
                 contributing_conditions=[factor],
-                rejected_candidates=[rejected],
+                rejected_candidates=[
+                    RejectedCandidate(
+                        node_ref=factor.node_ref,
+                        reason=factor.reason,
+                        evidence_refs=factor.evidence_refs,
+                        hypothesis_id=judgment.hypothesis_id,
+                        recursive_path=factor.recursive_path,
+                        confirmation_status="not_necessary",
+                        confidence=factor.confidence,
+                        confirmation=judgment.to_dict(),
+                        provenance=factor.provenance,
+                    )
+                ],
+                metadata=metadata,
             )
 
     def test_factor_without_confirmed_root_remains_inconclusive(self):
         for role in ("contributing_condition", "amplifying_factor"):
             with self.subTest(role=role):
-                confirmation, factor, _ = factor_bundle(role=role)
+                judgment, factor, metadata = factor_bundle(role=role)
                 report = RecursiveAttributionReport(
                     case_id="factor-only",
                     objective="Find roots.",
-                    **confirmation_seed_fields(confirmation),
-                    confirmations=[confirmation],
+                    start_refs=["record:decision"],
+                    seed_results=[
+                        report_seed(
+                            "inconclusive",
+                            start_ref="record:decision",
+                        )
+                    ],
+                    analysis_perspective=judgment.analysis_perspective,
                     contributing_conditions=(
                         [factor] if role == "contributing_condition" else []
                     ),
                     amplifying_factors=(
                         [factor] if role == "amplifying_factor" else []
                     ),
+                    metadata=metadata,
                 )
 
                 self.assertEqual(report.rejected_candidates, ())
@@ -387,7 +672,7 @@ class CausalStateTest(unittest.TestCase):
 
     def test_non_root_publications_must_equal_their_owning_confirmation(self):
         for role in ("contributing_condition", "amplifying_factor"):
-            confirmation, factor, _ = factor_bundle(role=role)
+            judgment, factor, metadata = factor_bundle(role=role)
             mutations = {
                 "reason": replace(factor, reason="A different factor reason."),
                 "confidence": replace(factor, confidence=0.2),
@@ -405,13 +690,21 @@ class CausalStateTest(unittest.TestCase):
             for label, mutated in mutations.items():
                 with self.subTest(role=role, mutation=label):
                     with self.assertRaisesRegex(
-                        ValueError, "confirmation facts|grounded role"
+                        ValueError, "completed FactorRole actions"
                     ):
                         RecursiveAttributionReport(
                             case_id="factor-confirmation-drift",
                             objective="Find roots.",
-                            **confirmation_seed_fields(confirmation),
-                            confirmations=[confirmation],
+                            start_refs=["record:decision"],
+                            seed_results=[
+                                report_seed(
+                                    "inconclusive",
+                                    start_ref="record:decision",
+                                )
+                            ],
+                            analysis_perspective=(
+                                judgment.analysis_perspective
+                            ),
                             contributing_conditions=(
                                 [mutated]
                                 if role == "contributing_condition"
@@ -420,11 +713,10 @@ class CausalStateTest(unittest.TestCase):
                             amplifying_factors=(
                                 [mutated] if role == "amplifying_factor" else []
                             ),
+                            metadata=metadata,
                         )
 
-        confirmation, _, rejected = factor_bundle()
-        unrelated = replace(confirmation, factor_role="unrelated")
-        rejected = canonical_rejected_candidate_publication(unrelated)
+        judgment, rejected, metadata = factor_bundle(role="unrelated")
         for label, mutated in {
             "reason": replace(rejected, reason="A different rejection reason."),
             "confidence": replace(rejected, confidence=0.1),
@@ -434,14 +726,23 @@ class CausalStateTest(unittest.TestCase):
         }.items():
             with self.subTest(role="rejected_candidate", mutation=label):
                 with self.assertRaisesRegex(
-                    ValueError, "confirmation facts|confirmation role"
+                    ValueError, "completed FactorRole actions"
                 ):
                     RecursiveAttributionReport(
                         case_id="rejected-confirmation-drift",
                         objective="Find roots.",
-                        **confirmation_seed_fields(unrelated),
-                        confirmations=[unrelated],
+                        start_refs=["record:decision"],
+                        seed_results=[
+                            report_seed(
+                                "inconclusive",
+                                start_ref="record:decision",
+                            )
+                        ],
+                        analysis_perspective=(
+                            judgment.analysis_perspective
+                        ),
                         rejected_candidates=[mutated],
+                        metadata=metadata,
                     )
 
     def _modern_report_bundle(self):
@@ -965,49 +1266,8 @@ class CausalStateTest(unittest.TestCase):
             candidate_node=node,
             seed_start_ref="record:observed",
         )
-        factor_confirmation = replace(
-            RootConfirmation.rejected(
-                "record:prompt",
-                "The request is a condition rather than a necessary cause.",
-                evidence_refs=["record:prompt", node.ref],
-                factor_role="contributing_condition",
-            ),
-            hypothesis_id="hyp:prompt-condition",
-            hypothesis_semantic_hash="semantic:prompt-condition",
-            defect_fingerprint=defect_state.fingerprint,
-            recursive_path=("record:prompt", node.ref),
-            seed_binding_identity=seed_binding_identity_for(
-                node.ref, defect_state.fingerprint
-            ),
+        factor_judgment, factor, factor_metadata = factor_bundle(
             analysis_perspective="Improve Agent repository reasoning.",
-            factor_mechanism={
-                "mechanism_type": "enabling_condition",
-                "source_ref": "record:prompt",
-                "target_ref": node.ref,
-                "effect": "The missing hint enabled the incomplete search.",
-            },
-        )
-        factor = canonical_causal_factor_publication(
-            confirmation=factor_confirmation,
-            analysis_perspective="Improve Agent repository reasoning.",
-        )
-        rejected_confirmation = replace(
-            RootConfirmation.rejected(
-                "record:prompt",
-                "Repository search could still satisfy the task.",
-                evidence_refs=["record:decision"],
-            ),
-            hypothesis_id="hyp:prompt-alternative",
-            hypothesis_semantic_hash="semantic:prompt-alternative",
-            defect_fingerprint=defect_state.fingerprint,
-            recursive_path=("record:prompt", node.ref),
-            seed_binding_identity=seed_binding_identity_for(
-                node.ref, defect_state.fingerprint
-            ),
-            analysis_perspective="Improve Agent repository reasoning.",
-        )
-        rejected = canonical_rejected_candidate_publication(
-            rejected_confirmation
         )
         report = RecursiveAttributionReport(
             case_id="case-1",
@@ -1029,10 +1289,6 @@ class CausalStateTest(unittest.TestCase):
                     "no_defect",
                     start_ref=node.ref,
                     defect_state=defect_state,
-                    confirmation_identities=(
-                        factor_confirmation.confirmation_identity,
-                        rejected_confirmation.confirmation_identity,
-                    ),
                 ),
             ],
             analysis_outcome="inconclusive",
@@ -1043,10 +1299,9 @@ class CausalStateTest(unittest.TestCase):
             step_judgments=[judgment],
             hypotheses=[hypothesis],
             introduction_candidates=[candidate],
-            confirmations=[confirmation, factor_confirmation, rejected_confirmation],
+            confirmations=[confirmation],
             confirmed_roots=[root],
             contributing_conditions=[factor],
-            rejected_candidates=[rejected],
             taint_paths=[["record:observed", "record:change", node.ref]],
             visited_order=["record:observed", "record:change", node.ref],
             visited_entries=[
@@ -1067,7 +1322,10 @@ class CausalStateTest(unittest.TestCase):
                 for ref in ("record:observed", "record:change", node.ref)
             ],
             unresolved_refs=["record:prompt"],
-            metadata={"offline_only": True},
+            metadata={
+                "offline_only": True,
+                **factor_metadata,
+            },
         )
 
         for value, type_ in (
@@ -1081,7 +1339,6 @@ class CausalStateTest(unittest.TestCase):
             (confirmation, RootConfirmation),
             (root, ConfirmedRoot),
             (factor, CausalFactor),
-            (rejected, RejectedCandidate),
             (report, RecursiveAttributionReport),
         ):
             self.assertEqual(type_.from_dict(value.to_dict()), value)
@@ -1095,6 +1352,10 @@ class CausalStateTest(unittest.TestCase):
         self.assertEqual(payload["visited_order"], list(report.visited_order))
         self.assertEqual(payload["unresolved_refs"], list(report.unresolved_refs))
         self.assertEqual(payload["metadata"], report.metadata)
+        self.assertEqual(
+            factor.confirmation["judgment_identity"],
+            factor_judgment.judgment_identity,
+        )
 
     def test_relation_values_are_exact_and_reject_unknown_values(self):
         self.assertEqual(
@@ -1571,34 +1832,13 @@ class CausalStateTest(unittest.TestCase):
                 "record:observed", defect_state.fingerprint
             ),
         )
-        factor_confirmation = replace(
-            RootConfirmation.rejected(
-                "record:prompt",
-                "The prompt is a condition, not a necessary cause.",
-                evidence_refs=["record:prompt", node.ref],
-                factor_role="contributing_condition",
-            ),
-            hypothesis_id="hyp:prompt-condition",
-            hypothesis_semantic_hash="semantic:prompt-condition",
-            defect_fingerprint=defect_state.fingerprint,
-            recursive_path=("record:prompt", node.ref),
-            seed_binding_identity=seed_binding_identity_for(
-                node.ref, defect_state.fingerprint
-            ),
-            factor_mechanism={
-                "mechanism_type": "enabling_condition",
-                "source_ref": "record:prompt",
-                "target_ref": node.ref,
-                "effect": "The omitted hint enabled the incomplete decision.",
-            },
-        )
-        factor = canonical_causal_factor_publication(
-            confirmation=factor_confirmation,
-            analysis_perspective="",
+        _, factor, factor_metadata = factor_bundle(
+            analysis_perspective="Immutable state test.",
         )
         report = RecursiveAttributionReport(
             case_id="immutable",
             objective="Find the root.",
+            analysis_perspective="Immutable state test.",
             start_refs=["record:observed", node.ref],
             seed_results=[
                 report_seed(
@@ -1613,18 +1853,18 @@ class CausalStateTest(unittest.TestCase):
                     "inconclusive",
                     start_ref=node.ref,
                     defect_state=defect_state,
-                    confirmation_identities=(
-                        factor_confirmation.confirmation_identity,
-                    ),
                 ),
             ],
             causal_candidates=[candidate],
             step_judgments=[judgment],
             hypotheses=[hypothesis],
-            confirmations=[confirmation, factor_confirmation],
+            confirmations=[confirmation],
             contributing_conditions=[factor],
             taint_paths=[["record:observed", node.ref]],
-            metadata={"nested": {"offline_only": True}},
+            metadata={
+                "nested": {"offline_only": True},
+                **factor_metadata,
+            },
         )
         item = sample_frontier_item()
         before = (candidate.to_dict(), hypothesis.semantic_hash, item.visit_key, report.to_dict())

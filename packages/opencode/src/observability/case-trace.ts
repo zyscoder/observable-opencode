@@ -6,6 +6,7 @@ import {
   CausalIRStore,
   normalizeTemporalReferences,
   projectProvenanceTrace,
+  writeJsonDocumentAtomic,
   type ArtifactLike,
   type CausalEdgeLike,
   type CausalIREdge,
@@ -20,10 +21,15 @@ import {
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
-import { renderProvenanceTraceHtml } from "./causal-trace-viewer"
+import { writeProvenanceTraceHtmlFile } from "./case-trace-html"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
 import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
+import {
+  collectTracePublication,
+  reportTracePublication,
+  type TracePublicationStatus,
+} from "./trace-publication"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
 
@@ -1367,11 +1373,6 @@ export type ActiveSpan = {
 
 const truthy = new Set(["1", "true", "yes", "on"])
 const tokenUsageFields = ["input", "output", "reasoning", "cached_input", "cache_write", "total", "cost"] as const
-const secretTextPatterns = [
-  /\bsk-[a-zA-Z0-9_-]{8,}\b/g,
-  /\bBearer\s+[a-zA-Z0-9._~+/=-]+\b/gi,
-  /\b(?:api[_-]?key|password|passwd|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*(?:=|:)\s*[^\s,;]+/gi,
-]
 const legacySemanticEdgeProjectionKey = "__case_trace_legacy_semantic_edge_projection"
 const legacySemanticEdgeOptionalFields = [
   "evidence_tier",
@@ -1449,36 +1450,487 @@ function sanitizeForJson(
   key = "",
   stack = new WeakSet<object>(),
   path: readonly string[] = [],
+  ancestorPaths = new WeakMap<object, string>(),
 ): unknown {
   if (input === undefined) return undefined
   if (isTokenUsageContainer(key)) return sanitizeTokenUsage(input)
   if (isSensitiveKey(key, path, input)) return "[REDACTED]"
   if (typeof input === "bigint") return String(input)
   if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
-  if (input instanceof Error) return sanitizeForJson(errorInfo(input), key, stack, path)
+  if (input instanceof Error) return sanitizeForJson(errorInfo(input), key, stack, path, ancestorPaths)
   if (input instanceof URL) return redactUrlText(input)
   if (typeof input === "string") return redactText(input)
   if (!input || typeof input !== "object") return input
-  if (stack.has(input)) return "[Circular]"
+  if (stack.has(input)) return `[Circular:${ancestorPaths.get(input) ?? "$"}]`
   stack.add(input)
+  ancestorPaths.set(input, path.length ? `$.${path.join(".")}` : "$")
   try {
     if (Array.isArray(input))
-      return input.map((item, index) => sanitizeForJson(item, String(index), stack, [...path, String(index)]))
+      return input.map((item, index) =>
+        sanitizeForJson(item, String(index), stack, [...path, String(index)], ancestorPaths),
+      )
     const output: Record<string, unknown> = {}
     for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) {
-      const sanitized = sanitizeForJson(value, childKey, stack, [...path, childKey])
+      const sanitized = sanitizeForJson(value, childKey, stack, [...path, childKey], ancestorPaths)
       if (sanitized !== undefined) output[childKey] = sanitized
     }
     return output
   } finally {
     stack.delete(input)
+    ancestorPaths.delete(input)
   }
+}
+
+export function sanitizeTraceJson(input: unknown, key = "", path: readonly string[] = []) {
+  const temporal = normalizeTemporalReferences(input, { path })
+  return sanitizeForJson(temporal.value, key, new WeakSet<object>(), path, new WeakMap<object, string>())
+}
+
+export function sanitizeTraceJsonValue(input: unknown, key: string, path: readonly string[]) {
+  if (input === undefined) return undefined
+  if (isTokenUsageContainer(key)) return sanitizeTokenUsage(input)
+  if (isSensitiveKey(key, path, input)) return "[REDACTED]"
+  if (typeof input === "bigint") return String(input)
+  if (typeof input === "function") return `[Function ${input.name || "anonymous"}]`
+  if (input instanceof Error) return errorInfo(input)
+  if (input instanceof URL) return redactUrlStructure(input)
+  return input
+}
+
+export function* sanitizeTraceJsonStringChunks(
+  fragments: Iterable<string>,
+  _key: string,
+  _path: readonly string[],
+  maxChunkCharacters: number,
+) {
+  yield* canonicalRedactTextChunks(fragments, Math.max(1, Math.floor(maxChunkCharacters)))
+}
+
+const textCredentialKeys = [
+  "proxy-authorization",
+  "proxy_authorization",
+  "refresh_token",
+  "refresh-token",
+  "authorization",
+  "access_token",
+  "access-token",
+  "credential",
+  "auth_token",
+  "auth-token",
+  "id_token",
+  "id-token",
+  "password",
+  "x-api-key",
+  "x_api_key",
+  "set-cookie",
+  "apikey",
+  "api_key",
+  "api-key",
+  "passwd",
+  "cookie",
+  "secret",
+  "token",
+] as const
+
+function asciiLowerCode(code: number) {
+  return code >= 0x41 && code <= 0x5a ? code + 0x20 : code
+}
+
+function textWordCode(code: number) {
+  return (
+    (code >= 0x30 && code <= 0x39) ||
+    (code >= 0x41 && code <= 0x5a) ||
+    code === 0x5f ||
+    (code >= 0x61 && code <= 0x7a)
+  )
+}
+
+function textWhitespaceCode(code: number) {
+  return code === 0x20 || (code >= 0x09 && code <= 0x0d) || code === 0xa0
+}
+
+class TextFragmentCursor {
+  private readonly iterator: Iterator<string>
+  private fragment = ""
+  private fragmentOffset = 0
+  private buffered: string[] = []
+  private bufferedOffset = 0
+  previousCode: number | undefined
+
+  constructor(fragments: Iterable<string>) {
+    this.iterator = fragments[Symbol.iterator]()
+  }
+
+  peek(offset = 0) {
+    while (this.buffered.length - this.bufferedOffset <= offset) {
+      const character = this.pull()
+      if (character === undefined) break
+      this.buffered.push(character)
+    }
+    return this.buffered[this.bufferedOffset + offset]
+  }
+
+  read() {
+    const character = this.peek()
+    if (character === undefined) return undefined
+    this.bufferedOffset += 1
+    this.previousCode = character.charCodeAt(0)
+    if (this.bufferedOffset >= 64 && this.bufferedOffset * 2 >= this.buffered.length) {
+      this.buffered.splice(0, this.bufferedOffset)
+      this.bufferedOffset = 0
+    }
+    return character
+  }
+
+  startsWithIgnoreCase(expected: string, offset = 0) {
+    for (let index = 0; index < expected.length; index++) {
+      const character = this.peek(offset + index)
+      if (character === undefined || asciiLowerCode(character.charCodeAt(0)) !== expected.charCodeAt(index)) return false
+    }
+    return true
+  }
+
+  private pull() {
+    while (this.fragmentOffset >= this.fragment.length) {
+      const next = this.iterator.next()
+      if (next.done) return undefined
+      if (typeof next.value !== "string") throw new TypeError("Sanitizer fragments must be strings")
+      this.fragment = next.value
+      this.fragmentOffset = 0
+    }
+    const character = this.fragment[this.fragmentOffset]!
+    this.fragmentOffset += 1
+    return character
+  }
+}
+
+function cursorCredentialKey(cursor: TextFragmentCursor, offset = 0) {
+  for (const key of textCredentialKeys) {
+    if (cursor.startsWithIgnoreCase(key, offset)) return key
+  }
+  return undefined
+}
+
+function cursorWordBoundary(cursor: TextFragmentCursor) {
+  return cursor.previousCode === undefined || !textWordCode(cursor.previousCode)
+}
+
+function streamSchemeCode(code: number) {
+  const lower = asciiLowerCode(code)
+  return (
+    (lower >= 0x61 && lower <= 0x7a) ||
+    (code >= 0x30 && code <= 0x39) ||
+    code === 0x2b ||
+    code === 0x2e ||
+    code === 0x2d
+  )
+}
+
+function credentialTokenCode(code: number) {
+  return (
+    textWordCode(code) ||
+    code === 0x2e ||
+    code === 0x7e ||
+    code === 0x2b ||
+    code === 0x2f ||
+    code === 0x3d ||
+    code === 0x2d
+  )
+}
+
+function* canonicalRedactTextChunks(fragments: Iterable<string>, limit: number): Generator<string> {
+  const cursor = new TextFragmentCursor(fragments)
+  let pending = ""
+  let sawInput = false
+
+  function* append(value: string) {
+    for (let index = 0; index < value.length; index++) {
+      pending += value[index]
+      if (pending.length < limit) continue
+      yield pending
+      pending = ""
+    }
+  }
+
+  function* readAndAppend(count = 1) {
+    for (let index = 0; index < count; index++) {
+      const character = cursor.read()
+      if (character === undefined) return
+      sawInput = true
+      yield* append(character)
+    }
+  }
+
+  function readAndDiscard(count = 1) {
+    for (let index = 0; index < count; index++) {
+      if (cursor.read() === undefined) return false
+      sawInput = true
+    }
+    return true
+  }
+
+  function* appendWhitespace() {
+    while (cursor.peek() !== undefined && textWhitespaceCode(cursor.peek()!.charCodeAt(0))) yield* readAndAppend()
+  }
+
+  function* redactQuotedValue(quote: string) {
+    yield* readAndAppend()
+    let hasValue = false
+    while (cursor.peek() !== undefined) {
+      const character = cursor.read()!
+      sawInput = true
+      if (character === quote) {
+        if (hasValue) yield* append("[REDACTED]")
+        yield* append(character)
+        return
+      }
+      hasValue = true
+      if (character === "\\" && cursor.peek() !== undefined) readAndDiscard()
+    }
+    if (hasValue) yield* append("[REDACTED]")
+  }
+
+  function* redactToOuterQuote(quote: string) {
+    let hasValue = false
+    while (cursor.peek() !== undefined) {
+      const character = cursor.read()!
+      sawInput = true
+      if (character === quote) {
+        if (hasValue) yield* append("[REDACTED]")
+        yield* append(character)
+        return
+      }
+      hasValue = true
+      if (character === "\\" && cursor.peek() !== undefined) readAndDiscard()
+    }
+    if (hasValue) yield* append("[REDACTED]")
+  }
+
+  function authorizationPrefixLength() {
+    for (const prefix of ["bearer", "basic"] as const) {
+      if (!cursor.startsWithIgnoreCase(prefix)) continue
+      const next = cursor.peek(prefix.length)
+      if (next !== undefined && textWhitespaceCode(next.charCodeAt(0))) return prefix.length
+    }
+    return 0
+  }
+
+  function* redactUnquotedValue(terminator: (code: number) => boolean) {
+    const first = cursor.peek()
+    if (first === undefined || terminator(first.charCodeAt(0))) return
+    if (first === '"' || first === "'") {
+      yield* redactQuotedValue(first)
+      return
+    }
+
+    const authorizationPrefix = authorizationPrefixLength()
+    if (authorizationPrefix) {
+      readAndDiscard(authorizationPrefix)
+      while (cursor.peek() !== undefined && textWhitespaceCode(cursor.peek()!.charCodeAt(0))) readAndDiscard()
+    }
+    yield* append("[REDACTED]")
+    while (cursor.peek() !== undefined && !terminator(cursor.peek()!.charCodeAt(0))) readAndDiscard()
+  }
+
+  function* processQueryCredential() {
+    const key = cursorCredentialKey(cursor, 1)
+    if (!key || cursor.peek(1 + key.length) !== "=") return false
+    yield* readAndAppend(1 + key.length + 1)
+    yield* redactUnquotedValue(
+      (code) => code === 0x26 || code === 0x23 || code === 0x22 || code === 0x27 || textWhitespaceCode(code),
+    )
+    return true
+  }
+
+  function* processQuotedCredential() {
+    const quote = cursor.peek()
+    if (quote !== '"' && quote !== "'") return false
+    const key = cursorCredentialKey(cursor, 1)
+    if (!key) return false
+    const afterKey = cursor.peek(1 + key.length)
+    if (afterKey !== quote && afterKey !== ":" && (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0))))
+      return false
+    yield* readAndAppend(1 + key.length)
+    if (cursor.peek() !== quote) {
+      yield* appendWhitespace()
+      if (cursor.peek() !== ":") return true
+      yield* readAndAppend()
+      yield* appendWhitespace()
+      yield* redactToOuterQuote(quote)
+      return true
+    }
+    yield* readAndAppend()
+    yield* appendWhitespace()
+    if (cursor.peek() !== ":") return true
+    yield* readAndAppend()
+    yield* appendWhitespace()
+    yield* redactUnquotedValue((code) => textWhitespaceCode(code) || code === 0x2c || code === 0x3b)
+    return true
+  }
+
+  function* processFlagCredential() {
+    if (cursor.peek() !== "-" || cursor.peek(1) !== "-") return false
+    const key = cursorCredentialKey(cursor, 2)
+    if (!key) return false
+    const separator = cursor.peek(2 + key.length)
+    if (separator !== "=" && (separator === undefined || !textWhitespaceCode(separator.charCodeAt(0)))) return false
+    yield* readAndAppend(2 + key.length)
+    if (cursor.peek() === "=") yield* readAndAppend()
+    else yield* appendWhitespace()
+    yield* redactUnquotedValue((code) => textWhitespaceCode(code) || code === 0x2c || code === 0x3b)
+    return true
+  }
+
+  function* processCredentialField() {
+    if (!cursorWordBoundary(cursor)) return false
+    const key = cursorCredentialKey(cursor)
+    if (!key) return false
+    const afterKey = cursor.peek(key.length)
+    if (
+      afterKey !== "=" &&
+      afterKey !== ":" &&
+      (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0)))
+    )
+      return false
+    yield* readAndAppend(key.length)
+    yield* appendWhitespace()
+    const separator = cursor.peek()
+    if (separator !== "=" && separator !== ":") return true
+    yield* readAndAppend()
+    yield* appendWhitespace()
+    const cookieLike = key === "cookie" || key === "set-cookie"
+    yield* redactUnquotedValue((code) =>
+      cookieLike ? textWhitespaceCode(code) : textWhitespaceCode(code) || code === 0x2c || code === 0x3b,
+    )
+    return true
+  }
+
+  function* processSkToken() {
+    if (!cursorWordBoundary(cursor) || !cursor.startsWithIgnoreCase("sk-")) return false
+    const candidate: string[] = []
+    for (let index = 0; index < 3; index++) candidate.push(cursor.read()!)
+    let valueLength = 0
+    while (cursor.peek() !== undefined && credentialTokenCode(cursor.peek()!.charCodeAt(0)) && valueLength < 8) {
+      candidate.push(cursor.read()!)
+      valueLength += 1
+    }
+    sawInput = true
+    if (valueLength < 8) {
+      for (const character of candidate) yield* append(character)
+      return true
+    }
+    yield* append("[REDACTED]")
+    while (cursor.peek() !== undefined && credentialTokenCode(cursor.peek()!.charCodeAt(0))) readAndDiscard()
+    return true
+  }
+
+  function* processBearerToken() {
+    if (!cursorWordBoundary(cursor) || !cursor.startsWithIgnoreCase("bearer")) return false
+    const separator = cursor.peek(6)
+    if (separator === undefined || !textWhitespaceCode(separator.charCodeAt(0))) return false
+    yield* readAndAppend(6)
+    yield* appendWhitespace()
+    const first = cursor.peek()
+    if (first === undefined || !credentialTokenCode(first.charCodeAt(0))) return true
+    yield* append("[REDACTED]")
+    while (cursor.peek() !== undefined && credentialTokenCode(cursor.peek()!.charCodeAt(0))) readAndDiscard()
+    return true
+  }
+
+  function* processUrlScheme() {
+    const first = cursor.peek()
+    if (
+      !cursorWordBoundary(cursor) ||
+      first === undefined ||
+      asciiLowerCode(first.charCodeAt(0)) < 0x61 ||
+      asciiLowerCode(first.charCodeAt(0)) > 0x7a
+    )
+      return false
+    while (cursor.peek() !== undefined && streamSchemeCode(cursor.peek()!.charCodeAt(0))) yield* readAndAppend()
+    if (cursor.peek() !== ":" || cursor.peek(1) !== "/" || cursor.peek(2) !== "/") return true
+    yield* readAndAppend(3)
+
+    const buffered: string[] = []
+    let segment = ""
+    let colonSeen = false
+    let usernameLength = 0
+    let passwordLength = 0
+    let usernameProbe = ""
+    let passwordProbe = ""
+    const store = (character: string) => {
+      segment += character
+      if (segment.length < limit) return
+      buffered.push(segment)
+      segment = ""
+    }
+    function* replay() {
+      for (const chunk of buffered) yield* append(chunk)
+      if (segment) yield* append(segment)
+    }
+
+    while (cursor.peek() !== undefined) {
+      const character = cursor.peek()!
+      const code = character.charCodeAt(0)
+      if (character === "@") {
+        readAndDiscard()
+        if (colonSeen && usernameLength > 0 && passwordLength > 0) {
+          const alreadyRedacted =
+            usernameLength === 14 &&
+            passwordLength === 14 &&
+            usernameProbe === "%5bredacted%5d" &&
+            passwordProbe === "%5bredacted%5d"
+          if (alreadyRedacted) yield* replay()
+          else yield* append("[REDACTED]:[REDACTED]")
+          yield* append("@")
+          return true
+        }
+        yield* replay()
+        yield* append("@")
+        return true
+      }
+      if (character === "/" || character === "?" || character === "#" || textWhitespaceCode(code)) {
+        yield* replay()
+        return true
+      }
+      readAndDiscard()
+      store(character)
+      if (!colonSeen && character === ":") {
+        colonSeen = true
+        continue
+      }
+      const lower = String.fromCharCode(asciiLowerCode(code))
+      if (colonSeen) {
+        passwordLength += 1
+        if (passwordLength <= 14) passwordProbe += lower
+      } else {
+        usernameLength += 1
+        if (usernameLength <= 14) usernameProbe += lower
+      }
+    }
+    yield* replay()
+    return true
+  }
+
+  while (cursor.peek() !== undefined) {
+    sawInput = true
+    const character = cursor.peek()!
+    if ((character === "?" || character === "&") && (yield* processQueryCredential())) continue
+    if ((character === '"' || character === "'") && (yield* processQuotedCredential())) continue
+    if (character === "-" && cursor.peek(1) === "-" && (yield* processFlagCredential())) continue
+    if (yield* processSkToken()) continue
+    if (yield* processBearerToken()) continue
+    if (yield* processCredentialField()) continue
+    if (yield* processUrlScheme()) continue
+    yield* readAndAppend()
+  }
+  if (pending) yield pending
+  else if (!sawInput) yield ""
 }
 
 function json(input: unknown, label?: string) {
   const path = label?.split(".").filter(Boolean) ?? []
   return JSON.stringify(
-    sanitizeForJson(normalizeTemporalReferences(input).value, path.at(-1) ?? "", new WeakSet<object>(), path),
+    sanitizeTraceJson(input, path.at(-1) ?? "", path),
     undefined,
     0,
   )
@@ -1595,7 +2047,7 @@ class TraceOwnedCausalIRStore {
   }
 
   finalize(data: unknown): CausalIRCommitResult {
-    return this.store.finalize(this.copy(data))
+    return this.store.finalize(data)
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -1619,49 +2071,19 @@ function hash(input: string) {
   return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16)
 }
 
-function redactText(input: string) {
-  let output = input
-  output = output.replace(
-    /\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi,
-    (match, scheme: string, username: string, password: string) =>
-      username.toUpperCase() === "%5BREDACTED%5D" && password.toUpperCase() === "%5BREDACTED%5D"
-        ? match
-        : `${scheme}[REDACTED]:[REDACTED]@`,
-  )
-  output = output.replace(
-    /([?&](?:api[_-]?key|authorization|cookie|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)=)[^&#\s"']+/gi,
-    "$1[REDACTED]",
-  )
-  output = output.replace(
-    /(["'])(api[_-]?key|authorization|cookie|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\1(\s*:\s*)(["'])(?:\\.|(?!\4)[\s\S])*?\4/gi,
-    (_match, quote: string, key: string, separator: string, valueQuote: string) =>
-      `${quote}${key}${quote}${separator}${valueQuote}[REDACTED]${valueQuote}`,
-  )
-  output = output.replace(
-    /(["'])(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)(?:\\.|(?!\1)[\s\S])*?\1/gi,
-    (_match, quote: string, header: string) => `${quote}${header}[REDACTED]${quote}`,
-  )
-  output = output.replace(
-    /(\b(?:cookie|set-cookie)\s*:\s*)(?!\[REDACTED\])(?:(?:"(?:\\.|[^"\\])*")|(?:'(?:\\.|[^'\\])*')|[^\s\r\n"'])+/gi,
-    "$1[REDACTED]",
-  )
-  output = output.replace(
-    /(^|[\r\n]|(?:[a-z]*Error:\s+))(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x[-_]api[-_]key)\s*:\s*)[^\r\n]*/gi,
-    "$1$2[REDACTED]",
-  )
-  output = output.replace(
-    /(\-\-(?:api[-_]?key|password|passwd|credential|secret|token|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token)(?:=|\s+))(?:(?:"[^"]*")|(?:'[^']*')|[^\s,;]+)/gi,
-    "$1[REDACTED]",
-  )
-  output = output.replace(
-    /\b((?:api[_-]?key|authorization|proxy[_-]?authorization|cookie|password|passwd|credential|secret|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token)\s*=\s*)(?:(?:"[^"]*")|(?:'[^']*')|(?:(?:Basic|Bearer)\s+)?[^\s,]+)/gi,
-    "$1[REDACTED]",
-  )
-  for (const pattern of secretTextPatterns) output = output.replace(pattern, "[REDACTED]")
-  return output
+function* boundedTextFragments(input: string, limit = 1024) {
+  if (!input.length) {
+    yield ""
+    return
+  }
+  for (let offset = 0; offset < input.length; offset += limit) yield input.substring(offset, offset + limit)
 }
 
-function redactUrlText(input: URL) {
+function redactText(input: string) {
+  return [...canonicalRedactTextChunks(boundedTextFragments(input), 1024)].join("")
+}
+
+function redactUrlStructure(input: URL) {
   const output = new URL(input.toString())
   if (output.username) output.username = "[REDACTED]"
   if (output.password) output.password = "[REDACTED]"
@@ -1669,7 +2091,11 @@ function redactUrlText(input: URL) {
     if (normalizeKey(key) === "token" || isSensitiveKey(key, [], "query-value"))
       output.searchParams.set(key, "[REDACTED]")
   }
-  return redactText(output.toString())
+  return output.toString()
+}
+
+function redactUrlText(input: URL) {
+  return redactText(redactUrlStructure(input))
 }
 
 function textForSummary(input: unknown) {
@@ -4478,7 +4904,7 @@ function isSecondarySummaryFact(input: EvidenceFactInput, claim: TraceStructured
 }
 
 function countCircularMarkers(input: unknown, stack = new WeakSet<object>()): number {
-  if (input === "[Circular]") return 1
+  if (typeof input === "string" && (input === "[Circular]" || input.startsWith("[Circular:"))) return 1
   if (!input || typeof input !== "object") return 0
   if (stack.has(input)) return 1
   stack.add(input)
@@ -4715,6 +5141,9 @@ class ActiveCaseTrace {
   private sequence = 0
   private artifactSequence = 0
   private finished = false
+  private locationReported = false
+  private signalFinalized: NodeJS.Signals | undefined
+  private signalFinalizationInProgress = false
   private sessionID: string | undefined
   private input: Record<string, unknown> | undefined
   private result: Record<string, unknown> | undefined
@@ -4817,7 +5246,7 @@ class ActiveCaseTrace {
   }
 
   setSessionID(sessionID: string | undefined) {
-    if (!sessionID) return
+    if (!sessionID || this.sessionID) return
     this.sessionID = sessionID
     this.write("trace.session", { session_id: sessionID })
   }
@@ -7726,6 +8155,14 @@ class ActiveCaseTrace {
       ...this.temporalSourceRefs(requestedSourceRefs),
       ...(temporal.selectors.length ? this.currentSourceRefs() : []),
     ])
+    const revisionBoundData = this.subjectRevision
+      ? {
+          ...(normalized.data ?? {}),
+          case_id: this.caseID,
+          subject_revision: this.subjectRevision,
+          revision_provenance_status: "valid",
+        }
+      : normalized.data
     const timestamp = nowIso()
     const node: CausalNode = {
       node_id: normalized.node_id ?? semanticID("node", this.causalNodes.length + 1),
@@ -7741,9 +8178,9 @@ class ActiveCaseTrace {
       input_refs: normalized.input_refs,
       output_refs: normalized.output_refs,
       data:
-        normalized.data === undefined
+        revisionBoundData === undefined
           ? undefined
-          : this.summarizeCausalObject(normalized.data, `${normalized.kind}.data`),
+          : this.summarizeCausalObject(revisionBoundData, `${normalized.kind}.data`),
       source_refs: sourceRefs,
       source_locations: normalized.source_locations,
       typed_resources: normalized.typed_resources,
@@ -8192,13 +8629,16 @@ class ActiveCaseTrace {
 
   finish(input?: FinishTraceInput) {
     try {
-      if (this.finished) return
+      if (this.finished || (this.signalFinalized && !this.signalFinalizationInProgress)) return
       this.evaluateConstraints()
       this.normalizeFinalResponseSegments()
       this.pruneDesignRecordsForFinalResponses()
       const error = input?.error ? errorInfo(input.error) : undefined
       if (error) this.errors.push(error)
-      this.result = input?.result ?? this.result
+      this.result =
+        input?.result === undefined
+          ? this.result
+          : (sanitizeTraceJson(input.result, "result", ["manifest", "result"]) as Record<string, unknown>)
       const status = input?.status ?? (error ? "error" : "success")
       const caseStatus = this.inferCaseStatus(status, error)
       this.enrichSemanticFactApplicabilityAndConflicts()
@@ -8217,6 +8657,7 @@ class ActiveCaseTrace {
         ...checkpointSummary,
         journal: this.causalIR.journalSummary(),
       }
+      causalIR.manifest = sanitizeTraceJson(causalIR.manifest, "manifest", ["manifest"]) as TraceManifest
       const finalization = this.causalIR.finalize(causalIR)
       const emittedCausalIR: CausalIRTraceSummary = finalization.committed
         ? causalIR
@@ -8225,41 +8666,211 @@ class ActiveCaseTrace {
             journal: this.causalIR.journalSummary(),
           }
       const provenance = this.projectProvenanceSummary(emittedCausalIR)
-      const canonical = jsonPretty(emittedCausalIR)
-      this.safeWrite(this.traceFile, canonical)
-      this.safeWrite(this.manifestFile, jsonPretty(emittedCausalIR.manifest))
-      this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
-      this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-      this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
-      this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
+      const persisted = this.persistTerminalSnapshot(emittedCausalIR, provenance, summary, false)
+      if (!this.terminalSnapshotComplete(persisted)) {
+        this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, emittedCausalIR, summary)
+      }
+      this.publishTerminalLocation(this.tracePublicationStatus(status))
     } finally {
       this.responseSourceBySegmentID.clear()
     }
   }
 
   flushForSignal(signal: NodeJS.Signals) {
-    const result = {
-      ...(recordFromUnknown(this.result) ?? {}),
+    if (this.signalFinalized) return
+    this.signalFinalized = signal
+    this.signalFinalizationInProgress = true
+    let result: Record<string, unknown> = {
       reason: signal,
       signal,
       trace_html_flush: "process_signal",
     }
-    if (!this.finished) {
-      this.finish({ status: "cancelled", result })
-      return
+    try {
+      result = {
+        ...(recordFromUnknown(this.result) ?? {}),
+        ...result,
+      }
+      if (!this.finished) this.finish({ status: "cancelled", result })
+      else this.persistSignalSnapshot(result)
+    } catch {
+      this.persistSignalSnapshotBestEffort(signal, result)
+    } finally {
+      this.signalFinalizationInProgress = false
     }
+  }
+
+  private persistSignalSnapshot(result: Record<string, unknown>) {
     this.result = result
     const caseStatus = this.observedCaseStatus() ?? this.inferCaseStatus("cancelled", undefined)
     const causalIR = this.causalIRSummary("cancelled", caseStatus)
     const summary = this.summary("cancelled", causalIR)
     const provenance = this.projectProvenanceSummary(causalIR)
-    const canonical = jsonPretty(causalIR)
-    this.safeWrite(this.traceFile, canonical)
-    this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
-    this.safeLinkOrWrite(this.traceFile, this.partialFile, canonical)
-    this.safeWrite(this.provenanceTraceFile, jsonPretty(provenance))
-    this.safeWrite(this.legacyTraceFile, jsonPretty(summary))
-    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(provenance))
+    const persisted = this.persistTerminalSnapshot(causalIR, provenance, summary, true)
+    if (!this.terminalSnapshotComplete(persisted)) {
+      this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, causalIR, summary)
+    }
+    this.publishTerminalLocation("cancelled")
+    this.finished = true
+  }
+
+  private persistSignalSnapshotBestEffort(signal: NodeJS.Signals, result: Record<string, unknown>) {
+    let fallback: CausalIRTraceSummary | undefined
+    this.result = result
+    try {
+      fallback = this.causalIRSummary("cancelled", this.observedCaseStatus() ?? "cancelled")
+    } catch {}
+    if (!fallback) {
+      try {
+        fallback = JSON.parse(fs.readFileSync(this.partialFile, "utf8")) as CausalIRTraceSummary
+      } catch {}
+    }
+    if (!fallback) {
+      const canonicalRemoved = this.removeStaleCanonicalTrace()
+      this.reportTerminalPersistenceFailure(signal, {
+        trace: false,
+        manifest: false,
+        partial: false,
+        html: false,
+        canonical_removed: canonicalRemoved,
+      })
+      this.publishTerminalLocation("cancelled")
+      this.finished = true
+      return
+    }
+    this.persistTerminalSnapshotEmergency(signal, fallback)
+    this.publishTerminalLocation("cancelled")
+    this.finished = true
+  }
+
+  private tracePublicationStatus(status: TraceStatus): TracePublicationStatus {
+    if (status === "success") return "completed"
+    if (status === "error") return "failed"
+    return "cancelled"
+  }
+
+  private publishTerminalLocation(status: TracePublicationStatus) {
+    if (this.locationReported || process.env.OPENCODE_CASE_TRACE_QUIET === "1") return
+    const publication = collectTracePublication({
+      sessionID: this.sessionID,
+      caseID: this.caseID,
+      status,
+      caseDir: this.caseDir,
+      traceFile: this.traceFile,
+      htmlFile: this.htmlFile,
+      partialFile: this.partialFile,
+    })
+    if (!publication) return
+    this.locationReported = true
+    reportTracePublication(publication)
+  }
+
+  private persistTerminalSnapshot(
+    causalIR: CausalIRTraceSummary,
+    provenance: ProvenanceTraceView,
+    legacy: TraceSummary | undefined,
+    forceStreaming: boolean,
+  ) {
+    const trace = this.safeWrite(this.traceFile, streamingJson(causalIR))
+    const manifest = this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
+    const partial = trace
+      ? this.safeLinkOrWrite(this.traceFile, this.partialFile, streamingJson(causalIR))
+      : this.safeWrite(this.partialFile, streamingJson(causalIR))
+    this.safeWrite(this.provenanceTraceFile, streamingJson(provenance))
+    if (legacy) this.safeWrite(this.legacyTraceFile, streamingJson(legacy))
+    const html = this.safeWriteProvenanceHtml(provenance, forceStreaming)
+    return { trace, manifest, partial, html }
+  }
+
+  private terminalSnapshotComplete(result: { trace: boolean; manifest: boolean; partial: boolean; html: boolean }) {
+    return result.trace && result.manifest && result.partial && result.html
+  }
+
+  private persistTerminalSnapshotEmergency(
+    signal: NodeJS.Signals | undefined,
+    persisted: CausalIRTraceSummary,
+    legacy?: TraceSummary,
+  ) {
+    const previousManifest = persisted.manifest as TraceManifest
+    const completed = previousManifest.case_status === "success"
+    const manifest: TraceManifest = signal
+      ? {
+          ...previousManifest,
+          status: completed ? "success" : "cancelled",
+          server_status: "cancelled",
+          process_status: "cancelled",
+          case_status: completed ? "success" : "cancelled",
+          shutdown_signal: signal,
+          shutdown_disposition: completed ? "graceful_after_case_completion" : "interrupted_before_case_completion",
+        }
+      : previousManifest
+    const fallback: CausalIRTraceSummary = { ...persisted, manifest }
+    let provenance: ProvenanceTraceView | undefined
+    try {
+      provenance = this.projectProvenanceSummary(fallback)
+    } catch {}
+    const result = {
+      trace: this.safeWrite(this.traceFile, streamingJson(fallback)),
+      manifest: this.safeWrite(this.manifestFile, jsonPretty(manifest)),
+      partial: this.safeWrite(this.partialFile, streamingJson(fallback)),
+      html: false,
+    }
+    if (provenance) {
+      this.safeWrite(this.provenanceTraceFile, streamingJson(provenance))
+      result.html = this.safeWriteProvenanceHtml(provenance, true)
+    }
+    const canonicalRemoved = result.trace || this.removeStaleCanonicalTrace()
+    if (!result.partial) {
+      try {
+        fs.unlinkSync(this.partialFile)
+      } catch {}
+    }
+    if (!result.html) {
+      try {
+        fs.unlinkSync(this.htmlFile)
+      } catch {}
+    }
+    if (!result.trace || !canonicalRemoved || !result.manifest || !result.html || !result.partial) {
+      this.reportTerminalPersistenceFailure(signal, { ...result, canonical_removed: canonicalRemoved })
+    }
+    return result
+  }
+
+  private removeStaleCanonicalTrace() {
+    try {
+      fs.unlinkSync(this.traceFile)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true
+      return false
+    }
+    let directory: number | undefined
+    try {
+      directory = fs.openSync(this.caseDir, "r")
+      fs.fsyncSync(directory)
+      return true
+    } catch {
+      return false
+    } finally {
+      if (directory !== undefined) {
+        try {
+          fs.closeSync(directory)
+        } catch {}
+      }
+    }
+  }
+
+  private reportTerminalPersistenceFailure(
+    signal: NodeJS.Signals | undefined,
+    result: { trace: boolean; manifest: boolean; partial: boolean; html: boolean; canonical_removed?: boolean },
+  ) {
+    try {
+      process.stderr.write(
+        `[opencode-observability] terminal trace persistence failed ${JSON.stringify({
+          case_id: this.caseID,
+          signal: signal ?? null,
+          writes: result,
+        })}\n`,
+      )
+    } catch {}
   }
 
   private summary(
@@ -10522,28 +11133,44 @@ class ActiveCaseTrace {
     if (!force && now < this.nextPartialWrite) return
     this.nextPartialWrite = now + interval
     const causalIR = summary ?? this.causalIRSummary("running")
-    this.safeWrite(this.partialFile, jsonPretty(causalIR))
-    this.safeWrite(this.htmlFile, renderProvenanceTraceHtml(this.projectProvenanceSummary(causalIR)))
+    this.safeWrite(this.partialFile, streamingJson(causalIR))
+    this.safeWriteProvenanceHtml(this.projectProvenanceSummary(causalIR))
     if (checkpoint) this.causalIR.checkpoint(causalIR)
   }
 
-  private safeWrite(target: string, content: string) {
+  private safeWriteProvenanceHtml(trace: ProvenanceTraceView, forceStreaming = false) {
+    return this.safeWrite(this.htmlFile, streamingHtml(trace, forceStreaming))
+  }
+
+  private safeWrite(target: string, content: string | StreamingJsonContent | StreamingHtmlContent) {
     const temporary = path.join(
       path.dirname(target),
       `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.tmp`,
     )
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(temporary, content)
-      fs.renameSync(temporary, target)
+      if (isStreamingHtmlContent(content)) {
+        writeProvenanceTraceHtmlFile(target, content.trace, { forceStreaming: content.forceStreaming })
+      } else if (isStreamingJsonContent(content)) {
+        writeJsonDocumentAtomic(target, content.value, {
+          sanitize: sanitizeTraceJsonValue,
+          sanitizeStringChunks: sanitizeTraceJsonStringChunks,
+          normalizeTemporalReferences: true,
+        })
+      } else {
+        fs.writeFileSync(temporary, content)
+        fs.renameSync(temporary, target)
+      }
+      return true
     } catch {
       try {
         fs.unlinkSync(temporary)
       } catch {}
+      return false
     }
   }
 
-  private safeLinkOrWrite(source: string, target: string, fallbackContent: string) {
+  private safeLinkOrWrite(source: string, target: string, fallbackContent: string | StreamingJsonContent) {
     const temporary = path.join(
       path.dirname(target),
       `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.link`,
@@ -10552,18 +11179,61 @@ class ActiveCaseTrace {
       fs.mkdirSync(path.dirname(target), { recursive: true })
       fs.linkSync(source, temporary)
       fs.renameSync(temporary, target)
-      return
+      return true
     } catch {
       try {
         fs.unlinkSync(temporary)
       } catch {}
     }
-    this.safeWrite(target, fallbackContent)
+    try {
+      fs.copyFileSync(source, temporary)
+      fs.renameSync(temporary, target)
+      return true
+    } catch {
+      try {
+        fs.unlinkSync(temporary)
+      } catch {}
+    }
+    return this.safeWrite(target, fallbackContent)
   }
 }
 
+const streamingJsonContent = Symbol("streaming-json-content")
+const streamingHtmlContent = Symbol("streaming-html-content")
+
+type StreamingJsonContent = {
+  [streamingJsonContent]: true
+  value: unknown
+}
+
+type StreamingHtmlContent = {
+  [streamingHtmlContent]: true
+  trace: ProvenanceTraceView
+  forceStreaming: boolean
+}
+
+function streamingJson(value: unknown): StreamingJsonContent {
+  return { [streamingJsonContent]: true, value }
+}
+
+function streamingHtml(trace: ProvenanceTraceView, forceStreaming: boolean): StreamingHtmlContent {
+  return { [streamingHtmlContent]: true, trace, forceStreaming }
+}
+
+function isStreamingJsonContent(
+  input: string | StreamingJsonContent | StreamingHtmlContent,
+): input is StreamingJsonContent {
+  return typeof input !== "string" && streamingJsonContent in input
+}
+
+function isStreamingHtmlContent(
+  input: string | StreamingJsonContent | StreamingHtmlContent,
+): input is StreamingHtmlContent {
+  return typeof input !== "string" && streamingHtmlContent in input
+}
+
 function jsonPretty(input: unknown) {
-  return JSON.stringify(sanitizeForJson(normalizeTemporalReferences(input).value), undefined, 2)
+  return JSON.stringify(sanitizeTraceJson(input), undefined, 2)
 }
 
 function prettyJsonString(input: string) {

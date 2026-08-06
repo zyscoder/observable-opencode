@@ -1,97 +1,129 @@
-# Task 2 Report: Claim Group Projection
+# Task 2 Report: ActiveCaseTrace Terminal Trace Publication
 
 ## Status
 
-Completed.
+Completed. No files were staged or committed.
+
+## Changes
+
+- `packages/opencode/src/observability/case-trace.ts`
+  - Imports Task 1 `collectTracePublication()`, `reportTracePublication()`, and
+    `TracePublicationStatus`.
+  - Adds `locationReported` and `publishTerminalLocation(status)` to publish
+    one stderr receipt per active trace, only after terminal persistence has
+    completed. `OPENCODE_CASE_TRACE_QUIET === "1"` suppresses the receipt.
+  - Maps `success`, `error`, and `cancelled` to `completed`, `failed`, and
+    `cancelled`; Task 1 degrades incomplete terminal artifacts to `partial`.
+  - Calls publication after normal `finish()`, `persistSignalSnapshot()`, and
+    `persistSignalSnapshotBestEffort()` persistence paths. Existing
+    before-exit, exit, SIGINT, SIGTERM, SIGHUP, uncaught-exception, and
+    unhandled-rejection routes already converge on these paths. SIGKILL remains
+    intentionally uncapturable.
+- `packages/opencode/test/observability/case-trace.test.ts`
+  - Defaults inherited fixtures to quiet mode, preserving existing empty-stderr
+    assertions.
+  - Adds RED/GREEN integration fixtures for explicit repeated `finish()` and
+    a real `SIGTERM`; both explicitly enable publication and check the receipt,
+    persisted `trace.json` and `trace.html` locations, unchanged stdout, and
+    one receipt only.
 
 ## RED
 
-- CaseTrace RED: the parenthetical `_cstack` final response emitted two claims without `next_claim_ref` / `previous_claim_ref`.
-- Causal IR RED: `response_to_claim_group` and `claim_group_precedes` replayed as unknown `derived_from` relations.
+The root command is deliberately blocked by `bunfig` in this checkout:
 
-## Implementation
+```bash
+bun test packages/opencode/test/observability/case-trace.test.ts -t "trace publication"
+```
 
-- Preallocate final-response claim IDs before emission and derive record references from the projected record identity: `record:responseclaim_<claim_id>`.
-- Preserve Task 1 `previous_claim_key` / `next_claim_key` and add the corresponding record references.
-- Project group, count, byte range, record references, and atomization fields to the Trace record, Causal node payload, and node metadata.
-- Retain `response_to_claim`; add `response_to_claim_group` with `claim_group_id` metadata.
-- Add `claim_group_precedes` only for adjacent claims in the same segment and same group. Its top-level and metadata attribution eligibility are false, with `causal_semantics=claim_group_order_only` and `behavior_impact=none`.
-- Register both relations as formal dataflow relations so journal replay preserves them without unknown-relation fallback.
+Result: expected local runner block (`do-not-run-tests-from-root`). Equivalent
+package command used:
+
+```bash
+cd packages/opencode
+bun test test/observability/case-trace.test.ts -t "trace publication"
+```
+
+Result before implementation: exit `1`; `0 pass`, `2 fail`. Both failures were
+the expected missing `Session trace saved` stderr receipt.
 
 ## GREEN
 
-- Focused CaseTrace claim group tests: 2 pass.
-- Focused Causal IR claim group replay test: 1 pass.
-- Focused `claim|journal` suite: 79 pass, 0 fail.
-- Full Causal IR suite: 54 pass, 0 fail.
-- Claim atomizer regression suite: 39 pass, 0 fail.
-- Full CaseTrace suite completed with all 135 test lines passing.
-- Typecheck: `tsgo --noEmit` passed.
-- `git diff --check` passed.
+Focused publication regression:
 
-## Commit
+```bash
+cd packages/opencode
+bun test test/observability/case-trace.test.ts -t "trace publication"
+```
 
-`feat(trace): project claim group provenance into causal IR`
+Result: exit `0`; `2 pass`, `0 fail`.
 
-## Files
+Terminal-path regression:
 
-- `packages/opencode/src/observability/case-trace.ts`
-- `packages/opencode/src/observability/trace-semantic-contract.ts`
-- `packages/opencode/test/observability/case-trace.test.ts`
-- `packages/opencode/test/observability/causal-ir.test.ts`
-- `.superpowers/sdd/task-2-report.md`
+```bash
+cd packages/opencode
+bun test test/observability/case-trace.test.ts -t "trace publication|receives SIGINT|receives SIGTERM|signal listener"
+```
+
+Result: exit `0`; `6 pass`, `0 fail`.
+
+Task 1 publication unit regression:
+
+```bash
+cd packages/opencode
+bun test test/observability/trace-publication.test.ts
+```
+
+Result: exit `0`; `4 pass`, `0 fail`.
+
+Full requested trace regression, run concurrently only to remain within the
+execution channel time window:
+
+```bash
+cd packages/opencode
+bun test --concurrent --max-concurrency=20 --reporter=dot \
+  test/observability/trace-publication.test.ts \
+  test/observability/case-trace.test.ts
+```
+
+Result: exit `0`; `150 pass`, `0 fail`, `2004 expect()` calls.
+
+Static diff check:
+
+```bash
+git diff --check
+```
+
+Result: exit `0`, no output.
+
+## Signal And One-Time Verification
+
+- The real SIGTERM fixture exits with code `143` and emits exactly one receipt.
+- The repeated explicit `CaseTrace.finish()` fixture exits `0` and emits
+  exactly one receipt.
+- Both fixtures confirm the receipt carries `session: ses_publication`,
+  `trace.html`, and `trace.json`; `trace.json` exists by the time stderr is
+  read. The explicit-finish fixture also retains its exact stdout
+  (`agent output\n`), while the SIGTERM fixture keeps stdout empty.
+- `locationReported` is set only after Task 1 returns a publication, so no
+  receipt is consumed before a file-backed terminal or partial snapshot exists.
+  Task 1 contains the stderr writer failure isolation, so reporting cannot
+  change process exit behavior.
+
+## Self-Review
+
+- Compared both shared files to
+  `/tmp/observable-opencode-task2-before.nJWk6H`; only the Task 2 additions
+  listed above appear in the snapshot diff. Existing uncommitted work remains.
+- Publication occurs after direct and emergency terminal persistence attempts;
+  it does not write stdout.
+- Existing unified process finalizers cover beforeExit/exit, all three
+  catchable signals, uncaught exceptions, and unhandled rejections without
+  changing their exit-control logic.
+- No `git add` or `git commit` was run, per task instruction.
 
 ## Concerns
 
-- Task 1 assigns distinct `claim_group_id` values to independent atomic statements. Consequently, a two-statement response with separate groups has no `claim_group_precedes` edge by design. The implementation will preserve and replay the ordering edge when adjacent claims share a group, without changing atomizer semantics.
-- Existing Causal IR aliasing already provides `response_claim:<claim_id>` and generic journal replay already preserves arbitrary payload and metadata fields, so no direct `causal-ir.ts` production change was required.
-
-## Review Fix: Fact Closure
-
-### RED
-
-- The generated parenthetical final response produced two independent claims but zero `claim_group_precedes` edges because emission required equal `claim_group_id` values.
-- A replayed `claim_group_precedes` edge retained `eligible_for_attribution: false` in metadata but the compatibility `dataflow_edges` projection omitted the top-level field.
-
-### GREEN
-
-- Adjacent claims from one response segment now produce exactly one order edge regardless of their distinct claim groups; explicit cross-segment claims and a generated single-claim final response produce none.
-- The production CaseTrace -> journal -> replay test verifies both response.claim nodes' data and metadata, byte ranges, previous/next record refs, order-edge semantics, and attribution isolation.
-- The replayed compatibility projection retains `eligible_for_attribution: false` both at the dataflow-edge top level and in metadata.
-- Verified: focused `claim|journal` suite (80 pass); CaseTrace suite (136 pass); Causal IR suite (54 pass); claim atomizer suite (39 pass); `bun run typecheck`; `git diff --check`.
-
-### Commit
-
-`fix(trace): close claim group projection review gaps`
-
-## Final Interface Closure
-
-### RED
-
-- A JavaScript/`as any` `responseClaim()` input omitting all five atomization facts wrote an incomplete `response.claim` record, node data payload, and node metadata payload.
-- The initial legacy normalization used a summarized source string. A Unicode legacy input larger than 8 KB exposed a truncated `source_byte_range` and a group hash derived from the truncated text.
-- The `claim_group_precedes` label still described ordering as being within one claim group even though the edge correctly joins adjacent claims from the same response segment regardless of group.
-
-### GREEN
-
-- `TraceResponseClaimRecord` and `ResponseClaimInput` now require `claim_group_id`, `claim_count`, `source_byte_range`, `atomization_status`, and `atomization_reason`; status is exactly `atomic | group_required | invalid_fragment`.
-- `normalizeLegacyResponseClaimAtomizationFacts()` is an isolated runtime boundary. Valid atomized inputs bypass it unchanged; incomplete or invalid dynamic inputs receive a deterministic group ID, count `1`, the original string's UTF-8 byte range, `group_required`, and `legacy_response_claim_missing_atomization_facts`.
-- The normal atomized path now verifies the five facts for every response-claim record, Causal IR node data payload, and node metadata payload. The legacy runtime regression verifies the same closure and journal replay for a long Unicode source.
-- `claim_group_precedes` now labels the fact as `Adjacent claim/group order within a response segment`; relation, eligibility, and metadata semantics are unchanged.
-
-### Verification
-
-- Focused CaseTrace RED/GREEN tests: parenthetical normal closure and legacy runtime normalization, 2 pass.
-- Full CaseTrace suite: 138 pass, 0 fail.
-- Full Causal IR suite: 54 pass, 0 fail.
-- Claim atomizer suite: 39 pass, 0 fail.
-- `bun run typecheck`: passed.
-- `git diff --check`: passed.
-
-### Commit
-
-`fix(trace): close Task 2 response claim interface`
-
-### Concerns
-
-- The compatibility boundary intentionally treats malformed dynamic values like missing values so persistence cannot produce a partial atomization closure. Statically typed callers must provide all five facts and retain their normal atomized values unchanged.
+No functional concerns. The plain serial full-suite command exceeds the
+execution channel's 30-second foreground window; the same two requested files
+were therefore verified successfully with Bun's concurrent runner, while the
+focused signal tests retained their serial execution and exact exit-code checks.

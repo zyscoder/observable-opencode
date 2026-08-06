@@ -11,12 +11,16 @@ from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
 from trace_attribution import causal_judge as causal_judge_module
+from trace_attribution import candidate_paging as candidate_paging_module
 from trace_attribution import evidence_capsule
 from trace_attribution import global_judge as global_judge_module
 from trace_attribution.causal_judge import BoundedJudgeCallError, ClaudeCausalJudge
 from trace_attribution.causal_state import (
     CausalCandidate,
     seed_defect_state,
+)
+from trace_attribution.confirmation_path import (
+    is_confirmation_causal_edge,
 )
 from trace_attribution.evidence_capsule import (
     CAPSULE_SCHEMA_VERSION,
@@ -27,6 +31,8 @@ from trace_attribution.global_judge import (
     GlobalCandidateJudgeRequest,
     active_focus_text_sha256,
     build_global_candidate_prompt,
+    canonicalize_global_candidate_structural_bindings,
+    global_candidate_comparison_contract_from_context,
     global_candidate_request_from_validation_envelope,
     global_candidate_judgment_from_payload,
     normalize_active_focus_text,
@@ -35,6 +41,17 @@ from trace_attribution.global_judge import (
 )
 from trace_attribution.graph import TraceGraph
 from trace_attribution.errors import TransportCallResult
+from trace_attribution.models import stable_json
+from trace_attribution.restoration_obligation import RestorationObligation
+
+
+class GlobalPageRepairBudgetTest(unittest.TestCase):
+    def test_page_budget_covers_the_full_semantic_repair_loop(self) -> None:
+        self.assertGreaterEqual(
+            candidate_paging_module
+            .GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+            causal_judge_module.MAX_SEMANTIC_REPAIR_ATTEMPTS,
+        )
 
 
 def sample_request(
@@ -231,6 +248,14 @@ def multi_root_payload(
                 ),
                 "compared_candidate_refs": eligible,
                 "causal_role": "root_candidate",
+                "responsibility": "primary",
+                "candidate_phase": "implementation",
+                "obligation_status_before": "unknown",
+                "obligation_status_after": "unknown",
+                "repair_window_effect": "remained_open",
+                "failure_mode": "positive_introduction",
+                "obligation_refs": [],
+                "contribution_mechanism": None,
                 "reason": "The candidate can independently explain the defect.",
                 "evidence_refs": [capsule.candidate_ref],
                 "confidence": 0.8,
@@ -242,6 +267,207 @@ def multi_root_payload(
         "decisive_evidence_refs": list(selected),
         "missing_evidence": [],
         "confidence": 0.8,
+    }
+
+
+def root_role_chain_request(
+    *, failure_kind: str = "functional"
+) -> GlobalCandidateJudgeRequest:
+    refs = (
+        "record:dec_147",
+        "record:dec_159",
+        "record:verification_omission",
+        "record:dec_343",
+    )
+    records = [
+        {
+            "record_id": "dec_147",
+            "component": "agent",
+            "event_type": "decision",
+            "data": {
+                "phase": "planning",
+                "rationale": "Introduce the functional implementation strategy.",
+            },
+        },
+        {
+            "record_id": "dec_159",
+            "component": "agent",
+            "event_type": "decision",
+            "data": {
+                "phase": "implementation",
+                "rationale": "Apply the strategy to the implementation.",
+            },
+        },
+        {
+            "record_id": "verification_omission",
+            "component": "agent",
+            "event_type": "decision",
+            "data": {
+                "phase": "verification",
+                "rationale": "Omit the independent functional verification.",
+            },
+        },
+        {
+            "record_id": "dec_343",
+            "component": "agent",
+            "event_type": "decision",
+            "data": {
+                "phase": "closure",
+                "rationale": "Close the task despite the unverified behavior.",
+            },
+        },
+        {
+            "record_id": "defect",
+            "component": "evaluation",
+            "event_type": "case.observed_defect",
+            "data": {
+                "failure_type": failure_kind,
+                "expected": "The implementation preserves the required behavior.",
+                "actual": "The implementation violates the required behavior.",
+            },
+        },
+    ]
+    path = (*refs, "record:defect")
+    trace = {
+        "case_id": "root-role-chain-{0}".format(failure_kind),
+        "records": records,
+        "dataflow_edges": [
+            {
+                "from": {
+                    "type": "record",
+                    "id": source.removeprefix("record:"),
+                },
+                "to": {
+                    "type": "record",
+                    "id": target.removeprefix("record:"),
+                },
+                "relation": (
+                    "decision_exposed_by_evaluation"
+                    if target == "record:defect"
+                    else "decision_guided_change"
+                ),
+                "evidence_type": "confirmed",
+                "confidence": 1.0,
+                "eligible_for_attribution": True,
+            }
+            for source, target in zip(path, path[1:])
+        ],
+    }
+    graph = TraceGraph.from_trace(trace)
+    objective = "Find the root for the active failure signature."
+    defect = seed_defect_state(graph.nodes["record:defect"], objective)
+    candidates = tuple(
+        CausalCandidate(
+            ref=ref,
+            node=graph.nodes[ref],
+            source="confirmed_edge",
+            score=1.0,
+            evidence_refs=(ref,),
+        )
+        for ref in refs
+    )
+    capsules = build_candidate_evidence_capsules(
+        graph=graph,
+        candidates=candidates,
+        defect_state=defect,
+        downstream_paths={
+            ref: path[path.index(ref) :]
+            for ref in refs
+        },
+        start_refs=("record:defect",),
+    )
+    return GlobalCandidateJudgeRequest(
+        case_id=trace["case_id"],
+        objective=objective,
+        analysis_perspective="task quality",
+        seed_ref="record:defect",
+        active_defect=defect,
+        active_focus_text=defect.actual,
+        active_focus_text_hash=active_focus_text_sha256(defect.actual),
+        start_refs=("record:defect",),
+        capsules=capsules,
+    )
+
+
+def root_role_chain_payload(
+    request: GlobalCandidateJudgeRequest, *, selected_ref: str
+) -> dict:
+    compared_refs = list(request.open_authored_root_candidate_refs)
+    assessments = []
+    for capsule in request.capsules:
+        selected = capsule.candidate_ref == selected_ref
+        evidence_refs = list(capsule.downstream_path[:2])
+        recorded_phase = str(
+            capsule.candidate["node"]["data"].get("phase")
+            or "intermediate"
+        )
+        assessments.append(
+            {
+                "candidate_ref": capsule.candidate_ref,
+                "defect_status": "present",
+                "input_defect_status": "absent" if selected else "present",
+                "output_defect_status": "present",
+                "causal_path_refs": list(capsule.downstream_path),
+                "counterfactual": counterfactual(
+                    capsule.candidate_ref,
+                    prevents_defect=selected,
+                ),
+                "compared_candidate_refs": compared_refs,
+                "causal_role": (
+                    "root_candidate" if selected else "contributing_condition"
+                ),
+                "responsibility": "primary" if selected else "shared",
+                "candidate_phase": (
+                    recorded_phase
+                    if recorded_phase
+                    in {
+                        "diagnostic",
+                        "planning",
+                        "intermediate",
+                        "implementation",
+                        "closure",
+                        "final",
+                    }
+                    else "intermediate"
+                ),
+                "obligation_status_before": "unknown",
+                "obligation_status_after": "unknown",
+                "repair_window_effect": "remained_open",
+                "failure_mode": (
+                    "positive_introduction"
+                    if selected
+                    else "omission_enabling_condition"
+                ),
+                "obligation_refs": [],
+                "contribution_mechanism": (
+                    None
+                    if selected
+                    else {
+                        "type": "repair_opportunity_consumption",
+                        "target_ref": evidence_refs[-1],
+                        "effect": "The later decision preserves the active defect.",
+                        "evidence_refs": evidence_refs,
+                    }
+                ),
+                "reason": "Compare the candidate against the active signature.",
+                "evidence_refs": [capsule.candidate_ref],
+                "confidence": 0.9,
+            }
+        )
+    return {
+        "outcome": "candidate_roots",
+        "reason": "One authored candidate requires independent confirmation.",
+        "active_focus_binding": {
+            "seed_ref": request.seed_ref,
+            "defect_fingerprint": request.active_defect.fingerprint,
+            "active_focus_text_hash": request.active_focus_text_hash,
+        },
+        "assessments": assessments,
+        "selected_candidate_refs": [selected_ref],
+        "expansion_requests": [],
+        "decisive_evidence_refs": [selected_ref],
+        "missing_evidence": [],
+        "confidence": 0.9,
     }
 
 
@@ -313,10 +539,42 @@ def assessment(
     causal_role: str,
     evidence_refs: list[str],
 ) -> dict:
+    is_root = causal_role == "root_candidate"
+    is_factor = causal_role in {
+        "contributing_condition",
+        "amplifying_factor",
+    }
     return {
         "candidate_ref": ref,
         "defect_status": defect_status,
         "causal_role": causal_role,
+        "responsibility": (
+            "primary" if is_root else "shared" if is_factor else "none"
+        ),
+        "candidate_phase": (
+            "implementation" if is_root else "planning" if is_factor else "intermediate"
+        ),
+        "obligation_status_before": "unknown",
+        "obligation_status_after": "unknown",
+        "repair_window_effect": "remained_open",
+        "failure_mode": (
+            "positive_introduction"
+            if is_root
+            else "omission_enabling_condition"
+            if is_factor
+            else "none"
+        ),
+        "obligation_refs": [],
+        "contribution_mechanism": (
+            {
+                "type": "scope_narrowing",
+                "target_ref": evidence_refs[0],
+                "effect": "The candidate narrows the downstream repair scope.",
+                "evidence_refs": evidence_refs,
+            }
+            if is_factor
+            else None
+        ),
         "reason": "Grounded comparative judgment for the offered candidate.",
         "evidence_refs": evidence_refs,
         "confidence": 0.9,
@@ -393,6 +651,794 @@ def payload(*, outcome: str, request: GlobalCandidateJudgeRequest | None = None)
 
 
 class GlobalCandidateJudgeContractTest(unittest.TestCase):
+    def test_functional_signature_rejects_false_closure_substitution(self):
+        request = root_role_chain_request(failure_kind="functional")
+
+        with self.assertRaisesRegex(ValueError, "closure substitution"):
+            validate_global_candidate_payload(
+                root_role_chain_payload(
+                    request,
+                    selected_ref="record:dec_343",
+                ),
+                request=request,
+            )
+
+    def test_functional_signature_selects_introduction_and_projects_closure_factor(self):
+        request = root_role_chain_request(failure_kind="functional")
+
+        judgment = validate_global_candidate_payload(
+            root_role_chain_payload(
+                request,
+                selected_ref="record:dec_147",
+            ),
+            request=request,
+        )
+        bindings = {
+            item.candidate_ref: item
+            for item in getattr(
+                judgment,
+                "active_failure_role_bindings",
+                (),
+            )
+        }
+
+        self.assertEqual(
+            set(bindings),
+            {
+                "record:dec_147",
+                "record:dec_159",
+                "record:verification_omission",
+                "record:dec_343",
+            },
+        )
+        self.assertEqual(
+            bindings["record:dec_147"].causal_role,
+            "defect_introduction_root",
+        )
+        self.assertEqual(bindings["record:dec_147"].disposition, "root")
+        self.assertEqual(
+            bindings["record:dec_343"].causal_role,
+            "false_closure",
+        )
+        self.assertEqual(bindings["record:dec_343"].disposition, "factor")
+
+    def test_acceptance_signature_may_select_false_closure_as_its_root(self):
+        request = root_role_chain_request(failure_kind="acceptance")
+
+        judgment = validate_global_candidate_payload(
+            root_role_chain_payload(
+                request,
+                selected_ref="record:dec_343",
+            ),
+            request=request,
+        )
+        binding = next(
+            (
+                item
+                for item in getattr(
+                    judgment,
+                    "active_failure_role_bindings",
+                    (),
+                )
+                if item.candidate_ref == "record:dec_343"
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.causal_role, "false_closure")
+        self.assertEqual(binding.disposition, "root")
+        self.assertEqual(
+            binding.counterfactual_prevention_signatures,
+            (request.active_defect.fingerprint,),
+        )
+
+    def test_two_signatures_have_independent_roots_and_shared_factors(self):
+        functional = root_role_chain_request(failure_kind="functional")
+        acceptance = root_role_chain_request(failure_kind="acceptance")
+        requests_and_roots = (
+            (functional, "record:dec_147"),
+            (acceptance, "record:dec_343"),
+        )
+        root_bindings = []
+        shared_bindings = []
+        for request, selected_ref in requests_and_roots:
+            judgment = validate_global_candidate_payload(
+                root_role_chain_payload(
+                    request,
+                    selected_ref=selected_ref,
+                ),
+                request=request,
+            )
+            bindings = {
+                item.candidate_ref: item
+                for item in getattr(
+                    judgment,
+                    "active_failure_role_bindings",
+                    (),
+                )
+            }
+            self.assertEqual(
+                set(bindings),
+                {
+                    "record:dec_147",
+                    "record:dec_159",
+                    "record:verification_omission",
+                    "record:dec_343",
+                },
+            )
+            root_bindings.extend(
+                item
+                for item in bindings.values()
+                if item.disposition == "root"
+            )
+            shared_bindings.append(bindings["record:dec_159"])
+
+        self.assertEqual(
+            [(item.candidate_ref, item.failure_signature) for item in root_bindings],
+            [
+                ("record:dec_147", functional.active_defect.fingerprint),
+                ("record:dec_343", acceptance.active_defect.fingerprint),
+            ],
+        )
+        self.assertTrue(
+            all(
+                item.counterfactual_prevention_signatures
+                == (item.failure_signature,)
+                for item in root_bindings
+            )
+        )
+        self.assertTrue(
+            all(item.disposition == "factor" for item in shared_bindings)
+        )
+        self.assertEqual(
+            {item.causal_role for item in shared_bindings},
+            {"amplifying_condition"},
+        )
+
+    def test_role_bindings_are_stable_under_candidate_permutation(self):
+        request = root_role_chain_request(failure_kind="functional")
+        reversed_request = replace(
+            request,
+            capsules=tuple(reversed(request.capsules)),
+        )
+
+        original = validate_global_candidate_payload(
+            root_role_chain_payload(
+                request,
+                selected_ref="record:dec_147",
+            ),
+            request=request,
+        )
+        permuted = validate_global_candidate_payload(
+            root_role_chain_payload(
+                reversed_request,
+                selected_ref="record:dec_147",
+            ),
+            request=reversed_request,
+        )
+
+        self.assertTrue(
+            hasattr(original, "active_failure_role_bindings")
+            and hasattr(permuted, "active_failure_role_bindings")
+        )
+        self.assertEqual(
+            [item.to_dict() for item in original.active_failure_role_bindings],
+            [item.to_dict() for item in permuted.active_failure_role_bindings],
+        )
+
+    def test_global_request_contains_bounded_tiered_factual_context_without_human_labels(self):
+        request = root_role_chain_request(failure_kind="functional")
+
+        factual = request.to_dict().get("factual_context")
+
+        self.assertIsInstance(factual, dict)
+        self.assertEqual(
+            set(factual),
+            {
+                "schema",
+                "failure_signature",
+                "obligations",
+                "plans",
+                "edits",
+                "verifications",
+                "outcomes",
+                "competitors",
+                "tiered_paths",
+            },
+        )
+        self.assertEqual(
+            factual["failure_signature"]["fingerprint"],
+            request.active_defect.fingerprint,
+        )
+        self.assertNotIn("active_role_binding", factual)
+        self.assertNotIn("causal_role", stable_json(factual))
+        self.assertTrue(factual["plans"])
+        self.assertTrue(factual["verifications"])
+        self.assertTrue(factual["outcomes"])
+        self.assertEqual(len(factual["tiered_paths"]), 4)
+        for path in factual["tiered_paths"]:
+            self.assertIn(
+                path["tier"],
+                {"confirmed_trace", "offline_reconstruction", "mixed"},
+            )
+            self.assertTrue(path["segments"])
+            self.assertTrue(
+                all(
+                    segment["provenance_tier"]
+                    in {"confirmed_trace", "offline_reconstruction"}
+                    for segment in path["segments"]
+                )
+            )
+        serialized = stable_json(factual).lower()
+        self.assertNotIn("human_root", serialized)
+        self.assertNotIn("ground_truth_root", serialized)
+
+    def test_mixed_unlabelled_path_provenance_fails_closed(self):
+        request = root_role_chain_request(failure_kind="functional")
+        capsule = request.capsules[0]
+        stripped_edges = []
+        for edge in capsule.causal_path_edges:
+            value = dict(edge)
+            if value.get("from_ref") == "record:dec_159":
+                for key in (
+                    "edge_origin",
+                    "source_container",
+                    "evidence_type",
+                    "inference_method",
+                    "recorded_provenance",
+                ):
+                    value.pop(key, None)
+            stripped_edges.append(value)
+        unlabelled = replace(
+            capsule,
+            causal_path_edges=tuple(stripped_edges),
+            outgoing_edges=tuple(stripped_edges),
+        )
+        mixed_request = replace(
+            request,
+            capsules=(unlabelled, *request.capsules[1:]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "unlabelled path provenance"):
+            mixed_request.to_dict()
+
+    def test_selected_responsible_omission_must_reference_request_obligation(self):
+        request = sample_request()
+        obligation = RestorationObligation.create(
+            obligation_id="restore-sigterm-cleanup",
+            kind="observed_defect_remediation",
+            baseline_state="preexisting_missing",
+            required_end_state="cleanup completes before task closure",
+            required_capabilities=("signal_cleanup",),
+            scope_refs=("record:decision",),
+            acceptance_evidence_refs=("record:defect",),
+            provenance={
+                "source": "external_quality_review",
+                "source_refs": ("record:decision",),
+                "derivation": "reviewed active defect",
+            },
+        )
+        request = replace(
+            request,
+            restoration_obligations=(obligation,),
+        )
+        value = payload(outcome="candidate_roots", request=request)
+        root = value["assessments"][0]
+        root.update(
+            {
+                "input_defect_status": "present",
+                "responsibility": "primary",
+                "candidate_phase": "closure",
+                "obligation_status_before": "pending",
+                "obligation_status_after": "violated",
+                "repair_window_effect": "closed",
+                "failure_mode": "responsible_omission",
+                "obligation_refs": [obligation.obligation_id],
+            }
+        )
+        root["counterfactual"]["intervention_kind"] = (
+            "replace_with_obligation_satisfying_behavior"
+        )
+
+        judgment = validate_global_candidate_payload(
+            value,
+            request=request,
+        )
+
+        self.assertEqual(
+            judgment.assessments[0].failure_mode,
+            "responsible_omission",
+        )
+
+        root["obligation_refs"] = ["restore-unseen-obligation"]
+        with self.assertRaisesRegex(ValueError, "current request"):
+            validate_global_candidate_payload(value, request=request)
+
+    def test_responsible_omission_root_allows_preexisting_defect_at_closure(self):
+        assessed = global_judge_module.GlobalCandidateAssessment(
+            candidate_ref="record:decision",
+            defect_status="present",
+            input_defect_status="present",
+            output_defect_status="present",
+            causal_path_refs=("record:decision", "record:defect"),
+            counterfactual={
+                "intervention_ref": "record:decision",
+                "intervention_kind": (
+                    "replace_with_obligation_satisfying_behavior"
+                ),
+                "predicted_defect_status": "absent",
+                "causal_effect": "prevents_defect",
+            },
+            compared_candidate_refs=("record:decision",),
+            causal_role="root_candidate",
+            responsibility="primary",
+            candidate_phase="closure",
+            obligation_status_before="pending",
+            obligation_status_after="violated",
+            repair_window_effect="closed",
+            failure_mode="responsible_omission",
+            obligation_refs=("obligation:restore-sigterm-cleanup",),
+            contribution_mechanism=None,
+            reason=(
+                "The task closed while the assigned restoration obligation "
+                "remained violated."
+            ),
+            evidence_refs=("record:decision", "record:defect"),
+            confidence=0.9,
+        )
+
+        self.assertEqual(assessed.failure_mode, "responsible_omission")
+        self.assertEqual(assessed.input_defect_status, "present")
+
+    def test_responsible_omission_root_rejects_open_repair_window(self):
+        with self.assertRaisesRegex(ValueError, "repair window"):
+            global_judge_module.GlobalCandidateAssessment(
+                candidate_ref="record:decision",
+                defect_status="present",
+                input_defect_status="present",
+                output_defect_status="present",
+                causal_path_refs=("record:decision", "record:defect"),
+                counterfactual={
+                    "intervention_ref": "record:decision",
+                    "intervention_kind": (
+                        "replace_with_obligation_satisfying_behavior"
+                    ),
+                    "predicted_defect_status": "absent",
+                    "causal_effect": "prevents_defect",
+                },
+                compared_candidate_refs=("record:decision",),
+                causal_role="root_candidate",
+                responsibility="primary",
+                candidate_phase="intermediate",
+                obligation_status_before="pending",
+                obligation_status_after="violated",
+                repair_window_effect="remained_open",
+                failure_mode="responsible_omission",
+                obligation_refs=("obligation:restore-sigterm-cleanup",),
+                contribution_mechanism=None,
+                reason="The task could still repair the defect.",
+                evidence_refs=("record:decision",),
+                confidence=0.8,
+            )
+
+    def test_ordinary_non_repair_is_not_a_contributing_condition(self):
+        assessed = global_judge_module.GlobalCandidateAssessment(
+            candidate_ref="record:diagnosis",
+            defect_status="present",
+            input_defect_status="present",
+            output_defect_status="present",
+            causal_path_refs=("record:diagnosis", "record:defect"),
+            counterfactual=counterfactual(
+                "record:diagnosis",
+                prevents_defect=False,
+            ),
+            compared_candidate_refs=("record:diagnosis",),
+            causal_role="unrelated",
+            responsibility="none",
+            candidate_phase="diagnostic",
+            obligation_status_before="pending",
+            obligation_status_after="pending",
+            repair_window_effect="remained_open",
+            failure_mode="ordinary_non_repair",
+            obligation_refs=(),
+            contribution_mechanism=None,
+            reason="A diagnostic observation did not close the repair window.",
+            evidence_refs=("record:diagnosis",),
+            confidence=0.8,
+        )
+
+        self.assertEqual(assessed.failure_mode, "ordinary_non_repair")
+        self.assertEqual(assessed.causal_role, "unrelated")
+
+    def test_contributing_condition_requires_grounded_mechanism(self):
+        with self.assertRaisesRegex(ValueError, "contribution mechanism"):
+            global_judge_module.GlobalCandidateAssessment(
+                candidate_ref="record:decision",
+                defect_status="present",
+                input_defect_status="present",
+                output_defect_status="present",
+                causal_path_refs=("record:decision", "record:defect"),
+                counterfactual=counterfactual(
+                    "record:decision",
+                    prevents_defect=False,
+                ),
+                compared_candidate_refs=("record:decision",),
+                causal_role="contributing_condition",
+                responsibility="shared",
+                candidate_phase="planning",
+                obligation_status_before="pending",
+                obligation_status_after="pending",
+                repair_window_effect="remained_open",
+                failure_mode="omission_enabling_condition",
+                obligation_refs=(),
+                contribution_mechanism=None,
+                reason="The decision allegedly narrowed later repair scope.",
+                evidence_refs=("record:decision",),
+                confidence=0.8,
+            )
+
+    def test_no_root_candidates_preserves_active_defect_without_selecting_page_roots(self):
+        request = sample_request()
+        value = payload(
+            outcome="no_root_candidates",
+            request=request,
+        )
+        value["decisive_evidence_refs"] = [
+            capsule.candidate_ref for capsule in request.capsules
+        ]
+        for item in value["assessments"]:
+            item["defect_status"] = "present"
+            item["input_defect_status"] = "present"
+            item["output_defect_status"] = "present"
+            item["causal_role"] = (
+                "outcome_evidence"
+                if item["candidate_ref"] == "record:verification"
+                else "unrelated"
+            )
+            item["counterfactual"] = counterfactual(
+                item["candidate_ref"],
+                prevents_defect=False,
+            )
+
+        judgment = validate_global_candidate_payload(
+            value,
+            request=request,
+        )
+
+        self.assertEqual(judgment.outcome, "no_root_candidates")
+        self.assertEqual(judgment.selected_candidate_refs, ())
+        self.assertTrue(
+            all(
+                item.output_defect_status == "present"
+                for item in judgment.assessments
+            )
+        )
+
+    def test_custom_confirmed_dataflow_is_causal_but_retrieval_route_is_not(self):
+        confirmed = {
+            "relation": "authored_decision_observed_by_evaluation",
+            "evidence_type": "confirmed",
+            "eligible_for_attribution": True,
+        }
+
+        self.assertTrue(
+            is_confirmation_causal_edge(
+                confirmed,
+                default_eligible=False,
+            )
+        )
+        self.assertFalse(
+            is_confirmation_causal_edge(
+                {
+                    **confirmed,
+                    "retrieval_candidate": True,
+                    "edge_origin": "offline.semantic_retrieval",
+                },
+                default_eligible=False,
+            )
+        )
+
+    def test_evidence_context_capsules_are_grounded_but_not_assessed(self):
+        request = sample_request()
+        decision, verification = request.capsules
+
+        separated = replace(
+            request,
+            capsules=(decision,),
+            evidence_context_capsules=(verification,),
+        )
+        payload = separated.to_dict()
+        contract = global_candidate_comparison_contract_from_context(
+            payload
+        )
+
+        self.assertEqual(
+            separated.offered_candidate_refs,
+            ("record:decision",),
+        )
+        self.assertIn("record:verification", separated.grounded_refs)
+        self.assertEqual(
+            [
+                item["candidate_ref"]
+                for item in contract["assessment_requirements"]
+            ],
+            ["record:decision"],
+        )
+        self.assertEqual(
+            [
+                item["candidate_ref"]
+                for item in payload["evidence_context_capsules"]
+            ],
+            ["record:verification"],
+        )
+
+    def test_comparison_contract_rejects_noncausal_progress_path(self):
+        contract = global_candidate_comparison_contract_from_context(
+            {
+                "seed_ref": "record:defect",
+                "active_defect": {"fingerprint": "defect-1"},
+                "active_focus_text_hash": "f" * 64,
+                "open_authored_root_candidate_refs": [],
+                "candidate_evidence_capsules": [
+                    {
+                        "candidate_ref": "record:progress",
+                        "candidate": {
+                            "root_candidate_eligible": True,
+                        },
+                        "downstream_path": [
+                            "record:progress",
+                            "record:defect",
+                        ],
+                        "causal_path_edges": [
+                            {
+                                "from_ref": "record:progress",
+                                "to_ref": "record:defect",
+                                "relation": (
+                                    "progress_episode_projects_to_target"
+                                ),
+                                "eligible_for_attribution": True,
+                            }
+                        ],
+                        "incoming_edges": [],
+                        "outgoing_edges": [],
+                    }
+                ],
+            }
+        )
+
+        requirement = contract["assessment_requirements"][0]
+        self.assertEqual(
+            requirement["required_causal_path_refs"],
+            [],
+        )
+        self.assertEqual(
+            requirement["required_compared_candidate_refs"],
+            [],
+        )
+        self.assertFalse(
+            requirement["open_authored_root_candidate"],
+        )
+        for causal_role in (
+            "root_candidate",
+            "contributing_condition",
+            "amplifying_factor",
+        ):
+            self.assertNotIn(
+                causal_role,
+                requirement["allowed_causal_roles"],
+            )
+
+    def test_structural_binding_canonicalization_changes_only_request_owned_fields(self):
+        request = sample_request()
+        original = payload(outcome="candidate_roots", request=request)
+        assessment = original["assessments"][0]
+        assessment["defect_status"] = "absent"
+        assessment["causal_path_refs"] = [
+            "record:decision",
+            "record:verification",
+        ]
+        assessment["compared_candidate_refs"] = []
+        assessment["counterfactual"]["intervention_ref"] = "record:wrong"
+        assessment["counterfactual"]["intervention_kind"] = "delete_candidate"
+        original["active_focus_binding"] = {
+            "seed_ref": "record:wrong",
+            "defect_fingerprint": "wrong",
+            "active_focus_text_hash": "wrong",
+        }
+        before = copy.deepcopy(original)
+
+        normalized, corrections = (
+            canonicalize_global_candidate_structural_bindings(
+                original,
+                request=request,
+            )
+        )
+
+        self.assertEqual(original, before)
+        normalized_assessment = normalized["assessments"][0]
+        self.assertEqual(
+            normalized["active_focus_binding"],
+            {
+                "seed_ref": request.seed_ref,
+                "defect_fingerprint": request.active_defect.fingerprint,
+                "active_focus_text_hash": request.active_focus_text_hash,
+            },
+        )
+        self.assertEqual(
+            normalized_assessment["causal_path_refs"],
+            list(request.capsules[0].downstream_path),
+        )
+        self.assertEqual(
+            normalized_assessment["compared_candidate_refs"],
+            list(request.open_authored_root_candidate_refs),
+        )
+        self.assertEqual(
+            normalized_assessment["counterfactual"]["intervention_ref"],
+            request.capsules[0].candidate_ref,
+        )
+        self.assertEqual(
+            normalized_assessment["counterfactual"]["intervention_kind"],
+            "delete_candidate",
+        )
+        self.assertEqual(
+            normalized_assessment["defect_status"],
+            normalized_assessment["output_defect_status"],
+        )
+        for semantic_field in (
+            "input_defect_status",
+            "output_defect_status",
+            "causal_role",
+            "reason",
+            "evidence_refs",
+            "confidence",
+        ):
+            self.assertEqual(
+                normalized_assessment[semantic_field],
+                before["assessments"][0][semantic_field],
+            )
+        self.assertEqual(
+            normalized_assessment["counterfactual"][
+                "predicted_defect_status"
+            ],
+            before["assessments"][0]["counterfactual"][
+                "predicted_defect_status"
+            ],
+        )
+        self.assertEqual(
+            normalized_assessment["counterfactual"]["causal_effect"],
+            before["assessments"][0]["counterfactual"]["causal_effect"],
+        )
+        for semantic_field in (
+            "outcome",
+            "reason",
+            "selected_candidate_refs",
+            "decisive_evidence_refs",
+            "missing_evidence",
+            "confidence",
+        ):
+            self.assertEqual(
+                normalized[semantic_field],
+                before[semantic_field],
+            )
+        self.assertEqual(
+            {item["field"] for item in corrections},
+            {
+                "active_focus_binding",
+                "defect_status",
+                "causal_path_refs",
+                "compared_candidate_refs",
+                "counterfactual.intervention_ref",
+            },
+        )
+
+    def test_structural_binding_canonicalization_does_not_launder_semantic_evidence(self):
+        request = sample_request()
+        original = payload(outcome="candidate_roots", request=request)
+        original["decisive_evidence_refs"] = ["record:not-grounded"]
+        original["assessments"][0]["evidence_refs"] = [
+            "record:not-grounded"
+        ]
+
+        normalized, _ = canonicalize_global_candidate_structural_bindings(
+            original,
+            request=request,
+        )
+
+        self.assertEqual(
+            normalized["decisive_evidence_refs"],
+            ["record:not-grounded"],
+        )
+        self.assertEqual(
+            normalized["assessments"][0]["evidence_refs"],
+            ["record:not-grounded"],
+        )
+        with self.assertRaisesRegex(ValueError, "grounded"):
+            validate_global_candidate_payload(normalized, request=request)
+
+    def test_claude_judge_canonicalizes_structural_bindings_before_validation(self):
+        request = sample_request()
+        invalid = payload(outcome="candidate_roots", request=request)
+        assessment = invalid["assessments"][0]
+        assessment["defect_status"] = "absent"
+        assessment["causal_path_refs"] = [
+            "record:decision",
+            "record:verification",
+        ]
+        assessment["compared_candidate_refs"] = []
+        assessment["counterfactual"]["intervention_ref"] = "record:wrong"
+        assessment["counterfactual"]["intervention_kind"] = (
+            "replace_with_semantically_correct_behavior"
+        )
+        invalid["active_focus_binding"] = {
+            "seed_ref": "record:wrong",
+            "defect_fingerprint": "wrong",
+            "active_focus_text_hash": "wrong",
+        }
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.calls = []
+
+            def create_message_text_with_usage(
+                self,
+                *,
+                system,
+                messages,
+                max_tokens,
+            ):
+                self.calls.append(
+                    {
+                        "system": system,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                return TransportCallResult(
+                    json.dumps(invalid),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        result = ClaudeCausalJudge(
+            transport=transport,
+            cache=JudgmentCache(),
+        ).judge_candidates_bounded(
+            request,
+            max_physical_requests=1,
+        )
+
+        self.assertEqual(result.physical_requests, 1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            result.value.assessments[0].causal_path_refs,
+            request.capsules[0].downstream_path,
+        )
+        self.assertEqual(
+            result.value.assessments[0].compared_candidate_refs,
+            request.open_authored_root_candidate_refs,
+        )
+        self.assertEqual(
+            {
+                item["field"]
+                for item in result.diagnostics[
+                    "structural_corrections"
+                ]
+            },
+            {
+                "active_focus_binding",
+                "defect_status",
+                "causal_path_refs",
+                "compared_candidate_refs",
+                "counterfactual.intervention_ref",
+            },
+        )
+
     def test_evidence_only_nodes_cannot_enter_global_root_selection(self):
         for event_type in (
             "case.completed",
@@ -831,13 +1877,13 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             value["missing_evidence"] = ["The action-group member needs context."]
             validate_global_candidate_payload(value, request=restored)
 
-    def test_validation_envelope_v7_round_trip_rejects_stale_identities(self):
+    def test_validation_envelope_v11_round_trip_rejects_stale_identities(self):
         request = sample_request()
         envelope = request.validation_envelope()
 
         self.assertEqual(
             envelope["schema_version"],
-            "global-candidate-validation-envelope/v9",
+            "global-candidate-validation-envelope/v11",
         )
         self.assertEqual(
             global_candidate_request_from_validation_envelope(envelope), request
@@ -1062,6 +2108,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                         "record:verification",
                         "record:defect",
                     ),
+                    episode_facts={
+                        **request.capsules[0].episode_facts,
+                        "grounded_hops": 2,
+                    },
                     downstream_path_references=(
                         request.capsules[0].downstream_path_references[0],
                         request.capsules[1].downstream_path_references[0],
@@ -1293,6 +2343,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         capsule = replace(
             request.capsules[0],
             downstream_path=("record:decision", "record:action", "record:defect"),
+            episode_facts={
+                **request.capsules[0].episode_facts,
+                "grounded_hops": 2,
+            },
             validation_source={
                 **request.capsules[0].validation_source,
                 "downstream_path": (
@@ -1381,6 +2435,15 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "output_defect_status": "present",
                 "causal_role": "contributing_condition",
                 "causal_path_refs": [],
+                "responsibility": "shared",
+                "candidate_phase": "planning",
+                "failure_mode": "omission_enabling_condition",
+                "contribution_mechanism": {
+                    "type": "scope_narrowing",
+                    "target_ref": "record:defect",
+                    "effect": "The decision narrows the repair scope.",
+                    "evidence_refs": ["record:verification"],
+                },
             }
         )
 
@@ -1392,7 +2455,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         value = payload(outcome="candidate_roots", request=request)
         value["assessments"][0]["input_defect_status"] = "present"
 
-        with self.assertRaisesRegex(ValueError, "input defect not present"):
+        with self.assertRaisesRegex(ValueError, "input defect absent or unknown"):
             validate_global_candidate_payload(value, request=request)
 
     def test_accepts_root_with_unknown_input_and_present_output(self):
@@ -1415,6 +2478,15 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         )
         second["input_defect_status"] = "unknown"
         second["causal_role"] = "contributing_condition"
+        second["responsibility"] = "shared"
+        second["candidate_phase"] = "planning"
+        second["failure_mode"] = "omission_enabling_condition"
+        second["contribution_mechanism"] = {
+            "type": "scope_narrowing",
+            "target_ref": "record:second",
+            "effect": "The candidate narrows the downstream repair scope.",
+            "evidence_refs": ["record:second"],
+        }
         second["counterfactual"] = counterfactual(
             "record:second", prevents_defect=False
         )
@@ -1482,12 +2554,12 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             json.dumps(judgment.to_dict(), sort_keys=True),
         )
 
-    def test_global_schema_is_v9_and_capsule_schema_is_v7(self):
+    def test_global_schema_is_v11_and_capsule_schema_is_v8(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v9",
+            "global-candidate-judgment/v11",
         )
-        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v7")
+        self.assertEqual(CAPSULE_SCHEMA_VERSION, "candidate-evidence-capsule/v8")
 
     def test_v4_global_judgment_cache_hits_only_after_validated_write(self):
         request = sample_request()
@@ -1541,6 +2613,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "defect_status": "absent",
                 "output_defect_status": "absent",
                 "causal_role": "unrelated",
+                "responsibility": "none",
+                "failure_mode": "none",
+                "contribution_mechanism": None,
                 "counterfactual": counterfactual(
                     "record:decision", prevents_defect=False
                 ),
@@ -1552,6 +2627,10 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                 "input_defect_status": "absent",
                 "output_defect_status": "present",
                 "causal_role": "root_candidate",
+                "responsibility": "primary",
+                "candidate_phase": "implementation",
+                "failure_mode": "positive_introduction",
+                "contribution_mechanism": None,
                 "counterfactual": counterfactual(
                     "record:verification", prevents_defect=True
                 ),
@@ -1594,6 +2673,15 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertEqual(judgment.outcome, "no_defect")
 
         value["assessments"][1]["causal_role"] = "contributing_condition"
+        value["assessments"][1]["responsibility"] = "shared"
+        value["assessments"][1]["candidate_phase"] = "planning"
+        value["assessments"][1]["failure_mode"] = "omission_enabling_condition"
+        value["assessments"][1]["contribution_mechanism"] = {
+            "type": "scope_narrowing",
+            "target_ref": "record:defect",
+            "effect": "The observation narrows the repair scope.",
+            "evidence_refs": ["record:verification"],
+        }
         with self.assertRaisesRegex(ValueError, "causal candidate"):
             validate_global_candidate_payload(value, request=request)
 
@@ -1686,7 +2774,7 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
 
         self.assertEqual(
             contract["schema"],
-            "global-candidate-comparison-contract/v1",
+            "global-candidate-comparison-contract/v2",
         )
         self.assertEqual(
             parsed["candidate_comparison_contract"], contract
@@ -1748,6 +2836,426 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
             constraints["open_authored_root_candidate_refs"],
             list(request.open_authored_root_candidate_refs),
         )
+        self.assertEqual(
+            constraints["exact_compared_candidate_refs"],
+            list(request.open_authored_root_candidate_refs),
+        )
+        self.assertEqual(
+            constraints["exact_causal_path_refs_by_candidate"],
+            {
+                item["candidate_ref"]: item[
+                    "required_causal_path_refs"
+                ]
+                for item in contract["assessment_requirements"]
+            },
+        )
+        self.assertEqual(
+            constraints["allowed_decisive_evidence_refs"],
+            list(request.grounded_refs),
+        )
+        self.assertEqual(
+            constraints["allowed_assessment_evidence_refs"],
+            list(request.grounded_refs),
+        )
+        self.assertEqual(
+            constraints["required_top_level_fields"],
+            [
+                "outcome",
+                "reason",
+                "assessments",
+                "selected_candidate_refs",
+                "expansion_requests",
+                "decisive_evidence_refs",
+                "missing_evidence",
+                "confidence",
+                "active_focus_binding",
+            ],
+        )
+        self.assertIn(
+            "compared_candidate_refs",
+            constraints["required_assessment_fields"],
+        )
+        self.assertEqual(
+            constraints["allowed_assessment_enums"],
+            {
+                "causal_role": sorted(global_judge_module.CAUSAL_ROLES),
+                "responsibility": sorted(
+                    global_judge_module.RESPONSIBILITIES
+                ),
+                "candidate_phase": sorted(
+                    global_judge_module.CANDIDATE_PHASES
+                ),
+                "obligation_status_before": sorted(
+                    global_judge_module.OBLIGATION_STATUSES
+                ),
+                "obligation_status_after": sorted(
+                    global_judge_module.OBLIGATION_STATUSES
+                ),
+                "repair_window_effect": sorted(
+                    global_judge_module.REPAIR_WINDOW_EFFECTS
+                ),
+                "failure_mode": sorted(
+                    global_judge_module.FAILURE_MODES
+                ),
+            },
+        )
+        self.assertIn(
+            {
+                "when": {
+                    "causal_role": [
+                        "contributing_condition",
+                        "amplifying_factor",
+                    ]
+                },
+                "require": {
+                    "failure_mode": [
+                        "omission_enabling_condition",
+                        "none",
+                    ],
+                    "contribution_mechanism": "non-null exact object",
+                },
+            },
+            constraints["assessment_compatibility_rules"],
+        )
+
+    def test_repair_constraints_translate_unknown_input_confidence_error(self):
+        request = sample_request()
+
+        constraints = causal_judge_module._repair_constraints(
+            stage="global_candidate_judgment",
+            node_ref=request.seed_ref,
+            request_context=request.to_dict(),
+            validation_error=(
+                "ValueError: candidate with unknown input defect cannot claim "
+                "certain confidence"
+            ),
+        )
+
+        self.assertEqual(
+            constraints["required_field_corrections"],
+            [
+                {
+                    "target_candidate_ref": "",
+                    "when": {
+                        "input_defect_status": "unknown",
+                    },
+                    "require": {
+                        "confidence": 0.99,
+                    },
+                    "preserve": [
+                        "candidate_ref",
+                        "defect_status",
+                        "output_defect_status",
+                        "causal_role",
+                        "responsibility",
+                        "candidate_phase",
+                        "obligation_status_before",
+                        "obligation_status_after",
+                        "repair_window_effect",
+                        "failure_mode",
+                        "obligation_refs",
+                        "contribution_mechanism",
+                        "causal_path_refs",
+                        "compared_candidate_refs",
+                        "counterfactual",
+                        "reason",
+                        "evidence_refs",
+                    ],
+                }
+            ],
+        )
+
+    def test_repair_constraints_include_page_exclusion_and_unknown_input_resolution(self):
+        request = sample_request()
+
+        constraints = causal_judge_module._repair_constraints(
+            stage="global_candidate_judgment",
+            node_ref=request.seed_ref,
+            request_context=request.to_dict(),
+            validation_error=(
+                "ValueError: no_root_candidates requires known input status "
+                "for every open authored root-eligible candidate"
+            ),
+        )
+
+        self.assertIn(
+            "no_root_candidates",
+            constraints["valid_outcomes"],
+        )
+        self.assertEqual(
+            constraints["required_outcome_resolution"][
+                "unknown_input_status"
+            ]["outcome"],
+            "inconclusive",
+        )
+        self.assertTrue(
+            constraints["required_outcome_resolution"][
+                "unknown_input_status"
+            ]["missing_evidence_must_name_candidate_and_prior_state"]
+        )
+
+    def test_global_judge_sends_field_correction_in_focused_repair(self):
+        request = sample_request()
+        invalid = payload(outcome="candidate_roots", request=request)
+        invalid["assessments"][0]["input_defect_status"] = "unknown"
+        invalid["assessments"][0]["confidence"] = 1.0
+        repaired = payload(outcome="candidate_roots", request=request)
+        repaired["assessments"][0]["input_defect_status"] = "unknown"
+        repaired["assessments"][0]["confidence"] = 0.99
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.calls = []
+                self.responses = [invalid, repaired]
+
+            def create_message_text_with_usage(self, *, system, messages, max_tokens):
+                self.calls.append(
+                    {"system": system, "messages": messages, "max_tokens": max_tokens}
+                )
+                return TransportCallResult(
+                    json.dumps(self.responses.pop(0)),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        result = ClaudeCausalJudge(
+            transport=transport, cache=JudgmentCache()
+        ).judge_candidates_bounded(request, max_physical_requests=2)
+
+        repair_payload = json.loads(transport.calls[1]["messages"][0]["content"])
+        self.assertEqual(result.value.outcome, "candidate_roots")
+        self.assertEqual(result.physical_requests, 2)
+        self.assertNotIn("original_prompt", repair_payload)
+        self.assertEqual(
+            repair_payload["canonical_request_context"],
+            request.to_dict(),
+        )
+        self.assertEqual(
+            repair_payload["repair_constraints"]["required_field_corrections"][0][
+                "require"
+            ]["confidence"],
+            0.99,
+        )
+        self.assertEqual(
+            repair_payload["repair_constraints"]["required_field_corrections"][0][
+                "target_candidate_ref"
+            ],
+            "record:decision",
+        )
+
+    def test_global_judge_converges_on_a_valid_fourth_semantic_attempt(self):
+        request = sample_request()
+        unsupported_responsibility = payload(
+            outcome="candidate_roots", request=request
+        )
+        unsupported_responsibility["assessments"][0][
+            "responsibility"
+        ] = "secondary"
+        invalid_responsible_omission = payload(
+            outcome="candidate_roots", request=request
+        )
+        invalid_responsible_omission["assessments"][0].update(
+            {
+                "failure_mode": "responsible_omission",
+                "responsibility": "primary",
+                "candidate_phase": "closure",
+                "obligation_status_before": "pending",
+                "obligation_status_after": "violated",
+                "repair_window_effect": "closed",
+            }
+        )
+        incompatible_non_repair = payload(
+            outcome="candidate_roots", request=request
+        )
+        incompatible_non_repair["assessments"][1].update(
+            {
+                "causal_role": "contributing_condition",
+                "responsibility": "shared",
+                "candidate_phase": "planning",
+                "failure_mode": "ordinary_non_repair",
+                "contribution_mechanism": {
+                    "type": "scope_narrowing",
+                    "target_ref": "record:defect",
+                    "effect": "The candidate narrowed the repair scope.",
+                    "evidence_refs": ["record:verification"],
+                },
+            }
+        )
+        valid = payload(outcome="candidate_roots", request=request)
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    unsupported_responsibility,
+                    invalid_responsible_omission,
+                    incompatible_non_repair,
+                    valid,
+                ]
+
+            def create_message_text_with_usage(
+                self, *, system, messages, max_tokens
+            ):
+                self.calls.append(
+                    {
+                        "system": system,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                return TransportCallResult(
+                    json.dumps(self.responses.pop(0)),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        result = ClaudeCausalJudge(
+            transport=transport,
+            cache=JudgmentCache(),
+        ).judge_candidates_bounded(
+            request,
+            max_physical_requests=6,
+        )
+
+        self.assertEqual(result.value.outcome, "candidate_roots")
+        self.assertEqual(result.physical_requests, 4)
+        self.assertEqual(len(transport.calls), 4)
+        fourth_payload = json.loads(
+            transport.calls[3]["messages"][0]["content"]
+        )
+        self.assertEqual(len(fourth_payload["validation_history"]), 3)
+
+    def test_global_judge_stops_after_three_equivalent_validation_errors(
+        self,
+    ):
+        request = sample_request()
+        invalid = payload(outcome="candidate_roots", request=request)
+        invalid["assessments"][0]["responsibility"] = "secondary"
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.request_count = 0
+
+            def create_message_text_with_usage(
+                self, *, system, messages, max_tokens
+            ):
+                self.request_count += 1
+                return TransportCallResult(
+                    json.dumps(invalid),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        with self.assertRaisesRegex(
+            BoundedJudgeCallError,
+            "validation_stalled_after_3_equivalent_errors",
+        ) as raised:
+            ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(),
+            ).judge_candidates_bounded(
+                request,
+                max_physical_requests=6,
+            )
+
+        self.assertEqual(transport.request_count, 3)
+        self.assertEqual(raised.exception.physical_requests, 3)
+
+    def test_global_judge_reports_budget_exhaustion_before_fourth_attempt(
+        self,
+    ):
+        request = sample_request()
+        unsupported_responsibility = payload(
+            outcome="candidate_roots", request=request
+        )
+        unsupported_responsibility["assessments"][0][
+            "responsibility"
+        ] = "secondary"
+        invalid_responsible_omission = payload(
+            outcome="candidate_roots", request=request
+        )
+        invalid_responsible_omission["assessments"][0].update(
+            {
+                "failure_mode": "responsible_omission",
+                "responsibility": "primary",
+                "candidate_phase": "closure",
+                "obligation_status_before": "pending",
+                "obligation_status_after": "violated",
+                "repair_window_effect": "closed",
+            }
+        )
+        incompatible_non_repair = payload(
+            outcome="candidate_roots", request=request
+        )
+        incompatible_non_repair["assessments"][1].update(
+            {
+                "causal_role": "contributing_condition",
+                "responsibility": "shared",
+                "candidate_phase": "planning",
+                "failure_mode": "ordinary_non_repair",
+                "contribution_mechanism": {
+                    "type": "scope_narrowing",
+                    "target_ref": "record:defect",
+                    "effect": "The candidate narrowed the repair scope.",
+                    "evidence_refs": ["record:verification"],
+                },
+            }
+        )
+        invalid_outputs = [
+            unsupported_responsibility,
+            invalid_responsible_omission,
+            incompatible_non_repair,
+        ]
+
+        class Transport:
+            model = "test-model"
+            max_tokens = 4096
+            repair_max_tokens = 1024
+            thinking_config = None
+
+            def __init__(self):
+                self.request_count = 0
+
+            def create_message_text_with_usage(
+                self, *, system, messages, max_tokens
+            ):
+                result = invalid_outputs[self.request_count]
+                self.request_count += 1
+                return TransportCallResult(
+                    json.dumps(result),
+                    physical_requests=1,
+                )
+
+        transport = Transport()
+        with self.assertRaisesRegex(
+            BoundedJudgeCallError,
+            "judge_request_budget_exhausted before semantic repair attempt 4",
+        ) as raised:
+            ClaudeCausalJudge(
+                transport=transport,
+                cache=JudgmentCache(),
+            ).judge_candidates_bounded(
+                request,
+                max_physical_requests=3,
+            )
+
+        self.assertEqual(transport.request_count, 3)
+        self.assertEqual(raised.exception.physical_requests, 3)
 
     def test_incomplete_open_candidate_error_names_candidate_and_fields(self):
         request = multi_root_request("record:first", "record:second")
@@ -1761,6 +3269,9 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         second["defect_status"] = "unknown"
         second["output_defect_status"] = "unknown"
         second["causal_role"] = "unknown"
+        second["responsibility"] = "unknown"
+        second["failure_mode"] = "unknown"
+        second["contribution_mechanism"] = None
         second["causal_path_refs"] = []
         second["counterfactual"] = counterfactual(
             "record:second", prevents_defect=False

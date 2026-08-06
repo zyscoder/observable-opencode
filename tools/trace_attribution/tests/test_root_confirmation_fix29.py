@@ -758,15 +758,15 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
     def test_versions_name_every_changed_judge_and_persistence_contract(self):
         self.assertEqual(
             GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
-            "global-candidate-judgment/v9",
+            "global-candidate-judgment/v11",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION,
-            "global-candidate-judgment/v9",
+            "global-candidate-judgment/v11",
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_VALIDATION_ENVELOPE_SCHEMA_VERSION,
-            "global-candidate-validation-envelope/v9",
+            "global-candidate-validation-envelope/v11",
         )
         self.assertIn(
             "failure-projection/v4",
@@ -784,10 +784,10 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
             GLOBAL_FAILURE_PROJECTION_SCHEMA,
             "global-candidate-failure-projection/v4",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -795,7 +795,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
 
     def test_old_global_envelope_and_report_are_rejected(self):

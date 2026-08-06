@@ -110,6 +110,110 @@ def slow_worker(payload, result_queue):
 
 
 class TraceGraphTest(unittest.TestCase):
+    def test_obligation_gap_offline_edge_never_becomes_a_confirmed_fact(self):
+        trace = {
+            "case_id": "offline-obligation-gap-case",
+            "manifest": {
+                "case_id": "offline-obligation-gap-case",
+                "run_id": "offline-obligation-gap-run",
+                "subject_revision": "git:offline-gap",
+                "subject_revision_provenance": {
+                    "method": "case_trace_config",
+                    "source": "CaseTraceConfig.subjectRevision",
+                    "bound_at": "case_start",
+                    "case_id": "offline-obligation-gap-case",
+                    "run_id": "offline-obligation-gap-run",
+                },
+            },
+            "records": [
+                {
+                    "record_id": "task_contract",
+                    "component": "user",
+                    "event_type": "message.input",
+                    "timestamp": "2026-07-31T00:00:00Z",
+                    "data": {
+                        "case_id": "offline-obligation-gap-case",
+                        "repository_revision": 1,
+                        "subject_revision": "git:offline-gap",
+                        "revision_status": "matched",
+                        "revision_provenance_status": "valid",
+                        "task_obligations": [
+                            {
+                                "obligation_id": "runtime-dependency",
+                                "obligation_text": "Preserve the packaging dependency.",
+                                "required_capabilities": ["packaging"],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "timestamp": "2026-07-31T00:01:00Z",
+                    "data": {
+                        "case_id": "offline-obligation-gap-case",
+                        "repository_revision": 1,
+                        "subject_revision": "git:offline-gap",
+                        "revision_status": "matched",
+                        "revision_provenance_status": "valid",
+                        "rationale": (
+                            "Packaging is required but tests probably omit it, "
+                            "so exclude packaging."
+                        ),
+                    },
+                },
+                {
+                    "record_id": "failure",
+                    "component": "tool",
+                    "event_type": "verification",
+                    "timestamp": "2026-07-31T00:02:00Z",
+                    "status": "failure",
+                    "data": {
+                        "case_id": "offline-obligation-gap-case",
+                        "repository_revision": 1,
+                        "subject_revision": "git:offline-gap",
+                        "revision_status": "matched",
+                        "revision_provenance_status": "valid",
+                        "exit_code": 1,
+                        "output": "ImportError: packaging is required",
+                        "failure_signature": {
+                            "schema": "obligation-failure-signature/v1",
+                            "signature_id": "offline-packaging-failure",
+                            "subsystem": "runtime.packaging",
+                            "status": "failed",
+                        },
+                        "failure_binding": {
+                            "binding_type": "obligation",
+                            "obligation_id": "runtime-dependency",
+                        },
+                    },
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        from trace_attribution.reconstruction import (
+            reconstruct_obligation_gap_candidates,
+        )
+
+        candidate = reconstruct_obligation_gap_candidates(graph)[0]
+
+        self.assertEqual(
+            candidate.offline_path_provenance[0]["evidence_type"],
+            "offline_reconstruction",
+        )
+        self.assertFalse(
+            candidate.offline_path_provenance[0]["confirmed_fact"]
+        )
+        self.assertEqual(
+            graph.edge_context("record:decision", "record:failure"),
+            [],
+        )
+        self.assertEqual(
+            graph.message_lineage["stats"]["confirmed_edge_count"],
+            0,
+        )
+
     def test_preserves_normalized_causal_edge_semantics(self):
         trace = {
             "case_id": "edge-context-case",
@@ -1091,6 +1195,51 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(refs, ["record:post_change", "record:change"])
         self.assertNotIn("record:baseline", refs)
 
+    def test_evidence_validation_allows_only_explicit_superseded_lineage_refs(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "superseded-lineage-audit-case",
+                "records": [
+                    {
+                        "record_id": "baseline",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "baseline",
+                            "repository_revision": 0,
+                            "effective_for_final_state": False,
+                        },
+                    },
+                    {
+                        "record_id": "current",
+                        "component": "tool",
+                        "event_type": "verification",
+                        "data": {
+                            "verification_id": "current",
+                            "repository_revision": 1,
+                            "effective_for_final_state": True,
+                        },
+                    },
+                ],
+            }
+        )
+
+        graph.assert_evidence_eligible_references(
+            {
+                "supersedes_refs": ["verification:baseline"],
+                "verification_supersedes_refs": ["verification:baseline"],
+            },
+            label="historical lineage metadata",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "violates graph evidence eligibility",
+        ):
+            graph.assert_evidence_eligible_references(
+                {"evidence_refs": ["verification:baseline"]},
+                label="current evidence",
+            )
+
     def test_graph_ranking_helpers_filter_stale_revisions_before_limit(self):
         graph = TraceGraph.from_trace(
             {
@@ -1466,6 +1615,99 @@ class TraceGraphTest(unittest.TestCase):
         self.assertEqual(defect.source_refs[0], "record:evidence_old")
         self.assertEqual(defect.data["source_ref_count_total"], 81)
         self.assertEqual(defect.data["source_ref_count_included"], len(defect.source_refs))
+
+    def test_stale_review_refs_fall_back_to_current_final_result_anchors(self):
+        trace = sample_trace()
+        review = {
+            "case_id": "unit-case",
+            "observed_defects": [
+                {
+                    "component": "verification",
+                    "failure_type": "false_completion",
+                    "description": "The final answer claims success despite missing verification.",
+                    "record_refs": [
+                        "record:decisionnode_from_an_older_trace_revision",
+                    ],
+                }
+            ],
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        graph = TraceGraph.from_trace(enriched)
+        defect = graph.nodes[
+            "record:observed_defect_verification_false_completion"
+        ]
+
+        self.assertEqual(defect.source_refs, ["record:claim_bad"])
+        self.assertEqual(
+            defect.data["source_binding"]["mode"],
+            "final_result_fallback",
+        )
+        self.assertEqual(
+            defect.data["source_binding"]["unresolved_declared_refs"],
+            ["record:decisionnode_from_an_older_trace_revision"],
+        )
+        self.assertEqual(
+            defect.data["source_binding"]["fallback_refs"],
+            ["record:claim_bad"],
+        )
+        self.assertEqual(
+            graph.upstream_refs(defect.ref),
+            ["record:claim_bad"],
+        )
+
+    def test_existing_offline_observed_defect_is_rebound_in_place(self):
+        trace = sample_trace()
+        trace["records"].append(
+            {
+                "record_id": "observed_defect_verification_false_completion",
+                "component": "evaluation",
+                "event_type": "case.observed_defect",
+                "source_refs": [
+                    "record:decisionnode_from_an_older_trace_revision",
+                ],
+                "data": {
+                    "offline_only": True,
+                    "failure_type": "false_completion",
+                },
+            }
+        )
+        review = {
+            "case_id": "unit-case",
+            "observed_defects": [
+                {
+                    "component": "verification",
+                    "failure_type": "false_completion",
+                    "description": "The final answer claims success despite missing verification.",
+                    "record_refs": [
+                        "record:decisionnode_from_an_older_trace_revision",
+                    ],
+                }
+            ],
+        }
+
+        enriched = inject_quality_gap_records(trace, review)
+        matching = [
+            record
+            for record in enriched["records"]
+            if record.get("record_id")
+            == "observed_defect_verification_false_completion"
+        ]
+        graph = TraceGraph.from_trace(enriched)
+        defect = graph.nodes[
+            "record:observed_defect_verification_false_completion"
+        ]
+
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(defect.source_refs, ["record:claim_bad"])
+        self.assertEqual(
+            defect.data["source_binding"]["mode"],
+            "final_result_fallback",
+        )
+        self.assertEqual(
+            defect.data["description"],
+            "The final answer claims success despite missing verification.",
+        )
 
     def test_trace_node_compact_respects_character_budget(self):
         node = TraceNode(

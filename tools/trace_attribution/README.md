@@ -93,19 +93,175 @@ python3 -m trace_attribution \
   --objective "Find why the final answer quality was poor."
 ```
 
-The compatibility engine remains the default. Select the resumable recursive engine
-explicitly when running the LLM-driven recursive hypothesis, investigation, and independent
-confirmation flow:
+The compatibility engine remains the default for existing objective-based runs. For a
+user question, the recommended command is `--engine recursive-agentic`: it runs the
+resumable recursive hypothesis, investigation, and independent confirmation flow, then
+adds a question-bound user projection to the report.
 
 ```bash
 PYTHONPATH=tools/trace_attribution \
 python3 -m trace_attribution \
   --engine recursive-agentic \
-  --trace /tmp/case/trace.json \
-  --out /tmp/attribution/case.attribution.json \
-  --objective "Find why the final answer quality was poor." \
-  --analysis-perspective "Improve Agent repository reasoning"
+  --trace /data/case-traces/case_xxx/trace.json \
+  --question "为什么本次修改编译失败？" \
+  --out /data/attribution/case_xxx.attribution.json
 ```
+
+`--question` and `--objective` are mutually exclusive. A question is normalized by
+canonical Unicode normalization, newline normalization, and trimming. Unless
+`--start-ref` is supplied, the analyzer ranks the trace's eligible default starts by
+question-token relevance and records the selected order in the output. Use repeatable
+`--start-ref` options when the investigation must begin at known refs.
+
+### Python API
+
+The same operation is available without invoking the CLI. The public API accepts a
+frozen `AttributionRequest`, and `analyze()` returns an `AttributionResult`; the
+result payload is also written to `output_path` and the reconstructed lineage is written
+next to it by default.
+
+```python
+from pathlib import Path
+
+from trace_attribution import AttributionOptions, AttributionRequest, analyze
+
+request = AttributionRequest(
+    trace_path=Path("/data/case-traces/case_xxx/trace.json"),
+    output_path=Path("/data/attribution/case_xxx.attribution.json"),
+    question="为什么本次修改编译失败？",
+    options=AttributionOptions(engine="recursive-agentic"),
+)
+result = analyze(request)
+
+print(result.output_path)
+print(result.payload["analysis_question"]["question_id"])
+```
+
+Set `PYTHONPATH=tools/trace_attribution` when running this snippet from the repository
+root. `result.question` is the immutable `AttributionQuestion` binding, or `None` for
+an objective-only request. `result.payload` is a read-only analysis result after the
+run; `result.lineage_path` identifies the sidecar message-lineage JSON.
+
+### Question output and user projection
+
+With `--question`, the JSON keeps the normal attribution report and adds these
+question-bound fields at the top level:
+
+- `analysis_question`: the binding envelope. `schema_version` is `attribution-question/v1`;
+  `question` preserves the supplied text; `normalized_question` is the canonical text;
+  `question_id` is the stable SHA-256 identity of the schema version plus normalized
+  question; `trace_binding` is exactly
+  `sha256(stable_json(graph.raw_trace))`, where `graph.raw_trace` is the effective
+  semantic Trace graph input after loading and combining any review/evaluation inputs;
+  `selected_start_refs` records the actual analysis starts; and `analysis_mode` is
+  `offline_read_only`. This binding is not the source file byte hash: a source-file
+  SHA-256 is only useful for proving that analysis did not modify the input file.
+- `conclusion`: a concise projection of confirmed root refs and their recorded reasons,
+  or an explicit insufficient-evidence conclusion when no root is confirmed.
+- `causal_chain`: taint paths that connect a selected start to a confirmed root.
+- `supporting_evidence_refs`: resolved, attribution-eligible evidence refs attached to
+  confirmed roots; ineligible external evaluation facts are excluded.
+- `rejected_hypotheses`: rejected candidate or hypothesis records retained for audit.
+- `confidence`: the highest numeric confidence among confirmed roots, or `0.0` when
+  there is no confirmed root.
+- `unresolved_gaps`: unresolved refs and trace-improvement gaps, including blocking and
+  advisory gaps.
+
+This is a projection for answering the user's question, not a second source of truth:
+the source Trace is read-only, the ordinary report fields remain available, and no
+attribution result is fed back into opencode.
+
+### Terminal trace receipt
+
+When an observable-opencode case reaches terminal persistence, it reports the saved
+locations once to `stderr`; agent output on `stdout` is not mixed with this diagnostic.
+The following is a copy/pasteable source-checkout flow. Run it from
+`packages/opencode`; it starts the actual source entry point, creates a generated
+session, sends one message, then performs a graceful shutdown. The default
+`OPENCODE_PROJECT_DIR=$PWD` means the package checkout is the inspected project. If
+that is not the intended project, export `OPENCODE_PROJECT_DIR` to its absolute path
+before starting the server; the same value is sent in `x-opencode-directory`.
+
+This example requires `curl` and `jq`, and deliberately leaves the DeepSeek credential
+to the environment/configuration used by the server. It does not embed an API key.
+
+```bash
+cd /path/to/observable-opencode/packages/opencode
+export OPENCODE_PROJECT_DIR="${OPENCODE_PROJECT_DIR:-$PWD}"
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_ID=case_xxx
+export OPENCODE_CASE_TRACE_DIR=/data/case-traces
+
+bun run --conditions=browser ./src/index.ts serve \
+  --hostname 127.0.0.1 --port 4096 \
+  >agent.stdout 2>trace.stderr &
+SERVER_PID=$!
+
+until curl -fsS http://127.0.0.1:4096/global/health >/dev/null; do
+  sleep 0.25
+done
+
+SESSION_JSON=$(curl -fsS -X POST http://127.0.0.1:4096/session \
+  -H "x-opencode-directory: $OPENCODE_PROJECT_DIR" \
+  -H "content-type: application/json" \
+  --data '{}')
+SESSION_ID=$(printf '%s' "$SESSION_JSON" | jq -er '.id')
+printf 'session: ses_<generated> (%s)\n' "$SESSION_ID"
+
+curl -fsS -X POST "http://127.0.0.1:4096/session/$SESSION_ID/message" \
+  -H "x-opencode-directory: $OPENCODE_PROJECT_DIR" \
+  -H "content-type: application/json" \
+  --data '{"model":{"providerID":"deepseek","modelID":"deepseek-v4-pro"},"parts":[{"type":"text","text":"Inspect this repository and summarize it."}]}' \
+  >message.response.json || true
+
+kill -TERM "$SERVER_PID"
+wait "$SERVER_PID" || true
+cat trace.stderr
+```
+
+The generated session ID is an actual `ses_<generated>` value returned by `POST
+/session`, not a promised literal such as `ses_publication`. A successful message
+request binds that session to the case, so the receipt can look like:
+
+```text
+[observable-opencode] Session trace saved
+  session: ses_<generated>
+  case: case_xxx
+  status: cancelled
+  directory: /data/case-traces/case_xxx
+  html: /data/case-traces/case_xxx/trace.html
+  json: /data/case-traces/case_xxx/trace.json
+  partial: /data/case-traces/case_xxx/partial/latest.json
+```
+
+The example uses `SIGTERM`, so its terminal status is `cancelled`. In general, `status`
+is `completed`, `failed`, `cancelled`, or `partial`. The `partial:` line
+is shown whenever the durable `partial/latest.json` copy exists, including when the
+complete `trace.json` and `trace.html` are also present. The status is downgraded to
+`partial` only when `partial/latest.json` exists and either `trace.json` or `trace.html`
+is incomplete. Set `OPENCODE_CASE_TRACE_QUIET=1` to suppress this location receipt.
+Quiet mode does not disable trace collection or remove files; it only suppresses the
+stderr diagnostic. With the variable unset or set to another value, the receipt remains
+enabled. If no session was bound, the `session:` line may be omitted. The command
+above stays attached until the server exits; inspect `trace.stderr` after a normal
+shutdown or a handled signal.
+
+### Signals and recovery boundary
+
+The observable-opencode `CaseTrace` finalizer handles `SIGINT`, `SIGTERM`, and `SIGHUP`.
+It flushes the active case, records the signal and cancellation disposition, publishes
+the terminal trace location, and exits with the conventional codes `130`, `143`, and
+`129`, respectively. A listener registered earlier by the host is still preceded by
+the trace finalizer so the trace gets its flush opportunity first. Repeated finalization
+is ignored.
+
+The recursive Python attribution service installs graceful handling for `SIGINT` and
+`SIGTERM`: it stops at the next safe analysis boundary, fsyncs checkpoints, and publishes
+an interrupted/inconclusive or partial report that can be resumed with the same command.
+It does not claim a Python-side graceful `SIGHUP` handler. For either process, `SIGKILL`
+cannot run a handler: no final receipt, in-memory work, or post-kill persistence is
+guaranteed. Only journal, partial, HTML, or output-transaction state already durably
+written before the kill is available for recovery.
 
 The recursive defaults are `--max-frontier-items 96`, `--max-depth 20`,
 `--max-hypotheses 24`, `--max-investigation-rounds 12`,

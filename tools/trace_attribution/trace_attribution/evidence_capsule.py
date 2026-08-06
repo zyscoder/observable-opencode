@@ -8,6 +8,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple
 
+from .candidate_budget import (
+    AUTHORED_DECISION,
+    CANDIDATE_BUDGET_SCHEMA,
+    CANDIDATE_BUDGET_V3_SCHEMA,
+    CANDIDATE_BUDGET_V2_SCHEMA,
+    MAX_GROUNDED_DECISION_RESERVE,
+    NO_ACTIVE_SEED_CAUSAL_PATH,
+    quality_first_candidate_budget,
+)
 from .causal_state import CausalCandidate, DefectState, FrozenMapping
 from .causal_retrieval import (
     canonical_candidate_route,
@@ -16,13 +25,14 @@ from .causal_retrieval import (
 )
 from .graph import TraceGraph
 from .models import JsonDict, TraceNode, stable_json
+from .restoration_obligation import RestorationObligation
 
 
-CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v7"
+CAPSULE_SCHEMA_VERSION = "candidate-evidence-capsule/v8"
 ACTION_GROUP_KEYS = ("action_group_id", "actionGroupID", "actionGroupId")
 CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
-GLOBAL_FUSION_MAX_PAYLOAD_BYTES = 32_768
+GLOBAL_FUSION_MAX_PAYLOAD_BYTES = 65_536
 GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES = 3
 VALIDATION_SOURCE_KEYS = frozenset(
     {
@@ -34,6 +44,101 @@ VALIDATION_SOURCE_KEYS = frozenset(
         "start_refs",
         "prompt_collections_sha256",
     }
+)
+CANDIDATE_FUNNEL_KEYS = frozenset(
+    {
+        "schema",
+        "discovered_count",
+        "offered_count",
+        "evidence_context_count",
+        "dropped_count",
+        "counts_by_category",
+        "policy",
+        "grounded_decision_refs",
+        "reserved_grounded_decision_refs",
+        "reserved_episode_refs",
+        "evidence_context_refs",
+        "context_reasons",
+        "drop_reasons",
+        "candidate_audit",
+        "selection_identity",
+    }
+)
+CANDIDATE_FUNNEL_V3_SCHEMA = CANDIDATE_BUDGET_V3_SCHEMA
+CANDIDATE_FUNNEL_V3_KEYS = frozenset(
+    key for key in CANDIDATE_FUNNEL_KEYS if key != "reserved_episode_refs"
+)
+CANDIDATE_FUNNEL_V1_SCHEMA = "candidate-budget-funnel/v1"
+CANDIDATE_FUNNEL_V2_KEYS = frozenset(
+    key
+    for key in CANDIDATE_FUNNEL_V3_KEYS
+    if key
+    not in {
+        "evidence_context_count",
+        "evidence_context_refs",
+        "context_reasons",
+    }
+)
+CANDIDATE_FUNNEL_V1_KEYS = frozenset(
+    key
+    for key in CANDIDATE_FUNNEL_V2_KEYS
+    if key != "grounded_decision_refs"
+)
+CANDIDATE_FUNNEL_V2_SCHEMA = CANDIDATE_BUDGET_V2_SCHEMA
+CANDIDATE_FUNNEL_CATEGORIES = frozenset(
+    {
+        AUTHORED_DECISION,
+        "tool_change_envelope",
+        "verification_outcome",
+        "factor_or_lifecycle",
+        "other",
+    }
+)
+CANDIDATE_FUNNEL_CATEGORY_COUNTS_KEYS = frozenset(
+    {"discovered", "offered", "evidence_context", "dropped"}
+)
+CANDIDATE_FUNNEL_V2_CATEGORY_COUNTS_KEYS = frozenset(
+    {"discovered", "offered", "dropped"}
+)
+CANDIDATE_FUNNEL_POLICY_KEYS = frozenset(
+    {"total_limit", "grounded_decision_reserve"}
+)
+CANDIDATE_FUNNEL_AUDIT_KEYS = frozenset(
+    {
+        "ref",
+        "category",
+        "discovered_rank",
+        "offered_rank",
+        "context_rank",
+        "assessment_eligible",
+        "disposition",
+        "reason",
+        "grounded_hops",
+        "episode_key",
+        "episode_role",
+        "reserve_rank",
+        "reserve_disposition",
+        "reserve_reason",
+        "candidate_identity",
+    }
+)
+CANDIDATE_FUNNEL_V3_AUDIT_KEYS = frozenset(
+    key
+    for key in CANDIDATE_FUNNEL_AUDIT_KEYS
+    if key
+    not in {
+        "grounded_hops",
+        "episode_key",
+        "episode_role",
+        "reserve_rank",
+        "reserve_disposition",
+        "reserve_reason",
+    }
+)
+CANDIDATE_FUNNEL_V2_AUDIT_KEYS = frozenset(
+    key
+    for key in CANDIDATE_FUNNEL_V3_AUDIT_KEYS
+    if key not in {"context_rank", "assessment_eligible"}
 )
 
 
@@ -64,6 +169,44 @@ def _dedupe_strings(values: Iterable[Any]) -> Tuple[str, ...]:
     return tuple(output)
 
 
+def _episode_facts(
+    value: Any,
+    *,
+    grounded_hops: int,
+) -> JsonDict:
+    required = {"episode_key", "episode_role", "grounded_hops"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError(
+            "candidate evidence capsule episode_facts schema mismatch"
+        )
+    episode_key = str(value.get("episode_key") or "").strip()
+    episode_role = str(value.get("episode_role") or "").strip()
+    supplied_hops = value.get("grounded_hops")
+    if not episode_key:
+        raise ValueError(
+            "candidate evidence capsule episode_key must be non-empty"
+        )
+    if episode_role not in {
+        "authored_plan",
+        "execution",
+        "verification",
+        "closure",
+        "other",
+    }:
+        raise ValueError(
+            "candidate evidence capsule episode_role is unsupported"
+        )
+    if type(supplied_hops) is not int or supplied_hops != grounded_hops:
+        raise ValueError(
+            "candidate evidence capsule grounded_hops must match downstream path"
+        )
+    return {
+        "episode_key": episode_key,
+        "episode_role": episode_role,
+        "grounded_hops": supplied_hops,
+    }
+
+
 @dataclass(frozen=True)
 class CandidateEvidenceCapsule:
     candidate_ref: str
@@ -80,6 +223,10 @@ class CandidateEvidenceCapsule:
     artifact_hydration: Mapping[str, Any] = field(default_factory=FrozenMapping)
     missing_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     validation_source: Mapping[str, Any] = field(default_factory=FrozenMapping)
+    restoration_obligations: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple
+    )
+    episode_facts: Mapping[str, Any] = field(default_factory=FrozenMapping)
 
     def __post_init__(self) -> None:
         candidate_ref = str(self.candidate_ref).strip()
@@ -112,6 +259,32 @@ class CandidateEvidenceCapsule:
             self, "missing_evidence_refs", _dedupe_strings(self.missing_evidence_refs)
         )
         object.__setattr__(self, "validation_source", _freeze(self.validation_source))
+        obligations = tuple(
+            RestorationObligation.from_dict(_thaw(item)).to_dict()
+            for item in self.restoration_obligations
+        )
+        object.__setattr__(
+            self,
+            "restoration_obligations",
+            tuple(_freeze(item) for item in obligations),
+        )
+        object.__setattr__(
+            self,
+            "episode_facts",
+            _freeze(
+                _episode_facts(
+                    self.episode_facts
+                    or {
+                        "episode_key": "fallback",
+                        "episode_role": "other",
+                        "grounded_hops": max(
+                            0, len(self.downstream_path) - 1
+                        ),
+                    },
+                    grounded_hops=max(0, len(self.downstream_path) - 1),
+                )
+            ),
+        )
         self.validate()
 
     def validate(self) -> None:
@@ -151,6 +324,18 @@ class CandidateEvidenceCapsule:
         if not self.downstream_path or self.downstream_path[0] != self.candidate_ref:
             raise ValueError("candidate identity must match downstream path start")
         self._validate_validation_source()
+        obligation_ids = [
+            str(item.get("obligation_id") or "")
+            for item in self.restoration_obligations
+        ]
+        if len(obligation_ids) != len(set(obligation_ids)):
+            raise ValueError(
+                "candidate evidence capsule contains duplicate restoration obligations"
+            )
+        _episode_facts(
+            self.episode_facts,
+            grounded_hops=max(0, len(self.downstream_path) - 1),
+        )
         if len(self.downstream_path_references) != len(self.downstream_path):
             raise ValueError(
                 "candidate downstream path references must cover every path position"
@@ -255,6 +440,10 @@ class CandidateEvidenceCapsule:
             "artifact_hydration": _thaw(self.artifact_hydration),
             "missing_evidence_refs": list(self.missing_evidence_refs),
             "validation_source": _thaw(self.validation_source),
+            "restoration_obligations": _thaw(
+                self.restoration_obligations
+            ),
+            "episode_facts": _thaw(self.episode_facts),
         }
 
     def judge_dict(self) -> JsonDict:
@@ -352,6 +541,8 @@ class CandidateEvidenceCapsule:
             "artifact_hydration",
             "missing_evidence_refs",
             "validation_source",
+            "restoration_obligations",
+            "episode_facts",
         }
         if set(value) != required or value.get("schema_version") != CAPSULE_SCHEMA_VERSION:
             raise ValueError("candidate evidence capsule schema mismatch")
@@ -393,6 +584,10 @@ class CandidateEvidenceCapsule:
             artifact_hydration=mapping("artifact_hydration"),
             missing_evidence_refs=strings("missing_evidence_refs"),
             validation_source=mapping("validation_source"),
+            restoration_obligations=mappings(
+                "restoration_obligations"
+            ),
+            episode_facts=mapping("episode_facts"),
         )
 
 
@@ -403,6 +598,8 @@ def build_candidate_evidence_capsules(
     defect_state: DefectState,
     downstream_paths: Mapping[str, Sequence[str]],
     start_refs: Sequence[str],
+    restoration_obligations: Sequence[RestorationObligation] = (),
+    episode_facts_by_ref: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Tuple[CandidateEvidenceCapsule, ...]:
     owner_refs = tuple(
         dict.fromkeys(
@@ -528,12 +725,41 @@ def build_candidate_evidence_capsules(
             artifact_hydration=prompt_collections["artifact_hydration"],
             missing_evidence_refs=tuple(prompt_collections["missing_evidence_refs"]),
             validation_source=validation_source,
+            restoration_obligations=tuple(
+                obligation.to_dict()
+                for obligation in restoration_obligations
+                if set(obligation.scope_refs)
+                & {
+                    ref,
+                    *path,
+                    *owner_refs,
+                    *raw_candidate_evidence_refs,
+                }
+            ),
+            episode_facts=(
+                (episode_facts_by_ref or {}).get(ref)
+                or {
+                    "episode_key": "fallback",
+                    "episode_role": "other",
+                    "grounded_hops": max(0, len(path) - 1),
+                }
+            ),
         )
         validate_candidate_evidence_capsule_against_graph(
             graph, capsule, authoritative_candidates=candidates
         )
         capsules.append(capsule)
     return tuple(capsules)
+
+
+def _candidate_judge_edge(
+    graph: TraceGraph,
+    candidate: CausalCandidate,
+) -> JsonDict:
+    edge = graph.sanitize_judge_edge_evidence(_thaw(candidate.edge))
+    if candidate.source not in {"confirmed_edge", "attribution_edge"}:
+        edge.pop("confidence", None)
+    return edge
 
 
 def _build_prompt_collections(
@@ -564,7 +790,7 @@ def _build_prompt_collections(
         if isinstance(item, Mapping) and str(item.get("raw_ref") or "")
     )
     artifact_hydration = raw_artifact_hydration
-    retrieval_edge = graph.sanitize_judge_edge_evidence(candidate.edge)
+    retrieval_edge = _candidate_judge_edge(graph, candidate)
     causal_edges = tuple(
         causal_path_edges
         if causal_path_edges is not None
@@ -591,7 +817,11 @@ def _build_prompt_collections(
     )
     raw_evidence_refs = _dedupe_strings(
         [
-            *(diagnostic_evidence_refs or candidate.evidence_refs),
+            *(
+                candidate.evidence_refs
+                if diagnostic_evidence_refs is None
+                else diagnostic_evidence_refs
+            ),
             *(retrieval_edge.get("evidence_refs") or ()),
             *node.source_refs,
             *(
@@ -636,17 +866,21 @@ def _validation_source(
     prompt_collections: Mapping[str, Any],
     diagnostic_evidence_refs: Sequence[str] | None = None,
 ) -> JsonDict:
+    candidate_evidence_refs = _dedupe_strings(
+        graph.filter_evidence_refs(
+            diagnostic_evidence_refs or candidate.evidence_refs
+        )
+    )
+    if (
+        not candidate_evidence_refs
+        and candidate.source in {"confirmed_edge", "attribution_edge"}
+    ):
+        candidate_evidence_refs = (candidate.ref,)
     return {
         "candidate_ref": candidate.ref,
         "candidate_source": candidate.source,
         "candidate_edge": _thaw(prompt_collections["retrieval_edge"]),
-        "candidate_evidence_refs": list(
-            _dedupe_strings(
-                graph.filter_evidence_refs(
-                    diagnostic_evidence_refs or candidate.evidence_refs
-                )
-            )
-        ),
+        "candidate_evidence_refs": list(candidate_evidence_refs),
         "downstream_path": list(path),
         "start_refs": list(start_refs),
         "prompt_collections_sha256": _prompt_collections_sha256(
@@ -678,7 +912,10 @@ def _prompt_collections_sha256(
 
 
 def candidate_compression_metrics(
-    graph: TraceGraph, capsules: Sequence[CandidateEvidenceCapsule]
+    graph: TraceGraph,
+    capsules: Sequence[CandidateEvidenceCapsule],
+    *,
+    candidate_funnel: Mapping[str, Any] | None = None,
 ) -> JsonDict:
     unique = {item.candidate_ref: item for item in capsules}
     trace_nodes = len(graph.nodes)
@@ -711,7 +948,505 @@ def candidate_compression_metrics(
     metrics["global_fusion_payload"] = global_fusion_payload_decision(
         metrics
     )
-    return metrics
+    return candidate_compression_with_funnel(metrics, candidate_funnel)
+
+
+def candidate_compression_with_funnel(
+    metrics: Mapping[str, Any],
+    candidate_funnel: Mapping[str, Any] | None,
+) -> JsonDict:
+    """Copy validated Task 2 selection facts onto a metrics projection."""
+    output = copy.deepcopy(dict(metrics))
+    if candidate_funnel is not None:
+        output["candidate_funnel"] = validate_candidate_funnel(
+            candidate_funnel
+        )
+    return output
+
+
+def candidate_funnel_is_valid(value: Any) -> bool:
+    try:
+        validate_candidate_funnel(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def validate_candidate_funnel(value: Any) -> JsonDict:
+    """Validate replayable v4 or signed historical v1-v3 funnel records."""
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate_funnel must be an object")
+    funnel = _thaw(value)
+    schema = funnel.get("schema")
+    if schema == CANDIDATE_BUDGET_SCHEMA:
+        funnel_keys = CANDIDATE_FUNNEL_KEYS
+        replayable = True
+    elif schema == CANDIDATE_FUNNEL_V3_SCHEMA:
+        funnel_keys = CANDIDATE_FUNNEL_V3_KEYS
+        replayable = False
+    elif schema == CANDIDATE_FUNNEL_V2_SCHEMA:
+        funnel_keys = CANDIDATE_FUNNEL_V2_KEYS
+        replayable = False
+    elif schema == CANDIDATE_FUNNEL_V1_SCHEMA:
+        funnel_keys = CANDIDATE_FUNNEL_V1_KEYS
+        replayable = False
+    else:
+        raise ValueError("candidate_funnel schema is unsupported")
+    if set(funnel) != set(funnel_keys):
+        raise ValueError("candidate_funnel has an invalid schema")
+    if not _is_sha256_identity(funnel.get("selection_identity")):
+        raise ValueError("candidate_funnel selection_identity is invalid")
+    has_context = schema in {
+        CANDIDATE_BUDGET_SCHEMA,
+        CANDIDATE_FUNNEL_V3_SCHEMA,
+    }
+    count_keys = ["discovered_count", "offered_count", "dropped_count"]
+    if has_context:
+        count_keys.append("evidence_context_count")
+    if any(
+        type(funnel.get(key)) is not int or funnel[key] < 0
+        for key in count_keys
+    ):
+        raise ValueError("candidate_funnel counts must be non-negative integers")
+    if funnel["discovered_count"] != (
+        funnel["offered_count"]
+        + funnel["dropped_count"]
+        + (
+            funnel["evidence_context_count"]
+            if has_context
+            else 0
+        )
+    ):
+        raise ValueError("candidate_funnel counts are not conserved")
+    _validate_candidate_funnel_policy(funnel["policy"])
+    if (
+        schema
+        in {
+            CANDIDATE_BUDGET_SCHEMA,
+            CANDIDATE_FUNNEL_V3_SCHEMA,
+            CANDIDATE_FUNNEL_V2_SCHEMA,
+        }
+        and funnel["policy"]
+        != quality_first_candidate_budget(
+            funnel["discovered_count"]
+        ).to_dict()
+    ):
+        raise ValueError(
+            "candidate_funnel policy does not match its quality-first policy tier"
+        )
+    selected_count = funnel["offered_count"] + (
+        funnel["evidence_context_count"]
+        if has_context
+        else 0
+    )
+    if selected_count > funnel["policy"]["total_limit"]:
+        raise ValueError("candidate_funnel selected count exceeds its policy")
+    _validate_candidate_funnel_category_counts(
+        funnel,
+        schema=str(schema),
+    )
+    _validate_candidate_funnel_audit(
+        funnel,
+        replayable=replayable,
+        schema=str(schema),
+    )
+    unsigned = {
+        key: funnel[key]
+        for key in funnel_keys
+        if key != "selection_identity"
+    }
+    expected_identity = hashlib.sha256(
+        stable_json(unsigned).encode("utf-8")
+    ).hexdigest()
+    if funnel["selection_identity"] != expected_identity:
+        raise ValueError("candidate_funnel selection_identity does not match")
+    return funnel
+
+
+def _validate_candidate_funnel_policy(policy: Any) -> None:
+    if not isinstance(policy, Mapping) or set(policy) != set(
+        CANDIDATE_FUNNEL_POLICY_KEYS
+    ):
+        raise ValueError("candidate_funnel policy has an invalid schema")
+    total_limit = policy.get("total_limit")
+    reserve = policy.get("grounded_decision_reserve")
+    if (
+        type(total_limit) is not int
+        or total_limit < 0
+        or type(reserve) is not int
+        or reserve < 0
+        or reserve > MAX_GROUNDED_DECISION_RESERVE
+    ):
+        raise ValueError("candidate_funnel policy is invalid")
+
+
+def _validate_candidate_funnel_category_counts(
+    funnel: Mapping[str, Any],
+    *,
+    schema: str,
+) -> None:
+    counts = funnel.get("counts_by_category")
+    if not isinstance(counts, Mapping) or set(counts) != set(
+        CANDIDATE_FUNNEL_CATEGORIES
+    ):
+        raise ValueError("candidate_funnel categories have an invalid schema")
+    has_context = schema in {
+        CANDIDATE_BUDGET_SCHEMA,
+        CANDIDATE_FUNNEL_V3_SCHEMA,
+    }
+    count_keys = (
+        CANDIDATE_FUNNEL_CATEGORY_COUNTS_KEYS
+        if has_context
+        else CANDIDATE_FUNNEL_V2_CATEGORY_COUNTS_KEYS
+    )
+    totals = {key: 0 for key in count_keys}
+    for category_counts in counts.values():
+        if not isinstance(category_counts, Mapping) or set(category_counts) != set(
+            count_keys
+        ):
+            raise ValueError("candidate_funnel category counts are invalid")
+        for key in totals:
+            count = category_counts.get(key)
+            if type(count) is not int or count < 0:
+                raise ValueError("candidate_funnel category counts are invalid")
+            totals[key] += count
+        if category_counts["discovered"] != (
+            category_counts["offered"]
+            + category_counts["dropped"]
+            + (
+                category_counts["evidence_context"]
+                if has_context
+                else 0
+            )
+        ):
+            raise ValueError("candidate_funnel category counts are not conserved")
+    expected_totals = {
+        "discovered": funnel["discovered_count"],
+        "offered": funnel["offered_count"],
+        "dropped": funnel["dropped_count"],
+    }
+    if has_context:
+        expected_totals["evidence_context"] = funnel[
+            "evidence_context_count"
+        ]
+    if totals != expected_totals:
+        raise ValueError("candidate_funnel category totals do not match")
+
+
+def _validate_candidate_funnel_audit(
+    funnel: Mapping[str, Any],
+    *,
+    replayable: bool,
+    schema: str,
+) -> None:
+    is_current = schema == CANDIDATE_BUDGET_SCHEMA
+    has_context = schema in {
+        CANDIDATE_BUDGET_SCHEMA,
+        CANDIDATE_FUNNEL_V3_SCHEMA,
+    }
+    grounded_refs = funnel.get("grounded_decision_refs", [])
+    reserved_refs = funnel.get("reserved_grounded_decision_refs")
+    reserved_episode_refs = (
+        funnel.get("reserved_episode_refs", []) if is_current else []
+    )
+    context_refs = (
+        funnel.get("evidence_context_refs", []) if has_context else []
+    )
+    audit = funnel.get("candidate_audit")
+    drop_reasons = funnel.get("drop_reasons")
+    context_reasons = (
+        funnel.get("context_reasons", {}) if has_context else {}
+    )
+    if (
+        not isinstance(grounded_refs, list)
+        or any(type(ref) is not str or not ref for ref in grounded_refs)
+        or len(set(grounded_refs)) != len(grounded_refs)
+        or not isinstance(reserved_refs, list)
+        or any(type(ref) is not str or not ref for ref in reserved_refs)
+        or len(set(reserved_refs)) != len(reserved_refs)
+        or not isinstance(reserved_episode_refs, list)
+        or any(
+            type(ref) is not str or not ref
+            for ref in reserved_episode_refs
+        )
+        or len(set(reserved_episode_refs)) != len(reserved_episode_refs)
+        or not isinstance(context_refs, list)
+        or any(type(ref) is not str or not ref for ref in context_refs)
+        or len(set(context_refs)) != len(context_refs)
+        or (
+            has_context
+            and len(context_refs) != funnel["evidence_context_count"]
+        )
+        or not isinstance(audit, list)
+        or len(audit) != funnel["discovered_count"]
+        or not isinstance(drop_reasons, Mapping)
+        or set(drop_reasons) != {"total_limit"}
+        or type(drop_reasons.get("total_limit")) is not int
+        or drop_reasons["total_limit"] != funnel["dropped_count"]
+        or (
+            has_context
+            and (
+                not isinstance(context_reasons, Mapping)
+                or set(context_reasons)
+                != {NO_ACTIVE_SEED_CAUSAL_PATH}
+                or type(
+                    context_reasons.get(NO_ACTIVE_SEED_CAUSAL_PATH)
+                )
+                is not int
+                or context_reasons[NO_ACTIVE_SEED_CAUSAL_PATH]
+                != funnel["evidence_context_count"]
+            )
+        )
+    ):
+        raise ValueError("candidate_funnel audit has an invalid schema")
+    offered_ranks = set()
+    context_ranks = set()
+    refs = set()
+    audit_by_ref = {}
+    count_keys = (
+        CANDIDATE_FUNNEL_CATEGORY_COUNTS_KEYS
+        if has_context
+        else CANDIDATE_FUNNEL_V2_CATEGORY_COUNTS_KEYS
+    )
+    counts = {
+        category: {key: 0 for key in count_keys}
+        for category in CANDIDATE_FUNNEL_CATEGORIES
+    }
+    audit_keys = (
+        CANDIDATE_FUNNEL_AUDIT_KEYS
+        if is_current
+        else CANDIDATE_FUNNEL_V3_AUDIT_KEYS
+        if schema == CANDIDATE_FUNNEL_V3_SCHEMA
+        else CANDIDATE_FUNNEL_V2_AUDIT_KEYS
+    )
+    for rank, entry in enumerate(audit):
+        if not isinstance(entry, Mapping) or set(entry) != set(audit_keys):
+            raise ValueError("candidate_funnel audit entry has an invalid schema")
+        ref = entry.get("ref")
+        category = entry.get("category")
+        disposition = entry.get("disposition")
+        offered_rank = entry.get("offered_rank")
+        context_rank = entry.get("context_rank") if has_context else None
+        assessment_eligible = (
+            entry.get("assessment_eligible") if has_context else True
+        )
+        allowed_dispositions = (
+            {"offered", "evidence_context", "dropped"}
+            if has_context
+            else {"offered", "dropped"}
+        )
+        if (
+            type(ref) is not str
+            or not ref
+            or ref in refs
+            or category not in CANDIDATE_FUNNEL_CATEGORIES
+            or type(entry.get("discovered_rank")) is not int
+            or entry["discovered_rank"] != rank
+            or disposition not in allowed_dispositions
+            or (has_context and type(assessment_eligible) is not bool)
+            or not _is_sha256_identity(entry.get("candidate_identity"))
+        ):
+            raise ValueError("candidate_funnel audit entry is invalid")
+        if is_current and (
+            type(entry.get("grounded_hops")) is not int
+            or entry["grounded_hops"] < 0
+            or not isinstance(entry.get("episode_key"), str)
+            or not entry["episode_key"]
+            or entry.get("episode_role")
+            not in {
+                "authored_plan",
+                "execution",
+                "verification",
+                "closure",
+                "other",
+            }
+            or (
+                entry.get("reserve_rank") is not None
+                and (
+                    type(entry["reserve_rank"]) is not int
+                    or entry["reserve_rank"] < 0
+                )
+            )
+            or entry.get("reserve_disposition")
+            not in {
+                "episode_reserved",
+                "grounded_decision_reserved",
+                "quality_order_fill",
+                "evidence_context",
+                "dropped",
+            }
+            or not isinstance(entry.get("reserve_reason"), str)
+            or not entry["reserve_reason"]
+        ):
+            raise ValueError(
+                "candidate_funnel episode reserve audit is invalid"
+            )
+        refs.add(ref)
+        audit_by_ref[ref] = entry
+        counts[category]["discovered"] += 1
+        if disposition == "offered":
+            if (
+                type(offered_rank) is not int
+                or offered_rank < 0
+                or context_rank is not None
+                or not assessment_eligible
+            ):
+                raise ValueError("candidate_funnel offered rank is invalid")
+            offered_ranks.add(offered_rank)
+            counts[category]["offered"] += 1
+            expected_reason = (
+                "episode_diverse_reserve"
+                if ref in reserved_episode_refs
+                else "grounded_decision_reserve"
+                if ref in reserved_refs
+                else "input_order"
+            )
+        elif disposition == "evidence_context":
+            if (
+                offered_rank is not None
+                or type(context_rank) is not int
+                or context_rank < 0
+                or assessment_eligible
+            ):
+                raise ValueError(
+                    "candidate_funnel context rank is invalid"
+                )
+            context_ranks.add(context_rank)
+            counts[category]["evidence_context"] += 1
+            expected_reason = NO_ACTIVE_SEED_CAUSAL_PATH
+        else:
+            if offered_rank is not None or context_rank is not None:
+                raise ValueError("candidate_funnel dropped candidate has a rank")
+            counts[category]["dropped"] += 1
+            expected_reason = "total_limit"
+        if entry.get("reason") != expected_reason:
+            raise ValueError("candidate_funnel audit reason is invalid")
+    if offered_ranks != set(range(funnel["offered_count"])):
+        raise ValueError("candidate_funnel offered ranks are not contiguous")
+    if has_context and context_ranks != set(
+        range(funnel["evidence_context_count"])
+    ):
+        raise ValueError("candidate_funnel context ranks are not contiguous")
+    if counts != funnel["counts_by_category"]:
+        raise ValueError("candidate_funnel audit counts do not match")
+    reserve_limit = min(
+        funnel["policy"]["total_limit"],
+        funnel["policy"]["grounded_decision_reserve"],
+    )
+    if (
+        len(reserved_refs) > reserve_limit
+        or len(set(reserved_refs) | set(reserved_episode_refs))
+        > reserve_limit
+        or any(
+            ref not in audit_by_ref
+            or audit_by_ref[ref]["category"] != AUTHORED_DECISION
+            or audit_by_ref[ref]["disposition"] != "offered"
+            for ref in reserved_refs
+        )
+    ):
+        raise ValueError("candidate_funnel reserved decisions are invalid")
+    if any(
+        ref not in audit_by_ref
+        or audit_by_ref[ref]["disposition"] != "offered"
+        for ref in reserved_episode_refs
+    ):
+        raise ValueError("candidate_funnel episode reserve is invalid")
+    if not replayable:
+        return
+    if (
+        any(
+            ref not in audit_by_ref
+            or audit_by_ref[ref]["category"] != AUTHORED_DECISION
+            or audit_by_ref[ref]["assessment_eligible"] is not True
+            for ref in grounded_refs
+        )
+    ):
+        raise ValueError("candidate_funnel grounded decisions are invalid")
+    expected_reserved = [
+        entry["ref"]
+        for entry in sorted(
+            (
+                entry
+                for entry in audit
+                if entry.get("reserve_rank") is not None
+            ),
+            key=lambda entry: entry["reserve_rank"],
+        )
+    ]
+    if (
+        set(expected_reserved)
+        != set(reserved_refs) | set(reserved_episode_refs)
+        or [ref for ref in expected_reserved if ref in grounded_refs]
+        != reserved_refs
+        or [
+            ref for ref in expected_reserved if ref in reserved_episode_refs
+        ]
+        != reserved_episode_refs
+    ):
+        raise ValueError(
+            "candidate_funnel reserve audit contradicts reserved refs"
+        )
+    eligible_refs = [
+        entry["ref"]
+        for entry in audit
+        if entry["assessment_eligible"] is True
+    ]
+    remaining_offered = max(
+        0,
+        funnel["policy"]["total_limit"] - len(expected_reserved),
+    )
+    expected_offered = expected_reserved + [
+        ref
+        for ref in eligible_refs
+        if ref not in set(expected_reserved)
+    ][:remaining_offered]
+    remaining_context = max(
+        0,
+        funnel["policy"]["total_limit"] - len(expected_offered),
+    )
+    expected_context = [
+        entry["ref"]
+        for entry in audit
+        if entry["assessment_eligible"] is False
+    ][:remaining_context]
+    actual_offered = [
+        entry["ref"]
+        for entry in sorted(
+            (
+                entry
+                for entry in audit
+                if entry["disposition"] == "offered"
+            ),
+            key=lambda entry: entry["offered_rank"],
+        )
+    ]
+    actual_context = [
+        entry["ref"]
+        for entry in sorted(
+            (
+                entry
+                for entry in audit
+                if entry["disposition"] == "evidence_context"
+            ),
+            key=lambda entry: entry["context_rank"],
+        )
+    ]
+    if (
+        actual_offered != expected_offered
+        or actual_context != expected_context
+        or context_refs != expected_context
+    ):
+        raise ValueError(
+            "candidate_funnel contradicts the v4 selection algorithm"
+        )
+
+
+def _is_sha256_identity(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def global_fusion_payload_decision(
@@ -737,15 +1472,19 @@ def global_fusion_payload_decision(
     dense_root_matrix = (
         open_root_candidates > max_open_root_candidates
     )
-    eligible = not (
-        negative_compression and oversized and dense_root_matrix
-    )
-    if not negative_compression or not oversized:
+    eligible = not (oversized and dense_root_matrix)
+    if not oversized:
         reason = "within_global_fusion_budget"
     elif not dense_root_matrix:
-        reason = "bounded_root_matrix_despite_negative_compression"
-    else:
+        reason = (
+            "bounded_root_matrix_despite_negative_compression"
+            if negative_compression
+            else "bounded_root_matrix_despite_oversized_payload"
+        )
+    elif negative_compression:
         reason = "oversized_negative_compression"
+    else:
+        reason = "oversized_dense_root_matrix"
     return {
         "eligible": eligible,
         "reason": reason,
@@ -876,9 +1615,7 @@ def validate_candidate_evidence_capsule_against_graph(
         source_candidate,
         authoritative_candidates=authoritative_candidates,
     )
-    source_edge = _thaw(
-        graph.sanitize_judge_edge_evidence(source_candidate.edge)
-    )
+    source_edge = _candidate_judge_edge(graph, source_candidate)
     recorded_source = active_candidate.source in {
         "confirmed_edge",
         "attribution_edge",
@@ -900,8 +1637,7 @@ def validate_candidate_evidence_capsule_against_graph(
             or (
                 not recorded_source
                 and route.source == source_candidate.source
-                and _thaw(graph.sanitize_judge_edge_evidence(route.edge))
-                == source_edge
+                and _candidate_judge_edge(graph, route) == source_edge
             )
         )
     )
@@ -914,9 +1650,16 @@ def validate_candidate_evidence_capsule_against_graph(
         if active_routes
         else active_candidate
     )
+    diagnostic_source_refs = source_evidence_refs
+    if (
+        diagnostic_source_refs == (active_candidate.ref,)
+        and not diagnostic_candidate.evidence_refs
+        and not diagnostic_candidate.edge.get("evidence_refs")
+    ):
+        diagnostic_source_refs = ()
     diagnostic_evidence_refs = _dedupe_strings(
         [
-            *source_evidence_refs,
+            *diagnostic_source_refs,
             *diagnostic_candidate.evidence_refs,
             *(diagnostic_candidate.edge.get("evidence_refs") or ()),
         ]
@@ -1031,8 +1774,18 @@ def _reconcile_candidate_source(
             if (graph.resolve(route.ref) or route.ref) == candidate.ref
             and route.source == candidate.source
             and not route.edge
-            and tuple(sorted(graph.filter_evidence_refs(route.evidence_refs)))
-            == tuple(sorted(candidate.evidence_refs))
+            and (
+                tuple(
+                    sorted(graph.filter_evidence_refs(route.evidence_refs))
+                )
+                == tuple(sorted(candidate.evidence_refs))
+                or (
+                    candidate.source
+                    in {"confirmed_edge", "attribution_edge"}
+                    and not route.evidence_refs
+                    and tuple(candidate.evidence_refs) == (candidate.ref,)
+                )
+            )
         ]
         if matching:
             return candidate
@@ -1061,12 +1814,21 @@ def _reconcile_candidate_source(
             raise ValueError(
                 "synthetic candidate requires an authoritative retrieval route"
             )
+        candidate_edge = _candidate_judge_edge(graph, candidate)
+        has_gap_aggregation = bool(
+            candidate_edge.get("attribution_only_obligation_gaps")
+        )
+        if has_gap_aggregation:
+            comparable_routes = (
+                canonical_candidate_route(graph, candidate.ref, routes),
+            )
+        else:
+            comparable_routes = tuple(routes)
         matching = [
             route
-            for route in routes
+            for route in comparable_routes
             if route.source == candidate.source
-            and _thaw(graph.sanitize_judge_edge_evidence(route.edge))
-            == _thaw(candidate.edge)
+            and _candidate_judge_edge(graph, route) == candidate_edge
             and tuple(
                 sorted(
                     _dedupe_strings(
@@ -1097,23 +1859,39 @@ def _reconcile_candidate_source(
         )
     active = canonical_candidate_route(graph, candidate.ref, routes)
     active_edge = graph.sanitize_judge_edge_evidence(active.edge)
-    active_evidence_refs = _dedupe_strings(
+    active_route_evidence_refs = _dedupe_strings(
         graph.filter_evidence_refs(active.evidence_refs)
     )
+    active_evidence_refs = _dedupe_strings(
+        (
+            *active_route_evidence_refs,
+            *graph.filter_evidence_refs(
+                active_edge.get("evidence_refs") or ()
+            ),
+        )
+    )
+    permitted_evidence_refs = {
+        active_route_evidence_refs,
+        active_evidence_refs,
+    }
+    if not active_evidence_refs:
+        permitted_evidence_refs.add((candidate.ref,))
     active_to_ref = graph.resolve(str(active_edge.get("to_ref") or ""))
-    matching_active_edges = [
-        graph.sanitize_judge_edge_evidence(item)
-        for item in graph.edge_context(candidate.ref, active_to_ref or "")
-        if str(item.get("relation") or "")
-        == str(active_edge.get("relation") or "")
-        and str(item.get("evidence_type") or "")
-        == str(active_edge.get("evidence_type") or "")
-    ]
     if (
-        active_edge not in matching_active_edges
+        not active_to_ref
+        or not any(
+            str(item.get("relation") or "")
+            == str(active_edge.get("relation") or "")
+            and str(item.get("evidence_type") or "")
+            == str(active_edge.get("evidence_type") or "")
+            for item in graph.edge_context(
+                candidate.ref,
+                active_to_ref,
+            )
+        )
         or active.source != candidate.source
         or _thaw(active_edge) != _thaw(candidate.edge)
-        or active_evidence_refs != tuple(candidate.evidence_refs)
+        or tuple(candidate.evidence_refs) not in permitted_evidence_refs
     ):
         raise ValueError(
             "candidate does not match its authoritative recorded route"
@@ -1124,7 +1902,7 @@ def _reconcile_candidate_source(
         source=active.source,
         edge=active_edge,
         score=active.score,
-        evidence_refs=active_evidence_refs,
+        evidence_refs=tuple(candidate.evidence_refs),
     )
 
 
@@ -1311,8 +2089,11 @@ __all__ = [
     "CandidateEvidenceCapsule",
     "build_action_group_context",
     "build_candidate_evidence_capsules",
+    "candidate_compression_with_funnel",
     "candidate_compression_metrics",
+    "candidate_funnel_is_valid",
     "global_fusion_payload_decision",
+    "validate_candidate_funnel",
     "validate_candidate_evidence_capsule_against_graph",
     "validate_candidate_evidence_capsules_against_graph",
 ]

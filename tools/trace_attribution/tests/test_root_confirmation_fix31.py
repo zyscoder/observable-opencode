@@ -288,7 +288,7 @@ def tamper_projection(projection):
 
 
 def direct_projection_identity(projection):
-    return "confirmation_request:v3:{0}".format(
+    return "confirmation_request:v4:{0}".format(
         hashlib.sha256(
             stable_json(projection).encode("utf-8")
         ).hexdigest()
@@ -539,19 +539,19 @@ class Fix31PersistenceVersionTest(unittest.TestCase):
     def test_versions_name_projection_identity_binding_contracts(self):
         self.assertEqual(
             causal_judge.ROOT_CONFIRMATION_REQUEST_PROJECTION_SCHEMA,
-            "root-confirmation-request-projection/v2",
+            "root-confirmation-request-projection/v3",
         )
         self.assertEqual(
             causal_judge.ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
-            "confirmation_request:v3:",
+            "confirmation_request:v4:",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v18",
+            "recursive-analysis-actions/v25",
         )
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -559,14 +559,14 @@ class Fix31PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
         self.assertIn(
             "recursive-root-confirmation/v17",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
-            "action-projection/v7",
+            "action-projection/v8",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(

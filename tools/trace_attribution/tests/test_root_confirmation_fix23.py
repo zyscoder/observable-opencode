@@ -128,6 +128,8 @@ class DurableConfirmationActionProjectionTest(unittest.TestCase):
                     "defect_fingerprint",
                     "seed_binding_identity",
                     "seed_key",
+                    "review_scope",
+                    "origin",
                     "recursive_path",
                     "evidence_refs",
                     "artifact_evidence_envelopes",
@@ -451,21 +453,21 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
     def test_all_affected_persisted_identities_are_bumped(self):
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v20",
+            "recursive-attribution-report/v22",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v20",
+            "recursive-attribution-checkpoint/v28",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v9",
+            "recursive-attribution-output/v15",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v18")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
         self.assertEqual(
             COMPARISON_SCHEMA_VERSION,
-            "recursive-attribution-comparison/v5",
+            "recursive-attribution-comparison/v7",
         )
         self.assertEqual(JUDGMENT_CACHE_VERSION, "3.0")
         self.assertEqual(
@@ -476,7 +478,7 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
             "recursive-root-confirmation/v17+resolution/v2"
             "+evidence-policy/v5+artifact-owner/v1+terminal-evidence/v2"
-            "+local-state-owner/v1+action-projection/v7"
+            "+local-state-owner/v1+action-projection/v8"
             "+response-identity/v1+counterfactual/v1"
             "+queue-response-identity/v1+published-root-projection/v3"
             "+causal-publication/v3"
@@ -486,8 +488,8 @@ class Fix23PersistedIdentityTest(unittest.TestCase):
         )
         self.assertEqual(
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
-            "global-candidate-judgment/v9+validation-envelope/v9"
-            "+capsule/v7+evidence-policy/v5+local-state-owner/v1"
+            "global-candidate-judgment/v11+validation-envelope/v11"
+            "+capsule/v8+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
             "+failure-projection/v4+terminal-record-schema/v3"
             "+judge-lifecycle/v1+graph-seed-authority/v1"

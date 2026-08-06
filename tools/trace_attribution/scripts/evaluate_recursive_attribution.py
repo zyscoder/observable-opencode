@@ -23,6 +23,17 @@ from trace_attribution.causal_state import (
     validate_modern_report_shape,
     validate_seed_outcome_payload,
 )
+from trace_attribution.benchmark_case import load_benchmark_case
+from trace_attribution.input_binding import bind_label_inputs
+from trace_attribution.label_contract import (
+    V5_LABEL_SCHEMA_VERSION,
+    validate_labels as validate_bound_labels,
+)
+from trace_attribution.seed_projection import score_seed_owned_report
+from trace_attribution.candidate_clustering import (
+    validate_candidate_cluster_shadow_event,
+)
+from trace_attribution.checkpoint import CheckpointBundle
 from trace_attribution.graph import TraceGraph, collect_artifact_ids, resolve_edge_endpoint
 from trace_attribution.models import TraceNode, stable_json
 from trace_attribution.recursive_analyzer import (
@@ -31,8 +42,12 @@ from trace_attribution.recursive_analyzer import (
 
 
 JsonDict = Dict[str, Any]
-LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
-COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v5"
+LEGACY_LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v3"
+LABEL_SCHEMA_VERSION = "recursive-attribution-labels/v4"
+LABEL_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_LABEL_SCHEMA_VERSION, LABEL_SCHEMA_VERSION}
+)
+COMPARISON_SCHEMA_VERSION = "recursive-attribution-comparison/v7"
 REPORT_SCHEMA_VERSION = MODERN_REPORT_SCHEMA_VERSION
 SEMANTIC_ANCHOR_PREFIX = "semantic_anchor:v2:"
 SEMANTIC_OCCURRENCE_PREFIX = "semantic_occurrence:v1:"
@@ -40,7 +55,7 @@ TEMPORAL_RELATIONS = frozenset(
     {"temporal_proximity", "temporal_sequence", "previous_event", "next_event"}
 )
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
-LABEL_KEYS = frozenset(
+LEGACY_LABEL_KEYS = frozenset(
     {
         "schema_version",
         "case_id",
@@ -51,6 +66,20 @@ LABEL_KEYS = frozenset(
         "allowed_unresolved_outcomes",
     }
 )
+LABEL_KEYS = frozenset(
+    {
+        *LEGACY_LABEL_KEYS,
+        "materializations",
+        "unrelated",
+    }
+)
+FACTOR_ROLE_LABEL_FIELDS = (
+    ("contributing_condition", "conditions"),
+    ("amplifying_factor", "amplifiers"),
+    ("downstream_materialization", "materializations"),
+    ("unrelated", "unrelated"),
+)
+FACTOR_ROLES = tuple(role for role, _ in FACTOR_ROLE_LABEL_FIELDS)
 LABEL_ENTRY_REQUIRED_KEYS = frozenset(
     {"semantic_anchor_id", "semantic_occurrence_id"}
 )
@@ -126,12 +155,30 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
 
 def validate_labels(value: Mapping[str, Any]) -> JsonDict:
     labels = dict(_mapping(value, "labels"))
-    _exact_keys(labels, LABEL_KEYS, "labels")
-    if labels["schema_version"] != LABEL_SCHEMA_VERSION:
+    schema_version = labels.get("schema_version")
+    if schema_version not in LABEL_SCHEMA_VERSIONS:
         raise EvaluationSchemaError("unsupported labels schema_version")
+    _exact_keys(
+        labels,
+        (
+            LABEL_KEYS
+            if schema_version == LABEL_SCHEMA_VERSION
+            else LEGACY_LABEL_KEYS
+        ),
+        "labels",
+    )
     if not isinstance(labels["case_id"], str) or not labels["case_id"]:
         raise EvaluationSchemaError("labels case_id must be a non-empty string")
-    for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
+    role_fields = [
+        "roots",
+        "conditions",
+        "amplifiers",
+        "forbidden_roots",
+    ]
+    if schema_version == LABEL_SCHEMA_VERSION:
+        role_fields.extend(["materializations", "unrelated"])
+    factor_occurrences: Dict[str, str] = {}
+    for role in role_fields:
         entries = _list(labels[role], "labels.{0}".format(role))
         occurrences: Set[str] = set()
         refs: Set[str] = set()
@@ -165,6 +212,21 @@ def validate_labels(value: Mapping[str, Any]) -> JsonDict:
             if node_ref is not None:
                 refs.add(node_ref)
             occurrences.add(occurrence)
+            if role in {
+                "conditions",
+                "amplifiers",
+                "materializations",
+                "unrelated",
+            }:
+                prior_role = factor_occurrences.get(occurrence)
+                if prior_role is not None:
+                    raise EvaluationSchemaError(
+                        "factor label occurrence appears in both {0} and {1}".format(
+                            prior_role,
+                            role,
+                        )
+                    )
+                factor_occurrences[occurrence] = role
     outcomes = _list(labels["allowed_unresolved_outcomes"], "allowed_unresolved_outcomes")
     if any(
         item not in {"inconclusive", "partial", "partial_root_found"}
@@ -258,6 +320,348 @@ def _safe_rate(numerator: int, denominator: int, *, empty: float = 0.0) -> float
     return round(numerator / denominator, 6)
 
 
+def _factor_role_evaluation(
+    report: Mapping[str, Any],
+    labels: Mapping[str, Any],
+) -> JsonDict:
+    schema_version = str(labels["schema_version"])
+    evaluated_roles = (
+        list(FACTOR_ROLES)
+        if schema_version == LABEL_SCHEMA_VERSION
+        else list(FACTOR_ROLES[:2])
+    )
+    excluded_roles = [
+        role for role in FACTOR_ROLES if role not in evaluated_roles
+    ]
+    expected_by_role = {
+        role: set(_label_occurrences(labels, field_name))
+        for role, field_name in FACTOR_ROLE_LABEL_FIELDS
+        if role in evaluated_roles
+    }
+    predicted_by_role = {
+        "contributing_condition": set(
+            _occurrences(
+                _items(report.get("contributing_conditions"))
+            )
+        ),
+        "amplifying_factor": set(
+            _occurrences(_items(report.get("amplifying_factors")))
+        ),
+        "downstream_materialization": set(
+            _occurrences(
+                _items(report.get("downstream_materializations"))
+            )
+        ),
+        "unrelated": set(
+            _occurrences(
+                item
+                for item in _items(report.get("rejected_candidates"))
+                if isinstance(item.get("confirmation"), Mapping)
+                and item["confirmation"].get("factor_role")
+                == "unrelated"
+            )
+        ),
+    }
+    expected_pairs = {
+        (role, occurrence)
+        for role, occurrences in expected_by_role.items()
+        for occurrence in occurrences
+    }
+    predicted_pairs = {
+        (role, occurrence)
+        for role in evaluated_roles
+        for occurrence in predicted_by_role[role]
+    }
+    correct_pairs = expected_pairs & predicted_pairs
+    precision = _safe_rate(
+        len(correct_pairs),
+        len(predicted_pairs),
+        empty=1.0 if not expected_pairs else 0.0,
+    )
+    recall = _safe_rate(
+        len(correct_pairs),
+        len(expected_pairs),
+        empty=1.0 if not predicted_pairs else 0.0,
+    )
+    f1 = (
+        0.0
+        if precision + recall == 0
+        else round(2 * precision * recall / (precision + recall), 6)
+    )
+
+    metadata = report.get("metadata")
+    occurrence_index = (
+        metadata.get("semantic_occurrence_index")
+        if isinstance(metadata, Mapping)
+        and isinstance(
+            metadata.get("semantic_occurrence_index"),
+            Mapping,
+        )
+        else {}
+    )
+    judgments_by_occurrence: Dict[str, List[Mapping[str, Any]]] = {}
+    for judgment in _items(
+        metadata.get("factor_role_judgments")
+        if isinstance(metadata, Mapping)
+        else ()
+    ):
+        occurrence = occurrence_index.get(
+            str(judgment.get("candidate_ref") or "")
+        )
+        if isinstance(occurrence, str) and occurrence:
+            judgments_by_occurrence.setdefault(occurrence, []).append(
+                judgment
+            )
+
+    predicted_roles_by_occurrence: Dict[str, Set[str]] = {}
+    for role, occurrences in predicted_by_role.items():
+        for occurrence in occurrences:
+            predicted_roles_by_occurrence.setdefault(
+                occurrence, set()
+            ).add(role)
+    columns = [
+        *FACTOR_ROLES,
+        "unknown",
+        "not_reviewed",
+        "necessary_escalation",
+        "conflict",
+    ]
+    confusion_matrix = {
+        role: {column: 0 for column in columns}
+        for role in evaluated_roles
+    }
+    predicted_class_by_expected_occurrence: Dict[str, str] = {}
+    expected_occurrences = {
+        occurrence
+        for occurrences in expected_by_role.values()
+        for occurrence in occurrences
+    }
+    for expected_role, occurrences in expected_by_role.items():
+        for occurrence in occurrences:
+            predicted_roles = predicted_roles_by_occurrence.get(
+                occurrence, set()
+            )
+            if len(predicted_roles) == 1:
+                predicted_role = next(iter(predicted_roles))
+            elif len(predicted_roles) > 1:
+                predicted_role = "conflict"
+            else:
+                judgments = judgments_by_occurrence.get(occurrence, [])
+                if any(
+                    item.get("necessity_status") == "necessary"
+                    for item in judgments
+                ):
+                    predicted_role = "necessary_escalation"
+                elif any(
+                    item.get("factor_role") == "unknown"
+                    and item.get("necessity_status") != "necessary"
+                    for item in judgments
+                ):
+                    predicted_role = "unknown"
+                else:
+                    predicted_role = "not_reviewed"
+            predicted_class_by_expected_occurrence[
+                occurrence
+            ] = predicted_role
+            confusion_matrix[expected_role][predicted_role] += 1
+    confusion_matrix["unlabeled"] = {
+        column: (
+            len(
+                predicted_by_role[column] - expected_occurrences
+            )
+            if column in predicted_by_role
+            else 0
+        )
+        for column in columns
+    }
+
+    disagreements: JsonDict = {}
+    for role, label_field in FACTOR_ROLE_LABEL_FIELDS:
+        if role not in evaluated_roles:
+            continue
+        expected_role_occurrences = expected_by_role[role]
+        predicted_role_occurrences = predicted_by_role[role]
+        disagreements[
+            "missing_expected_{0}".format(label_field)
+        ] = sorted(
+            expected_role_occurrences - predicted_role_occurrences
+        )
+        disagreements[
+            "unexpected_predicted_{0}".format(label_field)
+        ] = sorted(
+            predicted_role_occurrences - expected_role_occurrences
+        )
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "expected_pairs": expected_pairs,
+        "predicted_pairs": predicted_pairs,
+        "expected_by_role": expected_by_role,
+        "predicted_by_role": predicted_by_role,
+        "predicted_class_by_expected_occurrence": (
+            predicted_class_by_expected_occurrence
+        ),
+        "scope": {
+            "label_schema_version": schema_version,
+            "scope": (
+                "full"
+                if schema_version == LABEL_SCHEMA_VERSION
+                else "partial"
+            ),
+            "unit": "semantic_occurrence_role_pair",
+            "evaluated_roles": evaluated_roles,
+            "excluded_roles": excluded_roles,
+        },
+        "confusion_matrix": confusion_matrix,
+        "disagreements": disagreements,
+    }
+
+
+def _human_llm_disagreement_evaluation(
+    report: Mapping[str, Any],
+    labels: Mapping[str, Any],
+    *,
+    expected_root_occurrences: Set[str],
+    predicted_root_occurrences: Set[str],
+    factor_evaluation: Mapping[str, Any],
+) -> JsonDict:
+    expected_class_by_occurrence: Dict[str, str] = {}
+
+    def assign_expected_class(
+        occurrence: str,
+        expected_class: str,
+    ) -> None:
+        prior = expected_class_by_occurrence.get(occurrence)
+        if prior is not None and prior != expected_class:
+            raise EvaluationSafetyError(
+                "human_label_occurrence_has_multiple_classes:"
+                "{0}:{1}:{2}".format(
+                    occurrence,
+                    prior,
+                    expected_class,
+                )
+            )
+        expected_class_by_occurrence[occurrence] = expected_class
+
+    for occurrence in expected_root_occurrences:
+        assign_expected_class(occurrence, "root_cause")
+    expected_by_role = factor_evaluation["expected_by_role"]
+    for role, occurrences in expected_by_role.items():
+        for occurrence in occurrences:
+            assign_expected_class(str(occurrence), str(role))
+
+    published_classes: Dict[str, Set[str]] = {}
+    for occurrence in predicted_root_occurrences:
+        published_classes.setdefault(occurrence, set()).add(
+            "root_cause"
+        )
+    for role, occurrences in factor_evaluation[
+        "predicted_by_role"
+    ].items():
+        for occurrence in occurrences:
+            published_classes.setdefault(
+                str(occurrence), set()
+            ).add(str(role))
+
+    metadata = report.get("metadata")
+    occurrence_index = (
+        metadata.get("semantic_occurrence_index")
+        if isinstance(metadata, Mapping)
+        and isinstance(
+            metadata.get("semantic_occurrence_index"),
+            Mapping,
+        )
+        else {}
+    )
+    root_statuses_by_occurrence: Dict[str, Set[str]] = {}
+    for confirmation in _items(report.get("confirmations")):
+        occurrence = confirmation.get("semantic_occurrence_id")
+        if not isinstance(occurrence, str) or not occurrence:
+            occurrence = occurrence_index.get(
+                str(confirmation.get("candidate_ref") or "")
+            )
+        status = confirmation.get("status")
+        if (
+            isinstance(occurrence, str)
+            and occurrence
+            and isinstance(status, str)
+            and status
+        ):
+            root_statuses_by_occurrence.setdefault(
+                occurrence, set()
+            ).add(status)
+
+    predicted_class_by_occurrence: Dict[str, str] = {}
+    mismatches: List[JsonDict] = []
+    factor_fallbacks = factor_evaluation[
+        "predicted_class_by_expected_occurrence"
+    ]
+    for occurrence, expected_class in sorted(
+        expected_class_by_occurrence.items()
+    ):
+        explicit_classes = published_classes.get(occurrence, set())
+        if len(explicit_classes) == 1:
+            predicted_class = next(iter(explicit_classes))
+        elif len(explicit_classes) > 1:
+            predicted_class = "conflict"
+        elif expected_class == "root_cause":
+            root_statuses = root_statuses_by_occurrence.get(
+                occurrence, set()
+            )
+            if "unknown" in root_statuses:
+                predicted_class = "unknown"
+            elif "rejected" in root_statuses:
+                predicted_class = "rejected"
+            else:
+                predicted_class = "not_reviewed"
+        else:
+            predicted_class = str(
+                factor_fallbacks.get(occurrence, "not_reviewed")
+            )
+        predicted_class_by_occurrence[occurrence] = predicted_class
+        if predicted_class != expected_class:
+            mismatches.append(
+                {
+                    "semantic_occurrence_id": occurrence,
+                    "human_class": expected_class,
+                    "predicted_class": predicted_class,
+                }
+            )
+
+    expected_pairs = {
+        *(
+            ("root_cause", occurrence)
+            for occurrence in expected_root_occurrences
+        ),
+        *factor_evaluation["expected_pairs"],
+    }
+    predicted_pairs = {
+        *(
+            ("root_cause", occurrence)
+            for occurrence in predicted_root_occurrences
+        ),
+        *factor_evaluation["predicted_pairs"],
+    }
+    pair_union = expected_pairs | predicted_pairs
+    return {
+        "item_count": len(expected_class_by_occurrence),
+        "disagreement_count": len(mismatches),
+        "disagreement_rate": _safe_rate(
+            len(mismatches),
+            len(expected_class_by_occurrence),
+        ),
+        "pair_jaccard_distance": _safe_rate(
+            len(expected_pairs ^ predicted_pairs),
+            len(pair_union),
+        ),
+        "predicted_class_by_occurrence": (
+            predicted_class_by_occurrence
+        ),
+        "mismatches": mismatches,
+    }
+
+
 def _request_count(report: Optional[Mapping[str, Any]]) -> Optional[int]:
     if report is None:
         return None
@@ -302,6 +706,7 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
         "co_roots",
         "contributing_conditions",
         "amplifying_factors",
+        "downstream_materializations",
         "confirmations",
         "causal_relations",
         "step_judgments",
@@ -479,6 +884,24 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
                 valid_seed_bindings=seed_bindings,
                 label="report.investigation_journal[{0}]".format(index),
             )
+        if item.get("kind") == "candidate_cluster_manifest_shadow":
+            try:
+                validate_candidate_cluster_shadow_event(
+                    _json_compatible_value(item),
+                    expected_seed_binding_identity=str(
+                        item.get("seed_binding_identity") or ""
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise EvaluationSchemaError(
+                    "report.investigation_journal[{0}] candidate cluster "
+                    "shadow event is invalid: {1}".format(index, exc)
+                )
+            if item.get("seed_binding_identity") not in seed_bindings:
+                raise EvaluationSchemaError(
+                    "report.investigation_journal[{0}] candidate cluster "
+                    "shadow event has no report seed".format(index)
+                )
 
 
 def _validate_local_owner(
@@ -510,6 +933,17 @@ def _without_projection_fields(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [_without_projection_fields(item) for item in value]
+    return value
+
+
+def _json_compatible_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_compatible_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible_value(item) for item in value]
     return value
 
 
@@ -574,10 +1008,9 @@ def _validate_artifact(
         return ["artifact_absent_from_trace:{0}".format(normalized)]
     if owner_ref and owner_ref not in owners.get(normalized, set()):
         violations.append("artifact_owner_mismatch:{0}:{1}".format(normalized, owner_ref))
-    expected_hash = str(artifact.get("hash") or artifact.get("content_hash") or "").casefold()
-    if not SHA256_PATTERN.fullmatch(expected_hash):
-        violations.append("artifact_hash_not_canonical:{0}".format(normalized))
-        return violations
+    declared_hash = str(
+        artifact.get("hash") or artifact.get("content_hash") or ""
+    ).casefold()
     artifact_root = graph._artifact_root
     artifact_path = artifact.get("path")
     if artifact_root is None or not isinstance(artifact_path, str) or not artifact_path:
@@ -592,12 +1025,45 @@ def _validate_artifact(
         violations.append("artifact_content_unavailable:{0}".format(normalized))
         return violations
     actual_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+    if SHA256_PATTERN.fullmatch(declared_hash):
+        expected_hash = declared_hash
+    else:
+        bare_hash = declared_hash.removeprefix("sha256:")
+        if (
+            not re.fullmatch(r"[0-9a-f]{8,64}", bare_hash)
+            or len(bare_hash) == 64
+            and declared_hash.startswith("sha256:")
+        ):
+            violations.append(
+                "artifact_hash_not_canonical:{0}".format(normalized)
+            )
+            return violations
+        if not actual_hash.removeprefix("sha256:").startswith(bare_hash):
+            violations.append(
+                "artifact_hash_prefix_mismatch:{0}".format(normalized)
+            )
+            return violations
+        expected_hash = actual_hash
     if actual_hash != expected_hash:
         violations.append("artifact_content_hash_mismatch:{0}".format(normalized))
     if envelope is None:
         return violations
-    envelope_hash = str(envelope.get("content_hash") or envelope.get("hash") or "").casefold()
-    if envelope_hash and envelope_hash != actual_hash:
+    envelope_hash = str(
+        envelope.get("content_hash") or envelope.get("hash") or ""
+    ).casefold()
+    bare_envelope_hash = envelope_hash.removeprefix("sha256:")
+    envelope_hash_matches = (
+        not envelope_hash
+        or envelope_hash == actual_hash
+        or (
+            re.fullmatch(r"[0-9a-f]{8,63}", bare_envelope_hash)
+            is not None
+            and actual_hash.removeprefix("sha256:").startswith(
+                bare_envelope_hash
+            )
+        )
+    )
+    if not envelope_hash_matches:
         violations.append("artifact_envelope_hash_mismatch:{0}".format(normalized))
     raw_range = envelope.get("byte_range")
     if raw_range is None:
@@ -723,6 +1189,7 @@ def _rejected_snapshot_artifact_ids(
         "co_roots",
         "contributing_conditions",
         "amplifying_factors",
+        "downstream_materializations",
         "rejected_candidates",
     ):
         for item in report.get(section) or ():
@@ -755,6 +1222,7 @@ def _duplicate_full_identities(report: Mapping[str, Any]) -> List[str]:
         "co_roots",
         "contributing_conditions",
         "amplifying_factors",
+        "downstream_materializations",
         "confirmations",
     ):
         identities = [stable_json(item) for item in _items(report.get(section))]
@@ -856,13 +1324,31 @@ def _semantic_duplicate_identities(report: Mapping[str, Any]) -> List[str]:
             publication_identity(item)
             for item in _items(report.get("amplifying_factors"))
         ],
+        "materializations": [
+            publication_identity(
+                {
+                    **item,
+                    "confirmation": item.get("role_judgment"),
+                }
+            )
+            for item in _items(
+                report.get("downstream_materializations")
+            )
+        ],
     }
     for role, identities in role_occurrences.items():
         duplicates(role, identities)
     role_sets = {
         role: set(occurrences) for role, occurrences in role_occurrences.items()
     }
-    for left, right in (("roots", "conditions"), ("roots", "amplifiers"), ("conditions", "amplifiers")):
+    for left, right in (
+        ("roots", "conditions"),
+        ("roots", "amplifiers"),
+        ("roots", "materializations"),
+        ("conditions", "amplifiers"),
+        ("conditions", "materializations"),
+        ("amplifiers", "materializations"),
+    ):
         if role_sets[left].intersection(role_sets[right]):
             violations.append("semantic_identity_role_conflict:{0}:{1}".format(left, right))
     return violations
@@ -890,7 +1376,10 @@ def _source_trace_violations(
         if not isinstance(record, Mapping):
             continue
         for source_ref in record.get("source_refs") or []:
-            if not isinstance(source_ref, str) or graph.resolve(source_ref) is None:
+            if not isinstance(source_ref, str) or (
+                source_ref.startswith("record:")
+                and graph.resolve(source_ref) is None
+            ):
                 violations.append(
                     "source_trace_unresolved_source_ref:{0}".format(source_ref)
                 )
@@ -905,10 +1394,15 @@ def _source_trace_violations(
             edge_ids.append(edge_id)
         metadata = edge.get("metadata") if isinstance(edge.get("metadata"), Mapping) else {}
         eligible = edge.get("eligible_for_attribution") is not False and metadata.get("eligible_for_attribution") is not False
-        if eligible and (
-            resolve_edge_endpoint(edge.get("from"), graph.aliases) is None
-            or resolve_edge_endpoint(edge.get("to"), graph.aliases) is None
-        ):
+        unresolved_graph_endpoint = any(
+            (
+                isinstance(endpoint, Mapping)
+                and str(endpoint.get("type") or "") in {"node", "record"}
+                and resolve_edge_endpoint(endpoint, graph.aliases) is None
+            )
+            for endpoint in (edge.get("from"), edge.get("to"))
+        )
+        if eligible and unresolved_graph_endpoint:
             violations.append("source_trace_unresolved_attribution_edge:{0}".format(edge_id))
     if len(edge_ids) != len(set(edge_ids)):
         violations.append("source_trace_duplicate_edge_id")
@@ -954,8 +1448,14 @@ def _validate_candidate(
         violations.append("{0}_node_snapshot_missing:{1}".format(section, ref))
     else:
         base_payload = _source_node_payload(graph, ref)
+        sanitized_base_payload = _node_payload(
+            graph.sanitize_judge_node(graph.nodes[ref])
+        )
         source_node = graph.hydrate_node(ref)
         hydrated_payload = _node_payload(source_node)
+        sanitized_hydrated_payload = _node_payload(
+            graph.sanitize_judge_node(source_node)
+        )
         embedded_payload = dict(embedded)
         embedded_data = (
             dict(embedded_payload.get("data"))
@@ -974,14 +1474,22 @@ def _validate_candidate(
                 rejected_snapshot_artifact_ids
             )
         )
-        if audit_only_hydration:
+        empty_hydration_projection = (
+            embedded_data.get("hydrated_artifacts") == []
+        )
+        if audit_only_hydration or empty_hydration_projection:
             embedded_data.pop("hydrated_artifacts", None)
             embedded_payload["data"] = embedded_data
         if (
             embedded_payload
-            if audit_only_hydration
+            if audit_only_hydration or empty_hydration_projection
             else dict(embedded)
-        ) not in (base_payload, hydrated_payload):
+        ) not in (
+            base_payload,
+            sanitized_base_payload,
+            hydrated_payload,
+            sanitized_hydrated_payload,
+        ):
             violations.append("{0}_node_snapshot_mismatch:{1}".format(section, ref))
         hydrated = embedded.get("data", {}).get("hydrated_artifacts") if isinstance(embedded.get("data"), Mapping) else None
         for artifact in _items(hydrated):
@@ -1088,7 +1596,12 @@ def _validate_factored_item(
     *,
     role: str,
 ) -> List[str]:
-    ref = str(item.get("node_ref") or "")
+    ref = str(
+        item.get(
+            "candidate_ref" if role == "materialization" else "node_ref"
+        )
+        or ""
+    )
     violations = _validate_ref(graph, ref)
     if item.get("semantic_anchor_id") != anchors.get(ref):
         violations.append("{0}_anchor_mismatch:{1}".format(role, ref))
@@ -1100,20 +1613,32 @@ def _validate_factored_item(
     else:
         for evidence_ref in evidence:
             violations.extend(_validate_ref(graph, evidence_ref, owner_ref=ref))
-    if role in {"condition", "amplifier"}:
-        mechanism = item.get("mechanism")
+    if role in {"condition", "amplifier", "materialization"}:
+        mechanism = item.get(
+            "materialization_mechanism"
+            if role == "materialization"
+            else "mechanism"
+        )
         if not isinstance(mechanism, Mapping) or not mechanism:
             violations.append("{0}_mechanism_missing:{1}".format(role, ref))
         else:
             source_ref = str(mechanism.get("source_ref") or "")
             target_ref = str(mechanism.get("target_ref") or "")
-            expected_type = "enabling_condition" if role == "condition" else "amplification"
+            expected_type = {
+                "condition": "enabling_condition",
+                "amplifier": "amplification",
+                "materialization": "downstream_materialization",
+            }[role]
             if source_ref != ref:
                 violations.append("{0}_mechanism_source_mismatch:{1}".format(role, ref))
             violations.extend(_validate_ref(graph, source_ref))
             violations.extend(_validate_ref(graph, target_ref))
-            if not isinstance(path, list) or not path or target_ref != path[-1]:
-                violations.append("{0}_mechanism_target_mismatch:{1}".format(role, ref))
+            if not isinstance(path, list) or target_ref not in path[1:]:
+                violations.append(
+                    "{0}_mechanism_target_must_be_downstream:{1}".format(
+                        role, ref
+                    )
+                )
             if mechanism.get("mechanism_type") != expected_type or not mechanism.get("effect"):
                 violations.append("{0}_mechanism_semantics_invalid:{1}".format(role, ref))
     return violations
@@ -1123,6 +1648,8 @@ def _trace_backed_safety_violations(
     report: Mapping[str, Any],
     labels: Mapping[str, Any],
     graph: TraceGraph,
+    *,
+    action_records: Optional[Iterable[Any]] = None,
 ) -> Tuple[
     List[str],
     RecursiveAttributionReport,
@@ -1139,6 +1666,8 @@ def _trace_backed_safety_violations(
             graph,
             parsed,
             label="evaluator report",
+            action_records=action_records,
+            migration_decision=None,
         )
     except (TypeError, ValueError) as exc:
         raise EvaluationSafetyError(
@@ -1162,7 +1691,14 @@ def _trace_backed_safety_violations(
     if report.get("analysis_outcome") != parsed.analysis_outcome:
         violations.append("analysis_outcome_state_machine_mismatch")
     if parsed.analysis_outcome in {"inconclusive", "partial"}:
-        allowed = set(labels["allowed_unresolved_outcomes"])
+        if labels.get("schema_version") == V5_LABEL_SCHEMA_VERSION:
+            allowed = {
+                str(outcome)
+                for seed in labels["seeds"]
+                for outcome in seed["allowed_unresolved_outcomes"]
+            }
+        else:
+            allowed = set(labels["allowed_unresolved_outcomes"])
         if parsed.analysis_outcome == "partial" and "partial_root_found" in allowed:
             allowed.add("partial")
         if parsed.analysis_outcome not in allowed:
@@ -1177,43 +1713,80 @@ def _trace_backed_safety_violations(
         violations.append("fabricated_refs_present")
     anchors = semantic_anchor_index(graph.case_id, graph)
     occurrences = semantic_occurrence_index(graph.case_id, graph)
-    label_roles: Dict[str, str] = {}
-    for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
-        for label in labels[role]:
-            anchor = str(label["semantic_anchor_id"])
-            occurrence = str(label["semantic_occurrence_id"])
-            explicit_ref = label.get("node_ref")
-            if explicit_ref is None:
-                matching_refs = [
-                    ref
-                    for ref in graph.nodes
-                    if anchors.get(ref) == anchor and occurrences.get(ref) == occurrence
-                ]
-                if len(matching_refs) != 1:
-                    violations.append(
-                        "label_identity_{0}:{1}:{2}".format(
-                            "unresolved" if not matching_refs else "ambiguous",
-                            role,
-                            occurrence,
-                        )
+    label_roles: Dict[Tuple[str, str], str] = {}
+    if labels.get("schema_version") == V5_LABEL_SCHEMA_VERSION:
+        label_entries = [
+            (str(seed["seed_binding_identity"]), role, label)
+            for seed in labels["seeds"]
+            for role in (
+                "roots",
+                "conditions",
+                "amplifiers",
+                "materializations",
+                "unrelated",
+                "forbidden_roots",
+            )
+            for label in seed[role]
+        ]
+        label_entries.extend(
+            (str(seed_identity), str(factor["factor_role"]), factor)
+            for factor in labels["case_shared_factors"]
+            for seed_identity in factor["seed_binding_identities"]
+        )
+    else:
+        label_fields = [
+            "roots",
+            "conditions",
+            "amplifiers",
+            *(
+                ["materializations", "unrelated"]
+                if labels["schema_version"] == LABEL_SCHEMA_VERSION
+                else []
+            ),
+            "forbidden_roots",
+        ]
+        label_entries = [
+            ("legacy", role, label)
+            for role in label_fields
+            for label in labels[role]
+        ]
+    for seed_identity, role, label in label_entries:
+        anchor = str(label["semantic_anchor_id"])
+        occurrence = str(label["semantic_occurrence_id"])
+        explicit_ref = label.get("node_ref")
+        if explicit_ref is None:
+            matching_refs = [
+                ref
+                for ref in graph.nodes
+                if anchors.get(ref) == anchor and occurrences.get(ref) == occurrence
+            ]
+            if len(matching_refs) != 1:
+                violations.append(
+                    "label_identity_{0}:{1}:{2}".format(
+                        "unresolved" if not matching_refs else "ambiguous",
+                        role,
+                        occurrence,
                     )
-                    continue
-                ref = matching_refs[0]
-            else:
-                ref = str(explicit_ref)
-                violations.extend(_validate_ref(graph, ref))
-            if anchors.get(ref) != anchor:
-                violations.append("label_anchor_mismatch:{0}:{1}".format(role, ref))
-            if occurrences.get(ref) != occurrence:
-                violations.append("label_occurrence_mismatch:{0}:{1}".format(role, ref))
-            prior_role = label_roles.get(occurrence)
+                )
+                continue
+            ref = matching_refs[0]
+        else:
+            ref = str(explicit_ref)
+            violations.extend(_validate_ref(graph, ref))
+        if anchors.get(ref) != anchor:
+            violations.append("label_anchor_mismatch:{0}:{1}".format(role, ref))
+        if occurrences.get(ref) != occurrence:
+            violations.append("label_occurrence_mismatch:{0}:{1}".format(role, ref))
+        if role != "forbidden_roots":
+            role_key = (seed_identity, occurrence)
+            prior_role = label_roles.get(role_key)
             if prior_role is not None and prior_role != role:
                 violations.append(
                     "label_occurrence_identity_role_conflict:{0}:{1}:{2}".format(
                         occurrence, prior_role, role
                     )
                 )
-            label_roles[occurrence] = role
+            label_roles[role_key] = role
     reported_index = metadata.get("semantic_anchor_index")
     if not isinstance(reported_index, Mapping) or dict(reported_index) != anchors:
         violations.append("semantic_anchor_index_mismatch")
@@ -1252,6 +1825,7 @@ def _trace_backed_safety_violations(
         ("co_roots", "node_ref"),
         ("contributing_conditions", "node_ref"),
         ("amplifying_factors", "node_ref"),
+        ("downstream_materializations", "candidate_ref"),
         ("rejected_candidates", "node_ref"),
         ("root_causes", "node_ref"),
         ("confirmations", "candidate_ref"),
@@ -1263,7 +1837,12 @@ def _trace_backed_safety_violations(
             if item.get("semantic_occurrence_id") != occurrences.get(ref):
                 violations.append("{0}_occurrence_mismatch:{1}".format(section, ref))
             embedded = item.get("confirmation")
-            if isinstance(embedded, Mapping) and embedded.get("semantic_occurrence_id") != occurrences.get(ref):
+            if (
+                isinstance(embedded, Mapping)
+                and "confirmation_identity" in embedded
+                and embedded.get("semantic_occurrence_id")
+                != occurrences.get(ref)
+            ):
                 violations.append(
                     "{0}_confirmation_occurrence_mismatch:{1}".format(section, ref)
                 )
@@ -1320,6 +1899,25 @@ def _trace_backed_safety_violations(
     confirmation_by_identity = {
         str(item.get("confirmation_identity") or ""): item for item in confirmations
     }
+    for judgment in _items(metadata.get("factor_role_judgments")):
+        comparison_identity = confirmation_identity_for(
+            hypothesis_id=str(judgment.get("hypothesis_id") or ""),
+            hypothesis_semantic_hash=str(
+                judgment.get("hypothesis_semantic_hash") or ""
+            ),
+            candidate_ref=str(judgment.get("candidate_ref") or ""),
+            defect_fingerprint=str(
+                judgment.get("defect_fingerprint") or ""
+            ),
+            recursive_path=tuple(
+                str(item)
+                for item in judgment.get("recursive_path") or []
+            ),
+            seed_binding_identity=str(
+                judgment.get("seed_binding_identity") or ""
+            ),
+        )
+        confirmation_by_identity[comparison_identity] = judgment
     for confirmation in confirmations:
         violations.extend(
             _validate_confirmation(graph, confirmation, anchors, confirmation_by_identity)
@@ -1332,6 +1930,17 @@ def _trace_backed_safety_violations(
         violations.extend(_validate_factored_item(graph, factor, anchors, role="condition"))
     for factor in _items(report.get("amplifying_factors")):
         violations.extend(_validate_factored_item(graph, factor, anchors, role="amplifier"))
+    for materialization in _items(
+        report.get("downstream_materializations")
+    ):
+        violations.extend(
+            _validate_factored_item(
+                graph,
+                materialization,
+                anchors,
+                role="materialization",
+            )
+        )
     for rejected in _items(report.get("rejected_candidates")):
         ref = str(rejected.get("node_ref") or "")
         violations.extend(_validate_ref(graph, ref))
@@ -1349,7 +1958,14 @@ def _trace_backed_safety_violations(
             if branch.get("node_ref") == ref:
                 violations.append("unresolved_branch_promoted_to_root:{0}".format(ref))
 
-    forbidden = set(_label_occurrences(labels, "forbidden_roots"))
+    if labels.get("schema_version") == V5_LABEL_SCHEMA_VERSION:
+        forbidden = {
+            str(item["semantic_occurrence_id"])
+            for seed in labels["seeds"]
+            for item in seed["forbidden_roots"]
+        }
+    else:
+        forbidden = set(_label_occurrences(labels, "forbidden_roots"))
     for root in roots:
         if root.get("semantic_occurrence_id") in forbidden:
             violations.append("forbidden_root_confirmed:{0}".format(root.get("node_ref")))
@@ -1361,19 +1977,71 @@ def _trace_backed_safety_violations(
     return sorted(set(violations)), parsed, anchors, occurrences
 
 
+def compare_v5_report(
+    report: Mapping[str, Any],
+    labels: Mapping[str, Any],
+    *,
+    loaded_case: Any,
+    action_records: Optional[Iterable[Any]] = None,
+) -> JsonDict:
+    """Bind and score one v5 report without exposing labels to attribution."""
+
+    report = dict(_mapping(report, "report"))
+    labels = validate_bound_labels(labels)
+    if labels["schema_version"] != V5_LABEL_SCHEMA_VERSION:
+        raise EvaluationSchemaError("v5 comparison requires v5 labels")
+    _validate_report_shape(report, labels)
+    binding_arguments: JsonDict = {
+        "trace_bytes": loaded_case.trace_bytes,
+        "review_bytes": loaded_case.review_bytes,
+        "evaluation_bytes": loaded_case.evaluation_bytes,
+    }
+    if loaded_case.bundle is not None:
+        binding_arguments["bundle"] = loaded_case.bundle
+    else:
+        binding_arguments["effective_trace"] = loaded_case.effective_trace
+        binding_arguments["graph"] = loaded_case.graph
+    binding = bind_label_inputs(labels, **binding_arguments)
+    violations, _parsed, _anchors, _occurrences = (
+        _trace_backed_safety_violations(
+            report,
+            labels,
+            loaded_case.graph,
+            action_records=action_records,
+        )
+    )
+    if violations:
+        raise EvaluationSafetyError("; ".join(violations))
+    return score_seed_owned_report(
+        report,
+        labels,
+        bound_seed_binding_identities=(
+            seed.seed_binding_identity for seed in binding.seeds
+        ),
+        binding_safety_passed=True,
+        checkpoint_safety_passed=True,
+    ).to_dict()
+
+
 def compare_report(
     report: Mapping[str, Any],
     labels: Mapping[str, Any],
     legacy_report: Optional[Mapping[str, Any]] = None,
     *,
     graph: Optional[TraceGraph],
+    action_records: Optional[Iterable[Any]] = None,
 ) -> JsonDict:
     if graph is None:
         raise EvaluationSafetyError("acceptance_requires_source_trace")
     report = dict(_mapping(report, "report"))
     labels = validate_labels(labels)
     _validate_report_shape(report, labels)
-    violations, parsed, _, _ = _trace_backed_safety_violations(report, labels, graph)
+    violations, parsed, _, _ = _trace_backed_safety_violations(
+        report,
+        labels,
+        graph,
+        action_records=action_records,
+    )
     if violations:
         raise EvaluationSafetyError("; ".join(violations))
 
@@ -1440,30 +2108,13 @@ def compare_report(
     ]
     mean_path_length = round(sum(path_lengths) / len(path_lengths), 6) if path_lengths else 0.0
 
-    predicted_conditions = set(_occurrences(_items(report["contributing_conditions"])))
-    predicted_amplifiers = set(_occurrences(_items(report["amplifying_factors"])))
-    expected_conditions = set(_label_occurrences(labels, "conditions"))
-    expected_amplifiers = set(_label_occurrences(labels, "amplifiers"))
-    predicted_factors = {
-        *(('condition', item) for item in predicted_conditions),
-        *(('amplifier', item) for item in predicted_amplifiers),
-    }
-    expected_factors = {
-        *(('condition', item) for item in expected_conditions),
-        *(('amplifier', item) for item in expected_amplifiers),
-    }
-    factor_precision = _safe_rate(
-        len(predicted_factors & expected_factors),
-        len(predicted_factors),
-        empty=1.0 if not expected_factors else 0.0,
-    )
+    factor_evaluation = _factor_role_evaluation(report, labels)
 
     judgments = _items(report["step_judgments"])
     confirmations = _items(report["confirmations"])
-    semantic_decisions = len(judgments) + len(confirmations)
-    unknown_count = sum(
-        1 for item in judgments if item.get("current_defect_status") == "unknown"
-    ) + sum(1 for item in confirmations if item.get("status") == "unknown")
+    unknown_counts = _semantic_unknown_counts(report)
+    semantic_decisions = unknown_counts["semantic_decision_count"]
+    unknown_count = unknown_counts["unknown_decision_count"]
     rejected_count = sum(1 for item in confirmations if item.get("status") == "rejected")
 
     investigations = _items(report["investigation_journal"])
@@ -1485,28 +2136,21 @@ def compare_report(
 
     logical_calls = metadata_int(report, "logical_judge_call_count")
     reused_calls = metadata_int(report, "checkpoint_reused_judgment_count")
-    expected_role_pairs = {
-        *(('root', item) for item in expected_set),
-        *expected_factors,
-    }
-    predicted_role_pairs = {
-        *(('root', item) for item in predicted_set),
-        *predicted_factors,
-    }
+    disagreement_evaluation = _human_llm_disagreement_evaluation(
+        report,
+        labels,
+        expected_root_occurrences=expected_set,
+        predicted_root_occurrences=predicted_set,
+        factor_evaluation=factor_evaluation,
+    )
     disagreements = {
         "missing_expected_roots": sorted(expected_set - predicted_set),
         "unexpected_predicted_roots": sorted(predicted_set - expected_set),
-        "missing_expected_conditions": sorted(expected_conditions - predicted_conditions),
-        "unexpected_predicted_conditions": sorted(predicted_conditions - expected_conditions),
-        "missing_expected_amplifiers": sorted(expected_amplifiers - predicted_amplifiers),
-        "unexpected_predicted_amplifiers": sorted(predicted_amplifiers - expected_amplifiers),
+        **factor_evaluation["disagreements"],
+        "human_llm_item_mismatches": disagreement_evaluation[
+            "mismatches"
+        ],
     }
-    disagreement_denominator = len(expected_role_pairs | predicted_role_pairs)
-    disagreement_rate = _safe_rate(
-        len(expected_role_pairs ^ predicted_role_pairs),
-        disagreement_denominator,
-        empty=0.0,
-    )
     unresolved_hypotheses = len(report["unresolved_hypotheses"])
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
@@ -1525,14 +2169,32 @@ def compare_report(
             "judge_request_reduction": request_reduction,
             "request_ratio": request_ratio,
             "mean_causal_path_length": mean_path_length,
-            "factor_role_precision": factor_precision,
+            "factor_role_precision": factor_evaluation["precision"],
+            "factor_role_pair_precision": factor_evaluation[
+                "precision"
+            ],
+            "factor_role_pair_recall": factor_evaluation["recall"],
+            "factor_role_pair_f1": factor_evaluation["f1"],
             "unknown_rate": _safe_rate(unknown_count, semantic_decisions),
+            "necessity_unknown_rate": _safe_rate(
+                unknown_counts["necessity_unknown_count"],
+                unknown_counts["factor_necessity_decision_count"],
+            ),
+            "non_root_role_unknown_rate": _safe_rate(
+                unknown_counts["non_root_role_unknown_count"],
+                unknown_counts["non_root_role_decision_count"],
+            ),
             "confirmation_rejection_rate": _safe_rate(rejected_count, len(confirmations)),
             "investigation_yield": _safe_rate(
                 len(yielded_investigations), len(completed_investigations)
             ),
             "checkpoint_reuse_rate": _safe_rate(reused_calls, logical_calls),
-            "human_llm_disagreement_rate": disagreement_rate,
+            "human_llm_disagreement_rate": disagreement_evaluation[
+                "disagreement_rate"
+            ],
+            "root_and_factor_role_pair_jaccard_distance": (
+                disagreement_evaluation["pair_jaccard_distance"]
+            ),
         },
         "counts": {
             "expected_root_count": len(expected_set),
@@ -1544,6 +2206,33 @@ def compare_report(
             "causal_path_count": len(path_lengths),
             "unknown_decision_count": unknown_count,
             "semantic_decision_count": semantic_decisions,
+            "necessity_unknown_count": unknown_counts[
+                "necessity_unknown_count"
+            ],
+            "factor_necessity_decision_count": unknown_counts[
+                "factor_necessity_decision_count"
+            ],
+            "non_root_role_unknown_count": unknown_counts[
+                "non_root_role_unknown_count"
+            ],
+            "non_root_role_decision_count": unknown_counts[
+                "non_root_role_decision_count"
+            ],
+            "necessary_escalation_count": unknown_counts[
+                "necessary_escalation_count"
+            ],
+            "expected_factor_role_pair_count": len(
+                factor_evaluation["expected_pairs"]
+            ),
+            "predicted_factor_role_pair_count": len(
+                factor_evaluation["predicted_pairs"]
+            ),
+            "human_labeled_item_count": disagreement_evaluation[
+                "item_count"
+            ],
+            "human_llm_disagreement_count": (
+                disagreement_evaluation["disagreement_count"]
+            ),
             "confirmation_count": len(confirmations),
             "confirmation_rejection_count": rejected_count,
             "investigation_count": len(investigations),
@@ -1551,6 +2240,63 @@ def compare_report(
             "checkpoint_reused_judgment_count": reused_calls,
             "unresolved_hypothesis_count": unresolved_hypotheses,
         },
+        "metric_scope": {
+            "factor_roles": factor_evaluation["scope"],
+            "unknown_rate": {
+                "unit": "semantic_judgment",
+                "definition": (
+                    "step defect unknown, root confirmation unknown, "
+                    "factor necessity unknown, or eligible non-root role "
+                    "unknown"
+                ),
+                "necessary_unknown_role_treatment": (
+                    "escalation_signal_excluded_from_abstention"
+                ),
+            },
+            "human_llm_disagreement_rate": {
+                "unit": "semantic_occurrence",
+                "denominator": (
+                    "unique_human_labeled_semantic_occurrences"
+                ),
+                "definition": (
+                    "item-level inequality between each unique human "
+                    "class and its predicted class"
+                ),
+                "included_human_classes": [
+                    "root_cause",
+                    *factor_evaluation["scope"]["evaluated_roles"],
+                ],
+                "predicted_classes": [
+                    "root_cause",
+                    *FACTOR_ROLES,
+                    "unknown",
+                    "not_reviewed",
+                    "necessary_escalation",
+                    "rejected",
+                    "conflict",
+                ],
+                "factor_label_scope": factor_evaluation["scope"][
+                    "scope"
+                ],
+            },
+            "root_and_factor_role_pair_jaccard_distance": {
+                "unit": "semantic_occurrence_role_pair",
+                "denominator": (
+                    "union_of_expected_and_predicted_root_and_"
+                    "evaluated_factor_role_pairs"
+                ),
+                "definition": (
+                    "symmetric-difference size divided by union size"
+                ),
+                "included_roles": [
+                    "root_cause",
+                    *factor_evaluation["scope"]["evaluated_roles"],
+                ],
+            },
+        },
+        "factor_role_confusion_matrix": factor_evaluation[
+            "confusion_matrix"
+        ],
         "disagreements": disagreements,
         "safety": {
             "passed": True,
@@ -1559,6 +2305,87 @@ def compare_report(
             "duplicate_identity_count": 0,
         },
     }
+
+
+def _semantic_unknown_counts(
+    report: Mapping[str, Any],
+) -> Dict[str, int]:
+    judgments = _items(report.get("step_judgments"))
+    confirmations = _items(report.get("confirmations"))
+    metadata = report.get("metadata")
+    factor_judgments = _items(
+        metadata.get("factor_role_judgments")
+        if isinstance(metadata, Mapping)
+        else ()
+    )
+    step_unknown_count = sum(
+        1
+        for item in judgments
+        if item.get("current_defect_status") == "unknown"
+    )
+    confirmation_unknown_count = sum(
+        1
+        for item in confirmations
+        if item.get("status") == "unknown"
+    )
+    necessity_unknown_count = sum(
+        1
+        for item in factor_judgments
+        if item.get("necessity_status") == "unknown"
+    )
+    non_root_role_judgments = [
+        item
+        for item in factor_judgments
+        if item.get("necessity_status") != "necessary"
+    ]
+    non_root_role_unknown_count = sum(
+        1
+        for item in non_root_role_judgments
+        if item.get("factor_role") == "unknown"
+    )
+    factor_unknown_count = sum(
+        1
+        for item in factor_judgments
+        if item.get("necessity_status") == "unknown"
+        or (
+            item.get("necessity_status") != "necessary"
+            and item.get("factor_role") == "unknown"
+        )
+    )
+    return {
+        "semantic_decision_count": (
+            len(judgments)
+            + len(confirmations)
+            + len(factor_judgments)
+        ),
+        "unknown_decision_count": (
+            step_unknown_count
+            + confirmation_unknown_count
+            + factor_unknown_count
+        ),
+        "necessity_unknown_count": necessity_unknown_count,
+        "factor_necessity_decision_count": len(factor_judgments),
+        "non_root_role_unknown_count": non_root_role_unknown_count,
+        "non_root_role_decision_count": len(
+            non_root_role_judgments
+        ),
+        "necessary_escalation_count": sum(
+            1
+            for item in factor_judgments
+            if item.get("necessity_status") == "necessary"
+            and item.get("factor_role") == "unknown"
+        ),
+    }
+
+
+def _semantic_decision_counts(
+    report: Mapping[str, Any],
+) -> Tuple[int, int]:
+    counts = _semantic_unknown_counts(report)
+    return (
+        counts["semantic_decision_count"],
+        counts["unknown_decision_count"],
+    )
 
 
 def metadata_int(report: Mapping[str, Any], key: str) -> int:
@@ -1571,10 +2398,19 @@ def metadata_int(report: Mapping[str, Any], key: str) -> int:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--trace")
+    source.add_argument("--benchmark-bundle", default="")
+    parser.add_argument("--review", default="")
+    parser.add_argument("--evaluation", action="append", default=[])
     parser.add_argument("--report", required=True)
-    parser.add_argument("--labels", required=True)
+    parser.add_argument("--labels", default="")
     parser.add_argument("--legacy-report", default="")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="",
+        help="Validated recursive checkpoint containing committed action facts.",
+    )
     parser.add_argument("--out", required=True)
     return parser.parse_args(argv)
 
@@ -1584,16 +2420,47 @@ def _read_json(path: str) -> JsonDict:
     return dict(_mapping(value, path))
 
 
+def _read_checkpoint_actions(path: str) -> Tuple[JsonDict, ...]:
+    state = CheckpointBundle(Path(path)).restore()
+    return state.actions
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        graph = TraceGraph.from_file(Path(args.trace))
-        result = compare_report(
-            _read_json(args.report),
-            _read_json(args.labels),
-            _read_json(args.legacy_report) if args.legacy_report else None,
-            graph=graph,
+        loaded_case = load_benchmark_case(
+            bundle_path=(
+                Path(args.benchmark_bundle) if args.benchmark_bundle else None
+            ),
+            trace_path=Path(args.trace) if args.trace else None,
+            review_path=Path(args.review) if args.review else None,
+            evaluation_paths=tuple(Path(path) for path in args.evaluation),
+            labels_path=Path(args.labels) if args.labels else None,
+            role="evaluation",
         )
+        labels = json.loads(loaded_case.labels_bytes)
+        action_records = (
+            _read_checkpoint_actions(args.checkpoint_dir)
+            if args.checkpoint_dir
+            else None
+        )
+        label_value = dict(_mapping(labels, "labels"))
+        report_value = _read_json(args.report)
+        if label_value.get("schema_version") == V5_LABEL_SCHEMA_VERSION:
+            result = compare_v5_report(
+                report_value,
+                label_value,
+                loaded_case=loaded_case,
+                action_records=action_records,
+            )
+        else:
+            result = compare_report(
+                report_value,
+                label_value,
+                _read_json(args.legacy_report) if args.legacy_report else None,
+                graph=loaded_case.graph,
+                action_records=action_records,
+            )
     except (EvaluationSchemaError, EvaluationSafetyError, OSError, ValueError, json.JSONDecodeError) as exc:
         print("recursive attribution evaluation failed: {0}".format(exc), file=sys.stderr)
         return 2

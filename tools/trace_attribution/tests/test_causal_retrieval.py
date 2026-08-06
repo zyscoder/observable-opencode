@@ -11,11 +11,15 @@ from trace_attribution.causal_retrieval import (
     SemanticPredecessorRetriever,
     authored_root_candidate_eligible,
     global_authored_root_candidate_eligible,
+    non_root_factor_candidate_eligible,
     root_candidate_eligible,
 )
 from trace_attribution.evaluation_facts import inject_external_evaluation_facts
 from trace_attribution.graph import TraceGraph
-from trace_attribution.judgment_context import build_recursive_judgment_context
+from trace_attribution.judgment_context import (
+    build_recursive_judgment_context,
+    candidate_commitment_cue_context,
+)
 
 
 def sample_defect_state():
@@ -477,6 +481,38 @@ class CausalRetrievalTest(unittest.TestCase):
                     )
                 )
 
+    def test_agent_lifecycle_is_never_an_authored_root_but_remains_a_factor(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "agent-lifecycle-root-exclusion",
+                "records": [
+                    {
+                        "record_id": "candidate",
+                        "component": "agent.lifecycle",
+                        "event_type": "agent.lifecycle",
+                        "status": "cancelled",
+                        "data": {
+                            "phase": "turn.started",
+                            "finalized_without_close": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertFalse(root_candidate_eligible(graph.nodes["record:candidate"]))
+        self.assertFalse(
+            authored_root_candidate_eligible(graph, "record:candidate")
+        )
+        self.assertFalse(
+            global_authored_root_candidate_eligible(
+                graph, "record:candidate"
+            )
+        )
+        self.assertTrue(
+            non_root_factor_candidate_eligible(graph, "record:candidate")
+        )
+
     def test_change_is_only_a_fallback_root_when_no_authored_producer_exists(self):
         graph = TraceGraph.from_trace(
             {
@@ -670,6 +706,42 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertTrue(edge["eligible_for_attribution"])
         self.assertEqual(graph.upstream_refs("record:progress"), ["record:decision"])
 
+    def test_process_lifecycle_edge_is_fact_grounded_not_semantic_ranking(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "process-lifecycle-edge",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "I will implement the repair."},
+                    },
+                    {
+                        "record_id": "observed",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "data": {"actual": "No repair was delivered."},
+                    },
+                ],
+            }
+        )
+
+        graph.add_offline_process_lifecycle_edge(
+            "record:decision",
+            "record:observed",
+            evidence_refs=["record:decision", "record:observed"],
+        )
+
+        edge = graph.edge_context("record:decision", "record:observed")[0]
+        self.assertEqual(edge["relation"], "process_lifecycle_observed")
+        self.assertEqual(edge["evidence_type"], "offline_reconstruction")
+        self.assertEqual(
+            edge["inference_method"],
+            "candidate_process_trajectory_v1",
+        )
+        self.assertNotEqual(edge["evidence_type"], "semantic_inferred")
+
     def test_progress_shortlist_recovers_older_semantically_relevant_delivery(self):
         records = []
         for index in range(1, 8):
@@ -760,6 +832,181 @@ class CausalRetrievalTest(unittest.TestCase):
         self.assertEqual(by_ref["record:reason_1"].source, "progress_window")
         self.assertLessEqual(len(candidates), 8)
         self.assertTrue(all(item.source == "progress_window" for item in candidates))
+
+    def test_judgment_context_binds_post_candidate_no_delivery_trajectory(self):
+        records = []
+        for index in range(4):
+            records.extend(
+                [
+                    {
+                        "record_id": "reason_{0}".format(index),
+                        "component": "processor",
+                        "event_type": "decision",
+                        "timestamp": "2026-08-03T10:00:{0:02d}.000Z".format(index * 2),
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": (
+                                "I will implement the required parser methods now."
+                                if index == 0
+                                else "Continue searching for another reference implementation."
+                            ),
+                            "metadata": {
+                                "sessionID": "ses_process_trajectory",
+                                "messageID": "msg_{0}".format(index),
+                            },
+                        },
+                    },
+                    {
+                        "record_id": "read_{0}".format(index),
+                        "component": "processor",
+                        "event_type": "decision",
+                        "timestamp": "2026-08-03T10:00:{0:02d}.500Z".format(index * 2),
+                        "data": {
+                            "decision_type": "llm_tool_call",
+                            "chosen_action": "read",
+                            "rationale": "Read another reference file.",
+                            "metadata": {
+                                "sessionID": "ses_process_trajectory",
+                                "messageID": "msg_{0}".format(index),
+                            },
+                        },
+                    },
+                ]
+            )
+        graph = TraceGraph.from_trace(
+            {"case_id": "candidate-process-trajectory", "records": records}
+        )
+        latest = max(
+            (
+                node
+                for node in graph.nodes.values()
+                if node.event_type == "progress.episode"
+            ),
+            key=lambda node: int(node.data.get("chronology_index") or 0),
+        )
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "candidate-process-trajectory",
+                "records": [
+                    *records,
+                    {
+                        "record_id": "observed",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "source_refs": [latest.ref],
+                        "data": {"defect_type": "repair_not_completed"},
+                    },
+                ],
+            }
+        )
+        latest = max(
+            (
+                node
+                for node in graph.nodes.values()
+                if node.event_type == "progress.episode"
+            ),
+            key=lambda node: int(node.data.get("chronology_index") or 0),
+        )
+        defect = sample_defect_state()
+
+        context = build_recursive_judgment_context(
+            graph=graph,
+            node_ref="record:reason_0",
+            defect_state=defect,
+            hypothesis=sample_hypothesis(defect),
+            candidates=[],
+            downstream_path=[
+                "record:reason_0",
+                latest.ref,
+                "record:observed",
+            ],
+        )
+
+        trajectory = context["candidate_process_trajectory"]
+        self.assertEqual(trajectory["candidate_ref"], "record:reason_0")
+        self.assertEqual(trajectory["post_candidate_episode_count"], 4)
+        self.assertEqual(
+            trajectory["post_candidate_no_delivery_episode_count"], 4
+        )
+        self.assertEqual(trajectory["post_candidate_mutation_count"], 0)
+        self.assertEqual(trajectory["post_candidate_verification_count"], 0)
+        self.assertFalse(trajectory["post_candidate_delivery_observed"])
+        self.assertTrue(trajectory["episode_summaries_truncated"])
+        cues = context["candidate_commitment_cues"]
+        self.assertEqual(cues["candidate_ref"], "record:reason_0")
+        self.assertEqual(cues["cue_count"], 1)
+        self.assertEqual(
+            cues["cues"][0]["cue_type"],
+            "explicit_forward_action_language",
+        )
+        self.assertIn(
+            "I will implement the required parser methods now.",
+            cues["cues"][0]["verbatim_excerpt"],
+        )
+        self.assertEqual(
+            cues["cues"][0]["semantic_status"],
+            "candidate_cue_not_a_commitment_verdict",
+        )
+
+        collapsed_context = build_recursive_judgment_context(
+            graph=graph,
+            node_ref="record:reason_0",
+            defect_state=defect,
+            hypothesis=sample_hypothesis(defect),
+            candidates=[],
+            downstream_path=[
+                "record:reason_0",
+                "record:observed",
+            ],
+        )
+        self.assertEqual(
+            collapsed_context["candidate_process_trajectory"][
+                "post_candidate_episode_count"
+            ],
+            4,
+        )
+
+    def test_tool_call_does_not_reattribute_inherited_reasoning_commitment(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "inherited-reasoning-commitment",
+                "records": [
+                    {
+                        "record_id": "reason",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": "I will implement the parser methods now.",
+                        },
+                    },
+                    {
+                        "record_id": "tool_call",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "source_refs": ["record:reason"],
+                        "data": {
+                            "decision_type": "llm_tool_call",
+                            "chosen_action": "read",
+                            "rationale": {
+                                "preview": (
+                                    '{"tool":"read","recent_reasoning":'
+                                    '"I will implement the parser methods now."}'
+                                )
+                            },
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            candidate_commitment_cue_context(
+                graph=graph,
+                current_ref="record:tool_call",
+            ),
+            {},
+        )
 
     def test_grounding_candidates_are_not_promoted_to_causal_predecessors(self):
         graph = TraceGraph.from_trace(

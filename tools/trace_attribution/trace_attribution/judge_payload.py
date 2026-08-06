@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
 from .models import stable_json
 
 
+HISTORICAL_LINEAGE_REFERENCE_KEYS = frozenset(
+    {
+        "superseded_evidence_refs",
+        "supersedes_refs",
+        "verification_superseded_by_refs",
+        "verification_supersedes_refs",
+    }
+)
 AUDIT_ONLY_KEYS = frozenset(
     {
+        *HISTORICAL_LINEAGE_REFERENCE_KEYS,
         "integrity_failures",
         "missing_artifact_ids",
         "missing_artifacts",
@@ -29,6 +39,7 @@ REFERENCE_LIST_KEYS = frozenset(
         "artifact_refs",
         "candidate_evidence_refs",
         "candidate_member_refs",
+        "changed_production_refs",
         "checked_evidence_refs",
         "decisive_evidence_refs",
         "delivery_history_candidate_member_refs",
@@ -46,6 +57,7 @@ REFERENCE_LIST_KEYS = frozenset(
         "retrieval_candidate_member_refs",
         "source_refs",
         "start_refs",
+        "verification_refs",
     }
 )
 REFERENCE_SCALAR_KEYS = frozenset(
@@ -53,8 +65,10 @@ REFERENCE_SCALAR_KEYS = frozenset(
         "anchor_ref",
         "artifact_id",
         "candidate_ref",
+        "candidate_episode_ref",
         "canonical_ref",
         "citation_ref",
+        "episode_ref",
         "from_ref",
         "intervention_ref",
         "node_ref",
@@ -65,6 +79,7 @@ REFERENCE_SCALAR_KEYS = frozenset(
         "source_ref",
         "target_ref",
         "to_ref",
+        "window_anchor_ref",
     }
 )
 ASSOCIATED_FACT_TOKENS = frozenset(
@@ -141,6 +156,222 @@ REFERENCE_ENVELOPE_KEYS = frozenset(
     }
 )
 ALLOWED_OWNER_PROVENANCE = frozenset({"inferred", "reconstructed", "recorded"})
+ATTRIBUTION_VERDICT_KEYS = frozenset(
+    {
+        "active_role_binding",
+        "attribution_verdict",
+        "causal_role",
+        "factor_role",
+        "factor_role_verdict",
+        "factor_verdict",
+        "is_causal_factor",
+        "is_root_cause",
+        "root_cause_verdict",
+        "root_verdict",
+    }
+)
+ATTRIBUTION_VERDICT_CONTAINER_KEYS = frozenset(
+    {
+        "attribution_decision",
+        "attribution_result",
+        "prior_attribution",
+        "prior_attribution_verdict",
+        "prior_verdict",
+    }
+)
+EMPTY_FACT_CONTAINER_KEYS = frozenset(
+    {"content", "data", "metadata", "payload"}
+)
+ANALYSIS_CONTROL_SCHEMA_FAMILIES = (
+    "causal-judgment",
+    "global-candidate-judgment",
+    "global-candidate-validation-envelope",
+    "factor-role-judgment",
+    "causal-root-confirmation",
+    "root-confirmation",
+    "recursive-root-confirmation",
+    "independent-factor-role",
+    "candidate-cluster-triage-page-response",
+    "candidate-cluster-triage-page-judgment",
+)
+MAX_ANALYSIS_CONTROL_DEPTH = 64
+MAX_ANALYSIS_CONTROL_NODES = 20000
+MAX_ANALYSIS_CONTROL_JSON_DECODES = 4
+
+
+def _normalized_control_key(value: Any) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize(
+            "NFKC", str(value)
+        ).casefold()
+        if character.isalnum()
+    )
+
+
+_NORMALIZED_ATTRIBUTION_VERDICT_KEYS = frozenset(
+    _normalized_control_key(key)
+    for key in (
+        *ATTRIBUTION_VERDICT_KEYS,
+        *ATTRIBUTION_VERDICT_CONTAINER_KEYS,
+    )
+)
+
+_NORMALIZED_ANALYSIS_CONTROL_SCHEMA_FAMILIES = tuple(
+    _normalized_control_key(family)
+    for family in ANALYSIS_CONTROL_SCHEMA_FAMILIES
+)
+
+
+def is_analysis_control_schema(value: Any) -> bool:
+    """Return whether a versioned schema belongs to a Judge control family."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = _normalized_control_key(value)
+    for family in _NORMALIZED_ANALYSIS_CONTROL_SCHEMA_FAMILIES:
+        if not normalized.startswith(family):
+            continue
+        version = normalized[len(family) :]
+        if len(version) >= 2 and version[0] == "v" and version[1].isdigit():
+            return True
+    return False
+
+
+def _decode_analysis_control_json(value: str) -> Any:
+    candidate = value
+    for _ in range(MAX_ANALYSIS_CONTROL_JSON_DECODES):
+        stripped = candidate.strip()
+        if not stripped.startswith(("{", "[", '"')):
+            return None
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(decoded, (Mapping, list)):
+            return decoded
+        if not isinstance(decoded, str):
+            return None
+        candidate = decoded
+    if candidate.strip().startswith(("{", "[", '"')):
+        raise ValueError("Judge facts exceed bounded JSON encoding depth")
+    return None
+
+
+def reject_analysis_control_envelopes(value: Any) -> None:
+    """Reject source-provided Judge verdict envelopes on every input surface."""
+
+    ancestors = set()
+    node_count = 0
+
+    def visit(item: Any, depth: int) -> None:
+        nonlocal node_count
+        node_count += 1
+        if (
+            depth > MAX_ANALYSIS_CONTROL_DEPTH
+            or node_count > MAX_ANALYSIS_CONTROL_NODES
+        ):
+            raise ValueError("Judge facts exceed bounded depth or complexity")
+        if isinstance(item, str):
+            decoded = _decode_analysis_control_json(item)
+            if decoded is not None:
+                visit(decoded, depth + 1)
+            return
+        if not isinstance(item, (Mapping, list, tuple)):
+            return
+        item_id = id(item)
+        if item_id in ancestors:
+            raise ValueError(
+                "Judge facts cannot contain recursive containers"
+            )
+        ancestors.add(item_id)
+        try:
+            if isinstance(item, Mapping):
+                for raw_key, child in item.items():
+                    normalized_key = _normalized_control_key(raw_key)
+                    if normalized_key in {
+                        "analysiscontrol",
+                        "analysiscontrolschema",
+                    }:
+                        raise ValueError(
+                            "Judge facts contain an analysis-control envelope"
+                        )
+                    if (
+                        normalized_key in {"schema", "schemaversion"}
+                        and is_analysis_control_schema(child)
+                    ):
+                        raise ValueError(
+                            "Judge facts contain an analysis-control schema"
+                        )
+                    if (
+                        normalized_key == "provenanceclass"
+                        and _normalized_control_key(child)
+                        == "analysiscontrol"
+                    ):
+                        raise ValueError(
+                            "Judge facts contain an analysis-control envelope"
+                        )
+                    visit(child, depth + 1)
+            else:
+                for child in item:
+                    visit(child, depth + 1)
+        finally:
+            ancestors.remove(item_id)
+
+    visit(value, 0)
+
+
+def scrub_attribution_verdicts(value: Any) -> Any:
+    """Remove source-untrusted prior attribution conclusions recursively."""
+
+    omitted = object()
+
+    def scrub(item: Any, parent_key: str = "") -> tuple[Any, bool]:
+        if isinstance(item, Mapping):
+            output = {}
+            removed = False
+            for raw_key, child in item.items():
+                key = str(raw_key)
+                if _normalized_control_key(
+                    key
+                ) in _NORMALIZED_ATTRIBUTION_VERDICT_KEYS:
+                    removed = True
+                    continue
+                cleaned, child_removed = scrub(child, key)
+                removed = removed or child_removed
+                if cleaned is not omitted:
+                    output[raw_key] = cleaned
+            if not output and removed:
+                if parent_key in EMPTY_FACT_CONTAINER_KEYS:
+                    return {}, True
+                return omitted, True
+            return output, removed
+
+        if isinstance(item, (list, tuple)):
+            output = []
+            removed = False
+            for child in item:
+                cleaned, child_removed = scrub(child, parent_key)
+                removed = removed or child_removed
+                if cleaned is not omitted:
+                    output.append(cleaned)
+            return output, removed
+
+        if isinstance(item, str):
+            stripped = item.strip()
+            if stripped.startswith(("{", "[")):
+                try:
+                    decoded = json.loads(item)
+                except json.JSONDecodeError:
+                    return item, False
+                cleaned, removed = scrub(decoded, parent_key)
+                if cleaned is omitted:
+                    return omitted, removed
+                return stable_json(cleaned), removed
+        return item, False
+
+    cleaned, _ = scrub(value)
+    return {} if cleaned is omitted else cleaned
 
 
 def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
@@ -150,6 +381,7 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
     unit, and recursively sanitizes JSON encoded inside string fields.
     """
 
+    value = scrub_attribution_verdicts(value)
     omitted = object()
 
     def key_tokens(value: str) -> set[str]:
@@ -531,6 +763,12 @@ def sanitize_judge_visible_payload(graph: Any, value: Any) -> Any:
 
 
 __all__ = [
+    "ANALYSIS_CONTROL_SCHEMA_FAMILIES",
+    "ATTRIBUTION_VERDICT_KEYS",
     "AUDIT_ONLY_KEYS",
+    "HISTORICAL_LINEAGE_REFERENCE_KEYS",
+    "is_analysis_control_schema",
+    "reject_analysis_control_envelopes",
     "sanitize_judge_visible_payload",
+    "scrub_attribution_verdicts",
 ]

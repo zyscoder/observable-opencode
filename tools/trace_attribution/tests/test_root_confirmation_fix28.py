@@ -71,7 +71,7 @@ class FullFactualConfirmationRequestIdentityTest(unittest.TestCase):
         )
         request = judge.confirmation_requests[0]
         base_identity = _confirmation_request_identity(request)
-        self.assertTrue(base_identity.startswith("confirmation_request:v3:"))
+        self.assertTrue(base_identity.startswith("confirmation_request:v4:"))
 
         mutations = {
             "defect": replace(

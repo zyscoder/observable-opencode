@@ -10,13 +10,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trace_attribution.cache import JudgmentCache
+from trace_attribution.candidate_budget import select_global_candidates
 from trace_attribution.causal_judge import (
     BoundedJudgeCallResult,
     BoundedJudgeCallError,
     BoundedJudgeCapability,
     ClaudeCausalJudge,
+    FactorRoleJudgment,
     OfflineCausalJudgeAdapter,
     OfflineJudgeCapability,
+    factor_role_request_identity,
 )
 from trace_attribution.causal_state import (
     CausalCandidate,
@@ -31,6 +34,10 @@ from trace_attribution.causal_state import (
     confirmation_identity_for,
     confirmation_response_identity_for,
     semantic_visit_key,
+)
+from trace_attribution.checkpoint import (
+    LegacyProjectionNotRequired,
+    LegacyProjectionRequired,
 )
 from trace_attribution.errors import (
     JudgeProviderUnavailable,
@@ -54,7 +61,10 @@ from trace_attribution.recursive_analyzer import (
     RecursiveAnalysisState,
     _assert_report_grounded_evidence,
     _grounded_downstream_path,
+    _validate_global_pass_derivations,
+    classify_legacy_projection_shape,
 )
+from trace_attribution import recursive_analyzer as recursive_analyzer_module
 
 
 def observed_trace(*, branching: bool = False, artifact_content: str = "") -> dict:
@@ -277,9 +287,14 @@ def forge_published_root_identity(report_payload: dict, ghost_ref: str) -> None:
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["counterfactual"] = confirmation["counterfactual"]
     root["confirmation"] = copy.deepcopy(confirmation)
+    active_role_binding = copy.deepcopy(
+        root["provenance"]["active_role_binding"]
+    )
+    active_role_binding["candidate_ref"] = ghost_ref
     root["provenance"] = canonical_confirmation_publication_provenance(
         RootConfirmation.from_dict(confirmation)
     )
+    root["provenance"]["active_role_binding"] = active_role_binding
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed = report_payload["seed_results"][0]
     seed["confirmed_root_refs"] = [ghost_ref]
@@ -301,9 +316,13 @@ def forge_published_root_path(report_payload: dict, recursive_path: list[str]) -
     root = report_payload["confirmed_roots"][0]
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
+    active_role_binding = copy.deepcopy(
+        root["provenance"]["active_role_binding"]
+    )
     root["provenance"] = canonical_confirmation_publication_provenance(
         RootConfirmation.from_dict(confirmation)
     )
+    root["provenance"]["active_role_binding"] = active_role_binding
     report_payload["seed_results"][0]["confirmation_identities"] = [
         confirmation["confirmation_identity"]
     ]
@@ -336,10 +355,12 @@ class ScriptedCausalJudge(OfflineJudgeCapability):
 
 
 class ConfirmingScriptedJudge(ScriptedCausalJudge):
-    def __init__(self, script, confirmations):
+    def __init__(self, script, confirmations, *, factor_roles=None):
         super().__init__(script)
         self.confirmations = dict(confirmations)
         self.confirmation_requests = []
+        self.factor_roles = dict(factor_roles or {})
+        self.factor_requests = []
 
     def confirm_candidate(self, request):
         self.confirmation_requests.append(request)
@@ -353,6 +374,9 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
                         "hypothesis_semantic_hash": item["hypothesis_semantic_hash"],
                         "candidate_ref": item["candidate_reference"]["resolved_ref"],
                         "defect_fingerprint": item["active_defect"]["fingerprint"],
+                        "seed_binding_identity": (
+                            request.seed_binding_identity
+                        ),
                         "confirmation_identity": item["confirmation_identity"],
                         "recursive_path": list(item["recursive_path"]),
                         "requires_independent_confirmation": item[
@@ -407,6 +431,64 @@ class ConfirmingScriptedJudge(ScriptedCausalJudge):
             )
         return result
 
+    def judge_factor_role(self, request):
+        self.factor_requests.append(request)
+        role = str(
+            self.factor_roles.get(request.candidate_ref) or "unknown"
+        )
+        necessity_status = (
+            "unknown" if role == "unknown" else "not_necessary"
+        )
+        mechanism_type = {
+            "contributing_condition": "enabling_condition",
+            "amplifying_factor": "amplification",
+            "downstream_materialization": "downstream_materialization",
+        }.get(role)
+        mechanism = (
+            {
+                "schema": "factor-role-mechanism/v1",
+                "mechanism_type": mechanism_type,
+                "source_ref": request.candidate_ref,
+                "target_ref": request.recursive_path[-1],
+                "effect": "Scripted independent factor-role effect.",
+            }
+            if mechanism_type is not None
+            else {}
+        )
+        predicted_effect = {
+            "contributing_condition": "reduces_defect_likelihood",
+            "amplifying_factor": "reduces_defect_severity",
+            "downstream_materialization": (
+                "defect_still_present_without_materialization"
+            ),
+            "unrelated": "no_grounded_causal_influence_established",
+            "unknown": "insufficient_grounded_evidence",
+        }[role]
+        return FactorRoleJudgment(
+            candidate_ref=request.candidate_ref,
+            necessity_status=necessity_status,
+            factor_role=role,
+            reason="Scripted independent {0} judgment.".format(role),
+            confidence=0.0 if role == "unknown" else 0.85,
+            evidence_refs=(request.candidate_ref,),
+            recursive_path=request.recursive_path,
+            factor_mechanism=mechanism,
+            counterfactual={
+                "schema": "factor-role-counterfactual/v1",
+                "intervention_ref": request.candidate_ref,
+                "intervention_kind": (
+                    "replace_with_semantically_correct_behavior"
+                ),
+                "predicted_effect": predicted_effect,
+            },
+            hypothesis_id=request.hypothesis_id,
+            hypothesis_semantic_hash=request.hypothesis_semantic_hash,
+            defect_fingerprint=request.defect_state.fingerprint,
+            seed_binding_identity=request.seed_binding_identity,
+            analysis_perspective=request.analysis_perspective,
+            request_identity=factor_role_request_identity(request),
+        )
+
 
 class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
     def __init__(
@@ -416,11 +498,20 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
         script=None,
         confirmations=None,
         selected_candidate_refs=None,
+        global_non_root_roles=None,
+        factor_roles=None,
     ):
-        super().__init__(script or {}, confirmations or {})
+        super().__init__(
+            script or {},
+            confirmations or {},
+            factor_roles=factor_roles,
+        )
         self.global_outcome = global_outcome
         self.global_requests = []
         self.selected_candidate_refs = tuple(selected_candidate_refs or ())
+        self.global_non_root_roles = dict(
+            global_non_root_roles or {}
+        )
 
     def judge_candidates_bounded(self, request, *, max_physical_requests):
         self.global_requests.append(request)
@@ -436,6 +527,24 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                 capsule.candidate_ref
                 in request.open_authored_root_candidate_refs
             )
+            non_root_role = self.global_non_root_roles.get(
+                capsule.candidate_ref
+            )
+            is_non_root = non_root_role is not None and not is_selected
+            non_root_present = non_root_role in {
+                "contributing_condition",
+                "amplifying_factor",
+                "outcome_evidence",
+            }
+            input_status = (
+                "present"
+                if non_root_role == "outcome_evidence"
+                else (
+                    "unknown"
+                    if non_root_present
+                    else "absent"
+                )
+            )
             assessments.append(
                 GlobalCandidateAssessment(
                     candidate_ref=capsule.candidate_ref,
@@ -443,39 +552,73 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                         "present"
                         if is_selected
                         else (
-                            "unknown"
-                            if self.global_outcome in {"needs_expansion", "inconclusive"}
-                            else "absent"
+                            "present"
+                            if is_non_root and non_root_present
+                            else (
+                                "absent"
+                                if is_non_root
+                                else (
+                                    "unknown"
+                                    if self.global_outcome
+                                    in {"needs_expansion", "inconclusive"}
+                                    else "absent"
+                                )
+                            )
                         )
                     ),
                     input_defect_status=(
                         "absent"
                         if is_selected or is_open
-                        else "unknown"
+                        else (
+                            input_status
+                            if is_non_root
+                            else "unknown"
+                        )
                     ),
                     output_defect_status=(
                         "present"
                         if is_selected
                         else (
-                            "unknown"
-                            if self.global_outcome in {"needs_expansion", "inconclusive"}
-                            else "absent"
+                            "present"
+                            if is_non_root and non_root_present
+                            else (
+                                "absent"
+                                if is_non_root
+                                else (
+                                    "unknown"
+                                    if self.global_outcome
+                                    in {"needs_expansion", "inconclusive"}
+                                    else "absent"
+                                )
+                            )
                         )
                     ),
                     causal_path_refs=(
                         tuple(capsule.downstream_path)
-                        if is_selected or is_open
+                        if is_selected or is_open or is_non_root
                         else ()
                     ),
                     counterfactual={
                         "intervention_ref": capsule.candidate_ref,
                         "intervention_kind": "replace_with_semantically_correct_behavior",
                         "predicted_defect_status": (
-                            "absent" if is_selected else "present"
+                            "absent"
+                            if is_selected
+                            or non_root_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "present"
                         ),
                         "causal_effect": (
                             "prevents_defect"
                             if is_selected
+                            or non_root_role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
                             else "does_not_prevent_defect"
                         ),
                     },
@@ -484,10 +627,77 @@ class FusionScriptedJudge(ConfirmingScriptedJudge, GlobalJudgeCapability):
                         "root_candidate"
                         if is_selected
                         else (
-                            "unknown"
-                            if self.global_outcome in {"needs_expansion", "inconclusive"}
-                            else "exculpatory_evidence"
+                            non_root_role
+                            if is_non_root
+                            else (
+                                "unknown"
+                                if self.global_outcome
+                                in {"needs_expansion", "inconclusive"}
+                                else "exculpatory_evidence"
+                            )
                         )
+                    ),
+                    responsibility=(
+                        "primary"
+                        if is_selected
+                        else "shared"
+                        if non_root_role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else "unknown"
+                        if self.global_outcome
+                        in {"needs_expansion", "inconclusive"}
+                        else "none"
+                    ),
+                    candidate_phase=(
+                        "implementation"
+                        if is_selected
+                        else "planning"
+                        if non_root_role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else "intermediate"
+                    ),
+                    obligation_status_before="unknown",
+                    obligation_status_after="unknown",
+                    repair_window_effect="remained_open",
+                    failure_mode=(
+                        "positive_introduction"
+                        if is_selected
+                        else "omission_enabling_condition"
+                        if non_root_role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else "unknown"
+                        if self.global_outcome
+                        in {"needs_expansion", "inconclusive"}
+                        else "none"
+                    ),
+                    obligation_refs=(),
+                    contribution_mechanism=(
+                        {
+                            "type": "scope_narrowing",
+                            "target_ref": capsule.candidate_ref,
+                            "effect": (
+                                "The scripted candidate changes the "
+                                "downstream repair scope."
+                            ),
+                            "evidence_refs": (
+                                capsule.candidate_ref,
+                            ),
+                        }
+                        if non_root_role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else None
                     ),
                     reason="Scripted global comparative assessment.",
                     evidence_refs=(capsule.candidate_ref,),
@@ -734,6 +944,88 @@ def valid_single_node_payload() -> dict:
 
 
 class RecursiveTraversalTest(unittest.TestCase):
+    def test_process_confirmation_rebuilds_fact_only_context(self):
+        defect = DefectState.create(
+            label="candidate_local_process_defect",
+            expected="The repair is delivered.",
+            actual="No repair was delivered.",
+            mechanism="An implementation commitment was not materialized.",
+            scope="candidate_local_process_execution",
+        )
+        cue = {
+            "schema": "candidate-commitment-cues/v1",
+            "candidate_ref": "record:decision",
+            "candidate_reference": {
+                "raw_ref": "record:decision",
+                "resolved_ref": "record:decision",
+                "resolution_status": "resolved",
+                "provenance_class": "recorded",
+            },
+            "cue_count": 1,
+            "cues": [
+                {
+                    "cue_id": "commitment_cue:test",
+                    "verbatim_excerpt": "I will implement the repair.",
+                    "source_artifact_id": "artifact_unenveloped",
+                }
+            ],
+        }
+        trajectory = {
+            "schema": "candidate-process-trajectory/v1",
+            "candidate_ref": "record:decision",
+            "candidate_reference": {
+                "raw_ref": "record:decision",
+                "resolved_ref": "record:decision",
+                "resolution_status": "resolved",
+                "provenance_class": "recorded",
+            },
+            "post_candidate_episode_count": 1,
+            "episode_summaries": [
+                {
+                    "episode_ref": "progress_episode:test",
+                    "reference": {
+                        "raw_ref": "progress_episode:test",
+                        "resolved_ref": "progress_episode:test",
+                        "resolution_status": "resolved",
+                        "provenance_class": "reconstructed",
+                    },
+                    "mutation_count": 0,
+                    "member_summaries": [
+                        {"ref": "record:unenveloped_member"}
+                    ],
+                }
+            ],
+        }
+
+        with patch.object(
+            recursive_analyzer_module,
+            "candidate_commitment_cue_context",
+            return_value=cue,
+        ), patch.object(
+            recursive_analyzer_module,
+            "candidate_process_trajectory_context",
+            return_value=trajectory,
+        ):
+            facts = recursive_analyzer_module._process_confirmation_factual_context(
+                graph=object(),
+                candidate_ref="record:decision",
+                path=("record:decision", "record:outcome"),
+                defect_state=defect,
+            )
+
+        self.assertEqual(
+            facts["schema"],
+            "candidate-process-confirmation-facts/v1",
+        )
+        projected_cue = facts["candidate_commitment_cues"]["cues"][0]
+        self.assertNotIn("source_artifact_id", projected_cue)
+        projected_episode = facts["candidate_process_trajectory"][
+            "episode_summaries"
+        ][0]
+        self.assertNotIn("member_summaries", projected_episode)
+        self.assertEqual(projected_episode["mutation_count"], 0)
+        self.assertNotIn("process_assessment", facts)
+
     def test_present_defective_dead_end_is_explicitly_unresolved(self):
         judge = ScriptedCausalJudge(
             {
@@ -1331,12 +1623,58 @@ class RecursiveTraversalTest(unittest.TestCase):
                 },
             ],
         }
-        judge = ScriptedCausalJudge(
+        judge = ConfirmingScriptedJudge(
             {
-                ("record:decision", "navigation_candidate_semantic_cause"): step(
-                    "record:decision", introduction=True
+                ("record:decision", "candidate_local_process_defect"): (
+                    lambda request: step(
+                        request.current_node.ref,
+                        introduction=True,
+                        suggested={
+                            "action": "request_root_confirmation",
+                            "arguments": {
+                                "hypothesis_id": request.recursive_context[
+                                    "active_hypothesis_id"
+                                ],
+                                "candidate_ref": request.current_node.ref,
+                                "defect_fingerprint": (
+                                    request.defect_state.fingerprint
+                                ),
+                            },
+                            "reason": (
+                                "Independently verify this process candidate."
+                            ),
+                        },
+                    )
                 ),
-            }
+            },
+            {
+                "record:decision": RootConfirmation(
+                    candidate_ref="record:decision",
+                    status="unknown",
+                    reason="Exercise the factual confirmation request.",
+                    counterfactual=confirmation_counterfactual_for(
+                        "record:decision",
+                        "unknown",
+                    ),
+                    counterfactual_status="unknown",
+                    factor_role="unknown",
+                    process_confirmation_assessment={
+                        "candidate_role": "bounded_investigation",
+                        "commitment_cue_disposition": "not_applicable",
+                        "commitment_status": "not_applicable",
+                        "trajectory_relation": "unknown",
+                        "intervention_scope": "unknown",
+                        "task_precondition_disposition": "ambiguous",
+                        "active_process_defect_after_intervention": "unknown",
+                        "downstream_failure_after_intervention": "unknown",
+                        "reason": "The synthetic fixture leaves causality unknown.",
+                        "evidence_refs": [
+                            "record:decision",
+                            "record:progress",
+                        ],
+                    },
+                )
+            },
         )
 
         report = AgenticRecursiveAnalyzer(judge=judge).analyze(
@@ -1348,6 +1686,173 @@ class RecursiveTraversalTest(unittest.TestCase):
         self.assertEqual(
             [request.current_node.ref for request in judge.requests],
             ["record:decision"],
+        )
+        self.assertEqual(len(judge.confirmation_requests), 1)
+        confirmation_request = judge.confirmation_requests[0]
+        self.assertEqual(
+            confirmation_request.recursive_path,
+            ("record:decision", "record:observed_defect"),
+        )
+        self.assertEqual(
+            confirmation_request.process_factual_context["schema"],
+            "candidate-process-confirmation-facts/v1",
+        )
+
+    def test_progress_navigation_judges_the_complete_bounded_candidate_page(self):
+        decision_count = 40
+        decision_refs = [
+            "record:decision_{0}".format(index)
+            for index in range(decision_count)
+        ]
+        trace = {
+            "case_id": "progress-routing-complete-page",
+            "records": [
+                *[
+                    {
+                        "record_id": "decision_{0}".format(index),
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": "Planning candidate {0}.".format(index),
+                        },
+                    }
+                    for index in range(decision_count)
+                ],
+                {
+                    "record_id": "progress",
+                    "component": "progress",
+                    "event_type": "progress.episode",
+                    "data": {
+                        "offline_only": True,
+                        "member_refs": decision_refs,
+                        "candidate_member_refs": decision_refs,
+                    },
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:progress"],
+                    "data": {
+                        "defect_type": "repair_not_completed",
+                        "expected": "The required repair is implemented.",
+                        "actual": "The repository remains unchanged.",
+                    },
+                },
+            ],
+        }
+        judge = ScriptedCausalJudge({})
+
+        AgenticRecursiveAnalyzer(
+            judge=judge,
+            max_hypotheses=64,
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find why the repair was not completed.",
+        )
+
+        judged_refs = {
+            request.current_node.ref for request in judge.requests
+        }
+        self.assertEqual(judged_refs, set(decision_refs))
+        self.assertTrue(
+            all(
+                request.defect_state.label
+                == "candidate_local_process_defect"
+                for request in judge.requests
+            )
+        )
+        self.assertTrue(
+            all(
+                "pre-existing downstream functional defect"
+                in request.defect_state.mechanism
+                for request in judge.requests
+            )
+        )
+
+    def test_progress_navigation_prioritizes_recorded_commitment_cue(self):
+        decision_refs = [
+            "record:ordinary_0",
+            "record:ordinary_1",
+            "record:committed",
+        ]
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "progress-routing-commitment-priority",
+                "records": [
+                    {
+                        "record_id": "ordinary_0",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": "Inspect the parser implementation.",
+                        },
+                    },
+                    {
+                        "record_id": "ordinary_1",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": "Read another reference file.",
+                        },
+                    },
+                    {
+                        "record_id": "committed",
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": (
+                                "I will implement the required parser methods now."
+                            ),
+                        },
+                    },
+                    {
+                        "record_id": "progress",
+                        "component": "progress",
+                        "event_type": "progress.episode",
+                        "data": {
+                            "offline_only": True,
+                            "member_refs": decision_refs,
+                            "candidate_member_refs": decision_refs,
+                        },
+                    },
+                    {
+                        "record_id": "observed_defect",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                        "source_refs": ["record:progress"],
+                        "data": {
+                            "defect_type": "repair_not_completed",
+                            "expected": "The repair is implemented.",
+                            "actual": "The repository remains unchanged.",
+                        },
+                    },
+                ],
+            }
+        )
+        judge = ScriptedCausalJudge({})
+
+        AgenticRecursiveAnalyzer(
+            judge=judge,
+            max_hypotheses=16,
+        ).analyze(
+            graph,
+            start_refs=["record:observed_defect"],
+            objective="Find why the repair was not completed.",
+        )
+
+        self.assertEqual(
+            judge.requests[0].current_node.ref,
+            "record:committed",
+        )
+        self.assertEqual(
+            {request.current_node.ref for request in judge.requests},
+            set(decision_refs),
         )
 
     def test_interrupted_case_failure_seeds_only_the_recorded_process_signal(self):
@@ -2253,10 +2758,16 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
         self.assertEqual(judge.confirmation_requests, [])
         self.assertEqual(report.confirmed_roots, ())
-        self.assertEqual(report.confirmations[0].status, "unknown")
+        self.assertEqual(len(report.confirmations), 1)
+        confirmation = report.confirmations[0]
+        self.assertEqual(confirmation.status, "unknown")
+        self.assertEqual(
+            report.seed_results[0].confirmation_identities,
+            (confirmation.confirmation_identity,),
+        )
         self.assertIn(
             "queued confirmation path lacks a grounded non-temporal edge",
-            report.confirmations[0].reason,
+            confirmation.reason,
         )
 
     def test_queued_confirmation_rejects_raw_temporal_origin_path(self):
@@ -2294,9 +2805,16 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
         self.assertEqual(judge.confirmation_requests, [])
         self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(len(report.confirmations), 1)
+        confirmation = report.confirmations[0]
+        self.assertEqual(confirmation.status, "unknown")
+        self.assertEqual(
+            report.seed_results[0].confirmation_identities,
+            (confirmation.confirmation_identity,),
+        )
         self.assertIn(
             "queued confirmation path lacks a grounded non-temporal edge",
-            report.confirmations[0].reason,
+            confirmation.reason,
         )
 
     def test_queued_confirmation_rejects_conflicting_raw_provenance(self):
@@ -2339,9 +2857,16 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
         self.assertEqual(judge.confirmation_requests, [])
         self.assertEqual(report.confirmed_roots, ())
+        self.assertEqual(len(report.confirmations), 1)
+        confirmation = report.confirmations[0]
+        self.assertEqual(confirmation.status, "unknown")
+        self.assertEqual(
+            report.seed_results[0].confirmation_identities,
+            (confirmation.confirmation_identity,),
+        )
         self.assertIn(
             "queued confirmation path lacks a grounded non-temporal edge",
-            report.confirmations[0].reason,
+            confirmation.reason,
         )
 
     def test_queued_confirmation_rejects_malformed_explicit_eligibility(self):
@@ -2381,27 +2906,16 @@ class RecursiveRootRankingTest(unittest.TestCase):
         self.assertEqual(report.confirmed_roots, ())
 
     def test_rejected_candidate_backtracks_to_independently_confirmed_alternative(self):
-        def first_step(request):
-            return step(
-                "record:change",
-                predecessors=(
-                    relation("record:decision", "same_defect_propagation"),
-                    relation("record:context", "same_defect_propagation"),
-                ),
-            )
-
-        judge = ConfirmingScriptedJudge(
-            {
-                "record:change": first_step,
-                "record:decision": self._confirmation_step,
-                "record:context": self._confirmation_step,
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            selected_candidate_refs=("record:decision",),
+            global_non_root_roles={
+                "record:context": "contributing_condition",
             },
-            {
-                "record:context": RootConfirmation.rejected(
-                    "record:context",
-                    "availability alone did not introduce the defect",
-                    factor_role="contributing_condition",
-                ),
+            factor_roles={
+                "record:context": "contributing_condition",
+            },
+            confirmations={
                 "record:decision": RootConfirmation.confirmed(
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
@@ -2415,7 +2929,10 @@ class RecursiveRootRankingTest(unittest.TestCase):
             },
         )
 
-        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
             TraceGraph.from_trace(observed_trace(branching=True)),
             start_refs=["record:observed_defect"],
             objective="Find why the implementation omitted the method.",
@@ -2430,7 +2947,10 @@ class RecursiveRootRankingTest(unittest.TestCase):
             ["record:context"],
         )
         self.assertEqual(report.rejected_candidates, ())
-        requests = {item.candidate_ref: item for item in judge.confirmation_requests}
+        requests = {
+            item.candidate_ref: item
+            for item in judge.confirmation_requests
+        }
         decision_request = requests["record:decision"]
         competitor_refs = {
             item["candidate_reference"]["resolved_ref"]
@@ -2438,6 +2958,15 @@ class RecursiveRootRankingTest(unittest.TestCase):
         }
         self.assertIn("record:context", competitor_refs)
         self.assertNotIn("record:change", competitor_refs)
+        self.assertEqual(
+            [
+                item["candidate_ref"]
+                for item in judge.factor_requests[
+                    0
+                ].confirmed_root_summaries
+            ],
+            ["record:decision"],
+        )
         self.assertTrue(decision_request.hypothesis_id)
         self.assertEqual(
             decision_request.defect_state.fingerprint,
@@ -2453,28 +2982,14 @@ class RecursiveRootRankingTest(unittest.TestCase):
         )
 
     def test_unrelated_rejected_candidate_is_not_published_as_a_factor(self):
-        judge = ConfirmingScriptedJudge(
-            {
-                "record:change": step(
-                    "record:change",
-                    predecessors=(
-                        relation("record:decision", "same_defect_propagation"),
-                        relation("record:context", "same_defect_propagation"),
-                    ),
-                ),
-                "record:decision": self._confirmation_step,
-                "record:context": self._confirmation_step,
+        judge = FusionScriptedJudge(
+            global_outcome="candidate_roots",
+            selected_candidate_refs=("record:decision",),
+            global_non_root_roles={
+                "record:context": "unrelated",
             },
-            {
-                "record:context": RootConfirmation.rejected(
-                    "record:context",
-                    "The context did not introduce the defect.",
-                    evidence_refs=[
-                        "record:context",
-                        "record:change",
-                        "record:observed_defect",
-                    ],
-                ),
+            factor_roles={"record:context": "unrelated"},
+            confirmations={
                 "record:decision": RootConfirmation.confirmed(
                     "record:decision",
                     excerpt="Implement only the methods found in the first search.",
@@ -2488,7 +3003,10 @@ class RecursiveRootRankingTest(unittest.TestCase):
             },
         )
 
-        report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+        report = AgenticRecursiveAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
             TraceGraph.from_trace(observed_trace(branching=True)),
             start_refs=["record:observed_defect"],
             objective="Find why the implementation omitted the method.",
@@ -2508,33 +3026,37 @@ class RecursiveRootRankingTest(unittest.TestCase):
             "unrelated",
         ):
             with self.subTest(role=role):
-                judge = ConfirmingScriptedJudge(
-                    {
-                        "record:change": step(
-                            "record:change",
-                            predecessors=(
-                                relation(
-                                    "record:context", "same_defect_propagation"
-                                ),
-                            ),
-                        ),
-                        "record:context": self._confirmation_step,
+                judge = FusionScriptedJudge(
+                    global_outcome="candidate_roots",
+                    selected_candidate_refs=("record:decision",),
+                    global_non_root_roles={
+                        "record:context": role,
                     },
-                    {
-                        "record:context": RootConfirmation.rejected(
-                            "record:context",
-                            "The context is not a necessary root.",
-                            evidence_refs=[
-                                "record:context",
-                                "record:change",
-                                "record:observed_defect",
-                            ],
-                            factor_role=role,
+                    factor_roles={"record:context": role},
+                    confirmations={
+                        "record:decision": RootConfirmation.confirmed(
+                            "record:decision",
+                            excerpt=(
+                                "Implement only the methods found in the "
+                                "first search."
+                            ),
+                            reason=(
+                                "The decision stopped repository discovery."
+                            ),
+                            counterfactual=confirmation_counterfactual_for(
+                                "record:decision",
+                                "confirmed",
+                            ),
+                            confidence=0.91,
+                            evidence_refs=["record:decision"],
                         ),
                     },
                 )
                 trace = observed_trace(branching=True)
-                report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+                report = AgenticRecursiveAnalyzer(
+                    judge=judge,
+                    fusion_mode="retrieval-global",
+                ).analyze(
                     TraceGraph.from_trace(trace),
                     start_refs=["record:observed_defect"],
                     objective="Find why the implementation omitted the method.",
@@ -2558,7 +3080,11 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
                     with self.subTest(role=role, mutation=mutation):
                         with self.assertRaisesRegex(
-                            ValueError, "non-root.*causal edge|confirmation path"
+                            ValueError,
+                            (
+                                "non-root.*causal edge|confirmation path|"
+                                "capsule incoming edges"
+                            ),
                         ):
                             _assert_report_grounded_evidence(
                                 TraceGraph.from_trace(mutated_trace),
@@ -3015,6 +3541,288 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
 
 class RetrievalGlobalFusionTest(unittest.TestCase):
+    def test_global_candidate_funnel_is_seed_local_when_later_pool_fails(self):
+        trace = observed_trace()
+        observed = next(
+            item
+            for item in trace["records"]
+            if item["record_id"] == "observed_defect"
+        )
+        second = copy.deepcopy(observed)
+        second["record_id"] = "second_observed_defect"
+        trace["records"].append(second)
+        trace["dataflow_edges"].append(
+            {
+                "from": {"type": "record", "id": "change"},
+                "to": {"type": "record", "id": "second_observed_defect"},
+                "relation": "change_observed_by_evaluation",
+                "evidence_type": "confirmed",
+                "confidence": 1.0,
+                "eligible_for_attribution": True,
+            }
+        )
+
+        class SecondPoolFailsAnalyzer(AgenticRecursiveAnalyzer):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.pool_calls = 0
+
+            def _global_candidate_pool(self, state, graph, item):
+                self.pool_calls += 1
+                if self.pool_calls == 2:
+                    raise ValueError("second seed candidate pool failed")
+                return super()._global_candidate_pool(state, graph, item)
+
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=[
+                "record:observed_defect",
+                "record:second_observed_defect",
+            ],
+            objective="Diagnose both observed defects independently.",
+            analysis_perspective="task quality",
+        )
+        analyzer = SecondPoolFailsAnalyzer(
+            judge=FusionScriptedJudge(global_outcome="no_defect"),
+            fusion_mode="retrieval-global",
+        )
+        analyzer._run_global_candidate_prepass(state, graph)
+
+        passes = [
+            item
+            for item in state.investigation_journal
+            if item.get("kind") == "global_candidate_pass"
+        ]
+        self.assertEqual(
+            [item["status"] for item in passes],
+            ["completed", "failed"],
+        )
+        self.assertIn(
+            "candidate_funnel",
+            passes[0]["candidate_compression"],
+        )
+        self.assertNotIn(
+            "candidate_funnel",
+            passes[1]["candidate_compression"],
+        )
+
+    def test_global_candidate_funnel_survives_completed_bypassed_and_capsule_failure(self):
+        trace = observed_trace()
+        trace["records"] = [
+            item for item in trace["records"] if item["record_id"] != "prompt"
+        ]
+        completed = AgenticRecursiveAnalyzer(
+            judge=FusionScriptedJudge(global_outcome="no_defect"),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(trace),
+            start_refs=["record:observed_defect"],
+            objective="Find the primary trace-visible root.",
+        )
+        completed_pass = next(
+            item
+            for item in completed.investigation_journal
+            if item.get("kind") == "global_candidate_pass"
+            and item.get("status") == "completed"
+        )
+        self.assertEqual(
+            completed_pass["candidate_compression"]["candidate_funnel"]["schema"],
+            "candidate-budget-funnel/v4",
+        )
+
+        oversized_metrics = {
+            "trace_node_count": 4,
+            "candidate_count": 3,
+            "candidate_node_reduction_ratio": 0.25,
+            "trace_json_bytes": 1_591,
+            "capsule_bytes": 38_966,
+            "candidate_byte_reduction_ratio": -23.491515,
+            "open_root_candidate_count": 4,
+            "global_fusion_payload": {"eligible": False, "reason": "patched"},
+        }
+        with patch(
+            "trace_attribution.recursive_analyzer.candidate_compression_metrics",
+            return_value=oversized_metrics,
+        ):
+            bypassed = AgenticRecursiveAnalyzer(
+                judge=FusionScriptedJudge(global_outcome="no_defect"),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+        gate = next(
+            item
+            for item in bypassed.investigation_journal
+            if item.get("kind") == "global_candidate_gate"
+        )
+        self.assertIn("candidate_funnel", gate["candidate_compression"])
+
+        with patch(
+            "trace_attribution.recursive_analyzer.build_candidate_evidence_capsules",
+            side_effect=ValueError("candidate capsule construction failed"),
+        ):
+            failed = AgenticRecursiveAnalyzer(
+                judge=FusionScriptedJudge(global_outcome="no_defect"),
+                fusion_mode="retrieval-global",
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed_defect"],
+                objective="Find the primary trace-visible root.",
+            )
+        failure = next(
+            item
+            for item in failed.investigation_journal
+            if item.get("kind") == "global_candidate_pass"
+            and item.get("status") == "failed"
+        )
+        self.assertEqual(
+            failure["candidate_compression"]["candidate_funnel"][
+                "selection_identity"
+            ],
+            completed_pass["candidate_compression"]["candidate_funnel"][
+                "selection_identity"
+            ],
+        )
+
+    def test_completed_legacy_bypassed_gate_projection_remains_replayable(self):
+        journal = [
+            {
+                "behavior_impact": "none_offline_analysis_only",
+                "candidate_compression": {
+                    "candidate_byte_reduction_ratio": 0.5,
+                    "candidate_count": 4,
+                    "candidate_node_reduction_ratio": 0.5,
+                    "capsule_bytes": 100,
+                    "global_fusion_payload": {
+                        "capsule_to_trace_expansion_ratio": 0.5,
+                        "dense_root_matrix": True,
+                        "eligible": False,
+                        "max_open_root_candidates": 3,
+                        "max_payload_bytes": 65536,
+                        "negative_compression": False,
+                        "open_root_candidate_count": 4,
+                        "oversized": True,
+                        "reason": "oversized_dense_root_matrix",
+                    },
+                    "open_root_candidate_count": 4,
+                    "trace_json_bytes": 200,
+                    "trace_node_count": 8,
+                },
+                "defect_fingerprint": "defect:legacy",
+                "fallback": "recursive_backward_taint",
+                "kind": "global_candidate_gate",
+                "seed_ref": "record:observed_defect",
+                "status": "bypassed",
+                "reason": "oversized_dense_root_matrix",
+            }
+        ]
+        metadata = {
+            "analysis": "agentic_recursive_semantic_taint",
+            "fusion_mode": "off",
+            "global_candidate_pass_count": 0,
+            "global_judge_physical_request_count": 0,
+            "global_candidate_judgments": [],
+            "candidate_compression": [],
+            "recursive_expansion_reasons": [],
+            "global_candidate_failures": [],
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "global pass metadata contradicts authoritative actions",
+        ):
+            _validate_global_pass_derivations(
+                journal,
+                metadata,
+                label="live report",
+            )
+
+        classification = classify_legacy_projection_shape(
+            journal,
+            metadata,
+        )
+        self.assertIsInstance(
+            classification,
+            LegacyProjectionRequired,
+        )
+        _validate_global_pass_derivations(
+            journal,
+            metadata,
+            label="restored completed report",
+            authorized_legacy_projection=classification,
+        )
+
+    def test_versioned_candidate_funnel_is_not_classified_as_legacy_bypass(self):
+        graph = TraceGraph.from_trace(observed_trace())
+        candidate = CausalCandidate(
+            ref="record:decision",
+            node=graph.nodes["record:decision"],
+            source="confirmed_edge",
+        )
+        funnel = select_global_candidates(
+            graph,
+            [candidate],
+        ).to_dict()
+        journal = [
+            {
+                "behavior_impact": "none_offline_analysis_only",
+                "candidate_compression": {
+                    "candidate_byte_reduction_ratio": 0.5,
+                    "candidate_count": 1,
+                    "candidate_node_reduction_ratio": 0.5,
+                    "capsule_bytes": 100,
+                    "global_fusion_payload": {
+                        "capsule_to_trace_expansion_ratio": 0.5,
+                        "dense_root_matrix": True,
+                        "eligible": False,
+                        "max_open_root_candidates": 3,
+                        "max_payload_bytes": 65536,
+                        "negative_compression": False,
+                        "open_root_candidate_count": 4,
+                        "oversized": True,
+                        "reason": "oversized_dense_root_matrix",
+                    },
+                    "open_root_candidate_count": 4,
+                    "trace_json_bytes": 200,
+                    "trace_node_count": 8,
+                    "candidate_funnel": funnel,
+                },
+                "defect_fingerprint": "defect:modern",
+                "fallback": "recursive_backward_taint",
+                "kind": "global_candidate_gate",
+                "seed_ref": "record:observed_defect",
+                "status": "bypassed",
+                "reason": "oversized_dense_root_matrix",
+            }
+        ]
+        metadata = {
+            "analysis": "agentic_recursive_semantic_taint",
+            "fusion_mode": "off",
+            "global_candidate_pass_count": 0,
+            "global_judge_physical_request_count": 0,
+            "global_candidate_judgments": [],
+            "candidate_compression": [],
+            "recursive_expansion_reasons": [],
+            "global_candidate_failures": [],
+        }
+
+        classification = classify_legacy_projection_shape(
+            journal,
+            metadata,
+        )
+
+        self.assertIsInstance(
+            classification,
+            LegacyProjectionNotRequired,
+        )
+        self.assertEqual(
+            classification.reason,
+            "legacy_shape_not_exact",
+        )
+
     def test_global_root_judgment_consumes_all_initial_seed_branches(self):
         trace = observed_trace()
         trace["records"].insert(
@@ -3093,7 +3901,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 "eligible": False,
                 "reason": "oversized_negative_compression",
                 "capsule_to_trace_expansion_ratio": 24.491515,
-                "max_payload_bytes": 32_768,
+                "max_payload_bytes": 65_536,
                 "max_open_root_candidates": 3,
             },
         }
@@ -3129,6 +3937,10 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(gates[0]["status"], "bypassed")
         self.assertEqual(
             gates[0]["reason"], "oversized_negative_compression"
+        )
+        self.assertEqual(
+            report.metadata["fusion_mode"],
+            "retrieval-global",
         )
 
     def test_progress_navigation_score_only_changes_queue_priority(self):
@@ -3533,7 +4345,10 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                 objective="Find the trace-visible root.",
             )
             global_request = judge.global_requests[0].to_dict()
-            capsules = global_request["candidate_evidence_capsules"]
+            capsules = [
+                *global_request["candidate_evidence_capsules"],
+                *global_request["evidence_context_capsules"],
+            ]
             return {
                 "global_request": global_request,
                 "capsule_refs": [item["candidate_ref"] for item in capsules],
@@ -3554,13 +4369,19 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertEqual(first_route_high, second_route_high)
         self.assertEqual(len(first_route_high["confirmation_facts"]), 1)
-        self.assertLess(
-            first_route_high["capsule_refs"].index("record:route_b"),
-            first_route_high["capsule_refs"].index("record:route_a"),
-        )
+        self.assertIn("record:route_a", first_route_high["capsule_refs"])
+        self.assertIn("record:route_b", first_route_high["capsule_refs"])
+        all_capsules = [
+            *first_route_high["global_request"][
+                "candidate_evidence_capsules"
+            ],
+            *first_route_high["global_request"][
+                "evidence_context_capsules"
+            ],
+        ]
         route_a = next(
             item
-            for item in first_route_high["global_request"]["candidate_evidence_capsules"]
+            for item in all_capsules
             if item["candidate_ref"] == "record:route_a"
         )
         self.assertEqual(route_a["candidate"]["source"], "attribution_edge")
@@ -3578,7 +4399,7 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         )
         route_b = next(
             item
-            for item in first_route_high["global_request"]["candidate_evidence_capsules"]
+            for item in all_capsules
             if item["candidate_ref"] == "record:route_b"
         )
         self.assertEqual(route_b["candidate"]["retrieval_edge"]["confidence"], 0.8)
@@ -3638,7 +4459,19 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
                     replace(
                         candidate,
                         score=self.score,
-                        edge={**candidate.edge, "confidence": self.edge_confidence},
+                        edge={
+                            **{
+                                key: value
+                                for key, value in candidate.edge.items()
+                                if key
+                                not in {
+                                    "retrieval_candidate",
+                                    "inference_method",
+                                    "edge_origin",
+                                }
+                            },
+                            "confidence": self.edge_confidence,
+                        },
                     )
                     for candidate in super().retrieve(*args, **kwargs)
                 ]
@@ -3712,12 +4545,24 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         reranked = run(0.99, 0.98)
 
         self.assertEqual(baseline, reranked)
-        candidate = baseline["global"][0]["candidate_evidence_capsules"][0]["candidate"]
-        self.assertNotIn("confidence", candidate["retrieval_edge"])
+        capsules = [
+            *baseline["global"][0]["candidate_evidence_capsules"],
+            *baseline["global"][0]["evidence_context_capsules"],
+        ]
+        retrieved_prompt = next(
+            item for item in capsules if item["candidate_ref"] == "record:prompt"
+        )
+        self.assertNotIn(
+            "confidence",
+            retrieved_prompt["candidate"]["retrieval_edge"],
+        )
+        changed_record = next(
+            item for item in capsules if item["candidate_ref"] == "record:change"
+        )
         self.assertTrue(
             any(
                 edge.get("confidence") == 0.98
-                for edge in baseline["global"][0]["candidate_evidence_capsules"][0]["incoming_edges"]
+                for edge in changed_record["incoming_edges"]
             )
         )
 
@@ -4034,7 +4879,67 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertIn(
             "record:test_result",
-            judge.global_requests[0].offered_candidate_refs,
+            tuple(
+                capsule.candidate_ref
+                for capsule in (
+                    judge.global_requests[0]
+                    .evidence_context_capsules
+                )
+            ),
+        )
+
+    def test_global_pass_gates_when_only_evidence_context_is_available(self):
+        class ContextOnlyAnalyzer(AgenticRecursiveAnalyzer):
+            def _global_candidate_pool(self, state, graph, item):
+                candidates, _paths, _funnel = super()._global_candidate_pool(
+                    state, graph, item
+                )
+                selection = select_global_candidates(
+                    graph,
+                    candidates,
+                    ineligible_reasons={
+                        candidate.ref: "no_active_seed_causal_path"
+                        for candidate in candidates
+                    },
+                )
+                selected = [
+                    *selection.offered,
+                    *selection.evidence_context,
+                ]
+                return (
+                    selected,
+                    {candidate.ref: (candidate.ref,) for candidate in selected},
+                    selection.to_dict(),
+                )
+
+        judge = FusionScriptedJudge(global_outcome="candidate_roots")
+
+        report = ContextOnlyAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the trace-grounded introduction.",
+        )
+
+        self.assertEqual(judge.global_requests, [])
+        self.assertEqual(report.metadata["global_candidate_failures"], ())
+        gate = next(
+            item
+            for item in report.investigation_journal
+            if item.get("kind") == "global_candidate_gate"
+        )
+        self.assertEqual(gate["status"], "bypassed")
+        self.assertEqual(
+            gate["reason"],
+            "no_assessment_eligible_candidates",
+        )
+        self.assertGreater(
+            gate["candidate_compression"]["candidate_funnel"][
+                "evidence_context_count"
+            ],
+            0,
         )
 
     def test_global_pool_recalls_large_nested_tool_result_verification(self):
@@ -4093,7 +4998,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertIn(
             "record:test_result",
-            judge.global_requests[0].offered_candidate_refs,
+            tuple(
+                capsule.candidate_ref
+                for capsule in (
+                    judge.global_requests[0]
+                    .evidence_context_capsules
+                )
+            ),
         )
 
     def test_global_pool_recalls_same_turn_authored_decision_sibling(self):
@@ -4146,7 +5057,13 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
 
         self.assertIn(
             "record:write_test",
-            judge.global_requests[0].offered_candidate_refs,
+            tuple(
+                capsule.candidate_ref
+                for capsule in (
+                    judge.global_requests[0]
+                    .evidence_context_capsules
+                )
+            ),
         )
 
     def test_global_root_candidate_goes_directly_to_independent_confirmation(self):
@@ -5111,7 +6028,16 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(len(seed.confirmation_identities), 1)
         self.assertEqual(report.confirmed_roots, ())
         self.assertEqual(report.co_roots, ())
-        self.assertEqual([item.status for item in report.confirmations], ["confirmed"])
+        self.assertEqual(judge.confirmation_requests, [])
+        self.assertEqual([item.status for item in report.confirmations], ["unknown"])
+        self.assertEqual(
+            seed.confirmation_identities,
+            (report.confirmations[0].confirmation_identity,),
+        )
+        self.assertIn(
+            "active causal role is not root-eligible",
+            report.confirmations[0].reason,
+        )
         self.assertEqual(RecursiveAttributionReport.from_dict(report.to_dict()), report)
 
     def test_mixed_seed_branch_failure_and_confirmation_stays_conservative(self):
@@ -5197,6 +6123,849 @@ class RetrievalGlobalFusionTest(unittest.TestCase):
         self.assertEqual(
             report.seed_results[0].outcome,
             "evidence_gap",
+        )
+
+
+class QualityFirstGlobalCandidateBudgetTest(unittest.TestCase):
+    def test_global_pool_preserves_latest_grounded_decision_beyond_discovery_and_reserve_caps(
+        self,
+    ):
+        class EmptyRetriever(SemanticPredecessorRetriever):
+            def retrieve(self, *args, **kwargs):
+                return []
+
+        noise_count = 300
+        decision_count = 65
+        trace = {
+            "case_id": "quality-first-late-decision-after-dense-closure",
+            "records": [
+                *[
+                    {
+                        "record_id": "noise_{0:03d}".format(index),
+                        "component": "context",
+                        "event_type": "context.snapshot",
+                        "data": {"text": "Candidate context {0}.".format(index)},
+                    }
+                    for index in range(noise_count)
+                ],
+                *[
+                    {
+                        "record_id": "decision_{0:02d}".format(index),
+                        "component": "agent",
+                        "event_type": "decision",
+                        "data": {
+                            "rationale": "Implementation decision {0}.".format(
+                                index
+                            )
+                        },
+                    }
+                    for index in range(decision_count)
+                ],
+                {
+                    "record_id": "change",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {"summary": "Materialize the implementation."},
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change"],
+                    "data": {"actual": "The implementation is incomplete."},
+                },
+            ],
+            "dataflow_edges": [
+                *[
+                    {
+                        "from": {
+                            "type": "record",
+                            "id": "noise_{0:03d}".format(index),
+                        },
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "context_available_to_change",
+                        "evidence_type": "confirmed",
+                        "eligible_for_attribution": True,
+                    }
+                    for index in range(noise_count)
+                ],
+                *[
+                    {
+                        "from": {
+                            "type": "record",
+                            "id": "decision_{0:02d}".format(index),
+                        },
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "decision_guided_change",
+                        "evidence_type": "confirmed",
+                        "eligible_for_attribution": True,
+                    }
+                    for index in range(decision_count)
+                ],
+                {
+                    "from": {"type": "record", "id": "change"},
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "change_created_observed_defect",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+        preferred_ref = "record:decision_64"
+
+        analyzer = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({}),
+            retriever=EmptyRetriever(),
+        )
+        closure, _, _ = analyzer._global_grounded_upstream_closure(
+            graph,
+            {
+                "record:observed_defect": (
+                    "record:observed_defect",
+                ),
+            },
+        )
+        closure_refs = [candidate.ref for candidate in closure]
+
+        self.assertGreater(len(closure), 256)
+        self.assertIn(preferred_ref, closure_refs)
+
+        candidates, paths, funnel = analyzer._global_candidate_pool(
+            state,
+            graph,
+            item,
+        )
+        offered_refs = [candidate.ref for candidate in candidates]
+
+        self.assertGreater(funnel["discovered_count"], 256)
+        self.assertEqual(
+            funnel["reserved_grounded_decision_refs"][0],
+            preferred_ref,
+        )
+        self.assertIn(preferred_ref, offered_refs)
+        self.assertEqual(
+            paths[preferred_ref],
+            (
+                preferred_ref,
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+
+    def test_global_pool_finds_and_reserves_deep_decision_after_more_than_256_shallow_candidates(
+        self,
+    ):
+        class EmptyRetriever(SemanticPredecessorRetriever):
+            def retrieve(self, *args, **kwargs):
+                return []
+
+        noise_count = 300
+        trace = {
+            "case_id": "quality-first-deep-decision-after-shallow-noise",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"rationale": "Select the incomplete implementation."},
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"tool": "edit"},
+                },
+                *[
+                    {
+                        "record_id": "noise_{0:03d}".format(index),
+                        "component": "context",
+                        "event_type": "context.snapshot",
+                        "data": {"text": "Shallow candidate {0}.".format(index)},
+                    }
+                    for index in range(noise_count)
+                ],
+                {
+                    "record_id": "change",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {"summary": "Materialize the incomplete implementation."},
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change"],
+                    "data": {"actual": "The implementation is incomplete."},
+                },
+            ],
+            "dataflow_edges": [
+                *[
+                    {
+                        "from": {
+                            "type": "record",
+                            "id": "noise_{0:03d}".format(index),
+                        },
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "context_available_to_change",
+                        "evidence_type": "confirmed",
+                        "eligible_for_attribution": True,
+                    }
+                    for index in range(noise_count)
+                ],
+                {
+                    "from": {"type": "record", "id": "tool_call"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "modified_by",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "tool_call"},
+                    "relation": "reasoning_selected_action",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "change"},
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "change_created_observed_defect",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+
+        candidates, paths, funnel = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({}),
+            retriever=EmptyRetriever(),
+        )._global_candidate_pool(state, graph, item)
+        offered_refs = [candidate.ref for candidate in candidates]
+        discovered_refs = [
+            entry["ref"] for entry in funnel["candidate_audit"]
+        ]
+
+        self.assertIn("record:decision", discovered_refs)
+        self.assertIn(
+            "record:decision",
+            funnel["reserved_grounded_decision_refs"],
+        )
+        self.assertIn("record:decision", offered_refs)
+        self.assertEqual(
+            paths["record:decision"],
+            (
+                "record:decision",
+                "record:tool_call",
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+
+    def test_grounded_upstream_scan_limit_is_a_hard_edge_bound(self):
+        noise_count = 40
+        trace = {
+            "case_id": "grounded-upstream-hard-scan-bound",
+            "records": [
+                *[
+                    {
+                        "record_id": "noise_{0:02d}".format(index),
+                        "component": "context",
+                        "event_type": "context.snapshot",
+                    }
+                    for index in range(noise_count)
+                ],
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {
+                        "type": "record",
+                        "id": "noise_{0:02d}".format(index),
+                    },
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "context_available_to_change",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                }
+                for index in range(noise_count)
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+
+        closure = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({})
+        )._global_grounded_upstream_closure
+        self.assertIn("scan_limit", closure.__code__.co_varnames)
+
+        candidates, _, _ = closure(
+            graph,
+            {
+                "record:observed_defect": (
+                    "record:observed_defect",
+                )
+            },
+            limit=256,
+            scan_limit=17,
+        )
+
+        self.assertEqual(len(candidates), 17)
+
+    def test_global_pool_closes_every_seed_outcome_branch_not_only_progress_frontier(
+        self,
+    ):
+        trace = {
+            "case_id": "quality-first-multi-anchor-seed",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"rationale": "Select the incomplete implementation."},
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"tool": "edit"},
+                },
+                {
+                    "record_id": "change",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {"summary": "Materialize the incomplete implementation."},
+                },
+                {
+                    "record_id": "progress",
+                    "component": "progress",
+                    "event_type": "progress.episode",
+                    "data": {
+                        "offline_only": True,
+                        "semantic_role": "navigation",
+                    },
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": [
+                        "record:change",
+                        "record:progress",
+                    ],
+                    "data": {
+                        "expected": "The complete requirement is implemented.",
+                        "actual": "The implementation is incomplete.",
+                    },
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "tool_call"},
+                    "relation": "reasoning_selected_action",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "tool_call"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "modified_by",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "progress"},
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "progress_episode_projects_to_target",
+                    "evidence_type": "offline_reconstruction",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+        self.assertEqual(item.node_ref, "record:progress")
+
+        candidates, paths, funnel = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({})
+        )._global_candidate_pool(state, graph, item)
+
+        self.assertIn(
+            "record:decision",
+            [candidate.ref for candidate in candidates],
+        )
+        self.assertEqual(
+            paths["record:decision"],
+            (
+                "record:decision",
+                "record:tool_call",
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+        self.assertIn(
+            "record:decision",
+            funnel["reserved_grounded_decision_refs"],
+        )
+        self.assertIn(
+            "record:progress",
+            [candidate.ref for candidate in candidates],
+        )
+        self.assertEqual(paths["record:progress"], ("record:progress",))
+        progress_audit = next(
+            entry
+            for entry in funnel["candidate_audit"]
+            if entry["ref"] == "record:progress"
+        )
+        self.assertEqual(
+            progress_audit["disposition"],
+            "evidence_context",
+        )
+        self.assertEqual(
+            progress_audit["reason"],
+            "no_active_seed_causal_path",
+        )
+
+    def test_global_pool_materializes_process_lifecycle_before_eligibility(self):
+        trace = {
+            "case_id": "global-process-lifecycle-eligibility",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {
+                        "decision_type": "reasoning_block",
+                        "rationale": (
+                            "I will implement the required parser methods now."
+                        ),
+                    },
+                },
+                {
+                    "record_id": "progress",
+                    "component": "progress",
+                    "event_type": "progress.episode",
+                    "data": {
+                        "offline_only": True,
+                        "member_refs": ["record:decision"],
+                        "candidate_member_refs": ["record:decision"],
+                        "no_delivery_progress": True,
+                        "chronology_index": 1,
+                    },
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:progress"],
+                    "data": {
+                        "expected": "The required repair is implemented.",
+                        "actual": "The repository remains unchanged.",
+                    },
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose why the repair remained undelivered.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+
+        candidates, paths, funnel = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({})
+        )._global_candidate_pool(state, graph, item)
+
+        decision_audit = next(
+            entry
+            for entry in funnel["candidate_audit"]
+            if entry["ref"] == "record:decision"
+        )
+        self.assertIn(
+            "record:decision",
+            [candidate.ref for candidate in candidates],
+        )
+        self.assertTrue(decision_audit["assessment_eligible"])
+        self.assertEqual(decision_audit["disposition"], "offered")
+        self.assertEqual(
+            paths["record:decision"],
+            ("record:decision", "record:observed_defect"),
+        )
+        lifecycle_edges = graph.edge_context(
+            "record:decision",
+            "record:observed_defect",
+        )
+        self.assertTrue(
+            any(
+                edge["relation"] == "process_lifecycle_observed"
+                and edge["evidence_type"] == "offline_reconstruction"
+                and edge["edge_origin"]
+                == "offline.process_lifecycle_reconstruction"
+                for edge in lifecycle_edges
+            )
+        )
+
+    def test_global_pool_canonicalizes_grounded_route_before_budget_selection(
+        self,
+    ):
+        trace = {
+            "case_id": "quality-first-route-canonicalization",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"rationale": "Select the implementation action."},
+                },
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"tool": "edit"},
+                },
+                {
+                    "record_id": "change",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {"summary": "Materialize the action."},
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change"],
+                    "data": {"actual": "The implementation is incomplete."},
+                },
+            ],
+            "dataflow_edges": [
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "tool_call"},
+                    "relation": "reasoning_selected_action",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "tool_call"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "modified_by",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "change"},
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "change_created_observed_defect",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+
+        class SemanticDecisionRetriever(SemanticPredecessorRetriever):
+            def retrieve(self, *args, **kwargs):
+                return [
+                    CausalCandidate(
+                        ref="record:decision",
+                        node=graph.nodes["record:decision"],
+                        source="semantic_fallback",
+                        edge={
+                            "from_ref": "record:decision",
+                            "to_ref": "record:change",
+                            "relation": "semantic_predecessor_match",
+                            "evidence_type": "semantic_inferred",
+                            "eligible_for_attribution": False,
+                            "retrieval_candidate": True,
+                        },
+                        score=0.99,
+                        evidence_refs=("record:decision",),
+                    )
+                ]
+
+        candidates, paths, funnel = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({}),
+            retriever=SemanticDecisionRetriever(),
+        )._global_candidate_pool(state, graph, item)
+        decision = next(
+            candidate
+            for candidate in candidates
+            if candidate.ref == "record:decision"
+        )
+
+        self.assertEqual(decision.source, "confirmed_edge")
+        self.assertEqual(
+            decision.edge["relation"],
+            "reasoning_selected_action",
+        )
+        self.assertEqual(
+            paths["record:decision"],
+            (
+                "record:decision",
+                "record:tool_call",
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+        self.assertEqual(
+            funnel["reserved_grounded_decision_refs"],
+            ["record:decision"],
+        )
+
+    def test_global_pool_reserves_grounded_two_hop_authored_decision_after_dense_first_hop(
+        self,
+    ):
+        filler_records = [
+            {
+                "record_id": "context_{0:02d}".format(index),
+                "component": "context",
+                "event_type": "context.snapshot",
+                "data": {"text": "Dense first-hop context {0}.".format(index)},
+            }
+            for index in range(24)
+        ]
+        trace = {
+            "case_id": "quality-first-grounded-decision-reserve",
+            "records": [
+                {
+                    "record_id": "decision",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"rationale": "Select the implementation action."},
+                },
+                *filler_records,
+                {
+                    "record_id": "tool_call",
+                    "component": "tool",
+                    "event_type": "tool.call",
+                    "data": {"tool": "edit"},
+                },
+                {
+                    "record_id": "change",
+                    "component": "processor",
+                    "event_type": "change",
+                    "data": {"summary": "Materialize the selected implementation."},
+                },
+                {
+                    "record_id": "observed_defect",
+                    "component": "evaluation",
+                    "event_type": "case.observed_defect",
+                    "source_refs": ["record:change"],
+                    "data": {
+                        "expected": "The complete requirement is implemented.",
+                        "actual": "The implementation is incomplete.",
+                    },
+                },
+            ],
+            "dataflow_edges": [
+                *[
+                    {
+                        "from": {
+                            "type": "record",
+                            "id": "context_{0:02d}".format(index),
+                        },
+                        "to": {"type": "record", "id": "change"},
+                        "relation": "context_available_to_change",
+                        "evidence_type": "confirmed",
+                        "eligible_for_attribution": True,
+                    }
+                    for index in range(24)
+                ],
+                {
+                    "from": {"type": "record", "id": "tool_call"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "modified_by",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "decision"},
+                    "to": {"type": "record", "id": "tool_call"},
+                    "relation": "reasoning_selected_action",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "change"},
+                    "to": {"type": "record", "id": "observed_defect"},
+                    "relation": "change_created_observed_defect",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ],
+        }
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+
+        pool = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({})
+        )._global_candidate_pool(state, graph, item)
+        candidates, paths, funnel = pool
+
+        self.assertIn(
+            "record:decision",
+            [candidate.ref for candidate in candidates],
+        )
+        self.assertEqual(
+            paths["record:decision"],
+            (
+                "record:decision",
+                "record:tool_call",
+                "record:change",
+                "record:observed_defect",
+            ),
+        )
+        self.assertEqual(len(candidates), 27)
+        self.assertEqual(
+            funnel["policy"],
+            {
+                "total_limit": 96,
+                "grounded_decision_reserve": 16,
+            },
+        )
+        self.assertEqual(funnel["dropped_count"], 0)
+        self.assertEqual(
+            funnel["reserved_grounded_decision_refs"],
+            ["record:decision"],
+        )
+        self.assertEqual(
+            funnel["discovered_count"],
+            funnel["offered_count"]
+            + funnel["evidence_context_count"]
+            + funnel["dropped_count"],
+        )
+
+        replay_candidates, replay_paths, replay_funnel = (
+            AgenticRecursiveAnalyzer(
+                judge=ScriptedCausalJudge({})
+            )._global_candidate_pool(state, graph, item)
+        )
+        self.assertEqual(replay_candidates, candidates)
+        self.assertEqual(replay_paths, paths)
+        self.assertEqual(
+            replay_funnel["selection_identity"],
+            funnel["selection_identity"],
+        )
+
+    def test_global_pool_deduplicates_routes_and_filters_inactive_navigation(
+        self,
+    ):
+        trace = observed_trace(branching=True)
+        trace["records"].extend(
+            [
+                {
+                    "record_id": "navigation",
+                    "component": "offline",
+                    "event_type": "message.input",
+                    "data": {"semantic_role": "navigation"},
+                },
+                {
+                    "record_id": "stale",
+                    "component": "agent",
+                    "event_type": "decision",
+                    "data": {"revision_status": "mismatched"},
+                },
+            ]
+        )
+        trace["dataflow_edges"].extend(
+            [
+                {
+                    "from": {"type": "record", "id": "navigation"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "context_available_to_change",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+                {
+                    "from": {"type": "record", "id": "stale"},
+                    "to": {"type": "record", "id": "change"},
+                    "relation": "decision_guided_change",
+                    "evidence_type": "confirmed",
+                    "eligible_for_attribution": True,
+                },
+            ]
+        )
+        graph = TraceGraph.from_trace(trace)
+        state = RecursiveAnalysisState.create(
+            graph=graph,
+            start_refs=["record:observed_defect"],
+            objective="Diagnose the incomplete implementation.",
+            analysis_perspective="task quality",
+        )
+        item = state.frontier.lifecycle_items()[0]
+        retriever = SemanticPredecessorRetriever()
+        before = retriever.retrieve(
+            graph,
+            item.node_ref,
+            item.defect_state,
+            state.ledger.get(item.hypothesis_id),
+            limit=24,
+            allow_semantic_fallback=True,
+        )
+
+        candidates, _paths, funnel = AgenticRecursiveAnalyzer(
+            judge=ScriptedCausalJudge({}),
+            retriever=retriever,
+        )._global_candidate_pool(state, graph, item)
+        after = retriever.retrieve(
+            graph,
+            item.node_ref,
+            item.defect_state,
+            state.ledger.get(item.hypothesis_id),
+            limit=24,
+            allow_semantic_fallback=True,
+        )
+        refs = [candidate.ref for candidate in candidates]
+
+        self.assertEqual(before, after)
+        self.assertEqual(len(refs), len(set(refs)))
+        self.assertNotIn("record:navigation", refs)
+        self.assertNotIn("record:stale", refs)
+        self.assertEqual(
+            funnel["discovered_count"],
+            funnel["offered_count"]
+            + funnel["evidence_context_count"]
+            + funnel["dropped_count"],
         )
 
 

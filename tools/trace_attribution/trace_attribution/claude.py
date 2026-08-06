@@ -7,9 +7,10 @@ import queue
 import re
 import signal
 import threading
+from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, TypeVar
 
 from .analyzer import JudgeClient
 from .cache import JudgmentCache, build_judge_cache_key
@@ -19,6 +20,10 @@ from .errors import (
     TransportCallError,
     TransportCallResult,
     is_provider_request_error,
+    provider_failure_disposition_to_dict,
+    provider_failure_fields,
+    provider_failure_disposition,
+    provider_failure_reason,
 )
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
 
@@ -115,6 +120,10 @@ class ClaudeJudgeClient(JudgeClient):
         self.consecutive_provider_errors = 0
         self.provider_circuit_open = False
         self.provider_circuit_reason = ""
+        self.provider_circuit_disposition = None
+        self.provider_circuit_first_request = 0
+        self.provider_circuit_first_failure_at = ""
+        self.provider_circuit_previous_failure = None
 
     def judge_node(
         self,
@@ -230,11 +239,25 @@ class ClaudeJudgeClient(JudgeClient):
 
     @property
     def provider_circuit_stats(self) -> Dict[str, Any]:
+        disposition = getattr(self, "provider_circuit_disposition", None)
+        previous_failure = getattr(
+            self, "provider_circuit_previous_failure", None
+        )
         return {
             "threshold": getattr(self, "provider_error_threshold", 3),
             "consecutive_errors": getattr(self, "consecutive_provider_errors", 0),
             "open": getattr(self, "provider_circuit_open", False),
             "reason": getattr(self, "provider_circuit_reason", ""),
+            "disposition": provider_failure_disposition_to_dict(disposition),
+            "first_request": getattr(self, "provider_circuit_first_request", 0),
+            "first_failure_at": getattr(
+                self, "provider_circuit_first_failure_at", ""
+            ),
+            "previous_failure": (
+                dict(previous_failure)
+                if isinstance(previous_failure, Mapping)
+                else None
+            ),
         }
 
     def judge_evaluation_assertion(
@@ -596,12 +619,32 @@ class ClaudeJudgeClient(JudgeClient):
                 response = direct_create(**request)
                 text = response_text(response)
             self.consecutive_provider_errors = 0
+            self.provider_circuit_reason = ""
+            self.provider_circuit_disposition = None
+            self.provider_circuit_first_request = 0
+            self.provider_circuit_first_failure_at = ""
             return TransportCallResult(text=text, physical_requests=1)
         except BaseException as exc:
-            if not is_provider_request_error(exc):
+            disposition = provider_failure_disposition(exc)
+            if disposition is None:
                 if isinstance(exc, Exception):
                     raise TransportCallError(exc, physical_requests=1) from exc
                 raise
+            self.provider_circuit_disposition = disposition
+            if not getattr(self, "provider_circuit_first_request", 0):
+                self.provider_circuit_first_request = self.request_count
+                self.provider_circuit_first_failure_at = datetime.now(
+                    timezone.utc
+                ).isoformat().replace("+00:00", "Z")
+            if not disposition.retryable:
+                self.provider_circuit_open = True
+                self.provider_circuit_reason = "non-retryable Provider failure: {0}".format(
+                    disposition.reason
+                )
+                raise TransportCallError(
+                    JudgeProviderUnavailable(self.provider_circuit_reason),
+                    physical_requests=1,
+                ) from exc
             consecutive = getattr(self, "consecutive_provider_errors", 0) + 1
             self.consecutive_provider_errors = consecutive
             threshold = max(1, int(getattr(self, "provider_error_threshold", 3)))
@@ -1171,12 +1214,24 @@ def run_worker_with_timeout(
     if not isinstance(result, dict):
         raise RuntimeError("judge worker returned invalid result")
     if not result.get("ok"):
-        error = str(result.get("error") or "judge worker failed")
-        error_type = str(result.get("error_type") or "")
-        if is_provider_request_error(RuntimeError(f"{error_type}: {error}")):
-            raise JudgeProviderError(error)
-        raise RuntimeError(error)
+        raise_worker_failure(result)
     return result
+
+
+def raise_worker_failure(result: Mapping[str, Any]) -> None:
+    """Rehydrate structured Provider fields emitted by the timeout worker."""
+    error = str(result.get("error") or "judge worker failed")
+    error_type = str(result.get("error_type") or "")
+    status = result.get("status_code")
+    code = result.get("error_code")
+    if type(status) is int or code or is_provider_request_error(
+        RuntimeError(f"{error_type}: {error}")
+    ):
+        provider_error = JudgeProviderError(error)
+        provider_error.status_code = status if type(status) is int else None
+        provider_error.code = str(code or "")
+        raise provider_error
+    raise RuntimeError(error)
 
 
 def anthropic_request_worker(payload: Dict[str, Any], result_queue: Any) -> None:
@@ -1201,11 +1256,14 @@ def anthropic_request_worker(payload: Dict[str, Any], result_queue: Any) -> None
         response = client.messages.create(**request)
         result_queue.put({"ok": True, "text": response_text(response)})
     except BaseException as exc:
+        status_code, error_code = provider_failure_fields(exc)
         result_queue.put(
             {
                 "ok": False,
                 "error_type": type(exc).__name__,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": provider_failure_reason(exc),
+                "status_code": status_code,
+                "error_code": str(error_code or ""),
             }
         )
 

@@ -20,9 +20,11 @@ from scripts.evaluate_recursive_attribution import (
     main as evaluate_main,
     validate_labels,
 )
+import trace_attribution.causal_state as causal_state_module
 from trace_attribution.causal_state import (
     CausalStepJudgment,
     DefectState,
+    FactorRoleJudgment,
     PredecessorAssessment,
     RecursiveAttributionReport,
     RootConfirmation,
@@ -33,8 +35,22 @@ from trace_attribution.causal_state import (
     semantic_anchor_index,
     semantic_occurrence_index,
 )
-from trace_attribution.causal_judge import OfflineJudgeCapability
+from trace_attribution.causal_judge import (
+    BoundedJudgeCallResult,
+    OfflineJudgeCapability,
+    RootConfirmationRequest,
+    factor_role_request_identity,
+    root_confirmation_request_projection,
+)
+from trace_attribution.global_judge import (
+    GlobalCandidateAssessment,
+    GlobalCandidateJudgment,
+    GlobalJudgeCapability,
+)
 from trace_attribution.graph import TraceGraph
+from trace_attribution.judgment_context import (
+    build_active_failure_factual_context,
+)
 from trace_attribution.models import TraceNode, stable_json
 from trace_attribution.recursive_analyzer import AgenticRecursiveAnalyzer
 
@@ -50,6 +66,188 @@ def node(*, data, source_refs=(), component="planner", event_type="decision"):
         data=data,
         source_refs=list(source_refs),
     )
+
+
+class ActiveFailureRootAcceptanceTest(unittest.TestCase):
+    def test_independent_acceptance_confirmation_can_publish_false_closure_root(self):
+        binding_type = getattr(
+            causal_state_module,
+            "ActiveFailureRoleBinding",
+            None,
+        )
+        self.assertIsNotNone(binding_type)
+        defect = DefectState.create(
+            label="acceptance",
+            expected="Closure follows independent acceptance verification.",
+            actual="The task was closed without acceptance verification.",
+            mechanism="false closure",
+            scope="acceptance",
+        )
+        seed_identity = causal_state_module.seed_binding_identity_for(
+            "record:acceptance_defect",
+            defect.fingerprint,
+        )
+        binding = binding_type.create(
+            candidate_ref="record:dec_343",
+            seed_ref="record:acceptance_defect",
+            failure_signature=defect.fingerprint,
+            failure_kind="acceptance",
+            causal_role="false_closure",
+            disposition="root",
+            counterfactual_prevention_signatures=(defect.fingerprint,),
+        )
+        confirmation = RootConfirmation(
+            candidate_ref="record:dec_343",
+            status="confirmed",
+            excerpt="close despite missing acceptance verification",
+            reason="Replacing the closure decision prevents this acceptance failure.",
+            counterfactual=confirmation_counterfactual_for(
+                "record:dec_343",
+                "confirmed",
+            ),
+            confidence=0.95,
+            evidence_refs=("record:dec_343", "record:acceptance_defect"),
+            counterfactual_status="supports_causality",
+            hypothesis_id="hypothesis:acceptance-closure",
+            hypothesis_semantic_hash="semantic:acceptance-closure",
+            defect_fingerprint=defect.fingerprint,
+            recursive_path=("record:dec_343", "record:acceptance_defect"),
+            seed_binding_identity=seed_identity,
+            analysis_perspective="task quality",
+            factor_role="necessary_cause",
+        )
+        path_references = tuple(
+            {
+                "raw_ref": ref,
+                "resolved_ref": ref,
+                "resolution_status": "resolved",
+                "provenance_class": "recorded",
+            }
+            for ref in confirmation.recursive_path
+        )
+        factual_context = build_active_failure_factual_context(
+            defect_state=defect,
+            seed_ref="record:acceptance_defect",
+            candidate_entries=(
+                {
+                    "candidate_ref": "record:dec_343",
+                    "path_refs": confirmation.recursive_path,
+                    "path_references": (
+                        {
+                            **path_references[0],
+                            "node": {
+                                "component": "agent",
+                                "event_type": "decision",
+                                "status": "completed",
+                                "data": {
+                                    "phase": "closure",
+                                    "rationale": (
+                                        "close despite missing acceptance "
+                                        "verification"
+                                    ),
+                                },
+                            },
+                        },
+                        {
+                            **path_references[1],
+                            "node": {
+                                "component": "evaluation",
+                                "event_type": "case.observed_defect",
+                                "status": "failed",
+                                "data": {"actual": defect.actual},
+                            },
+                        },
+                    ),
+                    "edges": (
+                        {
+                            "from_ref": "record:dec_343",
+                            "to_ref": "record:acceptance_defect",
+                            "relation": (
+                                "authored_decision_observed_by_evaluation"
+                            ),
+                            "edge_origin": "trace.dataflow_edges",
+                            "source_container": "trace.dataflow_edges",
+                            "evidence_type": "confirmed",
+                        },
+                    ),
+                },
+            ),
+        )
+        request_projection = root_confirmation_request_projection(
+            RootConfirmationRequest(
+                candidate_ref=confirmation.candidate_ref,
+                defect_state=defect,
+                recursive_path=confirmation.recursive_path,
+                candidate_reference=path_references[0],
+                recursive_path_references=path_references,
+                supporting_evidence=path_references,
+                opposing_evidence=(),
+                competing_hypotheses=(),
+                task_obligations=(),
+                analysis_perspective=confirmation.analysis_perspective,
+                hypothesis_id=confirmation.hypothesis_id,
+                hypothesis_semantic_hash=(
+                    confirmation.hypothesis_semantic_hash
+                ),
+                seed_binding_identity=confirmation.seed_binding_identity,
+                factual_context=factual_context,
+            )
+        )
+        publication = causal_state_module.canonical_confirmed_root_publication(
+            confirmation=confirmation,
+            defect_state=defect,
+            candidate_node=TraceNode(
+                ref="record:dec_343",
+                record_id="dec_343",
+                component="agent",
+                event_type="decision",
+                data={
+                    "phase": "closure",
+                    "rationale": "close despite missing acceptance verification",
+                },
+            ),
+            seed_start_ref="record:acceptance_defect",
+            active_role_binding=binding,
+            request_projection=request_projection,
+        )
+
+        self.assertEqual(publication.causal_role, "false_closure")
+        self.assertEqual(
+            publication.provenance["active_role_binding"],
+            binding.to_dict(),
+        )
+        self.assertEqual(
+            causal_state_module.ConfirmedRoot.from_dict(
+                publication.to_dict()
+            ).to_dict(),
+            publication.to_dict(),
+        )
+
+    def test_functional_signature_cannot_publish_false_closure_as_root(self):
+        binding_type = getattr(
+            causal_state_module,
+            "ActiveFailureRoleBinding",
+            None,
+        )
+        self.assertIsNotNone(binding_type)
+        defect = DefectState.create(
+            label="functional",
+            expected="The implementation preserves behavior.",
+            actual="The implementation changes behavior.",
+            mechanism="functional regression",
+            scope="functional",
+        )
+
+        with self.assertRaisesRegex(ValueError, "closure substitution"):
+            binding_type.create(
+                candidate_ref="record:dec_343",
+                seed_ref="record:functional_defect",
+                failure_signature=defect.fingerprint,
+                failure_kind="functional",
+                causal_role="false_closure",
+                disposition="root",
+                counterfactual_prevention_signatures=(defect.fingerprint,),
+            )
 
 
 class SemanticAnchorV2ReviewTest(unittest.TestCase):
@@ -409,9 +607,10 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         candidate = next(
             item
             for item in ungrounded_candidate_edge["causal_candidates"]
-            if item.get("edge", {}).get("eligible_for_attribution") is False
-            and item.get("edge", {}).get("to_ref")
+            if item.get("edge", {}).get("to_ref")
         )
+        candidate["edge"]["eligible_for_attribution"] = False
+        candidate["edge"]["retrieval_candidate"] = True
         candidate["edge"]["to_ref"] = "record:invented"
         with self.assertRaises(EvaluationSafetyError):
             self.compare(ungrounded_candidate_edge)
@@ -475,6 +674,8 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
         )
         labels = copy.deepcopy(self.labels)
         labels["schema_version"] = "recursive-attribution-labels/v3"
+        labels.pop("materializations")
+        labels.pop("unrelated")
         for role in ("roots", "conditions", "amplifiers", "forbidden_roots"):
             for item in labels[role]:
                 item["semantic_occurrence_id"] = occurrences[item["node_ref"]]
@@ -488,7 +689,7 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
 
         result = compare_report(report, labels, None, graph=graph)
 
-        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v5")
+        self.assertEqual(result["schema_version"], "recursive-attribution-comparison/v7")
         self.assertEqual(result["metrics"]["confirmed_root_recall"], 0.5)
         self.assertEqual(result["metrics"]["confirmed_root_precision"], 1.0)
         self.assertTrue(result["metrics"]["top1_match"])
@@ -548,8 +749,12 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             self.compare(impossible_reuse)
 
         duplicate_judgment = copy.deepcopy(self.report)
-        duplicate_judgment["step_judgments"].append(
-            copy.deepcopy(duplicate_judgment["step_judgments"][0])
+        duplicate_judgment["metadata"]["factor_role_judgments"].append(
+            copy.deepcopy(
+                duplicate_judgment["metadata"][
+                    "factor_role_judgments"
+                ][0]
+            )
         )
         with self.assertRaises(EvaluationSafetyError):
             self.compare(duplicate_judgment)
@@ -566,10 +771,14 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
             self.compare(unknown_field)
 
         semantic_duplicate = copy.deepcopy(self.report)
-        duplicate = copy.deepcopy(semantic_duplicate["step_judgments"][0])
-        duplicate["current_defect_reason"] = "Different prose cannot create a new judgment."
+        duplicate = copy.deepcopy(
+            semantic_duplicate["contributing_conditions"][0]
+        )
+        duplicate["reason"] = (
+            "Different prose cannot create a new factor publication."
+        )
         duplicate["confidence"] = max(0.0, duplicate["confidence"] - 0.01)
-        semantic_duplicate["step_judgments"].append(duplicate)
+        semantic_duplicate["contributing_conditions"].append(duplicate)
         with self.assertRaises(EvaluationSafetyError):
             self.compare(semantic_duplicate)
 
@@ -689,6 +898,8 @@ class TraceBackedAcceptanceReviewTest(unittest.TestCase):
                 "roots",
                 "conditions",
                 "amplifiers",
+                "materializations",
+                "unrelated",
                 "forbidden_roots",
             ):
                 for label in labels[role]:
@@ -800,7 +1011,10 @@ def _reference_node(reference):
     return dict(content) if isinstance(content, dict) else {}
 
 
-class DeterministicRuleSemanticJudge(OfflineJudgeCapability):
+class DeterministicRuleSemanticJudge(
+    OfflineJudgeCapability,
+    GlobalJudgeCapability,
+):
     """Fixture-phrase rule smoke probe; never attribution-quality evidence."""
 
     def __init__(self):
@@ -808,6 +1022,7 @@ class DeterministicRuleSemanticJudge(OfflineJudgeCapability):
         self.provider_circuit_open = False
         self.provider_circuit_reason = ""
         self.semantic_inputs = []
+        self.global_requests = []
 
     def judge_step(self, request):
         current = {
@@ -919,6 +1134,302 @@ class DeterministicRuleSemanticJudge(OfflineJudgeCapability):
             )
         return replace(result, competitor_comparisons=tuple(comparisons))
 
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.global_requests.append(request)
+        capsules = []
+        selected = []
+        for capsule in request.capsules:
+            node = dict(capsule.candidate["node"])
+            self.semantic_inputs.append(_semantic_payload(node))
+            candidate_class = _fixture_rule_class(node)
+            event_type = str(node.get("event_type") or "")
+            role = {
+                "condition": "contributing_condition",
+                "amplifier": "amplifying_factor",
+            }.get(candidate_class)
+            if (
+                role is not None
+                and event_type
+                in {
+                    "case.failed",
+                    "subagent.result",
+                    "tool.error",
+                    "tool.result",
+                }
+            ):
+                role = "outcome_evidence"
+            is_root = (
+                candidate_class == "root"
+                and capsule.candidate_ref
+                in request.open_authored_root_candidate_refs
+            )
+            if is_root:
+                selected.append(capsule.candidate_ref)
+            capsules.append((capsule, role, is_root))
+
+        assessments = []
+        page_has_factor = any(
+            role is not None for _, role, _ in capsules
+        )
+        outcome = (
+            "candidate_roots"
+            if selected
+            else (
+                "inconclusive"
+                if page_has_factor
+                else "no_defect"
+            )
+        )
+        for capsule, role, is_root in capsules:
+            is_factor = role is not None
+            is_open = (
+                capsule.candidate_ref
+                in request.open_authored_root_candidate_refs
+            )
+            prevents = is_root or role in {
+                "contributing_condition",
+                "amplifying_factor",
+            }
+            assessments.append(
+                GlobalCandidateAssessment(
+                    candidate_ref=capsule.candidate_ref,
+                    defect_status=(
+                        "present"
+                        if is_root or is_factor
+                        else "absent"
+                    ),
+                    input_defect_status=(
+                        "present"
+                        if role == "outcome_evidence"
+                        else (
+                            "absent"
+                            if is_root
+                            or is_factor
+                            or outcome == "no_defect"
+                            else "unknown"
+                        )
+                    ),
+                    output_defect_status=(
+                        "present"
+                        if is_root or is_factor
+                        else "absent"
+                    ),
+                    causal_path_refs=(
+                        tuple(capsule.downstream_path)
+                        if is_root or is_factor or is_open
+                        else ()
+                    ),
+                    counterfactual={
+                        "intervention_ref": capsule.candidate_ref,
+                        "intervention_kind": (
+                            "replace_with_semantically_correct_behavior"
+                        ),
+                        "predicted_defect_status": (
+                            "absent" if prevents else "present"
+                        ),
+                        "causal_effect": (
+                            "prevents_defect"
+                            if prevents
+                            else "does_not_prevent_defect"
+                        ),
+                    },
+                    compared_candidate_refs=(
+                        request.open_authored_root_candidate_refs
+                    ),
+                    causal_role=(
+                        "root_candidate"
+                        if is_root
+                        else (
+                            role
+                            if role is not None
+                            else "exculpatory_evidence"
+                        )
+                    ),
+                    responsibility=(
+                        "primary"
+                        if is_root
+                        else (
+                            "shared"
+                            if role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "none"
+                        )
+                    ),
+                    candidate_phase=(
+                        "implementation"
+                        if is_root
+                        else (
+                            "planning"
+                            if role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "intermediate"
+                        )
+                    ),
+                    obligation_status_before="unknown",
+                    obligation_status_after="unknown",
+                    repair_window_effect="remained_open",
+                    failure_mode=(
+                        "positive_introduction"
+                        if is_root
+                        else (
+                            "omission_enabling_condition"
+                            if role
+                            in {
+                                "contributing_condition",
+                                "amplifying_factor",
+                            }
+                            else "none"
+                        )
+                    ),
+                    obligation_refs=(),
+                    contribution_mechanism=(
+                        {
+                            "type": "scope_narrowing",
+                            "target_ref": request.seed_ref,
+                            "effect": (
+                                "The factor constrained the behavior reaching "
+                                "the observed defect."
+                            ),
+                            "evidence_refs": (capsule.candidate_ref,),
+                        }
+                        if role
+                        in {
+                            "contributing_condition",
+                            "amplifying_factor",
+                        }
+                        else None
+                    ),
+                    reason=(
+                        "Classified from candidate event and data "
+                        "semantics only."
+                    ),
+                    evidence_refs=(capsule.candidate_ref,),
+                    confidence=0.85,
+                )
+            )
+        return BoundedJudgeCallResult(
+            GlobalCandidateJudgment(
+                outcome=outcome,
+                reason=(
+                    "Compared all candidates from event and data "
+                    "semantics only."
+                ),
+                assessments=tuple(assessments),
+                selected_candidate_refs=tuple(selected),
+                expansion_requests=(),
+                decisive_evidence_refs=(
+                    tuple(selected)
+                    if selected
+                    else (
+                        (request.capsules[0].candidate_ref,)
+                        if outcome == "no_defect"
+                        and request.capsules
+                        else ()
+                    )
+                ),
+                missing_evidence=(
+                    (
+                        "This page contains a non-root factor; compare it "
+                        "with surviving root candidates."
+                    ),
+                )
+                if outcome == "inconclusive"
+                else (),
+                confidence=0.85,
+                active_focus_binding={
+                    "seed_ref": request.seed_ref,
+                    "defect_fingerprint": (
+                        request.active_defect.fingerprint
+                    ),
+                    "active_focus_text_hash": (
+                        request.active_focus_text_hash
+                    ),
+                },
+            ),
+            0,
+        )
+
+    def judge_factor_role(self, request):
+        node = _reference_node(request.candidate_reference)
+        candidate_class = _fixture_rule_class(node)
+        role = {
+            "condition": "contributing_condition",
+            "amplifier": "amplifying_factor",
+        }.get(candidate_class, "unrelated")
+        if node.get("event_type") in {
+            "case.failed",
+            "subagent.result",
+            "tool.error",
+            "tool.result",
+        }:
+            role = "downstream_materialization"
+        mechanism_type = {
+            "contributing_condition": "enabling_condition",
+            "amplifying_factor": "amplification",
+            "downstream_materialization": (
+                "downstream_materialization"
+            ),
+        }.get(role)
+        mechanism = (
+            {
+                "schema": "factor-role-mechanism/v1",
+                "mechanism_type": mechanism_type,
+                "source_ref": request.candidate_ref,
+                "target_ref": request.recursive_path[-1],
+                "effect": (
+                    "The semantic fact changes defect exposure or "
+                    "carries the defect downstream."
+                ),
+            }
+            if mechanism_type is not None
+            else {}
+        )
+        predicted_effect = {
+            "contributing_condition": "reduces_defect_likelihood",
+            "amplifying_factor": "reduces_defect_severity",
+            "downstream_materialization": (
+                "defect_still_present_without_materialization"
+            ),
+            "unrelated": (
+                "no_grounded_causal_influence_established"
+            ),
+        }[role]
+        return FactorRoleJudgment(
+            candidate_ref=request.candidate_ref,
+            necessity_status="not_necessary",
+            factor_role=role,
+            reason=(
+                "Independent semantic review classified the "
+                "candidate's non-root role."
+            ),
+            confidence=0.8,
+            evidence_refs=(request.candidate_ref,),
+            recursive_path=request.recursive_path,
+            factor_mechanism=mechanism,
+            counterfactual={
+                "schema": "factor-role-counterfactual/v1",
+                "intervention_ref": request.candidate_ref,
+                "intervention_kind": (
+                    "replace_with_semantically_correct_behavior"
+                ),
+                "predicted_effect": predicted_effect,
+            },
+            hypothesis_id=request.hypothesis_id,
+            hypothesis_semantic_hash=(
+                request.hypothesis_semantic_hash
+            ),
+            defect_fingerprint=request.defect_state.fingerprint,
+            seed_binding_identity=request.seed_binding_identity,
+            analysis_perspective=request.analysis_perspective,
+            request_identity=factor_role_request_identity(request),
+        )
+
 
 def metamorphic_trace(name, seed):
     trace, _, _ = load_fixture(FIXTURE_ROOT / name)
@@ -926,7 +1437,8 @@ def metamorphic_trace(name, seed):
     rng = random.Random(seed)
     old_ids = [item["record_id"] for item in transformed["records"]]
     mapping = {
-        old: "rule_{0:08x}".format(rng.getrandbits(32)) for old in old_ids
+        old: "rule_{0:08x}".format(rng.getrandbits(32))
+        for old in old_ids
     }
     component_aliases = {}
     for index, record in enumerate(transformed["records"]):
@@ -960,7 +1472,10 @@ def run_rule_smoke(trace):
         for ref, node in graph.nodes.items()
         if node.event_type in {"case.observed_defect", "case.observed_success"}
     )
-    report = AgenticRecursiveAnalyzer(judge=judge).analyze(
+    report = AgenticRecursiveAnalyzer(
+        judge=judge,
+        fusion_mode="retrieval-global",
+    ).analyze(
         graph,
         start_refs=[start],
         objective="Find the semantic mismatch introduction.",

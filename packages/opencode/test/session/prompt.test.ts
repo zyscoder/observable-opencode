@@ -52,6 +52,7 @@ import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { SyncEvent } from "@/sync"
+import { CaseTrace } from "@/observability/case-trace"
 
 void Log.init({ print: false })
 
@@ -343,6 +344,71 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
 })
 
 // Loop semantics
+
+it.live("binds the root trace session even when a child prompt arrives first", () =>
+  provideTmpdirServer(
+    ({ dir }) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const previous = {
+            enabled: process.env.OPENCODE_CASE_TRACE,
+            quiet: process.env.OPENCODE_CASE_TRACE_QUIET,
+            caseID: process.env.OPENCODE_CASE_ID,
+            traceDir: process.env.OPENCODE_CASE_TRACE_DIR,
+          }
+          process.env.OPENCODE_CASE_TRACE = "1"
+          process.env.OPENCODE_CASE_TRACE_QUIET = "1"
+          process.env.OPENCODE_CASE_ID = "prompt-session-binding"
+          process.env.OPENCODE_CASE_TRACE_DIR = path.join(dir, "traces")
+          return previous
+        }),
+        () =>
+          Effect.gen(function* () {
+            const prompt = yield* SessionPrompt.Service
+            const sessions = yield* Session.Service
+            const chat = yield* sessions.create({ title: "Trace session binding" })
+            const child = yield* sessions.create({ title: "Child trace session", parentID: chat.id })
+
+            yield* prompt.prompt({
+              sessionID: child.id,
+              agent: "build",
+              noReply: true,
+              parts: [{ type: "text", text: "child prompt first" }],
+            })
+            for (const text of ["first prompt", "second prompt"]) {
+              yield* prompt.prompt({
+                sessionID: chat.id,
+                agent: "build",
+                noReply: true,
+                parts: [{ type: "text", text }],
+              })
+            }
+
+            expect((CaseTrace.get() as any)?.sessionID).toBe(chat.id)
+            const events = (yield* Effect.promise(() => fs.readFile(CaseTrace.get()!.eventsFile, "utf8")))
+              .trim()
+              .split("\n")
+              .map((line) => JSON.parse(line))
+            expect(events.filter((event) => event.type === "trace.session")).toHaveLength(1)
+          }),
+        (previous) =>
+          Effect.sync(() => {
+            CaseTrace.finish({ status: "cancelled", result: { reason: "test_cleanup" } })
+            for (const [name, value] of Object.entries({
+              OPENCODE_CASE_TRACE: previous.enabled,
+              OPENCODE_CASE_TRACE_QUIET: previous.quiet,
+              OPENCODE_CASE_ID: previous.caseID,
+              OPENCODE_CASE_TRACE_DIR: previous.traceDir,
+            })) {
+              if (value === undefined) delete process.env[name]
+              else process.env[name] = value
+            }
+            CaseTrace.configure()
+          }),
+      ),
+    { git: true, config: providerCfg },
+  ),
+)
 
 it.live("loop exits immediately when last assistant has stop finish", () =>
   provideTmpdirServer(

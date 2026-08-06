@@ -257,7 +257,10 @@ class ExactLocalStateOwnerTest(unittest.TestCase):
     def test_partial_restore_cross_checks_owned_state_with_ledger_and_frontier(self):
         trace = two_hop_shared_root_trace()
         config = shared_root_checkpoint_config(
-            trace, self.objective, self.starts
+            trace,
+            self.objective,
+            self.starts,
+            fusion_mode="off",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "recursive-owner.checkpoint"

@@ -679,7 +679,10 @@ class LocalOccurrenceRelationBijectionTest(unittest.TestCase):
     def setUpClass(cls):
         cls.trace = two_hop_shared_root_trace()
         cls.config = shared_root_checkpoint_config(
-            cls.trace, OBJECTIVE, STARTS
+            cls.trace,
+            OBJECTIVE,
+            STARTS,
+            fusion_mode="off",
         )
         cls.tempdir = tempfile.TemporaryDirectory()
         cls.root = Path(cls.tempdir.name) / "fix25-relations.checkpoint"

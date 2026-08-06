@@ -10,6 +10,8 @@ import { renderCaseTraceHtml } from "@/observability/case-trace-html"
 import { renderProvenanceTraceHtml } from "@/observability/causal-trace-viewer"
 import type { ProvenanceTraceSummary, TraceSummary } from "@/observability/case-trace"
 
+process.env.OPENCODE_CASE_TRACE_QUIET = "1"
+
 async function exists(file: string) {
   return fs
     .access(file)
@@ -352,6 +354,50 @@ describe("case trace", () => {
       run_id: manifest.run_id,
     })
     expect(manifest.environment.revision).toBe("git:legacy-changed")
+  })
+
+  test("binds artifact-owning causal nodes to the immutable case-start revision", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-node-revision-binding-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "node-revision-binding.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ subjectRevision: "git:case-start" })`,
+        `CaseTrace.node({ node_id: "decisionnode_revision_bound", kind: "decision", component: "processor", title: "Implement the fix", data: { subject_revision: "git:forged", revision_provenance_status: "invalid", rationale: ${JSON.stringify("I will implement the missing methods. ".repeat(100))} } })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "node-revision-binding",
+        OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH: "128",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const trace = JSON.parse(
+      await fs.readFile(path.join(dir, "node-revision-binding", "trace.json"), "utf8"),
+    ) as any
+    const owner = trace.records.find((record: any) => record.record_id === "decisionnode_revision_bound")
+
+    expect(owner.artifact_refs.length).toBeGreaterThan(0)
+    expect(owner.data).toMatchObject({
+      case_id: "node-revision-binding",
+      subject_revision: "git:case-start",
+      revision_provenance_status: "valid",
+    })
   })
 
   test("lazy serve path captures dedicated subject revision environment variable", async () => {
@@ -5180,6 +5226,190 @@ describe("case trace", () => {
     assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
   })
 
+  test("trace publication reports an explicit finish once after terminal persistence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-publication-finish-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "trace-publication-finish.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.setSessionID("ses_publication")`,
+        `CaseTrace.finish({ status: "success" })`,
+        `CaseTrace.finish({ status: "success" })`,
+        `process.stdout.write("agent output\\n")`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_QUIET: "0",
+        OPENCODE_CASE_ID: "trace-publication-finish",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const code = await proc.exited
+    const stdout = await new Response(proc.stdout).text()
+    const stderr = await new Response(proc.stderr).text()
+    const caseDir = path.join(dir, "trace-publication-finish")
+
+    expect(code).toBe(0)
+    expect(stdout).toBe("agent output\n")
+    expect(stderr.match(/Session trace saved/g)).toHaveLength(1)
+    expect(stderr).toContain("session: ses_publication")
+    expect(stderr).toContain(path.join(caseDir, "trace.html"))
+    expect(stderr).toContain(path.join(caseDir, "trace.json"))
+    expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
+  })
+
+  test("trace publication reports SIGTERM persistence once without changing its exit code", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-publication-sigterm-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "trace-publication-sigterm.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.setSessionID("ses_publication")`,
+        `CaseTrace.node({ node_id: "trace_publication_sigterm_ready", kind: "verification", component: "runtime", title: "ready" })`,
+        `;(CaseTrace.get() as any).writePartial(true)`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_QUIET: "0",
+        OPENCODE_CASE_ID: "trace-publication-sigterm",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const caseDir = path.join(dir, "trace-publication-sigterm")
+    expect(await waitForCompleteCausalIRCheckpoint(caseDir, "trace_publication_sigterm_ready")).toBeDefined()
+
+    proc.kill("SIGTERM")
+    const code = await proc.exited
+    const stdout = await new Response(proc.stdout).text()
+    const stderr = await new Response(proc.stderr).text()
+
+    expect(code).toBe(143)
+    expect(stdout).toBe("")
+    expect(stderr.match(/Session trace saved/g)).toHaveLength(1)
+    expect(stderr).toContain("session: ses_publication")
+    expect(stderr).toContain(path.join(caseDir, "trace.html"))
+    expect(stderr).toContain(path.join(caseDir, "trace.json"))
+    expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
+  })
+
+  const publicationExitFixtures: ReadonlyArray<{
+    mode: string
+    exitCode: number
+    status: string
+    signal?: NodeJS.Signals
+    partialOnly?: boolean
+  }> = [
+    { mode: "beforeExit", exitCode: 0, status: "completed" },
+    { mode: "SIGINT", exitCode: 130, status: "cancelled", signal: "SIGINT" },
+    { mode: "SIGHUP", exitCode: 129, status: "cancelled", signal: "SIGHUP" },
+    { mode: "uncaughtException", exitCode: 1, status: "failed" },
+    { mode: "unhandledRejection", exitCode: 1, status: "failed" },
+    { mode: "partialEmergency", exitCode: 0, status: "partial", partialOnly: true },
+  ]
+  for (const fixture of publicationExitFixtures) {
+    test(`trace publication covers ${fixture.mode} exactly once on stderr`, async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-trace-publication-${fixture.mode}-`))
+      const packageDir = path.resolve(import.meta.dir, "../..")
+      const script = path.join(dir, `trace-publication-${fixture.mode}.ts`)
+      const caseID = `trace-publication-${fixture.mode}`
+      const marker = `trace_publication_${fixture.mode}_ready`
+      const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+      const terminalLines =
+        fixture.mode === "beforeExit"
+          ? []
+          : fixture.mode === "uncaughtException"
+            ? [`throw new Error("publication uncaught exception")`]
+            : fixture.mode === "unhandledRejection"
+              ? [`Promise.reject(new Error("publication unhandled rejection"))`, `setInterval(() => {}, 1000)`]
+              : fixture.mode === "partialEmergency"
+                ? [
+                    `const trace = CaseTrace.get() as any`,
+                    `const originalSafeWrite = trace.safeWrite.bind(trace)`,
+                    `trace.safeWrite = (target: string, content: unknown) => target === trace.partialFile ? originalSafeWrite(target, content) : false`,
+                    `CaseTrace.finish({ status: "error", result: { reason: "forced_partial_emergency" } })`,
+                  ]
+                : [`setInterval(() => {}, 1000)`]
+
+      await fs.writeFile(
+        script,
+        [
+          `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+          `CaseTrace.setSessionID("ses_${fixture.mode}")`,
+          `CaseTrace.node({ node_id: ${JSON.stringify(marker)}, kind: "verification", component: "runtime", title: "ready" })`,
+          `;(CaseTrace.get() as any).writePartial(true)`,
+          ...terminalLines,
+        ].join("\n"),
+      )
+
+      const proc = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: "1",
+          OPENCODE_CASE_TRACE_QUIET: "0",
+          OPENCODE_CASE_ID: caseID,
+          OPENCODE_CASE_TRACE_DIR: dir,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const caseDir = path.join(dir, caseID)
+      if (fixture.signal) {
+        expect(await waitForCompleteCausalIRCheckpoint(caseDir, marker)).toBeDefined()
+        proc.kill(fixture.signal)
+      }
+      const code = await proc.exited
+      const stdout = await new Response(proc.stdout).text()
+      const stderr = await new Response(proc.stderr).text()
+      const traceFile = path.join(caseDir, "trace.json")
+      const htmlFile = path.join(caseDir, "trace.html")
+      const partialFile = path.join(caseDir, "partial", "latest.json")
+
+      expect(code).toBe(fixture.exitCode)
+      expect(stdout).toBe("")
+      expect(stderr.match(/Session trace saved/g)).toHaveLength(1)
+      expect(stderr).toContain(`session: ses_${fixture.mode}`)
+      expect(stderr).toContain(`status: ${fixture.status}`)
+      expect(stderr).toContain(`directory: ${caseDir}`)
+      expect(stderr).toContain(`partial: ${partialFile}`)
+      expect(await exists(partialFile)).toBe(true)
+      if (fixture.partialOnly) {
+        expect(stderr).not.toContain(`html: ${htmlFile}`)
+        expect(stderr).not.toContain(`json: ${traceFile}`)
+        expect(await exists(htmlFile)).toBe(false)
+        expect(await exists(traceFile)).toBe(false)
+      } else {
+        expect(stderr).toContain(`html: ${htmlFile}`)
+        expect(stderr).toContain(`json: ${traceFile}`)
+        expect(await exists(htmlFile)).toBe(true)
+        expect(await exists(traceFile)).toBe(true)
+      }
+    })
+  }
+
   test("flushes before an earlier server signal listener exits the process", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-signal-listener-order-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -6570,7 +6800,8 @@ describe("case trace", () => {
     expect(slice.hash).toBe(createHash("sha256").update(sliceBytes).digest("hex").slice(0, 16))
   })
 
-  test("renders artifact-backed summaries with expandable full content", () => {
+  test("renders authorized artifact-backed summaries with expandable full content", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-authorized-artifact-html-"))
     const trace = {
       trace_version: "1.0",
       case_id: "artifact-html-case",
@@ -6618,13 +6849,22 @@ describe("case trace", () => {
       events: [],
     } as TraceSummary
 
-    const html = renderCaseTraceHtml(trace, {
-      artifactContents: new Map([["artifact_1", "full semantic model messages payload"]]),
-    } as any)
+    try {
+      await fs.mkdir(path.join(dir, "artifacts"), { recursive: true })
+      await fs.writeFile(path.join(dir, "artifacts/artifact_1.txt"), "authoritative artifact body")
+      const html = renderCaseTraceHtml(trace, {
+        artifactDir: dir,
+        artifactContents: new Map([["artifact_1", "full semantic model messages payload"]]),
+      } as any)
 
-    expect(html).toContain("Artifacts")
-    expect(html).toContain("查看完整内容")
-    expect(html).toContain("full semantic model messages payload")
+      expect(html).toContain("Artifacts")
+      expect(html).toContain("查看完整内容")
+      expect(html).toContain("full semantic model messages payload")
+      const snapshotDigest = createHash("sha256").update("authoritative artifact body").digest("hex")
+      expect(html).toContain(`href="artifacts/render-snapshots/sha256/${snapshotDigest}"`)
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   test("persists semantic trace records with artifacts and redaction", async () => {
@@ -8514,7 +8754,10 @@ describe("case trace", () => {
     expect(baseline.code).toBe(0)
     expect(failedTrace.code).toBe(0)
     expect(baseline.stderr).toBe("")
-    expect(failedTrace.stderr).toBe("")
+    expect(failedTrace.stderr).toContain("[opencode-observability] terminal trace persistence failed")
+    expect(failedTrace.stderr).toContain('"trace":false')
+    expect(failedTrace.stderr).toContain('"canonical_removed":false')
+    expect(failedTrace.stderr).not.toContain("stable agent result")
     expect(failedTrace.stdout).toEqual(baseline.stdout)
     expect(failedTrace.hash).toBe(baseline.hash)
     const caseDir = path.join(traceRoot, "passive-write-failure-case")

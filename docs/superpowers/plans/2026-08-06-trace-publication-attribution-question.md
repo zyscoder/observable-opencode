@@ -71,7 +71,11 @@ test("reports only terminal files that exist", async () => {
 
 - [ ] **Step 2: 验证测试先失败**
 
-Run: `bun test packages/opencode/test/observability/trace-publication.test.ts`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/trace-publication.test.ts
+```
 
 Expected: FAIL，提示 `trace-publication` 模块不存在。
 
@@ -101,7 +105,11 @@ export function reportTracePublication(input: TracePublication, write?: (text: s
 
 - [ ] **Step 4: 验证纯模块测试通过**
 
-Run: `bun test packages/opencode/test/observability/trace-publication.test.ts`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/trace-publication.test.ts
+```
 
 Expected: PASS。
 
@@ -149,7 +157,11 @@ expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
 
 - [ ] **Step 2: 验证集成测试先失败**
 
-Run: `bun test packages/opencode/test/observability/case-trace.test.ts -t "trace publication"`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/case-trace.test.ts -t "trace publication"
+```
 
 Expected: FAIL，`stderr` 中没有终态回执。
 
@@ -181,13 +193,21 @@ private publishTerminalLocation(status: TracePublicationStatus) {
 
 - [ ] **Step 4: 验证正常、重复 finish 和三类信号**
 
-Run: `bun test packages/opencode/test/observability/case-trace.test.ts -t "trace publication|receives SIGINT|receives SIGTERM|signal listener"`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/case-trace.test.ts -t "trace publication|receives SIGINT|receives SIGTERM|signal listener"
+```
 
 Expected: PASS；`stdout` 不变，信号退出码不变，每个 fixture 仅一份回执。
 
 - [ ] **Step 5: 运行 Trace 回归**
 
-Run: `bun test packages/opencode/test/observability/trace-publication.test.ts packages/opencode/test/observability/case-trace.test.ts`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/trace-publication.test.ts test/observability/case-trace.test.ts
+```
 
 Expected: PASS，现有 stderr 空值断言通过静默环境保持兼容。
 
@@ -483,11 +503,19 @@ python3 -m trace_attribution \
 
 - [ ] **Step 2: 运行 TypeScript 格式与测试**
 
-Run: `bun test packages/opencode/test/observability/trace-publication.test.ts packages/opencode/test/observability/case-trace.test.ts`
+Run:
+```bash
+cd packages/opencode
+bun test test/observability/trace-publication.test.ts test/observability/case-trace.test.ts
+```
 
 Expected: PASS。
 
-Run: `bun run --cwd packages/opencode typecheck`
+Run:
+```bash
+cd packages/opencode
+bun run typecheck
+```
 
 Expected: PASS。
 

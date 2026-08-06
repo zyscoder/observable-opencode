@@ -37,13 +37,23 @@ def _full_cache_stats(*, enabled, path):
 
 def _provider_for_state(state, cache_stats, *, cache_identity="cache:test"):
     provider = {
-        "schema": "recursive-provider-state/v1",
+        "schema": "recursive-provider-state/v3",
         "circuit": {
             "open": True,
             "reason": "persisted Fix35 circuit",
             "consecutive_provider_errors": 2,
             "provider_error_threshold": 7,
+            "disposition": {
+                "retryable": True,
+                "category": "http_retryable",
+                "status_code": 503,
+                "error_code": "service_unavailable",
+                "reason": "persisted Fix35 circuit",
+            },
+            "first_request": 1,
+            "first_failure_at": "2026-07-31T00:00:00Z",
         },
+        "previous_failure": None,
         "cache_identity": cache_identity,
         "cache_stats": copy.deepcopy(cache_stats),
         "accounting": {

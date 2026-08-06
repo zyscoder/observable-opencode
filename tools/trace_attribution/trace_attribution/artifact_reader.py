@@ -188,6 +188,82 @@ class VerifiedArtifactReader:
         )
 
 
+class PinnedVerifiedArtifactReader(VerifiedArtifactReader):
+    """Expose only artifact bytes retained by a completed bundle validation."""
+
+    def __init__(
+        self,
+        artifact_index: Dict[str, JsonDict],
+        pinned_content: Dict[str, bytes],
+    ) -> None:
+        private_index = {
+            str(artifact_id): dict(artifact)
+            for artifact_id, artifact in artifact_index.items()
+        }
+        super().__init__(
+            {
+                artifact_id: dict(artifact)
+                for artifact_id, artifact in private_index.items()
+            },
+            None,
+        )
+        self._pinned_artifact_index = private_index
+        self._pinned_content = {
+            str(artifact_id): bytes(content)
+            for artifact_id, content in pinned_content.items()
+        }
+
+    def _read_uncached(self, artifact_id: str) -> VerifiedArtifact:
+        artifact = self._pinned_artifact_index.get(artifact_id)
+        if not isinstance(artifact, dict):
+            return _unavailable(artifact_id, "artifact_not_indexed")
+        content_bytes = self._pinned_content.get(artifact_id)
+        if content_bytes is None:
+            return _unavailable(artifact_id, "pinned_artifact_missing")
+        manifest_hash = artifact.get("content_hash") or artifact.get("hash")
+        if not content_hash_matches(content_bytes, manifest_hash):
+            return _unavailable(
+                artifact_id,
+                "pinned_artifact_hash_mismatch",
+                file_hash_status="mismatch",
+                hash_mismatch=True,
+                file_available=True,
+            )
+        if not valid_declared_byte_length(artifact, len(content_bytes)):
+            return _unavailable(
+                artifact_id,
+                "pinned_artifact_byte_length_mismatch",
+                file_hash_status="byte_length_mismatch",
+                file_available=True,
+            )
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return _unavailable(
+                artifact_id,
+                "pinned_artifact_invalid_utf8",
+                file_hash_status="invalid_utf8",
+                file_available=True,
+            )
+        manifest_identity = str(manifest_hash or "").strip()
+        return VerifiedArtifact(
+            artifact_id=artifact_id,
+            content=content,
+            content_bytes=content_bytes,
+            source="bundle_file",
+            truncated=False,
+            byte_ranges=((0, len(content_bytes)),),
+            file_hash_status="verified",
+            slice_hash_status="not_used",
+            semantic_slice_count=0,
+            rejected_semantic_slice_count=0,
+            failures=(),
+            hash_mismatch=False,
+            file_available=True,
+            file_identity=(len(content_bytes), 0, 0, manifest_identity),
+        )
+
+
 def case_relative_artifact_path(value: str) -> bool:
     if not value or "\x00" in value or "\\" in value or re.match(r"^[A-Za-z]:", value):
         return False

@@ -44,6 +44,13 @@ from .checkpoint import (
     build_checkpoint_config,
     publish_output_transaction,
 )
+from .candidate_clustering import (
+    CandidateCluster,
+    CandidateClusterManifest,
+    CandidateFact,
+    build_candidate_cluster_manifest,
+    validate_candidate_cluster_shadow_event,
+)
 from .graph import TraceGraph
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
@@ -78,17 +85,32 @@ from .recursive_analyzer import (
     RecursiveAnalysisState,
     SeedAttributionBuilder,
 )
+from .request import (
+    AttributionOptions,
+    AttributionQuestion,
+    AttributionRequest,
+    AttributionResult,
+    normalize_question,
+)
+from .service import analyze
 
 __all__ = [
     "AttributionReport",
     "AttributionHypothesis",
     "AttributionControlDirective",
     "AgenticRecursiveAnalyzer",
+    "AttributionOptions",
+    "AttributionQuestion",
+    "AttributionRequest",
+    "AttributionResult",
     "BackwardTaintAnalyzer",
     "BoundedJudgeCapability",
     "BoundedJudgeCallResult",
     "BoundedJudgeCallError",
     "CausalCandidate",
+    "CandidateCluster",
+    "CandidateClusterManifest",
+    "CandidateFact",
     "CandidateEvidenceCapsule",
     "CausalFactor",
     "CausalInvestigationTools",
@@ -125,6 +147,7 @@ __all__ = [
     "TraceGraph",
     "TraceNode",
     "annotate_report_semantic_anchors",
+    "analyze",
     "active_focus_text_sha256",
     "semantic_anchor_id",
     "semantic_anchor_index",
@@ -136,8 +159,10 @@ __all__ = [
     "confirmation_response_identity_for",
     "is_definitive_confirmation",
     "normalize_active_focus_text",
+    "normalize_question",
     "seed_binding_identity_for",
     "build_checkpoint_config",
+    "build_candidate_cluster_manifest",
     "build_candidate_evidence_capsules",
     "candidate_compression_metrics",
     "global_fusion_payload_decision",
@@ -145,4 +170,5 @@ __all__ = [
     "publish_output_transaction",
     "validate_active_focus_binding",
     "validate_root_confirmation_substantive_invariants",
+    "validate_candidate_cluster_shadow_event",
 ]

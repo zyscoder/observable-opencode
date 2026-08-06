@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
+import multiprocessing
+import os
 import shutil
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +19,7 @@ from trace_attribution.causal_judge import (
     BoundedJudgeCallResult,
     BoundedJudgeCapability,
     OfflineJudgeCapability,
+    root_confirmation_request_projection_identity,
 )
 from trace_attribution.global_judge import (
     GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION,
@@ -28,6 +33,7 @@ from trace_attribution.causal_state import (
     AttributionHypothesis,
     CausalStepJudgment,
     DefectState,
+    FactorRoleJudgment,
     FrontierItem,
     LocalStateOwner,
     PredecessorAssessment,
@@ -41,20 +47,31 @@ from trace_attribution.causal_state import (
 )
 from trace_attribution.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    FACTOR_ROLE_CONTRACT_IDENTITY,
+    OUTPUT_SCHEMA_VERSION,
     CheckpointBundle,
     CheckpointCompatibilityError,
     CheckpointCorruptionError,
+    CheckpointLockError,
     CheckpointState,
+    CompletedCheckpointReplayProof,
+    LegacyProjectionNotRequired,
+    LegacyProjectionRequired,
     _sha256,
     build_checkpoint_config,
+    publish_output_transaction,
+    validate_checkpoint_config,
 )
 from trace_attribution.graph import TraceGraph
 from trace_attribution.hypotheses import HypothesisLedger, RecursiveFrontier
 from trace_attribution.models import stable_json
 from trace_attribution.recursive_analyzer import (
+    ACTION_STATE_SCHEMA,
     AgenticRecursiveAnalyzer,
     RecursiveAnalysisState,
+    classify_legacy_projection_shape,
     _provider_state_payload,
+    _validate_provider_state,
 )
 
 
@@ -183,6 +200,7 @@ def trace_with_audit_only_external() -> dict:
 
 
 def sample_config(**changes: object) -> dict:
+    fusion_mode = changes.pop("fusion_mode", None)
     values = {
         "trace": sample_trace(),
         "case_id": "checkpoint-case",
@@ -208,7 +226,342 @@ def sample_config(**changes: object) -> dict:
         },
     }
     values.update(changes)
+    if fusion_mode is not None:
+        values["runtime_identity"] = {
+            **values["runtime_identity"],
+            "fusion_mode": fusion_mode,
+        }
     return build_checkpoint_config(**values)
+
+
+def completed_replay_bundle(root: Path, *, report=None):
+    config = sample_config()
+    report = report or {
+        "schema_version": "completed-replay-test/v1",
+        "case_id": "checkpoint-case",
+        "result": "complete",
+    }
+    lineage = {
+        "version": "1.0",
+        "collection_mode": "offline_passive_reconstruction",
+        "behavior_impact": "none",
+        "turns": [],
+        "snapshots": [],
+        "edges": [],
+        "gaps": [],
+        "stats": {},
+        "progress_reconstruction": {},
+    }
+    bundle = CheckpointBundle(root / "report.checkpoint")
+    bundle.initialize(config)
+    output = publish_output_transaction(
+        bundle=bundle,
+        attribution_path=root / "report.json",
+        lineage_path=root / "report.message-lineage.json",
+        report=report,
+        message_lineage=lineage,
+    )
+    bundle.mark_analysis_completed(
+        report=report,
+        output_commit=output,
+    )
+    return bundle, config, report, lineage
+
+
+def exact_legacy_projection_report():
+    return {
+        "schema_version": "completed-replay-test/v1",
+        "case_id": "checkpoint-case",
+        "investigation_journal": [
+            {
+                "behavior_impact": "none_offline_analysis_only",
+                "candidate_compression": {
+                    "candidate_byte_reduction_ratio": 0.5,
+                    "candidate_count": 4,
+                    "candidate_node_reduction_ratio": 0.5,
+                    "capsule_bytes": 100,
+                    "global_fusion_payload": {
+                        "capsule_to_trace_expansion_ratio": 0.5,
+                        "dense_root_matrix": True,
+                        "eligible": False,
+                        "max_open_root_candidates": 3,
+                        "max_payload_bytes": 65536,
+                        "negative_compression": False,
+                        "open_root_candidate_count": 4,
+                        "oversized": True,
+                        "reason": "oversized_dense_root_matrix",
+                    },
+                    "open_root_candidate_count": 4,
+                    "trace_json_bytes": 200,
+                    "trace_node_count": 8,
+                },
+                "defect_fingerprint": "defect-one",
+                "fallback": "recursive_backward_taint",
+                "kind": "global_candidate_gate",
+                "reason": "oversized_dense_root_matrix",
+                "seed_ref": "record:only",
+                "status": "bypassed",
+            }
+        ],
+        "metadata": {
+            "analysis": "agentic_recursive_semantic_taint",
+            "fusion_mode": "off",
+            "global_candidate_pass_count": 0,
+            "global_judge_physical_request_count": 0,
+            "global_candidate_judgments": [],
+            "candidate_compression": [],
+            "recursive_expansion_reasons": [],
+            "global_candidate_failures": [],
+        },
+    }
+
+
+def _write_hashed_json(path: Path, value: dict, hash_key: str) -> None:
+    unsigned = {key: item for key, item in value.items() if key != hash_key}
+    value[hash_key] = _sha256(unsigned)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _rewrite_bundle_as_legal_v27(bundle: CheckpointBundle) -> None:
+    legacy_schema = "recursive-attribution-checkpoint/v27"
+
+    def legacy_provider_state(value):
+        if isinstance(value, list):
+            return [legacy_provider_state(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        migrated = {
+            key: legacy_provider_state(item) for key, item in value.items()
+        }
+        if str(migrated.get("schema") or "").startswith(
+            "recursive-provider-state/"
+        ):
+            circuit = dict(migrated["circuit"])
+            migrated.pop("previous_failure", None)
+            for key in (
+                "disposition",
+                "first_request",
+                "first_failure_at",
+                "opened_at",
+            ):
+                circuit.pop(key, None)
+            migrated["schema"] = "recursive-provider-state/v1"
+            migrated["circuit"] = circuit
+            unsigned = {
+                key: item for key, item in migrated.items() if key != "identity"
+            }
+            migrated["identity"] = _sha256(unsigned)
+        return migrated
+
+    journal_heads = {}
+    for name, path in (
+        ("frontier", bundle.frontier_path),
+        ("hypotheses", bundle.hypotheses_path),
+        ("actions", bundle.actions_path),
+    ):
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        previous_hash = ""
+        for record in records:
+            record["schema_version"] = legacy_schema
+            record["payload"] = legacy_provider_state(record["payload"])
+            record["previous_hash"] = previous_hash
+            unsigned = {
+                key: item for key, item in record.items() if key != "record_hash"
+            }
+            record["record_hash"] = _sha256(unsigned)
+            previous_hash = record["record_hash"]
+        path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+        journal_heads[name] = {
+            "count": len(records),
+            "sequence": len(records),
+            "record_hash": previous_hash,
+        }
+
+    commit = json.loads(bundle.commit_path.read_text(encoding="utf-8"))
+    commit["schema_version"] = legacy_schema
+    commit["journal_heads"] = journal_heads
+    _write_hashed_json(bundle.commit_path, commit, "commit_hash")
+
+    manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    config = dict(manifest["config"])
+    config["schema_version"] = legacy_schema
+    config["runtime_identity"] = dict(config["runtime_identity"])
+    config["runtime_identity"].pop("fusion_mode", None)
+    semantic = {
+        key: item for key, item in config.items() if key != "config_fingerprint"
+    }
+    config["config_fingerprint"] = _sha256(semantic)
+    manifest["schema_version"] = legacy_schema
+    manifest["config"] = config
+    _write_hashed_json(bundle.manifest_path, manifest, "manifest_hash")
+
+
+def _visible_checkpoint_root(root: Path) -> Path:
+    current = root / "CURRENT"
+    if not current.is_file():
+        return root
+    relative = current.read_text(encoding="utf-8").strip()
+    if not relative:
+        raise AssertionError("CURRENT must name a generation")
+    return root / relative
+
+
+def _checkpoint_carrier_schemas(root: Path) -> set[str]:
+    active = _visible_checkpoint_root(root)
+    schemas = {
+        json.loads((active / "manifest.json").read_text(encoding="utf-8"))[
+            "schema_version"
+        ],
+        json.loads((active / "commit.json").read_text(encoding="utf-8"))[
+            "schema_version"
+        ],
+    }
+    for name in (
+        "frontier.jsonl",
+        "hypotheses.jsonl",
+        "investigation-actions.jsonl",
+    ):
+        schemas.update(
+            json.loads(line)["schema_version"]
+            for line in (active / name).read_text(encoding="utf-8").splitlines()
+        )
+    return schemas
+
+
+def _migration_pause_worker(root, config, paused, release, result):
+    def pause_before_current(stage):
+        if stage != "migration_generation_directory_durable":
+            return
+        paused.set()
+        if not release.wait(10):
+            raise AssertionError("stale migration release timed out")
+
+    try:
+        state = CheckpointBundle(
+            Path(root),
+            fault_hook=pause_before_current,
+        ).restore(expected_config=config)
+        result.put(("ok", state.transaction_sequence))
+    except BaseException as exc:
+        result.put(("error", repr(exc)))
+
+
+def _migration_append_worker(root, config, started, finished, result):
+    started.set()
+    try:
+        bundle = CheckpointBundle(Path(root))
+        bundle.initialize(config)
+        bundle.record_action(
+            "concurrent_append",
+            "concurrency:migration-writer",
+            {"writer": "migration-writer"},
+        )
+        result.put(("ok", "migration-writer"))
+    except BaseException as exc:
+        result.put(("error", repr(exc)))
+    finally:
+        finished.set()
+
+
+def _barrier_append_worker(
+    root,
+    config,
+    writer,
+    ready,
+    start,
+    finished,
+    result,
+):
+    try:
+        bundle = CheckpointBundle(Path(root))
+        bundle.initialize(config)
+        ready.put(writer)
+        if not start.wait(10):
+            raise AssertionError("concurrent writer start timed out")
+        bundle.record_action(
+            "concurrent_append",
+            "concurrency:{0}".format(writer),
+            {"writer": writer},
+        )
+        result.put(("ok", writer))
+    except BaseException as exc:
+        result.put(("error", writer, repr(exc)))
+    finally:
+        finished.set()
+
+
+def _spanning_reader_worker(root, config, paused, release, result):
+    bundle = CheckpointBundle(Path(root))
+    read_commit = bundle._read_commit
+
+    def pause_after_generation_resolution():
+        paused.set()
+        if not release.wait(10):
+            raise AssertionError("spanning reader release timed out")
+        return read_commit()
+
+    bundle._read_commit = pause_after_generation_resolution
+    try:
+        state = bundle.restore(expected_config=config)
+        result.put(("ok", state.transaction_sequence))
+    except BaseException as exc:
+        result.put(("error", repr(exc)))
+
+
+def _checkpoint_regular_file_bytes(root: Path) -> int:
+    return sum(
+        path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name != ".checkpoint.lock"
+    )
+
+
+def _resign_completed_lineage(bundle: CheckpointBundle, lineage: dict) -> None:
+    output = json.loads(bundle.output_commit_path.read_text(encoding="utf-8"))
+    lineage_path = Path(output["lineage_path"])
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    output["lineage_hash"] = hashlib.sha256(lineage_path.read_bytes()).hexdigest()
+    _write_hashed_json(bundle.output_commit_path, output, "output_commit_hash")
+
+    actions = [
+        json.loads(line)
+        for line in bundle.actions_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal = actions[-1]
+    terminal["payload"]["lineage_hash"] = output["lineage_hash"]
+    terminal["payload"]["output_commit_hash"] = output["output_commit_hash"]
+    unsigned_terminal = {
+        key: item for key, item in terminal.items() if key != "record_hash"
+    }
+    terminal["record_hash"] = _sha256(unsigned_terminal)
+    bundle.actions_path.write_text(
+        "".join(
+            json.dumps(action, ensure_ascii=False, sort_keys=True) + "\n"
+            for action in actions
+        ),
+        encoding="utf-8",
+    )
+
+    commit = json.loads(bundle.commit_path.read_text(encoding="utf-8"))
+    commit["journal_heads"]["actions"]["record_hash"] = terminal["record_hash"]
+    _write_hashed_json(bundle.commit_path, commit, "commit_hash")
 
 
 class CountingOfflineJudge(OfflineJudgeCapability):
@@ -329,6 +682,11 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     )
     refresh_checkpoint_confirmation_response_identity(confirmation)
     root = report_payload["confirmed_roots"][0]
+    role_binding = copy.deepcopy(
+        root.get("provenance", {}).get("active_role_binding")
+    )
+    if role_binding is not None:
+        role_binding["candidate_ref"] = ghost_ref
     root["node_ref"] = ghost_ref
     root["recursive_path"] = list(confirmation["recursive_path"])
     root["counterfactual"] = confirmation["counterfactual"]
@@ -336,6 +694,8 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
     root["provenance"] = canonical_confirmation_publication_provenance(
         RootConfirmation.from_dict(confirmation)
     )
+    if role_binding is not None:
+        root["provenance"]["active_role_binding"] = role_binding
     report_payload["root_causes"][0]["node_ref"] = ghost_ref
     seed["confirmed_root_refs"] = [ghost_ref]
     seed["confirmation_identities"] = [confirmation["confirmation_identity"]]
@@ -343,6 +703,9 @@ def forge_checkpoint_root_identity(report_payload: dict, ghost_ref: str) -> None
 
 def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) -> None:
     confirmation = report_payload["confirmations"][0]
+    old_path = list(confirmation["recursive_path"])
+    old_confirmation_identity = confirmation["confirmation_identity"]
+    old_response_identity = confirmation["response_identity"]
     confirmation["recursive_path"] = list(recursive_path)
     confirmation["confirmation_identity"] = confirmation_identity_for(
         hypothesis_id=confirmation["hypothesis_id"],
@@ -353,47 +716,134 @@ def forge_checkpoint_root_path(report_payload: dict, recursive_path: list[str]) 
         seed_binding_identity=confirmation["seed_binding_identity"],
     )
     refresh_checkpoint_confirmation_response_identity(confirmation)
+    new_confirmation_identity = confirmation["confirmation_identity"]
+    new_response_identity = confirmation["response_identity"]
+
+    metadata = report_payload["metadata"]
+    request_surfaces = [
+        metadata["confirmation_queue"][0],
+        metadata["confirmation_journal"][0],
+        metadata["confirmation_action_projection"][0],
+    ]
+    canonical_request = copy.deepcopy(
+        request_surfaces[0]["factual_request_projection"]
+    )
+    request_facts = canonical_request["facts"]
+    request_facts["recursive_path"] = list(recursive_path)
+    references_by_ref = {
+        item["resolved_ref"]: item
+        for item in request_facts["recursive_path_references"]
+    }
+    request_facts["recursive_path_references"] = [
+        copy.deepcopy(references_by_ref[ref]) for ref in recursive_path
+    ]
+    old_request_identity = request_surfaces[0]["semantic_identity"]
+    new_request_identity = root_confirmation_request_projection_identity(
+        canonical_request
+    )
+
+    def rewrite(value):
+        if isinstance(value, dict):
+            for key, item in list(value.items()):
+                if key == "recursive_path" and item == old_path:
+                    value[key] = list(recursive_path)
+                elif item == old_confirmation_identity:
+                    value[key] = new_confirmation_identity
+                elif item == old_response_identity:
+                    value[key] = new_response_identity
+                elif isinstance(item, str) and old_request_identity in item:
+                    value[key] = item.replace(
+                        old_request_identity,
+                        new_request_identity,
+                    )
+                else:
+                    rewrite(item)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if item == old_confirmation_identity:
+                    value[index] = new_confirmation_identity
+                elif item == old_response_identity:
+                    value[index] = new_response_identity
+                elif isinstance(item, str) and old_request_identity in item:
+                    value[index] = item.replace(
+                        old_request_identity,
+                        new_request_identity,
+                    )
+                else:
+                    rewrite(item)
+
+    rewrite(report_payload)
+    for surface in request_surfaces:
+        surface["factual_request_projection"] = copy.deepcopy(
+            canonical_request
+        )
+        surface["confirmation"] = copy.deepcopy(confirmation)
+        surface["response_identity"] = new_response_identity
     root = report_payload["confirmed_roots"][0]
+    role_binding = copy.deepcopy(
+        root.get("provenance", {}).get("active_role_binding")
+    )
     root["recursive_path"] = list(recursive_path)
     root["confirmation"] = copy.deepcopy(confirmation)
     root["provenance"] = canonical_confirmation_publication_provenance(
         RootConfirmation.from_dict(confirmation)
     )
+    if role_binding is not None:
+        root["provenance"]["active_role_binding"] = role_binding
     report_payload["seed_results"][0]["confirmation_identities"] = [
         confirmation["confirmation_identity"]
     ]
 
 
 def forge_checkpoint_factor_path(payload: dict, recursive_path: list[str]) -> None:
-    factor = payload["contributing_conditions"][0]
-    old_identity = factor["confirmation"]["confirmation_identity"]
-    confirmation = next(
+    container = payload.get("metadata", payload)
+    action_key = (
+        "factor_role_action_projections"
+        if "factor_role_action_projections" in container
+        else "factor_role_action_projection"
+    )
+    action = container[action_key][0]
+    original = FactorRoleJudgment.from_dict(action["judgment"])
+    rewritten = replace(
+        original,
+        recursive_path=tuple(recursive_path),
+    )
+    action["judgment"] = rewritten.to_dict()
+    action["judgment_identity"] = rewritten.judgment_identity
+    container["factor_role_judgments"] = [rewritten.to_dict()]
+    container["factor_role_journal"] = [
+        {**copy.deepcopy(action), "status": "completed"}
+    ]
+    queue = next(
         item
-        for item in payload["confirmations"]
-        if item["confirmation_identity"] == old_identity
+        for item in container["confirmation_queue"]
+        if item["review_scope"] == "non_root"
+        and item["candidate_ref"] == rewritten.candidate_ref
     )
-    confirmation["recursive_path"] = list(recursive_path)
-    confirmation["confirmation_identity"] = confirmation_identity_for(
-        hypothesis_id=confirmation["hypothesis_id"],
-        hypothesis_semantic_hash=confirmation["hypothesis_semantic_hash"],
-        candidate_ref=confirmation["candidate_ref"],
-        defect_fingerprint=confirmation["defect_fingerprint"],
-        recursive_path=confirmation["recursive_path"],
-        seed_binding_identity=confirmation["seed_binding_identity"],
-    )
-    refresh_checkpoint_confirmation_response_identity(confirmation)
-    factor["recursive_path"] = list(recursive_path)
-    factor["confirmation"] = copy.deepcopy(confirmation)
-    factor["provenance"] = canonical_confirmation_publication_provenance(
-        RootConfirmation.from_dict(confirmation)
-    )
-    for seed in payload["seed_ledger"] if "seed_ledger" in payload else payload["seed_results"]:
-        seed["confirmation_identities"] = [
-            confirmation["confirmation_identity"]
-            if identity == old_identity
-            else identity
-            for identity in seed["confirmation_identities"]
-        ]
+    queue["factor_role_judgment"] = rewritten.to_dict()
+    queue["response_identity"] = rewritten.judgment_identity
+    for collection, embedded_key in (
+        ("contributing_conditions", "confirmation"),
+        ("amplifying_factors", "confirmation"),
+        ("downstream_materializations", "role_judgment"),
+        ("rejected_candidates", "confirmation"),
+    ):
+        for publication in payload.get(collection) or ():
+            candidate_ref = str(
+                publication.get("node_ref")
+                or publication.get("candidate_ref")
+                or ""
+            )
+            if candidate_ref != rewritten.candidate_ref:
+                continue
+            publication["recursive_path"] = list(recursive_path)
+            publication[embedded_key] = rewritten.to_dict()
+            publication["provenance"]["response_identity"] = (
+                rewritten.judgment_identity
+            )
+            publication["provenance"]["judgment_identity"] = (
+                rewritten.judgment_identity
+            )
 
 
 class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapability):
@@ -431,6 +881,14 @@ class InterruptingGlobalNoDefectJudge(CountingOfflineJudge, GlobalJudgeCapabilit
                 },
                 compared_candidate_refs=request.open_authored_root_candidate_refs,
                 causal_role="exculpatory_evidence",
+                responsibility="none",
+                candidate_phase="intermediate",
+                obligation_status_before="unknown",
+                obligation_status_after="unknown",
+                repair_window_effect="remained_open",
+                failure_mode="none",
+                obligation_refs=(),
+                contribution_mechanism=None,
                 reason="The scripted evidence refutes this observed defect.",
                 evidence_refs=(capsule.candidate_ref,),
                 confidence=1.0,
@@ -709,6 +1167,270 @@ class InjectedRestoreCheckpoint:
 
 
 class CausalCheckpointTest(unittest.TestCase):
+    def test_completed_replay_derives_proof_without_pre_authorizing_migration(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle, config, report, lineage = completed_replay_bundle(Path(tempdir))
+
+            replay = CheckpointBundle(bundle.root).restore_for_replay(
+                expected_config=config,
+                expected_lineage=lineage,
+            )
+
+            self.assertEqual(replay.state.final_report, report)
+            proof = replay.replay_proof
+            self.assertIsInstance(proof, CompletedCheckpointReplayProof)
+            self.assertEqual(
+                proof.schema_version,
+                "completed-checkpoint-replay-proof/v1",
+            )
+            self.assertEqual(
+                proof.config_fingerprint,
+                config["config_fingerprint"],
+            )
+            self.assertEqual(
+                {name for name, _, _, _ in proof.journal_heads},
+                {"frontier", "hypotheses", "actions"},
+            )
+            self.assertEqual(
+                proof.proof_identity,
+                proof.recomputed_identity(),
+            )
+            self.assertFalse(hasattr(replay, "migration_decision"))
+
+    def test_completed_replay_reuses_published_output_without_appending(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle, config, report, lineage = completed_replay_bundle(
+                Path(tempdir)
+            )
+            replay_bundle = CheckpointBundle(bundle.root)
+            before_actions = bundle.actions_path.read_bytes()
+            replay_bundle.restore_for_replay(
+                expected_config=config,
+                expected_lineage=lineage,
+            )
+
+            output = replay_bundle.completed_replay_output_commit(
+                attribution_path=Path(tempdir) / "report.json",
+                lineage_path=Path(tempdir) / "report.message-lineage.json",
+                report=report,
+                message_lineage=lineage,
+            )
+
+            self.assertEqual(output["status"], "published")
+            self.assertEqual(
+                output["attribution_hash"],
+                hashlib.sha256(
+                    (json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+                ).hexdigest(),
+            )
+            self.assertEqual(bundle.actions_path.read_bytes(), before_actions)
+
+    def test_exact_legacy_shape_is_required_before_proof_can_derive_decision(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            report = exact_legacy_projection_report()
+            bundle, config, _, lineage = completed_replay_bundle(
+                Path(tempdir),
+                report=report,
+            )
+            replay = CheckpointBundle(bundle.root).restore_for_replay(
+                expected_config=config,
+                expected_lineage=lineage,
+            )
+
+            classification = classify_legacy_projection_shape(
+                report["investigation_journal"],
+                report["metadata"],
+            )
+            self.assertIsInstance(classification, LegacyProjectionRequired)
+            decision = replay.replay_proof.derive_migration_decision(
+                classification
+            )
+
+            self.assertEqual(
+                decision.classifier_identity,
+                classification.classifier_identity,
+            )
+            self.assertEqual(
+                decision.classifier_reason,
+                classification.reason,
+            )
+            self.assertEqual(
+                decision.to_dict()["authorization"][
+                    "classifier_identity"
+                ],
+                classification.classifier_identity,
+            )
+            self.assertEqual(
+                decision.decision_identity,
+                decision.recomputed_identity(),
+            )
+
+    def test_forged_classifier_and_decision_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            report = exact_legacy_projection_report()
+            bundle, config, _, lineage = completed_replay_bundle(
+                Path(tempdir),
+                report=report,
+            )
+            replay = CheckpointBundle(bundle.root).restore_for_replay(
+                expected_config=config,
+                expected_lineage=lineage,
+            )
+            classification = classify_legacy_projection_shape(
+                report["investigation_journal"],
+                report["metadata"],
+            )
+            forged_classifier = replace(
+                classification,
+                classifier_identity="forged-classifier",
+            )
+            with self.assertRaises(CheckpointCorruptionError):
+                replay.replay_proof.derive_migration_decision(
+                    forged_classifier
+                )
+
+            decision = replay.replay_proof.derive_migration_decision(
+                classification
+            )
+            forged_decision = replace(
+                decision,
+                classifier_reason="forged-reason",
+            )
+            with self.assertRaises(CheckpointCorruptionError):
+                forged_decision.assert_authorizes(
+                    report=report,
+                    action_records=replay.state.actions,
+                    classification=classification,
+                )
+
+    def test_near_legacy_shape_cannot_authorize_migration(self):
+        report = exact_legacy_projection_report()
+        report["investigation_journal"][0][
+            "candidate_compression"
+        ]["unexpected_field"] = "forged"
+
+        classification = classify_legacy_projection_shape(
+            report["investigation_journal"],
+            report["metadata"],
+        )
+
+        self.assertIsInstance(
+            classification,
+            LegacyProjectionNotRequired,
+        )
+        self.assertEqual(
+            classification.reason,
+            "legacy_shape_not_exact",
+        )
+
+    def test_completed_replay_rejects_wrong_or_incomplete_config_identity(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            bundle, config, _, lineage = completed_replay_bundle(root)
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=sample_config(objective="Different objective."),
+                    expected_lineage=lineage,
+                )
+
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            del manifest["config"]["cache_identity"]
+            _write_hashed_json(bundle.manifest_path, manifest, "manifest_hash")
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=config,
+                    expected_lineage=lineage,
+                )
+
+    def test_completed_replay_requires_every_journal_file(self):
+        for journal_name in ("frontier", "hypotheses", "actions"):
+            with self.subTest(journal=journal_name):
+                with tempfile.TemporaryDirectory() as tempdir:
+                    bundle, config, _, lineage = completed_replay_bundle(
+                        Path(tempdir)
+                    )
+                    bundle._paths[journal_name].unlink()
+
+                    with self.assertRaises(CheckpointCorruptionError):
+                        CheckpointBundle(bundle.root).restore_for_replay(
+                            expected_config=config,
+                            expected_lineage=lineage,
+                        )
+
+    def test_completed_replay_rejects_missing_or_wrong_schema_output_and_lineage(self):
+        mutations = ("missing_lineage", "wrong_output_schema", "wrong_lineage")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as tempdir:
+                    bundle, config, _, lineage = completed_replay_bundle(
+                        Path(tempdir)
+                    )
+                    output = json.loads(
+                        bundle.output_commit_path.read_text(encoding="utf-8")
+                    )
+                    lineage_path = Path(output["lineage_path"])
+                    if mutation == "missing_lineage":
+                        lineage_path.unlink()
+                    elif mutation == "wrong_output_schema":
+                        output["schema_version"] = "recursive-attribution-output/v0"
+                        _write_hashed_json(
+                            bundle.output_commit_path,
+                            output,
+                            "output_commit_hash",
+                        )
+                    else:
+                        lineage_path.write_text("{}\n", encoding="utf-8")
+
+                    with self.assertRaises(
+                        (CheckpointCompatibilityError, CheckpointCorruptionError)
+                    ):
+                        CheckpointBundle(bundle.root).restore_for_replay(
+                            expected_config=config,
+                            expected_lineage=lineage,
+                        )
+
+    def test_completed_replay_rejects_a_self_consistent_resigned_lineage_forgery(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle, config, _, lineage = completed_replay_bundle(Path(tempdir))
+            forged_lineage = {**lineage, "behavior_impact": "forged"}
+            _resign_completed_lineage(bundle, forged_lineage)
+
+            with self.assertRaisesRegex(
+                CheckpointCorruptionError,
+                "lineage.*current trace",
+            ):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=config,
+                    expected_lineage=lineage,
+                )
+
+    def test_completed_replay_rejects_incomplete_journal_and_nonterminal_state(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle, config, _, lineage = completed_replay_bundle(Path(tempdir))
+            raw_actions = bundle.actions_path.read_bytes()
+            bundle.actions_path.write_bytes(raw_actions[:-1])
+            with self.assertRaises(CheckpointCorruptionError):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=config,
+                    expected_lineage=lineage,
+                )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle, config, _, lineage = completed_replay_bundle(Path(tempdir))
+            bundle.record_action(
+                "audit_recorded",
+                "audit:after-completion",
+                {"status": "later"},
+            )
+            with self.assertRaisesRegex(
+                CheckpointCorruptionError,
+                "terminal",
+            ):
+                CheckpointBundle(bundle.root).restore_for_replay(
+                    expected_config=config,
+                    expected_lineage=lineage,
+                )
+
     def test_v1_visit_key_migration_rewrites_all_occurrences_and_converges_with_v2(self):
         fixture_path = (
             Path(__file__).parent
@@ -926,7 +1648,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 "actions",
                 1,
                 1,
-                "provider_call_completed",
+                "visit_migration_marker",
                 "provider:{0}".format(visit_key),
                 {"visit_key": visit_key, "status": "completed"},
             )
@@ -1034,7 +1756,7 @@ class CausalCheckpointTest(unittest.TestCase):
                 json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
             )
 
-            with self.assertRaises(CheckpointCompatibilityError):
+            with self.assertRaises(CheckpointCorruptionError):
                 CheckpointBundle(root).restore(expected_config=sample_config())
 
     def test_restore_rejects_older_evidence_eligibility_policy_identity(self):
@@ -1275,7 +1997,7 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             config["global_judgment_contract"],
-            "global-candidate-judgment/v9+validation-envelope/v9+capsule/v7"
+            "global-candidate-judgment/v11+validation-envelope/v11+capsule/v8"
             "+evidence-policy/v5+local-state-owner/v1"
             "+global-pass-identity/v1+failure-action/v3"
             "+failure-projection/v4+terminal-record-schema/v3"
@@ -1288,14 +2010,1091 @@ class CausalCheckpointTest(unittest.TestCase):
             config["root_confirmation_contract"],
             "recursive-root-confirmation/v17+resolution/v2+evidence-policy/v5"
             "+artifact-owner/v1+terminal-evidence/v2+local-state-owner/v1"
-            "+action-projection/v7+response-identity/v1+counterfactual/v1"
+            "+action-projection/v8+response-identity/v1+counterfactual/v1"
             "+queue-response-identity/v1+published-root-projection/v3"
             "+causal-publication/v3"
             "+perspective-binding/v1"
             "+step-action-projection/v1+confirmation-request-identity/v3"
             "+confirmation-request-projection/v2",
         )
-        self.assertEqual(CHECKPOINT_SCHEMA_VERSION, "recursive-attribution-checkpoint/v20")
+        self.assertEqual(
+            config["factor_role_contract"],
+            FACTOR_ROLE_CONTRACT_IDENTITY,
+        )
+        self.assertTrue(
+            config["factor_role_contract"].startswith(
+                "factor-role-contract/v1:sha256:"
+            )
+        )
+        self.assertEqual(
+            ACTION_STATE_SCHEMA,
+            "recursive-analysis-actions/v25",
+        )
+        self.assertEqual(
+            CHECKPOINT_SCHEMA_VERSION,
+            "recursive-attribution-checkpoint/v28",
+        )
+        self.assertEqual(
+            OUTPUT_SCHEMA_VERSION,
+            "recursive-attribution-output/v15",
+        )
+
+    def test_legal_v27_checkpoint_migrates_runtime_and_provider_defaults(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            judge = CountingOfflineJudge()
+            judge.provider_circuit_open = True
+            judge.provider_circuit_reason = "historical provider failure"
+            judge.consecutive_provider_errors = 3
+            judge.provider_error_threshold = 3
+            bundle = CheckpointBundle(root)
+            AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=bundle,
+                checkpoint_config=config,
+                stop_requested=lambda: True,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            state = RecursiveAnalysisState.from_checkpoint(
+                graph=TraceGraph.from_trace(sample_trace()),
+                checkpoint=restored,
+            )
+
+        self.assertEqual(
+            restored.config["schema_version"],
+            "recursive-attribution-checkpoint/v28",
+        )
+        self.assertEqual(restored.config["runtime_identity"]["fusion_mode"], "off")
+        self.assertEqual(state.provider_state["schema"], "recursive-provider-state/v3")
+        self.assertFalse(state.provider_state["circuit"]["open"])
+        self.assertEqual(state.provider_state["circuit"]["reason"], "")
+        self.assertEqual(
+            state.provider_state["circuit"]["consecutive_provider_errors"],
+            0,
+        )
+        self.assertEqual(state.provider_state["circuit"]["disposition"], None)
+        self.assertEqual(state.provider_state["circuit"]["first_request"], 0)
+        self.assertEqual(state.provider_state["circuit"]["first_failure_at"], "")
+        self.assertEqual(
+            state.provider_state["previous_failure"]["reason"],
+            "historical provider failure",
+        )
+
+    def test_typed_v2_provider_state_migrates_read_only_to_canonical_v3(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "typed-v2-provider.checkpoint"
+            config = sample_config()
+            judge = CountingOfflineJudge()
+            judge.provider_circuit_open = True
+            judge.provider_circuit_reason = "v2 provider unavailable"
+            judge.consecutive_provider_errors = 2
+            judge.provider_error_threshold = 7
+            judge.provider_circuit_disposition = {
+                "retryable": True,
+                "category": "http_retryable",
+                "status_code": 503,
+                "error_code": "service_unavailable",
+                "reason": "v2 provider unavailable",
+            }
+            judge.provider_circuit_first_request = 4
+            judge.provider_circuit_first_failure_at = "2026-07-31T00:00:00Z"
+            AgenticRecursiveAnalyzer(
+                judge=judge,
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+                stop_requested=lambda: True,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            state = RecursiveAnalysisState.from_checkpoint(
+                graph=TraceGraph.from_trace(sample_trace()),
+                checkpoint=restored,
+            )
+
+        v2 = copy.deepcopy(state.provider_state)
+        v2["schema"] = "recursive-provider-state/v2"
+        v2.pop("previous_failure")
+        unsigned_v2 = {key: value for key, value in v2.items() if key != "identity"}
+        v2["identity"] = hashlib.sha256(
+            stable_json(unsigned_v2).encode("utf-8")
+        ).hexdigest()
+        original_v2 = copy.deepcopy(v2)
+
+        migrated = _validate_provider_state(
+            v2,
+            state,
+            cache_identity=config["cache_identity"],
+        )
+
+        self.assertEqual(v2, original_v2)
+        self.assertEqual(migrated["schema"], "recursive-provider-state/v3")
+        self.assertEqual(
+            migrated["previous_failure"],
+            {
+                "open": True,
+                "reason": "v2 provider unavailable",
+                "consecutive_provider_errors": 2,
+                "provider_error_threshold": 7,
+                "disposition": {
+                    "retryable": True,
+                    "category": "http_retryable",
+                    "status_code": 503,
+                    "error_code": "service_unavailable",
+                    "reason": "v2 provider unavailable",
+                },
+                "first_request": 4,
+                "first_failure_at": "2026-07-31T00:00:00Z",
+            },
+        )
+        self.assertEqual(
+            migrated["circuit"],
+            {
+                "open": False,
+                "reason": "",
+                "consecutive_provider_errors": 0,
+                "provider_error_threshold": 7,
+                "disposition": None,
+                "first_request": 0,
+                "first_failure_at": "",
+            },
+        )
+        self.assertEqual(migrated["accounting"], original_v2["accounting"])
+        self.assertEqual(migrated["cache_identity"], original_v2["cache_identity"])
+        self.assertEqual(migrated["cache_stats"], original_v2["cache_stats"])
+        unsigned_v3 = {
+            key: value for key, value in migrated.items() if key != "identity"
+        }
+        self.assertEqual(
+            migrated["identity"],
+            hashlib.sha256(stable_json(unsigned_v3).encode("utf-8")).hexdigest(),
+        )
+
+    def test_malformed_typed_v2_provider_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "malformed-v2-provider.checkpoint"
+            config = sample_config()
+            AgenticRecursiveAnalyzer(
+                judge=CountingOfflineJudge(),
+                checkpoint=CheckpointBundle(root),
+                checkpoint_config=config,
+                stop_requested=lambda: True,
+            ).analyze(
+                TraceGraph.from_trace(sample_trace()),
+                start_refs=["record:only"],
+                objective="Find the defect.",
+                analysis_perspective="Improve repository reasoning.",
+            )
+            state = RecursiveAnalysisState.from_checkpoint(
+                graph=TraceGraph.from_trace(sample_trace()),
+                checkpoint=CheckpointBundle(root).restore(expected_config=config),
+            )
+
+        malformed = copy.deepcopy(state.provider_state)
+        malformed["schema"] = "recursive-provider-state/v2"
+        malformed.pop("previous_failure")
+        malformed["circuit"].pop("first_failure_at")
+        unsigned_v2 = {
+            key: value for key, value in malformed.items() if key != "identity"
+        }
+        malformed["identity"] = hashlib.sha256(
+            stable_json(unsigned_v2).encode("utf-8")
+        ).hexdigest()
+        original_malformed = copy.deepcopy(malformed)
+
+        with self.assertRaisesRegex(ValueError, "provider circuit"):
+            _validate_provider_state(
+                malformed,
+                state,
+                cache_identity=config["cache_identity"],
+            )
+
+        self.assertEqual(malformed, original_malformed)
+
+    def test_v27_retrieval_global_checkpoint_uses_expected_mode_and_unifies_carriers(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-global-v27.checkpoint"
+            runtime = dict(sample_config()["runtime_identity"])
+            runtime["fusion_mode"] = "retrieval-global"
+            config = sample_config(runtime_identity=runtime)
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="global:evidence",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={
+                    "investigation_journal": [
+                        {
+                            "kind": "global_candidate_page",
+                            "status": "failed",
+                        }
+                    ]
+                },
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(root).restore(expected_config=sample_config())
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            active = _visible_checkpoint_root(root)
+            manifest = json.loads(
+                (active / "manifest.json").read_text(encoding="utf-8")
+            )
+            commit = json.loads(
+                (active / "commit.json").read_text(encoding="utf-8")
+            )
+            journal_records = [
+                json.loads(line)
+                for path in (
+                    active / "frontier.jsonl",
+                    active / "hypotheses.jsonl",
+                    active / "investigation-actions.jsonl",
+                )
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            restored.config["runtime_identity"]["fusion_mode"],
+            "retrieval-global",
+        )
+        self.assertEqual(manifest["schema_version"], CHECKPOINT_SCHEMA_VERSION)
+        self.assertEqual(commit["schema_version"], CHECKPOINT_SCHEMA_VERSION)
+        self.assertTrue(journal_records)
+        self.assertTrue(
+            all(
+                record["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+                for record in journal_records
+            )
+        )
+        self.assertTrue(
+            all(
+                record["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+                for record in (
+                    *restored.frontier_records,
+                    *restored.hypothesis_records,
+                    *restored.actions,
+                )
+            )
+        )
+
+    def test_v27_migration_recovers_from_every_generation_transaction_fault(self):
+        phases = (
+            "migration_staging_created",
+            "migration_staged_frontier",
+            "migration_staged_hypotheses",
+            "migration_staged_actions",
+            "migration_staged_commit",
+            "migration_staged_manifest",
+            "migration_staging_durable",
+            "migration_staging_validated",
+            "migration_transaction_published",
+            "migration_generation_published",
+            "migration_generation_directory_durable",
+            "migration_current_prepared",
+            "migration_current_replaced",
+            "migration_current_directory_durable",
+            "migration_active_validated",
+            "migration_transaction_removed",
+            "migration_cleanup_complete",
+        )
+
+        for phase in phases:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir) / "legacy-v27.checkpoint"
+                config = sample_config()
+                bundle = CheckpointBundle(root)
+                bundle.initialize(config)
+                bundle.commit_snapshot(
+                    semantic_key="migration:fault-fixture",
+                    frontier_payload={"snapshot": "frontier"},
+                    hypothesis_payload={"snapshot": "hypotheses"},
+                    action_payload={"snapshot": "actions"},
+                )
+                expected_state = bundle.restore(expected_config=config)
+                _rewrite_bundle_as_legal_v27(bundle)
+                carrier_paths = (
+                    bundle.frontier_path,
+                    bundle.hypotheses_path,
+                    bundle.actions_path,
+                    bundle.commit_path,
+                    bundle.manifest_path,
+                )
+                original_v27 = {
+                    path.name: path.read_bytes() for path in carrier_paths
+                }
+                observed = []
+
+                def interrupt(stage):
+                    observed.append(stage)
+                    if stage == phase:
+                        raise KeyboardInterrupt("migration fault at {0}".format(stage))
+
+                with self.assertRaisesRegex(KeyboardInterrupt, phase):
+                    CheckpointBundle(root, fault_hook=interrupt).restore(
+                        expected_config=config
+                    )
+
+                self.assertIn(phase, observed)
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in carrier_paths
+                    },
+                    original_v27,
+                )
+                self.assertEqual(len(_checkpoint_carrier_schemas(root)), 1)
+
+                restored = CheckpointBundle(root).restore(expected_config=config)
+                self.assertEqual(restored, expected_state)
+                active = _visible_checkpoint_root(root)
+                manifest = json.loads(
+                    (active / "manifest.json").read_text(encoding="utf-8")
+                )
+                commit = json.loads(
+                    (active / "commit.json").read_text(encoding="utf-8")
+                )
+                journal_records = [
+                    json.loads(line)
+                    for path in (
+                        active / "frontier.jsonl",
+                        active / "hypotheses.jsonl",
+                        active / "investigation-actions.jsonl",
+                    )
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(manifest["schema_version"], CHECKPOINT_SCHEMA_VERSION)
+                self.assertEqual(commit["schema_version"], CHECKPOINT_SCHEMA_VERSION)
+                self.assertTrue(
+                    all(
+                        record["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+                        for record in journal_records
+                    )
+                )
+                self.assertTrue((root / "CURRENT").is_file())
+                self.assertEqual(
+                    list((root / ".migration-transactions").glob("*.json")),
+                    [],
+                )
+                orphan_staging = list(
+                    (root / "generations").glob(".migration-v28-*")
+                )
+                self.assertEqual(
+                    len(orphan_staging),
+                    1 if phase in frozenset(phases[:8]) else 0,
+                )
+
+                before_initialize = {
+                    path.name: path.read_bytes()
+                    for path in active.iterdir()
+                    if path.is_file()
+                }
+                reopened = CheckpointBundle(root)
+                reopened.initialize(config)
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in active.iterdir()
+                        if path.is_file()
+                    },
+                    before_initialize,
+                )
+                self.assertEqual(
+                    CheckpointBundle(root).restore(expected_config=config),
+                    expected_state,
+                )
+
+    def test_v27_migration_never_exposes_mixed_active_carrier_schemas(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:mixed-schema-fixture",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            paused = threading.Event()
+            release = threading.Event()
+            worker_errors = []
+
+            def pause_after_generation_write(stage):
+                if stage not in {
+                    "migration_after_replace_frontier",
+                    "migration_generation_directory_durable",
+                } or paused.is_set():
+                    return
+                paused.set()
+                if not release.wait(5):
+                    raise AssertionError("migration publication test timed out")
+
+            def migrate():
+                try:
+                    CheckpointBundle(
+                        root,
+                        fault_hook=pause_after_generation_write,
+                    ).restore(expected_config=config)
+                except BaseException as exc:
+                    worker_errors.append(exc)
+
+            worker = threading.Thread(target=migrate)
+            worker.start()
+            self.assertTrue(paused.wait(5), "migration did not reach publication gate")
+            try:
+                schemas = _checkpoint_carrier_schemas(root)
+                self.assertEqual(len(schemas), 1, schemas)
+            finally:
+                release.set()
+                worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(worker_errors, [])
+
+    def test_concurrent_v27_restores_survive_stale_transaction_snapshot(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:concurrent-fixture",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            def stop_after_transaction_publication(stage):
+                if stage == "migration_marker_published":
+                    raise KeyboardInterrupt("leave a recoverable transaction")
+
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "leave a recoverable transaction",
+            ):
+                CheckpointBundle(
+                    root,
+                    fault_hook=stop_after_transaction_publication,
+                ).restore(expected_config=config)
+
+            restore_b = CheckpointBundle(root)
+            validate_generation = restore_b._validate_migration_generation
+            transaction_read = threading.Event()
+            resume_b = threading.Event()
+            states = []
+            worker_errors = []
+
+            def validate_after_transaction_read(
+                *,
+                marker,
+                expected_config,
+                generation_path=None,
+            ):
+                staging = root / marker["staging_directory"]
+                if generation_path == staging and not transaction_read.is_set():
+                    transaction_read.set()
+                    if not resume_b.wait(5):
+                        raise AssertionError("concurrent restore test timed out")
+                return validate_generation(
+                    marker=marker,
+                    expected_config=expected_config,
+                    generation_path=generation_path,
+                )
+
+            restore_b._validate_migration_generation = (
+                validate_after_transaction_read
+            )
+
+            def run_restore_b():
+                try:
+                    states.append(restore_b.restore(expected_config=config))
+                except BaseException as exc:
+                    worker_errors.append(exc)
+
+            worker = threading.Thread(target=run_restore_b)
+            worker.start()
+            self.assertTrue(
+                transaction_read.wait(5),
+                "restore B did not read the migration transaction",
+            )
+            state_a = []
+            worker_a_errors = []
+
+            def run_restore_a():
+                try:
+                    state_a.append(
+                        CheckpointBundle(root).restore(expected_config=config)
+                    )
+                except BaseException as exc:
+                    worker_a_errors.append(exc)
+
+            worker_a = threading.Thread(target=run_restore_a)
+            worker_a.start()
+            worker_a.join(0.1)
+            try:
+                self.assertTrue(
+                    worker_a.is_alive(),
+                    "second restorer did not wait for the migration lock",
+                )
+            finally:
+                resume_b.set()
+                worker.join(5)
+                worker_a.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(worker_a.is_alive())
+            self.assertEqual(worker_errors, [])
+            self.assertEqual(worker_a_errors, [])
+            self.assertEqual(states, state_a)
+            active_generation = _visible_checkpoint_root(root)
+            self.assertTrue(active_generation.is_dir())
+
+    def test_resume_append_keeps_published_generation_immutable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:immutable-fixture",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+            migrated = CheckpointBundle(root).restore(expected_config=config)
+            published = _visible_checkpoint_root(root)
+
+            resumed = CheckpointBundle(root)
+            resumed.initialize(config)
+            resumed.record_action(
+                "resume_probe",
+                "migration:immutable-resume",
+                {"status": "recorded"},
+            )
+
+            replacement = _visible_checkpoint_root(root)
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            self.assertNotEqual(replacement, published)
+            self.assertFalse(published.exists())
+            self.assertEqual(
+                restored.transaction_sequence,
+                migrated.transaction_sequence + 1,
+            )
+            self.assertEqual(restored.actions[-1]["operation"], "resume_probe")
+
+    def test_stale_migration_cannot_overwrite_a_newer_process_append(self):
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:stale-source",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            migration_paused = context.Event()
+            release_migration = context.Event()
+            migration_result = context.Queue()
+            migrator = context.Process(
+                target=_migration_pause_worker,
+                args=(
+                    root,
+                    config,
+                    migration_paused,
+                    release_migration,
+                    migration_result,
+                ),
+            )
+            migrator.start()
+            self.assertTrue(
+                migration_paused.wait(10),
+                "stale migrator did not reach its publication gate",
+            )
+
+            writer_started = context.Event()
+            writer_finished = context.Event()
+            writer_result = context.Queue()
+            writer = context.Process(
+                target=_migration_append_worker,
+                args=(
+                    root,
+                    config,
+                    writer_started,
+                    writer_finished,
+                    writer_result,
+                ),
+            )
+            writer.start()
+            self.assertTrue(writer_started.wait(10))
+            writer_finished_while_migration_paused = writer_finished.wait(1)
+            release_migration.set()
+            migrator.join(10)
+            writer.join(10)
+
+            self.assertFalse(migrator.is_alive())
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(migrator.exitcode, 0)
+            self.assertEqual(writer.exitcode, 0)
+            self.assertFalse(writer_finished_while_migration_paused)
+            self.assertEqual(migration_result.get(timeout=5)[0], "ok")
+            self.assertEqual(writer_result.get(timeout=5), ("ok", "migration-writer"))
+
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            appended = [
+                action
+                for action in restored.actions
+                if action["semantic_key"] == "concurrency:migration-writer"
+            ]
+            self.assertEqual(len(appended), 1)
+            self.assertEqual(appended[0]["payload"], {"writer": "migration-writer"})
+
+    def test_two_process_writers_append_exactly_once_in_root_and_generation_layouts(self):
+        context = multiprocessing.get_context("fork")
+        for layout in ("root-v28", "generation-v28"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir) / "case.checkpoint"
+                config = sample_config()
+                bundle = CheckpointBundle(root)
+                bundle.initialize(config)
+                if layout == "generation-v28":
+                    bundle.commit_snapshot(
+                        semantic_key="migration:writer-source",
+                        frontier_payload={"snapshot": "frontier"},
+                        hypothesis_payload={"snapshot": "hypotheses"},
+                        action_payload={"snapshot": "actions"},
+                    )
+                    _rewrite_bundle_as_legal_v27(bundle)
+                    CheckpointBundle(root).restore(expected_config=config)
+
+                ready = context.Queue()
+                start = context.Event()
+                result = context.Queue()
+                finished = [context.Event(), context.Event()]
+                writers = [
+                    context.Process(
+                        target=_barrier_append_worker,
+                        args=(
+                            root,
+                            config,
+                            writer,
+                            ready,
+                            start,
+                            finished[index],
+                            result,
+                        ),
+                    )
+                    for index, writer in enumerate(("writer-a", "writer-b"))
+                ]
+                for process in writers:
+                    process.start()
+                self.assertEqual(
+                    {ready.get(timeout=10), ready.get(timeout=10)},
+                    {"writer-a", "writer-b"},
+                )
+                start.set()
+                for event in finished:
+                    self.assertTrue(event.wait(10))
+                for process in writers:
+                    process.join(10)
+                    self.assertFalse(process.is_alive())
+                    self.assertEqual(process.exitcode, 0)
+
+                results = [result.get(timeout=5), result.get(timeout=5)]
+                self.assertEqual(
+                    {entry[:2] for entry in results},
+                    {("ok", "writer-a"), ("ok", "writer-b")},
+                )
+                restored = CheckpointBundle(root).restore(expected_config=config)
+                appended = [
+                    action
+                    for action in restored.actions
+                    if action["operation"] == "concurrent_append"
+                ]
+                self.assertCountEqual(
+                    [action["payload"]["writer"] for action in appended],
+                    ["writer-a", "writer-b"],
+                )
+                self.assertEqual(
+                    len({action["record_hash"] for action in appended}),
+                    2,
+                )
+
+    def test_shared_reader_blocks_publication_until_old_generation_can_be_reclaimed(self):
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:reader-source",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+            CheckpointBundle(root).restore(expected_config=config)
+            old_generation = _visible_checkpoint_root(root)
+
+            reader_paused = context.Event()
+            release_reader = context.Event()
+            reader_result = context.Queue()
+            reader = context.Process(
+                target=_spanning_reader_worker,
+                args=(root, config, reader_paused, release_reader, reader_result),
+            )
+            reader.start()
+            self.assertTrue(reader_paused.wait(10))
+
+            writer_started = context.Event()
+            writer_finished = context.Event()
+            writer_result = context.Queue()
+            writer = context.Process(
+                target=_migration_append_worker,
+                args=(
+                    root,
+                    config,
+                    writer_started,
+                    writer_finished,
+                    writer_result,
+                ),
+            )
+            writer.start()
+            self.assertTrue(writer_started.wait(10))
+            writer_finished_while_reader_paused = writer_finished.wait(1)
+            release_reader.set()
+            reader.join(10)
+            writer.join(10)
+
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(reader.exitcode, 0)
+            self.assertEqual(writer.exitcode, 0)
+            self.assertFalse(writer_finished_while_reader_paused)
+            self.assertEqual(reader_result.get(timeout=5)[0], "ok")
+            self.assertEqual(writer_result.get(timeout=5)[0], "ok")
+            self.assertFalse(old_generation.exists())
+
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            self.assertEqual(
+                sum(
+                    action["semantic_key"] == "concurrency:migration-writer"
+                    for action in restored.actions
+                ),
+                1,
+            )
+
+    def test_restore_rejects_symlink_substitution_for_every_active_carrier(self):
+        carrier_names = (
+            "manifest.json",
+            "commit.json",
+            "frontier.jsonl",
+            "hypotheses.jsonl",
+            "investigation-actions.jsonl",
+        )
+        for carrier_name in carrier_names:
+            with self.subTest(carrier=carrier_name), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir) / "legacy-v27.checkpoint"
+                config = sample_config()
+                bundle = CheckpointBundle(root)
+                bundle.initialize(config)
+                bundle.commit_snapshot(
+                    semantic_key="migration:symlink-source",
+                    frontier_payload={"snapshot": "frontier"},
+                    hypothesis_payload={"snapshot": "hypotheses"},
+                    action_payload={"snapshot": "actions"},
+                )
+                _rewrite_bundle_as_legal_v27(bundle)
+                CheckpointBundle(root).restore(expected_config=config)
+                active = _visible_checkpoint_root(root)
+                carrier = active / carrier_name
+                escaped = Path(tempdir) / "escaped-{0}".format(carrier_name)
+                shutil.copyfile(carrier, escaped)
+                carrier.unlink()
+                carrier.symlink_to(escaped)
+
+                with self.assertRaisesRegex(
+                    CheckpointCorruptionError,
+                    "regular|symlink|carrier|contained",
+                ):
+                    CheckpointBundle(root).restore(expected_config=config)
+
+    def test_cleanup_rejects_an_inactive_generation_symlink_without_following_it(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:cleanup-source",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+            CheckpointBundle(root).restore(expected_config=config)
+            current_before = (root / "CURRENT").read_bytes()
+            outside = Path(tempdir) / "outside-generation"
+            outside.mkdir()
+            sentinel = outside / "must-survive.txt"
+            sentinel.write_text("outside checkpoint\n", encoding="utf-8")
+            (root / "generations" / "v28-escaped").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(CheckpointCorruptionError):
+                resumed = CheckpointBundle(root)
+                resumed.initialize(config)
+                resumed.record_action(
+                    "unsafe_cleanup_probe",
+                    "concurrency:unsafe-cleanup",
+                    {"status": "must-not-commit"},
+                )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "outside checkpoint\n")
+            self.assertEqual((root / "CURRENT").read_bytes(), current_before)
+
+    def test_lock_artifact_symlink_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config()
+            CheckpointBundle(root).initialize(config)
+            outside = Path(tempdir) / "outside-lock"
+            outside.write_text("not a checkpoint lock\n", encoding="utf-8")
+            lock_path = root / ".checkpoint.lock"
+            lock_path.unlink(missing_ok=True)
+            lock_path.symlink_to(outside)
+
+            with self.assertRaisesRegex(
+                CheckpointCorruptionError,
+                "lock|regular|symlink",
+            ):
+                CheckpointBundle(root).restore(expected_config=config)
+
+    def test_carrier_identity_change_during_read_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config()
+            CheckpointBundle(root).initialize(config)
+            manifest = root / "manifest.json"
+            manifest_inode = manifest.stat().st_ino
+            manifest_bytes = manifest.read_bytes()
+            real_read = os.read
+            replaced = False
+
+            def replace_manifest_after_read(descriptor, size):
+                nonlocal replaced
+                content = real_read(descriptor, size)
+                if (
+                    content
+                    and not replaced
+                    and os.fstat(descriptor).st_ino == manifest_inode
+                ):
+                    temporary = root / ".manifest-identity-swap"
+                    temporary.write_bytes(manifest_bytes)
+                    os.replace(temporary, manifest)
+                    replaced = True
+                return content
+
+            with mock.patch(
+                "trace_attribution.checkpoint.os.read",
+                side_effect=replace_manifest_after_read,
+            ):
+                with self.assertRaisesRegex(
+                    CheckpointCorruptionError,
+                    "changed identity",
+                ):
+                    CheckpointBundle(root).restore(expected_config=config)
+            self.assertTrue(replaced)
+
+    def test_lock_acquisition_and_release_errors_are_explicit(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            config = sample_config()
+            CheckpointBundle(root).initialize(config)
+
+            with mock.patch(
+                "trace_attribution.checkpoint.fcntl.flock",
+                side_effect=OSError("acquisition failed"),
+            ):
+                with self.assertRaisesRegex(
+                    CheckpointLockError,
+                    "acquisition failed",
+                ):
+                    CheckpointBundle(root).restore(expected_config=config)
+
+            real_flock = fcntl.flock
+
+            def fail_release(descriptor, operation):
+                if operation == fcntl.LOCK_UN:
+                    raise OSError("release failed")
+                return real_flock(descriptor, operation)
+
+            with mock.patch(
+                "trace_attribution.checkpoint.fcntl.flock",
+                side_effect=fail_release,
+            ):
+                with self.assertRaisesRegex(
+                    CheckpointLockError,
+                    "release failed",
+                ):
+                    CheckpointBundle(root).restore(expected_config=config)
+
+    def test_one_hundred_generation_appends_have_bounded_retention_and_disk(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "legacy-v27.checkpoint"
+            config = sample_config()
+            bundle = CheckpointBundle(root)
+            bundle.initialize(config)
+            bundle.commit_snapshot(
+                semantic_key="migration:bounded-source",
+                frontier_payload={"snapshot": "frontier"},
+                hypothesis_payload={"snapshot": "hypotheses"},
+                action_payload={"snapshot": "actions"},
+            )
+            _rewrite_bundle_as_legal_v27(bundle)
+            CheckpointBundle(root).restore(expected_config=config)
+
+            writer = CheckpointBundle(root)
+            writer.initialize(config)
+            for index in range(100):
+                writer.record_action(
+                    "bounded_append",
+                    "concurrency:bounded:{0}".format(index),
+                    {"index": index},
+                )
+
+            active = _visible_checkpoint_root(root)
+            generations = [
+                path
+                for path in (root / "generations").iterdir()
+                if path.name.startswith("v28-")
+                and path.is_dir()
+                and not path.is_symlink()
+            ]
+            active_bytes = sum(
+                (active / name).stat().st_size
+                for name in (
+                    "manifest.json",
+                    "commit.json",
+                    "frontier.jsonl",
+                    "hypotheses.jsonl",
+                    "investigation-actions.jsonl",
+                )
+            )
+            retained_bytes = _checkpoint_regular_file_bytes(root)
+            restored = CheckpointBundle(root).restore(expected_config=config)
+
+            self.assertEqual(
+                [
+                    action["payload"]["index"]
+                    for action in restored.actions
+                    if action["operation"] == "bounded_append"
+                ],
+                list(range(100)),
+            )
+            self.assertLessEqual(len(generations), 2)
+            self.assertLessEqual(retained_bytes, active_bytes * 3)
+
+    def test_v27_without_fusion_evidence_or_expected_mode_is_not_migratable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "ambiguous-v27.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            _rewrite_bundle_as_legal_v27(bundle)
+
+            with self.assertRaises(CheckpointCompatibilityError):
+                CheckpointBundle(root).restore()
+
+    def test_checkpoint_rejects_mixed_manifest_commit_and_terminal_schemas(self):
+        for carrier in ("commit", "terminal"):
+            with self.subTest(carrier=carrier), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir) / "mixed.checkpoint"
+                config = sample_config()
+                bundle = CheckpointBundle(root)
+                bundle.initialize(config)
+                bundle.commit_snapshot(
+                    semantic_key="mixed:source",
+                    frontier_payload={"snapshot": "frontier"},
+                    hypothesis_payload={"snapshot": "hypotheses"},
+                    action_payload={"snapshot": "actions"},
+                )
+                _rewrite_bundle_as_legal_v27(bundle)
+                commit = json.loads(
+                    bundle.commit_path.read_text(encoding="utf-8")
+                )
+                if carrier == "commit":
+                    commit["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+                else:
+                    actions = [
+                        json.loads(line)
+                        for line in bundle.actions_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+                    ]
+                    actions[-1]["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+                    unsigned = {
+                        key: value
+                        for key, value in actions[-1].items()
+                        if key != "record_hash"
+                    }
+                    actions[-1]["record_hash"] = _sha256(unsigned)
+                    bundle.actions_path.write_text(
+                        "".join(
+                            json.dumps(record, sort_keys=True) + "\n"
+                            for record in actions
+                        ),
+                        encoding="utf-8",
+                    )
+                    commit["journal_heads"]["actions"]["record_hash"] = (
+                        actions[-1]["record_hash"]
+                    )
+                _write_hashed_json(bundle.commit_path, commit, "commit_hash")
+
+                with self.assertRaises(CheckpointCorruptionError):
+                    CheckpointBundle(root).restore(expected_config=config)
+
+    def test_checkpoint_rejects_a_different_factor_role_truth_contract(self):
+        config = sample_config()
+        config["factor_role_contract"] = (
+            "factor-role-contract/v1:sha256:forged"
+        )
+        semantic = {
+            key: value
+            for key, value in config.items()
+            if key != "config_fingerprint"
+        }
+        config["config_fingerprint"] = _sha256(semantic)
+
+        with self.assertRaisesRegex(
+            CheckpointCompatibilityError,
+            "factor role contract",
+        ):
+            validate_checkpoint_config(config)
 
     def test_completed_report_rejects_v4_global_judgment_with_unresolved_evidence(self):
         trace = multi_seed_global_trace()
@@ -1304,6 +3103,7 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=start_refs,
+            fusion_mode="retrieval-global",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"
@@ -1362,6 +3162,7 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=start_refs,
+            fusion_mode="retrieval-global",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "partial-global.checkpoint"
@@ -1410,6 +3211,7 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=start_refs,
+            fusion_mode="retrieval-global",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "completed-global.checkpoint"
@@ -1460,6 +3262,7 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=start_refs,
+            fusion_mode="retrieval-global",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             partial_root = Path(tempdir) / "partial-stale-capsule.checkpoint"
@@ -2032,11 +3835,8 @@ class CausalCheckpointTest(unittest.TestCase):
 
     def test_partial_and_completed_restore_reject_stale_intermediate_factor_path(self):
         from tests.test_recursive_analyzer import (
-            ConfirmingScriptedJudge,
-            RecursiveRootRankingTest,
+            FusionScriptedJudge,
             observed_trace,
-            relation,
-            step,
         )
 
         trace = observed_trace(branching=True)
@@ -2063,29 +3863,35 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=["record:observed_defect"],
+            fusion_mode="retrieval-global",
         )
 
         def judge():
-            return ConfirmingScriptedJudge(
-                {
-                    "record:change": step(
-                        "record:change",
-                        predecessors=(
-                            relation("record:context", "same_defect_propagation"),
-                        ),
-                    ),
-                    "record:context": RecursiveRootRankingTest()._confirmation_step,
+            return FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                selected_candidate_refs=("record:decision",),
+                global_non_root_roles={
+                    "record:context": "contributing_condition",
                 },
-                {
-                    "record:context": RootConfirmation.rejected(
-                        "record:context",
-                        "The context is a condition, not a necessary root.",
-                        evidence_refs=[
-                            "record:context",
-                            "record:change",
-                            "record:observed_defect",
-                        ],
-                        factor_role="contributing_condition",
+                factor_roles={
+                    "record:context": "contributing_condition",
+                },
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt=(
+                            "Implement only the methods found in the "
+                            "first search."
+                        ),
+                        reason=(
+                            "The decision stopped repository discovery."
+                        ),
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision",
+                            "confirmed",
+                        ),
+                        confidence=0.91,
+                        evidence_refs=["record:decision"],
                     )
                 },
             )
@@ -2094,6 +3900,7 @@ class CausalCheckpointTest(unittest.TestCase):
             root = Path(tempdir) / "stale-intermediate-factor.checkpoint"
             report = AgenticRecursiveAnalyzer(
                 judge=judge(),
+                fusion_mode="retrieval-global",
                 checkpoint=CheckpointBundle(root),
                 checkpoint_config=config,
             ).analyze(
@@ -2125,6 +3932,7 @@ class CausalCheckpointTest(unittest.TestCase):
             ):
                 AgenticRecursiveAnalyzer(
                     judge=judge(),
+                    fusion_mode="retrieval-global",
                     checkpoint=InjectedRestoreCheckpoint(restored, root),
                     checkpoint_config=config,
                 ).analyze(
@@ -2136,11 +3944,8 @@ class CausalCheckpointTest(unittest.TestCase):
 
     def test_partial_and_completed_checkpoint_reject_disconnected_factor_path(self):
         from tests.test_recursive_analyzer import (
-            ConfirmingScriptedJudge,
-            RecursiveRootRankingTest,
+            FusionScriptedJudge,
             observed_trace,
-            relation,
-            step,
         )
 
         trace = observed_trace(branching=True)
@@ -2148,29 +3953,35 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=["record:observed_defect"],
+            fusion_mode="retrieval-global",
         )
 
         def judge():
-            return ConfirmingScriptedJudge(
-                {
-                    "record:change": step(
-                        "record:change",
-                        predecessors=(
-                            relation("record:context", "same_defect_propagation"),
-                        ),
-                    ),
-                    "record:context": RecursiveRootRankingTest()._confirmation_step,
+            return FusionScriptedJudge(
+                global_outcome="candidate_roots",
+                selected_candidate_refs=("record:decision",),
+                global_non_root_roles={
+                    "record:context": "contributing_condition",
                 },
-                {
-                    "record:context": RootConfirmation.rejected(
-                        "record:context",
-                        "The context is a condition, not a necessary root.",
-                        evidence_refs=[
-                            "record:context",
-                            "record:change",
-                            "record:observed_defect",
-                        ],
-                        factor_role="contributing_condition",
+                factor_roles={
+                    "record:context": "contributing_condition",
+                },
+                confirmations={
+                    "record:decision": RootConfirmation.confirmed(
+                        "record:decision",
+                        excerpt=(
+                            "Implement only the methods found in the "
+                            "first search."
+                        ),
+                        reason=(
+                            "The decision stopped repository discovery."
+                        ),
+                        counterfactual=confirmation_counterfactual_for(
+                            "record:decision",
+                            "confirmed",
+                        ),
+                        confidence=0.91,
+                        evidence_refs=["record:decision"],
                     )
                 },
             )
@@ -2179,6 +3990,7 @@ class CausalCheckpointTest(unittest.TestCase):
             root = Path(tempdir) / "factor-path.checkpoint"
             AgenticRecursiveAnalyzer(
                 judge=judge(),
+                fusion_mode="retrieval-global",
                 checkpoint=CheckpointBundle(root),
                 checkpoint_config=config,
             ).analyze(
@@ -2194,13 +4006,16 @@ class CausalCheckpointTest(unittest.TestCase):
                 item
                 for item in reversed(partial_actions)
                 if item["operation"] == "state_snapshot"
-                and item["payload"]["contributing_conditions"]
+                and item["payload"]["factor_role_action_projection"]
             )
             forge_checkpoint_factor_path(
                 snapshot["payload"],
                 ["record:context", "record:decision", "record:observed_defect"],
             )
-            with self.assertRaisesRegex(ValueError, "non-root.*causal edge"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "factor role|FactorRole|path|request",
+            ):
                 RecursiveAnalysisState.from_checkpoint(
                     graph=TraceGraph.from_trace(trace),
                     checkpoint=replace(restored, actions=tuple(partial_actions)),
@@ -2216,9 +4031,13 @@ class CausalCheckpointTest(unittest.TestCase):
                 report_action["payload"]["report"],
                 ["record:context", "record:decision", "record:observed_defect"],
             )
-            with self.assertRaisesRegex(ValueError, "non-root.*causal edge"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "factor role|FactorRole|path|request",
+            ):
                 AgenticRecursiveAnalyzer(
                     judge=judge(),
+                    fusion_mode="retrieval-global",
                     checkpoint=InjectedRestoreCheckpoint(
                         replace(restored, actions=tuple(completed_actions)), root
                     ),
@@ -2257,6 +4076,79 @@ class CausalCheckpointTest(unittest.TestCase):
                 commit["journal_heads"]["frontier"]["record_hash"],
                 records[0]["record_hash"],
             )
+
+    def test_snapshot_content_addresses_repeated_large_nested_values(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            shared = {
+                "candidate_ref": "record:decisionnode_revision_bound",
+                "rationale": "semantic evidence " * 12_000,
+            }
+
+            for sequence in (1, 2):
+                bundle.commit_snapshot(
+                    semantic_key="snapshot:{0}".format(sequence),
+                    frontier_payload={"frontier": []},
+                    hypothesis_payload={"hypotheses": []},
+                    action_payload={"sequence": sequence, "shared": shared},
+                )
+
+            restored = CheckpointBundle(root).restore(
+                expected_config=sample_config()
+            )
+            self.assertEqual(
+                restored.actions[-1]["payload"],
+                {"sequence": 2, "shared": shared},
+            )
+            blobs = list(
+                (root / "checkpoint-blobs" / "sha256").glob("*.json")
+            )
+            self.assertEqual(len(blobs), 1)
+            self.assertLess(bundle.actions_path.stat().st_size, 8_000)
+
+    def test_restore_rejects_missing_content_addressed_checkpoint_blob(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            bundle.commit_snapshot(
+                semantic_key="snapshot:missing",
+                frontier_payload={"frontier": []},
+                hypothesis_payload={"hypotheses": []},
+                action_payload={"shared": {"text": "evidence " * 12_000}},
+            )
+            blob = next(
+                (root / "checkpoint-blobs" / "sha256").glob("*.json")
+            )
+            blob.unlink()
+
+            with self.assertRaisesRegex(
+                CheckpointCorruptionError, "checkpoint blob is missing"
+            ):
+                CheckpointBundle(root).restore(expected_config=sample_config())
+
+    def test_restore_rejects_modified_content_addressed_checkpoint_blob(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "case.checkpoint"
+            bundle = CheckpointBundle(root)
+            bundle.initialize(sample_config())
+            bundle.commit_snapshot(
+                semantic_key="snapshot:modified",
+                frontier_payload={"frontier": []},
+                hypothesis_payload={"hypotheses": []},
+                action_payload={"shared": {"text": "evidence " * 12_000}},
+            )
+            blob = next(
+                (root / "checkpoint-blobs" / "sha256").glob("*.json")
+            )
+            blob.write_text('{"forged":true}', encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                CheckpointCorruptionError, "checkpoint blob hash mismatch"
+            ):
+                CheckpointBundle(root).restore(expected_config=sample_config())
 
     def test_recursive_restore_rejects_state_members_from_different_transactions(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3014,7 +4906,23 @@ class CausalCheckpointTest(unittest.TestCase):
                 started_reservation,
             )
 
-    def test_resume_restores_provider_circuit_state_before_traversal(self):
+    def test_resume_preserves_provider_failure_history_but_allows_one_probe(self):
+        class FreshProbeJudge(CountingOfflineJudge):
+            def __init__(self):
+                super().__init__()
+                self.active_state_at_probe = None
+
+            def judge_step_offline(self, request):
+                self.active_state_at_probe = {
+                    "open": self.provider_circuit_open,
+                    "reason": self.provider_circuit_reason,
+                    "errors": self.consecutive_provider_errors,
+                    "disposition": self.provider_circuit_disposition,
+                    "first_request": self.provider_circuit_first_request,
+                    "first_failure_at": self.provider_circuit_first_failure_at,
+                }
+                return super().judge_step_offline(request)
+
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "case.checkpoint"
             config = sample_config()
@@ -3023,6 +4931,17 @@ class CausalCheckpointTest(unittest.TestCase):
             first_judge.provider_circuit_reason = "provider unavailable"
             first_judge.consecutive_provider_errors = 3
             first_judge.provider_error_threshold = 3
+            first_judge.provider_circuit_disposition = {
+                "retryable": True,
+                "category": "http_retryable",
+                "status_code": 503,
+                "error_code": "service_unavailable",
+                "reason": "historical provider failure",
+            }
+            first_judge.provider_circuit_first_request = 1
+            first_judge.provider_circuit_first_failure_at = (
+                "2026-07-31T00:00:00Z"
+            )
             AgenticRecursiveAnalyzer(
                 judge=first_judge,
                 checkpoint=CheckpointBundle(root),
@@ -3035,11 +4954,14 @@ class CausalCheckpointTest(unittest.TestCase):
                 analysis_perspective="Improve repository reasoning.",
             )
 
-            resumed_judge = CountingOfflineJudge()
+            resumed_judge = FreshProbeJudge()
             resumed_judge.provider_circuit_open = False
             resumed_judge.provider_circuit_reason = ""
             resumed_judge.consecutive_provider_errors = 0
             resumed_judge.provider_error_threshold = 3
+            resumed_judge.provider_circuit_disposition = None
+            resumed_judge.provider_circuit_first_request = 0
+            resumed_judge.provider_circuit_first_failure_at = ""
             report = AgenticRecursiveAnalyzer(
                 judge=resumed_judge,
                 checkpoint=CheckpointBundle(root),
@@ -3050,9 +4972,45 @@ class CausalCheckpointTest(unittest.TestCase):
                 objective="Find the defect.",
                 analysis_perspective="Improve repository reasoning.",
             )
-            self.assertEqual(resumed_judge.step_calls, 0)
-            self.assertTrue(report.metadata["provider_circuit"]["open"])
-            self.assertEqual(resumed_judge.consecutive_provider_errors, 3)
+            self.assertEqual(resumed_judge.step_calls, 1)
+            self.assertEqual(
+                resumed_judge.active_state_at_probe,
+                {
+                    "open": False,
+                    "reason": "",
+                    "errors": 0,
+                    "disposition": None,
+                    "first_request": 0,
+                    "first_failure_at": "",
+                },
+            )
+            self.assertFalse(report.metadata["provider_circuit"]["open"])
+            self.assertEqual(
+                report.metadata["provider_circuit"]["previous_failure"][
+                    "disposition"
+                ]["status_code"],
+                503,
+            )
+            self.assertEqual(resumed_judge.consecutive_provider_errors, 0)
+            restored = CheckpointBundle(root).restore(expected_config=config)
+            restored_state = RecursiveAnalysisState.from_checkpoint(
+                graph=TraceGraph.from_trace(sample_trace()),
+                checkpoint=restored,
+            )
+            circuit = restored_state.provider_state["circuit"]
+            self.assertFalse(circuit["open"])
+            self.assertEqual(circuit["reason"], "")
+            self.assertEqual(circuit["consecutive_provider_errors"], 0)
+            self.assertIsNone(circuit["disposition"])
+            self.assertEqual(circuit["first_request"], 0)
+            self.assertEqual(circuit["first_failure_at"], "")
+            previous = restored_state.provider_state["previous_failure"]
+            self.assertEqual(previous["disposition"]["status_code"], 503)
+            self.assertEqual(previous["first_request"], 1)
+            self.assertEqual(
+                previous["first_failure_at"],
+                "2026-07-31T00:00:00Z",
+            )
 
     def test_provider_state_is_atomic_with_recursive_snapshot(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3455,6 +5413,7 @@ class CausalCheckpointTest(unittest.TestCase):
             trace=trace,
             case_id=trace["case_id"],
             start_refs=start_refs,
+            fusion_mode="retrieval-global",
         )
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "global.checkpoint"

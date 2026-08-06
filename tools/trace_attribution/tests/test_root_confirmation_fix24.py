@@ -84,6 +84,10 @@ def unknown_seed_terminal_action(action):
         request_identity=request_identity,
         owner=owner.to_dict(),
         seed_key=unknown_seed,
+        review_scope=output["payload"]["action_projection"][
+            "review_scope"
+        ],
+        origin=output["payload"]["action_projection"]["origin"],
         confirmation=confirmation,
         physical_requests_reserved=output["payload"][
             "physical_requests_reserved"
