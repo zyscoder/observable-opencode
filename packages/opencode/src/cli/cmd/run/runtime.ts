@@ -21,6 +21,7 @@ import { recordRunSpanError, setRunSpanAttributes, withRunSpan } from "./otel"
 import { trace } from "./trace"
 import { cycleVariant, formatModelLabel, resolveSavedVariant, resolveVariant, saveVariant } from "./variant.shared"
 import type { RunInput, RunPrompt, RunProvider } from "./types"
+import { CaseTrace } from "@/observability/case-trace"
 
 /** @internal Exported for testing */
 export { pickVariant, resolveVariant } from "./variant.shared"
@@ -127,6 +128,37 @@ function eagerStream(input: RunRuntimeInput, ctx: BootContext) {
   return ctx.resume === true || !input.resolveSession || !!input.demo
 }
 
+/** @internal Exported for trace lifecycle tests */
+export function finishReplacedTraceSession(sessionID: string | undefined) {
+  if (!sessionID) return
+  CaseTrace.finishSession(sessionID, {
+    status: "success",
+    result: {
+      reason: "session.replaced",
+    },
+  })
+}
+
+/** @internal Exported for trace lifecycle tests */
+export function finishInteractiveTraceSessions(input: { sessionID?: string; error?: unknown }) {
+  const status = input.error ? "error" : "success"
+  if (input.sessionID) {
+    CaseTrace.finishSession(input.sessionID, {
+      status,
+      error: input.error,
+      result: {
+        reason: "interactive.runtime.closed",
+      },
+    })
+  }
+  CaseTrace.finishAll({
+    status: "success",
+    result: {
+      reason: "interactive.runtime.closed",
+    },
+  })
+}
+
 function variantsFor(providers: RunProvider[], model: RunInput["model"]) {
   if (!model) {
     return []
@@ -223,6 +255,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           state.sessionID = next.sessionID
           state.sessionTitle = next.sessionTitle ?? state.sessionTitle
           state.agent = next.agent
+          CaseTrace.setSessionID(state.sessionID)
           setRunSpanAttributes(span, {
             "opencode.agent.name": state.agent,
             "session.id": state.sessionID,
@@ -523,6 +556,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           footer,
           initialInput: input.initialInput,
           trace: log,
+          sessionID: () => state.sessionID || undefined,
           onSend: (prompt) => {
             state.shown = true
             state.history.push(prompt)
@@ -531,6 +565,8 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
             ? async () => {
                 try {
                   await state.switching?.catch(() => {})
+                  const previousSessionID = state.sessionID
+                  finishReplacedTraceSession(previousSessionID)
                   const created = await createSession(ctx, {
                     agent: state.agent,
                     model: state.model,
@@ -545,6 +581,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
                   state.sessionID = created.sessionID
                   state.sessionTitle = created.sessionTitle
                   state.agent = created.agent ?? state.agent
+                  CaseTrace.setSessionID(state.sessionID)
                   state.history = []
                   includeFiles = true
                   state.demo = input.demo
@@ -665,6 +702,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
         })
       }
 
+      let queueFailure: unknown
       try {
         const eager = eagerStream(input, ctx)
         if (eager) {
@@ -683,8 +721,15 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
 
         try {
           await runQueue()
+        } catch (error) {
+          queueFailure = error
+          throw error
         } finally {
           await state.stream?.then((item) => item.handle.close()).catch(() => {})
+          finishInteractiveTraceSessions({
+            sessionID: state.sessionID || undefined,
+            error: queueFailure,
+          })
         }
       } finally {
         const title = await resolveExitTitle(ctx, input, state)

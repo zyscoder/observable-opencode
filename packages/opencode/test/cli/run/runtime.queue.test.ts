@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { runPromptQueue } from "@/cli/cmd/run/runtime.queue"
 import type { FooterApi, FooterEvent, RunPrompt, StreamCommit } from "@/cli/cmd/run/types"
+import { CaseTrace } from "@/observability/case-trace"
 
 function footer() {
   const prompts = new Set<(input: RunPrompt) => void>()
@@ -70,6 +71,68 @@ function footer() {
 }
 
 describe("run runtime queue", () => {
+  test("keeps queued trace records with the session that owns each turn across /new", async () => {
+    const ui = footer()
+    const events: Array<Record<string, unknown>> = []
+    const spans: Array<Record<string, unknown>> = []
+    const originalEvent = CaseTrace.event
+    const originalStartSpan = CaseTrace.startSpan
+    let sessionID = "ses_a"
+
+    ;(CaseTrace as unknown as { event: (input: Record<string, unknown>) => void }).event = (input) => {
+      events.push(input)
+    }
+    ;(CaseTrace as unknown as { startSpan: (input: Record<string, unknown>) => { end: () => void } }).startSpan = (
+      input,
+    ) => {
+      spans.push(input)
+      return { end: () => {} }
+    }
+
+    try {
+      const task = runPromptQueue({
+        footer: ui.api,
+        sessionID: () => sessionID,
+        onNewSession: async () => {
+          sessionID = "ses_b"
+        },
+        run: async (prompt) => {
+          if (prompt.text === "B") {
+            throw new Error("B failed")
+          }
+        },
+      })
+
+      ui.submit("A")
+      await Promise.resolve()
+      await Promise.resolve()
+      ui.submit("/new")
+      await Promise.resolve()
+      await Promise.resolve()
+      ui.submit("B")
+
+      await expect(task).rejects.toThrow("B failed")
+    } finally {
+      ;(CaseTrace as unknown as { event: typeof CaseTrace.event }).event = originalEvent
+      ;(CaseTrace as unknown as { startSpan: typeof CaseTrace.startSpan }).startSpan = originalStartSpan
+    }
+
+    const inputFor = (record: Record<string, unknown>) => record.input as Record<string, unknown>
+    const dataFor = (record: Record<string, unknown>) => record.data as Record<string, unknown>
+    expect(spans.map(inputFor).map((input) => input.sessionID)).toEqual(["ses_a", "ses_b"])
+    expect(events.filter((event) => event.event_type === "queue.enqueue").map(dataFor).map((data) => data.sessionID)).toEqual([
+      "ses_a",
+      "ses_a",
+      "ses_b",
+    ])
+    expect(events.filter((event) => event.event_type === "turn.duration").map(dataFor).map((data) => data.sessionID)).toEqual([
+      "ses_a",
+      "ses_b",
+    ])
+    expect(events.find((event) => event.event_type === "queue.error")?.data).toMatchObject({ sessionID: "ses_b" })
+    expect(events.filter((event) => event.event_type === "turn.idle").at(-1)?.data).toMatchObject({ sessionID: "ses_b" })
+  })
+
   test("ignores empty prompts", async () => {
     const ui = footer()
     let calls = 0

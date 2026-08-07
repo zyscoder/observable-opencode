@@ -28,15 +28,22 @@ export type QueueInput = {
   footer: FooterApi
   initialInput?: string
   trace?: Trace
+  sessionID?: () => string | undefined
   onSend?: (prompt: RunPrompt) => void
   onNewSession?: () => void | Promise<void>
   run: (prompt: RunPrompt, signal: AbortSignal) => Promise<void>
 }
 
+type QueuedPrompt = {
+  prompt: RunPrompt
+  sessionID?: string
+}
+
 type State = {
-  queue: RunPrompt[]
+  queue: QueuedPrompt[]
   ctrl?: AbortController
   closed: boolean
+  lastSessionID?: string
 }
 
 function defer<T = void>(): Deferred<T> {
@@ -98,10 +105,12 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     draining = (async () => {
       try {
         while (!state.closed && state.queue.length > 0) {
-          const prompt = state.queue.shift()
-          if (!prompt) {
+          const queued = state.queue.shift()
+          if (!queued) {
             continue
           }
+          const { prompt, sessionID } = queued
+          state.lastSessionID = sessionID
 
           if (isNewCommand(prompt.text)) {
             emit(
@@ -144,6 +153,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               },
             )
             await input.onNewSession()
+            state.lastSessionID = input.sessionID?.()
             continue
           }
 
@@ -166,6 +176,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             operation: "turn",
             name: "interactive.turn",
             input: {
+              sessionID,
               prompt: CaseTrace.summarizeText(prompt.text),
               queue: state.queue.length,
               part_count: prompt.parts.length,
@@ -222,6 +233,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               component: "runtime",
               event_type: "turn.duration",
               data: {
+                sessionID,
                 duration,
                 queue: state.queue.length,
               },
@@ -242,6 +254,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           component: "runtime",
           event_type: "queue.error",
           data: {
+            sessionID: state.lastSessionID,
             error,
           },
         })
@@ -264,6 +277,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           component: "runtime",
           event_type: "turn.idle",
           data: {
+            sessionID: state.lastSessionID ?? input.sessionID?.(),
             queue: state.queue.length,
           },
         })
@@ -283,11 +297,13 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
       return
     }
 
-    state.queue.push(prompt)
+    const sessionID = input.sessionID?.()
+    state.queue.push({ prompt, sessionID })
     CaseTrace.event({
       component: "runtime",
       event_type: "queue.enqueue",
       data: {
+        sessionID,
         prompt: CaseTrace.summarizeText(prompt.text),
         part_count: prompt.parts.length,
         queue: state.queue.length,

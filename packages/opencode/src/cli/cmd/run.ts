@@ -83,6 +83,33 @@ function block(info: Inline, output?: string) {
   UI.empty()
 }
 
+function finishRunTraces(input: { sessionID?: string; failure?: unknown }) {
+  const status = input.failure || process.exitCode ? "error" : "success"
+  const result = {
+    exit_code: process.exitCode ?? 0,
+  }
+
+  if (input.sessionID) {
+    CaseTrace.finishSession(input.sessionID, {
+      status,
+      error: input.failure,
+      result,
+    })
+  }
+
+  // Earlier interactive roots have their own terminal result. The process
+  // record and any still-open roots close successfully instead of inheriting
+  // the last active turn's error.
+  CaseTrace.finishAll({
+    status: "success",
+    result: {
+      ...result,
+      reason: "run.closed",
+      active_status: status,
+    },
+  })
+}
+
 async function tool(part: ToolPart) {
   try {
     const { toolInlineInfo } = await import("./run/tool")
@@ -611,6 +638,7 @@ export const RunCommand = effectCmd({
           },
         })
         let failure: unknown
+        let activeSessionID: string | undefined
         try {
           const sess = await session(sdk)
           if (!sess?.id) {
@@ -618,6 +646,7 @@ export const RunCommand = effectCmd({
             process.exit(1)
           }
           const sessionID = sess.id
+          activeSessionID = sessionID
           CaseTrace.setSessionID(sessionID)
           runSpan?.event({
             event_type: "session.selected",
@@ -928,13 +957,7 @@ export const RunCommand = effectCmd({
             },
           })
           try {
-            CaseTrace.finishAll({
-              status,
-              error: failure,
-              result: {
-                exit_code: process.exitCode ?? 0,
-              },
-            })
+            finishRunTraces({ sessionID: activeSessionID, failure })
           } catch {}
         }
       }
@@ -992,13 +1015,7 @@ export const RunCommand = effectCmd({
             },
           })
           try {
-            CaseTrace.finishAll({
-              status,
-              error: failure,
-              result: {
-                exit_code: process.exitCode ?? 0,
-              },
-            })
+            finishRunTraces({ failure })
           } catch {}
         }
       }
