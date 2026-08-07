@@ -71,7 +71,7 @@ function footer() {
 }
 
 describe("run runtime queue", () => {
-  test("keeps queued trace records with the session that owns each turn across /new", async () => {
+  test("defers prompt trace ownership behind an immediately queued /new", async () => {
     const ui = footer()
     const events: Array<Record<string, unknown>> = []
     const spans: Array<Record<string, unknown>> = []
@@ -104,11 +104,7 @@ describe("run runtime queue", () => {
       })
 
       ui.submit("A")
-      await Promise.resolve()
-      await Promise.resolve()
       ui.submit("/new")
-      await Promise.resolve()
-      await Promise.resolve()
       ui.submit("B")
 
       await expect(task).rejects.toThrow("B failed")
@@ -120,17 +116,69 @@ describe("run runtime queue", () => {
     const inputFor = (record: Record<string, unknown>) => record.input as Record<string, unknown>
     const dataFor = (record: Record<string, unknown>) => record.data as Record<string, unknown>
     expect(spans.map(inputFor).map((input) => input.sessionID)).toEqual(["ses_a", "ses_b"])
-    expect(events.filter((event) => event.event_type === "queue.enqueue").map(dataFor).map((data) => data.sessionID)).toEqual([
-      "ses_a",
-      "ses_a",
-      "ses_b",
-    ])
-    expect(events.filter((event) => event.event_type === "turn.duration").map(dataFor).map((data) => data.sessionID)).toEqual([
-      "ses_a",
-      "ses_b",
-    ])
+    expect(
+      events
+        .filter((event) => event.event_type === "queue.enqueue")
+        .map(dataFor)
+        .map((data) => data.sessionID),
+    ).toEqual(["ses_a", "ses_a", "ses_b"])
+    expect(
+      events
+        .filter((event) => event.event_type === "queue.enqueue")
+        .map(dataFor)
+        .at(-1),
+    ).toMatchObject({
+      deferred: true,
+      enqueued_at: expect.any(Number),
+      sessionID: "ses_b",
+    })
+    expect(
+      events
+        .filter((event) => event.event_type === "turn.duration")
+        .map(dataFor)
+        .map((data) => data.sessionID),
+    ).toEqual(["ses_a", "ses_b"])
     expect(events.find((event) => event.event_type === "queue.error")?.data).toMatchObject({ sessionID: "ses_b" })
-    expect(events.filter((event) => event.event_type === "turn.idle").at(-1)?.data).toMatchObject({ sessionID: "ses_b" })
+    expect(events.filter((event) => event.event_type === "turn.idle").at(-1)?.data).toMatchObject({
+      sessionID: "ses_b",
+    })
+  })
+
+  test("attributes /new enqueue to the old session and final idle to the new session", async () => {
+    const ui = footer()
+    const events: Array<Record<string, unknown>> = []
+    const originalEvent = CaseTrace.event
+    let sessionID = "ses_a"
+
+    ;(CaseTrace as unknown as { event: (input: Record<string, unknown>) => void }).event = (input) => {
+      events.push(input)
+    }
+
+    try {
+      const task = runPromptQueue({
+        footer: ui.api,
+        sessionID: () => sessionID,
+        onNewSession: async () => {
+          sessionID = "ses_b"
+          ui.api.close()
+        },
+        run: async () => {},
+      })
+
+      ui.submit("/new")
+      await task
+    } finally {
+      ;(CaseTrace as unknown as { event: typeof CaseTrace.event }).event = originalEvent
+    }
+
+    const dataFor = (record: Record<string, unknown>) => record.data as Record<string, unknown>
+    expect(events.find((event) => event.event_type === "queue.enqueue")?.data).toMatchObject({
+      sessionID: "ses_a",
+      new_session: true,
+    })
+    expect(events.filter((event) => event.event_type === "turn.idle").at(-1)?.data).toMatchObject({
+      sessionID: "ses_b",
+    })
   })
 
   test("ignores empty prompts", async () => {
@@ -363,6 +411,117 @@ describe("run runtime queue", () => {
 
     expect(hit).toBe(true)
     expect(seen).toEqual(["one"])
+  })
+
+  test("ends the turn span as cancelled when the footer closes while idle", async () => {
+    const ui = footer()
+    const endings: Array<Record<string, unknown> | undefined> = []
+    const originalStartSpan = CaseTrace.startSpan
+    let releaseIdle: (() => void) | undefined
+    const idle = new Promise<void>((resolve) => {
+      releaseIdle = resolve
+    })
+    ui.api.idle = () => idle
+    ;(
+      CaseTrace as unknown as {
+        startSpan: (input: Record<string, unknown>) => { end: (input?: Record<string, unknown>) => void }
+      }
+    ).startSpan = () => ({
+      end: (input) => endings.push(input),
+    })
+
+    try {
+      const task = runPromptQueue({ footer: ui.api, sessionID: () => "ses_a", run: async () => {} })
+      ui.submit("one")
+      await Promise.resolve()
+      ui.api.close()
+      releaseIdle?.()
+      await task
+    } finally {
+      ;(CaseTrace as unknown as { startSpan: typeof CaseTrace.startSpan }).startSpan = originalStartSpan
+    }
+
+    expect(endings).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        output: expect.objectContaining({ reason: "cancelled", stage: "footer.idle" }),
+      }),
+    ])
+  })
+
+  test("ends the turn span as cancelled when append closes the footer", async () => {
+    const ui = footer()
+    const endings: Array<Record<string, unknown> | undefined> = []
+    const originalStartSpan = CaseTrace.startSpan
+    const originalAppend = ui.api.append
+    ui.api.append = (commit) => {
+      originalAppend(commit)
+      ui.api.close()
+    }
+    ;(
+      CaseTrace as unknown as {
+        startSpan: (input: Record<string, unknown>) => { end: (input?: Record<string, unknown>) => void }
+      }
+    ).startSpan = () => ({
+      end: (input) => endings.push(input),
+    })
+
+    try {
+      const task = runPromptQueue({ footer: ui.api, sessionID: () => "ses_a", run: async () => {} })
+      ui.submit("one")
+      await task
+    } finally {
+      ;(CaseTrace as unknown as { startSpan: typeof CaseTrace.startSpan }).startSpan = originalStartSpan
+    }
+
+    expect(endings).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        output: expect.objectContaining({ reason: "cancelled", stage: "footer.append" }),
+      }),
+    ])
+  })
+
+  test("ends the active turn span as cancelled when the footer closes during run", async () => {
+    const ui = footer()
+    const endings: Array<Record<string, unknown> | undefined> = []
+    const originalStartSpan = CaseTrace.startSpan
+    let entered: (() => void) | undefined
+    const started = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+
+    ;(
+      CaseTrace as unknown as {
+        startSpan: (input: Record<string, unknown>) => { end: (input?: Record<string, unknown>) => void }
+      }
+    ).startSpan = () => ({
+      end: (input) => endings.push(input),
+    })
+
+    try {
+      const task = runPromptQueue({
+        footer: ui.api,
+        sessionID: () => "ses_a",
+        run: async (_prompt, signal) => {
+          entered?.()
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
+        },
+      })
+      ui.submit("one")
+      await started
+      ui.api.close()
+      await task
+    } finally {
+      ;(CaseTrace as unknown as { startSpan: typeof CaseTrace.startSpan }).startSpan = originalStartSpan
+    }
+
+    expect(endings).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        output: expect.objectContaining({ reason: "cancelled", stage: "turn.run" }),
+      }),
+    ])
   })
 
   test("propagates run errors", async () => {

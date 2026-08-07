@@ -21,6 +21,7 @@ import { recordRunSpanError, setRunSpanAttributes, withRunSpan } from "./otel"
 import { trace } from "./trace"
 import { cycleVariant, formatModelLabel, resolveSavedVariant, resolveVariant, saveVariant } from "./variant.shared"
 import type { RunInput, RunPrompt, RunProvider } from "./types"
+import type { InteractiveTurnOutcome } from "./runtime.queue"
 import { CaseTrace } from "@/observability/case-trace"
 
 /** @internal Exported for testing */
@@ -129,14 +130,62 @@ function eagerStream(input: RunRuntimeInput, ctx: BootContext) {
 }
 
 /** @internal Exported for trace lifecycle tests */
-export function finishReplacedTraceSession(sessionID: string | undefined) {
+export function finishReplacedTraceSession(sessionID: string | undefined, error?: unknown) {
   if (!sessionID) return
   CaseTrace.finishSession(sessionID, {
-    status: "success",
+    status: error ? "error" : "success",
+    error,
     result: {
       reason: "session.replaced",
     },
   })
+}
+
+/** @internal Trace-only outcome channel; does not alter the interactive error contract. */
+export async function captureInteractiveTurnOutcome(input: {
+  run: () => Promise<void>
+  cancelled: () => boolean
+  report: (error: unknown) => void | Promise<void>
+}): Promise<InteractiveTurnOutcome> {
+  try {
+    await input.run()
+    return { status: "success" }
+  } catch (error) {
+    if (input.cancelled()) return { status: "cancelled" }
+    await input.report(error)
+    return { status: "error", error }
+  }
+}
+
+/** @internal Session-scoped unresolved turn failures for trace finalization. */
+export function createInteractiveTraceOutcomeTracker() {
+  const failures = new Map<string, unknown>()
+  return {
+    record(sessionID: string | undefined, outcome: InteractiveTurnOutcome) {
+      if (!sessionID) return
+      if (outcome.status === "error") failures.set(sessionID, outcome.error)
+      if (outcome.status === "success") failures.delete(sessionID)
+    },
+    failure(sessionID: string | undefined) {
+      return sessionID ? failures.get(sessionID) : undefined
+    },
+    clear(sessionID: string | undefined) {
+      if (sessionID) failures.delete(sessionID)
+    },
+  }
+}
+
+/** @internal Creates the replacement before publishing the old root as terminal. */
+export async function replaceInteractiveTraceSession<T>(input: {
+  previousSessionID?: string
+  previousError?: unknown
+  create: () => Promise<T>
+  prepare?: (created: T) => void | Promise<void>
+}): Promise<T> {
+  const created = await input.create()
+  await input.prepare?.(created)
+  finishReplacedTraceSession(input.previousSessionID, input.previousError)
+  return created
 }
 
 /** @internal Exported for trace lifecycle tests */
@@ -544,6 +593,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
         return next
       }
 
+      const traceOutcomes = createInteractiveTraceOutcomeTracker()
       const runQueue = async () => {
         let includeFiles = true
         if (state.demo) {
@@ -566,14 +616,21 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
                 try {
                   await state.switching?.catch(() => {})
                   const previousSessionID = state.sessionID
-                  finishReplacedTraceSession(previousSessionID)
-                  const created = await createSession(ctx, {
-                    agent: state.agent,
-                    model: state.model,
-                    variant: state.activeVariant,
+                  const created = await replaceInteractiveTraceSession({
+                    previousSessionID,
+                    previousError: traceOutcomes.failure(previousSessionID),
+                    create: () =>
+                      createSession(ctx, {
+                        agent: state.agent,
+                        model: state.model,
+                        variant: state.activeVariant,
+                      }),
+                    prepare: async () => {
+                      await footer.idle().catch(() => {})
+                      await state.stream?.then((item) => item.handle.close()).catch(() => {})
+                    },
                   })
-                  await footer.idle().catch(() => {})
-                  await state.stream?.then((item) => item.handle.close()).catch(() => {})
+                  traceOutcomes.clear(previousSessionID)
                   state.stream = undefined
                   state.session = undefined
                   state.selectSubagent = undefined
@@ -645,6 +702,9 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
                 }
               }
             : undefined,
+          onTraceOutcome: ({ sessionID, outcome }) => {
+            traceOutcomes.record(sessionID, outcome)
+          },
           run: async (prompt, signal) => {
             if (state.demo && (await state.demo.prompt(prompt, signal))) {
               return
@@ -665,38 +725,38 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
                 "opencode.prompt.file_parts": includeFiles ? input.files.length : 0,
                 "session.id": state.sessionID || undefined,
               },
-              async (span) => {
-                try {
-                  const next = await ensureStream()
-                  setRunSpanAttributes(span, {
-                    "opencode.agent.name": state.agent,
-                    "opencode.model.provider": state.model?.providerID,
-                    "opencode.model.id": state.model?.modelID,
-                    "opencode.model.variant": state.activeVariant,
-                    "session.id": state.sessionID || undefined,
-                  })
-                  await next.handle.runPromptTurn({
-                    agent: state.agent,
-                    model: state.model,
-                    variant: state.activeVariant,
-                    prompt,
-                    files: input.files,
-                    includeFiles,
-                    signal,
-                  })
-                  includeFiles = false
-                } catch (error) {
-                  if (signal.aborted || footer.isClosed) {
-                    return
-                  }
-
-                  recordRunSpanError(span, error)
-                  const text =
-                    (await state.stream?.then((item) => item.mod).catch(() => undefined))?.formatUnknownError(error) ??
-                    (error instanceof Error ? error.message : String(error))
-                  footer.append({ kind: "error", text, phase: "start", source: "system" })
-                }
-              },
+              async (span) =>
+                captureInteractiveTurnOutcome({
+                  cancelled: () => signal.aborted || footer.isClosed,
+                  run: async () => {
+                    const next = await ensureStream()
+                    setRunSpanAttributes(span, {
+                      "opencode.agent.name": state.agent,
+                      "opencode.model.provider": state.model?.providerID,
+                      "opencode.model.id": state.model?.modelID,
+                      "opencode.model.variant": state.activeVariant,
+                      "session.id": state.sessionID || undefined,
+                    })
+                    await next.handle.runPromptTurn({
+                      agent: state.agent,
+                      model: state.model,
+                      variant: state.activeVariant,
+                      prompt,
+                      files: input.files,
+                      includeFiles,
+                      signal,
+                    })
+                    includeFiles = false
+                  },
+                  report: async (error) => {
+                    recordRunSpanError(span, error)
+                    const text =
+                      (await state.stream?.then((item) => item.mod).catch(() => undefined))?.formatUnknownError(
+                        error,
+                      ) ?? (error instanceof Error ? error.message : String(error))
+                    footer.append({ kind: "error", text, phase: "start", source: "system" })
+                  },
+                }),
             )
           },
         })
@@ -728,7 +788,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           await state.stream?.then((item) => item.handle.close()).catch(() => {})
           finishInteractiveTraceSessions({
             sessionID: state.sessionID || undefined,
-            error: queueFailure,
+            error: queueFailure ?? traceOutcomes.failure(state.sessionID),
           })
         }
       } finally {

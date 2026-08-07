@@ -31,12 +31,20 @@ export type QueueInput = {
   sessionID?: () => string | undefined
   onSend?: (prompt: RunPrompt) => void
   onNewSession?: () => void | Promise<void>
-  run: (prompt: RunPrompt, signal: AbortSignal) => Promise<void>
+  onTraceOutcome?: (input: { sessionID?: string; outcome: InteractiveTurnOutcome }) => void
+  run: (prompt: RunPrompt, signal: AbortSignal) => Promise<void | InteractiveTurnOutcome>
 }
+
+export type InteractiveTurnOutcome =
+  | { status: "success" }
+  | { status: "error"; error: unknown }
+  | { status: "cancelled" }
 
 type QueuedPrompt = {
   prompt: RunPrompt
   sessionID?: string
+  deferredSession: boolean
+  enqueuedAt: number
 }
 
 type State = {
@@ -44,6 +52,7 @@ type State = {
   ctrl?: AbortController
   closed: boolean
   lastSessionID?: string
+  pendingSessionSwitches: number
 }
 
 function defer<T = void>(): Deferred<T> {
@@ -69,6 +78,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
   const state: State = {
     queue: [],
     closed: input.footer.isClosed,
+    pendingSessionSwitches: 0,
   }
   let draining: Promise<void> | undefined
 
@@ -97,6 +107,22 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     finish()
   }
 
+  const traceEnqueue = (queued: QueuedPrompt, sessionID: string | undefined) => {
+    CaseTrace.event({
+      component: "runtime",
+      event_type: "queue.enqueue",
+      data: {
+        sessionID,
+        prompt: CaseTrace.summarizeText(queued.prompt.text),
+        part_count: queued.prompt.parts.length,
+        queue: state.queue.length,
+        new_session: isNewCommand(queued.prompt.text),
+        deferred: queued.deferredSession,
+        enqueued_at: queued.enqueuedAt,
+      },
+    })
+  }
+
   const drain = () => {
     if (draining || state.closed || state.queue.length === 0) {
       return
@@ -109,7 +135,11 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
           if (!queued) {
             continue
           }
-          const { prompt, sessionID } = queued
+          const { prompt } = queued
+          const sessionID = queued.deferredSession ? input.sessionID?.() : queued.sessionID
+          if (queued.deferredSession) {
+            traceEnqueue(queued, sessionID)
+          }
           state.lastSessionID = sessionID
 
           if (isNewCommand(prompt.text)) {
@@ -123,6 +153,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               },
             )
             if (!input.onNewSession) {
+              state.pendingSessionSwitches = Math.max(0, state.pendingSessionSwitches - 1)
               emit(
                 {
                   type: "stream.patch",
@@ -152,8 +183,12 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
                 queue: state.queue.length,
               },
             )
-            await input.onNewSession()
-            state.lastSessionID = input.sessionID?.()
+            try {
+              await input.onNewSession()
+            } finally {
+              state.pendingSessionSwitches = Math.max(0, state.pendingSessionSwitches - 1)
+              state.lastSessionID = input.sessionID?.()
+            }
             continue
           }
 
@@ -182,10 +217,29 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
               part_count: prompt.parts.length,
             },
           })
+          let spanEnded = false
+          const endSpan = (next?: Parameters<NonNullable<typeof span>["end"]>[0]) => {
+            if (spanEnded) return
+            spanEnded = true
+            span?.end(next)
+          }
+          const cancelSpan = (stage: string) => {
+            const outcome = { status: "cancelled" as const }
+            endSpan({
+              status: "cancelled",
+              output: {
+                reason: "cancelled",
+                stage,
+                queue: state.queue.length,
+              },
+            })
+            input.onTraceOutcome?.({ sessionID, outcome })
+          }
 
           try {
             await input.footer.idle()
             if (state.closed) {
+              cancelSpan("footer.idle")
               break
             }
 
@@ -195,33 +249,43 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             input.onSend?.(prompt)
 
             if (state.closed) {
+              cancelSpan("footer.append")
               break
             }
 
             const task = input.run(prompt, ctrl.signal).then(
-              () => ({ type: "done" as const }),
+              (value) => ({ type: "done" as const, value }),
               (error) => ({ type: "error" as const, error }),
             )
 
             const next = await Promise.race([task, stop.promise])
             if (next.type === "closed") {
               ctrl.abort()
+              cancelSpan("turn.run")
               break
             }
 
             if (next.type === "error") {
               throw next.error
             }
-            span?.end({
-              output: {
-                queue: state.queue.length,
-              },
-            })
+            const outcome = next.value
+            if (outcome?.status === "error") {
+              endSpan({ status: "error", error: outcome.error })
+            } else if (outcome?.status === "cancelled") {
+              endSpan({
+                status: "cancelled",
+                output: { reason: "cancelled", stage: "turn.run", queue: state.queue.length },
+              })
+            } else {
+              endSpan({ output: { queue: state.queue.length } })
+            }
+            input.onTraceOutcome?.({ sessionID, outcome: outcome ?? { status: "success" } })
           } catch (error) {
-            span?.end({
+            endSpan({
               status: "error",
               error,
             })
+            input.onTraceOutcome?.({ sessionID, outcome: { status: "error", error } })
             throw error
           } finally {
             if (state.ctrl === ctrl) {
@@ -297,19 +361,21 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
       return
     }
 
-    const sessionID = input.sessionID?.()
-    state.queue.push({ prompt, sessionID })
-    CaseTrace.event({
-      component: "runtime",
-      event_type: "queue.enqueue",
-      data: {
-        sessionID,
-        prompt: CaseTrace.summarizeText(prompt.text),
-        part_count: prompt.parts.length,
-        queue: state.queue.length,
-        new_session: isNewCommand(prompt.text),
-      },
-    })
+    const newSession = isNewCommand(prompt.text)
+    const deferredSession = !newSession && state.pendingSessionSwitches > 0
+    const queued: QueuedPrompt = {
+      prompt,
+      sessionID: deferredSession ? undefined : input.sessionID?.(),
+      deferredSession,
+      enqueuedAt: Date.now(),
+    }
+    if (newSession) {
+      state.pendingSessionSwitches += 1
+    }
+    state.queue.push(queued)
+    if (!deferredSession) {
+      traceEnqueue(queued, queued.sessionID)
+    }
     emit(
       {
         type: "queue",
@@ -319,7 +385,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
         queue: state.queue.length,
       },
     )
-    if (isNewCommand(prompt.text)) {
+    if (newSession) {
       drain()
       return
     }

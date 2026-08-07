@@ -83,7 +83,8 @@ function block(info: Inline, output?: string) {
   UI.empty()
 }
 
-function finishRunTraces(input: { sessionID?: string; failure?: unknown }) {
+/** @internal Exported for trace lifecycle tests. */
+export function finishRunTraces(input: { sessionID?: string; failure?: unknown }) {
   const status = input.failure || process.exitCode ? "error" : "success"
   const result = {
     exit_code: process.exitCode ?? 0,
@@ -105,7 +106,6 @@ function finishRunTraces(input: { sessionID?: string; failure?: unknown }) {
     result: {
       ...result,
       reason: "run.closed",
-      active_status: status,
     },
   })
 }
