@@ -688,6 +688,55 @@ describe("case trace", () => {
     expect(slash.trace).not.toContain("first root content")
   })
 
+  test("clears routed case ID allocations when reconfiguring the same base", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-reconfigured-base-collision-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "reconfigured-base-collision.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const routedSuffix = `--ses_a--${routedIdentityDigestForTest("root", "ses/a")}`
+    const baseCaseID = `${"b".repeat(160 - routedSuffix.length)}${routedSuffix}`
+    const disambiguated = `${baseCaseID.slice(0, 160 - `${routedSuffix}--1`.length)}${routedSuffix}--1`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "first", session_id: "ses_first", input: { text: "first lifecycle root" } })`,
+        `CaseTrace.promptAssembly({ stage: "slash", session_id: "ses/a", input: { text: "first lifecycle slash" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+        `const reconfigured = CaseTrace.configure({ caseID: ${JSON.stringify(baseCaseID)} })`,
+        `CaseTrace.promptAssembly({ stage: "first", session_id: "ses_first", input: { text: "second lifecycle root" } })`,
+        `CaseTrace.promptAssembly({ stage: "slash", session_id: "ses/a", input: { text: "second lifecycle slash" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+        `process.stdout.write(JSON.stringify({ reconfiguredCaseID: reconfigured?.caseID }))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: baseCaseID,
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({ reconfiguredCaseID: baseCaseID })
+
+    const directories = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+
+    expect(directories).toEqual([baseCaseID, disambiguated].sort())
+    expect(directories).not.toContain(`${baseCaseID.slice(0, 160 - `${routedSuffix}--2`.length)}${routedSuffix}--2`)
+    expect(await fs.readFile(path.join(dir, disambiguated, "trace.json"), "utf8")).toContain("second lifecycle slash")
+  })
+
   test("reconfigures in finally and keeps trace finalization failures passive", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-reconfigure-finalizer-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
