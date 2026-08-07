@@ -73,3 +73,9 @@ The first process-isolation implementation routed every zero-root unhinted call 
 - Zero-root unhinted calls intentionally retain compatibility semantics for existing single-case callers. Production no-hint entry policy remains Task 3C scope.
 - Independent root terminal-state policy remains Task 3B scope.
 - Public finalization is deliberately best-effort and silent to callers; registry-level tests retain retry visibility for internal finalization failures.
+
+## Follow-up: Routed Directory Identity Collision
+
+- RED: With base `collision-case`, roots `ses_first`, `ses/a`, and `ses_a` produced only two directories because subsequent short IDs used only the sanitized session text.
+- GREEN: The first root continues to use the exact base. Every subsequent root suffix now contains a readable sanitized session fragment plus a stable 12-hex SHA-256 summary over the original `{ kind: "root", sessionID }` identity. Process and no-base compatibility routes use the same role-aware identity domain, preventing a process route from sharing a name with a root whose raw session ID is `process`.
+- Regression coverage: the focused test verifies three distinct directories, exact base placement for `ses_first`, correct manifest session IDs, isolated contents, and distinct summaries for `ses/a` and `ses_a` despite their shared `ses_a` readable fragment.

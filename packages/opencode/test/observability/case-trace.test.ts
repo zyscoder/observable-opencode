@@ -19,6 +19,18 @@ async function exists(file: string) {
     .catch(() => false)
 }
 
+function routedIdentityDigestForTest(kind: "root" | "process", sessionID?: string) {
+  return createHash("sha256")
+    .update(JSON.stringify({ kind, sessionID: sessionID ?? null }))
+    .digest("hex")
+    .slice(0, 12)
+}
+
+function routedCaseDirectoryForTest(base: string, kind: "root" | "process", sessionID?: string) {
+  const readable = kind === "root" ? sessionID!.replace(/[^a-zA-Z0-9._-]+/g, "_") : kind
+  return `${base}--${readable}--${routedIdentityDigestForTest(kind, sessionID)}`
+}
+
 async function waitForExists(file: string, timeoutMs = 2000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
@@ -348,10 +360,11 @@ describe("case trace", () => {
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
       .sort()
-    expect(caseDirectories).toEqual(["multi-session-case", "multi-session-case--ses_root_b"])
+    const rootBCaseDirectory = routedCaseDirectoryForTest("multi-session-case", "root", "ses_root_b")
+    expect(caseDirectories).toEqual(["multi-session-case", rootBCaseDirectory])
 
     const rootADir = path.join(dir, "multi-session-case")
-    const rootBDir = path.join(dir, "multi-session-case--ses_root_b")
+    const rootBDir = path.join(dir, rootBCaseDirectory)
     const manifestA = JSON.parse(await fs.readFile(path.join(rootADir, "manifest.json"), "utf8")) as any
     const manifestB = JSON.parse(await fs.readFile(path.join(rootBDir, "manifest.json"), "utf8")) as any
     const traceA = await fs.readFile(path.join(rootADir, "trace.json"), "utf8")
@@ -404,9 +417,11 @@ describe("case trace", () => {
     })
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
+    const processCaseDirectory = routedCaseDirectoryForTest("compatibility-identity-case", "process")
+    const rootBCaseDirectory = routedCaseDirectoryForTest("compatibility-identity-case", "root", "ses_b")
     expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({
       configuredCaseID: "compatibility-identity-case",
-      unscopedCaseID: "compatibility-identity-case--process",
+      unscopedCaseID: processCaseDirectory,
       same: false,
     })
 
@@ -416,8 +431,8 @@ describe("case trace", () => {
       .sort()
     expect(caseDirectories).toEqual([
       "compatibility-identity-case",
-      "compatibility-identity-case--process",
-      "compatibility-identity-case--ses_b",
+      processCaseDirectory,
+      rootBCaseDirectory,
     ])
 
     const traces = await Promise.all(
@@ -435,7 +450,7 @@ describe("case trace", () => {
     expect(rootA.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(false)
     expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(true)
     expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(false)
-    expect(processTrace.caseDirectory).toBe("compatibility-identity-case--process")
+    expect(processTrace.caseDirectory).toBe(processCaseDirectory)
   })
 
   test("keeps rootless and unknown-ref records in an isolated process trace", async () => {
@@ -475,17 +490,15 @@ describe("case trace", () => {
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
       .sort()
-    expect(caseDirectories).toEqual([
-      "rootless-routing-case",
-      "rootless-routing-case--process",
-      "rootless-routing-case--ses_root_b",
-    ])
+    const processCaseDirectory = routedCaseDirectoryForTest("rootless-routing-case", "process")
+    const rootBCaseDirectory = routedCaseDirectoryForTest("rootless-routing-case", "root", "ses_root_b")
+    expect(caseDirectories).toEqual(["rootless-routing-case", processCaseDirectory, rootBCaseDirectory])
 
     const readRawEvents = async (caseDirectory: string) =>
       fs.readFile(path.join(dir, caseDirectory, "raw-events.jsonl"), "utf8")
     const rootA = await readRawEvents("rootless-routing-case")
-    const rootB = await readRawEvents("rootless-routing-case--ses_root_b")
-    const processTrace = await readRawEvents("rootless-routing-case--process")
+    const rootB = await readRawEvents(rootBCaseDirectory)
+    const processTrace = await readRawEvents(processCaseDirectory)
 
     expect(rootA).toContain("owner only")
     expect(rootA).not.toContain("unknown only")
@@ -556,6 +569,66 @@ describe("case trace", () => {
     expect(Object.values(first).every((caseID) => caseID.length <= 160)).toBe(true)
     expect(first[sessionA]).toContain("tail_a")
     expect(first[sessionB]).toContain("tail_b")
+  })
+
+  test("keeps sanitized root session collisions in distinct case directories", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-session-id-collision-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "session-id-collision.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "first", session_id: "ses_first", input: { text: "first root content" } })`,
+        `CaseTrace.promptAssembly({ stage: "slash", session_id: "ses/a", input: { text: "slash root content" } })`,
+        `CaseTrace.promptAssembly({ stage: "underscore", session_id: "ses_a", input: { text: "underscore root content" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "collision-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const traces = await Promise.all(
+      (await fs.readdir(dir, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => ({
+          directory: entry.name,
+          manifest: JSON.parse(await fs.readFile(path.join(dir, entry.name, "manifest.json"), "utf8")) as any,
+          trace: await fs.readFile(path.join(dir, entry.name, "trace.json"), "utf8"),
+        })),
+    )
+
+    expect(traces).toHaveLength(3)
+    expect(new Set(traces.map((trace) => trace.directory)).size).toBe(3)
+    expect(traces.map((trace) => trace.manifest.session_id).sort()).toEqual(["ses/a", "ses_a", "ses_first"])
+
+    const first = traces.find((trace) => trace.manifest.session_id === "ses_first")!
+    const slash = traces.find((trace) => trace.manifest.session_id === "ses/a")!
+    const underscore = traces.find((trace) => trace.manifest.session_id === "ses_a")!
+
+    expect(first.directory).toBe("collision-case")
+    expect(first.trace).toContain("first root content")
+    expect(slash.directory).toMatch(/^collision-case--ses_a--[0-9a-f]{12}$/)
+    expect(underscore.directory).toMatch(/^collision-case--ses_a--[0-9a-f]{12}$/)
+    expect(slash.directory).not.toBe(underscore.directory)
+    expect(slash.trace).toContain("slash root content")
+    expect(underscore.trace).toContain("underscore root content")
+    expect(slash.trace).not.toContain("underscore root content")
+    expect(underscore.trace).not.toContain("slash root content")
   })
 
   test("reconfigures in finally and keeps trace finalization failures passive", async () => {
@@ -1766,7 +1839,10 @@ describe("case trace", () => {
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "exact-tool-context-case", "trace.json"), "utf8")) as any
     const otherTrace = JSON.parse(
-      await fs.readFile(path.join(dir, "exact-tool-context-case--ses_other", "trace.json"), "utf8"),
+      await fs.readFile(
+        path.join(dir, routedCaseDirectoryForTest("exact-tool-context-case", "root", "ses_other"), "trace.json"),
+        "utf8",
+      ),
     ) as any
     const transforms = Object.fromEntries(
       [...trace.records, ...otherTrace.records]
@@ -5326,7 +5402,10 @@ describe("case trace", () => {
       await fs.readFile(path.join(dir, "subagent-parent-boundary-case", "trace.json"), "utf8"),
     ) as any
     const otherTrace = JSON.parse(
-      await fs.readFile(path.join(dir, "subagent-parent-boundary-case--ses_other", "trace.json"), "utf8"),
+      await fs.readFile(
+        path.join(dir, routedCaseDirectoryForTest("subagent-parent-boundary-case", "root", "ses_other"), "trace.json"),
+        "utf8",
+      ),
     ) as any
     const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
     const consumerStages = subagent.data.parent_consumption_refs

@@ -1420,13 +1420,22 @@ function safeCaseID(input: string) {
   return sanitizedCaseID(input).slice(0, 160)
 }
 
-function boundedRoutedCaseID(input: string, suffix: string) {
-  const sanitized = sanitizedCaseID(input)
-  if (sanitized.length <= 160) return sanitized
+function routedIdentityDigest(kind: "root" | "process" | "compatibility", sessionID: string | undefined) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ kind, sessionID: sessionID ?? null }))
+    .digest("hex")
+    .slice(0, 12)
+}
 
-  const digest = crypto.createHash("sha256").update(sanitized).digest("hex").slice(0, 12)
-  const suffixTail = sanitizedCaseID(suffix).slice(-64)
-  const marker = `--${digest}--${suffixTail}`
+function routedSuffix(kind: "root" | "process" | "compatibility", sessionID: string | undefined) {
+  const readable = kind === "root" ? sanitizedCaseID(sessionID ?? "session").slice(-64) : kind
+  return `${readable}--${routedIdentityDigest(kind, sessionID)}`
+}
+
+function boundedRoutedCaseID(base: string, suffix: string) {
+  const sanitized = sanitizedCaseID(base)
+  const marker = `--${suffix}`
   return `${sanitized.slice(0, 160 - marker.length)}${marker}`
 }
 
@@ -1436,15 +1445,18 @@ function routedCaseID(
   ordinal: number,
   kind: "root" | "process" | "compatibility",
 ) {
-  if (kind === "compatibility") return safeCaseID(base ?? "")
+  if (kind === "compatibility") {
+    if (base) return safeCaseID(base)
+    return boundedRoutedCaseID(`case-${stamp()}-${process.pid}`, routedSuffix(kind, sessionID))
+  }
   if (kind === "process") {
-    if (base) return boundedRoutedCaseID(`${base}--process`, "process")
-    return safeCaseID(`process-${stamp()}-${process.pid}-${ordinal}`)
+    if (base) return boundedRoutedCaseID(base, routedSuffix(kind, sessionID))
+    return boundedRoutedCaseID(`process-${stamp()}-${process.pid}-${ordinal}`, routedSuffix(kind, sessionID))
   }
   if (!sessionID) return safeCaseID(base ?? "")
   if (base && ordinal === 0) return safeCaseID(base)
-  if (base) return boundedRoutedCaseID(`${base}--${sessionID}`, sessionID)
-  return boundedRoutedCaseID(`session-${sessionID}`, sessionID)
+  if (base) return boundedRoutedCaseID(base, routedSuffix(kind, sessionID))
+  return boundedRoutedCaseID("session", routedSuffix(kind, sessionID))
 }
 
 function safeNumber(input: unknown) {
