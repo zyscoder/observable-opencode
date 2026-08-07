@@ -70,6 +70,24 @@ test("routes reference-only records to their owner", () => {
   expect(registry.resolve({ refs: ["span:span_1"] })).toBe(owner)
 })
 
+test("routes references shared by multiple roots to the process trace", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
+
+  registry.remember(first, ["turn:shared"])
+  registry.remember(first, ["turn:shared"])
+  expect(registry.resolve({ refs: ["turn:shared"] })).toBe(first)
+
+  registry.remember(second, ["turn:shared"])
+  const processTrace = registry.resolve({ refs: ["turn:shared"] })
+
+  expect(processTrace).not.toBe(first)
+  expect(processTrace).not.toBe(second)
+  registry.remember(first, ["turn:shared"])
+  expect(registry.resolve({ refs: ["turn:shared"] })).toBe(processTrace)
+})
+
 test("isolates unknown refs after multiple roots without losing known owners", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const owner = registry.resolve({ sessionID: "ses_owner" })

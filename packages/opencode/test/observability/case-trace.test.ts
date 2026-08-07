@@ -453,6 +453,104 @@ describe("case trace", () => {
     expect(processTrace.caseDirectory).toBe(processCaseDirectory)
   })
 
+  test("claims a compatibility trace through its public setSessionID method", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-direct-compatibility-identity-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "direct-compatibility-identity.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const configured = CaseTrace.configure({ caseID: "direct-compatibility-case" })`,
+        `configured?.setSessionID("ses_a")`,
+        `CaseTrace.setSessionID("ses_b")`,
+        `CaseTrace.promptAssembly({ stage: "root_a", session_id: "ses_a", input: { text: "prompt A" } })`,
+        `CaseTrace.promptAssembly({ stage: "root_b", session_id: "ses_b", input: { text: "prompt B" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDirectories = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+    const rootBCaseDirectory = routedCaseDirectoryForTest("direct-compatibility-case", "root", "ses_b")
+    expect(caseDirectories).toEqual(["direct-compatibility-case", rootBCaseDirectory])
+
+    const traces = await Promise.all(
+      caseDirectories.map(async (caseDirectory) => ({
+        caseDirectory,
+        trace: JSON.parse(await fs.readFile(path.join(dir, caseDirectory, "trace.json"), "utf8")) as any,
+      })),
+    )
+    const rootA = traces.find((item) => item.trace.manifest.session_id === "ses_a")!
+    const rootB = traces.find((item) => item.trace.manifest.session_id === "ses_b")!
+
+    expect(rootA.caseDirectory).toBe("direct-compatibility-case")
+    expect(rootA.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(true)
+    expect(rootA.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(false)
+    expect(rootB.caseDirectory).toBe(rootBCaseDirectory)
+    expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(true)
+    expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(false)
+  })
+
+  test("keeps records with cross-root ambiguous references in the process trace", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-ambiguous-ref-routing-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "ambiguous-ref-routing.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "shared_node", kind: "test.node", component: "trace", title: "root A", status: "success", data: { sessionID: "ses_a" } })`,
+        `CaseTrace.node({ node_id: "shared_node", kind: "test.node", component: "trace", title: "root B", status: "success", data: { sessionID: "ses_b" } })`,
+        `CaseTrace.event({ component: "trace", event_type: "ambiguous.marker", data: { marker: "process only", source_refs: ["node:shared_node"] } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "ambiguous-ref-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const processCaseDirectory = routedCaseDirectoryForTest("ambiguous-ref-case", "process")
+    const rootBCaseDirectory = routedCaseDirectoryForTest("ambiguous-ref-case", "root", "ses_b")
+    const rootA = await fs.readFile(path.join(dir, "ambiguous-ref-case", "raw-events.jsonl"), "utf8")
+    const rootB = await fs.readFile(path.join(dir, rootBCaseDirectory, "raw-events.jsonl"), "utf8")
+    const processTrace = await fs.readFile(path.join(dir, processCaseDirectory, "raw-events.jsonl"), "utf8")
+
+    expect(rootA).not.toContain("process only")
+    expect(rootB).not.toContain("process only")
+    expect(processTrace).toContain("process only")
+  })
+
   test("keeps rootless and unknown-ref records in an isolated process trace", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-rootless-routing-"))
     const packageDir = path.resolve(import.meta.dir, "../..")

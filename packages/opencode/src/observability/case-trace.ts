@@ -5289,7 +5289,10 @@ class ActiveCaseTrace {
   private writable = true
   private nextPartialWrite = 0
 
-  constructor(config: CaseTraceConfig) {
+  constructor(
+    config: CaseTraceConfig,
+    private readonly bindSession?: (sessionID: string) => boolean,
+  ) {
     this.caseID = safeCaseID(config.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
     this.rootDir = config.traceDir ?? defaultTraceDir()
     this.caseDir = path.join(this.rootDir, this.caseID)
@@ -5333,6 +5336,7 @@ class ActiveCaseTrace {
 
   setSessionID(sessionID: string | undefined) {
     if (!sessionID || this.sessionID) return
+    if (this.bindSession && !this.bindSession(sessionID)) return
     this.sessionID = sessionID
     this.write("trace.session", { session_id: sessionID })
   }
@@ -11341,14 +11345,26 @@ function configuredBaseCaseID(input: CaseTraceConfig) {
 function traceRegistry() {
   if (registry) return registry
   registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal, kind) => {
-    const trace = new ActiveCaseTrace({
-      ...baseConfig,
-      caseID: allocateRoutedCaseID(baseCaseID, sessionID, ordinal, kind),
-    })
+    let trace: ActiveCaseTrace
+    trace = new ActiveCaseTrace(
+      {
+        ...baseConfig,
+        caseID: allocateRoutedCaseID(baseCaseID, sessionID, ordinal, kind),
+      },
+      kind === "compatibility" ? (boundSessionID) => bindCompatibilityTrace(trace, boundSessionID) : undefined,
+    )
     trace.setSessionID(sessionID)
     return trace
   })
   return registry
+}
+
+function bindCompatibilityTrace(trace: ActiveCaseTrace, sessionID: string) {
+  const claimed = traceRegistry().claimCompatibility(sessionID)
+  if (claimed !== trace) return false
+  compatibilitySessionID = sessionID
+  compatibilityBindingAllowed = false
+  return true
 }
 
 function claimCompatibilitySession(sessionID: string) {

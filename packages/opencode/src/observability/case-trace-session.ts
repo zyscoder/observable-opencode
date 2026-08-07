@@ -119,11 +119,13 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
 
 export type SessionTraceKind = "root" | "process" | "compatibility"
 
+const ambiguousOwner = Symbol("ambiguous trace owner")
+
 export class SessionTraceRegistry<T extends object> {
   private readonly roots = new Map<string, T>()
   private readonly orphans = new Set<T>()
   private readonly aliases = new Map<string, string>()
-  private readonly owners = new Map<string, T>()
+  private readonly owners = new Map<string, T | typeof ambiguousOwner>()
   private finalized = new WeakSet<T>()
   private processTrace: T | undefined
   private compatibilityTrace: T | undefined
@@ -141,7 +143,7 @@ export class SessionTraceRegistry<T extends object> {
 
     for (const ref of hint?.refs ?? []) {
       const owner = this.owners.get(ref)
-      if (owner) return owner
+      if (owner && owner !== ambiguousOwner) return owner
     }
 
     if (this.roots.size === 1) return this.roots.values().next().value!
@@ -189,7 +191,12 @@ export class SessionTraceRegistry<T extends object> {
   }
 
   remember(trace: T, refs: string[]): void {
-    for (const ref of refs) if (ref) this.owners.set(ref, trace)
+    for (const ref of refs) {
+      if (!ref) continue
+      const owner = this.owners.get(ref)
+      if (!owner) this.owners.set(ref, trace)
+      else if (owner !== trace) this.owners.set(ref, ambiguousOwner)
+    }
   }
 
   finishSession(sessionID: string, finish: (trace: T) => void): void {
