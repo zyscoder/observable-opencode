@@ -1391,7 +1391,6 @@ let baseConfig: CaseTraceConfig = {}
 let baseCaseID: string | undefined
 let lifecycleConfigured = false
 let compatibilityFinished = false
-let compatibilityTrace: ActiveCaseTrace | undefined
 let compatibilitySessionID: string | undefined
 let compatibilityBindingAllowed = false
 let processFinalizerInstalled = false
@@ -1412,16 +1411,40 @@ function stamp() {
     .replace(/\.\d+Z$/, "Z")
 }
 
-function safeCaseID(input: string) {
+function sanitizedCaseID(input: string) {
   const trimmed = input.trim() || `case-${stamp()}-${process.pid}`
-  return trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 160)
+  return trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_")
 }
 
-function routedCaseID(base: string | undefined, sessionID: string | undefined, ordinal: number) {
+function safeCaseID(input: string) {
+  return sanitizedCaseID(input).slice(0, 160)
+}
+
+function boundedRoutedCaseID(input: string, suffix: string) {
+  const sanitized = sanitizedCaseID(input)
+  if (sanitized.length <= 160) return sanitized
+
+  const digest = crypto.createHash("sha256").update(sanitized).digest("hex").slice(0, 12)
+  const suffixTail = sanitizedCaseID(suffix).slice(-64)
+  const marker = `--${digest}--${suffixTail}`
+  return `${sanitized.slice(0, 160 - marker.length)}${marker}`
+}
+
+function routedCaseID(
+  base: string | undefined,
+  sessionID: string | undefined,
+  ordinal: number,
+  kind: "root" | "process" | "compatibility",
+) {
+  if (kind === "compatibility") return safeCaseID(base ?? "")
+  if (kind === "process") {
+    if (base) return boundedRoutedCaseID(`${base}--process`, "process")
+    return safeCaseID(`process-${stamp()}-${process.pid}-${ordinal}`)
+  }
   if (!sessionID) return safeCaseID(base ?? "")
   if (base && ordinal === 0) return safeCaseID(base)
-  if (base) return safeCaseID(`${base}--${sessionID}`)
-  return safeCaseID(`session-${sessionID}`)
+  if (base) return boundedRoutedCaseID(`${base}--${sessionID}`, sessionID)
+  return boundedRoutedCaseID(`session-${sessionID}`, sessionID)
 }
 
 function safeNumber(input: unknown) {
@@ -11264,32 +11287,31 @@ const summarizeJsonField = summarizeJson
 
 function configuredBaseCaseID(input: CaseTraceConfig) {
   const value = input.caseID ?? process.env.OPENCODE_CASE_ID
-  return value?.trim() ? safeCaseID(value) : undefined
+  return value?.trim() ? sanitizedCaseID(value) : undefined
 }
 
 function traceRegistry() {
   if (registry) return registry
-  registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal) => {
-    if (
-      sessionID &&
-      compatibilityBindingAllowed &&
-      compatibilityTrace &&
-      (!compatibilitySessionID || compatibilitySessionID === sessionID)
-    ) {
-      compatibilitySessionID = sessionID
-      compatibilityTrace.setSessionID(sessionID)
-      return compatibilityTrace
-    }
-
+  registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal, kind) => {
     const trace = new ActiveCaseTrace({
       ...baseConfig,
-      caseID: routedCaseID(baseCaseID, sessionID, ordinal),
+      caseID: routedCaseID(baseCaseID, sessionID, ordinal, kind),
     })
     trace.setSessionID(sessionID)
-    if (!sessionID) compatibilityTrace = trace
     return trace
   })
   return registry
+}
+
+function claimCompatibilitySession(sessionID: string) {
+  if (!compatibilityBindingAllowed) return undefined
+  const trace = traceRegistry().claimCompatibility(sessionID)
+  if (!trace) return undefined
+
+  compatibilitySessionID = sessionID
+  compatibilityBindingAllowed = false
+  trace.setSessionID(sessionID)
+  return trace
 }
 
 function beginLifecycle(input: CaseTraceConfig = {}) {
@@ -11300,7 +11322,6 @@ function beginLifecycle(input: CaseTraceConfig = {}) {
   }
   lifecycleConfigured = true
   compatibilityFinished = false
-  compatibilityTrace = undefined
   compatibilitySessionID = undefined
   compatibilityBindingAllowed = false
   installProcessFinalizer()
@@ -11314,7 +11335,14 @@ function ensureLifecycle() {
 function routed(input?: unknown) {
   if (!enabledFromEnv() || compatibilityFinished) return undefined
   ensureLifecycle()
-  return traceRegistry().resolve(traceRouteHint(input))
+  const hint = traceRouteHint(input)
+  const router = traceRegistry()
+  if (!hint.sessionID && !router.hasRoots()) {
+    compatibilityBindingAllowed = true
+    return router.resolveCompatibility()
+  }
+  if (hint.sessionID) claimCompatibilitySession(hint.sessionID)
+  return router.resolve(hint)
 }
 
 function remember<T>(trace: ActiveCaseTrace | undefined, value: T): T {
@@ -11420,7 +11448,6 @@ export namespace CaseTrace {
       baseCaseID = undefined
       lifecycleConfigured = false
       compatibilityFinished = false
-      compatibilityTrace = undefined
       compatibilitySessionID = undefined
       compatibilityBindingAllowed = false
       return undefined
@@ -11428,12 +11455,15 @@ export namespace CaseTrace {
 
     const nextBaseCaseID = configuredBaseCaseID(input)
     if (lifecycleConfigured && (compatibilityFinished || nextBaseCaseID !== baseCaseID)) {
-      if (!compatibilityFinished) {
-        registry?.reset((trace) => trace.finish({ status: "cancelled", result: { reason: "reconfigured" } }))
-      } else {
-        registry?.reset()
+      try {
+        if (!compatibilityFinished) {
+          registry?.reset((trace) => trace.finish({ status: "cancelled", result: { reason: "reconfigured" } }))
+        } else {
+          registry?.reset()
+        }
+      } catch {} finally {
+        beginLifecycle(input)
       }
-      beginLifecycle(input)
       return get()
     }
 
@@ -11457,16 +11487,14 @@ export namespace CaseTrace {
   export function get() {
     if (!enabledFromEnv() || compatibilityFinished) return undefined
     ensureLifecycle()
-    compatibilityBindingAllowed = true
-    return traceRegistry().resolve()
+    if (!compatibilitySessionID) compatibilityBindingAllowed = true
+    return traceRegistry().resolveCompatibility()
   }
 
   export function setSessionID(sessionID: string | undefined) {
-    const trace = get()
-    trace?.setSessionID(sessionID)
-    if (!trace || !sessionID) return
-    compatibilityTrace = trace
-    compatibilitySessionID = sessionID
+    if (!enabledFromEnv() || compatibilityFinished || !sessionID) return
+    ensureLifecycle()
+    if (claimCompatibilitySession(sessionID)) return
     traceRegistry().resolve({ sessionID })
   }
 
@@ -11481,6 +11509,7 @@ export namespace CaseTrace {
   export function aliasSession(childSessionID: string, parentSessionID: string) {
     if (!enabledFromEnv() || compatibilityFinished) return
     ensureLifecycle()
+    claimCompatibilitySession(parentSessionID)
     traceRegistry().alias(childSessionID, parentSessionID)
   }
 
@@ -11602,21 +11631,23 @@ export namespace CaseTrace {
 
   export function finishSession(sessionID: string, input?: FinishTraceInput) {
     if (!enabledFromEnv()) return
-    registry?.finishSession(sessionID, (trace) => trace.finish(input))
+    try {
+      registry?.finishSession(sessionID, (trace) => trace.finish(input))
+    } catch {}
   }
 
   export function finishAll(input?: FinishTraceInput) {
     if (!enabledFromEnv()) return
     try {
       registry?.finishAll((trace) => trace.finish(input))
-    } finally {
+    } catch {} finally {
       compatibilityFinished = true
     }
   }
 
   export function finish(input?: FinishTraceInput) {
     if (!enabledFromEnv() || compatibilityFinished) return
-    get()
+    if (!registry) return
     finishAll(input)
   }
 

@@ -371,6 +371,269 @@ describe("case trace", () => {
     expect(traceB).not.toContain("root A")
   })
 
+  test("claims the compatibility trace once and keeps later roots independent", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-compatibility-identity-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "compatibility-identity.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const configured = CaseTrace.configure({ caseID: "compatibility-identity-case" })`,
+        `CaseTrace.setSessionID("ses_a")`,
+        `CaseTrace.promptAssembly({ stage: "root_a", session_id: "ses_a", input: { text: "prompt A" } })`,
+        `CaseTrace.setSessionID("ses_b")`,
+        `CaseTrace.promptAssembly({ stage: "root_b", session_id: "ses_b", input: { text: "prompt B" } })`,
+        `const unscoped = CaseTrace.get()`,
+        `CaseTrace.finishAll({ status: "success" })`,
+        `process.stdout.write(JSON.stringify({ configuredCaseID: configured?.caseID, unscopedCaseID: unscoped?.caseID, same: configured === unscoped }))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({
+      configuredCaseID: "compatibility-identity-case",
+      unscopedCaseID: "compatibility-identity-case--process",
+      same: false,
+    })
+
+    const caseDirectories = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+    expect(caseDirectories).toEqual([
+      "compatibility-identity-case",
+      "compatibility-identity-case--process",
+      "compatibility-identity-case--ses_b",
+    ])
+
+    const traces = await Promise.all(
+      caseDirectories.map(async (caseDirectory) => ({
+        caseDirectory,
+        trace: JSON.parse(await fs.readFile(path.join(dir, caseDirectory, "trace.json"), "utf8")) as any,
+      })),
+    )
+    const rootA = traces.find((item) => item.trace.manifest.session_id === "ses_a")!
+    const rootB = traces.find((item) => item.trace.manifest.session_id === "ses_b")!
+    const processTrace = traces.find((item) => item.trace.manifest.session_id === undefined)!
+
+    expect(rootA.caseDirectory).toBe("compatibility-identity-case")
+    expect(rootA.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(true)
+    expect(rootA.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(false)
+    expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_b")).toBe(true)
+    expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(false)
+    expect(processTrace.caseDirectory).toBe("compatibility-identity-case--process")
+  })
+
+  test("keeps rootless and unknown-ref records in an isolated process trace", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-rootless-routing-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "rootless-routing.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const promptA = CaseTrace.promptAssembly({ stage: "root_a", session_id: "ses_root_a", input: { text: "root A" } })`,
+        `CaseTrace.promptAssembly({ stage: "root_b", session_id: "ses_root_b", input: { text: "root B" } })`,
+        `CaseTrace.event({ component: "trace", event_type: "rootless.marker", data: { marker: "rootless only" } })`,
+        `CaseTrace.event({ component: "trace", event_type: "unknown.marker", data: { marker: "unknown only", source_refs: ["span:unknown"] } })`,
+        `CaseTrace.event({ component: "trace", event_type: "owner.marker", data: { marker: "owner only", source_refs: ["node:" + promptA?.node_id] } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "rootless-routing-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const caseDirectories = (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+    expect(caseDirectories).toEqual([
+      "rootless-routing-case",
+      "rootless-routing-case--process",
+      "rootless-routing-case--ses_root_b",
+    ])
+
+    const readRawEvents = async (caseDirectory: string) =>
+      fs.readFile(path.join(dir, caseDirectory, "raw-events.jsonl"), "utf8")
+    const rootA = await readRawEvents("rootless-routing-case")
+    const rootB = await readRawEvents("rootless-routing-case--ses_root_b")
+    const processTrace = await readRawEvents("rootless-routing-case--process")
+
+    expect(rootA).toContain("owner only")
+    expect(rootA).not.toContain("unknown only")
+    expect(rootA).not.toContain("rootless only")
+    expect(rootB).not.toContain("owner only")
+    expect(rootB).not.toContain("unknown only")
+    expect(rootB).not.toContain("rootless only")
+    expect(processTrace).toContain("rootless only")
+    expect(processTrace).toContain("unknown only")
+    expect(processTrace).not.toContain("owner only")
+  })
+
+  test("keeps long routed case IDs unique, bounded, and stable", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-long-route-id-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "long-route-id.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const baseCaseID = `base-${"x".repeat(180)}`
+    const sessionA = `ses-${"shared".repeat(24)}-tail_a`
+    const sessionB = `ses-${"shared".repeat(24)}-tail_b`
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "first", session_id: "ses_first", input: { text: "first" } })`,
+        `CaseTrace.promptAssembly({ stage: "long_a", session_id: ${JSON.stringify(sessionA)}, input: { text: "long A" } })`,
+        `CaseTrace.promptAssembly({ stage: "long_b", session_id: ${JSON.stringify(sessionB)}, input: { text: "long B" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const run = async (traceDir: string) => {
+      const proc = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: "1",
+          OPENCODE_CASE_ID: baseCaseID,
+          OPENCODE_CASE_TRACE_DIR: traceDir,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(await proc.exited).toBe(0)
+      expect(await new Response(proc.stderr).text()).toBe("")
+      const directories = (await fs.readdir(traceDir, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+      const bySession: Record<string, string> = {}
+      for (const directory of directories) {
+        const manifest = JSON.parse(await fs.readFile(path.join(traceDir, directory, "manifest.json"), "utf8")) as any
+        bySession[manifest.session_id] = directory
+      }
+      return bySession
+    }
+
+    const firstDir = path.join(dir, "first-run")
+    const secondDir = path.join(dir, "second-run")
+    await fs.mkdir(firstDir)
+    await fs.mkdir(secondDir)
+    const first = await run(firstDir)
+    const second = await run(secondDir)
+
+    expect(first).toEqual(second)
+    expect(Object.values(first)).toHaveLength(3)
+    expect(new Set(Object.values(first)).size).toBe(3)
+    expect(Object.values(first).every((caseID) => caseID.length <= 160)).toBe(true)
+    expect(first[sessionA]).toContain("tail_a")
+    expect(first[sessionB]).toContain("tail_b")
+  })
+
+  test("reconfigures in finally and keeps trace finalization failures passive", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-reconfigure-finalizer-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "reconfigure-finalizer.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const previous = CaseTrace.configure({ caseID: "reconfigure-old" }) as any`,
+        `previous.finish = () => { throw new Error("forced reconfigure finalization failure") }`,
+        `let reconfigureThrew = false`,
+        `let fresh: any`,
+        `try { fresh = CaseTrace.configure({ caseID: "reconfigure-new" }) } catch { reconfigureThrew = true }`,
+        `CaseTrace.promptAssembly({ stage: "new_lifecycle", session_id: "ses_new", input: { text: "new lifecycle prompt" } })`,
+        `const finish = fresh.finish.bind(fresh)`,
+        `fresh.finish = () => { throw new Error("forced public finalization failure") }`,
+        `let finishThrew = false`,
+        `try { CaseTrace.finishAll({ status: "success" }) } catch { finishThrew = true }`,
+        `fresh.finish = finish`,
+        `CaseTrace.finishAll({ status: "success" })`,
+        `process.stdout.write(JSON.stringify({ reconfigureThrew, finishThrew, previousCaseID: previous.caseID, freshCaseID: fresh.caseID, same: previous === fresh }))`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(proc.stdout).text())).toEqual({
+      reconfigureThrew: false,
+      finishThrew: false,
+      previousCaseID: "reconfigure-old",
+      freshCaseID: "reconfigure-new",
+      same: false,
+    })
+
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "reconfigure-new", "trace.json"), "utf8")) as any
+    expect(trace.manifest.case_id).toBe("reconfigure-new")
+    expect(trace.manifest.session_id).toBe("ses_new")
+    expect(trace.records.some((record: any) => record.data?.stage === "new_lifecycle")).toBe(true)
+  })
+
+  test("finish is a no-op before any trace exists", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-empty-finish-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "empty-finish.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(script, [`import { CaseTrace } from ${JSON.stringify(traceModule)}`, `CaseTrace.finish()`].join("\n"))
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "empty-finish-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+    expect((await fs.readdir(dir, { withFileTypes: true })).filter((entry) => entry.isDirectory())).toEqual([])
+  })
+
   test("does not create trace directories when routed APIs are disabled", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-routing-disabled-"))
     const traceRoot = path.join(dir, "traces")
@@ -1006,7 +1269,6 @@ describe("case trace", () => {
         `const generic = CaseTrace.node({ node_id: "temporal_generic", kind: "execution.observation", component: "runtime", input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], output_refs: ["recent_change_records"], source_refs: ["recent_evidence_records"], data: { nested: { input_refs: ["recent_evidence_records", "evidence:" + fact.node_id], evidence_refs: ["recent_verification_records"], payload_refs: ["recent_tool_results"], typed_refs: [{ ref_type: "external", ref_id: "recent_change_records", legacy_ref: "recent_change_records" }] } } })`,
         `const edgeTarget = CaseTrace.node({ node_id: "temporal_edge_target", kind: "execution.observation", component: "runtime", data: { marker: "edge_target" } })`,
         `CaseTrace.setSessionID("ses_temporal")`,
-        `CaseTrace.aliasSession("ses_repeat", "ses_temporal")`,
         `CaseTrace.edge({ edge_id: "temporal_legacy_edge", from: { type: "external", id: "explicit_source" }, to: { type: "node", id: edgeTarget.node_id }, relation: "derived_from", evidence_refs: ["recent_evidence_records"] })`,
         `CaseTrace.decision({ decision_id: "temporal_decision", component: "processor", decision_type: "tool_selection", intent: "inspect pricing owner", chosen_action: "read", source_refs: ["recent_evidence_records"], metadata: { payload_refs: ["recent_change_records"] } })`,
         `CaseTrace.promptAssembly({ stage: "temporal_prompt", session_id: "ses_temporal", input: { text: "inspect pricing owner", evidence_refs: ["recent_evidence_records"] }, source_refs: ["recent_evidence_records"] })`,
@@ -1014,9 +1276,9 @@ describe("case trace", () => {
         `CaseTrace.compactionCheck({ check_id: "temporal_compaction", session_id: "ses_temporal", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.compaction({ trigger: "auto", session_id: "ses_temporal", output_summary: "pricing owner remains billing", result: "success", source_refs: ["recent_evidence_records"], after_context_refs: ["recent_change_records"], context_ledger: { retained_fact_refs: ["recent_evidence_records"], dropped_fact_refs: ["recent_verification_records"] }, metadata: { payload_refs: ["recent_tool_results"] } })`,
         `CaseTrace.change({ change_id: "temporal_change", files: ["src/pricing.ts"], intent: "record temporal policy", source_refs: ["recent_evidence_records"], verification_refs: ["recent_verification_records"], metadata: { evidence_refs: ["recent_evidence_records"] } })`,
-        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_1", session_id: "ses_repeat", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_1", session_id: "ses_temporal", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
         `const secondFact = CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "shipping owner is logistics", data: { subject: "shipping", predicate: "owner", value: "logistics" }, source_refs: [] })`,
-        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_2", session_id: "ses_repeat", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
+        `CaseTrace.compactionCheck({ check_id: "temporal_repeat_2", session_id: "ses_temporal", model_id: "model_repeat", selected_algorithm: "none", overflow: false, trigger_reason: "unit_test", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.responseOutput({ segment_id: "temporal_response", text: "Pricing owner is billing.", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.exitGate({ gate_id: "temporal_gate", has_final_answer: true, needs_compaction: false, auto_continue: false, synthetic_continue: false, continuation_source: "none", decision: "exit", reason: "response complete", source_refs: ["recent_evidence_records"] })`,
         `CaseTrace.finish({ status: "success" })`,
@@ -1474,8 +1736,6 @@ describe("case trace", () => {
       [
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "inspect" }, environment: { model: "unit-test" } })`,
-        `CaseTrace.aliasSession("ses_owner", "ses_fixture")`,
-        `CaseTrace.aliasSession("ses_other", "ses_fixture")`,
         `CaseTrace.event({ component: "tool", event_type: "tool.call", data: { sessionID: "ses_owner", messageID: "msg_tool", callID: "call_1", tool: "read", input: { path: "owner.txt" } } })`,
         `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "owner observation", data: { session_id: "ses_owner", call_id: "call_1", output: "owner pending" }, source_refs: ["tool_call:call_1"] })`,
         `CaseTrace.observation({ source: "tool", category: "tool_output", summary: "unscoped legacy observation", data: { call_id: "call_1", output: "ambiguous pending" }, source_refs: ["tool_call:call_1"] })`,
@@ -1505,27 +1765,30 @@ describe("case trace", () => {
     expect(await new Response(proc.stderr).text()).toBe("")
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "exact-tool-context-case", "trace.json"), "utf8")) as any
+    const otherTrace = JSON.parse(
+      await fs.readFile(path.join(dir, "exact-tool-context-case--ses_other", "trace.json"), "utf8"),
+    ) as any
     const transforms = Object.fromEntries(
-      trace.records
+      [...trace.records, ...otherTrace.records]
         .filter((record: any) => record.event_type === "context.transform")
         .map((record: any) => [record.data.stage, record]),
     )
     const ownerResult = trace.records.find(
       (record: any) => record.event_type === "tool.result" && record.data.session_id === "ses_owner",
     )
-    const otherResult = trace.records.find(
+    const otherResult = otherTrace.records.find(
       (record: any) => record.event_type === "tool.result" && record.data.session_id === "ses_other",
     )
     const ownerCall = trace.records.find(
       (record: any) => record.event_type === "tool.call" && record.data.session_id === "ses_owner",
     )
-    const otherCall = trace.records.find(
+    const otherCall = otherTrace.records.find(
       (record: any) => record.event_type === "tool.call" && record.data.session_id === "ses_other",
     )
     const ownerObservation = trace.records.find(
       (record: any) => record.event_type === "execution.observation" && record.data.data?.session_id === "ses_owner",
     )
-    const otherObservation = trace.records.find(
+    const otherObservation = otherTrace.records.find(
       (record: any) => record.event_type === "execution.observation" && record.data.data?.session_id === "ses_other",
     )
     const unscopedObservation = trace.records.find(
@@ -1549,7 +1812,7 @@ describe("case trace", () => {
       ),
     ).toBe(true)
     expect(
-      trace.edges.some(
+      otherTrace.edges.some(
         (edge: any) => edge.from.ref_id === otherCall.record_id && edge.to.ref_id === otherResult.record_id,
       ),
     ).toBe(true)
@@ -5035,7 +5298,6 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.configure({ input: { prompt: "delegate" }, environment: { model: "unit-test" } })`,
         `CaseTrace.aliasSession("ses_child_boundary", "ses_parent")`,
-        `CaseTrace.aliasSession("ses_other", "ses_parent")`,
         `CaseTrace.contextTransform({ stage: "before_child", session_id: "ses_parent", message_id: "msg_before", input: { messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] }, output: { model_messages: [{ role: "user", content: "renewalQuote owner is billing-platform" }] } })`,
         `const span = CaseTrace.get()?.startSpan({ component: "task", operation: "subagent", name: "general", input: { description: "find owner", parent_session_id: "ses_parent", message_id: "msg_parent" } })`,
         `span?.end({ output: { child_session_id: "ses_child_boundary", child_status: "success", output: "renewalQuote owner is billing-platform" } })`,
@@ -5063,6 +5325,9 @@ describe("case trace", () => {
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "subagent-parent-boundary-case", "trace.json"), "utf8"),
     ) as any
+    const otherTrace = JSON.parse(
+      await fs.readFile(path.join(dir, "subagent-parent-boundary-case--ses_other", "trace.json"), "utf8"),
+    ) as any
     const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
     const consumerStages = subagent.data.parent_consumption_refs
       .map((ref: string) => ref.replace(/^context:/, ""))
@@ -5070,6 +5335,11 @@ describe("case trace", () => {
       .filter(Boolean)
 
     expect(consumerStages).toEqual(["after_child"])
+    expect(
+      otherTrace.records.some(
+        (record: any) => record.event_type === "context.transform" && record.data.stage === "other_parent",
+      ),
+    ).toBe(true)
   })
 
   test("treats run and lifecycle records cancelled at trace finish as expected finalization", async () => {

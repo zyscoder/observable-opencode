@@ -5,17 +5,26 @@ export type TraceRouteHint = {
 
 const directSessionKeys = new Set(["sessionID", "session_id", "parentSessionID", "parent_session_id"])
 const directSessionContainers = new Set(["input", "data", "metadata"])
-const referenceKeys = new Set([
-  "span_id",
-  "turn_id",
-  "decision_id",
-  "snapshot_id",
-  "record_id",
-  "node_id",
-  "fact_id",
-  "verification_id",
-  "change_id",
+const referenceKeys = new Map<string, string[]>([
+  ["span_id", ["span"]],
+  ["turn_id", ["turn"]],
+  ["decision_id", ["decision"]],
+  ["snapshot_id", ["snapshot"]],
+  ["record_id", ["record"]],
+  ["node_id", ["node"]],
+  ["fact_id", ["fact"]],
+  ["verification_id", ["verification"]],
+  ["change_id", ["change"]],
+  ["edge_id", ["edge"]],
+  ["check_id", ["check", "compaction_check"]],
+  ["constraint_id", ["constraint"]],
+  ["design_id", ["design"]],
+  ["gate_id", ["gate", "exit_gate"]],
+  ["segment_id", ["segment", "response_segment"]],
+  ["claim_id", ["claim", "response_claim"]],
+  ["lifecycle_id", ["lifecycle"]],
 ])
+const referenceContainers = new Set(["source_refs", "evidence_refs", "aliases"])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -63,23 +72,38 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
   }
 
   const visit = (value: unknown): void => {
+    if (value === null || typeof value !== "object" || seenObjects.has(value)) return
+    seenObjects.add(value)
     if (Array.isArray(value)) {
       for (const item of value) visit(item)
       return
     }
-    if (!isRecord(value) || seenObjects.has(value)) return
-    seenObjects.add(value)
+    if (!isRecord(value)) return
+
+    const refID = typeof value.ref_id === "string" ? value.ref_id : undefined
+    const refType = typeof value.ref_type === "string" ? value.ref_type : undefined
+    if (refID) {
+      rememberRef(refID)
+      if (refType) rememberRef(`${refType}:${refID}`)
+    }
 
     for (const [key, field] of Object.entries(value)) {
-      if (referenceKeys.has(key)) {
-        const prefix = key.slice(0, -"_id".length)
-        if (typeof field === "string" && field) rememberRef(`${prefix}:${field}`)
+      const prefixes = referenceKeys.get(key)
+      if (prefixes) {
+        if (typeof field === "string" && field) {
+          rememberRef(field)
+          for (const prefix of prefixes) rememberRef(`${prefix}:${field}`)
+        }
         if (Array.isArray(field)) {
-          for (const item of field) if (typeof item === "string" && item) rememberRef(`${prefix}:${item}`)
+          for (const item of field) {
+            if (typeof item !== "string" || !item) continue
+            rememberRef(item)
+            for (const prefix of prefixes) rememberRef(`${prefix}:${item}`)
+          }
         }
       }
 
-      if (key === "source_refs") {
+      if (referenceContainers.has(key)) {
         if (typeof field === "string") rememberRef(field)
         if (Array.isArray(field)) for (const item of field) rememberRef(item)
       }
@@ -93,6 +117,8 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
   return sessionID ? { sessionID, refs } : { refs }
 }
 
+export type SessionTraceKind = "root" | "process" | "compatibility"
+
 export class SessionTraceRegistry<T extends object> {
   private readonly roots = new Map<string, T>()
   private readonly orphans = new Set<T>()
@@ -100,9 +126,14 @@ export class SessionTraceRegistry<T extends object> {
   private readonly owners = new Map<string, T>()
   private finalized = new WeakSet<T>()
   private processTrace: T | undefined
-  private ordinal = 0
+  private compatibilityTrace: T | undefined
+  private compatibilitySessionID: string | undefined
+  private rootOrdinal = 0
+  private processOrdinal = 0
 
-  constructor(private readonly create: (sessionID: string | undefined, ordinal: number) => T) {}
+  constructor(
+    private readonly create: (sessionID: string | undefined, ordinal: number, kind: SessionTraceKind) => T,
+  ) {}
 
   resolve(hint?: Partial<TraceRouteHint>): T {
     const sessionID = hint?.sessionID
@@ -114,8 +145,33 @@ export class SessionTraceRegistry<T extends object> {
     }
 
     if (this.roots.size === 1) return this.roots.values().next().value!
-    if (!this.processTrace) this.processTrace = this.create(undefined, this.ordinal++)
+    if (!this.processTrace) this.processTrace = this.create(undefined, this.processOrdinal++, "process")
     return this.processTrace
+  }
+
+  hasRoots(): boolean {
+    return this.roots.size > 0
+  }
+
+  resolveCompatibility(): T {
+    if (this.compatibilityTrace && !this.compatibilitySessionID) return this.compatibilityTrace
+    if (this.roots.size === 1) return this.roots.values().next().value!
+    if (this.roots.size > 1) return this.resolve()
+    this.compatibilityTrace = this.create(undefined, 0, "compatibility")
+    return this.compatibilityTrace
+  }
+
+  claimCompatibility(sessionID: string): T | undefined {
+    const rootSessionID = this.rootSessionID(sessionID)
+    if (this.compatibilitySessionID) {
+      return this.compatibilitySessionID === rootSessionID ? this.compatibilityTrace : undefined
+    }
+    if (!this.compatibilityTrace || this.roots.size > 0) return undefined
+
+    this.compatibilitySessionID = rootSessionID
+    this.roots.set(rootSessionID, this.compatibilityTrace)
+    this.rootOrdinal++
+    return this.compatibilityTrace
   }
 
   alias(childSessionID: string, parentSessionID: string): T {
@@ -156,6 +212,7 @@ export class SessionTraceRegistry<T extends object> {
   values(): T[] {
     const traces = new Set<T>(this.roots.values())
     for (const trace of this.orphans) traces.add(trace)
+    if (this.compatibilityTrace) traces.add(this.compatibilityTrace)
     if (this.processTrace) traces.add(this.processTrace)
     return [...traces]
   }
@@ -169,8 +226,11 @@ export class SessionTraceRegistry<T extends object> {
       this.aliases.clear()
       this.owners.clear()
       this.processTrace = undefined
+      this.compatibilityTrace = undefined
+      this.compatibilitySessionID = undefined
       this.finalized = new WeakSet<T>()
-      this.ordinal = 0
+      this.rootOrdinal = 0
+      this.processOrdinal = 0
     }
   }
 
@@ -178,7 +238,7 @@ export class SessionTraceRegistry<T extends object> {
     const rootSessionID = this.rootSessionID(sessionID)
     let trace = this.roots.get(rootSessionID)
     if (!trace) {
-      trace = this.create(rootSessionID, this.ordinal++)
+      trace = this.create(rootSessionID, this.rootOrdinal++, "root")
       this.roots.set(rootSessionID, trace)
     }
     return trace

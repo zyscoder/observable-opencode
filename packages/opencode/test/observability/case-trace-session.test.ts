@@ -16,6 +16,24 @@ test("isolates independent root sessions", () => {
   expect(registry.resolve({ sessionID: "ses_a" })).toBe(registry.resolve({ sessionID: "ses_a" }))
 })
 
+test("keeps process and root ordinals independent", () => {
+  const created: Array<{ sessionID: string | undefined; ordinal: number }> = []
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID, ordinal) => {
+    created.push({ sessionID, ordinal })
+    return create(sessionID ?? "process")
+  })
+
+  registry.resolve()
+  registry.resolve({ sessionID: "ses_a" })
+  registry.resolve({ sessionID: "ses_b" })
+
+  expect(created).toEqual([
+    { sessionID: undefined, ordinal: 0 },
+    { sessionID: "ses_a", ordinal: 0 },
+    { sessionID: "ses_b", ordinal: 1 },
+  ])
+})
+
 test("routes child sessions to their parent root", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const parent = registry.resolve({ sessionID: "ses_parent" })
@@ -50,6 +68,20 @@ test("routes reference-only records to their owner", () => {
   registry.remember(owner, ["span:span_1", "decision:dec_1"])
 
   expect(registry.resolve({ refs: ["span:span_1"] })).toBe(owner)
+})
+
+test("isolates unknown refs after multiple roots without losing known owners", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const owner = registry.resolve({ sessionID: "ses_owner" })
+  const other = registry.resolve({ sessionID: "ses_other" })
+  registry.remember(owner, ["span:owned"])
+
+  const isolated = registry.resolve({ refs: ["span:unknown"] })
+
+  expect(isolated).not.toBe(owner)
+  expect(isolated).not.toBe(other)
+  expect(registry.resolve({ refs: ["span:owned"] })).toBe(owner)
+  expect(registry.values()).toEqual([owner, other, isolated])
 })
 
 test("finishes every root exactly once", () => {
@@ -104,8 +136,71 @@ test("extracts route hints from session and reference fields", () => {
   expect(traceRouteHint({ data: { sessionID: "ses_data" } })).toEqual({ sessionID: "ses_data", refs: [] })
   expect(traceRouteHint({ metadata: { sessionID: "ses_metadata" } })).toEqual({ sessionID: "ses_metadata", refs: [] })
   expect(traceRouteHint({ span_id: "span_1", source_refs: ["decision:dec_1"] })).toEqual({
-    refs: ["span:span_1", "decision:dec_1"],
+    refs: ["span_1", "span:span_1", "decision:dec_1"],
   })
+})
+
+test("extracts returned semantic IDs with raw and typed aliases", () => {
+  expect(
+    traceRouteHint({
+      edge_id: "edge_a",
+      check_id: "check_a",
+      constraint_id: "constraint_a",
+      design_id: "design_a",
+      gate_id: "gate_a",
+      segment_id: "segment_a",
+      claim_id: "claim_a",
+      lifecycle_id: "life_a",
+    }),
+  ).toEqual({
+    refs: [
+      "edge_a",
+      "edge:edge_a",
+      "check_a",
+      "check:check_a",
+      "compaction_check:check_a",
+      "constraint_a",
+      "constraint:constraint_a",
+      "design_a",
+      "design:design_a",
+      "gate_a",
+      "gate:gate_a",
+      "exit_gate:gate_a",
+      "segment_a",
+      "segment:segment_a",
+      "response_segment:segment_a",
+      "claim_a",
+      "claim:claim_a",
+      "response_claim:claim_a",
+      "life_a",
+      "lifecycle:life_a",
+    ],
+  })
+})
+
+test("extracts every supported reference container and arbitrary typed refs", () => {
+  expect(
+    traceRouteHint({
+      source_refs: ["span:span_a"],
+      evidence_refs: ["evidence:fact_a"],
+      aliases: ["node_alias_a"],
+      metadata: {
+        nested: {
+          ref_type: "edge",
+          ref_id: "edge_a",
+        },
+      },
+    }),
+  ).toEqual({
+    refs: ["span:span_a", "evidence:fact_a", "node_alias_a", "edge_a", "edge:edge_a"],
+  })
+})
+
+test("does not overflow on self-referential arrays", () => {
+  const cyclic: unknown[] = []
+  cyclic.push(cyclic, { source_refs: ["span:cyclic"] })
+
+  expect(traceRouteHint(cyclic)).toEqual({ refs: ["span:cyclic"] })
 })
 
 test("does not collect session IDs below the accepted routing containers", () => {
