@@ -1389,6 +1389,7 @@ const legacySemanticEdgeOptionalFieldSet = new Set<string>(legacySemanticEdgeOpt
 let registry: SessionTraceRegistry<ActiveCaseTrace> | undefined
 let baseConfig: CaseTraceConfig = {}
 let baseCaseID: string | undefined
+let allocatedCaseIDs = new Set<string>()
 let lifecycleConfigured = false
 let compatibilityFinished = false
 let compatibilitySessionID: string | undefined
@@ -1420,7 +1421,9 @@ function safeCaseID(input: string) {
   return sanitizedCaseID(input).slice(0, 160)
 }
 
-function routedIdentityDigest(kind: "root" | "process" | "compatibility", sessionID: string | undefined) {
+type RoutedCaseKind = "root" | "process" | "compatibility"
+
+function routedIdentityDigest(kind: RoutedCaseKind, sessionID: string | undefined) {
   return crypto
     .createHash("sha256")
     .update(JSON.stringify({ kind, sessionID: sessionID ?? null }))
@@ -1428,14 +1431,14 @@ function routedIdentityDigest(kind: "root" | "process" | "compatibility", sessio
     .slice(0, 12)
 }
 
-function routedSuffix(kind: "root" | "process" | "compatibility", sessionID: string | undefined) {
+function routedSuffix(kind: RoutedCaseKind, sessionID: string | undefined) {
   const readable = kind === "root" ? sanitizedCaseID(sessionID ?? "session").slice(-64) : kind
   return `${readable}--${routedIdentityDigest(kind, sessionID)}`
 }
 
-function boundedRoutedCaseID(base: string, suffix: string) {
+function boundedRoutedCaseID(base: string, suffix: string, disambiguation?: number) {
   const sanitized = sanitizedCaseID(base)
-  const marker = `--${suffix}`
+  const marker = `--${suffix}${disambiguation === undefined ? "" : `--${disambiguation}`}`
   return `${sanitized.slice(0, 160 - marker.length)}${marker}`
 }
 
@@ -1443,7 +1446,7 @@ function routedCaseID(
   base: string | undefined,
   sessionID: string | undefined,
   ordinal: number,
-  kind: "root" | "process" | "compatibility",
+  kind: RoutedCaseKind,
 ) {
   if (kind === "compatibility") {
     if (base) return safeCaseID(base)
@@ -1457,6 +1460,39 @@ function routedCaseID(
   if (base && ordinal === 0) return safeCaseID(base)
   if (base) return boundedRoutedCaseID(base, routedSuffix(kind, sessionID))
   return boundedRoutedCaseID("session", routedSuffix(kind, sessionID))
+}
+
+function routedCaseIDSeed(base: string | undefined, ordinal: number, kind: RoutedCaseKind) {
+  if (base) return base
+  if (kind === "compatibility") return `case-${stamp()}-${process.pid}`
+  if (kind === "process") return `process-${stamp()}-${process.pid}-${ordinal}`
+  return "session"
+}
+
+function allocateRoutedCaseID(
+  base: string | undefined,
+  sessionID: string | undefined,
+  ordinal: number,
+  kind: RoutedCaseKind,
+) {
+  const reservedBase = base ? safeCaseID(base) : undefined
+  const isFirstRoot = kind === "root" && ordinal === 0 && !!base
+  if (reservedBase && (isFirstRoot || kind === "compatibility")) {
+    allocatedCaseIDs.add(reservedBase!)
+    return reservedBase!
+  }
+
+  const suffix = routedSuffix(kind, sessionID)
+  const seed = routedCaseIDSeed(base, ordinal, kind)
+  let caseID = routedCaseID(base, sessionID, ordinal, kind)
+  let disambiguation = 1
+
+  while (allocatedCaseIDs.has(caseID) || caseID === reservedBase) {
+    caseID = boundedRoutedCaseID(seed, suffix, disambiguation++)
+  }
+
+  allocatedCaseIDs.add(caseID)
+  return caseID
 }
 
 function safeNumber(input: unknown) {
@@ -11307,7 +11343,7 @@ function traceRegistry() {
   registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal, kind) => {
     const trace = new ActiveCaseTrace({
       ...baseConfig,
-      caseID: routedCaseID(baseCaseID, sessionID, ordinal, kind),
+      caseID: allocateRoutedCaseID(baseCaseID, sessionID, ordinal, kind),
     })
     trace.setSessionID(sessionID)
     return trace
@@ -11328,6 +11364,8 @@ function claimCompatibilitySession(sessionID: string) {
 
 function beginLifecycle(input: CaseTraceConfig = {}) {
   baseCaseID = configuredBaseCaseID(input)
+  allocatedCaseIDs.clear()
+  if (baseCaseID) allocatedCaseIDs.add(safeCaseID(baseCaseID))
   baseConfig = {
     ...input,
     caseID: baseCaseID,
@@ -11458,6 +11496,7 @@ export namespace CaseTrace {
       registry = undefined
       baseConfig = {}
       baseCaseID = undefined
+      allocatedCaseIDs.clear()
       lifecycleConfigured = false
       compatibilityFinished = false
       compatibilitySessionID = undefined

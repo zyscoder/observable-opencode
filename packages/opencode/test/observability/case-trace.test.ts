@@ -19,14 +19,14 @@ async function exists(file: string) {
     .catch(() => false)
 }
 
-function routedIdentityDigestForTest(kind: "root" | "process", sessionID?: string) {
+function routedIdentityDigestForTest(kind: "root" | "process" | "compatibility", sessionID?: string) {
   return createHash("sha256")
     .update(JSON.stringify({ kind, sessionID: sessionID ?? null }))
     .digest("hex")
     .slice(0, 12)
 }
 
-function routedCaseDirectoryForTest(base: string, kind: "root" | "process", sessionID?: string) {
+function routedCaseDirectoryForTest(base: string, kind: "root" | "process" | "compatibility", sessionID?: string) {
   const readable = kind === "root" ? sessionID!.replace(/[^a-zA-Z0-9._-]+/g, "_") : kind
   return `${base}--${readable}--${routedIdentityDigestForTest(kind, sessionID)}`
 }
@@ -629,6 +629,63 @@ describe("case trace", () => {
     expect(underscore.trace).toContain("underscore root content")
     expect(slash.trace).not.toContain("underscore root content")
     expect(underscore.trace).not.toContain("slash root content")
+  })
+
+  test("reserves an exact 160-character base for the first root when a routed identity collides with it", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-reserved-base-collision-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "reserved-base-collision.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const routedSuffix = `--ses_a--${routedIdentityDigestForTest("root", "ses/a")}`
+    const baseCaseID = `${"b".repeat(160 - routedSuffix.length)}${routedSuffix}`
+
+    expect(baseCaseID).toHaveLength(160)
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.promptAssembly({ stage: "first", session_id: "ses_first", input: { text: "first root content" } })`,
+        `CaseTrace.promptAssembly({ stage: "slash", session_id: "ses/a", input: { text: "slash root content" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: baseCaseID,
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const traces = await Promise.all(
+      (await fs.readdir(dir, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => ({
+          directory: entry.name,
+          manifest: JSON.parse(await fs.readFile(path.join(dir, entry.name, "manifest.json"), "utf8")) as any,
+          trace: await fs.readFile(path.join(dir, entry.name, "trace.json"), "utf8"),
+        })),
+    )
+
+    const first = traces.find((trace) => trace.manifest.session_id === "ses_first")!
+    const slash = traces.find((trace) => trace.manifest.session_id === "ses/a")!
+    const disambiguated = `${baseCaseID.slice(0, 160 - `${routedSuffix}--1`.length)}${routedSuffix}--1`
+
+    expect(traces).toHaveLength(2)
+    expect(first.directory).toBe(baseCaseID)
+    expect(slash.directory).toBe(disambiguated)
+    expect(first.trace).toContain("first root content")
+    expect(first.trace).not.toContain("slash root content")
+    expect(slash.trace).toContain("slash root content")
+    expect(slash.trace).not.toContain("first root content")
   })
 
   test("reconfigures in finally and keeps trace finalization failures passive", async () => {
