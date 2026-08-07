@@ -68,6 +68,8 @@ test("routes reference-only records to their owner", () => {
   registry.remember(owner, ["span:span_1", "decision:dec_1"])
 
   expect(registry.resolve({ refs: ["span:span_1"] })).toBe(owner)
+  expect(registry.resolve({ refs: ["span:unknown", "span:span_1"] })).toBe(owner)
+  expect(registry.resolve({ refs: ["span:span_1", "span:unknown"] })).toBe(owner)
 })
 
 test("routes references shared by multiple roots to the process trace", () => {
@@ -86,6 +88,50 @@ test("routes references shared by multiple roots to the process trace", () => {
   expect(processTrace).not.toBe(second)
   registry.remember(first, ["turn:shared"])
   expect(registry.resolve({ refs: ["turn:shared"] })).toBe(processTrace)
+})
+
+test("routes refs with disjoint unique owners to the process trace regardless of order", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
+  registry.remember(first, ["node:unique_a"])
+  registry.remember(second, ["node:unique_b"])
+
+  const forward = registry.resolve({ refs: ["node:unique_a", "node:unique_b"] })
+  const reverse = registry.resolve({ refs: ["node:unique_b", "node:unique_a"] })
+
+  expect(forward).not.toBe(first)
+  expect(forward).not.toBe(second)
+  expect(reverse).toBe(forward)
+})
+
+test("intersects a shared owner set with a unique owner regardless of order", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
+  registry.remember(first, ["node:shared", "node:unique_a"])
+  registry.remember(second, ["node:shared"])
+
+  expect(registry.resolve({ refs: ["node:shared", "node:unique_a"] })).toBe(first)
+  expect(registry.resolve({ refs: ["node:unique_a", "node:shared"] })).toBe(first)
+})
+
+test("routes an empty owner intersection to the process trace regardless of order", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
+  const third = registry.resolve({ sessionID: "ses_c" })
+  registry.remember(first, ["node:shared"])
+  registry.remember(second, ["node:shared"])
+  registry.remember(third, ["node:unique_c"])
+
+  const forward = registry.resolve({ refs: ["node:shared", "node:unique_c"] })
+  const reverse = registry.resolve({ refs: ["node:unique_c", "node:shared"] })
+
+  expect(forward).not.toBe(first)
+  expect(forward).not.toBe(second)
+  expect(forward).not.toBe(third)
+  expect(reverse).toBe(forward)
 })
 
 test("isolates unknown refs after multiple roots without losing known owners", () => {
@@ -134,7 +180,8 @@ test("continues finalization after a failure and retries the failed trace", () =
 
 test("clears routing state after a failed reset and starts a fresh lifecycle", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
-  registry.resolve({ sessionID: "ses_failed" })
+  const previous = registry.resolve({ sessionID: "ses_failed" })
+  registry.remember(previous, ["node:previous"])
 
   expect(() => registry.reset(() => {
     throw new Error("reset finalizer failed")
@@ -142,6 +189,11 @@ test("clears routing state after a failed reset and starts a fresh lifecycle", (
   expect(registry.values()).toEqual([])
 
   const fresh = registry.resolve({ sessionID: "ses_fresh" })
+  const other = registry.resolve({ sessionID: "ses_other" })
+  const isolated = registry.resolve({ refs: ["node:previous"] })
+  expect(isolated).not.toBe(previous)
+  expect(isolated).not.toBe(fresh)
+  expect(isolated).not.toBe(other)
   registry.finishAll((trace) => trace.finished.push({ status: "success" }))
 
   expect(fresh.finished).toEqual([{ status: "success" }])

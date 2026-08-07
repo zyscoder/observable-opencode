@@ -119,13 +119,11 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
 
 export type SessionTraceKind = "root" | "process" | "compatibility"
 
-const ambiguousOwner = Symbol("ambiguous trace owner")
-
 export class SessionTraceRegistry<T extends object> {
   private readonly roots = new Map<string, T>()
   private readonly orphans = new Set<T>()
   private readonly aliases = new Map<string, string>()
-  private readonly owners = new Map<string, T | typeof ambiguousOwner>()
+  private readonly owners = new Map<string, Set<T>>()
   private finalized = new WeakSet<T>()
   private processTrace: T | undefined
   private compatibilityTrace: T | undefined
@@ -141,9 +139,22 @@ export class SessionTraceRegistry<T extends object> {
     const sessionID = hint?.sessionID
     if (sessionID) return this.rootTrace(sessionID)
 
+    let ownerCandidates: Set<T> | undefined
     for (const ref of hint?.refs ?? []) {
-      const owner = this.owners.get(ref)
-      if (owner && owner !== ambiguousOwner) return owner
+      const owners = this.owners.get(ref)
+      if (!owners) continue
+      if (!ownerCandidates) {
+        ownerCandidates = new Set(owners)
+        continue
+      }
+      for (const candidate of ownerCandidates) {
+        if (!owners.has(candidate)) ownerCandidates.delete(candidate)
+      }
+    }
+    if (ownerCandidates) {
+      if (ownerCandidates.size === 1) return ownerCandidates.values().next().value!
+      if (!this.processTrace) this.processTrace = this.create(undefined, this.processOrdinal++, "process")
+      return this.processTrace
     }
 
     if (this.roots.size === 1) return this.roots.values().next().value!
@@ -193,9 +204,12 @@ export class SessionTraceRegistry<T extends object> {
   remember(trace: T, refs: string[]): void {
     for (const ref of refs) {
       if (!ref) continue
-      const owner = this.owners.get(ref)
-      if (!owner) this.owners.set(ref, trace)
-      else if (owner !== trace) this.owners.set(ref, ambiguousOwner)
+      let owners = this.owners.get(ref)
+      if (!owners) {
+        owners = new Set<T>()
+        this.owners.set(ref, owners)
+      }
+      owners.add(trace)
     }
   }
 
