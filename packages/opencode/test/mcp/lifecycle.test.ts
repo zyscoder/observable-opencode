@@ -2,6 +2,8 @@ import { test, expect, mock, beforeEach } from "bun:test"
 import { InstanceRuntime } from "../../src/project/instance-runtime"
 import { Effect } from "effect"
 import type { MCP as MCPNS } from "../../src/mcp/index"
+import fs from "fs/promises"
+import path from "path"
 
 // --- Mock infrastructure ---
 
@@ -10,6 +12,8 @@ interface MockClientState {
   tools: Array<{ name: string; description?: string; inputSchema: object; outputSchema?: object }>
   listToolsCalls: number
   requestCalls: number
+  toolCalls: Array<{ name: string; args: Record<string, unknown> }>
+  toolCallError?: Error
   listToolsShouldFail: boolean
   listToolsError: string
   listPromptsShouldFail: boolean
@@ -38,6 +42,7 @@ function getOrCreateClientState(name?: string): MockClientState {
       tools: [{ name: "test_tool", description: "A test tool", inputSchema: { type: "object", properties: {} } }],
       listToolsCalls: 0,
       requestCalls: 0,
+      toolCalls: [],
       listToolsShouldFail: false,
       listToolsError: "listTools failed",
       listPromptsShouldFail: false,
@@ -147,6 +152,15 @@ void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
       throw new Error(`unsupported request: ${request.method}`)
     }
 
+    async callTool(request: { name: string; arguments: Record<string, unknown> }) {
+      this._state.toolCalls.push({ name: request.name, args: request.arguments })
+      if (this._state.toolCallError) throw this._state.toolCallError
+      return {
+        content: [{ type: "text", text: `result:${String(request.arguments.value ?? "")}` }],
+        metadata: { source: "mock" },
+      }
+    }
+
     async listPrompts() {
       if (this._state?.listPromptsShouldFail) {
         throw new Error("listPrompts failed")
@@ -247,6 +261,100 @@ test(
       expect(Object.keys(toolsB).length).toBeGreaterThan(0)
       expect(serverState.listToolsCalls).toBe(1)
     }),
+  ),
+)
+
+test(
+  "tools route concurrent session calls to their own case traces",
+  withInstance(
+    {
+      "trace-server": {
+        type: "local",
+        command: ["echo", "test"],
+      },
+    },
+    (mcp) =>
+      Effect.gen(function* () {
+        const previous = {
+          enabled: process.env.OPENCODE_CASE_TRACE,
+          quiet: process.env.OPENCODE_CASE_TRACE_QUIET,
+          traceDir: process.env.OPENCODE_CASE_TRACE_DIR,
+          caseID: process.env.OPENCODE_CASE_ID,
+        }
+        const traceDir = path.join("/tmp", `opencode-mcp-traces-${crypto.randomUUID()}`)
+        process.env.OPENCODE_CASE_TRACE = "1"
+        process.env.OPENCODE_CASE_TRACE_QUIET = "1"
+        process.env.OPENCODE_CASE_TRACE_DIR = traceDir
+        process.env.OPENCODE_CASE_ID = "mcp-route"
+
+        const { CaseTrace } = yield* Effect.promise(() => import("../../src/observability/case-trace"))
+        try {
+          lastCreatedClientName = "trace-server"
+          yield* mcp.add("trace-server", {
+            type: "local",
+            command: ["echo", "test"],
+          })
+
+          const toolA = Object.values(yield* mcp.tools({ sessionID: "ses_root_a", messageID: "msg_a" }))[0]
+          const toolB = Object.values(yield* mcp.tools({ sessionID: "ses_root_b", messageID: "msg_b" }))[0]
+          if (!toolA?.execute || !toolB?.execute) throw new Error("expected traced MCP tools to be executable")
+          const executeA = toolA.execute
+          const executeB = toolB.execute
+
+          yield* Effect.promise(() => Promise.all([executeA({ value: "A" }, {} as any), executeB({ value: "B" }, {} as any)]))
+          getOrCreateClientState("trace-server").toolCallError = new Error("B failed")
+          const failed = yield* Effect.promise(() =>
+            executeB({ value: "B-error" }, {} as any).then(
+              () => false,
+              () => true,
+            ),
+          )
+          expect(failed).toBe(true)
+          CaseTrace.finishAll({ status: "success", result: { reason: "mcp-routing-test" } })
+
+          const eventFiles = (yield* Effect.promise(() => fs.readdir(traceDir, { recursive: true })))
+            .filter((entry) => entry.endsWith("events.jsonl"))
+            .map((entry) => path.join(traceDir, entry))
+          const byContents = yield* Effect.promise(() =>
+            Promise.all(eventFiles.map(async (file) => ({ file, contents: await fs.readFile(file, "utf8") }))),
+          )
+          const traceA = byContents.find((entry) => entry.contents.includes("ses_root_a"))
+          const traceB = byContents.find((entry) => entry.contents.includes("ses_root_b"))
+
+          expect(traceA).toBeDefined()
+          expect(traceB).toBeDefined()
+          const eventsA = traceA!.contents
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line))
+          const eventsB = traceB!.contents
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line))
+          const toolEventsA = eventsA.filter((event) => event.data?.operation === "tool.call")
+          const toolEventsB = eventsB.filter((event) => event.data?.operation === "tool.call")
+
+          expect(toolEventsA.some((event) => event.data.input_summary?.preview.includes('"value":"A"'))).toBe(true)
+          expect(toolEventsA.some((event) => event.data.input_summary?.preview.includes('"value":"B"'))).toBe(false)
+          expect(toolEventsA.some((event) => event.data.output_summary?.preview.includes("result:A"))).toBe(true)
+          expect(toolEventsB.some((event) => event.data.input_summary?.preview.includes('"value":"B"'))).toBe(true)
+          expect(toolEventsB.some((event) => event.data.input_summary?.preview.includes('"value":"A"'))).toBe(false)
+          expect(toolEventsB.some((event) => event.data.error?.message === "B failed")).toBe(true)
+        } finally {
+          CaseTrace.configure()
+          for (const [name, value] of Object.entries({
+            OPENCODE_CASE_TRACE: previous.enabled,
+            OPENCODE_CASE_TRACE_QUIET: previous.quiet,
+            OPENCODE_CASE_TRACE_DIR: previous.traceDir,
+            OPENCODE_CASE_ID: previous.caseID,
+          })) {
+            if (value === undefined) delete process.env[name]
+            else process.env[name] = value
+          }
+          CaseTrace.configure()
+          yield* Effect.promise(() => fs.rm(traceDir, { recursive: true, force: true }))
+        }
+      }),
   ),
 )
 

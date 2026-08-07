@@ -78,6 +78,11 @@ export const Failed = NamedError.create(
 
 type MCPClient = Client
 
+export type ToolTraceContext = {
+  sessionID?: string
+  messageID?: string
+}
+
 const StatusConnected = Schema.Struct({ status: Schema.Literal("connected") }).annotate({
   identifier: "MCPStatusConnected",
 })
@@ -178,7 +183,13 @@ function listTools(key: string, client: MCPClient, timeout: number) {
 }
 
 // Convert MCP tool definition to AI SDK Tool type
-function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClient, timeout?: number): Tool {
+function convertMcpTool(
+  clientName: string,
+  mcpTool: MCPToolDef,
+  client: MCPClient,
+  timeout?: number,
+  traceContext?: ToolTraceContext,
+): Tool {
   const inputSchema = mcpTool.inputSchema
 
   // Spread first, then override type to ensure it's always "object"
@@ -198,6 +209,8 @@ function convertMcpTool(clientName: string, mcpTool: MCPToolDef, client: MCPClie
         operation: "tool.call",
         name: `${clientName}:${mcpTool.name}`,
         input: {
+          sessionID: traceContext?.sessionID,
+          messageID: traceContext?.messageID,
           server: clientName,
           tool: mcpTool.name,
           args,
@@ -308,7 +321,7 @@ interface State {
 export interface Interface {
   readonly status: () => Effect.Effect<Record<string, Status>>
   readonly clients: () => Effect.Effect<Record<string, MCPClient>>
-  readonly tools: () => Effect.Effect<Record<string, Tool>>
+  readonly tools: (traceContext?: ToolTraceContext) => Effect.Effect<Record<string, Tool>>
   readonly prompts: () => Effect.Effect<Record<string, PromptInfo & { client: string }>>
   readonly resources: () => Effect.Effect<Record<string, ResourceInfo & { client: string }>>
   readonly add: (name: string, mcp: ConfigMCP.Info) => Effect.Effect<{ status: Record<string, Status> | Status }>
@@ -763,7 +776,7 @@ export const layer = Layer.effect(
       s.status[name] = { status: "disabled" }
     })
 
-    const tools = Effect.fn("MCP.tools")(function* () {
+    const tools = Effect.fn("MCP.tools")(function* (traceContext?: ToolTraceContext) {
       const result: Record<string, Tool> = {}
       const s = yield* InstanceState.get(state)
 
@@ -795,6 +808,7 @@ export const layer = Layer.effect(
                 mcpTool,
                 client,
                 timeout,
+                traceContext,
               )
             }
           }),

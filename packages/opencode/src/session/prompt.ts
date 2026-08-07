@@ -635,7 +635,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         })
       }
 
-      for (const [key, item] of Object.entries(yield* mcp.tools())) {
+      for (const [key, item] of Object.entries(
+        yield* mcp.tools({ sessionID: input.session.id, messageID: input.processor.message.id }),
+      )) {
         const execute = item.execute
         if (!execute) continue
 
