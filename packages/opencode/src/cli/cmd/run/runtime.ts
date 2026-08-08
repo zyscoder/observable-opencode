@@ -43,6 +43,8 @@ type CreateSessionInput = {
 
 type CreateSession = (sdk: RunInput["sdk"], input: CreateSessionInput) => Promise<{ id: string; title?: string }>
 
+export type BeforeTraceFinalize = (input: { sessionID?: string; failure?: unknown }) => void
+
 type RunRuntimeInput = {
   boot: () => Promise<BootContext>
   afterPaint?: (ctx: BootContext) => Promise<void> | void
@@ -54,6 +56,7 @@ type RunRuntimeInput = {
   initialInput?: string
   thinking: boolean
   demo?: RunInput["demo"]
+  beforeTraceFinalize?: BeforeTraceFinalize
 }
 
 type RunLocalInput = {
@@ -70,6 +73,7 @@ type RunLocalInput = {
   initialInput?: string
   thinking: boolean
   demo?: RunInput["demo"]
+  beforeTraceFinalize?: BeforeTraceFinalize
 }
 
 type StreamState = {
@@ -189,7 +193,16 @@ export async function replaceInteractiveTraceSession<T>(input: {
 }
 
 /** @internal Exported for trace lifecycle tests */
-export function finishInteractiveTraceSessions(input: { sessionID?: string; error?: unknown }) {
+export function finishInteractiveTraceSessions(input: {
+  sessionID?: string
+  error?: unknown
+  beforeTraceFinalize?: BeforeTraceFinalize
+}) {
+  try {
+    input.beforeTraceFinalize?.({ sessionID: input.sessionID, failure: input.error })
+  } catch {
+    // Trace cleanup must not alter the interactive runtime's behavior.
+  }
   const status = input.error ? "error" : "success"
   if (input.sessionID) {
     CaseTrace.finishSession(input.sessionID, {
@@ -789,6 +802,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           finishInteractiveTraceSessions({
             sessionID: state.sessionID || undefined,
             error: queueFailure ?? traceOutcomes.failure(state.sessionID),
+            beforeTraceFinalize: input.beforeTraceFinalize,
           })
         }
       } finally {
@@ -828,6 +842,7 @@ export async function runInteractiveLocalMode(input: RunLocalInput): Promise<voi
         initialInput: input.initialInput,
         thinking: input.thinking,
         demo: input.demo,
+        beforeTraceFinalize: input.beforeTraceFinalize,
         resolveSession: () => {
           if (session) {
             return session
@@ -866,7 +881,9 @@ export async function runInteractiveLocalMode(input: RunLocalInput): Promise<voi
 }
 
 // Attach mode. Uses the caller-provided SDK client directly.
-export async function runInteractiveMode(input: RunInput & { createSession?: CreateSession }): Promise<void> {
+export async function runInteractiveMode(
+  input: RunInput & { createSession?: CreateSession; beforeTraceFinalize?: BeforeTraceFinalize },
+): Promise<void> {
   return withRunSpan(
     "RunInteractive.attachMode",
     {
@@ -880,6 +897,7 @@ export async function runInteractiveMode(input: RunInput & { createSession?: Cre
         initialInput: input.initialInput,
         thinking: input.thinking,
         demo: input.demo,
+        beforeTraceFinalize: input.beforeTraceFinalize,
         boot: async () => ({
           sdk: input.sdk,
           directory: input.directory,

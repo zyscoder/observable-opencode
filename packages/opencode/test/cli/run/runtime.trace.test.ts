@@ -169,6 +169,61 @@ test("finalizes a replaced interactive root independently from a later failed ro
   ])
 })
 
+test("closes the outer run span before interactive trace finalization preserves its terminal output", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-runtime-trace-finalizer-order-"))
+  const packageDir = path.resolve(import.meta.dir, "../../..")
+  const script = path.join(dir, "runtime-trace-finalizer-order.ts")
+  const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+  const runtimeModule = pathToFileURL(path.join(packageDir, "src/cli/cmd/run/runtime.ts")).href
+
+  await fs.writeFile(
+    script,
+    [
+      `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+      `import { finishInteractiveTraceSessions } from ${JSON.stringify(runtimeModule)}`,
+      `CaseTrace.configure({ caseID: "interactive-finalizer-order" })`,
+      `CaseTrace.setSessionID("ses_final")`,
+      `const run = CaseTrace.startSpan({ component: "run", operation: "execute", name: "interactive" })`,
+      `let finalized = false`,
+      `finishInteractiveTraceSessions({`,
+      `  sessionID: "ses_final",`,
+      `  beforeTraceFinalize: ({ failure }) => {`,
+      `    finalized = true`,
+      `    run?.end({ status: failure ? "error" : "success", output: { exit_code: 23, terminal: "outer-run-complete" } })`,
+      `  },`,
+      `})`,
+      `if (!finalized) process.exitCode = 2`,
+    ].join("\n"),
+  )
+
+  const proc = Bun.spawn([process.execPath, script], {
+    cwd: packageDir,
+    env: {
+      ...process.env,
+      OPENCODE_CASE_TRACE: "1",
+      OPENCODE_CASE_TRACE_DIR: dir,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  expect(await proc.exited).toBe(0)
+
+  const traces = await Promise.all(
+    (await fs.readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) =>
+        JSON.parse(await fs.readFile(path.join(dir, entry.name, "legacy-trace.json"), "utf8")) as any,
+      ),
+  )
+  const trace = traces.find((item) => item.session_id === "ses_final")
+  expect(trace).toBeDefined()
+  const runSpan = trace!.spans.find((span: any) => span.component === "run" && span.operation === "execute")
+  expect(runSpan).toMatchObject({ status: "success" })
+  expect(runSpan.output_summary.preview).toContain('"exit_code":23')
+  expect(runSpan.output_summary.preview).toContain('"terminal":"outer-run-complete"')
+  expect(runSpan.metadata?.finalized_status).toBeUndefined()
+})
+
 test("writes independent real traces for A success, replacement, B transport failure, and process success", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-runtime-trace-outcomes-"))
   const packageDir = path.resolve(import.meta.dir, "../../..")

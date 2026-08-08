@@ -639,6 +639,20 @@ export const RunCommand = effectCmd({
         })
         let failure: unknown
         let activeSessionID: string | undefined
+        let runSpanClosed = false
+        const closeRunSpan = (traceFailure?: unknown) => {
+          if (runSpanClosed) return
+          runSpanClosed = true
+          const terminalFailure = failure ?? traceFailure
+          const status = terminalFailure || process.exitCode ? "error" : "success"
+          runSpan?.end({
+            status,
+            error: terminalFailure,
+            output: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
+        }
         try {
           const sess = await session(sdk)
           if (!sess?.id) {
@@ -939,6 +953,7 @@ export const RunCommand = effectCmd({
               createSession: createFreshSession,
               thinking,
               demo: args.demo,
+              beforeTraceFinalize: ({ failure }) => closeRunSpan(failure),
             })
           } catch (error) {
             dieInteractive(error)
@@ -948,14 +963,7 @@ export const RunCommand = effectCmd({
           failure = error
           throw error
         } finally {
-          const status = failure || process.exitCode ? "error" : "success"
-          runSpan?.end({
-            status,
-            error: failure,
-            output: {
-              exit_code: process.exitCode ?? 0,
-            },
-          })
+          closeRunSpan()
           try {
             finishRunTraces({ sessionID: activeSessionID, failure })
           } catch {}
@@ -986,6 +994,20 @@ export const RunCommand = effectCmd({
           },
         })
         let failure: unknown
+        let runSpanClosed = false
+        const closeRunSpan = (traceFailure?: unknown) => {
+          if (runSpanClosed) return
+          runSpanClosed = true
+          const terminalFailure = failure ?? traceFailure
+          const status = terminalFailure || process.exitCode ? "error" : "success"
+          runSpan?.end({
+            status,
+            error: terminalFailure,
+            output: {
+              exit_code: process.exitCode ?? 0,
+            },
+          })
+        }
         try {
           return await runInteractiveLocalMode({
             directory: directory ?? root,
@@ -1001,19 +1023,13 @@ export const RunCommand = effectCmd({
             initialInput,
             thinking,
             demo: args.demo,
+            beforeTraceFinalize: ({ failure }) => closeRunSpan(failure),
           })
         } catch (error) {
           failure = error
           dieInteractive(error)
         } finally {
-          const status = failure || process.exitCode ? "error" : "success"
-          runSpan?.end({
-            status,
-            error: failure,
-            output: {
-              exit_code: process.exitCode ?? 0,
-            },
-          })
+          closeRunSpan()
           try {
             finishRunTraces({ failure })
           } catch {}
