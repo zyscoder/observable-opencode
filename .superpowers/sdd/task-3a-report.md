@@ -86,3 +86,17 @@ The first process-isolation implementation routed every zero-root unhinted call 
 - GREEN: The lifecycle reserves the sanitized first-root base before process or non-first-root allocation. The allocator keeps a lifecycle-scoped assigned-ID set; a compatibility trace may retain that base only because it can be claimed as the first root. Every colliding process or later-root candidate retries with a deterministic `--N` counter while retaining the role-aware identity digest.
 - Reset behavior: `beginLifecycle()` and the disabled/reconfigure reset path clear the allocator and reserve the new base, so names never leak across lifecycles.
 - Verification: the exact-160 reproduction, sanitized-session collision regression, and same-base reconfigure regression pass. `bun --cwd packages/opencode test test/observability/case-trace-session.test.ts test/observability/case-trace.test.ts --timeout 30000` passes. `bun --cwd packages/opencode typecheck` is currently blocked by an unrelated dirty `src/cli/cmd/run.ts` change that references an undefined `sessionID`.
+
+## Follow-up: Compatibility Binding and Ambiguous Reference Ownership
+
+- RED: A real subprocess reproduced `configure() -> returnedTrace.setSessionID("ses_a") -> CaseTrace.setSessionID("ses_b")`; the registry claimed the compatibility trace for B while its manifest remained A. Registry and subprocess tests also showed that a shared reference was silently reassigned to the last root.
+- GREEN: Compatibility traces receive a passive registry-binding hook. Their public `setSessionID()` now claims the same trace before persisting the session, while ordinary root traces do not recurse through the hook. Reference ownership is tri-state: unowned, uniquely owned, or permanently ambiguous for the lifecycle; ambiguous references route to the process trace.
+- Verification: the three focused RED cases pass after the fix. The combined case-trace, session-router, runtime queue/trace, and MCP lifecycle suites pass with 215 tests and 2296 assertions. `bun --cwd packages/opencode typecheck` and `git diff --check` pass.
+
+## Task 3 Final Integration
+
+- Interactive outer-run spans are process-scoped, so replacing a root session cannot finalize a process-wide span before its terminal output is recorded.
+- Runtime queue ownership is resolved across `/new` boundaries; replaced roots, active roots, and the process trace keep independent terminal states.
+- MCP tool spans carry passive session/message route context without changing tool schemas, arguments, results, timeouts, or error propagation.
+- Startup paths that call `process.exit(1)` persist both the process trace and run-span `exit_code=1` before exiting.
+- Final verification: focused suites pass with 235 tests, `bun --cwd packages/opencode typecheck` passes, `git diff --check` passes, and the whole Task 3 review is approved.
