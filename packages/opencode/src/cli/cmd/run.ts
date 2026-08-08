@@ -70,6 +70,8 @@ type SessionInfo = {
   directory?: string
 }
 
+type RunTraceLifecycle = Pick<typeof CaseTrace, "finishSession" | "finishAll">
+
 function inline(info: Inline) {
   const suffix = info.description ? UI.Style.TEXT_DIM + ` ${info.description}` + UI.Style.TEXT_NORMAL : ""
   UI.println(UI.Style.TEXT_NORMAL + info.icon, UI.Style.TEXT_NORMAL + info.title + suffix)
@@ -84,14 +86,18 @@ function block(info: Inline, output?: string) {
 }
 
 /** @internal Exported for trace lifecycle tests. */
-export function finishRunTraces(input: { sessionID?: string; failure?: unknown }) {
-  const status = input.failure || process.exitCode ? "error" : "success"
+export function finishRunTraces(
+  input: { sessionID?: string; failure?: unknown; exitCode?: number },
+  trace: RunTraceLifecycle = CaseTrace,
+) {
+  const exitCode = input.exitCode ?? process.exitCode ?? 0
+  const status = input.failure || exitCode ? "error" : "success"
   const result = {
-    exit_code: process.exitCode ?? 0,
+    exit_code: exitCode,
   }
 
   if (input.sessionID) {
-    CaseTrace.finishSession(input.sessionID, {
+    trace.finishSession(input.sessionID, {
       status,
       error: input.failure,
       result,
@@ -101,13 +107,32 @@ export function finishRunTraces(input: { sessionID?: string; failure?: unknown }
   // Earlier interactive roots have their own terminal result. The process
   // record and any still-open roots close successfully instead of inheriting
   // the last active turn's error.
-  CaseTrace.finishAll({
-    status: "success",
+  const processStatus = !input.sessionID && status === "error" ? "error" : "success"
+  trace.finishAll({
+    status: processStatus,
+    ...(processStatus === "error" && input.failure ? { error: input.failure } : {}),
     result: {
       ...result,
       reason: "run.closed",
     },
   })
+}
+
+/** @internal Best-effort trace publication for exit paths that bypass finally. */
+export function exitRunWithTrace(input: {
+  sessionID?: string
+  failure: unknown
+  closeRunSpan: (failure?: unknown, exitCode?: number) => void
+  trace?: RunTraceLifecycle
+  exit?: (code: number) => never
+}): never {
+  try {
+    input.closeRunSpan(input.failure, 1)
+  } catch {}
+  try {
+    finishRunTraces({ sessionID: input.sessionID, failure: input.failure, exitCode: 1 }, input.trace)
+  } catch {}
+  return (input.exit ?? process.exit)(1)
 }
 
 async function tool(part: ToolPart) {
@@ -624,6 +649,7 @@ export const RunCommand = effectCmd({
         const runSpan = CaseTrace.startSpan({
           component: "run",
           operation: "execute",
+          ...(args.interactive ? { trace_scope: "process" as const } : {}),
           name: args.interactive ? "interactive" : "non-interactive",
           input: {
             command: args.command,
@@ -640,24 +666,27 @@ export const RunCommand = effectCmd({
         let failure: unknown
         let activeSessionID: string | undefined
         let runSpanClosed = false
-        const closeRunSpan = (traceFailure?: unknown) => {
+        const closeRunSpan = (traceFailure?: unknown, traceExitCode?: number) => {
           if (runSpanClosed) return
           runSpanClosed = true
           const terminalFailure = failure ?? traceFailure
-          const status = terminalFailure || process.exitCode ? "error" : "success"
+          const exitCode = traceExitCode ?? process.exitCode ?? 0
+          const status = terminalFailure || exitCode ? "error" : "success"
           runSpan?.end({
             status,
             error: terminalFailure,
             output: {
-              exit_code: process.exitCode ?? 0,
+              exit_code: exitCode,
             },
           })
         }
         try {
           const sess = await session(sdk)
           if (!sess?.id) {
+            const sessionFailure = new Error("Session not found")
+            failure = sessionFailure
             UI.error("Session not found")
-            process.exit(1)
+            exitRunWithTrace({ failure: sessionFailure, closeRunSpan })
           }
           const sessionID = sess.id
           activeSessionID = sessionID
@@ -982,6 +1011,7 @@ export const RunCommand = effectCmd({
         const runSpan = CaseTrace.startSpan({
           component: "run",
           operation: "execute",
+          trace_scope: "process",
           name: "interactive-local",
           input: {
             interactive: true,

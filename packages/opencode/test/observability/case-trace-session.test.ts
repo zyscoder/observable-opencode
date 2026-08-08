@@ -34,6 +34,21 @@ test("keeps process and root ordinals independent", () => {
   ])
 })
 
+test("routes an explicit process scope away from compatibility and root traces", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID, _ordinal, kind) =>
+    create(sessionID ?? kind),
+  )
+
+  const compatibility = registry.resolveCompatibility()
+  const processTrace = registry.resolve({ scope: "process" })
+  const root = registry.resolve({ sessionID: "ses_a" })
+
+  expect(processTrace.id).toBe("process")
+  expect(processTrace).not.toBe(compatibility)
+  expect(processTrace).not.toBe(root)
+  expect(registry.resolve({ scope: "process", sessionID: "ses_a" })).toBe(processTrace)
+})
+
 test("routes child sessions to their parent root", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const parent = registry.resolve({ sessionID: "ses_parent" })
@@ -208,6 +223,17 @@ test("extracts route hints from session and reference fields", () => {
   expect(traceRouteHint({ span_id: "span_1", source_refs: ["decision:dec_1"] })).toEqual({
     refs: ["span_1", "span:span_1", "decision:dec_1"],
   })
+})
+
+test("extracts process scope only from trusted top-level fields", () => {
+  expect(traceRouteHint({ trace_scope: "process", sessionID: "ses_a" })).toEqual({
+    scope: "process",
+    sessionID: "ses_a",
+    refs: [],
+  })
+  expect(traceRouteHint({ traceScope: "process" })).toEqual({ scope: "process", refs: [] })
+  expect(traceRouteHint({ data: { trace_scope: "process" } })).toEqual({ refs: [] })
+  expect(traceRouteHint({ metadata: { traceScope: "process" } })).toEqual({ refs: [] })
 })
 
 test("extracts returned semantic IDs with raw and typed aliases", () => {

@@ -1,4 +1,5 @@
 export type TraceRouteHint = {
+  scope?: "process"
   sessionID?: string
   refs: string[]
 }
@@ -62,6 +63,10 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
     }
   }
 
+  const scope =
+    isRecord(input) && (input.trace_scope === "process" || input.traceScope === "process")
+      ? "process"
+      : undefined
   let sessionID = isRecord(input) ? directSessionID(input) : undefined
   if (isRecord(input) && !sessionID) {
     for (const [key, value] of Object.entries(input)) {
@@ -114,7 +119,11 @@ export function traceRouteHint(input: unknown): TraceRouteHint {
   }
 
   visit(input)
-  return sessionID ? { sessionID, refs } : { refs }
+  return {
+    ...(scope ? { scope } : {}),
+    ...(sessionID ? { sessionID } : {}),
+    refs,
+  }
 }
 
 export type SessionTraceKind = "root" | "process" | "compatibility"
@@ -136,6 +145,8 @@ export class SessionTraceRegistry<T extends object> {
   ) {}
 
   resolve(hint?: Partial<TraceRouteHint>): T {
+    if (hint?.scope === "process") return this.resolveProcess()
+
     const sessionID = hint?.sessionID
     if (sessionID) return this.rootTrace(sessionID)
 
@@ -153,13 +164,11 @@ export class SessionTraceRegistry<T extends object> {
     }
     if (ownerCandidates) {
       if (ownerCandidates.size === 1) return ownerCandidates.values().next().value!
-      if (!this.processTrace) this.processTrace = this.create(undefined, this.processOrdinal++, "process")
-      return this.processTrace
+      return this.resolveProcess()
     }
 
     if (this.roots.size === 1) return this.roots.values().next().value!
-    if (!this.processTrace) this.processTrace = this.create(undefined, this.processOrdinal++, "process")
-    return this.processTrace
+    return this.resolveProcess()
   }
 
   hasRoots(): boolean {
@@ -263,6 +272,11 @@ export class SessionTraceRegistry<T extends object> {
       this.roots.set(rootSessionID, trace)
     }
     return trace
+  }
+
+  private resolveProcess(): T {
+    if (!this.processTrace) this.processTrace = this.create(undefined, this.processOrdinal++, "process")
+    return this.processTrace
   }
 
   private rootSessionID(sessionID: string): string {

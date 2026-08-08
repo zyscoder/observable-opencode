@@ -1038,6 +1038,7 @@ type GenerationGroundingCandidates = {
 type StartSpanInput = {
   component: TraceComponent
   operation: string
+  trace_scope?: "process"
   name?: string
   parentSpanID?: string
   input?: unknown
@@ -11403,7 +11404,7 @@ function routed(input?: unknown) {
   ensureLifecycle()
   const hint = traceRouteHint(input)
   const router = traceRegistry()
-  if (!hint.sessionID && !router.hasRoots()) {
+  if (!hint.scope && !hint.sessionID && !router.hasRoots()) {
     compatibilityBindingAllowed = true
     return router.resolveCompatibility()
   }

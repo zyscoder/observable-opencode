@@ -133,10 +133,17 @@ function eagerStream(input: RunRuntimeInput, ctx: BootContext) {
   return ctx.resume === true || !input.resolveSession || !!input.demo
 }
 
+type InteractiveTraceSessionLifecycle = Pick<typeof CaseTrace, "finishSession">
+type InteractiveTraceLifecycle = Pick<typeof CaseTrace, "finishSession" | "finishAll">
+
 /** @internal Exported for trace lifecycle tests */
-export function finishReplacedTraceSession(sessionID: string | undefined, error?: unknown) {
+export function finishReplacedTraceSession(
+  sessionID: string | undefined,
+  error?: unknown,
+  trace: InteractiveTraceSessionLifecycle = CaseTrace,
+) {
   if (!sessionID) return
-  CaseTrace.finishSession(sessionID, {
+  trace.finishSession(sessionID, {
     status: error ? "error" : "success",
     error,
     result: {
@@ -185,10 +192,11 @@ export async function replaceInteractiveTraceSession<T>(input: {
   previousError?: unknown
   create: () => Promise<T>
   prepare?: (created: T) => void | Promise<void>
+  trace?: InteractiveTraceSessionLifecycle
 }): Promise<T> {
   const created = await input.create()
   await input.prepare?.(created)
-  finishReplacedTraceSession(input.previousSessionID, input.previousError)
+  finishReplacedTraceSession(input.previousSessionID, input.previousError, input.trace)
   return created
 }
 
@@ -197,7 +205,7 @@ export function finishInteractiveTraceSessions(input: {
   sessionID?: string
   error?: unknown
   beforeTraceFinalize?: BeforeTraceFinalize
-}) {
+}, trace: InteractiveTraceLifecycle = CaseTrace) {
   try {
     input.beforeTraceFinalize?.({ sessionID: input.sessionID, failure: input.error })
   } catch {
@@ -205,7 +213,7 @@ export function finishInteractiveTraceSessions(input: {
   }
   const status = input.error ? "error" : "success"
   if (input.sessionID) {
-    CaseTrace.finishSession(input.sessionID, {
+    trace.finishSession(input.sessionID, {
       status,
       error: input.error,
       result: {
@@ -213,7 +221,7 @@ export function finishInteractiveTraceSessions(input: {
       },
     })
   }
-  CaseTrace.finishAll({
+  trace.finishAll({
     status: "success",
     result: {
       reason: "interactive.runtime.closed",
