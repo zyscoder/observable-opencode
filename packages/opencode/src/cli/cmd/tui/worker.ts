@@ -14,7 +14,7 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
-import { CaseTrace } from "@/observability/case-trace"
+import { finalizeWorkerTraces } from "@/cli/cmd/tui/worker-trace"
 
 ensureProcessMetadata("worker")
 
@@ -105,13 +105,7 @@ export const rpc = {
       failure = error
       throw error
     } finally {
-      CaseTrace.finish({
-        status: failure ? "error" : "success",
-        error: failure,
-        result: {
-          reason: "worker.shutdown",
-        },
-      })
+      await finalizeWorkerTraces({ failure })
     }
   },
 }

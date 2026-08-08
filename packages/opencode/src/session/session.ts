@@ -32,6 +32,7 @@ import { ProjectID } from "../project/schema"
 import { WorkspaceID } from "../control-plane/schema"
 import { SessionID, MessageID, PartID } from "./schema"
 import { ModelID, ProviderID } from "@/provider/schema"
+import { CaseTrace } from "@/observability/case-trace"
 
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
@@ -224,6 +225,23 @@ export const Info = Schema.Struct({
   revert: optionalOmitUndefined(Revert),
 }).annotate({ identifier: "Session" })
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
+
+export type RemovedSessionTraceFinalizer = Pick<typeof CaseTrace, "finishSession">
+
+export function finalizeRemovedRootSessionTrace(
+  session: Pick<Info, "id" | "parentID">,
+  trace: RemovedSessionTraceFinalizer = CaseTrace,
+): void {
+  if (session.parentID) return
+  try {
+    trace.finishSession(session.id, {
+      status: "success",
+      result: { reason: "session.deleted" },
+    })
+  } catch {
+    // Trace persistence is diagnostic only and must not affect session removal.
+  }
+}
 
 export const ProjectInfo = Schema.Struct({
   id: ProjectID,
@@ -599,6 +617,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
 
         yield* sync.run(Event.Deleted, { sessionID, info: session }, { publish: hasInstance })
         yield* sync.remove(sessionID)
+        finalizeRemovedRootSessionTrace(session)
       } catch (e) {
         log.error(e)
       }
