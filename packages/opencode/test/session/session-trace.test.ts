@@ -4,7 +4,44 @@ import { existsSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { finalizeRemovedRootSessionTrace } from "@/session/session"
+import { Effect } from "effect"
+import { finalizeRemovedRootSessionTrace, finalizeRootTraceAfterRemoval } from "@/session/session"
+
+test("finalizes only after the removal effect succeeds", async () => {
+  const order: string[] = []
+  const result = await Effect.runPromise(
+    finalizeRootTraceAfterRemoval(
+      { id: "ses_root" as any },
+      Effect.sync(() => {
+        order.push("remove")
+        return "removed"
+      }),
+      {
+        finishSession() {
+          order.push("finish")
+        },
+      },
+    ),
+  )
+
+  expect(result).toBe("removed")
+  expect(order).toEqual(["remove", "finish"])
+})
+
+test("preserves removal failure and never finalizes the trace", async () => {
+  const failure = new Error("remove failed")
+  let finishes = 0
+  const result = Effect.runPromise(
+    finalizeRootTraceAfterRemoval({ id: "ses_root" as any }, Effect.fail(failure), {
+      finishSession() {
+        finishes++
+      },
+    }),
+  )
+
+  await expect(result).rejects.toBe(failure)
+  expect(finishes).toBe(0)
+})
 
 test("finalizes the trace only after a root session has been removed", () => {
   const calls: unknown[] = []
@@ -77,8 +114,14 @@ test("real session removal finalizes only after the root is successfully removed
         `  CaseTrace.setSessionID(root.id)`,
         `  const child = await run((service) => service.create({ parentID: root.id, title: "trace child" }))`,
         `  await run((service) => service.remove(child.id))`,
+        `  let childError`,
+        `  try { await run((service) => service.get(child.id)) } catch (error) { childError = error }`,
+        `  if (childError?.name !== "NotFoundError") throw new Error("child remained readable after removal")`,
         `  if (existsSync(path.join(${JSON.stringify(dir)}, "session-root-remove", "trace.json"))) throw new Error("child removal finalized root trace")`,
         `  await run((service) => service.remove(root.id))`,
+        `  let rootError`,
+        `  try { await run((service) => service.get(root.id)) } catch (error) { rootError = error }`,
+        `  if (rootError?.name !== "NotFoundError") throw new Error("root remained readable after removal")`,
         `  if (!existsSync(path.join(${JSON.stringify(dir)}, "session-root-remove", "trace.json"))) throw new Error("root removal did not finalize trace")`,
         `} })`,
         `process.exit(0)`,

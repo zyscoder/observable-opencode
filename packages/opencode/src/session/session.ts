@@ -243,6 +243,16 @@ export function finalizeRemovedRootSessionTrace(
   }
 }
 
+export function finalizeRootTraceAfterRemoval<A, E, R>(
+  session: Pick<Info, "id" | "parentID">,
+  removal: Effect.Effect<A, E, R>,
+  trace: RemovedSessionTraceFinalizer = CaseTrace,
+): Effect.Effect<A, E, R> {
+  return removal.pipe(
+    Effect.tap(() => Effect.sync(() => finalizeRemovedRootSessionTrace(session, trace))),
+  )
+}
+
 export const ProjectInfo = Schema.Struct({
   id: ProjectID,
   name: optionalOmitUndefined(Schema.String),
@@ -616,8 +626,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
         )
 
         yield* sync.run(Event.Deleted, { sessionID, info: session }, { publish: hasInstance })
-        yield* sync.remove(sessionID)
-        finalizeRemovedRootSessionTrace(session)
+        yield* finalizeRootTraceAfterRemoval(session, sync.remove(sessionID))
       } catch (e) {
         log.error(e)
       }
