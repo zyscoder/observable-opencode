@@ -94,9 +94,9 @@ Observable OpenCode 不引入专属运行时 Provider，也不读取某个供应
 执行。请以 OpenCode 实际加载的配置和原生 CLI、请求级覆盖为权威，不应依赖本文推断
 配置合并或优先级。
 
-OpenCode 会使用全局配置目录（通常为 `~/.config/opencode/`）中的 `config.json`、
-`opencode.json` 或 `opencode.jsonc`，并发现项目中的 `opencode.json`、`opencode.jsonc`
-以及 `.opencode/opencode.json`、`.opencode/opencode.jsonc`。也可使用原生入口
+OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/opencode/`）中的
+`config.json`、`opencode.json` 和 `opencode.jsonc`，并发现项目中的 `opencode.json`、
+`opencode.jsonc` 以及 `.opencode/opencode.json`、`.opencode/opencode.jsonc`。也可使用原生入口
 `OPENCODE_CONFIG`、`OPENCODE_CONFIG_DIR`、`OPENCODE_CONFIG_CONTENT`，或原生 CLI 和
 请求参数覆盖。不同版本及配置来源会按 OpenCode 的原生合并规则处理。
 
@@ -252,6 +252,7 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 ├── provenance-trace.json      # 归因事实投影
 ├── legacy-trace.json          # 兼容投影
 ├── events.jsonl               # 结构化事件流
+├── records.jsonl              # Causal IR 结构化记录流
 ├── raw-events.jsonl           # 原始事件流
 ├── manifest.json              # root/process 与产物清单
 ├── artifacts/                 # 大文本和可校验语义载荷
@@ -311,6 +312,10 @@ python3 -m trace_attribution \
 
 ## Python API
 
+下面的 API 可嵌入任意 Python 程序。运行该程序时，只需通过 `PYTHONPATH` 提供仓库中
+`tools/trace_attribution` 的绝对路径；程序的当前工作目录无需位于
+`observable-opencode` 仓库。
+
 ```python
 from pathlib import Path
 
@@ -332,12 +337,6 @@ result = analyze(
 print(result.payload["conclusion"])
 print(result.payload["causal_chain"])
 print(result.payload["supporting_evidence_refs"])
-```
-
-运行该程序时同样设置：
-
-```bash
-PYTHONPATH=/opt/observable-opencode/tools/trace_attribution python3 analyze.py
 ```
 
 详细的归因算法、预算、checkpoint、benchmark bundle 和报告字段说明见
