@@ -348,7 +348,7 @@ print(result.payload["supporting_evidence_refs"])
 
 ```bash
 bun install
-bun --cwd packages/opencode run typecheck
+bun run --cwd packages/opencode typecheck
 bun --cwd packages/opencode test \
   test/observability/trace-publication.test.ts \
   test/observability/case-trace.test.ts
