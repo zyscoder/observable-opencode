@@ -87,46 +87,118 @@ chmod +x opencode-observable-darwin-arm64
 xattr -d com.apple.quarantine opencode-observable-darwin-arm64
 ```
 
-## 配置 DeepSeek
+## 配置模型与 Provider
 
-OpenCode 运行时使用内置 DeepSeek Provider：
+Observable OpenCode 不引入专属运行时 Provider，也不读取某个供应商专用 API Key。
+模型、认证和 Provider 均由 **OpenCode 原生配置链** 决定；本项目只被动记录已经发生的
+执行。请以 OpenCode 实际加载的配置和原生 CLI、请求级覆盖为权威，不应依赖本文推断
+配置合并或优先级。
 
-```bash
-export DEEPSEEK_API_KEY="<your-deepseek-api-key>"
+OpenCode 会使用全局配置目录（通常为 `~/.config/opencode/`）中的 `config.json`、
+`opencode.json` 或 `opencode.jsonc`，并发现项目中的 `opencode.json`、`opencode.jsonc`
+以及 `.opencode/opencode.json`、`.opencode/opencode.jsonc`。也可使用原生入口
+`OPENCODE_CONFIG`、`OPENCODE_CONFIG_DIR`、`OPENCODE_CONFIG_CONTENT`，或原生 CLI 和
+请求参数覆盖。不同版本及配置来源会按 OpenCode 的原生合并规则处理。
+
+下面是一个兼容 OpenAI 风格 API 的通用模板。可放在项目 `opencode.json` 或你选择的
+原生配置文件中：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "{env:MODEL}",
+  "provider": {
+    "compatible": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenAI Compatible",
+      "options": {
+        "baseURL": "{env:URL}",
+        "apiKey": "{env:APIKEY}"
+      },
+      "models": {
+        "glm-4.5": { "name": "GLM 4.5" },
+        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+      }
+    }
+  }
+}
 ```
 
-企业网络无法访问 `models.dev` 时，可以禁用启动阶段的远程模型目录刷新。程序会
-使用编译进可执行文件的模型快照，不会因该请求长期阻塞：
+其中 `MODEL` 必须是完整模型标识，例如 `compatible/glm-4.5`；`APIKEY` 和 `URL`
+分别提供该兼容服务的认证和地址。它们只是此模板选用的环境变量占位符，可以替换为
+企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用 OpenCode
+内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
+
+企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
+编译进可执行文件的模型快照：
 
 ```bash
 export OPENCODE_DISABLE_MODELS_FETCH=1
 ```
 
-也可以限制刷新超时或指向企业内部镜像：
+也可以按 OpenCode 原生方式限制刷新超时或指向企业内部镜像：
 
 ```bash
 export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 # export OPENCODE_MODELS_URL="https://models.example.internal"
 ```
 
-## 启动 HTTP Server 并记录 Trace
+## 交互式 TUI 并记录 Trace
 
-Benchmark 应通过 `opencode session <-> HTTP server <-> request` 方式执行，避免
-命令行一次性运行与实际 Harness 行为不一致。
+交互式 TUI 是一等入口。先通过上述 OpenCode 原生配置选择 Provider 和模型，再启动
+目标项目：
 
 ```bash
-export DEEPSEEK_API_KEY="<your-deepseek-api-key>"
-export OPENCODE_DISABLE_MODELS_FETCH=1
-export OPENCODE_SERVER_PASSWORD="<server-password>"
+export MODEL="compatible/glm-4.5"
+export APIKEY="<your-compatible-api-key>"
+export URL="https://api.example.com/v1"
 
+export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_CASE_TRACE=1
-export OPENCODE_CASE_ID="benchmark-case-001"
 export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+# 可选：为一次 benchmark case 指定稳定名称
+export OPENCODE_CASE_ID="benchmark-case-001"
+
+opencode /data/repos/target-project
+```
+
+同一 root session 的多轮交互写入同一份 Trace。输入 `/new` 会独立完成旧 root，并为
+新 root 创建另一份 Trace；Subagent 的事件归入其父 root。正常退出、root session 删除
+或收到可捕获的 `SIGINT`、`SIGTERM`、`SIGHUP` 时，程序会先持久化已有数据，再对每个
+已完成 root 向 `stderr` 输出保存位置：
+
+```text
+[observable-opencode] Session trace saved
+  session: ses_...
+  case: benchmark-case-001
+  status: cancelled
+  directory: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4
+  html: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.html
+  json: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
+  partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
+```
+
+可捕获的中断会保留有效 Trace，状态通常为 `cancelled`；仅有阶段性快照时为 `partial`。
+`SIGKILL` 无法执行任何用户态退出处理，只能依赖进程运行期间已经原子写入的
+`partial/latest.json`。设置 `OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，
+不会关闭 Trace。
+
+## 启动 HTTP Server 并记录 Trace
+
+Benchmark 可以通过 `opencode session <-> HTTP server <-> request` 执行，以贴近
+Harness 的实际交互行为。HTTP 路径与 TUI 使用同一套原生配置；请求中不需要重复指定
+模型。
+
+```bash
+export OPENCODE_SERVER_PASSWORD="<server-password>"
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_ID="benchmark-case-001"
 
 opencode serve --hostname 127.0.0.1 --port 4096
 ```
 
-另一个终端创建 session 并发送请求：
+在另一个终端创建 session 并发送消息：
 
 ```bash
 PROJECT_DIR="/data/repos/target-project"
@@ -144,54 +216,59 @@ curl -fsS -X POST "http://127.0.0.1:4096/session/$SESSION_ID/message" \
   -H "x-opencode-directory: $PROJECT_DIR" \
   -H 'content-type: application/json' \
   --data '{
-    "model": {"providerID": "deepseek", "modelID": "deepseek-v4-flash"},
     "parts": [{"type": "text", "text": "分析并修复当前项目中的测试失败。"}]
   }'
 ```
 
-服务正常结束，或收到可捕获的 `SIGINT`、`SIGTERM`、`SIGHUP` 后，会先持久化
-已有 Trace，再向 `stderr` 输出一次保存位置：
+只有特定 case 需要与项目或全局配置不同的模型时，才使用 OpenCode 原生请求级 model
+覆盖。完成一个 HTTP session 时建议显式删除它，以立刻完成该 root 的 Trace；否则服务
+关闭时会统一收尾：
 
-```text
-[observable-opencode] Session trace saved
-  session: ses_...
-  case: benchmark-case-001
-  status: cancelled
-  directory: /data/evo-bench/traces/benchmark-case-001
-  html: /data/evo-bench/traces/benchmark-case-001/trace.html
-  json: /data/evo-bench/traces/benchmark-case-001/trace.json
-  partial: /data/evo-bench/traces/benchmark-case-001/partial/latest.json
+```bash
+curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
+  -H "Authorization: Basic $AUTH" \
+  -H "x-opencode-directory: $PROJECT_DIR"
 ```
-
-`SIGTERM`、`SIGINT` 等中断会保留有效 Trace，状态为 `cancelled`；仅有阶段性
-快照时状态为 `partial`。`SIGKILL` 无法执行任何用户态退出处理，因此只能依赖进程
-运行期间已经原子写入的 `partial/latest.json`。设置
-`OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，不会关闭 Trace。
 
 ## Trace 目录
 
+一个进程可以生成多份 root Trace，而不是只有一份全局 Trace。以 case ID
+`benchmark-case-001` 为例，首个 root 使用基础目录，后续 root 和进程级事件使用各自
+独立目录：
+
 ```text
-/data/evo-bench/traces/<case-id>/
-├── trace.html                 # 唯一的可视化入口
+/data/evo-bench/traces/
+├── benchmark-case-001/                              # first root
+├── benchmark-case-001--<session>--<digest>/          # later root
+└── benchmark-case-001--process--<digest>/             # process-level events
+```
+
+每个目录都保持相同的产物结构：
+
+```text
+<trace-directory>/
+├── trace.html                 # 可视化入口
 ├── trace.json                 # Causal IR 语义 Trace
 ├── provenance-trace.json      # 归因事实投影
 ├── legacy-trace.json          # 兼容投影
 ├── events.jsonl               # 结构化事件流
 ├── raw-events.jsonl           # 原始事件流
-├── manifest.json              # case 与产物清单
+├── manifest.json              # root/process 与产物清单
 ├── artifacts/                 # 大文本和可校验语义载荷
 └── partial/
     └── latest.json            # 运行中/异常退出恢复快照
 ```
 
-直接在浏览器中打开 `trace.html`，即可查看主 Agent、Subagent、任务编排、上下文
-压缩、message 多层转换、LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的
+直接在浏览器中打开所需 root 的 `trace.html`，即可查看主 Agent、Subagent、任务编排、
+上下文压缩、message 多层转换、LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的
 完整数据流。大文本保存在 `artifacts/` 中，在 HTML 内按需展开。
 
 ## 使用离线归因 CLI
 
 归因模块目前随源码仓库发布，并未安装为系统级命令。它不要求当前目录位于
 `observable-opencode`；只需要把仓库中的 Python 包绝对路径加入 `PYTHONPATH`。
+下面的 DeepSeek/Anthropic 兼容配置仅用于可选的离线归因 Judge，和 OpenCode 运行时的
+Provider、模型选择及认证完全无关。
 
 ```bash
 export OBSERVABLE_OPENCODE_HOME="/opt/observable-opencode"
@@ -272,8 +349,8 @@ PYTHONPATH=/opt/observable-opencode/tools/trace_attribution python3 analyze.py
 
 ```bash
 bun install
-bun run --cwd packages/opencode typecheck
-bun test --cwd packages/opencode \
+bun --cwd packages/opencode run typecheck
+bun --cwd packages/opencode test \
   test/observability/trace-publication.test.ts \
   test/observability/case-trace.test.ts
 
