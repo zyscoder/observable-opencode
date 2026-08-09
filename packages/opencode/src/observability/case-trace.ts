@@ -1056,6 +1056,7 @@ type EndSpanInput = {
 type TraceEventInput = {
   component: TraceComponent
   event_type: string
+  trace_scope?: "process"
   span_id?: string
   data?: unknown
 }
@@ -11399,10 +11400,45 @@ function ensureLifecycle() {
   beginLifecycle()
 }
 
-function routed(input?: unknown) {
+const routedDefinitionPrefixes: Record<string, string[]> = {
+  snapshot_id: ["snapshot"],
+  decision_id: ["decision"],
+  turn_id: ["turn"],
+  record_id: ["record"],
+  node_id: ["node"],
+  fact_id: ["fact"],
+  verification_id: ["verification"],
+  change_id: ["change"],
+  edge_id: ["edge"],
+  check_id: ["check", "compaction_check"],
+  constraint_id: ["constraint"],
+  design_id: ["design"],
+  gate_id: ["gate", "exit_gate"],
+  segment_id: ["segment", "response_segment"],
+  claim_id: ["claim", "response_claim"],
+  lifecycle_id: ["lifecycle"],
+}
+
+function routedHint(input: unknown, definitionKeys: readonly string[]) {
+  const hint = traceRouteHint(input)
+  const record = recordFromUnknown(input)
+  if (!record || definitionKeys.length === 0) return hint
+
+  const definitions = new Set<string>()
+  for (const key of definitionKeys) {
+    const value = record[key]
+    if (typeof value !== "string" || !value) continue
+    definitions.add(value)
+    for (const prefix of routedDefinitionPrefixes[key] ?? []) definitions.add(`${prefix}:${value}`)
+  }
+  if (definitions.size === 0) return hint
+  return { ...hint, refs: hint.refs.filter((ref) => !definitions.has(ref)) }
+}
+
+function routed(input?: unknown, definitionKeys: readonly string[] = []) {
   if (!enabledFromEnv() || compatibilityFinished) return undefined
   ensureLifecycle()
-  const hint = traceRouteHint(input)
+  const hint = routedHint(input, definitionKeys)
   const router = traceRegistry()
   if (!hint.scope && !hint.sessionID && !router.hasRoots()) {
     compatibilityBindingAllowed = true
@@ -11582,7 +11618,12 @@ export namespace CaseTrace {
   }
 
   export function event(input: TraceEventInput) {
-    routed(input)?.event(input)
+    const trace = routed(input)
+    if (!trace) return
+    trace.event(input)
+    if (input.event_type !== "tool.call") return
+    const callID = firstStringField(input.data, ["callID", "call_id", "toolCallId", "tool_call_id"])
+    if (callID) traceRegistry().remember(trace, [callID, `tool_call:${callID}`])
   }
 
   export function usage(input: unknown, spanID?: string) {
@@ -11590,12 +11631,12 @@ export namespace CaseTrace {
   }
 
   export function contextSnapshot(input: ContextSnapshotInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["snapshot_id"])
     return remember(trace, trace?.contextSnapshot(input))
   }
 
   export function decision(input: SemanticDecisionInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["decision_id"])
     return remember(trace, trace?.decision(input))
   }
 
@@ -11610,67 +11651,67 @@ export namespace CaseTrace {
   }
 
   export function edge(input: SemanticEdgeInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["edge_id"])
     return remember(trace, trace?.edge(input))
   }
 
   export function verification(input: VerificationRecordInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["verification_id"])
     return remember(trace, trace?.verification(input))
   }
 
   export function change(input: ChangeRecordInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["change_id"])
     return remember(trace, trace?.change(input))
   }
 
   export function constraint(input: ConstraintRecordInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["constraint_id"])
     return remember(trace, trace?.constraint(input))
   }
 
   export function finalEvidence(input: FinalResponseEvidenceInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["claim_id"])
     return remember(trace, trace?.finalEvidence(input))
   }
 
   export function responseOutput(input: ResponseOutputInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["segment_id"])
     return remember(trace, trace?.responseOutput(input))
   }
 
   export function designRecord(input: DesignRecordInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["design_id"])
     return remember(trace, trace?.designRecord(input))
   }
 
   export function llmTurn(input: LlmTurnInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["turn_id"])
     return remember(trace, trace?.llmTurn(input))
   }
 
   export function agentLifecycle(input: AgentLifecycleInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["lifecycle_id"])
     return remember(trace, trace?.agentLifecycle(input))
   }
 
   export function exitGate(input: ExitGateInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["gate_id"])
     return remember(trace, trace?.exitGate(input))
   }
 
   export function evidenceFact(input: EvidenceFactInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["fact_id"])
     return remember(trace, trace?.evidenceFact(input))
   }
 
   export function node(input: CausalNodeInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["node_id"])
     return remember(trace, trace?.node(input))
   }
 
   export function causalEdge(input: CausalEdgeInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["edge_id"])
     return remember(trace, trace?.causalEdge(input))
   }
 
@@ -11685,7 +11726,7 @@ export namespace CaseTrace {
   }
 
   export function compactionCheck(input: CompactionCheckInput) {
-    const trace = routed(input)
+    const trace = routed(input, ["check_id"])
     return remember(trace, trace?.compactionCheck(input))
   }
 

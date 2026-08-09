@@ -144,6 +144,7 @@ function listTools(key: string, client: MCPClient, timeout: number) {
       CaseTrace.event({
         component: "mcp",
         event_type: "tools.list",
+        trace_scope: "process",
         data: {
           server: key,
           count: result.tools.length,
@@ -164,6 +165,7 @@ function listTools(key: string, client: MCPClient, timeout: number) {
           CaseTrace.event({
             component: "mcp",
             event_type: "tools.list.tolerant",
+            trace_scope: "process",
             data: {
               server: key,
               count: result.tools.length,
@@ -533,6 +535,7 @@ export const layer = Layer.effect(
         CaseTrace.event({
           component: "mcp",
           event_type: "server.disabled",
+          trace_scope: "process",
           data: {
             server: key,
             type: mcp.type,
@@ -545,6 +548,7 @@ export const layer = Layer.effect(
       const span = CaseTrace.startSpan({
         component: "mcp",
         operation: "connect",
+        trace_scope: "process",
         name: key,
         input: {
           server: key,

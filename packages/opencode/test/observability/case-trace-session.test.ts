@@ -87,6 +87,24 @@ test("routes reference-only records to their owner", () => {
   expect(registry.resolve({ refs: ["span:span_1", "span:unknown"] })).toBe(owner)
 })
 
+test("routes explicit sessions with conflicting reference owners to the process trace", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
+  registry.remember(first, ["span:owned_by_a", "tool_call:shared"])
+  registry.remember(second, ["span:owned_by_b", "tool_call:shared"])
+
+  expect(registry.resolve({ sessionID: "ses_a", refs: ["span:owned_by_a"] })).toBe(first)
+  expect(registry.resolve({ sessionID: "ses_b", refs: ["span:owned_by_b"] })).toBe(second)
+  expect(registry.resolve({ sessionID: "ses_a", refs: ["tool_call:shared"] })).toBe(first)
+  expect(registry.resolve({ sessionID: "ses_b", refs: ["tool_call:shared"] })).toBe(second)
+
+  const processTrace = registry.resolve({ sessionID: "ses_b", refs: ["span:owned_by_a"] })
+  expect(processTrace).not.toBe(first)
+  expect(processTrace).not.toBe(second)
+  expect(registry.resolve({ sessionID: "ses_a", refs: ["span:owned_by_b"] })).toBe(processTrace)
+})
+
 test("routes references shared by multiple roots to the process trace", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const first = registry.resolve({ sessionID: "ses_a" })

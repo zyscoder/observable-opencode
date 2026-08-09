@@ -148,7 +148,7 @@ export class SessionTraceRegistry<T extends object> {
     if (hint?.scope === "process") return this.resolveProcess()
 
     const sessionID = hint?.sessionID
-    if (sessionID) return this.rootTrace(sessionID)
+    const sessionTrace = sessionID ? this.roots.get(this.rootSessionID(sessionID)) : undefined
 
     let ownerCandidates: Set<T> | undefined
     for (const ref of hint?.refs ?? []) {
@@ -161,6 +161,11 @@ export class SessionTraceRegistry<T extends object> {
       for (const candidate of ownerCandidates) {
         if (!owners.has(candidate)) ownerCandidates.delete(candidate)
       }
+    }
+    if (sessionID) {
+      if (!ownerCandidates) return this.rootTrace(sessionID)
+      if (sessionTrace && ownerCandidates.has(sessionTrace)) return sessionTrace
+      return this.resolveProcess()
     }
     if (ownerCandidates) {
       if (ownerCandidates.size === 1) return ownerCandidates.values().next().value!

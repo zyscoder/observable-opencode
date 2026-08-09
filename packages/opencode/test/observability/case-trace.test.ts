@@ -509,6 +509,49 @@ describe("case trace", () => {
     expect(rootB.trace.records.some((record: any) => record.data?.stage === "root_a")).toBe(false)
   })
 
+  test("keeps explicitly process-scoped startup events outside the first root", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-pre-root-process-routing-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "pre-root-process-routing.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.event({ component: "mcp", event_type: "startup.marker", trace_scope: "process", data: { marker: "startup only" } })`,
+        `CaseTrace.promptAssembly({ stage: "root_a", session_id: "ses_root_a", input: { text: "root A" } })`,
+        `CaseTrace.finishAll({ status: "success" })`,
+      ].join("\n"),
+    )
+
+    const proc = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_ID: "pre-root-process-case",
+        OPENCODE_CASE_TRACE_DIR: dir,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await proc.exited).toBe(0)
+    expect(await new Response(proc.stderr).text()).toBe("")
+
+    const processCaseDirectory = routedCaseDirectoryForTest("pre-root-process-case", "process")
+    const rootTrace = await fs.readFile(path.join(dir, "pre-root-process-case", "raw-events.jsonl"), "utf8")
+    const processTrace = await fs.readFile(path.join(dir, processCaseDirectory, "raw-events.jsonl"), "utf8")
+    const rootManifest = JSON.parse(
+      await fs.readFile(path.join(dir, "pre-root-process-case", "manifest.json"), "utf8"),
+    ) as any
+
+    expect(rootManifest.session_id).toBe("ses_root_a")
+    expect(rootTrace).not.toContain("startup only")
+    expect(processTrace).toContain("startup only")
+    expect(processTrace).not.toContain("root A")
+  })
+
   test("keeps records with cross-root ambiguous references in the process trace", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-ambiguous-ref-routing-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
