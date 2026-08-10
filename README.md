@@ -283,6 +283,107 @@ Provider 默认单次请求超时是 300000 毫秒（5 分钟），网络错误�
 60 秒，不会修复错误的 URL、认证或 ID 映射。流式接口还可按服务响应特征配置
 `chunkTimeout`；该值过小会误杀长时间没有输出首个数据块的正常推理请求。
 
+### 端到端验证流程
+
+完成上述预检后，建议在隔离的临时仓库中验证基础问答、流式响应、Tool Calling、文件
+读写和 Trace 收尾。下面的命令不会修改待测业务仓库。`--dangerously-skip-permissions` 仅用于
+这个一次性目录，不能照搬到生产项目。
+
+首先确认当前配置确实注册了目标模型：
+
+```bash
+MODEL_REF="compatible/$MODEL"
+
+opencode models compatible | grep -Fx "$MODEL_REF"
+```
+
+期望输出为 `compatible/<MODEL>`。若没有输出，不应继续请求 API，应先检查 Provider ID、
+`models` 键以及 `OPENCODE_CONFIG_CONTENT` 合并后的配置。
+
+然后创建最小验证仓库并执行一个必须使用工具的任务：
+
+```bash
+VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/observable-opencode-verify.XXXXXX")"
+git -C "$VERIFY_DIR" init -q
+printf 'owner=payments\n' > "$VERIFY_DIR/fixture.txt"
+
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_ID="compatible-tool-smoke"
+export OPENCODE_CASE_TRACE_DIR="$VERIFY_DIR/traces"
+
+opencode --print-logs --log-level DEBUG run \
+  --dir "$VERIFY_DIR" \
+  --model "$MODEL_REF" \
+  --format json \
+  --dangerously-skip-permissions \
+  '必须使用工具完成任务：读取 fixture.txt；把内容原样写入 result.txt；再次读取 result.txt；最后回复读取到的内容。' \
+  > "$VERIFY_DIR/run-events.jsonl" \
+  2> "$VERIFY_DIR/run-debug.log"
+```
+
+依次检查 Agent 行为和 CLI 事件流：
+
+```bash
+test -s "$VERIFY_DIR/result.txt"
+grep -Fx 'owner=payments' "$VERIFY_DIR/result.txt"
+
+jq -s '{
+  event_count: length,
+  event_types: (map(.type) | unique)
+}' "$VERIFY_DIR/run-events.jsonl"
+```
+
+`result.txt` 内容正确说明模型不仅能回答文本，还能生成被 OpenCode 接受并成功执行的工具
+调用。`run-events.jsonl` 应包含 assistant message 和 tool use 相关事件；只有最终文本而没有
+工具事件，说明该模型或兼容网关尚未通过 Tool Calling 验证。
+
+最后确认 Trace 已完整生成，并检查其中确实存在 LLM 与 Tool 语义节点：
+
+```bash
+TRACE_JSON="$(find "$OPENCODE_CASE_TRACE_DIR" -type f -name trace.json | head -n 1)"
+test -n "$TRACE_JSON"
+
+TRACE_CASE_DIR="$(dirname "$TRACE_JSON")"
+test -s "$TRACE_CASE_DIR/trace.html"
+test -s "$TRACE_CASE_DIR/manifest.json"
+test -s "$TRACE_CASE_DIR/partial/latest.json"
+
+jq -e '
+  .trace_version and
+  .causal_ir_version and
+  (.nodes | length > 0) and
+  any(.nodes[]; .component == "llm") and
+  any(.nodes[]; .component == "tool")
+' "$TRACE_JSON" > /dev/null
+
+jq '{
+  trace_version,
+  causal_ir_version,
+  status: .manifest.status,
+  metrics,
+  components: ([.nodes[].component] | unique)
+}' "$TRACE_JSON"
+
+printf 'Trace HTML: %s\n' "$TRACE_CASE_DIR/trace.html"
+```
+
+通过标准是：API 直连成功、`opencode run` 正常结束、文件内容正确、CLI 事件包含工具执行、
+`trace.html` 可打开，并且 `trace.json` 同时包含 `llm` 和 `tool` 组件。完成后可以删除
+`$VERIFY_DIR`；若需要排障，应先保留其中的 `run-debug.log`、事件流和 Trace。
+
+### 验证失败定位
+
+| 失败位置 | 优先检查 | 含义 |
+| --- | --- | --- |
+| `opencode models` 找不到模型 | Provider ID、`models` 键、环境变量替换、配置合并 | 请求尚未发送，属于本地模型注册问题。 |
+| 直连返回 `401/403` | `APIKEY`、认证头、网关权限 | 认证或授权失败。 |
+| 直连返回 `404` | `URL` 是否为 API Base URL、是否需要 `/v1` 等路径 | 地址或路由不匹配。 |
+| 直连提示 model not found | `$MODEL` 与上游真实 ID，必要时配置模型 `id` 映射 | 本地别名与上游模型 ID 不一致。 |
+| 直连成功但基础问答失败 | OpenCode 实际 Provider、流式协议、超时、兼容响应字段 | 兼容接口不一定完整兼容 OpenCode 使用的流式调用。 |
+| 基础问答成功但工具验证失败 | Tool Calling 请求字段、返回的 tool call 结构、模型能力 | 只能证明文本生成可用，不能证明 Agent 开发任务可用。 |
+| Agent 行为成功但 Trace 检查失败 | Trace 环境变量、目录权限、进程收尾和退出信号 | 模型正常，问题位于可观测链路。 |
+| Trace 状态为 `cancelled` | Harness/代理超时、`SIGINT`/`SIGTERM`、客户端提前断开 | Trace 仍可包含有效过程，但本次验证没有正常完成。 |
+
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
 编译进可执行文件的模型快照：
 
