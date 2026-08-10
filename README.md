@@ -33,6 +33,47 @@ flowchart LR
     R --> O["Root Cause / Causal Chain / Evidence / Gaps"]
 ```
 
+## 快速开始
+
+下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。
+`MODEL`、`APIKEY`、`URL` 是配置文件中的环境变量占位符，不是 Observable OpenCode
+新增的模型协议。模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
+
+```bash
+export MODEL="compatible/deepseek-v4-flash"
+export APIKEY="<your-api-key>"
+export URL="https://api.deepseek.com"
+
+export OPENCODE_CONFIG_CONTENT='{
+  "model": "{env:MODEL}",
+  "provider": {
+    "compatible": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenAI Compatible",
+      "options": {
+        "baseURL": "{env:URL}",
+        "apiKey": "{env:APIKEY}"
+      },
+      "models": {
+        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+      }
+    }
+  }
+}'
+
+export OPENCODE_DISABLE_MODELS_FETCH=1
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_ID="benchmark-case-001"
+export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+
+opencode /data/repos/target-project
+```
+
+在 TUI 中完成提问后正常退出。终端会打印本次 root session 的 `trace.html`、
+`trace.json` 和 `partial/latest.json` 路径。HTTP benchmark 使用方式见
+[启动 HTTP Server 并记录 Trace](#启动-http-server-并记录-trace)，离线分析方式见
+[使用离线归因 CLI](#使用离线归因-cli)。
+
 ## 获取 Release 可执行文件
 
 GitHub Actions 会发布 Linux 与 macOS 的独立可执行文件，不需要在目标机器上
@@ -76,9 +117,15 @@ opencode --version
 macOS 校验可执行：
 
 ```bash
-shasum -a 256 opencode-observable-darwin-arm64
-chmod +x opencode-observable-darwin-arm64
-./opencode-observable-darwin-arm64 --version
+RELEASE_TAG="<Releases 页面中的版本，例如 v1.2.3-observable.1>"
+ASSET="opencode-observable-darwin-arm64"
+BASE_URL="https://github.com/zyscoder/observable-opencode/releases/download/${RELEASE_TAG}"
+
+curl -fL -o "$ASSET" "$BASE_URL/$ASSET"
+curl -fL -o SHA256SUMS "$BASE_URL/SHA256SUMS"
+grep "  $ASSET$" SHA256SUMS | shasum -a 256 --check
+chmod +x "$ASSET"
+./"$ASSET" --version
 ```
 
 如果 macOS 阻止运行从浏览器下载的二进制，可在确认校验和及来源后移除隔离属性：
@@ -129,6 +176,20 @@ OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/openc
 企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用 OpenCode
 内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
 
+常见兼容接口可以按下面的方式替换环境变量；URL 必须以供应商或企业网关的实际文档为准：
+
+```bash
+# DeepSeek 示例
+export MODEL="compatible/deepseek-v4-flash"
+export APIKEY="<your-deepseek-api-key>"
+export URL="https://api.deepseek.com"
+
+# GLM 或企业兼容网关示例
+# export MODEL="compatible/glm-4.5"
+# export APIKEY="<your-compatible-api-key>"
+# export URL="https://<compatible-endpoint>/v1"
+```
+
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
 编译进可执行文件的模型快照：
 
@@ -142,6 +203,42 @@ export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 # export OPENCODE_MODELS_URL="https://models.example.internal"
 ```
+
+### 运行时环境变量
+
+| 环境变量 | 是否必需 | 作用 |
+| --- | --- | --- |
+| `OPENCODE_CONFIG` | 否 | 指向额外的 OpenCode 原生配置文件。 |
+| `OPENCODE_CONFIG_DIR` | 否 | 指定 OpenCode 原生配置目录。 |
+| `OPENCODE_CONFIG_CONTENT` | 否 | 直接注入 OpenCode 原生 JSON 配置，适合 CI 或 benchmark。 |
+| `MODEL` | 取决于配置 | 本文模板使用的完整模型标识，例如 `compatible/deepseek-v4-flash`。 |
+| `APIKEY` | 取决于配置 | 本文模板使用的 Provider API Key。请通过 Secret 注入，不要写入仓库。 |
+| `URL` | 取决于配置 | 本文模板使用的兼容 API Base URL。 |
+| `OPENCODE_DISABLE_MODELS_FETCH` | 推荐 | 设为 `1` 时跳过启动阶段的 `models.dev` 请求，使用内置模型快照。 |
+| `OPENCODE_MODELS_FETCH_TIMEOUT_MS` | 否 | 远程模型目录请求超时，单位为毫秒。 |
+| `OPENCODE_MODELS_URL` | 否 | 将远程模型目录切换到企业镜像。 |
+| `OPENCODE_CASE_TRACE` | 是 | 设为 `1` 启用语义 Trace。 |
+| `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
+| `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
+| `OPENCODE_CASE_TRACE_QUIET` | 否 | 设为 `1` 隐藏退出时的 Trace 路径提示，不影响落盘。 |
+| `OPENCODE_SERVER_PASSWORD` | HTTP 推荐 | 为 `opencode serve` 启用 Basic Auth，用户名固定为 `opencode`。 |
+
+高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
+默认值为 `2048`。大文本会写入 `artifacts/` 并由 HTML 按需展示。通常应保持默认值；将它
+提高到数十万会显著放大序列化、内存和收尾开销，复杂 case 甚至可能延迟信号处理。
+
+### 目标仓库的 `.opencode` 扩展依赖
+
+Release 可执行文件包含 Observable OpenCode 本身，但无法预先打包任意目标仓库中
+`.opencode/` 插件、Tool 或 Skill 所依赖的 npm/workspace 包。如果启动时报错类似：
+
+```text
+Cannot find module '@opencode-ai/plugin' from '/path/to/project/.opencode/...'
+```
+
+应按目标仓库自己的开发说明安装或提供这些依赖。若该扩展与本次 benchmark 无关，也可以
+只在 benchmark 副本中停用对应扩展。不要把这类错误误判为 Release 二进制缺少自身依赖，
+也不要为了绕过错误而修改生产仓库。
 
 ## 交互式 TUI 并记录 Trace
 
@@ -211,7 +308,7 @@ SESSION_JSON="$(curl -fsS -X POST http://127.0.0.1:4096/session \
   --data '{}')"
 SESSION_ID="$(printf '%s' "$SESSION_JSON" | jq -er '.id')"
 
-curl -fsS -X POST "http://127.0.0.1:4096/session/$SESSION_ID/message" \
+curl -fsS --max-time 3600 -X POST "http://127.0.0.1:4096/session/$SESSION_ID/message" \
   -H "Authorization: Basic $AUTH" \
   -H "x-opencode-directory: $PROJECT_DIR" \
   -H 'content-type: application/json' \
@@ -219,6 +316,10 @@ curl -fsS -X POST "http://127.0.0.1:4096/session/$SESSION_ID/message" \
     "parts": [{"type": "text", "text": "分析并修复当前项目中的测试失败。"}]
   }'
 ```
+
+消息接口会同步等待本轮 Agent 执行完成。复杂 case 应同时为 `curl`、Benchmark Harness、
+反向代理和负载均衡器设置足够长且一致的超时，避免客户端提前断开后将正常执行误记为
+取消或失败。
 
 只有特定 case 需要与项目或全局配置不同的模型时，才使用 OpenCode 原生请求级 model
 覆盖。完成一个 HTTP session 时建议显式删除它，以立刻完成该 root 的 Trace；否则服务
@@ -273,19 +374,44 @@ Provider、模型选择及认证完全无关。
 
 ```bash
 export OBSERVABLE_OPENCODE_HOME="/opt/observable-opencode"
-python3 -m pip install anthropic
+export ATTRIBUTION_VENV="$HOME/.venvs/observable-opencode-attribution"
+python3 -m venv "$ATTRIBUTION_VENV"
+source "$ATTRIBUTION_VENV/bin/activate"
+python -m pip install --upgrade pip anthropic
 
 export ANTHROPIC_API_KEY="<your-deepseek-api-key>"
 export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 export CLAUDE_MODEL="deepseek-v4-flash"
+export CLAUDE_TIMEOUT_SECONDS=3600
 
 PYTHONPATH="$OBSERVABLE_OPENCODE_HOME/tools/trace_attribution" \
-python3 -m trace_attribution \
+python -m trace_attribution \
   --engine recursive-agentic \
+  --fusion-mode retrieval-global \
   --trace /data/evo-bench/traces/benchmark-case-001/trace.json \
   --question "为什么本次修改编译失败？" \
-  --out /data/evo-bench/attribution/benchmark-case-001.json
+  --out /data/evo-bench/attribution/benchmark-case-001.json \
+  --judge-timeout-sec 3600 \
+  --judge-max-tokens 16000
 ```
+
+归因 Judge 通过 Anthropic SDK 调用 Anthropic 兼容接口。它和运行 Observable OpenCode 的
+模型相互独立，因此可以用一个模型执行 case、另一个模型离线归因。环境变量含义如下：
+
+| 环境变量 | 是否必需 | 作用 |
+| --- | --- | --- |
+| `OBSERVABLE_OPENCODE_HOME` | 推荐 | 源码仓绝对路径；用于构造 `PYTHONPATH`，不要求 `cd` 到仓库。 |
+| `ATTRIBUTION_VENV` | 否 | 本文示例使用的 Python 虚拟环境路径，可换成已有环境。 |
+| `PYTHONPATH` | 是 | 至少包含 `$OBSERVABLE_OPENCODE_HOME/tools/trace_attribution`。 |
+| `ANTHROPIC_API_KEY` | LLM Judge 必需 | Anthropic 或 Anthropic 兼容服务的 API Key。 |
+| `ANTHROPIC_BASE_URL` | 兼容服务必需 | 例如 DeepSeek 的 `https://api.deepseek.com/anthropic`。 |
+| `CLAUDE_MODEL` | 推荐 | 归因 Judge 使用的模型 ID。 |
+| `CLAUDE_TIMEOUT_SECONDS` | 否 | 每次 Judge/repair 请求超时，默认 `3600` 秒。 |
+
+推荐先使用 CLI 默认候选预算：`max_nodes=48`、`max_frontier_items=96`、
+`max_hypotheses=24`、`max_investigation_rounds=12`、`max_judge_requests=128`。只有在报告
+明确显示预算耗尽时再扩大相应参数。`--judge-max-tokens` 默认是 `4096`；推理模型输出
+较长 JSON 时可像上例提高，但需确认服务端支持该上限。
 
 `--question` 用于描述用户真正想定位的缺陷，例如：
 
@@ -309,6 +435,22 @@ python3 -m trace_attribution \
 
 如果没有足够证据，模块会返回
 `no_confirmed_root_cause / evidence_insufficient`，不会为了给出答案而虚构根因。
+对于已知缺陷节点，可重复传入 `--start-ref decision:dec_107`、`--start-ref node:<id>` 等
+Trace 引用收窄起点；若不知道节点，保持自动候选检索即可。被中断且没有最终回复的 Trace
+可能只能确认“中断触发了失败状态”，这不等于中断就是任务质量缺陷的根因，归因模块会在
+证据不足时保留 `inconclusive` 结论。
+
+### CLI 产物
+
+若 `--out` 为 `/data/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
+message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程重启后，可使用相同
+参数继续分析，避免重复消耗已经完成的 Judge 请求。最终重点查看：
+
+- `conclusion`：确认的根因或证据不足结论；
+- `causal_chain`：从表象缺陷后向回溯到引入位置的路径；
+- `supporting_evidence_refs`：可回到 Trace 核验的证据引用；
+- `rejected_hypotheses`：已排除候选及排除依据；
+- `unresolved_gaps`：仍需补充的 Trace 语义信息。
 
 ## Python API
 
