@@ -35,27 +35,29 @@ flowchart LR
 
 ## 快速开始
 
-下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。
-`MODEL`、`APIKEY`、`URL` 是配置文件中的环境变量占位符，不是 Observable OpenCode
-新增的模型协议。模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
+下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。在这个
+三变量模板中，`MODEL` 只保存 Provider 内部模型 ID，例如 `glm-5.1`；配置会把它组装为
+完整的 `compatible/glm-5.1`。`MODEL`、`APIKEY`、`URL` 不是 Observable OpenCode 新增的
+模型协议，模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
 
 ```bash
-export MODEL="compatible/deepseek-v4-flash"
-export APIKEY="<your-api-key>"
-export URL="https://api.deepseek.com"
+export MODEL="glm-5.1"
+export APIKEY="<your-compatible-api-key>"
+export URL="https://<your-openai-compatible-base-url>"
 
 export OPENCODE_CONFIG_CONTENT='{
-  "model": "{env:MODEL}",
+  "model": "compatible/{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}"
+        "apiKey": "{env:APIKEY}",
+        "timeout": 60000
       },
       "models": {
-        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+        "{env:MODEL}": { "name": "{env:MODEL}" }
       }
     }
   }
@@ -147,48 +149,139 @@ OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/openc
 `OPENCODE_CONFIG`、`OPENCODE_CONFIG_DIR`、`OPENCODE_CONFIG_CONTENT`，或原生 CLI 和
 请求参数覆盖。不同版本及配置来源会按 OpenCode 的原生合并规则处理。
 
-下面是一个兼容 OpenAI 风格 API 的通用模板。可放在项目 `opencode.json` 或你选择的
-原生配置文件中：
+下面是一个兼容 OpenAI 风格 API 的三变量模板。可放在项目 `opencode.json` 或你选择的
+原生配置文件中。此模板约定 `MODEL` 是 Provider 内部模型 ID，而不是完整的
+`provider/model` 字符串：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "{env:MODEL}",
+  "model": "compatible/{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}"
+        "apiKey": "{env:APIKEY}",
+        "timeout": 60000
       },
       "models": {
-        "glm-4.5": { "name": "GLM 4.5" },
-        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+        "{env:MODEL}": { "name": "{env:MODEL}" }
       }
     }
   }
 }
 ```
 
-其中 `MODEL` 必须是完整模型标识，例如 `compatible/glm-4.5`；`APIKEY` 和 `URL`
-分别提供该兼容服务的认证和地址。它们只是此模板选用的环境变量占位符，可以替换为
-企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用 OpenCode
-内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
+其中 `MODEL` 例如为 `glm-5.1`，最终完整模型标识是 `compatible/glm-5.1`；`APIKEY` 和
+`URL` 分别提供该兼容服务的认证和 Base URL。它们只是此模板选用的环境变量占位符，可以
+替换为企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用
+OpenCode 内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
 
 常见兼容接口可以按下面的方式替换环境变量；URL 必须以供应商或企业网关的实际文档为准：
 
 ```bash
 # DeepSeek 示例
-export MODEL="compatible/deepseek-v4-flash"
+export MODEL="deepseek-v4-flash"
 export APIKEY="<your-deepseek-api-key>"
 export URL="https://api.deepseek.com"
 
 # GLM 或企业兼容网关示例
-# export MODEL="compatible/glm-4.5"
+# export MODEL="glm-5.1"
 # export APIKEY="<your-compatible-api-key>"
 # export URL="https://<compatible-endpoint>/v1"
 ```
+
+### Provider 与模型 ID 必须对齐
+
+完整模型标识的格式是 `<provider-id>/<model-id>`。例如 `rtos/glm-5.1` 会被解析为
+Provider `rtos` 和模型 `glm-5.1`，因此配置必须同时满足：
+
+```text
+默认模型：rtos/glm-5.1
+Provider 键：rtos
+rtos.models 中的键：glm-5.1
+```
+
+下面这种组合是错误的：默认模型指向 `rtos`，但只注册了 `compatible`；同时模型表的键
+错误地包含了 Provider 前缀。
+
+```bash
+export MODEL="rtos/glm-5.1"
+# provider.compatible.models["rtos/glm-5.1"]  # 错误
+```
+
+如需把 Provider 命名为 `rtos`，可以增加 `PROVIDER` 变量，并继续让 `MODEL` 只保存模型 ID：
+
+```bash
+export PROVIDER="rtos"
+export MODEL="glm-5.1"
+export APIKEY="<your-glm-api-key>"
+export URL="https://<your-glm-openai-compatible-base-url>"
+
+export OPENCODE_CONFIG_CONTENT='{
+  "model": "{env:PROVIDER}/{env:MODEL}",
+  "provider": {
+    "{env:PROVIDER}": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "RTOS OpenAI Compatible",
+      "options": {
+        "baseURL": "{env:URL}",
+        "apiKey": "{env:APIKEY}",
+        "timeout": 60000
+      },
+      "models": {
+        "{env:MODEL}": { "name": "{env:MODEL}" }
+      }
+    }
+  }
+}'
+```
+
+`OPENCODE_CONFIG_CONTENT` 会与全局和项目配置合并，而不是隔离运行。如果默认模型写成
+`rtos/glm-5.1`，机器上又已有另一个 `rtos` Provider，OpenCode 可能使用已有 Provider 的
+地址和认证，而不是新配置的 `compatible`。因此启动前应先检查实际模型列表。
+
+### 配置与连接预检
+
+使用 `compatible` 模板时，下面的命令必须能列出 `compatible/glm-5.1`：
+
+```bash
+opencode models compatible
+```
+
+使用 `rtos` 模板时改为：
+
+```bash
+opencode models rtos
+```
+
+然后绕过 OpenCode，直接验证兼容 API。`URL` 应是供应商或企业网关要求的 Base URL，
+而不是网页地址；是否包含 `/v1` 等路径以接口文档为准：
+
+```bash
+curl -sS --fail-with-body \
+  --connect-timeout 10 \
+  --max-time 30 \
+  -H "Authorization: Bearer $APIKEY" \
+  -H "Content-Type: application/json" \
+  "${URL%/}/chat/completions" \
+  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"1+2=?\"}],\"stream\":false}"
+```
+
+直连成功后，再用非交互命令查看 OpenCode 的实际错误和重试状态：
+
+```bash
+opencode --print-logs --log-level DEBUG run \
+  --model "compatible/$MODEL" \
+  "1+2=?"
+```
+
+Provider 默认单次请求超时是 300000 毫秒（5 分钟），网络错误和部分 5xx 错误还会退避
+重试，因此总等待时间可能远超 5 分钟。示例中的 `timeout: 60000` 只把单次请求限制为
+60 秒，不会修复错误的 URL、认证或 ID 映射。流式接口还可按服务响应特征配置
+`chunkTimeout`；该值过小会误杀长时间没有输出首个数据块的正常推理请求。
 
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
 编译进可执行文件的模型快照：
@@ -211,7 +304,8 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CONFIG` | 否 | 指向额外的 OpenCode 原生配置文件。 |
 | `OPENCODE_CONFIG_DIR` | 否 | 指定 OpenCode 原生配置目录。 |
 | `OPENCODE_CONFIG_CONTENT` | 否 | 直接注入 OpenCode 原生 JSON 配置，适合 CI 或 benchmark。 |
-| `MODEL` | 取决于配置 | 本文模板使用的完整模型标识，例如 `compatible/deepseek-v4-flash`。 |
+| `PROVIDER` | 取决于配置 | 可选的自定义 Provider ID，例如 `rtos`；固定使用 `compatible` 时不需要。 |
+| `MODEL` | 取决于配置 | 本文三变量模板使用的 Provider 内部模型 ID，例如 `glm-5.1`。 |
 | `APIKEY` | 取决于配置 | 本文模板使用的 Provider API Key。请通过 Secret 注入，不要写入仓库。 |
 | `URL` | 取决于配置 | 本文模板使用的兼容 API Base URL。 |
 | `OPENCODE_DISABLE_MODELS_FETCH` | 推荐 | 设为 `1` 时跳过启动阶段的 `models.dev` 请求，使用内置模型快照。 |
@@ -246,7 +340,7 @@ Cannot find module '@opencode-ai/plugin' from '/path/to/project/.opencode/...'
 目标项目：
 
 ```bash
-export MODEL="compatible/glm-4.5"
+export MODEL="glm-5.1"
 export APIKEY="<your-compatible-api-key>"
 export URL="https://api.example.com/v1"
 
