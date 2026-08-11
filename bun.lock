@@ -581,6 +581,18 @@
         "vite": "catalog:",
       },
     },
+    "packages/trace-renderer": {
+      "name": "@opencode-ai/trace-renderer",
+      "version": "1.14.48",
+      "dependencies": {
+        "opencode": "workspace:*",
+      },
+      "devDependencies": {
+        "@tsconfig/bun": "catalog:",
+        "@types/bun": "catalog:",
+        "@typescript/native-preview": "catalog:",
+      },
+    },
     "packages/ui": {
       "name": "@opencode-ai/ui",
       "version": "1.14.48",
@@ -1587,6 +1599,8 @@
     "@opencode-ai/slack": ["@opencode-ai/slack@workspace:packages/slack"],
 
     "@opencode-ai/storybook": ["@opencode-ai/storybook@workspace:packages/storybook"],
+
+    "@opencode-ai/trace-renderer": ["@opencode-ai/trace-renderer@workspace:packages/trace-renderer"],
 
     "@opencode-ai/ui": ["@opencode-ai/ui@workspace:packages/ui"],
 

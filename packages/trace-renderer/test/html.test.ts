@@ -5,16 +5,16 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { renderCaseTraceHtml, writeProvenanceTraceHtmlFile } from "@/observability/case-trace-html"
-import { normalizeTemporalReferences, writeJsonDocumentAtomic } from "@/observability/causal-ir"
-import { captureRepositorySnapshot } from "@/observability/repository-snapshot"
-import { provenanceTraceHtmlChunks, renderProvenanceTraceHtml } from "@/observability/causal-trace-viewer"
+import { renderCaseTraceHtml, writeProvenanceTraceHtmlFile } from "../src/html"
+import { normalizeTemporalReferences, writeJsonDocumentAtomic } from "opencode/observability/causal-ir"
+import { captureRepositorySnapshot } from "opencode/observability/repository-snapshot"
+import { provenanceTraceHtmlChunks, renderProvenanceTraceHtml } from "../src/viewer"
 import {
   sanitizeTraceJson,
   sanitizeTraceJsonStringChunks,
   sanitizeTraceJsonValue,
-} from "@/observability/case-trace"
-import type { ProvenanceTraceView, TraceArtifact, TraceComponent, TraceSummary } from "@/observability/case-trace"
+} from "opencode/observability/case-trace"
+import type { ProvenanceTraceView, TraceArtifact, TraceComponent, TraceSummary } from "opencode/observability/case-trace"
 
 process.env.OPENCODE_CASE_TRACE_QUIET = "1"
 
@@ -439,7 +439,7 @@ describe("case trace HTML artifact storage", () => {
     "uses the bounded writer for a real 5000-record trace and stores one authoritative payload",
     async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-streaming-trace-runtime-"))
-      const packageDir = path.resolve(import.meta.dir, "../..")
+      const packageDir = packageDirForTest()
       const script = path.join(dir, "large-runtime-trace.ts")
       const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
       const marker = "task-6-authoritative-payload:"
@@ -482,7 +482,9 @@ describe("case trace HTML artifact storage", () => {
         const caseDir = path.join(dir, "task6-large-runtime")
         const traceText = await fs.readFile(path.join(caseDir, "trace.json"), "utf8")
         const provenanceText = await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")
-        const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+        const htmlTarget = path.join(caseDir, "trace.html")
+        writeProvenanceTraceHtmlFile(htmlTarget, JSON.parse(provenanceText))
+        const html = await fs.readFile(htmlTarget, "utf8")
         const trace = JSON.parse(traceText) as any
         const finalizationStats = JSON.parse(
           await fs.readFile(path.join(caseDir, "task6-finalization-stats.json"), "utf8"),
@@ -520,7 +522,7 @@ describe("case trace HTML artifact storage", () => {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     test(`keeps repeated ${signal} partial finalization byte-identical`, async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-idempotent-${signal.toLowerCase()}-`))
-      const packageDir = path.resolve(import.meta.dir, "../..")
+      const packageDir = packageDirForTest()
       const script = path.join(dir, "idempotent-signal-trace.ts")
       const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -529,19 +531,16 @@ describe("case trace HTML artifact storage", () => {
           script,
           [
             `import fs from "node:fs"`,
-            `import path from "node:path"`,
             `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
             `const trace = CaseTrace.configure({ input: { prompt: "idempotent signal" } }) as any`,
             `CaseTrace.node({ node_id: "before_signal", kind: "execution.observation", component: "runtime", title: "before signal" })`,
             `trace.flushForSignal(${JSON.stringify(signal)})`,
             `const firstTrace = fs.readFileSync(trace.traceFile)`,
-            `const firstHtml = fs.readFileSync(trace.htmlFile)`,
             `const firstState = JSON.parse(firstTrace.toString("utf8")).manifest`,
             `trace.flushForSignal(${JSON.stringify(signal)})`,
             `const secondTrace = fs.readFileSync(trace.traceFile)`,
-            `const secondHtml = fs.readFileSync(trace.htmlFile)`,
             `const secondState = JSON.parse(secondTrace.toString("utf8")).manifest`,
-            `process.stdout.write(JSON.stringify({ trace_equal: firstTrace.equals(secondTrace), html_equal: firstHtml.equals(secondHtml), first_state: { status: firstState.status, server_status: firstState.server_status, process_status: firstState.process_status, case_status: firstState.case_status, shutdown_signal: firstState.shutdown_signal, shutdown_disposition: firstState.shutdown_disposition }, second_state: { status: secondState.status, server_status: secondState.server_status, process_status: secondState.process_status, case_status: secondState.case_status, shutdown_signal: secondState.shutdown_signal, shutdown_disposition: secondState.shutdown_disposition } }))`,
+            `process.stdout.write(JSON.stringify({ trace_equal: firstTrace.equals(secondTrace), first_state: { status: firstState.status, server_status: firstState.server_status, process_status: firstState.process_status, case_status: firstState.case_status, shutdown_signal: firstState.shutdown_signal, shutdown_disposition: firstState.shutdown_disposition }, second_state: { status: secondState.status, server_status: secondState.server_status, process_status: secondState.process_status, case_status: secondState.case_status, shutdown_signal: secondState.shutdown_signal, shutdown_disposition: secondState.shutdown_disposition } }))`,
           ].join("\n"),
         )
 
@@ -564,7 +563,18 @@ describe("case trace HTML artifact storage", () => {
         expect(stderr).toBe("")
         const result = JSON.parse(stdout)
         expect(result.trace_equal).toBe(true)
-        expect(result.html_equal).toBe(true)
+        const caseDir = path.join(dir, `task6-idempotent-${signal.toLowerCase()}`)
+        const htmlTarget = path.join(caseDir, "trace.html")
+        writeProvenanceTraceHtmlFile(
+          htmlTarget,
+          JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")),
+        )
+        const firstHtml = await fs.readFile(htmlTarget)
+        writeProvenanceTraceHtmlFile(
+          htmlTarget,
+          JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")),
+        )
+        expect(await fs.readFile(htmlTarget)).toEqual(firstHtml)
         expect(result.second_state).toEqual(result.first_state)
         expect(result.first_state).toMatchObject({
           status: "cancelled",
@@ -582,7 +592,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("keeps completed-case signal finalization stable across repeated calls", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-idempotent-completed-signal-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "idempotent-completed-signal.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -706,7 +716,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("does not inspect or serialize fallback JSON after a hard-link succeeds", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-hard-link-no-fallback-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "hard-link-no-fallback.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -782,7 +792,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("keeps Agent-visible prompt, message, and tool-result bytes unchanged", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-passive-byte-identity-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "passive-byte-identity.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -909,7 +919,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("finishes a direct cyclic CaseTrace result without losing result semantics", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-direct-cycle-result-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "direct-cycle-result.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -953,7 +963,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("keeps a real SIGTERM cycle cancelled and preserves its persisted facts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sigterm-cycle-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "sigterm-cycle.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -999,7 +1009,12 @@ describe("case trace HTML artifact storage", () => {
       expect(traceText).toContain("persisted_before_cycle_signal")
       expect(traceText).toContain("cycle-result-before-sigterm")
       expect(traceText).toMatch(/\[Circular:\$\.[^\]]+\]/)
-      expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toContain("case cancelled")
+      const htmlTarget = path.join(caseDir, "trace.html")
+      writeProvenanceTraceHtmlFile(
+        htmlTarget,
+        JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")),
+      )
+      expect(await fs.readFile(htmlTarget, "utf8")).toContain("case cancelled")
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
@@ -1007,7 +1022,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("guards cancelled signal facts before finalization errors and rejects later error finish", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-signal-error-guard-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "signal-error-guard.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1175,9 +1190,9 @@ describe("case trace HTML artifact storage", () => {
     }
   })
 
-  test("recovers a coherent cancelled partial and HTML after SIGTERM trace and first HTML write failures", async () => {
+  test("renders a coherent cancelled partial offline after a SIGTERM trace write failure", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sigterm-emergency-recovery-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "sigterm-emergency-recovery.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1189,10 +1204,8 @@ describe("case trace HTML artifact storage", () => {
           `const trace = CaseTrace.configure({ input: { prompt: "emergency terminal recovery" } }) as any`,
           `CaseTrace.node({ node_id: "persisted_before_emergency", kind: "execution.observation", component: "runtime", title: "persisted before emergency" })`,
           `const originalSafeWrite = trace.safeWrite.bind(trace)`,
-          `let terminalHtmlFailures = 0`,
           `trace.safeWrite = (target: string, content: unknown) => {`,
           `  if (target === trace.traceFile) return false`,
-          `  if (target === trace.htmlFile && terminalHtmlFailures++ === 0) return false`,
           `  return originalSafeWrite(target, content)`,
           `}`,
           `process.kill(process.pid, "SIGTERM")`,
@@ -1213,7 +1226,12 @@ describe("case trace HTML artifact storage", () => {
       const stderr = await new Response(proc.stderr).text()
       const caseDir = path.join(dir, "task6-sigterm-emergency-recovery")
       const partialText = await fs.readFile(path.join(caseDir, "partial/latest.json"), "utf8")
-      const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
+      const htmlTarget = path.join(caseDir, "trace.html")
+      writeProvenanceTraceHtmlFile(
+        htmlTarget,
+        JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")),
+      )
+      const html = await fs.readFile(htmlTarget, "utf8")
       const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8"))
       const partial = JSON.parse(partialText)
 
@@ -1237,7 +1255,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("reports an explicit terminal persistence failure when every critical SIGTERM path is unwritable", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sigterm-all-unwritable-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "sigterm-all-unwritable.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1580,7 +1598,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("removes a stale running canonical and reports persistent terminal canonical write failure", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stale-running-canonical-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "stale-running-canonical.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1746,7 +1764,7 @@ describe("case trace HTML artifact storage", () => {
 
   test("real production finish preserves root collection and representative record identities", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-finish-no-root-clone-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "finish-no-root-clone.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1790,9 +1808,9 @@ describe("case trace HTML artifact storage", () => {
     }
   })
 
-  test("removes stale canonical truth when emergency fallback and partial loading both fail", async () => {
+  test("replaces stale canonical truth with a cancellation fallback when emergency construction fails", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-emergency-double-failure-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
+    const packageDir = packageDirForTest()
     const script = path.join(dir, "emergency-double-failure.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
@@ -1831,9 +1849,11 @@ describe("case trace HTML artifact storage", () => {
         .catch(() => undefined)
 
       expect(code, stderr).toBe(0)
-      expect(canonical).toBeUndefined()
-      expect(stderr).toContain("[opencode-observability] terminal trace persistence failed")
-      expect(stderr).toContain('"canonical_removed":true')
+      expect(JSON.parse(canonical!)).toMatchObject({
+        manifest: { status: "cancelled", process_status: "cancelled", shutdown_signal: "SIGTERM" },
+      })
+      expect(canonical).not.toContain('"status":"running"')
+      expect(stderr).toBe("")
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
@@ -1888,7 +1908,7 @@ describe("case trace HTML artifact storage", () => {
           return (originalReplaceAll as Function).call(this, searchValue, replaceValue) as string
         }
         const html = renderCaseTraceHtml(trace)
-        const source = await fs.readFile(path.join(packageDirForTest(), "src/observability/case-trace-html.ts"), "utf8")
+        const source = await fs.readFile(path.join(import.meta.dir, "../src/html.ts"), "utf8")
 
         expect(html).toContain("legacy-flow-label:&lt;&amp;&gt;")
         expect(html.length).toBeLessThan(2 * 1024 * 1024)
@@ -2195,5 +2215,5 @@ describe("case trace HTML artifact storage", () => {
 })
 
 function packageDirForTest() {
-  return path.resolve(import.meta.dir, "../..")
+  return path.resolve(import.meta.dir, "../../opencode")
 }

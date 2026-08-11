@@ -1,5 +1,5 @@
-import type { ProvenanceTraceView, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "./case-trace"
-import { TRACE_VERSION } from "./trace-semantic-contract"
+import type { ProvenanceTraceView, ProvenanceRecord, TraceArtifact, TraceTokenUsage } from "opencode/observability/case-trace"
+import { TRACE_VERSION } from "opencode/observability/trace-semantic-contract"
 
 export type ProvenanceTraceHtmlChunkOptions = {
   maxChunkBytes?: number

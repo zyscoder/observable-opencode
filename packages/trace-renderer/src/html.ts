@@ -8,14 +8,14 @@ import {
   escapeViewerHtml,
   provenanceTraceHtmlChunks,
   safeArtifactRelativePath,
-} from "./causal-trace-viewer"
+} from "./viewer"
 import type {
   ProvenanceTraceView,
   TraceArtifact,
   TraceComponent,
   TraceFieldSummary,
   TraceSummary,
-} from "./case-trace"
+} from "opencode/observability/case-trace"
 
 type RenderCaseTraceHtmlOptions = {
   artifactDir?: string
