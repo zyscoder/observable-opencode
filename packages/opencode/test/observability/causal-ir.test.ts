@@ -401,8 +401,14 @@ describe("causal IR store", () => {
     store.updateNode(replacement)
 
     const expectedReplacementHash = payloadHashForAudit((journal[1]?.data as any).snapshot.nodes[0])
+    expect((journal[1]?.data as any).hash_state_replacement).toBe("nodes_and_edges")
     expect(journal[2]?.previous_payload_hash).toBe(expectedReplacementHash)
     expect(() => validateCausalIRJournal(journal)).not.toThrow()
+
+    const unmarked = structuredClone(journal)
+    delete (unmarked[1]!.data as any).hash_state_replacement
+    unmarked[1]!.payload_hash = payloadHashForAudit(unmarked[1]!.data)
+    expect(() => validateCausalIRJournal(unmarked)).toThrow("previous payload hash does not match entity history")
 
     const deletedJournal: CausalIRJournalEntry[] = []
     const deletedStore = new CausalIRStore({
@@ -414,8 +420,15 @@ describe("causal IR store", () => {
     deletedStore.replaceNodes([])
     deletedStore.createNode(node("node_deleted", { chosen_action: "recreated" }))
 
+    expect((deletedJournal[1]?.data as any).hash_state_replacement).toBe("nodes_and_edges")
     expect(deletedJournal[2]?.previous_payload_hash).toBeUndefined()
     expect(() => validateCausalIRJournal(deletedJournal)).not.toThrow()
+
+    const staleDeletedNode = structuredClone(deletedJournal)
+    staleDeletedNode[2]!.previous_payload_hash = staleDeletedNode[0]!.payload_hash
+    expect(() => validateCausalIRJournal(staleDeletedNode)).toThrow(
+      "previous payload hash does not match entity history",
+    )
   })
 
   test("clears removed edge payload hashes after replacement", () => {
@@ -429,11 +442,34 @@ describe("causal IR store", () => {
     store.replaceEdges([])
     store.createEdge(edge("edge_deleted"))
 
+    expect((journal[1]?.data as any).hash_state_replacement).toBe("edges")
     expect(journal[2]?.previous_payload_hash).toBeUndefined()
     expect(() => validateCausalIRJournal(journal)).not.toThrow()
+
+    const staleDeletedEdge = structuredClone(journal)
+    staleDeletedEdge[2]!.previous_payload_hash = staleDeletedEdge[0]!.payload_hash
+    expect(() => validateCausalIRJournal(staleDeletedEdge)).toThrow(
+      "previous payload hash does not match entity history",
+    )
+
+    const replacedJournal: CausalIRJournalEntry[] = []
+    const replacedStore = new CausalIRStore({
+      runID: "run_edge_replaced",
+      caseID: "case_edge_replaced",
+      append: (entry) => replacedJournal.push(entry),
+    })
+    replacedStore.createEdge({ ...edge("edge_replaced"), label: "original" })
+    replacedStore.replaceEdges([{ ...edge("edge_replaced"), label: "replacement" }])
+    replacedStore.createEdge({ ...edge("edge_replaced"), label: "updated" })
+
+    expect((replacedJournal[1]?.data as any).hash_state_replacement).toBe("edges")
+    expect(replacedJournal[2]?.previous_payload_hash).toBe(
+      payloadHashForAudit((replacedJournal[1]?.data as any).snapshot.edges[0]),
+    )
+    expect(() => validateCausalIRJournal(replacedJournal)).not.toThrow()
   })
 
-  test("keeps checkpoint payload data separate from bounded entity hash candidates", () => {
+  test("keeps public checkpoint data separate from internal hash state replacement", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({
       runID: "run_checkpoint_collision",
@@ -442,15 +478,39 @@ describe("causal IR store", () => {
     })
     const created = store.createNode(node("node_checkpoint_collision", { chosen_action: "original" }))
     created.data = { chosen_action: "mutated-reference" }
-    store.checkpoint({ reason: "nodes.replaced" })
+    store.checkpoint({ reason: "nodes.replaced", hash_state_replacement: "nodes_and_edges" })
     store.updateNode(created)
 
+    expect((journal[1]?.data as any).hash_state_replacement).toBeUndefined()
+    expect((journal[1]?.data as any).data.hash_state_replacement).toBe("nodes_and_edges")
     expect(journal[2]?.previous_payload_hash).toBe(journal[0]?.payload_hash)
     expect(() => validateCausalIRJournal(journal)).not.toThrow()
+
+    const snapshotHashTamper = structuredClone(journal)
+    snapshotHashTamper[2]!.previous_payload_hash = payloadHashForAudit(
+      (snapshotHashTamper[1]!.data as any).snapshot.nodes[0],
+    )
+    expect(() => validateCausalIRJournal(snapshotHashTamper)).toThrow(
+      "previous payload hash does not match entity history",
+    )
 
     const tampered = structuredClone(journal)
     tampered[2]!.previous_payload_hash = "0".repeat(64)
     expect(() => validateCausalIRJournal(tampered)).toThrow("previous payload hash does not match entity history")
+
+    for (const invalid of ["nodes", { entities: "nodes_and_edges" }]) {
+      const malformed = structuredClone(journal)
+      const checkpoint = malformed[1]!.data as any
+      checkpoint.hash_state_replacement = invalid
+      malformed[1]!.payload_hash = payloadHashForAudit(malformed[1]!.data)
+      let failure: unknown
+      try {
+        validateCausalIRJournal(malformed)
+      } catch (error) {
+        failure = error
+      }
+      expect(failure).toMatchObject({ line: 2, message: "invalid checkpoint hash state replacement" })
+    }
   })
 
   test("chains canonical payload hashes using locale-independent lexical key ordering", () => {
