@@ -54,11 +54,11 @@ export OPENCODE_CONFIG_CONTENT='{
       "options": {
         "baseURL": "{env:URL}",
         "apiKey": "{env:APIKEY}"
-        "timeout": 720000,
-        "chunkTimeout": 720000
+        "timeout": "720000",
+        "chunkTimeout": "720000"
       },
       "models": {
-        "{env:MODEL}": {"name": {env:MODEL}}
+        "{env:MODEL}": {"name": "{env:MODEL}"}
       }
     }
   }
