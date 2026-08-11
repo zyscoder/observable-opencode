@@ -2,6 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import {
   projectProvenanceTrace,
+  replayFinalizedCausalIRTrace,
   replayCausalIRJournal,
   replayCausalIRTrace,
   type CausalIREdge,
@@ -13,14 +14,42 @@ import {
   type ProvenanceTraceProjection,
 } from "opencode/observability/causal-ir"
 
+export type CompatibilityTraceProjection = {
+  trace_version: string
+  manifest: { case_id: string; run_id?: string }
+  records: unknown[]
+  dataflow_edges: unknown[]
+  artifacts: unknown[]
+  metrics: {
+    spans: number
+    events: number
+    records: number
+    dataflow_edges: number
+    artifacts: number
+    token_usage: Record<string, unknown>
+    trace_health: { issues: unknown[] }
+  }
+}
+
+export type RenderableTrace = ProvenanceTraceProjection | CompatibilityTraceProjection
+
 export type RenderableTraceLoadResult = {
-  trace: ProvenanceTraceProjection
+  trace: RenderableTrace
   caseDir: string
   source: "trace.json" | "records.jsonl"
   incomplete: boolean
 }
 
 type TraceSource = RenderableTraceLoadResult["source"]
+
+type CompatibilityTraceDocument = Record<string, unknown> & {
+  trace_schema_version: string
+  case_id: string
+  run_id?: string
+  records: unknown[]
+  dataflow_edges: unknown[]
+  artifacts?: unknown[]
+}
 
 function isRecord(input: unknown): input is Record<string, unknown> {
   return Boolean(input) && typeof input === "object" && !Array.isArray(input)
@@ -180,6 +209,39 @@ function projectDocument(document: CausalIRTraceDocument) {
   )
 }
 
+function isCompatibilityTraceDocument(input: unknown): input is CompatibilityTraceDocument {
+  return (
+    isRecord(input) &&
+    isNonEmptyString(input.trace_schema_version) &&
+    isNonEmptyString(input.case_id) &&
+    Array.isArray(input.records) &&
+    Array.isArray(input.dataflow_edges) &&
+    (input.artifacts === undefined || Array.isArray(input.artifacts))
+  )
+}
+
+function projectCompatibilityDocument(document: CompatibilityTraceDocument): CompatibilityTraceProjection {
+  const artifacts = Array.isArray(document.artifacts) ? document.artifacts : []
+  const manifest: CompatibilityTraceProjection["manifest"] = { case_id: document.case_id }
+  if (isNonEmptyString(document.run_id)) manifest.run_id = document.run_id
+  return {
+    trace_version: document.trace_schema_version as string,
+    manifest,
+    records: document.records,
+    dataflow_edges: document.dataflow_edges,
+    artifacts,
+    metrics: {
+      spans: 0,
+      events: document.records.length,
+      records: document.records.length,
+      dataflow_edges: document.dataflow_edges.length,
+      artifacts: artifacts.length,
+      token_usage: {},
+      trace_health: { issues: [] },
+    },
+  }
+}
+
 function readJournal(file: string) {
   const content = fs.readFileSync(file, "utf8")
   const lines = content.split(/\r?\n/)
@@ -198,10 +260,6 @@ function readJournal(file: string) {
       throw new Error(`${file}:${lineNumber}: invalid JSONL entry (${detail})`)
     }
   })
-}
-
-function hasFinalization(journal: readonly Record<string, unknown>[]) {
-  return journal.some((entry) => entry.operation === "case.finalized")
 }
 
 function recoveryManifest(
@@ -237,6 +295,14 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
   const selected = selectSource(input)
   if (selected.source === "trace.json") {
     const document = readJSON(selected.file)
+    if (isCompatibilityTraceDocument(document)) {
+      return {
+        trace: projectCompatibilityDocument(document),
+        caseDir: selected.caseDir,
+        source: selected.source,
+        incomplete: false,
+      }
+    }
     if (!isCausalIRTraceDocument(document)) throw new Error(`${selected.file}: invalid Causal IR trace document`)
     return {
       trace: projectDocument(document),
@@ -248,9 +314,10 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
 
   const journal = readJournal(selected.file)
   const replayedTrace = replayCausalIRTrace(journal)
-  if (replayedTrace && hasFinalization(journal)) {
+  const finalizedTrace = replayFinalizedCausalIRTrace(journal)
+  if (finalizedTrace) {
     return {
-      trace: projectDocument(replayedTrace),
+      trace: projectDocument(finalizedTrace),
       caseDir: selected.caseDir,
       source: selected.source,
       incomplete: false,

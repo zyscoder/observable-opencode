@@ -1407,24 +1407,32 @@ function isCompactFinalizationJournalData(input: unknown): input is CausalIRFina
   )
 }
 
-function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument {
+function isCausalIRTraceEnvelope(input: unknown): input is CausalIRTraceEnvelope {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
-  const value = input as Partial<CausalIRTraceDocument>
+  const value = input as Partial<CausalIRTraceEnvelope>
   return (
     value.causal_ir_version === CAUSAL_IR_VERSION &&
     typeof value.trace_version === "string" &&
+    value.trace_version.length > 0 &&
     !!value.manifest &&
     typeof value.manifest === "object" &&
-    Array.isArray(value.nodes) &&
-    Array.isArray(value.edges) &&
-    Array.isArray(value.artifacts) &&
-    Array.isArray(value.diagnostics) &&
     !!value.journal &&
     typeof value.journal === "object" &&
     !!value.metrics &&
     typeof value.metrics === "object" &&
     !!value.compatibility &&
     typeof value.compatibility === "object"
+  )
+}
+
+function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument {
+  if (!isCausalIRTraceEnvelope(input)) return false
+  const value = input as CausalIRTraceDocument
+  return (
+    Array.isArray(value.nodes) &&
+    Array.isArray(value.edges) &&
+    Array.isArray(value.artifacts) &&
+    Array.isArray(value.diagnostics)
   )
 }
 
@@ -2224,7 +2232,11 @@ export function replayCausalIRTrace(journal: unknown[]): CausalIRTraceDocument |
       trace = journalData(entry.data.trace)
       continue
     }
-    if (entry.operation === "case.finalized" && isCompactFinalizationJournalData(entry.data) && entry.data.canonical) {
+    if (
+      entry.operation === "case.finalized" &&
+      isCompactFinalizationJournalData(entry.data) &&
+      isCausalIRTraceEnvelope(entry.data.canonical)
+    ) {
       compact = journalData(entry.data.canonical)
     }
   }
@@ -2246,6 +2258,46 @@ export function replayCausalIRTrace(journal: unknown[]): CausalIRTraceDocument |
     dataflow_edges: projection.dataflow_edges,
   }
   return JSON.parse(JSON.stringify(document)) as CausalIRTraceDocument
+}
+
+/**
+ * Replays only a journal whose terminal record is a valid finalization capable
+ * of producing the canonical trace. Checkpoints are intentionally excluded.
+ */
+export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceDocument | undefined {
+  const terminal = journal.at(-1)
+  if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) return undefined
+  const entry = terminal as Partial<CausalIRJournalEntry>
+  if (entry.operation !== "case.finalized") return undefined
+
+  const trace = replayCausalIRTrace(journal)
+  if (!trace) return undefined
+  if (isLifecycleJournalData(entry.data) && isCausalIRTraceDocument(entry.data.trace)) return trace
+  if (!isCompactFinalizationJournalData(entry.data) || !isCausalIRTraceEnvelope(entry.data.canonical)) return undefined
+
+  const graph = entry.data.graph
+  if (
+    graph.version !== CAUSAL_IR_VERSION ||
+    !Number.isSafeInteger(graph.nodes) ||
+    !Number.isSafeInteger(graph.edges) ||
+    !Number.isSafeInteger(graph.artifacts) ||
+    !Number.isSafeInteger(graph.diagnostics) ||
+    graph.nodes < 0 ||
+    graph.edges < 0 ||
+    graph.artifacts < 0 ||
+    graph.diagnostics < 0 ||
+    typeof graph.integrity_hash !== "string" ||
+    !graph.integrity_hash
+  )
+    return undefined
+  if (
+    trace.nodes.length !== graph.nodes ||
+    trace.edges.length !== graph.edges ||
+    trace.artifacts.length !== graph.artifacts ||
+    trace.diagnostics.length !== graph.diagnostics
+  )
+    return undefined
+  return trace
 }
 
 function optionalNumber(input: unknown) {
