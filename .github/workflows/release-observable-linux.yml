@@ -57,10 +57,19 @@ jobs:
             darwin-arm64
             darwin-x64
             darwin-x64-baseline
+            win32-arm64
+            win32-x64
+            win32-x64-baseline
           )
 
           for target in "${targets[@]}"; do
-            asset="release/observable-trace-${target}"
+            release_target="${target/win32/windows}"
+            extension=""
+            if [[ "$target" == win32-* ]]; then
+              extension=".exe"
+            fi
+
+            asset="release/observable-trace-${release_target}${extension}"
             bun build --compile --target="bun-${target}" packages/trace-renderer/src/cli.ts --outfile "$asset"
             if [ ! -f "$asset" ]; then
               echo "Missing expected renderer binary: $asset" >&2
@@ -86,20 +95,28 @@ jobs:
             opencode-darwin-arm64
             opencode-darwin-x64
             opencode-darwin-x64-baseline
+            opencode-windows-arm64
+            opencode-windows-x64
+            opencode-windows-x64-baseline
           )
 
           for target in "${targets[@]}"; do
-            source="packages/opencode/dist/${target}/bin/opencode"
+            extension=""
+            if [[ "$target" == opencode-windows-* ]]; then
+              extension=".exe"
+            fi
+
+            source="packages/opencode/dist/${target}/bin/opencode${extension}"
             if [ ! -f "$source" ]; then
               echo "Missing expected binary: $source" >&2
               exit 1
             fi
 
-            asset="release/${target/opencode-/opencode-observable-}"
+            asset="release/${target/opencode-/opencode-observable-}${extension}"
             cp "$source" "$asset"
             chmod +x "$asset"
 
-            renderer_asset="release/observable-trace-${target/opencode-/}"
+            renderer_asset="release/observable-trace-${target/opencode-/}${extension}"
             if [ ! -f "$renderer_asset" ]; then
               echo "Missing expected renderer binary: $renderer_asset" >&2
               exit 1
@@ -136,8 +153,12 @@ jobs:
           - opencode-observable-linux-arm64-musl: Alpine/musl arm64
           - opencode-observable-darwin-x64: macOS Intel
           - opencode-observable-darwin-x64-baseline: macOS Intel without AVX2
+          - opencode-observable-windows-arm64.exe: Windows arm64
+          - opencode-observable-windows-x64.exe: Windows x64
+          - opencode-observable-windows-x64-baseline.exe: Windows x64 without AVX2
 
-          The matching `observable-trace-<platform>` assets use the same platform suffixes.
+          The matching `observable-trace-<platform>` assets use the same platform suffixes;
+          Windows renderer assets also use the `.exe` extension.
 
           Enable trace at runtime with:
 
@@ -170,6 +191,7 @@ jobs:
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" release/opencode-observable-* release/observable-trace-* release/SHA256SUMS --clobber
+            gh release edit "$TAG_NAME" --notes-file release/RELEASE_NOTES.md
           else
             gh release create "$TAG_NAME" \
               release/opencode-observable-* \

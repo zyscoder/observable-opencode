@@ -77,7 +77,7 @@ opencode /data/repos/target-project
 
 ## 获取 Release 可执行文件
 
-GitHub Actions 会发布 Linux 与 macOS 的独立可执行文件，不需要在目标机器上
+GitHub Actions 会发布 Linux、macOS 和 Windows 的独立可执行文件，不需要在目标机器上
 执行 `bun install`。从 [Releases](https://github.com/zyscoder/observable-opencode/releases)
 选择对应资产：
 
@@ -86,9 +86,15 @@ GitHub Actions 会发布 Linux 与 macOS 的独立可执行文件，不需要在
 | Linux x86_64 | `opencode-observable-linux-x64` | `observable-trace-linux-x64` |
 | 旧 x86_64 CPU（无 AVX2） | `opencode-observable-linux-x64-baseline` | `observable-trace-linux-x64-baseline` |
 | Alpine/musl x86_64 | `opencode-observable-linux-x64-musl` | `observable-trace-linux-x64-musl` |
+| Alpine/musl 旧 x86_64 CPU（无 AVX2） | `opencode-observable-linux-x64-baseline-musl` | `observable-trace-linux-x64-baseline-musl` |
 | Linux arm64 | `opencode-observable-linux-arm64` | `observable-trace-linux-arm64` |
+| Alpine/musl Linux arm64 | `opencode-observable-linux-arm64-musl` | `observable-trace-linux-arm64-musl` |
 | macOS Apple Silicon | `opencode-observable-darwin-arm64` | `observable-trace-darwin-arm64` |
 | macOS Intel | `opencode-observable-darwin-x64` | `observable-trace-darwin-x64` |
+| macOS Intel（无 AVX2） | `opencode-observable-darwin-x64-baseline` | `observable-trace-darwin-x64-baseline` |
+| Windows arm64 | `opencode-observable-windows-arm64.exe` | `observable-trace-windows-arm64.exe` |
+| Windows x64 | `opencode-observable-windows-x64.exe` | `observable-trace-windows-x64.exe` |
+| Windows x64（无 AVX2） | `opencode-observable-windows-x64-baseline.exe` | `observable-trace-windows-x64-baseline.exe` |
 
 以 Linux x86_64 为例：
 
@@ -416,9 +422,9 @@ python -m trace_attribution \
   --judge-max-tokens 16000
 ```
 
-渲染和归因是两个独立的离线步骤：使用 `observable-trace render <case-dir>` 查看 HTML，
-使用 `trace-attribution --trace <case-dir>/trace.json --question "..."`（源码 checkout 中为
-上面的 `python -m trace_attribution` 命令）执行归因。即使已经渲染过 HTML，也必须把
+渲染和归因是两个独立的离线步骤：使用 `observable-trace render <case-dir>` 查看 HTML；
+使用上面的源码 checkout 命令，以 `--engine recursive-agentic --trace <case-dir>/trace.json`
+和 `--question "..." --out <report>.json` 执行归因。即使已经渲染过 HTML，也必须把
 `trace.json` 而不是 `trace.html` 传给归因 CLI。
 
 归因 Judge 通过 Anthropic SDK 调用 Anthropic 兼容接口。它和运行 Observable OpenCode 的

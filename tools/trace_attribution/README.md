@@ -118,13 +118,13 @@ For question-based attribution, keep rendering separate and provide the canonica
 not HTML:
 
 ```bash
-trace-attribution \
+PYTHONPATH=tools/trace_attribution \
+python3 -m trace_attribution \
+  --engine recursive-agentic \
   --trace /data/case-traces/case_xxx/trace.json \
-  --question "为什么本次修改编译失败？"
+  --question "为什么本次修改编译失败？" \
+  --out /data/attribution/case_xxx.attribution.json
 ```
-
-In a source checkout, invoke that CLI as `PYTHONPATH=tools/trace_attribution python3 -m
-trace_attribution` and retain the same `--trace` and `--question` arguments.
 
 The compatibility engine remains the default for existing objective-based runs. For a
 user question, the recommended command is `--engine recursive-agentic`: it runs the
