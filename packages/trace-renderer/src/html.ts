@@ -267,16 +267,6 @@ function validatePublishedSnapshot(target: string, expectedDigest: string, expec
   }
 }
 
-function cleanupSnapshotDirectories(outputRoot: string) {
-  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
-  try {
-    fs.rmdirSync(snapshotRoot)
-  } catch {}
-  try {
-    fs.rmdirSync(path.dirname(snapshotRoot))
-  } catch {}
-}
-
 function ensureRendererDirectory(directory: string) {
   try {
     const stats = fs.lstatSync(directory)
@@ -288,6 +278,73 @@ function ensureRendererDirectory(directory: string) {
   fs.mkdirSync(directory)
   const stats = fs.lstatSync(directory)
   if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(`${directory}: renderer snapshot path is not a directory`)
+}
+
+type SnapshotDirectory = {
+  path: string
+  realPath: string
+  fd: number
+  dev: number
+  ino: number
+}
+
+type SnapshotLeaf = {
+  path: string
+  dev: number
+  ino: number
+}
+
+const snapshotTestHook = Symbol.for("opencode.trace-renderer.test.snapshot-hook")
+
+function closeSnapshotDirectory(directory: SnapshotDirectory | undefined) {
+  if (!directory) return
+  try {
+    fs.closeSync(directory.fd)
+  } catch {}
+}
+
+function validateSnapshotDirectory(directory: SnapshotDirectory) {
+  const lexical = fs.lstatSync(directory.path)
+  const descriptor = fs.fstatSync(directory.fd)
+  if (
+    lexical.isSymbolicLink() ||
+    !lexical.isDirectory() ||
+    !descriptor.isDirectory() ||
+    !sameArtifactIdentity(lexical, directory) ||
+    !sameArtifactIdentity(descriptor, directory) ||
+    fs.realpathSync(directory.path) !== directory.realPath
+  )
+    throw new Error(`${directory.path}: renderer snapshot directory identity changed`)
+}
+
+function validateSnapshotLeaf(pathname: string, expected: Pick<SnapshotLeaf, "dev" | "ino">) {
+  const stats = fs.lstatSync(pathname)
+  if (stats.isSymbolicLink() || !stats.isFile() || !sameArtifactIdentity(stats, expected))
+    throw new Error(`${pathname}: renderer snapshot leaf identity changed`)
+}
+
+function removeSnapshotLeaf(directory: SnapshotDirectory, leaf: SnapshotLeaf) {
+  try {
+    validateSnapshotDirectory(directory)
+    validateSnapshotLeaf(leaf.path, leaf)
+    fs.unlinkSync(leaf.path)
+    validateSnapshotDirectory(directory)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function cleanupSnapshotDirectory(directory: SnapshotDirectory) {
+  try {
+    validateSnapshotDirectory(directory)
+    fs.rmdirSync(directory.realPath)
+  } catch {}
+}
+
+function runSnapshotTestHook(stage: "after_prepare" | "before_rollback", directory: SnapshotDirectory) {
+  const hook = (globalThis as Record<symbol, unknown>)[snapshotTestHook]
+  if (typeof hook === "function") hook(stage, directory.realPath)
 }
 
 function prepareSnapshotRoot(outputRoot: string) {
@@ -302,25 +359,57 @@ function prepareSnapshotRoot(outputRoot: string) {
   const relative = path.relative(fs.realpathSync(root), fs.realpathSync(snapshotRoot))
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
     throw new Error(`${snapshotRoot}: renderer snapshot path escapes output directory`)
-  return snapshotRoot
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(
+      snapshotRoot,
+      fs.constants.O_RDONLY |
+        (typeof fs.constants.O_DIRECTORY === "number" ? fs.constants.O_DIRECTORY : 0) |
+        (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0),
+    )
+    const stats = fs.fstatSync(fd)
+    if (!stats.isDirectory()) throw new Error(`${snapshotRoot}: renderer snapshot path is not a directory`)
+    const directory = { path: snapshotRoot, realPath: fs.realpathSync(snapshotRoot), fd, dev: stats.dev, ino: stats.ino }
+    validateSnapshotDirectory(directory)
+    fd = undefined
+    return directory
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+  }
 }
 
 type PublishedArtifactSnapshot = {
   path: string
-  created: boolean
+  created?: SnapshotLeaf
 }
 
 function publishArtifactSnapshot(
-  outputRoot: string,
-  snapshotRoot: string,
+  directory: SnapshotDirectory,
   target: AuthorizedArtifactTarget,
-): PublishedArtifactSnapshot | undefined {
-  const temporary = path.join(snapshotRoot, `.snapshot.${process.pid}.${Math.random().toString(16).substring(2)}.tmp`)
+): PublishedArtifactSnapshot {
+  validateSnapshotDirectory(directory)
+  const temporary = path.join(directory.realPath, `.snapshot.${process.pid}.${Math.random().toString(16).substring(2)}.tmp`)
   let temporaryFd: number | undefined
-  let published: string | undefined
-  let created = false
+  let temporaryLeaf: SnapshotLeaf | undefined
+  let created: SnapshotLeaf | undefined
   try {
-    temporaryFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
+    temporaryFd = fs.openSync(
+      temporary,
+      fs.constants.O_WRONLY |
+        fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0),
+      0o600,
+    )
+    const temporaryStats = fs.fstatSync(temporaryFd)
+    if (!temporaryStats.isFile()) throw new Error(`${temporary}: renderer snapshot temporary is not a file`)
+    temporaryLeaf = { path: temporary, dev: temporaryStats.dev, ino: temporaryStats.ino }
+    validateSnapshotDirectory(directory)
+    validateSnapshotLeaf(temporary, temporaryLeaf)
     const digest = createHash("sha256")
     const buffer = Buffer.allocUnsafe(64 * 1024)
     let sourcePosition = 0
@@ -339,34 +428,33 @@ function publishArtifactSnapshot(
 
     const contentDigest = digest.digest("hex")
     const relativeSnapshot = `artifacts/render-snapshots/sha256/${contentDigest}`
-    published = path.join(snapshotRoot, contentDigest)
+    const published = path.join(directory.realPath, contentDigest)
+    validateSnapshotDirectory(directory)
+    validateSnapshotLeaf(temporary, temporaryLeaf)
     try {
       fs.linkSync(temporary, published)
-      created = true
+      created = { path: published, dev: temporaryLeaf.dev, ino: temporaryLeaf.ino }
+      validateSnapshotDirectory(directory)
+      validateSnapshotLeaf(published, created)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-      if (!validatePublishedSnapshot(published, contentDigest, sourcePosition)) return undefined
+      if (!validatePublishedSnapshot(published, contentDigest, sourcePosition))
+        throw new Error(`${published}: existing renderer snapshot failed validation`)
     }
-    fs.unlinkSync(temporary)
-    fsyncDirectory(snapshotRoot)
+    removeSnapshotLeaf(directory, temporaryLeaf)
+    validateSnapshotDirectory(directory)
+    fsyncDirectory(directory.realPath)
     return { path: relativeSnapshot, created }
-  } catch {
-    if (created && published) {
-      try {
-        fs.unlinkSync(published)
-      } catch {}
-      cleanupSnapshotDirectories(outputRoot)
-    }
-    return undefined
+  } catch (error) {
+    if (created) removeSnapshotLeaf(directory, created)
+    throw error
   } finally {
     if (temporaryFd !== undefined) {
       try {
         fs.closeSync(temporaryFd)
       } catch {}
     }
-    try {
-      fs.unlinkSync(temporary)
-    } catch {}
+    if (temporaryLeaf) removeSnapshotLeaf(directory, temporaryLeaf)
   }
 }
 
@@ -375,26 +463,30 @@ function publishArtifactSnapshots(
   targets: ReadonlyMap<string, AuthorizedArtifactTarget>,
 ) {
   const snapshots = new Map<string, string>()
-  const created: string[] = []
-  if (!outputRoot) return { snapshots, created }
-  const snapshotRoot = targets.size ? prepareSnapshotRoot(outputRoot) : undefined
-  for (const [relativePath, target] of targets) {
-    const snapshot = publishArtifactSnapshot(outputRoot, snapshotRoot!, target)
-    if (!snapshot) continue
-    snapshots.set(relativePath, snapshot.path)
-    if (snapshot.created) created.push(snapshot.path)
+  const created: SnapshotLeaf[] = []
+  if (!outputRoot || !targets.size) return { snapshots, created, directory: undefined }
+  const directory = prepareSnapshotRoot(outputRoot)
+  try {
+    runSnapshotTestHook("after_prepare", directory)
+    for (const [relativePath, target] of targets) {
+      const snapshot = publishArtifactSnapshot(directory, target)
+      snapshots.set(relativePath, snapshot.path)
+      if (snapshot.created) created.push(snapshot.created)
+    }
+    return { snapshots, created, directory }
+  } catch (error) {
+    rollbackPublishedArtifactSnapshots(directory, created)
+    closeSnapshotDirectory(directory)
+    throw error
   }
-  return { snapshots, created }
 }
 
-function rollbackPublishedArtifactSnapshots(outputRoot: string, snapshots: readonly string[]) {
-  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
+function rollbackPublishedArtifactSnapshots(directory: SnapshotDirectory, snapshots: readonly SnapshotLeaf[]) {
+  runSnapshotTestHook("before_rollback", directory)
   for (const snapshot of snapshots) {
-    try {
-      fs.unlinkSync(path.join(snapshotRoot, path.basename(snapshot)))
-    } catch {}
+    if (!removeSnapshotLeaf(directory, snapshot)) return
   }
-  cleanupSnapshotDirectories(outputRoot)
+  cleanupSnapshotDirectory(directory)
 }
 
 export function writeProvenanceTraceHtmlFile(
@@ -408,11 +500,13 @@ export function writeProvenanceTraceHtmlFile(
   const outputRoot = path.dirname(target)
   const authorized = authorizedArtifactTargets(trace.artifacts, options.artifactSourceRoot ?? outputRoot)
   let artifactSnapshotPaths: ReadonlyMap<string, string>
-  let createdSnapshots: string[]
+  let createdSnapshots: SnapshotLeaf[]
+  let snapshotDirectory: SnapshotDirectory | undefined
   try {
     const published = publishArtifactSnapshots(outputRoot, authorized)
     artifactSnapshotPaths = published.snapshots
     createdSnapshots = published.created
+    snapshotDirectory = published.directory
   } finally {
     closeAuthorizedArtifactTargets(authorized)
   }
@@ -421,8 +515,10 @@ export function writeProvenanceTraceHtmlFile(
   try {
     written = writeAtomicChunks(target, chunks, maxChunkBytes)
   } catch (error) {
-    rollbackPublishedArtifactSnapshots(outputRoot, createdSnapshots)
+    if (snapshotDirectory) rollbackPublishedArtifactSnapshots(snapshotDirectory, createdSnapshots)
     throw error
+  } finally {
+    closeSnapshotDirectory(snapshotDirectory)
   }
   return {
     mode: streaming ? "streaming" : "inline",
@@ -953,11 +1049,15 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
   const allowedArtifactTargets = authorizedArtifactTargets(trace.artifacts ?? [], options.artifactDir)
   let artifactContents: Map<string, string>
   let artifactSnapshotPaths: ReadonlyMap<string, string>
+  let snapshotDirectory: SnapshotDirectory | undefined
   try {
-    artifactSnapshotPaths = publishArtifactSnapshots(options.artifactDir, allowedArtifactTargets).snapshots
+    const published = publishArtifactSnapshots(options.artifactDir, allowedArtifactTargets)
+    artifactSnapshotPaths = published.snapshots
+    snapshotDirectory = published.directory
     artifactContents = collectArtifactContents(trace, options, allowedArtifactTargets, artifactSnapshotPaths)
   } finally {
     closeAuthorizedArtifactTargets(allowedArtifactTargets)
+    closeSnapshotDirectory(snapshotDirectory)
   }
   const spans = trace.spans.toSorted((a, b) => a.start_ms - b.start_ms)
   const maxEnd = Math.max(trace.duration_ms, ...spans.map((span) => span.end_ms ?? span.start_ms))

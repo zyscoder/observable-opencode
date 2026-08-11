@@ -208,6 +208,41 @@ describe("observable-trace render", () => {
     })
   })
 
+  test("returns non-zero when snapshot identity changes after preparation", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "observable-trace-identity-output-"))
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), "observable-trace-identity-outside-"))
+      try {
+        await writeFinalizedCase(caseDir)
+        const before = await hashes(caseDir)
+        const output = path.join(outputDir, "trace.html")
+        const result = runCommand(
+          process.execPath,
+          "-e",
+          `import fs from "node:fs"
+globalThis[Symbol.for("opencode.trace-renderer.test.snapshot-hook")] = (stage, root) => {
+  if (stage !== "after_prepare") return
+  fs.renameSync(root, root + "-replaced")
+  fs.symlinkSync(${JSON.stringify(outside)}, root)
+}
+const { render } = await import(${JSON.stringify(cli)})
+try { render(["render", ${JSON.stringify(caseDir)}, "--output", ${JSON.stringify(output)}]) }
+catch { console.error("render-failed"); process.exitCode = 1 }`,
+        )
+        const after = await hashes(caseDir)
+
+        expect(result.exitCode).not.toBe(0)
+        expect(Buffer.from(result.stderr).toString()).toContain("render-failed")
+        expect(await fs.readdir(outside)).toEqual([])
+        expect(await fs.stat(output).catch(() => undefined)).toBeUndefined()
+        expect(after).toEqual(before)
+      } finally {
+        await fs.rm(outputDir, { recursive: true, force: true })
+        await fs.rm(outside, { recursive: true, force: true })
+      }
+    })
+  })
+
   test("rolls back newly published snapshots when HTML publication fails", async () => {
     await withCaseDirectory(async (caseDir) => {
       await writeFinalizedCase(caseDir)

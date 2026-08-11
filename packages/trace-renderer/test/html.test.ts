@@ -18,6 +18,14 @@ function artifactSnapshotPath(content: string) {
   return `artifacts/render-snapshots/sha256/${createHash("sha256").update(content).digest("hex")}`
 }
 
+const snapshotTestHook = Symbol.for("opencode.trace-renderer.test.snapshot-hook")
+
+function setSnapshotTestHook(hook: ((stage: string, snapshotRoot: string) => void) | undefined) {
+  const hooks = globalThis as Record<symbol, unknown>
+  if (hook) hooks[snapshotTestHook] = hook
+  else delete hooks[snapshotTestHook]
+}
+
 function section(html: string, id: string) {
   const start = html.indexOf(`<section id="${id}"`)
   if (start === -1) return ""
@@ -130,6 +138,94 @@ function expandRuntimeFixture(trace: ProvenanceTraceView) {
 }
 
 describe("case trace HTML artifact storage", () => {
+  test("aborts snapshot publication when the prepared directory is replaced", async () => {
+    const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-snapshot-source-"))
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-snapshot-output-"))
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-snapshot-outside-"))
+    const payload = "snapshot identity payload"
+    const artifact: TraceArtifact = {
+      artifact_id: "snapshot_identity",
+      kind: "text",
+      label: "snapshot.identity",
+      path: "artifacts/input.txt",
+      length: payload.length,
+      hash: "snapshot-identity",
+      preview: payload,
+      created_at: "2026-08-11T00:00:00.000Z",
+      occurrences: 1,
+      availability: "bundled",
+    }
+
+    try {
+      await fs.mkdir(path.join(sourceDir, "artifacts"))
+      await fs.writeFile(path.join(sourceDir, artifact.path), payload)
+      setSnapshotTestHook((stage, snapshotRoot) => {
+        if (stage !== "after_prepare") return
+        nodeFs.renameSync(snapshotRoot, `${snapshotRoot}-replaced`)
+        nodeFs.symlinkSync(outsideDir, snapshotRoot)
+      })
+
+      expect(() =>
+        writeProvenanceTraceHtmlFile(path.join(outputDir, "trace.html"), provenanceTrace([], [artifact]), {
+          artifactSourceRoot: sourceDir,
+        }),
+      ).toThrow("snapshot")
+      expect(await fs.readdir(outsideDir)).toEqual([])
+      expect(await fs.stat(path.join(outputDir, "trace.html")).catch(() => undefined)).toBeUndefined()
+      expect(await fs.readFile(path.join(sourceDir, artifact.path), "utf8")).toBe(payload)
+    } finally {
+      setSnapshotTestHook(undefined)
+      await fs.rm(sourceDir, { recursive: true, force: true })
+      await fs.rm(outputDir, { recursive: true, force: true })
+      await fs.rm(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not delete an external leaf when snapshot identity changes before rollback", async () => {
+    const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-rollback-source-"))
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-rollback-output-"))
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-rollback-outside-"))
+    const payload = "rollback identity payload"
+    const digest = createHash("sha256").update(payload).digest("hex")
+    const artifact: TraceArtifact = {
+      artifact_id: "rollback_identity",
+      kind: "text",
+      label: "rollback.identity",
+      path: "artifacts/input.txt",
+      length: payload.length,
+      hash: "rollback-identity",
+      preview: payload,
+      created_at: "2026-08-11T00:00:00.000Z",
+      occurrences: 1,
+      availability: "bundled",
+    }
+
+    try {
+      await fs.mkdir(path.join(sourceDir, "artifacts"))
+      await fs.writeFile(path.join(sourceDir, artifact.path), payload)
+      await fs.mkdir(path.join(outputDir, "trace.html"))
+      await fs.writeFile(path.join(outsideDir, digest), "external sentinel")
+      setSnapshotTestHook((stage, snapshotRoot) => {
+        if (stage !== "before_rollback") return
+        nodeFs.renameSync(snapshotRoot, `${snapshotRoot}-replaced`)
+        nodeFs.symlinkSync(outsideDir, snapshotRoot)
+      })
+
+      expect(() =>
+        writeProvenanceTraceHtmlFile(path.join(outputDir, "trace.html"), provenanceTrace([], [artifact]), {
+          artifactSourceRoot: sourceDir,
+        }),
+      ).toThrow()
+      expect(await fs.readFile(path.join(outsideDir, digest), "utf8")).toBe("external sentinel")
+      expect(await fs.readFile(path.join(sourceDir, artifact.path), "utf8")).toBe(payload)
+    } finally {
+      setSnapshotTestHook(undefined)
+      await fs.rm(sourceDir, { recursive: true, force: true })
+      await fs.rm(outputDir, { recursive: true, force: true })
+      await fs.rm(outsideDir, { recursive: true, force: true })
+    }
+  })
+
   test("streams a 5001-record OpenCode provenance fixture without embedding its artifact payload", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-runtime-provenance-fixture-"))
     const target = path.join(dir, "trace.html")
