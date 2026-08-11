@@ -97,7 +97,97 @@ function provenanceTrace(
   } as unknown as ProvenanceTraceView
 }
 
+async function provenanceFixture(name: string) {
+  const content = await fs.readFile(path.join(import.meta.dir, "fixtures", name), "utf8")
+  return JSON.parse(content) as ProvenanceTraceView
+}
+
+function expandRuntimeFixture(trace: ProvenanceTraceView) {
+  const first = trace.records.find((record) => record.record_id === "task6_record_0")
+  const last = trace.records.find((record) => record.record_id === "task6_record_5000")
+  if (!first || !last) throw new Error("runtime provenance fixture is missing its boundary records")
+
+  const records = Array.from({ length: 5001 }, (_, index) => {
+    if (index === 5000) return last
+    return {
+      ...first,
+      record_id: `task6_record_${index}`,
+      time_ms: first.time_ms + index,
+      title: `task6 record ${index}`,
+    }
+  })
+
+  return {
+    ...trace,
+    records,
+    metrics: {
+      ...trace.metrics,
+      records: records.length,
+      artifacts: trace.artifacts.length,
+      dataflow_edges: trace.dataflow_edges.length,
+    },
+  }
+}
+
 describe("case trace HTML artifact storage", () => {
+  test("streams a 5001-record OpenCode provenance fixture without embedding its artifact payload", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-runtime-provenance-fixture-"))
+    const target = path.join(dir, "trace.html")
+    const fullPayload = `task-6-authoritative-payload:${"z".repeat(4096)}`
+    const trace = expandRuntimeFixture(await provenanceFixture("opencode-large-runtime-provenance.json"))
+
+    try {
+      const stats = writeProvenanceTraceHtmlFile(target, trace, {
+        forceStreaming: true,
+        maxChunkBytes: 64 * 1024,
+      })
+      const html = await fs.readFile(target, "utf8")
+
+      expect(stats.mode).toBe("streaming")
+      expect(stats.record_count).toBe(5001)
+      expect(stats.artifact_payloads_embedded).toBe(0)
+      expect(html).toContain("Trace v6.0")
+      expect(html).toContain("task6_record_0")
+      expect(html).toContain("task6_record_5000")
+      expect(html).not.toContain(fullPayload)
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("renders a signal-finalized OpenCode provenance fixture repeatedly", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-signal-provenance-fixture-"))
+    const target = path.join(dir, "trace.html")
+    const trace = await provenanceFixture("opencode-signal-finalized-provenance.json")
+
+    try {
+      const inline = renderProvenanceTraceHtml(trace)
+      writeProvenanceTraceHtmlFile(target, trace, { forceStreaming: true, maxChunkBytes: 4096 })
+      const first = await fs.readFile(target, "utf8")
+      writeProvenanceTraceHtmlFile(target, trace, { forceStreaming: true, maxChunkBytes: 4096 })
+      const second = await fs.readFile(target, "utf8")
+
+      expect(first).toBe(inline)
+      expect(second).toBe(first)
+      expect(second).toContain("Trace v6.0")
+      expect(second).toContain("before_signal")
+      expect(second).toContain("case cancelled")
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("renders the cancelled terminal status from an OpenCode emergency-recovery provenance fixture", async () => {
+    const trace = await provenanceFixture("opencode-sigterm-emergency-recovery-provenance.json")
+
+    const html = renderProvenanceTraceHtml(trace)
+
+    expect(html).toContain("Trace v6.0")
+    expect(html).toContain("persisted_before_emergency")
+    expect(html).toContain("SIGTERM")
+    expect(html).toContain("case cancelled")
+  })
+
   test("continues to render legacy small-trace fields and inline artifact drill-down", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-legacy-artifact-root-"))
     const payload = "legacy artifact body"

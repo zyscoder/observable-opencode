@@ -1,0 +1,123 @@
+{
+  "trace_version": "6.0",
+  "manifest": {
+    "trace_version": "6.0",
+    "case_id": "task6-large-runtime",
+    "run_id": "fixture-task6-large-runtime",
+    "started_at": "2026-08-11T00:00:00.000Z",
+    "ended_at": "2026-08-11T00:00:04.670Z",
+    "duration_ms": 4670,
+    "status": "success",
+    "server_status": "success",
+    "process_status": "success",
+    "shutdown_disposition": "normal_case_completion",
+    "case_status": "success",
+    "collection_mode": "passive_sidecar",
+    "behavior_impact": "none",
+    "environment": {},
+    "token_usage": {},
+    "result": {
+      "answer": "agent-visible-result"
+    },
+    "files": {
+      "trace": "trace.json",
+      "legacy_trace": "legacy-trace.json",
+      "provenance_trace": "provenance-trace.json",
+      "records": "records.jsonl",
+      "raw_events": "raw-events.jsonl",
+      "partial_latest": "partial/latest.json"
+    }
+  },
+  "records": [
+    {
+      "record_id": "task6_record_0",
+      "component": "tool",
+      "event_type": "execution.observation",
+      "timestamp": "2026-08-11T00:00:00.007Z",
+      "time_ms": 7,
+      "title": "task6 record 0",
+      "source_locations": [],
+      "artifact_refs": [
+        "artifact_2_3bcf3325d2a6c2f7"
+      ],
+      "data": {
+        "output": {
+          "type": "text",
+          "length": 4125,
+          "hash": "3bcf3325d2a6c2f7",
+          "preview": "task-6-authoritative-payload:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "artifact_id": "artifact_2_3bcf3325d2a6c2f7",
+          "payload_ref": "artifact_2_3bcf3325d2a6c2f7",
+          "payload_dedupe_group_id": "text:3bcf3325d2a6c2f7"
+        }
+      }
+    },
+    {
+      "record_id": "task6_record_5000",
+      "component": "tool",
+      "event_type": "execution.observation",
+      "timestamp": "2026-08-11T00:00:04.665Z",
+      "time_ms": 4665,
+      "title": "task6 record 5000",
+      "source_locations": [],
+      "artifact_refs": [
+        "artifact_2_3bcf3325d2a6c2f7"
+      ],
+      "data": {
+        "output": {
+          "type": "text",
+          "length": 4125,
+          "hash": "3bcf3325d2a6c2f7",
+          "preview": "task-6-authoritative-payload:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "artifact_id": "artifact_2_3bcf3325d2a6c2f7",
+          "payload_ref": "artifact_2_3bcf3325d2a6c2f7",
+          "payload_dedupe_group_id": "text:3bcf3325d2a6c2f7"
+        }
+      }
+    }
+  ],
+  "dataflow_edges": [],
+  "artifacts": [
+    {
+      "artifact_id": "artifact_2_3bcf3325d2a6c2f7",
+      "kind": "text",
+      "label": "observation.data",
+      "path": "artifacts/sha256/3bcf3325d2a6c2f7_observation.data.txt",
+      "length": 4125,
+      "hash": "3bcf3325d2a6c2f7",
+      "preview": "task-6-authoritative-payload:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "created_at": "2026-08-11T00:00:00.019Z",
+      "dedupe_key": "text:3bcf3325d2a6c2f7",
+      "occurrences": 5001,
+      "storage_encoding": "identity",
+      "original_length": 4125,
+      "stored_length": 4125,
+      "availability": "bundled",
+      "content_hash": "3bcf3325d2a6c2f7",
+      "byte_length": 4125,
+      "semantic_slices": [
+        {
+          "byte_range": [0, 96],
+          "content": "task-6-authoritative-payload:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "hash": "b8c473fd297ce18d",
+          "truncated": true
+        }
+      ]
+    }
+  ],
+  "metrics": {
+    "spans": 0,
+    "events": 0,
+    "records": 5003,
+    "dataflow_edges": 0,
+    "artifacts": 2,
+    "token_usage": {},
+    "stream_summary": {},
+    "trace_health": {
+      "execution_observations": 5001,
+      "payload_duplication_groups": 1,
+      "compaction_quality_flags": {},
+      "issues": []
+    }
+  }
+}
