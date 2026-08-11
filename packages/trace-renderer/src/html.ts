@@ -277,19 +277,44 @@ function cleanupSnapshotDirectories(outputRoot: string) {
   } catch {}
 }
 
+function ensureRendererDirectory(directory: string) {
+  try {
+    const stats = fs.lstatSync(directory)
+    if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(`${directory}: renderer snapshot path is not a directory`)
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+  fs.mkdirSync(directory)
+  const stats = fs.lstatSync(directory)
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(`${directory}: renderer snapshot path is not a directory`)
+}
+
+function prepareSnapshotRoot(outputRoot: string) {
+  fs.mkdirSync(outputRoot, { recursive: true })
+  const root = path.resolve(outputRoot)
+  ensureRendererDirectory(root)
+  const snapshotRoot = ["artifacts", "render-snapshots", "sha256"].reduce((directory, segment) => {
+    const next = path.join(directory, segment)
+    ensureRendererDirectory(next)
+    return next
+  }, root)
+  const relative = path.relative(fs.realpathSync(root), fs.realpathSync(snapshotRoot))
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
+    throw new Error(`${snapshotRoot}: renderer snapshot path escapes output directory`)
+  return snapshotRoot
+}
+
 type PublishedArtifactSnapshot = {
   path: string
   created: boolean
 }
 
-function publishArtifactSnapshot(outputRoot: string, target: AuthorizedArtifactTarget): PublishedArtifactSnapshot | undefined {
-  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
-  fs.mkdirSync(snapshotRoot, { recursive: true })
-  const realOutputRoot = fs.realpathSync(outputRoot)
-  const realSnapshotRoot = fs.realpathSync(snapshotRoot)
-  const snapshotRootRelative = path.relative(realOutputRoot, realSnapshotRoot)
-  if (!snapshotRootRelative || snapshotRootRelative.startsWith("..") || path.isAbsolute(snapshotRootRelative)) return undefined
-
+function publishArtifactSnapshot(
+  outputRoot: string,
+  snapshotRoot: string,
+  target: AuthorizedArtifactTarget,
+): PublishedArtifactSnapshot | undefined {
   const temporary = path.join(snapshotRoot, `.snapshot.${process.pid}.${Math.random().toString(16).substring(2)}.tmp`)
   let temporaryFd: number | undefined
   let published: string | undefined
@@ -314,7 +339,7 @@ function publishArtifactSnapshot(outputRoot: string, target: AuthorizedArtifactT
 
     const contentDigest = digest.digest("hex")
     const relativeSnapshot = `artifacts/render-snapshots/sha256/${contentDigest}`
-    published = path.resolve(outputRoot, relativeSnapshot)
+    published = path.join(snapshotRoot, contentDigest)
     try {
       fs.linkSync(temporary, published)
       created = true
@@ -352,8 +377,9 @@ function publishArtifactSnapshots(
   const snapshots = new Map<string, string>()
   const created: string[] = []
   if (!outputRoot) return { snapshots, created }
+  const snapshotRoot = targets.size ? prepareSnapshotRoot(outputRoot) : undefined
   for (const [relativePath, target] of targets) {
-    const snapshot = publishArtifactSnapshot(outputRoot, target)
+    const snapshot = publishArtifactSnapshot(outputRoot, snapshotRoot!, target)
     if (!snapshot) continue
     snapshots.set(relativePath, snapshot.path)
     if (snapshot.created) created.push(snapshot.path)
