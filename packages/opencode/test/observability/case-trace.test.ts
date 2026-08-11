@@ -6947,6 +6947,7 @@ describe("case trace", () => {
         OPENCODE_CASE_TRACE: "1",
         OPENCODE_CASE_ID: "sigkill-case",
         OPENCODE_CASE_TRACE_DIR: dir,
+        OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS: "5",
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -6956,6 +6957,7 @@ describe("case trace", () => {
     const recordsFile = path.join(caseDir, "records.jsonl")
     expect(await waitForExists(recordsFile)).toBe(true)
     expect(await fs.readFile(recordsFile, "utf8")).toContain("fixture_signal_sigkill_ready")
+    await Bun.sleep(50)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(false)
     expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
     proc.kill("SIGKILL")
