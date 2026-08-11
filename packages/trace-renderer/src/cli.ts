@@ -17,7 +17,9 @@ export function render(argv: string[]) {
   const input = parseRenderArguments(argv)
   const loaded = loadRenderableTrace(path.resolve(input.input))
   const output = input.output ? path.resolve(input.output) : path.join(loaded.caseDir, "trace.html")
-  writeProvenanceTraceHtmlFile(output, loaded.trace as Parameters<typeof writeProvenanceTraceHtmlFile>[1])
+  writeProvenanceTraceHtmlFile(output, loaded.trace as Parameters<typeof writeProvenanceTraceHtmlFile>[1], {
+    artifactSourceRoot: loaded.caseDir,
+  })
   return { source: loaded.source, incomplete: loaded.incomplete, output }
 }
 

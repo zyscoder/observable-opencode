@@ -21,8 +21,12 @@ async function hashes(caseDir: string) {
 }
 
 function run(...args: string[]) {
+  return runCommand(process.execPath, cli, ...args)
+}
+
+function runCommand(command: string, ...args: string[]) {
   return Bun.spawnSync({
-    cmd: [process.execPath, cli, ...args],
+    cmd: [command, ...args],
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -150,6 +154,113 @@ describe("observable-trace render", () => {
       expect(await fs.readFile(output, "utf8")).toContain("Trace v6.0")
       expect(await fs.stat(path.join(caseDir, "trace.html")).catch(() => undefined)).toBeUndefined()
     })
+  })
+
+  test("publishes external-output artifact snapshots from the loaded case", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "observable-trace-external-output-"))
+      try {
+        await writeFinalizedCase(caseDir)
+        const before = await hashes(caseDir)
+        const output = path.join(outputDir, "trace.html")
+        const snapshot = path.join(
+          outputDir,
+          "artifacts",
+          "render-snapshots",
+          "sha256",
+          sha256(Buffer.from("authoritative artifact payload")),
+        )
+
+        const result = run("render", caseDir, "--output", output)
+        const html = await fs.readFile(output, "utf8")
+        const after = await hashes(caseDir)
+
+        expect(result.exitCode).toBe(0)
+        expect(html).toContain(`href="artifacts/render-snapshots/sha256/${path.basename(snapshot)}"`)
+        expect(await fs.readFile(snapshot, "utf8")).toBe("authoritative artifact payload")
+        expect(after).toEqual(before)
+      } finally {
+        await fs.rm(outputDir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  test("rolls back newly published snapshots when HTML publication fails", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      await writeFinalizedCase(caseDir)
+      await fs.mkdir(path.join(caseDir, "trace.html"))
+      const before = await hashes(caseDir)
+
+      const result = run("render", caseDir)
+      const after = await hashes(caseDir)
+
+      expect(result.exitCode).not.toBe(0)
+      expect(after).toEqual(before)
+      expect((await fs.stat(path.join(caseDir, "trace.html"))).isDirectory()).toBe(true)
+      expect(
+        await fs.stat(path.join(caseDir, "artifacts", "render-snapshots", "sha256")).catch(() => undefined),
+      ).toBeUndefined()
+    })
+  })
+
+  test("preserves pre-existing snapshots while rolling back newly published snapshots", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      await writeFinalizedCase(caseDir)
+      expect(run("render", caseDir).exitCode).toBe(0)
+      const existingSnapshot = path.join(
+        caseDir,
+        "artifacts",
+        "render-snapshots",
+        "sha256",
+        sha256(Buffer.from("authoritative artifact payload")),
+      )
+      await fs.rm(path.join(caseDir, "trace.html"))
+      await fs.mkdir(path.join(caseDir, "trace.html"))
+      await fs.writeFile(path.join(caseDir, "artifacts", "second.txt"), "new artifact payload")
+      const traceFile = path.join(caseDir, "trace.json")
+      const trace = JSON.parse(await fs.readFile(traceFile, "utf8")) as { artifacts: Record<string, unknown>[] }
+      trace.artifacts.push({
+        artifact_id: "second_artifact",
+        kind: "text",
+        label: "second",
+        path: "artifacts/second.txt",
+        length: 20,
+        hash: "second-hash",
+        preview: "new artifact payload",
+        created_at: "2026-08-11T00:00:00.000Z",
+        occurrences: 1,
+        availability: "bundled",
+      })
+      await fs.writeFile(traceFile, JSON.stringify(trace))
+      const before = await hashes(caseDir)
+
+      const result = run("render", caseDir)
+      const after = await hashes(caseDir)
+
+      expect(result.exitCode).not.toBe(0)
+      expect(await fs.readFile(existingSnapshot, "utf8")).toBe("authoritative artifact payload")
+      expect(after).toEqual(before)
+    })
+  })
+
+  test("executes the compiled package command entry", async () => {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "observable-trace-compiled-"))
+    try {
+      const packageJSON = JSON.parse(await fs.readFile(path.resolve(import.meta.dir, "../package.json"), "utf8")) as {
+        bin: Record<string, string>
+      }
+      const entry = path.resolve(import.meta.dir, "..", packageJSON.bin["observable-trace"])
+      const executable = path.join(outputDir, "observable-trace")
+      const built = runCommand(process.execPath, "build", "--compile", entry, "--outfile", executable)
+      const result = runCommand(executable)
+
+      expect(entry).toBe(cli)
+      expect(built.exitCode).toBe(0)
+      expect(result.exitCode).not.toBe(0)
+      expect(Buffer.from(result.stderr).toString()).toContain("usage: observable-trace render")
+    } finally {
+      await fs.rm(outputDir, { recursive: true, force: true })
+    }
   })
 
   test("rejects malformed commands and unreadable inputs without producing output", async () => {

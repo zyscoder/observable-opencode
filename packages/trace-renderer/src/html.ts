@@ -23,6 +23,7 @@ type RenderCaseTraceHtmlOptions = {
 }
 
 export type WriteProvenanceTraceHtmlOptions = {
+  artifactSourceRoot?: string
   forceStreaming?: boolean
   maxChunkBytes?: number
   streamingThreshold?: number
@@ -266,16 +267,33 @@ function validatePublishedSnapshot(target: string, expectedDigest: string, expec
   }
 }
 
-function publishArtifactSnapshot(caseRoot: string, target: AuthorizedArtifactTarget) {
-  const snapshotRoot = path.resolve(caseRoot, "artifacts", "render-snapshots", "sha256")
+function cleanupSnapshotDirectories(outputRoot: string) {
+  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
+  try {
+    fs.rmdirSync(snapshotRoot)
+  } catch {}
+  try {
+    fs.rmdirSync(path.dirname(snapshotRoot))
+  } catch {}
+}
+
+type PublishedArtifactSnapshot = {
+  path: string
+  created: boolean
+}
+
+function publishArtifactSnapshot(outputRoot: string, target: AuthorizedArtifactTarget): PublishedArtifactSnapshot | undefined {
+  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
   fs.mkdirSync(snapshotRoot, { recursive: true })
-  const realCaseRoot = fs.realpathSync(caseRoot)
+  const realOutputRoot = fs.realpathSync(outputRoot)
   const realSnapshotRoot = fs.realpathSync(snapshotRoot)
-  const snapshotRootRelative = path.relative(realCaseRoot, realSnapshotRoot)
+  const snapshotRootRelative = path.relative(realOutputRoot, realSnapshotRoot)
   if (!snapshotRootRelative || snapshotRootRelative.startsWith("..") || path.isAbsolute(snapshotRootRelative)) return undefined
 
   const temporary = path.join(snapshotRoot, `.snapshot.${process.pid}.${Math.random().toString(16).substring(2)}.tmp`)
   let temporaryFd: number | undefined
+  let published: string | undefined
+  let created = false
   try {
     temporaryFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
     const digest = createHash("sha256")
@@ -296,17 +314,24 @@ function publishArtifactSnapshot(caseRoot: string, target: AuthorizedArtifactTar
 
     const contentDigest = digest.digest("hex")
     const relativeSnapshot = `artifacts/render-snapshots/sha256/${contentDigest}`
-    const published = path.resolve(caseRoot, relativeSnapshot)
+    published = path.resolve(outputRoot, relativeSnapshot)
     try {
       fs.linkSync(temporary, published)
+      created = true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
       if (!validatePublishedSnapshot(published, contentDigest, sourcePosition)) return undefined
     }
     fs.unlinkSync(temporary)
     fsyncDirectory(snapshotRoot)
-    return relativeSnapshot
+    return { path: relativeSnapshot, created }
   } catch {
+    if (created && published) {
+      try {
+        fs.unlinkSync(published)
+      } catch {}
+      cleanupSnapshotDirectories(outputRoot)
+    }
     return undefined
   } finally {
     if (temporaryFd !== undefined) {
@@ -321,16 +346,29 @@ function publishArtifactSnapshot(caseRoot: string, target: AuthorizedArtifactTar
 }
 
 function publishArtifactSnapshots(
-  caseRoot: string | undefined,
+  outputRoot: string | undefined,
   targets: ReadonlyMap<string, AuthorizedArtifactTarget>,
 ) {
   const snapshots = new Map<string, string>()
-  if (!caseRoot) return snapshots
+  const created: string[] = []
+  if (!outputRoot) return { snapshots, created }
   for (const [relativePath, target] of targets) {
-    const snapshot = publishArtifactSnapshot(caseRoot, target)
-    if (snapshot) snapshots.set(relativePath, snapshot)
+    const snapshot = publishArtifactSnapshot(outputRoot, target)
+    if (!snapshot) continue
+    snapshots.set(relativePath, snapshot.path)
+    if (snapshot.created) created.push(snapshot.path)
   }
-  return snapshots
+  return { snapshots, created }
+}
+
+function rollbackPublishedArtifactSnapshots(outputRoot: string, snapshots: readonly string[]) {
+  const snapshotRoot = path.resolve(outputRoot, "artifacts", "render-snapshots", "sha256")
+  for (const snapshot of snapshots) {
+    try {
+      fs.unlinkSync(path.join(snapshotRoot, path.basename(snapshot)))
+    } catch {}
+  }
+  cleanupSnapshotDirectories(outputRoot)
 }
 
 export function writeProvenanceTraceHtmlFile(
@@ -341,15 +379,25 @@ export function writeProvenanceTraceHtmlFile(
   const maxChunkBytes = Math.max(1024, Math.floor(options.maxChunkBytes ?? 256 * 1024))
   const streamingThreshold = Math.max(1, Math.floor(options.streamingThreshold ?? 5000))
   const streaming = options.forceStreaming === true || trace.records.length >= streamingThreshold
-  const authorized = authorizedArtifactTargets(trace.artifacts, path.dirname(target))
+  const outputRoot = path.dirname(target)
+  const authorized = authorizedArtifactTargets(trace.artifacts, options.artifactSourceRoot ?? outputRoot)
   let artifactSnapshotPaths: ReadonlyMap<string, string>
+  let createdSnapshots: string[]
   try {
-    artifactSnapshotPaths = publishArtifactSnapshots(path.dirname(target), authorized)
+    const published = publishArtifactSnapshots(outputRoot, authorized)
+    artifactSnapshotPaths = published.snapshots
+    createdSnapshots = published.created
   } finally {
     closeAuthorizedArtifactTargets(authorized)
   }
   const chunks = provenanceTraceHtmlChunks(trace, { maxChunkBytes, artifactSnapshotPaths })
-  const written = writeAtomicChunks(target, chunks, maxChunkBytes)
+  let written: ReturnType<typeof writeAtomicChunks>
+  try {
+    written = writeAtomicChunks(target, chunks, maxChunkBytes)
+  } catch (error) {
+    rollbackPublishedArtifactSnapshots(outputRoot, createdSnapshots)
+    throw error
+  }
   return {
     mode: streaming ? "streaming" : "inline",
     record_count: trace.records.length,
@@ -880,7 +928,7 @@ export function renderCaseTraceHtml(trace: TraceSummary, options: RenderCaseTrac
   let artifactContents: Map<string, string>
   let artifactSnapshotPaths: ReadonlyMap<string, string>
   try {
-    artifactSnapshotPaths = publishArtifactSnapshots(options.artifactDir, allowedArtifactTargets)
+    artifactSnapshotPaths = publishArtifactSnapshots(options.artifactDir, allowedArtifactTargets).snapshots
     artifactContents = collectArtifactContents(trace, options, allowedArtifactTargets, artifactSnapshotPaths)
   } finally {
     closeAuthorizedArtifactTargets(allowedArtifactTargets)
