@@ -501,11 +501,17 @@ function componentStats(trace: ProvenanceTraceView) {
 function renderOverview(trace: ProvenanceTraceView) {
   const caseStatus = trace.manifest.case_status ?? trace.manifest.status
   const statusClass = caseStatus === "success" ? "ok" : caseStatus === "running" ? "running" : "bad"
+  const recoveryStatus = (trace.manifest as { recovery_status?: string }).recovery_status
   return `<section id="overview">
     <div class="section-title">
       <h2>Overview</h2>
       <span class="status-pill ${statusClass}">case ${escapeHtml(caseStatus)}</span>
     </div>
+    ${
+      recoveryStatus
+        ? `<div class="recovery-banner"><strong>Incomplete journal recovery</strong><span>${escapeHtml(recoveryStatus)}</span></div>`
+        : ""
+    }
     <div class="overview-grid">
       <div><span class="label">Case</span><strong>${escapeHtml(trace.manifest.case_id)}</strong></div>
       <div><span class="label">Run</span><code>${escapeHtml(trace.manifest.run_id)}</code></div>
@@ -1324,6 +1330,7 @@ function* provenanceTraceHtmlSemanticChunks(
     .status-pill.ok { color: var(--accent); background: var(--accent-soft); border-color: #a7d8d0; }
     .status-pill.bad { color: var(--bad); background: #fff1f0; border-color: #fecdca; }
     .status-pill.running { color: var(--amber); background: #fff7e6; border-color: #fedf89; }
+    .recovery-banner { display: flex; gap: 8px; align-items: center; margin: 0 0 14px; padding: 10px 12px; color: var(--bad); background: #fff1f0; border: 1px solid #fecdca; font-size: 13px; }
     .kind { color: var(--accent); }
     .component { color: var(--blue); }
     .status { color: var(--muted); }
