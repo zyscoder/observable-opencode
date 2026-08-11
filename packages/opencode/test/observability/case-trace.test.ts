@@ -6952,9 +6952,9 @@ describe("case trace", () => {
     })
 
     const caseDir = path.join(dir, "sigkill-case")
-    const recordsFile = path.join(caseDir, "records.jsonl")
-    expect(await waitForExists(recordsFile)).toBe(true)
-    expect(await fs.readFile(recordsFile, "utf8")).toContain("fixture_signal_sigkill_ready")
+    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigkill_ready")
+    expect(persistedJournal).toBeDefined()
+    assertCausalIRJournalAudit(persistedJournal!)
     await Bun.sleep(50)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(false)
     expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
