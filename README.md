@@ -53,7 +53,7 @@ export OPENCODE_CONFIG_CONTENT='{
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}"
+        "apiKey": "{env:APIKEY}",
         "timeout": "720000",
         "chunkTimeout": "720000"
       },
