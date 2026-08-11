@@ -46,7 +46,7 @@ export APIKEY="<your-api-key>"
 export URL="https://api.deepseek.com"
 
 export OPENCODE_CONFIG_CONTENT='{
-  "model": "{env:MODEL}",
+  "model": "compatible/{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
@@ -54,9 +54,11 @@ export OPENCODE_CONFIG_CONTENT='{
       "options": {
         "baseURL": "{env:URL}",
         "apiKey": "{env:APIKEY}"
+        "timeout": 720000,
+        "chunkTimeout": 720000
       },
       "models": {
-        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+        "{env:MODEL}": {"name": {env:MODEL}}
       }
     }
   }
