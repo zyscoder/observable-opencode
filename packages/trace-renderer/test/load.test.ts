@@ -618,10 +618,7 @@ describe("loadRenderableTrace", () => {
   })
 
   test("loads the repository's finalized projection-only compatibility trace unchanged", () => {
-    const traceFile = path.resolve(
-      import.meta.dir,
-      "../../../.benchmark-runs/attribution-convergence-vnext-20260803/sphinx-flash-probe/input/trace.json",
-    )
+    const traceFile = path.resolve(import.meta.dir, "fixtures/sphinx-projection-only/trace.json")
     const fixture = JSON.parse(fs.readFileSync(traceFile, "utf8")) as { records: unknown[]; dataflow_edges: unknown[] }
 
     const result = loadRenderableTrace(traceFile)

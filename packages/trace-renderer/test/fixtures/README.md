@@ -3,6 +3,9 @@
 `opencode-pre-migration-canonical-trace.json` preserves a canonical historical
 manifest that still advertises the renderer-owned `trace.html` output.
 
+`sphinx-projection-only/trace.json` preserves the historical projection-only
+compatibility shape without depending on ignored local benchmark output.
+
 These renderer-owned fixtures were derived from `provenance-trace.json` files
 captured on 2026-08-11 from the OpenCode runtime scenarios in
 `packages/opencode/test/observability/case-trace-runtime.test.ts`:
