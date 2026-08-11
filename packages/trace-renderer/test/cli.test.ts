@@ -6,6 +6,10 @@ import path from "node:path"
 import { CausalIRStore } from "opencode/observability/causal-ir"
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts")
+const preMigrationCanonicalFixture = path.resolve(
+  import.meta.dir,
+  "fixtures/opencode-pre-migration-canonical-trace.json",
+)
 
 function sha256(content: Uint8Array) {
   return createHash("sha256").update(content).digest("hex")
@@ -123,6 +127,23 @@ describe("observable-trace render", () => {
           sha256(Buffer.from("authoritative artifact payload")),
         ),
       ])
+    })
+  })
+
+  test("renders a pre-migration canonical trace_html manifest while protecting semantic manifest files", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      await fs.copyFile(preMigrationCanonicalFixture, path.join(caseDir, "trace.json"))
+      await fs.writeFile(path.join(caseDir, "records.jsonl"), '{"historical":"journal"}\n')
+      await fs.writeFile(path.join(caseDir, "historical-semantic.json"), '{"historical":"semantic"}\n')
+
+      const rendered = run("render", caseDir)
+
+      expect(rendered.exitCode).toBe(0)
+      expect(Buffer.from(rendered.stdout).toString()).toContain(`output: ${path.join(caseDir, "trace.html")}`)
+      expect((await fs.stat(path.join(caseDir, "trace.html"))).isFile()).toBe(true)
+
+      await expectRejectedCollision(caseDir, path.join(caseDir, "historical-semantic.json"))
+      await expectRejectedCollision(caseDir, path.join(caseDir, "records.jsonl"))
     })
   })
 

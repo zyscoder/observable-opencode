@@ -7007,16 +7007,16 @@ describe("case trace", () => {
       "legacy-trace.json",
       "provenance-trace.json",
       "partial/latest.json",
-      "trace.html",
     ]) {
       expect(await exists(path.join(caseDir, relative))).toBe(false)
     }
+    expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toBe("stale offline render")
 
     second.kill("SIGKILL")
     await second.exited.catch(() => undefined)
     expect(await new Response(second.stderr).text()).toBe("")
     expect(await exists(path.join(caseDir, "trace.json"))).toBe(false)
-    expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
+    expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toBe("stale offline render")
 
     const rendered = Bun.spawnSync({
       cmd: [process.execPath, renderer, "render", caseDir, "--output", path.join(dir, "recovered.html")],

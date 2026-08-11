@@ -5,6 +5,7 @@ import {
   CausalIRStore,
   projectProvenanceTrace,
   replayCausalIRJournal,
+  validateCausalIRJournal,
   type CausalIRJournalEntry,
   type CausalIRNodeInput,
 } from "@/observability/causal-ir"
@@ -401,6 +402,7 @@ describe("causal IR store", () => {
 
     const expectedReplacementHash = payloadHashForAudit((journal[1]?.data as any).snapshot.nodes[0])
     expect(journal[2]?.previous_payload_hash).toBe(expectedReplacementHash)
+    expect(() => validateCausalIRJournal(journal)).not.toThrow()
 
     const deletedJournal: CausalIRJournalEntry[] = []
     const deletedStore = new CausalIRStore({
@@ -413,6 +415,7 @@ describe("causal IR store", () => {
     deletedStore.createNode(node("node_deleted", { chosen_action: "recreated" }))
 
     expect(deletedJournal[2]?.previous_payload_hash).toBeUndefined()
+    expect(() => validateCausalIRJournal(deletedJournal)).not.toThrow()
   })
 
   test("clears removed edge payload hashes after replacement", () => {
@@ -427,6 +430,7 @@ describe("causal IR store", () => {
     store.createEdge(edge("edge_deleted"))
 
     expect(journal[2]?.previous_payload_hash).toBeUndefined()
+    expect(() => validateCausalIRJournal(journal)).not.toThrow()
   })
 
   test("chains canonical payload hashes using locale-independent lexical key ordering", () => {

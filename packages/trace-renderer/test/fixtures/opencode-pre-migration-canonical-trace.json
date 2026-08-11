@@ -1,0 +1,55 @@
+{
+  "trace_version": "6.0",
+  "causal_ir_version": "1.0",
+  "manifest": {
+    "trace_version": "6.0",
+    "case_id": "pre-migration-canonical-case",
+    "run_id": "pre-migration-canonical-run",
+    "started_at": "2026-08-11T00:00:00.000Z",
+    "ended_at": "2026-08-11T00:00:00.010Z",
+    "duration_ms": 10,
+    "status": "success",
+    "server_status": "success",
+    "process_status": "success",
+    "case_status": "success",
+    "collection_mode": "passive_sidecar",
+    "behavior_impact": "none",
+    "environment": {},
+    "token_usage": {},
+    "files": {
+      "trace": "trace.json",
+      "records": "records.jsonl",
+      "historical_semantic": "historical-semantic.json",
+      "trace_html": "trace.html"
+    }
+  },
+  "nodes": [],
+  "edges": [],
+  "artifacts": [],
+  "diagnostics": [],
+  "journal": {
+    "schema_version": "1.0",
+    "format": "causal-ir-jsonl",
+    "path": "records.jsonl",
+    "summary_scope": "entries_before_lifecycle_entry",
+    "entry_count": 0,
+    "last_sequence": 0,
+    "poisoned": false
+  },
+  "metrics": {
+    "spans": 0,
+    "events": 0,
+    "records": 0,
+    "dataflow_edges": 0,
+    "artifacts": 0,
+    "token_usage": {},
+    "trace_health": {
+      "issues": []
+    }
+  },
+  "compatibility": {
+    "provenance_projection": "provenance-trace.json"
+  },
+  "records": [],
+  "dataflow_edges": []
+}

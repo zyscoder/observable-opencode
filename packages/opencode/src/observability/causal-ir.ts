@@ -1515,6 +1515,10 @@ function replayableCanonicalNode(input: unknown, runID: string, caseID: string):
   )
 }
 
+function canonicalNodePayloadHashMatches(node: CausalIRNode) {
+  return node.integrity.payload_hash === payloadHash(node.payload)
+}
+
 function replayableCanonicalEdge(input: unknown): input is CausalIREdge {
   if (!journalRecord(input)) return false
   return (
@@ -1550,7 +1554,9 @@ function replayableSnapshot(input: unknown, runID: string, caseID: string): inpu
     input.runID === runID &&
     input.caseID === caseID &&
     Array.isArray(input.nodes) &&
-    input.nodes.every((node) => replayableCanonicalNode(node, runID, caseID)) &&
+    input.nodes.every(
+      (node) => replayableCanonicalNode(node, runID, caseID) && canonicalNodePayloadHashMatches(node),
+    ) &&
     Array.isArray(input.edges) &&
     input.edges.every(replayableCanonicalEdge) &&
     Array.isArray(input.artifacts) &&
@@ -1560,10 +1566,87 @@ function replayableSnapshot(input: unknown, runID: string, caseID: string): inpu
   )
 }
 
+function replayableJournalSummary(input: unknown): input is CausalIRJournalSummary {
+  if (!journalRecord(input)) return false
+  return (
+    input.schema_version === CAUSAL_IR_VERSION &&
+    input.format === "causal-ir-jsonl" &&
+    input.path === "records.jsonl" &&
+    input.summary_scope === "entries_before_lifecycle_entry" &&
+    Number.isSafeInteger(input.entry_count) &&
+    Number.isSafeInteger(input.last_sequence) &&
+    Number(input.entry_count) >= 0 &&
+    input.entry_count === input.last_sequence &&
+    (input.last_payload_hash === undefined || journalString(input.last_payload_hash)) &&
+    typeof input.poisoned === "boolean"
+  )
+}
+
+function replayableLifecycleTrace(input: unknown, runID: string, caseID: string): input is CausalIRTraceDocument {
+  if (!isCausalIRTraceDocument(input) || !journalRecord(input.manifest)) return false
+  return (
+    input.manifest.run_id === runID &&
+    input.manifest.case_id === caseID &&
+    input.nodes.every(
+      (node) => replayableCanonicalNode(node, runID, caseID) && canonicalNodePayloadHashMatches(node),
+    ) &&
+    input.edges.every(replayableCanonicalEdge) &&
+    input.artifacts.every(replayableArtifact) &&
+    input.diagnostics.every(replayableDiagnostic) &&
+    replayableJournalSummary(input.journal)
+  )
+}
+
+function lifecycleSnapshotMatchesTrace(data: CausalIRLifecycleJournalData) {
+  const trace = data.trace!
+  return (
+    payloadHash(data.data) === payloadHash(trace.manifest) &&
+    payloadHash(data.snapshot.nodes) === payloadHash(trace.nodes) &&
+    payloadHash(data.snapshot.edges) === payloadHash(trace.edges) &&
+    payloadHash(data.snapshot.artifacts) === payloadHash(trace.artifacts) &&
+    payloadHash(data.snapshot.diagnostics) === payloadHash(trace.diagnostics)
+  )
+}
+
+function journalEntryHashKey(operation: CausalIRJournalEntry["operation"], entityID: string) {
+  switch (operation) {
+    case "node.created":
+    case "node.updated":
+      return `node:${entityID}`
+    case "edge.created":
+      return `edge:${entityID}`
+    case "artifact.created":
+    case "artifact.reused":
+      return `artifact:${entityID}`
+    case "diagnostic.created":
+      return `diagnostic:${entityID}`
+    case "case.checkpointed":
+    case "case.finalized":
+      return `case:${entityID}`
+  }
+}
+
+function rebuildJournalEntityPayloadHashes<T extends Record<string, unknown>>(
+  payloadHashes: Map<string, string>,
+  hashType: string,
+  items: T[],
+  idKey: keyof T,
+) {
+  const prefix = `${hashType}:`
+  for (const key of payloadHashes.keys()) {
+    if (key.startsWith(prefix)) payloadHashes.delete(key)
+  }
+  for (const item of items) {
+    const entityID = item[idKey]
+    if (typeof entityID === "string") payloadHashes.set(`${hashType}:${entityID}`, payloadHash(item))
+  }
+}
+
 export function validateCausalIRJournal(journal: unknown[], options: CausalIRJournalValidationOptions = {}): void {
   if (!journal.length) throw new CausalIRJournalValidationError(1, "journal is empty")
   let runID = ""
   let caseID = ""
+  const payloadHashes = new Map<string, string>()
 
   for (let index = 0; index < journal.length; index++) {
     const line = index + 1
@@ -1584,14 +1667,23 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
       throw new CausalIRJournalValidationError(line, `unknown operation ${String(item.operation)}`)
     if (!journalString(item.record_type) || !journalString(item.entity_id) || !journalString(item.payload_hash))
       throw new CausalIRJournalValidationError(line, "missing record type, entity identity, or payload hash")
+    const operation = item.operation as CausalIRJournalEntry["operation"]
+    const entryPayloadHash = payloadHash(item.data)
+    if (item.payload_hash !== entryPayloadHash)
+      throw new CausalIRJournalValidationError(line, "journal payload hash does not match data")
+    const hashKey = journalEntryHashKey(operation, item.entity_id)
+    if (item.previous_payload_hash !== payloadHashes.get(hashKey))
+      throw new CausalIRJournalValidationError(line, "previous payload hash does not match entity history")
 
-    switch (item.operation) {
+    switch (operation) {
       case "node.created":
       case "node.updated":
         if (!replayableCanonicalNode(item.data, runID, caseID))
           throw new CausalIRJournalValidationError(line, "malformed canonical node entry")
         if (item.entity_id !== item.data.node_id)
           throw new CausalIRJournalValidationError(line, "node entity identity does not match payload")
+        if (!canonicalNodePayloadHashMatches(item.data))
+          throw new CausalIRJournalValidationError(line, "canonical node payload hash does not match payload")
         break
       case "edge.created":
         if (!replayableCanonicalEdge(item.data))
@@ -1616,14 +1708,29 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
           throw new CausalIRJournalValidationError(line, "malformed checkpoint entry")
         if (item.entity_id !== caseID)
           throw new CausalIRJournalValidationError(line, "checkpoint case identity does not match journal")
+        if (journalRecord(item.data.data) && item.data.data.reason === "nodes.replaced") {
+          rebuildJournalEntityPayloadHashes(payloadHashes, "node", item.data.snapshot.nodes, "node_id")
+          rebuildJournalEntityPayloadHashes(payloadHashes, "edge", item.data.snapshot.edges, "edge_id")
+        } else if (journalRecord(item.data.data) && item.data.data.reason === "edges.replaced") {
+          rebuildJournalEntityPayloadHashes(payloadHashes, "edge", item.data.snapshot.edges, "edge_id")
+        }
         break
       case "case.finalized":
-        if (!isCompactFinalizationJournalData(item.data))
-          throw new CausalIRJournalValidationError(line, "malformed compact finalization entry")
         if (item.entity_id !== caseID)
           throw new CausalIRJournalValidationError(line, "finalization case identity does not match journal")
+        if (item.record_type !== "finish")
+          throw new CausalIRJournalValidationError(line, "finalization record type does not match journal")
+        if (isCompactFinalizationJournalData(item.data)) break
+        if (
+          !isLifecycleJournalData(item.data) ||
+          !replayableSnapshot(item.data.snapshot, runID, caseID) ||
+          !replayableLifecycleTrace(item.data.trace, runID, caseID) ||
+          !lifecycleSnapshotMatchesTrace(item.data)
+        )
+          throw new CausalIRJournalValidationError(line, "malformed lifecycle finalization entry")
         break
     }
+    payloadHashes.set(hashKey, entryPayloadHash)
   }
 
   if (options.requireInitialRunNode) {
@@ -2459,6 +2566,11 @@ export function replayCausalIRTrace(journal: unknown[]): CausalIRTraceDocument |
  * of producing the canonical trace. Checkpoints are intentionally excluded.
  */
 export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceDocument | undefined {
+  try {
+    validateCausalIRJournal(journal)
+  } catch {
+    return undefined
+  }
   const terminal = journal.at(-1)
   if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) return undefined
   const entry = terminal as Partial<CausalIRJournalEntry>

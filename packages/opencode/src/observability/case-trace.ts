@@ -11164,7 +11164,6 @@ class ActiveCaseTrace {
       "legacy-trace.json",
       "provenance-trace.json",
       "partial",
-      "trace.html",
     ]) {
       fs.rmSync(path.join(this.caseDir, relative), { recursive: true, force: true })
     }

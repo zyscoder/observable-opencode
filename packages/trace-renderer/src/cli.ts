@@ -51,7 +51,8 @@ function assertOutputDoesNotCollide(output: string, loaded: ReturnType<typeof lo
   const protectedPaths = new Set(semanticTraceFiles.map((relative) => path.resolve(loaded.caseDir, relative)))
   const files = (loaded.trace.manifest as Record<string, unknown>).files
   if (files && typeof files === "object" && !Array.isArray(files)) {
-    for (const value of Object.values(files)) {
+    for (const [key, value] of Object.entries(files)) {
+      if (key === "trace_html") continue
       if (typeof value !== "string" || !value || path.isAbsolute(value)) continue
       const resolved = path.resolve(loaded.caseDir, value)
       const relative = path.relative(loaded.caseDir, resolved)

@@ -386,8 +386,9 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 ```
 
 复用稳定 `OPENCODE_CASE_ID` 启动新 trace 时，runtime 会先使上一 run 的 terminal/derived
-输出失效（包括旧的离线 `trace.html`），再记录新 journal，因此 live `records.jsonl` 始终属于
-当前 run。runtime 自身仍不会生成 HTML。
+语义 JSON 输出失效，再记录新 journal，因此 live `records.jsonl` 始终属于当前 run。已有的
+离线 `trace.html` 会保留，但可能仍展示上一 run；必须显式重新渲染才能更新。runtime 不拥有、
+不删除也不生成 HTML。
 
 ## 离线渲染 Trace
 
@@ -402,7 +403,7 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 已有已完成的 `trace.json`，renderer 会生成完整视图。若只有 `records.jsonl`，renderer 会
 回放 journal 并在 HTML 中标记为不完整恢复，不能把它当作成功完成的 case。`SIGKILL` 无法
 执行 finalizer，也不会留下当前 run 的 `partial/latest.json`，因此只能依赖被杀前已持久化的
-`records.jsonl`；之后可渲染 journal-only 恢复结果。
+`records.jsonl`；之后可显式重新渲染 journal-only 恢复结果，替换可能保留的上一 run HTML。
 
 生成的 HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 多层转换、
 LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因不读取 HTML，也不应将

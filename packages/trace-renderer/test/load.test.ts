@@ -120,6 +120,55 @@ function createFinalizedJournal() {
   return journal
 }
 
+function createLegacyLifecycleFinalizedJournal() {
+  const { journal, store } = createJournal()
+  store.checkpoint({ phase: "legacy-before-finalization" })
+  const snapshot = store.snapshot()
+  const trace = canonicalTrace(snapshot, store.journalSummary())
+  const terminal = {
+    sequence: journal.length + 1,
+    time: "2026-08-11T00:00:01.000Z",
+    run_id: "run_load_test",
+    case_id: "case_load_test",
+    operation: "case.finalized",
+    record_type: "finish",
+    entity_id: "case_load_test",
+    previous_payload_hash: (journal.at(-1) as any).payload_hash,
+    data: { snapshot, data: trace.manifest, trace },
+  }
+  rehashEntry(terminal)
+  journal.push(terminal)
+  return journal
+}
+
+function createJournalWithEntityChains() {
+  const { journal, store } = createJournal()
+  const response = store.nodes.find((node) => node.node_id === "response_1")!
+  response.title = "updated response"
+  store.updateNode(response)
+  store.createEdge({
+    edge_id: "input_to_response",
+    from: { type: "external", id: "input_2" },
+    to: { type: "node", id: "response_1" },
+    relation: "produced",
+    eligible_for_attribution: true,
+  })
+  store.reuseArtifact({
+    artifact_id: "artifact_1",
+    hash: "artifact-hash-reused",
+    path: "artifacts/input-reused.txt",
+    metadata: { role: "input" },
+  })
+  store.createDiagnostic({
+    diagnostic_id: "diagnostic_1",
+    kind: "integrity_notice",
+    message: "updated diagnostic",
+  })
+  store.checkpoint({ phase: "first" })
+  store.checkpoint({ phase: "second" })
+  return journal as any[]
+}
+
 function canonicalJSON(input: unknown): string {
   if (input === null || typeof input !== "object") return JSON.stringify(input) ?? "null"
   if (Array.isArray(input)) return `[${input.map(canonicalJSON).join(",")}]`
@@ -246,10 +295,87 @@ describe("loadRenderableTrace", () => {
     })
   })
 
+  test("loads a terminal valid legacy lifecycle finalization", () => {
+    withCaseDirectory((caseDir) => {
+      const journalFile = path.join(caseDir, "records.jsonl")
+      fs.writeFileSync(
+        journalFile,
+        createLegacyLifecycleFinalizedJournal()
+          .map((entry) => JSON.stringify(entry))
+          .join("\n"),
+      )
+
+      const result = loadRenderableTrace(journalFile)
+
+      expect(result).toMatchObject({ caseDir, source: "records.jsonl", incomplete: false })
+      expect(result.trace.manifest).toMatchObject({
+        run_id: "run_load_test",
+        case_id: "case_load_test",
+        status: "success",
+      })
+      expect(result.trace.records).toEqual(
+        expect.arrayContaining([expect.objectContaining({ record_id: "response_1" })]),
+      )
+    })
+  })
+
+  test("rejects invalid legacy lifecycle structure, identity, and terminal payload hash at its line", () => {
+    const cases: Array<[string, (terminal: any) => void]> = [
+      [
+        "snapshot identity",
+        (terminal) => {
+          terminal.data.snapshot.runID = "run_tampered"
+          rehashEntry(terminal)
+        },
+      ],
+      [
+        "trace identity",
+        (terminal) => {
+          terminal.data.trace.manifest.case_id = "case_tampered"
+          rehashEntry(terminal)
+        },
+      ],
+      [
+        "snapshot and trace graph mismatch",
+        (terminal) => {
+          terminal.data.trace.nodes = []
+          rehashEntry(terminal)
+        },
+      ],
+      [
+        "lifecycle canonical node payload hash",
+        (terminal) => {
+          terminal.data.snapshot.nodes[0].integrity.payload_hash = "0".repeat(64)
+          terminal.data.trace.nodes[0].integrity.payload_hash = "0".repeat(64)
+          rehashEntry(terminal)
+        },
+      ],
+      [
+        "terminal payload hash",
+        (terminal) => {
+          terminal.data.data.status = "error"
+        },
+      ],
+    ]
+
+    for (const [label, tamper] of cases) {
+      withCaseDirectory((caseDir) => {
+        const journal = createLegacyLifecycleFinalizedJournal() as any[]
+        tamper(journal.at(-1))
+        const terminalLine = journal.length
+        const journalFile = path.join(caseDir, "records.jsonl")
+        fs.writeFileSync(journalFile, journal.map((entry) => JSON.stringify(entry)).join("\n"))
+
+        expect(() => loadRenderableTrace(journalFile), label).toThrow(`records.jsonl:${terminalLine}`)
+      })
+    }
+  })
+
   test("rejects a compact finalization whose integrity hash does not match the replayed graph", () => {
     const journal = createFinalizedJournal()
     const finalization = journal.at(-1) as { data: { graph: { integrity_hash: string } } }
     finalization.data.graph.integrity_hash = "0".repeat(64)
+    rehashEntry(finalization)
 
     expect(replayFinalizedCausalIRTrace(journal)).toBeUndefined()
 
@@ -465,6 +591,63 @@ describe("loadRenderableTrace", () => {
 
       expect(() => loadRenderableTrace(journalFile)).toThrow("records.jsonl:1")
     })
+  })
+
+  test("rejects nonterminal entry and canonical node payload hash tampering at the affected line", () => {
+    const cases: Array<[string, (journal: any[]) => void, number]> = [
+      [
+        "entry payload hash",
+        (journal) => {
+          journal[1].data.component = "tampered-component"
+        },
+        2,
+      ],
+      [
+        "canonical node payload hash",
+        (journal) => {
+          journal[1].data.payload.text = "tampered response"
+          rehashEntry(journal[1])
+        },
+        2,
+      ],
+    ]
+
+    for (const [label, tamper, line] of cases) {
+      withCaseDirectory((caseDir) => {
+        const journal = createJournal().journal as any[]
+        tamper(journal)
+        const journalFile = path.join(caseDir, "records.jsonl")
+        fs.writeFileSync(journalFile, journal.map((entry) => JSON.stringify(entry)).join("\n"))
+
+        expect(() => loadRenderableTrace(journalFile), label).toThrow(`records.jsonl:${line}`)
+      })
+    }
+  })
+
+  test("rejects broken per-entity previous payload hash chains at the affected line", () => {
+    const targets: Array<[string, (entry: any) => boolean]> = [
+      ["node", (entry) => entry.operation === "node.updated" && entry.entity_id === "response_1"],
+      ["edge", (entry) => entry.operation === "edge.created" && entry.data.from.ref_id === "input_2"],
+      ["artifact", (entry) => entry.operation === "artifact.reused"],
+      [
+        "diagnostic",
+        (entry) => entry.operation === "diagnostic.created" && entry.data.message === "updated diagnostic",
+      ],
+      ["case", (entry) => entry.operation === "case.checkpointed" && entry.data.data.phase === "second"],
+    ]
+
+    for (const [label, matches] of targets) {
+      withCaseDirectory((caseDir) => {
+        const journal = createJournalWithEntityChains()
+        const index = journal.findIndex(matches)
+        expect(index, label).toBeGreaterThan(0)
+        journal[index].previous_payload_hash = "0".repeat(64)
+        const journalFile = path.join(caseDir, "records.jsonl")
+        fs.writeFileSync(journalFile, journal.map((entry) => JSON.stringify(entry)).join("\n"))
+
+        expect(() => loadRenderableTrace(journalFile), label).toThrow(`records.jsonl:${index + 1}`)
+      })
+    }
   })
 
   test("rejects syntactically valid but structurally invalid journals with a line number", () => {
