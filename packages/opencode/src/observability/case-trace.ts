@@ -21,7 +21,6 @@ import {
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
-import { writeProvenanceTraceHtmlFile } from "./case-trace-html"
 import { SessionTraceRegistry, traceRouteHint } from "./case-trace-session"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
@@ -871,7 +870,7 @@ export type TraceManifest = {
     trace: string
     legacy_trace: string
     provenance_trace?: string
-    trace_html: string
+    trace_html?: string
     records: string
     raw_events: string
     partial_latest: string
@@ -5219,10 +5218,8 @@ class ActiveCaseTrace {
   readonly recordsFile: string
   readonly traceFile: string
   readonly legacyTraceFile: string
-  readonly htmlFile: string
   readonly manifestFile: string
   readonly provenanceTraceFile: string
-  readonly partialDir: string
   readonly partialFile: string
   readonly startedAt = Date.now()
   readonly startedIso = nowIso()
@@ -5289,7 +5286,6 @@ class ActiveCaseTrace {
   private recordedSkillRequestNames = new Set<string>()
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
-  private nextPartialWrite = 0
 
   constructor(
     config: CaseTraceConfig,
@@ -5304,11 +5300,9 @@ class ActiveCaseTrace {
     this.recordsFile = path.join(this.caseDir, "records.jsonl")
     this.traceFile = path.join(this.caseDir, "trace.json")
     this.legacyTraceFile = path.join(this.caseDir, "legacy-trace.json")
-    this.htmlFile = path.join(this.caseDir, "trace.html")
     this.manifestFile = path.join(this.caseDir, "manifest.json")
     this.provenanceTraceFile = path.join(this.caseDir, "provenance-trace.json")
-    this.partialDir = path.join(this.caseDir, "partial")
-    this.partialFile = path.join(this.partialDir, "latest.json")
+    this.partialFile = path.join(this.caseDir, "partial", "latest.json")
     this.input = config.input
     const configuredSubjectRevision = config.subjectRevision?.trim()
     const environmentSubjectRevision = process.env.OPENCODE_TRACE_SUBJECT_REVISION?.trim()
@@ -5479,7 +5473,6 @@ class ActiveCaseTrace {
         ])
         node.artifact_refs = this.collectArtifactRefs(node.data)
         this.causalIR.updateNode(node)
-        this.writePartial()
       }
     }
   }
@@ -6269,7 +6262,7 @@ class ActiveCaseTrace {
           behavior_impact: "none",
         },
       },
-      { trackGeneration: false, writePartial: false },
+      { trackGeneration: false },
     )
     this.contextSetNodeIDsByKey.set(key, node.node_id)
     if (input.kind === "confirmed_tool_selection") {
@@ -8002,7 +7995,6 @@ class ActiveCaseTrace {
       existing.source_refs = mergeRefs(existing.source_refs, sourceRefs)
       existing.artifact_refs = this.collectArtifactRefs(existing.data)
       this.causalIR.updateNode(existing)
-      this.writePartial()
       return existing
     }
     const node = this.node({
@@ -8149,7 +8141,6 @@ class ActiveCaseTrace {
         ...diagnosticData,
       })
       const stored = this.causalIR.updateNode(existing) as CausalNode
-      this.writePartial()
       return stored
     }
     const node = this.node({
@@ -8236,7 +8227,7 @@ class ActiveCaseTrace {
 
   node(
     input: CausalNodeInput,
-    options: { trackGeneration?: boolean; writePartial?: boolean } = {},
+    options: { trackGeneration?: boolean } = {},
   ) {
     const temporal = normalizeTemporalReferences(input)
     const normalized = temporal.value
@@ -8290,7 +8281,6 @@ class ActiveCaseTrace {
       if (stored.kind === "llm.call") this.remember(this.recentLLMNodeIDs, stored.node_id)
     }
     this.createTemporalAdvisoryEdges(stored, temporalAdvisoryRefs)
-    if (options.writePartial !== false) this.writePartial()
     return stored
   }
 
@@ -8348,7 +8338,6 @@ class ActiveCaseTrace {
       const target = this.causalNodes.find((node) => node.node_id === normalized.to.id)
       if (target) this.createTemporalAdvisoryEdges(target, this.currentSourceRefs())
     }
-    this.writePartial()
     return stored
   }
 
@@ -8366,7 +8355,6 @@ class ActiveCaseTrace {
         status: "suppressed",
         ...diagnosticData,
       })
-      this.writePartial()
       return undefined
     }
     const sourceRefs = this.observationSourceRefs(input)
@@ -8758,7 +8746,7 @@ class ActiveCaseTrace {
             journal: this.causalIR.journalSummary(),
           }
       const provenance = this.projectProvenanceSummary(emittedCausalIR)
-      const persisted = this.persistTerminalSnapshot(emittedCausalIR, provenance, summary, false)
+      const persisted = this.persistTerminalSnapshot(emittedCausalIR, provenance, summary)
       if (!this.terminalSnapshotComplete(persisted)) {
         this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, emittedCausalIR, summary)
       }
@@ -8775,7 +8763,7 @@ class ActiveCaseTrace {
     let result: Record<string, unknown> = {
       reason: signal,
       signal,
-      trace_html_flush: "process_signal",
+      trace_flush: "process_signal",
     }
     try {
       result = {
@@ -8797,7 +8785,7 @@ class ActiveCaseTrace {
     const causalIR = this.causalIRSummary("cancelled", caseStatus)
     const summary = this.summary("cancelled", causalIR)
     const provenance = this.projectProvenanceSummary(causalIR)
-    const persisted = this.persistTerminalSnapshot(causalIR, provenance, summary, true)
+    const persisted = this.persistTerminalSnapshot(causalIR, provenance, summary)
     if (!this.terminalSnapshotComplete(persisted)) {
       this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, causalIR, summary)
     }
@@ -8813,7 +8801,7 @@ class ActiveCaseTrace {
     } catch {}
     if (!fallback) {
       try {
-        fallback = JSON.parse(fs.readFileSync(this.partialFile, "utf8")) as CausalIRTraceSummary
+        fallback = JSON.parse(fs.readFileSync(this.traceFile, "utf8")) as CausalIRTraceSummary
       } catch {}
     }
     if (!fallback) {
@@ -8822,7 +8810,6 @@ class ActiveCaseTrace {
         trace: false,
         manifest: false,
         partial: false,
-        html: false,
         canonical_removed: canonicalRemoved,
       })
       this.publishTerminalLocation("cancelled")
@@ -8848,7 +8835,6 @@ class ActiveCaseTrace {
       status,
       caseDir: this.caseDir,
       traceFile: this.traceFile,
-      htmlFile: this.htmlFile,
       partialFile: this.partialFile,
     })
     if (!publication) return
@@ -8860,7 +8846,6 @@ class ActiveCaseTrace {
     causalIR: CausalIRTraceSummary,
     provenance: ProvenanceTraceView,
     legacy: TraceSummary | undefined,
-    forceStreaming: boolean,
   ) {
     const trace = this.safeWrite(this.traceFile, streamingJson(causalIR))
     const manifest = this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
@@ -8869,12 +8854,11 @@ class ActiveCaseTrace {
       : this.safeWrite(this.partialFile, streamingJson(causalIR))
     this.safeWrite(this.provenanceTraceFile, streamingJson(provenance))
     if (legacy) this.safeWrite(this.legacyTraceFile, streamingJson(legacy))
-    const html = this.safeWriteProvenanceHtml(provenance, forceStreaming)
-    return { trace, manifest, partial, html }
+    return { trace, manifest, partial }
   }
 
-  private terminalSnapshotComplete(result: { trace: boolean; manifest: boolean; partial: boolean; html: boolean }) {
-    return result.trace && result.manifest && result.partial && result.html
+  private terminalSnapshotComplete(result: { trace: boolean; manifest: boolean; partial: boolean }) {
+    return result.trace && result.manifest && result.partial
   }
 
   private persistTerminalSnapshotEmergency(
@@ -8904,11 +8888,9 @@ class ActiveCaseTrace {
       trace: this.safeWrite(this.traceFile, streamingJson(fallback)),
       manifest: this.safeWrite(this.manifestFile, jsonPretty(manifest)),
       partial: this.safeWrite(this.partialFile, streamingJson(fallback)),
-      html: false,
     }
     if (provenance) {
       this.safeWrite(this.provenanceTraceFile, streamingJson(provenance))
-      result.html = this.safeWriteProvenanceHtml(provenance, true)
     }
     const canonicalRemoved = result.trace || this.removeStaleCanonicalTrace()
     if (!result.partial) {
@@ -8916,12 +8898,7 @@ class ActiveCaseTrace {
         fs.unlinkSync(this.partialFile)
       } catch {}
     }
-    if (!result.html) {
-      try {
-        fs.unlinkSync(this.htmlFile)
-      } catch {}
-    }
-    if (!result.trace || !canonicalRemoved || !result.manifest || !result.html || !result.partial) {
+    if (!result.trace || !canonicalRemoved || !result.manifest || !result.partial) {
       this.reportTerminalPersistenceFailure(signal, { ...result, canonical_removed: canonicalRemoved })
     }
     return result
@@ -8952,7 +8929,7 @@ class ActiveCaseTrace {
 
   private reportTerminalPersistenceFailure(
     signal: NodeJS.Signals | undefined,
-    result: { trace: boolean; manifest: boolean; partial: boolean; html: boolean; canonical_removed?: boolean },
+    result: { trace: boolean; manifest: boolean; partial: boolean; canonical_removed?: boolean },
   ) {
     try {
       process.stderr.write(
@@ -9031,7 +9008,6 @@ class ActiveCaseTrace {
         trace: "trace.json",
         legacy_trace: "legacy-trace.json",
         provenance_trace: "provenance-trace.json",
-        trace_html: "trace.html",
         records: "records.jsonl",
         raw_events: "raw-events.jsonl",
         partial_latest: "partial/latest.json",
@@ -9290,7 +9266,7 @@ class ActiveCaseTrace {
 
   private serverShutdownReason() {
     const result = recordFromUnknown(this.result) ?? {}
-    const flush = stringField(result, ["trace_html_flush"])
+    const flush = stringField(result, ["trace_flush", "trace_html_flush"])
     if (flush === "process_signal") return "process_signal"
     const signal = stringField(result, ["signal"])
     if (signal) return "process_signal"
@@ -9379,7 +9355,7 @@ class ActiveCaseTrace {
               shutdown_disposition: shutdown.disposition,
               server_shutdown_reason: shutdownReason,
               observation_source:
-                stringField(recordFromUnknown(this.result) ?? {}, ["trace_html_flush"]) === "process_signal"
+                stringField(recordFromUnknown(this.result) ?? {}, ["trace_flush", "trace_html_flush"]) === "process_signal"
                   ? "process_signal_handler"
                   : "finish_result",
               sender_identity_available: false,
@@ -10681,7 +10657,6 @@ class ActiveCaseTrace {
       previousContextRecord.artifact_refs = this.collectArtifactRefs(previousContextRecord.data)
       this.causalIR.updateNode(previousContextRecord)
       this.createTemporalAdvisoryEdges(previousContextRecord, temporalAdvisoryRefs)
-      this.writePartial()
       return previousContextRecord
     }
     const data = omitUndefined({
@@ -11089,7 +11064,6 @@ class ActiveCaseTrace {
     if (existing) {
       existing.occurrences = (existing.occurrences ?? 1) + 1
       this.causalIR.reuseArtifact(existing)
-      this.writePartial()
       return existing
     }
     const artifactID = `artifact_${++this.artifactSequence}_${contentHash}`
@@ -11145,7 +11119,6 @@ class ActiveCaseTrace {
         expected_path: relativePath,
         message: "Artifact content could not be persisted; no artifact link was registered.",
       })
-      this.writePartial()
       return undefined
     }
   }
@@ -11153,7 +11126,6 @@ class ActiveCaseTrace {
   private open() {
     try {
       fs.mkdirSync(this.caseDir, { recursive: true })
-      fs.mkdirSync(this.partialDir, { recursive: true })
       fs.writeFileSync(this.eventsFile, "")
       fs.writeFileSync(this.rawEventsFile, "")
       fs.writeFileSync(this.recordsFile, "")
@@ -11179,7 +11151,6 @@ class ActiveCaseTrace {
           environment: this.environment,
         },
       })
-      this.writePartial(true)
     } catch {
       this.writable = false
     }
@@ -11218,32 +11189,14 @@ class ActiveCaseTrace {
     }
   }
 
-  private writePartial(force = false, summary?: CausalIRTraceSummary, checkpoint = force) {
-    if (!this.writable) return
-    const now = Date.now()
-    const interval = safeNumber(process.env.OPENCODE_CASE_TRACE_PARTIAL_INTERVAL_MS || 5000) || 5000
-    if (!force && now < this.nextPartialWrite) return
-    this.nextPartialWrite = now + interval
-    const causalIR = summary ?? this.causalIRSummary("running")
-    this.safeWrite(this.partialFile, streamingJson(causalIR))
-    this.safeWriteProvenanceHtml(this.projectProvenanceSummary(causalIR))
-    if (checkpoint) this.causalIR.checkpoint(causalIR)
-  }
-
-  private safeWriteProvenanceHtml(trace: ProvenanceTraceView, forceStreaming = false) {
-    return this.safeWrite(this.htmlFile, streamingHtml(trace, forceStreaming))
-  }
-
-  private safeWrite(target: string, content: string | StreamingJsonContent | StreamingHtmlContent) {
+  private safeWrite(target: string, content: string | StreamingJsonContent) {
     const temporary = path.join(
       path.dirname(target),
       `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.tmp`,
     )
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true })
-      if (isStreamingHtmlContent(content)) {
-        writeProvenanceTraceHtmlFile(target, content.trace, { forceStreaming: content.forceStreaming })
-      } else if (isStreamingJsonContent(content)) {
+      if (isStreamingJsonContent(content)) {
         writeJsonDocumentAtomic(target, content.value, {
           sanitize: sanitizeTraceJsonValue,
           sanitizeStringChunks: sanitizeTraceJsonStringChunks,
@@ -11291,37 +11244,20 @@ class ActiveCaseTrace {
 }
 
 const streamingJsonContent = Symbol("streaming-json-content")
-const streamingHtmlContent = Symbol("streaming-html-content")
 
 type StreamingJsonContent = {
   [streamingJsonContent]: true
   value: unknown
 }
 
-type StreamingHtmlContent = {
-  [streamingHtmlContent]: true
-  trace: ProvenanceTraceView
-  forceStreaming: boolean
-}
-
 function streamingJson(value: unknown): StreamingJsonContent {
   return { [streamingJsonContent]: true, value }
 }
 
-function streamingHtml(trace: ProvenanceTraceView, forceStreaming: boolean): StreamingHtmlContent {
-  return { [streamingHtmlContent]: true, trace, forceStreaming }
-}
-
 function isStreamingJsonContent(
-  input: string | StreamingJsonContent | StreamingHtmlContent,
+  input: string | StreamingJsonContent,
 ): input is StreamingJsonContent {
   return typeof input !== "string" && streamingJsonContent in input
-}
-
-function isStreamingHtmlContent(
-  input: string | StreamingJsonContent | StreamingHtmlContent,
-): input is StreamingHtmlContent {
-  return typeof input !== "string" && streamingHtmlContent in input
 }
 
 function jsonPretty(input: unknown) {

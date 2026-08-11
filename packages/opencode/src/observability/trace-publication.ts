@@ -9,7 +9,6 @@ export type TracePublication = {
   status: TracePublicationStatus
   caseDir: string
   traceFile?: string
-  htmlFile?: string
   partialFile?: string
 }
 
@@ -19,7 +18,6 @@ export type TracePublicationInput = {
   status: TracePublicationStatus
   caseDir: string
   traceFile?: string
-  htmlFile?: string
   partialFile?: string
 }
 
@@ -31,19 +29,17 @@ function existingAbsolutePath(file: string | undefined): string | undefined {
 
 export function collectTracePublication(input: TracePublicationInput): TracePublication | undefined {
   const traceFile = existingAbsolutePath(input.traceFile)
-  const htmlFile = existingAbsolutePath(input.htmlFile)
   const partialFile = existingAbsolutePath(input.partialFile)
 
-  if (!traceFile && !htmlFile && !partialFile) return undefined
+  if (!traceFile && !partialFile) return undefined
 
-  const status = partialFile && (!traceFile || !htmlFile) ? "partial" : input.status
+  const status = partialFile && !traceFile ? "partial" : input.status
   return {
     sessionID: input.sessionID,
     caseID: input.caseID,
     status,
     caseDir: path.resolve(input.caseDir),
     traceFile,
-    htmlFile,
     partialFile,
   }
 }
@@ -55,7 +51,6 @@ export function formatTracePublication(input: TracePublication): string {
     `  case: ${input.caseID}`,
     `  status: ${input.status}`,
     `  directory: ${input.caseDir}`,
-    input.htmlFile ? `  html: ${input.htmlFile}` : undefined,
     input.traceFile ? `  json: ${input.traceFile}` : undefined,
     input.partialFile ? `  partial: ${input.partialFile}` : undefined,
   ]

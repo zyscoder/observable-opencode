@@ -267,14 +267,14 @@ async function waitForCompleteCausalIRCheckpoint(caseDir: string, markerNodeID: 
   while (Date.now() - start < timeoutMs) {
     try {
       const journal = await readCausalIRJournal(caseDir)
-      if (journal.some((entry) => checkpointIncludesNode(entry, markerNodeID))) return journal
+      if (journal.some((entry: any) => entry.entity_id === markerNodeID)) return journal
     } catch {}
     await Bun.sleep(50)
   }
 
   try {
     const journal = await readCausalIRJournal(caseDir)
-    return journal.some((entry) => checkpointIncludesNode(entry, markerNodeID)) ? journal : undefined
+    return journal.some((entry: any) => entry.entity_id === markerNodeID) ? journal : undefined
   } catch {
     return undefined
   }
@@ -1148,7 +1148,7 @@ describe("case trace", () => {
     })
   })
 
-  test("writes trace semantic contract v6.0 bundle with trace.html as the only HTML entry point", async () => {
+  test("writes only semantic JSON terminal files", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-provenance-trace-bundle-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "causal-bundle.ts")
@@ -1194,12 +1194,12 @@ describe("case trace", () => {
       "legacy-trace.json",
       "records.jsonl",
       "raw-events.jsonl",
-      "trace.html",
     ]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
     expect(await exists(path.join(caseDir, "viewer.html"))).toBe(false)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
+    expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
@@ -1208,7 +1208,6 @@ describe("case trace", () => {
     const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
     const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
     const journal = await readCausalIRJournal(caseDir)
-    const traceHtml = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const provenanceText = JSON.stringify(provenance)
     const canonicalEdge = trace.edges[0] as NonNullable<ProvenanceTraceSummary["edges"]>[number]
     const originalRelation: string = canonicalEdge.original_relation
@@ -1255,7 +1254,7 @@ describe("case trace", () => {
     expect(manifest.case_id).toBe("causal-bundle-case")
     expect(manifest.files.trace).toBe("trace.json")
     expect(manifest.files.legacy_trace).toBe("legacy-trace.json")
-    expect(manifest.files.trace_html).toBe("trace.html")
+    expect(manifest.files.trace_html).toBeUndefined()
     expect(manifest.files.viewer_alias).toBeUndefined()
     expect(trace.trace_version).toBe("6.0")
     expect(trace.causal_ir_version).toBe("1.0")
@@ -1345,20 +1344,6 @@ describe("case trace", () => {
     const response = provenance.records.find((record: any) => record.event_type === "response.output")
     expect(response.data.response_role).toBe("final_answer")
     expect(response.data.is_final_for_case).toBe(true)
-    expect(traceHtml).toContain("Trace v6.0")
-    expect(traceHtml).toContain('id="overview"')
-    expect(traceHtml).toContain('id="trace-health"')
-    expect(traceHtml).toContain('id="agent-flow"')
-    expect(traceHtml).toContain('id="llm-turns"')
-    expect(traceHtml).toContain('id="lifecycle"')
-    expect(traceHtml).toContain('id="subagents"')
-    expect(traceHtml).toContain('id="claim-evidence-matrix"')
-    expect(traceHtml).toContain('id="evidence-facts"')
-    expect(traceHtml).toContain("Claim Evidence Matrix")
-    expect(traceHtml).toContain("Component Dataflow")
-    expect(traceHtml).toContain("IO Inspector")
-    expect(traceHtml).toContain("Context And Compaction")
-    expect(traceHtml).not.toContain("Evidence Inspector")
   })
 
   test("round-trips node parent, input, and output refs through canonical and compatibility envelopes", async () => {
@@ -1496,7 +1481,6 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const canonicalEdge = trace.edges.find((item: any) => item.edge_id === "late_alias_edge")
     const compatibilityEdge = trace.dataflow_edges.find((item: any) => item.edge_id === "late_alias_edge")
     const legacyEdges = legacy.dataflow_edges.filter((item: any) => item.edge_id === "late_alias_edge")
@@ -1571,8 +1555,6 @@ describe("case trace", () => {
     expect(partial.edges).toEqual(trace.edges)
     expect(partial.dataflow_edges).toEqual(trace.dataflow_edges)
     expect(JSON.stringify(trace.dataflow_edges)).not.toContain("__case_trace_legacy_semantic_edge_projection")
-    expect(html).toContain("resolved edge after alias resolution")
-    expect(html).not.toContain("__case_trace_legacy_semantic_edge_projection")
   })
 
   test("keeps recent fallback refs temporal advisory and outside attribution source refs", async () => {
@@ -2435,7 +2417,6 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "semantic-v45-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
     expect(trace.trace_version).toBe("6.0")
@@ -2443,10 +2424,6 @@ describe("case trace", () => {
     expect(eventTypes).toContain("context.transform")
     expect(eventTypes).toContain("decision")
     expect(trace.dataflow_edges.some((edge: any) => edge.relation === "selected_by")).toBe(true)
-    expect(html).toContain("Semantic Pipeline")
-    expect(html).toContain("prompt.assembly")
-    expect(html).toContain("context.transform")
-    expect(html).toContain("llm_tool_call")
   })
 
   test("records unresolved user-requested skills as formal skill.load facts", async () => {
@@ -2593,7 +2570,6 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "lifecycle-v45-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const eventTypes = trace.records.map((record: any) => record.event_type)
 
     expect(trace.trace_version).toBe("6.0")
@@ -2642,11 +2618,6 @@ describe("case trace", () => {
     expect(trace.dataflow_edges.filter((edge: any) => edge.relation === "supported_response")).toHaveLength(1)
     expect(trace.dataflow_edges.some((edge: any) => edge.relation === "supports_claim")).toBe(true)
     expect(trace.metrics.trace_health.circular_reference_markers).toBe(0)
-    expect(html).toContain("LLM Turns")
-    expect(html).toContain("Lifecycle And Exit Gates")
-    expect(html).toContain("Semantic Evidence")
-    expect(html).toContain("Trace Health")
-    expect(html).toContain("applyDiscount")
   })
 
   test("keeps code paths, function calls, decimals, and percentages intact when splitting response claims", async () => {
@@ -4422,7 +4393,6 @@ describe("case trace", () => {
     const caseDir = path.join(dir, "quality-v45-case")
     const traceText = await fs.readFile(path.join(caseDir, "trace.json"), "utf8")
     const trace = JSON.parse(traceText) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
 
     expect(trace.trace_version).toBe("6.0")
     expect(traceText).not.toContain("[Circular]")
@@ -4437,7 +4407,6 @@ describe("case trace", () => {
     expect(health.expected_lifecycle_finalized_records).toBeGreaterThan(0)
     expect(health.unexpected_missing_close_records).toBe(0)
     expect(health.issues.some((issue: any) => issue.kind === "finalized_open_record")).toBe(false)
-    expect(html).toContain('id="trace-health"')
   })
 
   test("filters low-value runtime events from formal provenance and normalizes legacy relations", async () => {
@@ -4742,9 +4711,6 @@ describe("case trace", () => {
     const responseClaim = trace.records.find((record: any) => record.event_type === "response.claim")
     expect(responseClaim.data.matched_evidence_refs).toContain(`evidence:${evidenceFact.record_id}`)
     expect(responseClaim.data.support_level).toBe("direct")
-    const html = await fs.readFile(path.join(dir, "mcp-facts-case", "trace.html"), "utf8")
-    expect(html).toContain("Typed Resources")
-    expect(html).toContain("repo_fact")
   })
 
   test("extracts line-level semantic facts from file read payloads before path-only fallback", async () => {
@@ -5080,7 +5046,6 @@ describe("case trace", () => {
         `CaseTrace.setSessionID("ses_sigint")`,
         `CaseTrace.agentLifecycle({ session_id: "ses_sigint", message_id: "msg_sigint", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGINT arrives" })`,
         `CaseTrace.node({ node_id: "fixture_signal_sigint_ready", kind: "verification", component: "runtime", title: "SIGINT fixture readiness marker" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -5107,7 +5072,7 @@ describe("case trace", () => {
     expect(stderr).toBe("")
     expect(await waitForExists(path.join(caseDir, "manifest.json"))).toBe(true)
     expect(await exists(path.join(caseDir, "provenance-trace.json"))).toBe(true)
-    expect(await exists(path.join(caseDir, "trace.html"))).toBe(true)
+    expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
@@ -5449,7 +5414,6 @@ describe("case trace", () => {
 
     const trace = JSON.parse(await fs.readFile(path.join(dir, "inline-subagent-v51-case", "trace.json"), "utf8")) as any
     const subagent = trace.records.find((record: any) => record.event_type === "subagent.call")
-    const html = await fs.readFile(path.join(dir, "inline-subagent-v51-case", "trace.html"), "utf8")
 
     expect(subagent.data.child_trace_available).toBe(true)
     expect(subagent.data.child_trace_mode).toBe("inline_same_trace")
@@ -5458,7 +5422,6 @@ describe("case trace", () => {
     expect(subagent.data.child_prompt_refs.length).toBeGreaterThan(0)
     expect(subagent.data.child_result_refs.length).toBeGreaterThan(0)
     expect(subagent.data.child_trace_unavailable_reason).toBeUndefined()
-    expect(html).toContain("inline_same_trace")
   })
 
   test("links parent consumption when parent response references child evidence", async () => {
@@ -5905,7 +5868,6 @@ describe("case trace", () => {
         `CaseTrace.agentLifecycle({ session_id: "ses_signal", message_id: "msg_user", agent: "build", phase: "turn.started", status: "running", summary: "turn is open when SIGTERM arrives" })`,
         `CaseTrace.evidenceFact({ source: "tool", category: "file_read", summary: "observed pricing file before signal", data: { path: "src/pricing.mjs", line_start: 1, line_end: 1, text: "export function renewalQuote(input) {}" } })`,
         `CaseTrace.node({ node_id: "fixture_signal_sigterm_canonical_ready", kind: "verification", component: "runtime", title: "SIGTERM canonical fixture readiness marker" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -5932,13 +5894,11 @@ describe("case trace", () => {
 
     expect(stderr).toBe("")
     expect(code).toBe(143)
-    expect(await exists(path.join(caseDir, "trace.html"))).toBe(true)
     expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const caseRecord = trace.records.find((record: any) => record.event_type === "case.failed")
     const journal = await readCausalIRJournal(caseDir)
 
@@ -5947,8 +5907,6 @@ describe("case trace", () => {
     expect(caseRecord).toBeTruthy()
     expect(caseRecord.data.case_status).toBe("cancelled")
     expect(trace.records.some((record: any) => record.event_type === "evidence.semantic_fact")).toBe(true)
-    expect(html).toContain("case cancelled")
-    expect(html).toContain("observed pricing file before signal")
     assertFinalCancelledPartialMatchesTrace(partial, trace)
     assertJournalReplaysCanonicalTrace(journal, trace)
     assertFinalForcedCheckpointMatchesCanonicalTrace(journal, partial, trace)
@@ -5992,7 +5950,7 @@ describe("case trace", () => {
     expect(stdout).toBe("agent output\n")
     expect(stderr.match(/Session trace saved/g)).toHaveLength(1)
     expect(stderr).toContain("session: ses_publication")
-    expect(stderr).toContain(path.join(caseDir, "trace.html"))
+    expect(stderr).not.toContain("html:")
     expect(stderr).toContain(path.join(caseDir, "trace.json"))
     expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
   })
@@ -6009,7 +5967,6 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.setSessionID("ses_publication")`,
         `CaseTrace.node({ node_id: "trace_publication_sigterm_ready", kind: "verification", component: "runtime", title: "ready" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -6038,7 +5995,7 @@ describe("case trace", () => {
     expect(stdout).toBe("")
     expect(stderr.match(/Session trace saved/g)).toHaveLength(1)
     expect(stderr).toContain("session: ses_publication")
-    expect(stderr).toContain(path.join(caseDir, "trace.html"))
+    expect(stderr).not.toContain("html:")
     expect(stderr).toContain(path.join(caseDir, "trace.json"))
     expect(await exists(path.join(caseDir, "trace.json"))).toBe(true)
   })
@@ -6087,7 +6044,6 @@ describe("case trace", () => {
           `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
           `CaseTrace.setSessionID("ses_${fixture.mode}")`,
           `CaseTrace.node({ node_id: ${JSON.stringify(marker)}, kind: "verification", component: "runtime", title: "ready" })`,
-          `;(CaseTrace.get() as any).writePartial(true)`,
           ...terminalLines,
         ].join("\n"),
       )
@@ -6113,7 +6069,6 @@ describe("case trace", () => {
       const stdout = await new Response(proc.stdout).text()
       const stderr = await new Response(proc.stderr).text()
       const traceFile = path.join(caseDir, "trace.json")
-      const htmlFile = path.join(caseDir, "trace.html")
       const partialFile = path.join(caseDir, "partial", "latest.json")
 
       expect(code).toBe(fixture.exitCode)
@@ -6125,16 +6080,13 @@ describe("case trace", () => {
       expect(stderr).toContain(`partial: ${partialFile}`)
       expect(await exists(partialFile)).toBe(true)
       if (fixture.partialOnly) {
-        expect(stderr).not.toContain(`html: ${htmlFile}`)
         expect(stderr).not.toContain(`json: ${traceFile}`)
-        expect(await exists(htmlFile)).toBe(false)
         expect(await exists(traceFile)).toBe(false)
       } else {
-        expect(stderr).toContain(`html: ${htmlFile}`)
         expect(stderr).toContain(`json: ${traceFile}`)
-        expect(await exists(htmlFile)).toBe(true)
         expect(await exists(traceFile)).toBe(true)
       }
+      expect(stderr).not.toContain("html:")
     })
   }
 
@@ -6151,7 +6103,6 @@ describe("case trace", () => {
         `process.once("SIGTERM", () => process.exit(143))`,
         `CaseTrace.configure({ input: { prompt: "server listener was registered first" } })`,
         `CaseTrace.node({ node_id: "signal_listener_order_ready", kind: "verification", component: "runtime", title: "ready" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -6267,14 +6218,12 @@ describe("case trace", () => {
     const partialIndex = writes.indexOf(path.join("partial", "latest.json"))
     const provenanceIndex = writes.indexOf("provenance-trace.json")
     const legacyIndex = writes.indexOf("legacy-trace.json")
-    const htmlIndex = writes.indexOf("trace.html")
 
     expect(traceIndex).toBeGreaterThanOrEqual(0)
     expect(manifestIndex).toBeGreaterThan(traceIndex)
     expect(partialIndex).toBeGreaterThan(manifestIndex)
     expect(provenanceIndex).toBeGreaterThan(partialIndex)
     expect(legacyIndex).toBeGreaterThan(partialIndex)
-    expect(htmlIndex).toBeGreaterThan(partialIndex)
 
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const finalization = (await readCausalIRJournal(caseDir)).at(-1) as any
@@ -6878,7 +6827,7 @@ describe("case trace", () => {
     expect(compaction.data.compression_loss_risks).toContain("dropped_semantic_facts")
   })
 
-  test("finalizes trace.json and trace.html when a traced process exits", async () => {
+  test("finalizes semantic JSON when a traced process exits", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "exit-with-active-trace.ts")
@@ -6912,7 +6861,7 @@ describe("case trace", () => {
     expect(await exists(path.join(dir, "exit-case", "events.jsonl"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "trace.json"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "legacy-trace.json"))).toBe(true)
-    expect(await exists(path.join(dir, "exit-case", "trace.html"))).toBe(true)
+    expect(await exists(path.join(dir, "exit-case", "trace.html"))).toBe(false)
 
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "exit-case", "legacy-trace.json"), "utf8"),
@@ -6921,7 +6870,7 @@ describe("case trace", () => {
     expect(trace.events.some((event) => event.event_type === "turn.start")).toBe(true)
   })
 
-  test("finalizes trace.json and trace.html when a traced process receives SIGTERM", async () => {
+  test("finalizes semantic JSON when a traced process receives SIGTERM", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigterm-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "sigterm-with-active-trace.ts")
@@ -6933,7 +6882,6 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigterm" } })`,
         `CaseTrace.node({ node_id: "fixture_signal_sigterm_legacy_ready", kind: "verification", component: "runtime", title: "SIGTERM legacy fixture readiness marker" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -6962,7 +6910,7 @@ describe("case trace", () => {
     expect(code).toBe(143)
     expect(await exists(path.join(dir, "sigterm-case", "trace.json"))).toBe(true)
     expect(await exists(path.join(dir, "sigterm-case", "legacy-trace.json"))).toBe(true)
-    expect(await exists(path.join(dir, "sigterm-case", "trace.html"))).toBe(true)
+    expect(await exists(path.join(dir, "sigterm-case", "trace.html"))).toBe(false)
 
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "sigterm-case", "legacy-trace.json"), "utf8"),
@@ -6976,7 +6924,7 @@ describe("case trace", () => {
     expect(provenance.manifest.case_status).toBe("cancelled")
   })
 
-  test("keeps a partial trace.html snapshot available before an uncapturable SIGKILL", async () => {
+  test("keeps records.jsonl but no rendered or partial snapshot before an uncapturable SIGKILL", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-sigkill-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
     const script = path.join(dir, "sigkill-with-active-trace.ts")
@@ -6988,7 +6936,6 @@ describe("case trace", () => {
         `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
         `CaseTrace.event({ component: "runtime", event_type: "turn.start", data: { prompt: "hello from sigkill" } })`,
         `CaseTrace.node({ node_id: "fixture_signal_sigkill_ready", kind: "verification", component: "runtime", title: "SIGKILL fixture readiness marker" })`,
-        `;(CaseTrace.get() as any).writePartial(true)`,
         `setInterval(() => {}, 1000)`,
       ].join("\n"),
     )
@@ -7006,23 +6953,17 @@ describe("case trace", () => {
     })
 
     const caseDir = path.join(dir, "sigkill-case")
-    const persistedJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "fixture_signal_sigkill_ready")
-    expect(persistedJournal).toBeDefined()
-    assertCausalIRJournalAudit(persistedJournal!)
-    expect(await waitForExists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
-    expect(await waitForExists(path.join(caseDir, "trace.html"))).toBe(true)
+    const recordsFile = path.join(caseDir, "records.jsonl")
+    expect(await waitForExists(recordsFile)).toBe(true)
+    expect(await fs.readFile(recordsFile, "utf8")).toContain("fixture_signal_sigkill_ready")
+    expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(false)
+    expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
     proc.kill("SIGKILL")
     await proc.exited.catch(() => undefined)
 
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
-    const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const journal = await readCausalIRJournal(caseDir)
 
-    expect(html).toContain("Trace v6.0")
-    expect(partial.manifest.server_status).toBe("running")
     assertCausalIRJournalAudit(journal)
-    assertJournalReplaysCanonicalTrace(journal, partial)
-    expect(journal.filter((entry: any) => entry.operation === "case.checkpointed").length).toBeGreaterThan(0)
     expect(journal.some((entry: any) => entry.operation === "case.finalized")).toBe(false)
   })
 
@@ -7411,9 +7352,6 @@ describe("case trace", () => {
     const artifactText = await fs.readFile(path.join(caseDir, artifact.path), "utf8")
     expect(artifactText).toContain(payload)
 
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
-    expect(html).toContain("Trace Provenance")
-    expect(html).toContain("Artifacts")
   })
 
   test("writes a redacted and byte-verifiable artifact semantic slice manifest", async () => {
@@ -7662,11 +7600,6 @@ describe("case trace", () => {
     expect(artifactText).not.toContain(secret)
     expect(artifactText).not.toContain("Bearer abc")
 
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
-    expect(html).toContain("Trace Provenance")
-    expect(html).toContain("Component Dataflow")
-    expect(html).toContain("IO Inspector")
-    expect(html).toContain("Context Ledger")
   })
 
   test("preserves explicit token metrics while redacting ambiguous token fields and credentials", async () => {
@@ -8372,7 +8305,6 @@ describe("case trace", () => {
         "provenance-trace.json",
         "partial/latest.json",
         "manifest.json",
-        "trace.html",
       ]
         .map((file) => path.join(caseDir, file))
         .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
@@ -8510,7 +8442,6 @@ describe("case trace", () => {
         "provenance-trace.json",
         "partial/latest.json",
         "manifest.json",
-        "trace.html",
       ]
         .map((file) => path.join(caseDir, file))
         .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
@@ -8575,7 +8506,6 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "artifact-write-failure-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
     const observation = trace.records.find((item: any) => item.title === "artifact_failure")
     const payloadSummary = observation.data.data
 
@@ -8585,7 +8515,6 @@ describe("case trace", () => {
     expect(trace.diagnostics).toContainEqual(
       expect.objectContaining({ kind: "artifact_write_failed", status: "write_failed" }),
     )
-    expect(html).not.toContain('href="artifacts/sha256/')
     expect((await readCausalIRJournal(caseDir)).some((entry: any) => entry.operation === "artifact.created")).toBe(
       false,
     )
@@ -8634,27 +8563,13 @@ describe("case trace", () => {
     const diagnosticIDs = ["missing_semantic_final_test_result", "observed_defect_missing_verification_after_change"]
 
     assertCausalIRJournalAudit(journal)
-    const checkpoints = journal.filter((entry: any) => entry.operation === "case.checkpointed")
     const finalized = journal.find((entry: any) => entry.operation === "case.finalized")
-    expect(checkpoints.length).toBeGreaterThan(0)
-    expect(
-      checkpoints.every(
-        (entry: any) => entry.record_type === "checkpoint" && entry.entity_id === trace.manifest.case_id,
-      ),
-    ).toBe(true)
     expect(finalized).toMatchObject({
       record_type: "finish",
       entity_id: trace.manifest.case_id,
-      previous_payload_hash: checkpoints.at(-1)?.payload_hash,
     })
     assertExactlyOneFinalizationAtEnd(journal)
 
-    for (const diagnosticID of diagnosticIDs) {
-      const entries = journal.filter((entry: any) => entry.entity_id === diagnosticID)
-      expect(entries.map((entry: any) => entry.operation)).toEqual(["node.created", "node.updated"])
-      expect(new Set(entries.map((entry: any) => entry.payload_hash)).size).toBe(entries.length)
-    }
-    expect(journal.some((entry: any) => entry.operation === "case.checkpointed")).toBe(true)
     expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
     expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
     assertJournalReplaysCanonicalTrace(journal, trace)
@@ -8717,7 +8632,6 @@ describe("case trace", () => {
           edge.eligible_for_attribution === true,
       ),
     ).toBe(true)
-    expect(journal.some((entry: any) => diagnosticIDs.includes(entry.entity_id))).toBe(true)
     expect(trace.records.some((record: any) => diagnosticIDs.includes(record.record_id))).toBe(false)
     expect(trace.nodes.some((node: any) => diagnosticIDs.includes(node.node_id))).toBe(false)
     assertJournalReplaysCanonicalTrace(journal, trace)
@@ -9496,7 +9410,6 @@ describe("case trace", () => {
       "provenance-trace.json",
       "records.jsonl",
       "partial/latest.json",
-      "trace.html",
     ]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
@@ -9578,9 +9491,7 @@ describe("case trace", () => {
       poisoned: true,
     })
     expect(partial.journal).toEqual(trace.journal)
-    expect(replayTrace).toBeDefined()
-    expect(replayTrace).not.toEqual(trace)
-    expect(replayTrace.journal.poisoned).toBe(false)
+    expect(replayTrace).toBeUndefined()
     expect(replayCausalIRJournal(journal)).toMatchObject({
       nodes: trace.nodes,
       edges: trace.edges,
@@ -9652,9 +9563,6 @@ describe("case trace", () => {
     expect(designRecords[0].data.selected_solution.artifact_id).toBeTruthy()
     expect(designRecords[0].data.test_strategy.preview).toContain("pricing")
 
-    const html = await fs.readFile(path.join(caseDir, "trace.html"), "utf8")
-    expect(html).toContain("Trace Provenance")
-    expect(html).toContain("Artifacts")
   })
 
   test("preserves nested semantic schema fields while externalizing raw causal payloads", async () => {

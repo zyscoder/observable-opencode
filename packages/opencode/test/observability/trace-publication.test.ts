@@ -12,33 +12,48 @@ function createCaseDir() {
   return mkdtempSync(path.join(tmpdir(), "opencode-trace-publication-"))
 }
 
-test("reports only terminal files that exist", () => {
+test("reports a completed trace when its semantic JSON exists without HTML", () => {
   const caseDir = createCaseDir()
   const traceFile = path.join(caseDir, "trace.json")
-  const htmlFile = path.join(caseDir, "trace.html")
   const partialFile = path.join(caseDir, "partial/latest.json")
 
   try {
     writeFileSync(traceFile, "{}")
-    writeFileSync(htmlFile, "<html></html>")
     const publication = collectTracePublication({
       sessionID: "ses_test",
       caseID: "case_test",
       status: "completed",
       caseDir,
       traceFile,
-      htmlFile,
       partialFile,
     })
 
     expect(publication?.status).toBe("completed")
     expect(publication?.caseDir).toBe(path.resolve(caseDir))
     expect(publication?.traceFile).toBe(path.resolve(traceFile))
-    expect(publication?.htmlFile).toBe(path.resolve(htmlFile))
     expect(publication?.partialFile).toBeUndefined()
     expect(formatTracePublication(publication!)).toContain("session: ses_test")
     expect(formatTracePublication(publication!)).toContain(path.resolve(traceFile))
     expect(formatTracePublication(publication!)).not.toContain("partial:")
+  } finally {
+    rmSync(caseDir, { recursive: true, force: true })
+  }
+})
+
+test("does not publish an HTML-only trace", () => {
+  const caseDir = createCaseDir()
+  const htmlFile = path.join(caseDir, "trace.html")
+
+  try {
+    writeFileSync(htmlFile, "<html></html>")
+    expect(
+      collectTracePublication({
+        caseID: "case_html_only",
+        status: "completed",
+        caseDir,
+        htmlFile,
+      } as any),
+    ).toBeUndefined()
   } finally {
     rmSync(caseDir, { recursive: true, force: true })
   }
@@ -59,14 +74,12 @@ test("publishes a partial snapshot when complete trace files are incomplete", ()
       status: "completed",
       caseDir: relativeCaseDir,
       traceFile: path.join(relativeCaseDir, "trace.json"),
-      htmlFile: path.join(relativeCaseDir, "trace.html"),
       partialFile: relativePartialFile,
     })
 
     expect(publication?.status).toBe("partial")
     expect(publication?.caseDir).toBe(path.resolve(caseDir))
     expect(publication?.traceFile).toBeUndefined()
-    expect(publication?.htmlFile).toBeUndefined()
     expect(publication?.partialFile).toBe(path.resolve(partialFile))
   } finally {
     rmSync(caseDir, { recursive: true, force: true })
@@ -83,7 +96,6 @@ test("returns no publication when no terminal file exists", () => {
         status: "failed",
         caseDir,
         traceFile: path.join(caseDir, "trace.json"),
-        htmlFile: path.join(caseDir, "trace.html"),
         partialFile: path.join(caseDir, "partial/latest.json"),
       }),
     ).toBeUndefined()
