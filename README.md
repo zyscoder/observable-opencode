@@ -35,29 +35,27 @@ flowchart LR
 
 ## 快速开始
 
-下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。在这个
-三变量模板中，`MODEL` 只保存 Provider 内部模型 ID，例如 `glm-5.1`；配置会把它组装为
-完整的 `compatible/glm-5.1`。`MODEL`、`APIKEY`、`URL` 不是 Observable OpenCode 新增的
-模型协议，模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
+下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。
+`MODEL`、`APIKEY`、`URL` 是配置文件中的环境变量占位符，不是 Observable OpenCode
+新增的模型协议。模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
 
 ```bash
-export MODEL="glm-5.1"
-export APIKEY="<your-compatible-api-key>"
-export URL="https://<your-openai-compatible-base-url>"
+export MODEL="compatible/deepseek-v4-flash"
+export APIKEY="<your-api-key>"
+export URL="https://api.deepseek.com"
 
 export OPENCODE_CONFIG_CONTENT='{
-  "model": "compatible/{env:MODEL}",
+  "model": "{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}",
-        "timeout": 60000
+        "apiKey": "{env:APIKEY}"
       },
       "models": {
-        "{env:MODEL}": { "name": "{env:MODEL}" }
+        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
       }
     }
   }
@@ -149,277 +147,48 @@ OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/openc
 `OPENCODE_CONFIG`、`OPENCODE_CONFIG_DIR`、`OPENCODE_CONFIG_CONTENT`，或原生 CLI 和
 请求参数覆盖。不同版本及配置来源会按 OpenCode 的原生合并规则处理。
 
-下面是一个兼容 OpenAI 风格 API 的三变量模板。可放在项目 `opencode.json` 或你选择的
-原生配置文件中。此模板约定 `MODEL` 是 Provider 内部模型 ID，而不是完整的
-`provider/model` 字符串：
+下面是一个兼容 OpenAI 风格 API 的通用模板。可放在项目 `opencode.json` 或你选择的
+原生配置文件中：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "compatible/{env:MODEL}",
+  "model": "{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}",
-        "timeout": 60000
+        "apiKey": "{env:APIKEY}"
       },
       "models": {
-        "{env:MODEL}": { "name": "{env:MODEL}" }
+        "glm-4.5": { "name": "GLM 4.5" },
+        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
       }
     }
   }
 }
 ```
 
-其中 `MODEL` 例如为 `glm-5.1`，最终完整模型标识是 `compatible/glm-5.1`；`APIKEY` 和
-`URL` 分别提供该兼容服务的认证和 Base URL。它们只是此模板选用的环境变量占位符，可以
-替换为企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用
-OpenCode 内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
+其中 `MODEL` 必须是完整模型标识，例如 `compatible/glm-4.5`；`APIKEY` 和 `URL`
+分别提供该兼容服务的认证和地址。它们只是此模板选用的环境变量占位符，可以替换为
+企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用 OpenCode
+内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
 
 常见兼容接口可以按下面的方式替换环境变量；URL 必须以供应商或企业网关的实际文档为准：
 
 ```bash
 # DeepSeek 示例
-export MODEL="deepseek-v4-flash"
+export MODEL="compatible/deepseek-v4-flash"
 export APIKEY="<your-deepseek-api-key>"
 export URL="https://api.deepseek.com"
 
-# GLM-5.1 通用 API 示例
-# export MODEL="glm-5.1"
-# export APIKEY="<your-glm-api-key>"
-# export URL="https://open.bigmodel.cn/api/paas/v4"
-
-# GLM Coding Plan 使用专用端点，不能与通用 API 端点混用
-# export URL="https://open.bigmodel.cn/api/coding/paas/v4"
-
-# 其他企业兼容网关
+# GLM 或企业兼容网关示例
+# export MODEL="compatible/glm-4.5"
 # export APIKEY="<your-compatible-api-key>"
 # export URL="https://<compatible-endpoint>/v1"
 ```
-
-`APIKEY` 必须属于 `URL` 指向的同一家服务：DeepSeek Key 不能用于 GLM URL，GLM Key
-也不能用于 DeepSeek URL。`MODEL` 是该服务接受的真实模型 ID，例如 `glm-5.1`；它不是
-Provider 前缀，也不是展示名称。
-
-### Provider 与模型 ID 必须对齐
-
-完整模型标识的格式是 `<provider-id>/<model-id>`。例如 `rtos/glm-5.1` 会被解析为
-Provider `rtos` 和模型 `glm-5.1`，因此配置必须同时满足：
-
-```text
-默认模型：rtos/glm-5.1
-Provider 键：rtos
-rtos.models 中的键：glm-5.1
-```
-
-下面这种组合是错误的：默认模型指向 `rtos`，但只注册了 `compatible`；同时模型表的键
-错误地包含了 Provider 前缀。
-
-```bash
-export MODEL="rtos/glm-5.1"
-# provider.compatible.models["rtos/glm-5.1"]  # 错误
-```
-
-如需把 Provider 命名为 `rtos`，可以增加 `PROVIDER` 变量，并继续让 `MODEL` 只保存模型 ID：
-
-```bash
-export PROVIDER="rtos"
-export MODEL="glm-5.1"
-export APIKEY="<your-glm-api-key>"
-export URL="https://<your-glm-openai-compatible-base-url>"
-
-export OPENCODE_CONFIG_CONTENT='{
-  "model": "{env:PROVIDER}/{env:MODEL}",
-  "provider": {
-    "{env:PROVIDER}": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "RTOS OpenAI Compatible",
-      "options": {
-        "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}",
-        "timeout": 60000
-      },
-      "models": {
-        "{env:MODEL}": { "name": "{env:MODEL}" }
-      }
-    }
-  }
-}'
-```
-
-`OPENCODE_CONFIG_CONTENT` 会与全局和项目配置合并，而不是隔离运行。如果默认模型写成
-`rtos/glm-5.1`，机器上又已有另一个 `rtos` Provider，OpenCode 可能使用已有 Provider 的
-地址和认证，而不是新配置的 `compatible`。因此启动前应先检查实际模型列表。
-
-### 配置与连接预检
-
-使用 `compatible` 模板时，下面的命令必须能列出 `compatible/glm-5.1`：
-
-```bash
-opencode models compatible
-```
-
-使用 `rtos` 模板时改为：
-
-```bash
-opencode models rtos
-```
-
-然后绕过 OpenCode，直接验证兼容 API。`URL` 应是供应商或企业网关要求的 Base URL，
-而不是网页地址；是否包含 `/v1` 等路径以接口文档为准：
-
-```bash
-RESPONSE_JSON="$(curl -sS --fail-with-body \
-  --connect-timeout 10 \
-  --max-time 30 \
-  -H "Authorization: Bearer $APIKEY" \
-  -H "Content-Type: application/json" \
-  "${URL%/}/chat/completions" \
-  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"只输出数字：1+2等于多少？\"}],\"stream\":false}")"
-
-# 先查看完整 JSON；成功响应不会直接是纯文本 3
-printf '%s\n' "$RESPONSE_JSON" | jq .
-
-# 再提取模型文本；通常输出 3，也可能是 "3。" 或带简短解释
-printf 'model answer: '
-printf '%s\n' "$RESPONSE_JSON" | jq -er '.choices[0].message.content // .error.message'
-```
-
-如果需要同时看到 HTTP 状态和响应体，可使用下面的排障写法：
-
-```bash
-curl -sS \
-  --connect-timeout 10 \
-  --max-time 30 \
-  -w '\nHTTP_STATUS=%{http_code}\n' \
-  -H "Authorization: Bearer $APIKEY" \
-  -H "Content-Type: application/json" \
-  "${URL%/}/chat/completions" \
-  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"只输出数字：1+2等于多少？\"}],\"stream\":false}"
-```
-
-GLM-5.1 通用 API 的官方请求地址是
-`https://open.bigmodel.cn/api/paas/v4/chat/completions`；因此在本文模板中应设置
-`URL=https://open.bigmodel.cn/api/paas/v4`。GLM Coding Plan 使用
-`https://open.bigmodel.cn/api/coding/paas/v4`，对应的 Key 和计费权限也必须是 Coding
-Plan。具体模型 ID、端点和鉴权要求以供应商文档为准。
-
-直连成功后，再用非交互命令查看 OpenCode 的实际错误和重试状态：
-
-```bash
-opencode --print-logs --log-level DEBUG run \
-  --model "compatible/$MODEL" \
-  "1+2=?"
-```
-
-Provider 默认单次请求超时是 300000 毫秒（5 分钟），网络错误和部分 5xx 错误还会退避
-重试，因此总等待时间可能远超 5 分钟。示例中的 `timeout: 60000` 只把单次请求限制为
-60 秒，不会修复错误的 URL、认证或 ID 映射。流式接口还可按服务响应特征配置
-`chunkTimeout`；该值过小会误杀长时间没有输出首个数据块的正常推理请求。
-
-### 端到端验证流程
-
-完成上述预检后，建议在隔离的临时仓库中验证基础问答、流式响应、Tool Calling、文件
-读写和 Trace 收尾。下面的命令不会修改待测业务仓库。`--dangerously-skip-permissions` 仅用于
-这个一次性目录，不能照搬到生产项目。
-
-首先确认当前配置确实注册了目标模型：
-
-```bash
-MODEL_REF="compatible/$MODEL"
-
-opencode models compatible | grep -Fx "$MODEL_REF"
-```
-
-期望输出为 `compatible/<MODEL>`。若没有输出，不应继续请求 API，应先检查 Provider ID、
-`models` 键以及 `OPENCODE_CONFIG_CONTENT` 合并后的配置。
-
-然后创建最小验证仓库并执行一个必须使用工具的任务：
-
-```bash
-VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/observable-opencode-verify.XXXXXX")"
-git -C "$VERIFY_DIR" init -q
-printf 'owner=payments\n' > "$VERIFY_DIR/fixture.txt"
-
-export OPENCODE_CASE_TRACE=1
-export OPENCODE_CASE_ID="compatible-tool-smoke"
-export OPENCODE_CASE_TRACE_DIR="$VERIFY_DIR/traces"
-
-opencode --print-logs --log-level DEBUG run \
-  --dir "$VERIFY_DIR" \
-  --model "$MODEL_REF" \
-  --format json \
-  --dangerously-skip-permissions \
-  '必须使用工具完成任务：读取 fixture.txt；把内容原样写入 result.txt；再次读取 result.txt；最后回复读取到的内容。' \
-  > "$VERIFY_DIR/run-events.jsonl" \
-  2> "$VERIFY_DIR/run-debug.log"
-```
-
-依次检查 Agent 行为和 CLI 事件流：
-
-```bash
-test -s "$VERIFY_DIR/result.txt"
-grep -Fx 'owner=payments' "$VERIFY_DIR/result.txt"
-
-jq -s '{
-  event_count: length,
-  event_types: (map(.type) | unique)
-}' "$VERIFY_DIR/run-events.jsonl"
-```
-
-`result.txt` 内容正确说明模型不仅能回答文本，还能生成被 OpenCode 接受并成功执行的工具
-调用。`run-events.jsonl` 应包含 assistant message 和 tool use 相关事件；只有最终文本而没有
-工具事件，说明该模型或兼容网关尚未通过 Tool Calling 验证。
-
-最后确认 Trace 已完整生成，并检查其中确实存在 LLM 与 Tool 语义节点：
-
-```bash
-TRACE_JSON="$(find "$OPENCODE_CASE_TRACE_DIR" -type f -name trace.json | head -n 1)"
-test -n "$TRACE_JSON"
-
-TRACE_CASE_DIR="$(dirname "$TRACE_JSON")"
-test -s "$TRACE_CASE_DIR/trace.html"
-test -s "$TRACE_CASE_DIR/manifest.json"
-test -s "$TRACE_CASE_DIR/partial/latest.json"
-
-jq -e '
-  .trace_version and
-  .causal_ir_version and
-  (.nodes | length > 0) and
-  any(.nodes[]; .component == "llm") and
-  any(.nodes[]; .component == "tool")
-' "$TRACE_JSON" > /dev/null
-
-jq '{
-  trace_version,
-  causal_ir_version,
-  status: .manifest.status,
-  metrics,
-  components: ([.nodes[].component] | unique)
-}' "$TRACE_JSON"
-
-printf 'Trace HTML: %s\n' "$TRACE_CASE_DIR/trace.html"
-```
-
-通过标准是：API 直连成功、`opencode run` 正常结束、文件内容正确、CLI 事件包含工具执行、
-`trace.html` 可打开，并且 `trace.json` 同时包含 `llm` 和 `tool` 组件。完成后可以删除
-`$VERIFY_DIR`；若需要排障，应先保留其中的 `run-debug.log`、事件流和 Trace。
-
-### 验证失败定位
-
-| 失败位置 | 优先检查 | 含义 |
-| --- | --- | --- |
-| `opencode models` 找不到模型 | Provider ID、`models` 键、环境变量替换、配置合并 | 请求尚未发送，属于本地模型注册问题。 |
-| 直连返回 `401/403` | `APIKEY`、认证头、网关权限 | 认证或授权失败。 |
-| 直连返回 `404` | `URL` 是否为 API Base URL、是否需要 `/v1` 等路径 | 地址或路由不匹配。 |
-| 直连提示 model not found | `$MODEL` 与上游真实 ID，必要时配置模型 `id` 映射 | 本地别名与上游模型 ID 不一致。 |
-| 直连成功但基础问答失败 | OpenCode 实际 Provider、流式协议、超时、兼容响应字段 | 兼容接口不一定完整兼容 OpenCode 使用的流式调用。 |
-| 基础问答成功但工具验证失败 | Tool Calling 请求字段、返回的 tool call 结构、模型能力 | 只能证明文本生成可用，不能证明 Agent 开发任务可用。 |
-| Agent 行为成功但 Trace 检查失败 | Trace 环境变量、目录权限、进程收尾和退出信号 | 模型正常，问题位于可观测链路。 |
-| Trace 状态为 `cancelled` | Harness/代理超时、`SIGINT`/`SIGTERM`、客户端提前断开 | Trace 仍可包含有效过程，但本次验证没有正常完成。 |
 
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
 编译进可执行文件的模型快照：
@@ -442,15 +211,12 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CONFIG` | 否 | 指向额外的 OpenCode 原生配置文件。 |
 | `OPENCODE_CONFIG_DIR` | 否 | 指定 OpenCode 原生配置目录。 |
 | `OPENCODE_CONFIG_CONTENT` | 否 | 直接注入 OpenCode 原生 JSON 配置，适合 CI 或 benchmark。 |
-| `PROVIDER` | 取决于配置 | 可选的自定义 Provider ID，例如 `rtos`；固定使用 `compatible` 时不需要。 |
-| `MODEL` | 取决于配置 | 本文三变量模板使用的 Provider 内部模型 ID，例如 `glm-5.1`。 |
+| `MODEL` | 取决于配置 | 本文模板使用的完整模型标识，例如 `compatible/deepseek-v4-flash`。 |
 | `APIKEY` | 取决于配置 | 本文模板使用的 Provider API Key。请通过 Secret 注入，不要写入仓库。 |
 | `URL` | 取决于配置 | 本文模板使用的兼容 API Base URL。 |
 | `OPENCODE_DISABLE_MODELS_FETCH` | 推荐 | 设为 `1` 时跳过启动阶段的 `models.dev` 请求，使用内置模型快照。 |
 | `OPENCODE_MODELS_FETCH_TIMEOUT_MS` | 否 | 远程模型目录请求超时，单位为毫秒。 |
 | `OPENCODE_MODELS_URL` | 否 | 将远程模型目录切换到企业镜像。 |
-| `OPENCODE_DB` | 否 | 显式指定 SQLite 数据库路径；绝对路径可让旧版 Observable Release 临时复用正式版数据库。 |
-| `OPENCODE_DISABLE_CHANNEL_DB` | 否 | 设为 `1` 时忽略构建 channel，回退到共享的 `opencode.db`。 |
 | `OPENCODE_CASE_TRACE` | 是 | 设为 `1` 启用语义 Trace。 |
 | `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
 | `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
@@ -460,44 +226,6 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
 默认值为 `2048`。大文本会写入 `artifacts/` 并由 HTML 按需展示。通常应保持默认值；将它
 提高到数十万会显著放大序列化、内存和收尾开销，复杂 case 甚至可能延迟信号处理。
-
-### 与正式版共享 Session 数据库
-
-新的 Observable Release 会以稳定 `latest` channel 构建，默认数据库路径与正式版 OpenCode
-一致，都是 `opencode.db`。因此，正式版创建的 session 可以直接用 Observable OpenCode
-继续执行并生成 Trace。当前已经安装的旧版分支构建可能仍使用
-`opencode-<channel>.db`，需要升级到新的 Release，或临时显式指定正式版数据库：
-
-```bash
-NORMAL_DB="$(opencode db path)"
-OBSERVABLE="/usr/local/bin/opencode-observable"
-
-# 先退出普通 opencode 和 opencode serve，再让两个进程复用同一个 SQLite 文件
-OPENCODE_DB="$NORMAL_DB" \
-OPENCODE_CASE_TRACE=1 \
-OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces" \
-"$OBSERVABLE" run --session "<session-id>"
-```
-
-也可以在确认正式版使用默认 `opencode.db` 后使用兼容开关：
-
-```bash
-OPENCODE_DISABLE_CHANNEL_DB=1 \
-OPENCODE_CASE_TRACE=1 \
-OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces" \
-/usr/local/bin/opencode-observable run --session "<session-id>"
-```
-
-切换前用下面的命令比较两套安装实际使用的数据库路径：
-
-```bash
-opencode db path
-/usr/local/bin/opencode-observable db path
-```
-
-共享数据库时必须使用同一操作系统用户、同一 `XDG_DATA_HOME`/`HOME` 环境，并避免两个
-进程同时修改同一个 session。`OPENCODE_DB` 只改变数据库位置，不会改变 Trace 目录、模型
-配置或 Agent 行为。
 
 ### 目标仓库的 `.opencode` 扩展依赖
 
@@ -518,7 +246,7 @@ Cannot find module '@opencode-ai/plugin' from '/path/to/project/.opencode/...'
 目标项目：
 
 ```bash
-export MODEL="glm-5.1"
+export MODEL="compatible/glm-4.5"
 export APIKEY="<your-compatible-api-key>"
 export URL="https://api.example.com/v1"
 
