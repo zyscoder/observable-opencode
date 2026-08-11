@@ -187,11 +187,22 @@ export MODEL="deepseek-v4-flash"
 export APIKEY="<your-deepseek-api-key>"
 export URL="https://api.deepseek.com"
 
-# GLM 或企业兼容网关示例
+# GLM-5.1 通用 API 示例
 # export MODEL="glm-5.1"
+# export APIKEY="<your-glm-api-key>"
+# export URL="https://open.bigmodel.cn/api/paas/v4"
+
+# GLM Coding Plan 使用专用端点，不能与通用 API 端点混用
+# export URL="https://open.bigmodel.cn/api/coding/paas/v4"
+
+# 其他企业兼容网关
 # export APIKEY="<your-compatible-api-key>"
 # export URL="https://<compatible-endpoint>/v1"
 ```
+
+`APIKEY` 必须属于 `URL` 指向的同一家服务：DeepSeek Key 不能用于 GLM URL，GLM Key
+也不能用于 DeepSeek URL。`MODEL` 是该服务接受的真实模型 ID，例如 `glm-5.1`；它不是
+Provider 前缀，也不是展示名称。
 
 ### Provider 与模型 ID 必须对齐
 
@@ -261,14 +272,40 @@ opencode models rtos
 而不是网页地址；是否包含 `/v1` 等路径以接口文档为准：
 
 ```bash
-curl -sS --fail-with-body \
+RESPONSE_JSON="$(curl -sS --fail-with-body \
   --connect-timeout 10 \
   --max-time 30 \
   -H "Authorization: Bearer $APIKEY" \
   -H "Content-Type: application/json" \
   "${URL%/}/chat/completions" \
-  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"1+2=?\"}],\"stream\":false}"
+  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"只输出数字：1+2等于多少？\"}],\"stream\":false}")"
+
+# 先查看完整 JSON；成功响应不会直接是纯文本 3
+printf '%s\n' "$RESPONSE_JSON" | jq .
+
+# 再提取模型文本；通常输出 3，也可能是 "3。" 或带简短解释
+printf 'model answer: '
+printf '%s\n' "$RESPONSE_JSON" | jq -er '.choices[0].message.content // .error.message'
 ```
+
+如果需要同时看到 HTTP 状态和响应体，可使用下面的排障写法：
+
+```bash
+curl -sS \
+  --connect-timeout 10 \
+  --max-time 30 \
+  -w '\nHTTP_STATUS=%{http_code}\n' \
+  -H "Authorization: Bearer $APIKEY" \
+  -H "Content-Type: application/json" \
+  "${URL%/}/chat/completions" \
+  --data "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"只输出数字：1+2等于多少？\"}],\"stream\":false}"
+```
+
+GLM-5.1 通用 API 的官方请求地址是
+`https://open.bigmodel.cn/api/paas/v4/chat/completions`；因此在本文模板中应设置
+`URL=https://open.bigmodel.cn/api/paas/v4`。GLM Coding Plan 使用
+`https://open.bigmodel.cn/api/coding/paas/v4`，对应的 Key 和计费权限也必须是 Coding
+Plan。具体模型 ID、端点和鉴权要求以供应商文档为准。
 
 直连成功后，再用非交互命令查看 OpenCode 的实际错误和重试状态：
 
@@ -412,6 +449,8 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_DISABLE_MODELS_FETCH` | 推荐 | 设为 `1` 时跳过启动阶段的 `models.dev` 请求，使用内置模型快照。 |
 | `OPENCODE_MODELS_FETCH_TIMEOUT_MS` | 否 | 远程模型目录请求超时，单位为毫秒。 |
 | `OPENCODE_MODELS_URL` | 否 | 将远程模型目录切换到企业镜像。 |
+| `OPENCODE_DB` | 否 | 显式指定 SQLite 数据库路径；绝对路径可让旧版 Observable Release 临时复用正式版数据库。 |
+| `OPENCODE_DISABLE_CHANNEL_DB` | 否 | 设为 `1` 时忽略构建 channel，回退到共享的 `opencode.db`。 |
 | `OPENCODE_CASE_TRACE` | 是 | 设为 `1` 启用语义 Trace。 |
 | `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
 | `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
@@ -421,6 +460,44 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
 默认值为 `2048`。大文本会写入 `artifacts/` 并由 HTML 按需展示。通常应保持默认值；将它
 提高到数十万会显著放大序列化、内存和收尾开销，复杂 case 甚至可能延迟信号处理。
+
+### 与正式版共享 Session 数据库
+
+新的 Observable Release 会以稳定 `latest` channel 构建，默认数据库路径与正式版 OpenCode
+一致，都是 `opencode.db`。因此，正式版创建的 session 可以直接用 Observable OpenCode
+继续执行并生成 Trace。当前已经安装的旧版分支构建可能仍使用
+`opencode-<channel>.db`，需要升级到新的 Release，或临时显式指定正式版数据库：
+
+```bash
+NORMAL_DB="$(opencode db path)"
+OBSERVABLE="/usr/local/bin/opencode-observable"
+
+# 先退出普通 opencode 和 opencode serve，再让两个进程复用同一个 SQLite 文件
+OPENCODE_DB="$NORMAL_DB" \
+OPENCODE_CASE_TRACE=1 \
+OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces" \
+"$OBSERVABLE" run --session "<session-id>"
+```
+
+也可以在确认正式版使用默认 `opencode.db` 后使用兼容开关：
+
+```bash
+OPENCODE_DISABLE_CHANNEL_DB=1 \
+OPENCODE_CASE_TRACE=1 \
+OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces" \
+/usr/local/bin/opencode-observable run --session "<session-id>"
+```
+
+切换前用下面的命令比较两套安装实际使用的数据库路径：
+
+```bash
+opencode db path
+/usr/local/bin/opencode-observable db path
+```
+
+共享数据库时必须使用同一操作系统用户、同一 `XDG_DATA_HOME`/`HOME` 环境，并避免两个
+进程同时修改同一个 session。`OPENCODE_DB` 只改变数据库位置，不会改变 Trace 目录、模型
+配置或 Agent 行为。
 
 ### 目标仓库的 `.opencode` 扩展依赖
 

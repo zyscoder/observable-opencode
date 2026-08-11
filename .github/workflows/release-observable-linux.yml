@@ -29,11 +29,52 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Set stable Observable build identity
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$TAG_NAME" ]; then
+            echo "Expected a release tag beginning with v, got: $TAG_NAME" >&2
+            exit 1
+          fi
+
+          # Stable OpenCode and Observable OpenCode must share opencode.db.
+          # Keep local/preview source builds channel-isolated; only release
+          # binaries opt into the stable database identity.
+          echo "OPENCODE_CHANNEL=latest" >> "$GITHUB_ENV"
+          echo "OPENCODE_VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Typecheck opencode package
         run: bun run --cwd packages/opencode typecheck
 
       - name: Build CLI binaries
         run: bun run --cwd packages/opencode build --skip-embed-web-ui
+
+      - name: Verify shared session database path
+        shell: bash
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/observable-opencode-data
+          XDG_CACHE_HOME: ${{ runner.temp }}/observable-opencode-cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/observable-opencode-config
+          XDG_STATE_HOME: ${{ runner.temp }}/observable-opencode-state
+        run: |
+          set -euo pipefail
+          mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+          binary="packages/opencode/dist/opencode-linux-x64/bin/opencode"
+          expected="$XDG_DATA_HOME/opencode/opencode.db"
+          actual="$("$binary" db path)"
+
+          if [ "$actual" != "$expected" ]; then
+            echo "Observable release must use the stable session database" >&2
+            echo "expected: $expected" >&2
+            echo "actual:   $actual" >&2
+            exit 1
+          fi
+
+          echo "Shared session database: $actual"
 
       - name: Prepare release assets
         shell: bash
@@ -72,6 +113,11 @@ jobs:
         run: |
           cat > release/RELEASE_NOTES.md <<'EOF'
           Observable opencode binaries with benchmark case trace support.
+
+          Release binaries use the stable OpenCode channel and share the formal OpenCode session database:
+
+          - database path: opencode.db
+          - existing sessions can be resumed with `opencode run --session <session-id>`
 
           Recommended asset for most x86_64 enterprise Linux hosts:
 
