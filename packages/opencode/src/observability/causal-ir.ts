@@ -807,6 +807,15 @@ function payloadHash(data: unknown) {
   return createHash("sha256").update(payload).digest("hex")
 }
 
+function causalIRGraphIntegrityHash(snapshot: Pick<CausalIRStoreSnapshot, "nodes" | "edges" | "artifacts" | "diagnostics">) {
+  return payloadHash({
+    nodes: snapshot.nodes.map((node) => [node.node_id, node.integrity.payload_hash]),
+    edges: snapshot.edges.map((edge) => [edge.edge_id, payloadHash(edge)]),
+    artifacts: snapshot.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash]),
+    diagnostics: snapshot.diagnostics.map((diagnostic) => [diagnostic.diagnostic_id, payloadHash(diagnostic)]),
+  })
+}
+
 function refTypeForLegacy(type: string): CausalIRRef["ref_type"] {
   if (type === "artifact") return "artifact"
   if (type === "raw_event" || type === "event") return "raw_event"
@@ -1571,12 +1580,7 @@ export class CausalIRStore {
   finalize(data: unknown): CausalIRCommitResult {
     const snapshot = this.synchronize()
     const trace = isCausalIRTraceDocument(data) ? data : undefined
-    const integrityHash = payloadHash({
-      nodes: snapshot.nodes.map((node) => [node.node_id, node.integrity.payload_hash]),
-      edges: snapshot.edges.map((edge) => [edge.edge_id, payloadHash(edge)]),
-      artifacts: snapshot.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash]),
-      diagnostics: snapshot.diagnostics.map((diagnostic) => [diagnostic.diagnostic_id, payloadHash(diagnostic)]),
-    })
+    const integrityHash = causalIRGraphIntegrityHash(snapshot)
     const compact: CausalIRFinalizationJournalData = {
       format: "compact_causal_ir_finalization",
       data: trace?.manifest ?? data,
@@ -2290,11 +2294,13 @@ export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceD
     !graph.integrity_hash
   )
     return undefined
+  const snapshot = replayCausalIRJournal(journal)
   if (
-    trace.nodes.length !== graph.nodes ||
-    trace.edges.length !== graph.edges ||
-    trace.artifacts.length !== graph.artifacts ||
-    trace.diagnostics.length !== graph.diagnostics
+    snapshot.nodes.length !== graph.nodes ||
+    snapshot.edges.length !== graph.edges ||
+    snapshot.artifacts.length !== graph.artifacts ||
+    snapshot.diagnostics.length !== graph.diagnostics ||
+    graph.integrity_hash !== causalIRGraphIntegrityHash(snapshot)
   )
     return undefined
   return trace

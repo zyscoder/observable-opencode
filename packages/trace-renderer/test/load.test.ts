@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { CausalIRStore, projectProvenanceTrace } from "opencode/observability/causal-ir"
+import { CausalIRStore, projectProvenanceTrace, replayFinalizedCausalIRTrace } from "opencode/observability/causal-ir"
 import { loadRenderableTrace } from "../src/load"
 
 function withCaseDirectory(run: (caseDir: string) => void) {
@@ -201,6 +201,28 @@ describe("loadRenderableTrace", () => {
       expect(result).toMatchObject({ caseDir, source: "records.jsonl", incomplete: false })
       expect(result.trace.manifest).toMatchObject({ status: "success", case_status: "success" })
       expect(result.trace.records).toMatchObject([{ record_id: "response_1" }])
+    })
+  })
+
+  test("rejects a compact finalization whose integrity hash does not match the replayed graph", () => {
+    const journal = createFinalizedJournal()
+    const finalization = journal.at(-1) as { data: { graph: { integrity_hash: string } } }
+    finalization.data.graph.integrity_hash = "0".repeat(64)
+
+    expect(replayFinalizedCausalIRTrace(journal)).toBeUndefined()
+
+    withCaseDirectory((caseDir) => {
+      const journalFile = path.join(caseDir, "records.jsonl")
+      fs.writeFileSync(journalFile, journal.map((entry) => JSON.stringify(entry)).join("\n"))
+
+      const result = loadRenderableTrace(journalFile)
+
+      expect(result).toMatchObject({ incomplete: true })
+      expect(result.trace.manifest).toMatchObject({
+        recovery_status: "incomplete_journal_replay",
+        status: "error",
+        case_status: "error",
+      })
     })
   })
 
