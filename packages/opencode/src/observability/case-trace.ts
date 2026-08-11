@@ -11126,6 +11126,7 @@ class ActiveCaseTrace {
   private open() {
     try {
       fs.mkdirSync(this.caseDir, { recursive: true })
+      this.invalidatePriorTerminalOutputs()
       fs.writeFileSync(this.eventsFile, "")
       fs.writeFileSync(this.rawEventsFile, "")
       fs.writeFileSync(this.recordsFile, "")
@@ -11153,6 +11154,26 @@ class ActiveCaseTrace {
       })
     } catch {
       this.writable = false
+    }
+  }
+
+  private invalidatePriorTerminalOutputs() {
+    for (const relative of [
+      "trace.json",
+      "manifest.json",
+      "legacy-trace.json",
+      "provenance-trace.json",
+      "partial",
+      "trace.html",
+    ]) {
+      fs.rmSync(path.join(this.caseDir, relative), { recursive: true, force: true })
+    }
+    let directory: number | undefined
+    try {
+      directory = fs.openSync(this.caseDir, "r")
+      fs.fsyncSync(directory)
+    } finally {
+      if (directory !== undefined) fs.closeSync(directory)
     }
   }
 

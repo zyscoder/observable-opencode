@@ -427,11 +427,7 @@ describe("case trace", () => {
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
       .sort()
-    expect(caseDirectories).toEqual([
-      "compatibility-identity-case",
-      processCaseDirectory,
-      rootBCaseDirectory,
-    ])
+    expect(caseDirectories).toEqual(["compatibility-identity-case", processCaseDirectory, rootBCaseDirectory])
 
     const traces = await Promise.all(
       caseDirectories.map(async (caseDirectory) => ({
@@ -934,7 +930,10 @@ describe("case trace", () => {
     const script = path.join(dir, "empty-finish.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 
-    await fs.writeFile(script, [`import { CaseTrace } from ${JSON.stringify(traceModule)}`, `CaseTrace.finish()`].join("\n"))
+    await fs.writeFile(
+      script,
+      [`import { CaseTrace } from ${JSON.stringify(traceModule)}`, `CaseTrace.finish()`].join("\n"),
+    )
 
     const proc = Bun.spawn([process.execPath, script], {
       cwd: packageDir,
@@ -1090,9 +1089,7 @@ describe("case trace", () => {
     expect(await proc.exited).toBe(0)
     expect(await new Response(proc.stderr).text()).toBe("")
 
-    const trace = JSON.parse(
-      await fs.readFile(path.join(dir, "node-revision-binding", "trace.json"), "utf8"),
-    ) as any
+    const trace = JSON.parse(await fs.readFile(path.join(dir, "node-revision-binding", "trace.json"), "utf8")) as any
     const owner = trace.records.find((record: any) => record.record_id === "decisionnode_revision_bound")
 
     expect(owner.artifact_refs.length).toBeGreaterThan(0)
@@ -1186,13 +1183,7 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const caseDir = path.join(dir, "causal-bundle-case")
-    for (const file of [
-      "manifest.json",
-      "trace.json",
-      "legacy-trace.json",
-      "records.jsonl",
-      "raw-events.jsonl",
-    ]) {
+    for (const file of ["manifest.json", "trace.json", "legacy-trace.json", "records.jsonl", "raw-events.jsonl"]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
     expect(await exists(path.join(caseDir, "viewer.html"))).toBe(false)
@@ -6967,8 +6958,75 @@ describe("case trace", () => {
     expect(journal.some((entry: any) => entry.operation === "case.finalized")).toBe(false)
   })
 
+  test("reuses a stable case directory with the current live journal authoritative through SIGKILL", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-reused-sigkill-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const firstScript = path.join(dir, "first-stable-case.ts")
+    const secondScript = path.join(dir, "second-stable-case.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const renderer = path.resolve(import.meta.dir, "../../../trace-renderer/src/cli.ts")
+    const env = {
+      ...process.env,
+      OPENCODE_CASE_TRACE: "1",
+      OPENCODE_CASE_ID: "reused-stable-case",
+      OPENCODE_CASE_TRACE_DIR: dir,
+    }
 
+    await fs.writeFile(
+      firstScript,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "old_run_marker", kind: "execution.observation", component: "runtime", title: "old run marker" })`,
+        `CaseTrace.finish({ status: "success" })`,
+      ].join("\n"),
+    )
+    const first = Bun.spawn([process.execPath, firstScript], { cwd: packageDir, env, stdout: "pipe", stderr: "pipe" })
+    expect(await first.exited).toBe(0)
+    expect(await new Response(first.stderr).text()).toBe("")
 
+    const caseDir = path.join(dir, "reused-stable-case")
+    const oldTrace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    await fs.writeFile(path.join(caseDir, "trace.html"), "stale offline render")
+    await fs.writeFile(
+      secondScript,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.node({ node_id: "new_run_marker", kind: "execution.observation", component: "runtime", title: "new run marker" })`,
+        `setInterval(() => {}, 1000)`,
+      ].join("\n"),
+    )
+
+    const second = Bun.spawn([process.execPath, secondScript], { cwd: packageDir, env, stdout: "pipe", stderr: "pipe" })
+    const liveJournal = await waitForCompleteCausalIRCheckpoint(caseDir, "new_run_marker")
+    expect(liveJournal).toBeDefined()
+    expect(liveJournal!.some((entry: any) => entry.data?.node_id === "old_run_marker")).toBe(false)
+    expect(liveJournal![0]?.run_id).not.toBe(oldTrace.manifest.run_id)
+    for (const relative of [
+      "trace.json",
+      "manifest.json",
+      "legacy-trace.json",
+      "provenance-trace.json",
+      "partial/latest.json",
+      "trace.html",
+    ]) {
+      expect(await exists(path.join(caseDir, relative))).toBe(false)
+    }
+
+    second.kill("SIGKILL")
+    await second.exited.catch(() => undefined)
+    expect(await new Response(second.stderr).text()).toBe("")
+    expect(await exists(path.join(caseDir, "trace.json"))).toBe(false)
+    expect(await exists(path.join(caseDir, "trace.html"))).toBe(false)
+
+    const rendered = Bun.spawnSync({
+      cmd: [process.execPath, renderer, "render", caseDir, "--output", path.join(dir, "recovered.html")],
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(rendered.exitCode).toBe(0)
+    expect(Buffer.from(rendered.stdout).toString()).toContain("source: records.jsonl")
+    expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: incomplete")
+  })
 
   test("stores large semantic payloads as artifacts and keeps trace.json lightweight", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-artifact-"))
@@ -7014,7 +7072,6 @@ describe("case trace", () => {
     expect(artifact).toBeTruthy()
     const artifactText = await fs.readFile(path.join(caseDir, artifact.path), "utf8")
     expect(artifactText).toContain(payload)
-
   })
 
   test("writes a redacted and byte-verifiable artifact semantic slice manifest", async () => {
@@ -7129,7 +7186,6 @@ describe("case trace", () => {
     expect(slice.hash).toBe(createHash("sha256").update(sliceBytes).digest("hex").slice(0, 16))
   })
 
-
   test("persists semantic trace records with artifacts and redaction", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-case-trace-semantic-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
@@ -7196,7 +7252,6 @@ describe("case trace", () => {
     expect(artifactText).toContain("semantic model message")
     expect(artifactText).not.toContain(secret)
     expect(artifactText).not.toContain("Bearer abc")
-
   })
 
   test("preserves explicit token metrics while redacting ambiguous token fields and credentials", async () => {
@@ -9159,7 +9214,6 @@ describe("case trace", () => {
     expect(designRecords[0].record_id).toBe(trace.design_records[0].design_id)
     expect(designRecords[0].data.selected_solution.artifact_id).toBeTruthy()
     expect(designRecords[0].data.test_strategy.preview).toContain("pricing")
-
   })
 
   test("preserves nested semantic schema fields while externalizing raw causal payloads", async () => {

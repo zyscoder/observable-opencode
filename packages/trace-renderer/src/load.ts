@@ -1,10 +1,12 @@
 import fs from "node:fs"
 import path from "node:path"
 import {
+  CausalIRJournalValidationError,
   projectProvenanceTrace,
   replayFinalizedCausalIRTrace,
   replayCausalIRJournal,
   replayCausalIRTrace,
+  validateCausalIRJournal,
   type CausalIREdge,
   type CausalIRNode,
   type CausalIRRef,
@@ -313,6 +315,14 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
   }
 
   const journal = readJournal(selected.file)
+  try {
+    validateCausalIRJournal(journal, { requireInitialRunNode: true })
+  } catch (error) {
+    if (error instanceof CausalIRJournalValidationError) {
+      throw new Error(`${selected.file}:${error.line}: ${error.message}`)
+    }
+    throw error
+  }
   const replayedTrace = replayCausalIRTrace(journal)
   const finalizedTrace = replayFinalizedCausalIRTrace(journal)
   if (finalizedTrace) {

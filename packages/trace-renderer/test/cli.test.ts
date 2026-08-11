@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { CausalIRStore } from "opencode/observability/causal-ir"
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts")
 
@@ -15,7 +16,9 @@ async function hashes(caseDir: string) {
   const targets = files
     .filter((entry) => entry.isFile())
     .map((entry) => path.join(entry.parentPath, entry.name))
-    .filter((file) => file.endsWith(".json") || file.endsWith(".jsonl") || file.includes(`${path.sep}artifacts${path.sep}`))
+    .filter(
+      (file) => file.endsWith(".json") || file.endsWith(".jsonl") || file.includes(`${path.sep}artifacts${path.sep}`),
+    )
     .sort()
   return new Map(await Promise.all(targets.map(async (file) => [file, sha256(await fs.readFile(file))] as const)))
 }
@@ -45,6 +48,8 @@ async function writeFinalizedCase(caseDir: string) {
   await fs.mkdir(path.join(caseDir, "artifacts"), { recursive: true })
   await fs.writeFile(path.join(caseDir, "artifacts", "input.txt"), "authoritative artifact payload")
   await fs.writeFile(path.join(caseDir, "records.jsonl"), '{"preserved":"journal input"}\n')
+  await fs.writeFile(path.join(caseDir, "manifest.json"), '{"preserved":"manifest input"}\n')
+  await fs.writeFile(path.join(caseDir, "legacy-trace.json"), '{"preserved":"legacy input"}\n')
   await fs.writeFile(
     path.join(caseDir, "trace.json"),
     JSON.stringify({
@@ -81,6 +86,17 @@ async function writeFinalizedCase(caseDir: string) {
   )
 }
 
+async function expectRejectedCollision(caseDir: string, output: string) {
+  const before = await hashes(caseDir)
+  const result = run("render", caseDir, "--output", output)
+  const after = await hashes(caseDir)
+
+  expect(result.exitCode).not.toBe(0)
+  expect(Buffer.from(result.stderr).toString()).toContain("collides with trace semantic input")
+  expect(after).toEqual(before)
+  expect(await fs.stat(path.join(caseDir, "artifacts", "render-snapshots")).catch(() => undefined)).toBeUndefined()
+}
+
 describe("observable-trace render", () => {
   test("renders a finalized case to the default output without mutating inputs", async () => {
     await withCaseDirectory(async (caseDir) => {
@@ -99,33 +115,46 @@ describe("observable-trace render", () => {
       expect((await fs.stat(output)).isFile()).toBe(true)
       expect(before).toEqual(new Map([...after].filter(([file]) => before.has(file))))
       expect([...after.keys()].filter((file) => !before.has(file))).toEqual([
-        path.join(caseDir, "artifacts", "render-snapshots", "sha256", sha256(Buffer.from("authoritative artifact payload"))),
+        path.join(
+          caseDir,
+          "artifacts",
+          "render-snapshots",
+          "sha256",
+          sha256(Buffer.from("authoritative artifact payload")),
+        ),
       ])
     })
   })
 
   test("renders an incomplete journal with a visible recovery banner", async () => {
     await withCaseDirectory(async (caseDir) => {
+      const journal: unknown[] = []
+      const store = new CausalIRStore({
+        runID: "run_journal_recovery",
+        caseID: "journal-recovery-case",
+        append: (entry) => journal.push(entry),
+      })
+      store.createNode({
+        node_id: "run_start",
+        kind: "run.start",
+        component: "run",
+        timestamp: "2026-08-11T00:00:00.000Z",
+        time_ms: 0,
+        status: "running",
+        data: { run_id: "run_journal_recovery", case_id: "journal-recovery-case" },
+      })
+      store.createNode({
+        node_id: "response_1",
+        kind: "response.output",
+        component: "result",
+        timestamp: "2026-08-11T00:00:00.000Z",
+        time_ms: 1,
+        status: "cancelled",
+        data: { text: "recovered journal payload" },
+      })
       await fs.writeFile(
         path.join(caseDir, "records.jsonl"),
-        `${JSON.stringify({
-          sequence: 1,
-          time: "2026-08-11T00:00:00.000Z",
-          run_id: "run_journal_recovery",
-          case_id: "journal-recovery-case",
-          operation: "node.created",
-          record_type: "node",
-          entity_id: "response_1",
-          data: {
-            node_id: "response_1",
-            kind: "response.output",
-            component: "result",
-            timestamp: "2026-08-11T00:00:00.000Z",
-            time_ms: 1,
-            status: "cancelled",
-            data: { text: "recovered journal payload" },
-          },
-        })}\n`,
+        `${journal.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
       )
       const before = await hashes(caseDir)
 
@@ -153,6 +182,38 @@ describe("observable-trace render", () => {
       expect(Buffer.from(result.stdout).toString()).toContain(`output: ${output}`)
       expect(await fs.readFile(output, "utf8")).toContain("Trace v6.0")
       expect(await fs.stat(path.join(caseDir, "trace.html")).catch(() => undefined)).toBeUndefined()
+    })
+  })
+
+  test("rejects direct output collisions with semantic and terminal files before publishing", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      await writeFinalizedCase(caseDir)
+
+      for (const relative of [
+        "trace.json",
+        "records.jsonl",
+        "manifest.json",
+        "legacy-trace.json",
+        "artifacts/input.txt",
+      ]) {
+        await expectRejectedCollision(caseDir, path.join(caseDir, relative))
+      }
+    })
+  })
+
+  test("rejects existing static aliases of semantic files and referenced artifacts", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      await writeFinalizedCase(caseDir)
+      const traceAlias = path.join(caseDir, "trace-alias.html")
+      const artifactAlias = path.join(caseDir, "artifact-alias.html")
+      const manifestSymlink = path.join(caseDir, "manifest-alias.html")
+      await fs.link(path.join(caseDir, "trace.json"), traceAlias)
+      await fs.link(path.join(caseDir, "artifacts", "input.txt"), artifactAlias)
+      await fs.symlink(path.join(caseDir, "manifest.json"), manifestSymlink)
+
+      await expectRejectedCollision(caseDir, traceAlias)
+      await expectRejectedCollision(caseDir, artifactAlias)
+      await expectRejectedCollision(caseDir, manifestSymlink)
     })
   })
 

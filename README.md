@@ -28,7 +28,7 @@ flowchart LR
     T -. "input / output" .-> C
     S -. "delegation / result" .-> C
     C --> V["Offline Trace Renderer"]
-    V --> H["trace.html"]
+    V --> HT["trace.html"]
     C --> R["Offline Attribution"]
     Q["User Defect Question"] --> R
     R --> O["Root Cause / Causal Chain / Evidence / Gaps"]
@@ -289,9 +289,10 @@ opencode /data/repos/target-project
   partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
 ```
 
-可捕获的中断会保留有效 Trace，状态通常为 `cancelled`；仅有阶段性快照时为 `partial`。
-`SIGKILL` 无法执行任何用户态退出处理，只能依赖进程运行期间已经原子写入的
-`records.jsonl` journal（以及已存在的 `partial/latest.json`）进行恢复。设置
+可捕获的中断会执行 terminal finalizer，写入状态通常为 `cancelled` 的语义 Trace 和终端兼容
+输出。运行期间不会生成完整 partial snapshot。`SIGKILL` 无法执行任何用户态退出处理，
+当前 run 只能依赖被杀前已追加的 `records.jsonl` journal 进行恢复；`partial/latest.json`
+仅在正常退出或可捕获信号完成 finalization 后出现，不能作为 `SIGKILL` 的当前 run 恢复源。设置
 `OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，不会关闭 Trace。
 
 ## 启动 HTTP Server 并记录 Trace
@@ -358,7 +359,17 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 └── benchmark-case-001--process--<digest>/             # process-level events
 ```
 
-每个目录都保持相同的产物结构：
+运行中的目录只包含 append-only JSONL 和当前 run 引用的 artifacts：
+
+```text
+<trace-directory>/
+├── events.jsonl
+├── records.jsonl
+├── raw-events.jsonl
+└── artifacts/
+```
+
+正常退出或可捕获信号完成 terminal finalization 后，目录增加以下语义和兼容输出：
 
 ```text
 <trace-directory>/
@@ -371,8 +382,12 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 ├── manifest.json              # root/process 与产物清单
 ├── artifacts/                 # 大文本和可校验语义载荷
 └── partial/
-    └── latest.json            # 运行中/异常退出恢复快照
+    └── latest.json            # terminal compatibility output
 ```
+
+复用稳定 `OPENCODE_CASE_ID` 启动新 trace 时，runtime 会先使上一 run 的 terminal/derived
+输出失效（包括旧的离线 `trace.html`），再记录新 journal，因此 live `records.jsonl` 始终属于
+当前 run。runtime 自身仍不会生成 HTML。
 
 ## 离线渲染 Trace
 
@@ -386,7 +401,8 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 默认输出是 `<case-dir>/trace.html`；也可用 `--output <path>` 写到报告目录。若 case
 已有已完成的 `trace.json`，renderer 会生成完整视图。若只有 `records.jsonl`，renderer 会
 回放 journal 并在 HTML 中标记为不完整恢复，不能把它当作成功完成的 case。`SIGKILL` 无法
-执行 finalizer，因此只能依赖被杀前已持久化的 journal；之后可渲染 journal-only 恢复结果。
+执行 finalizer，也不会留下当前 run 的 `partial/latest.json`，因此只能依赖被杀前已持久化的
+`records.jsonl`；之后可渲染 journal-only 恢复结果。
 
 生成的 HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 多层转换、
 LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因不读取 HTML，也不应将

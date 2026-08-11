@@ -807,12 +807,16 @@ function payloadHash(data: unknown) {
   return createHash("sha256").update(payload).digest("hex")
 }
 
-function causalIRGraphIntegrityHash(snapshot: Pick<CausalIRStoreSnapshot, "nodes" | "edges" | "artifacts" | "diagnostics">) {
+function causalIRFinalizationIntegrityHash(
+  snapshot: Pick<CausalIRStoreSnapshot, "nodes" | "edges" | "artifacts" | "diagnostics">,
+  canonical?: CausalIRTraceEnvelope,
+) {
   return payloadHash({
-    nodes: snapshot.nodes.map((node) => [node.node_id, node.integrity.payload_hash]),
-    edges: snapshot.edges.map((edge) => [edge.edge_id, payloadHash(edge)]),
-    artifacts: snapshot.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash]),
-    diagnostics: snapshot.diagnostics.map((diagnostic) => [diagnostic.diagnostic_id, payloadHash(diagnostic)]),
+    nodes: snapshot.nodes,
+    edges: snapshot.edges,
+    artifacts: snapshot.artifacts,
+    diagnostics: snapshot.diagnostics,
+    canonical,
   })
 }
 
@@ -1445,6 +1449,193 @@ function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument
   )
 }
 
+export class CausalIRJournalValidationError extends Error {
+  constructor(
+    readonly line: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = "CausalIRJournalValidationError"
+  }
+}
+
+type CausalIRJournalValidationOptions = {
+  requireInitialRunNode?: boolean
+}
+
+const causalIRJournalOperations = new Set<CausalIRJournalEntry["operation"]>([
+  "node.created",
+  "node.updated",
+  "edge.created",
+  "artifact.created",
+  "artifact.reused",
+  "diagnostic.created",
+  "case.checkpointed",
+  "case.finalized",
+])
+
+function journalRecord(input: unknown): input is Record<string, unknown> {
+  return Boolean(input) && typeof input === "object" && !Array.isArray(input)
+}
+
+function journalString(input: unknown): input is string {
+  return typeof input === "string" && input.length > 0
+}
+
+function replayableCanonicalNode(input: unknown, runID: string, caseID: string): input is CausalIRNode {
+  if (!journalRecord(input) || !journalRecord(input.order) || !journalRecord(input.scope)) return false
+  if (!journalRecord(input.payload) || !journalRecord(input.integrity)) return false
+  return (
+    journalString(input.node_id) &&
+    journalString(input.kind) &&
+    journalString(input.schema_version) &&
+    (input.origin === "observed" || input.origin === "deterministic_derived" || input.origin === "offline_derived") &&
+    journalString(input.component) &&
+    Number.isFinite(input.order.sequence) &&
+    journalString(input.order.timestamp) &&
+    Number.isFinite(input.order.time_ms) &&
+    input.scope.run_id === runID &&
+    input.scope.case_id === caseID &&
+    Array.isArray(input.input_refs) &&
+    input.input_refs.every(isValidTypedRef) &&
+    Array.isArray(input.output_refs) &&
+    input.output_refs.every(isValidTypedRef) &&
+    Array.isArray(input.source_refs) &&
+    input.source_refs.every(isValidTypedRef) &&
+    Array.isArray(input.source_locations) &&
+    Array.isArray(input.artifact_refs) &&
+    input.artifact_refs.every((item) => typeof item === "string") &&
+    Array.isArray(input.aliases) &&
+    input.aliases.every((item) => typeof item === "string") &&
+    (input.derivation === null || journalRecord(input.derivation)) &&
+    journalString(input.integrity.payload_hash) &&
+    journalString(input.timestamp) &&
+    Number.isFinite(input.time_ms) &&
+    journalRecord(input.data)
+  )
+}
+
+function replayableCanonicalEdge(input: unknown): input is CausalIREdge {
+  if (!journalRecord(input)) return false
+  return (
+    journalString(input.edge_id) &&
+    isValidTypedRef(input.from) &&
+    isValidTypedRef(input.to) &&
+    journalString(input.original_relation) &&
+    journalString(input.normalized_relation) &&
+    (input.evidence_tier === "confirmed" ||
+      input.evidence_tier === "content_matched" ||
+      input.evidence_tier === "temporal_advisory") &&
+    typeof input.eligible_for_attribution === "boolean" &&
+    journalString(input.derivation_method) &&
+    Array.isArray(input.evidence_refs) &&
+    input.evidence_refs.every(isValidTypedRef)
+  )
+}
+
+function replayableArtifact(input: unknown): input is ArtifactLike {
+  return (
+    journalRecord(input) && journalString(input.artifact_id) && journalString(input.hash) && journalString(input.path)
+  )
+}
+
+function replayableDiagnostic(input: unknown): input is CausalIRDiagnosticLike {
+  return journalRecord(input) && journalString(input.diagnostic_id)
+}
+
+function replayableSnapshot(input: unknown, runID: string, caseID: string): input is CausalIRStoreSnapshot {
+  if (!journalRecord(input)) return false
+  return (
+    input.version === CAUSAL_IR_VERSION &&
+    input.runID === runID &&
+    input.caseID === caseID &&
+    Array.isArray(input.nodes) &&
+    input.nodes.every((node) => replayableCanonicalNode(node, runID, caseID)) &&
+    Array.isArray(input.edges) &&
+    input.edges.every(replayableCanonicalEdge) &&
+    Array.isArray(input.artifacts) &&
+    input.artifacts.every(replayableArtifact) &&
+    Array.isArray(input.diagnostics) &&
+    input.diagnostics.every(replayableDiagnostic)
+  )
+}
+
+export function validateCausalIRJournal(journal: unknown[], options: CausalIRJournalValidationOptions = {}): void {
+  if (!journal.length) throw new CausalIRJournalValidationError(1, "journal is empty")
+  let runID = ""
+  let caseID = ""
+
+  for (let index = 0; index < journal.length; index++) {
+    const line = index + 1
+    const item = journal[index]
+    if (!journalRecord(item)) throw new CausalIRJournalValidationError(line, "expected a journal entry object")
+    if (!Number.isSafeInteger(item.sequence) || item.sequence !== line)
+      throw new CausalIRJournalValidationError(line, `expected contiguous sequence ${line}`)
+    if (!journalString(item.time)) throw new CausalIRJournalValidationError(line, "missing journal time")
+    if (!journalString(item.run_id) || !journalString(item.case_id))
+      throw new CausalIRJournalValidationError(line, "missing run or case identity")
+    if (!runID) {
+      runID = item.run_id
+      caseID = item.case_id
+    } else if (item.run_id !== runID || item.case_id !== caseID) {
+      throw new CausalIRJournalValidationError(line, "journal run or case identity changed")
+    }
+    if (!causalIRJournalOperations.has(item.operation as CausalIRJournalEntry["operation"]))
+      throw new CausalIRJournalValidationError(line, `unknown operation ${String(item.operation)}`)
+    if (!journalString(item.record_type) || !journalString(item.entity_id) || !journalString(item.payload_hash))
+      throw new CausalIRJournalValidationError(line, "missing record type, entity identity, or payload hash")
+
+    switch (item.operation) {
+      case "node.created":
+      case "node.updated":
+        if (!replayableCanonicalNode(item.data, runID, caseID))
+          throw new CausalIRJournalValidationError(line, "malformed canonical node entry")
+        if (item.entity_id !== item.data.node_id)
+          throw new CausalIRJournalValidationError(line, "node entity identity does not match payload")
+        break
+      case "edge.created":
+        if (!replayableCanonicalEdge(item.data))
+          throw new CausalIRJournalValidationError(line, "malformed canonical edge entry")
+        if (item.entity_id !== item.data.edge_id)
+          throw new CausalIRJournalValidationError(line, "edge entity identity does not match payload")
+        break
+      case "artifact.created":
+      case "artifact.reused":
+        if (!replayableArtifact(item.data)) throw new CausalIRJournalValidationError(line, "malformed artifact entry")
+        if (item.entity_id !== item.data.artifact_id)
+          throw new CausalIRJournalValidationError(line, "artifact entity identity does not match payload")
+        break
+      case "diagnostic.created":
+        if (!replayableDiagnostic(item.data))
+          throw new CausalIRJournalValidationError(line, "malformed diagnostic entry")
+        if (item.entity_id !== item.data.diagnostic_id)
+          throw new CausalIRJournalValidationError(line, "diagnostic entity identity does not match payload")
+        break
+      case "case.checkpointed":
+        if (!isLifecycleJournalData(item.data) || !replayableSnapshot(item.data.snapshot, runID, caseID))
+          throw new CausalIRJournalValidationError(line, "malformed checkpoint entry")
+        if (item.entity_id !== caseID)
+          throw new CausalIRJournalValidationError(line, "checkpoint case identity does not match journal")
+        break
+      case "case.finalized":
+        if (!isCompactFinalizationJournalData(item.data))
+          throw new CausalIRJournalValidationError(line, "malformed compact finalization entry")
+        if (item.entity_id !== caseID)
+          throw new CausalIRJournalValidationError(line, "finalization case identity does not match journal")
+        break
+    }
+  }
+
+  if (options.requireInitialRunNode) {
+    const first = journal[0] as Record<string, unknown>
+    const node = first.data as CausalIRNode
+    if (first.operation !== "node.created" || node.kind !== "run.start")
+      throw new CausalIRJournalValidationError(1, "expected initial run.start node")
+    if (node.payload.run_id !== runID || node.payload.case_id !== caseID)
+      throw new CausalIRJournalValidationError(1, "initial run.start identity does not match journal")
+  }
+}
+
 export class CausalIRStore {
   readonly nodes: CausalNodeLike[] = []
   readonly edges: CausalEdgeLike[] = []
@@ -1580,7 +1771,17 @@ export class CausalIRStore {
   finalize(data: unknown): CausalIRCommitResult {
     const snapshot = this.synchronize()
     const trace = isCausalIRTraceDocument(data) ? data : undefined
-    const integrityHash = causalIRGraphIntegrityHash(snapshot)
+    const canonical: CausalIRTraceEnvelope | undefined = trace
+      ? {
+          trace_version: trace.trace_version,
+          causal_ir_version: trace.causal_ir_version,
+          manifest: trace.manifest,
+          journal: trace.journal,
+          metrics: trace.metrics,
+          compatibility: trace.compatibility,
+        }
+      : undefined
+    const integrityHash = causalIRFinalizationIntegrityHash(snapshot, canonical)
     const compact: CausalIRFinalizationJournalData = {
       format: "compact_causal_ir_finalization",
       data: trace?.manifest ?? data,
@@ -1593,18 +1794,7 @@ export class CausalIRStore {
         integrity_hash: integrityHash,
       },
       canonical_trace_path: "trace.json",
-      ...(trace
-        ? {
-            canonical: {
-              trace_version: trace.trace_version,
-              causal_ir_version: trace.causal_ir_version,
-              manifest: trace.manifest,
-              journal: trace.journal,
-              metrics: trace.metrics,
-              compatibility: trace.compatibility,
-            },
-          }
-        : {}),
+      ...(canonical ? { canonical } : {}),
     }
     return this.append("case.finalized", "finish", this.input.caseID, compact, "case")
   }
@@ -2273,6 +2463,15 @@ export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceD
   if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) return undefined
   const entry = terminal as Partial<CausalIRJournalEntry>
   if (entry.operation !== "case.finalized") return undefined
+  if (
+    !Number.isSafeInteger(entry.sequence) ||
+    entry.sequence !== journal.length ||
+    typeof entry.time !== "string" ||
+    !entry.time ||
+    typeof entry.payload_hash !== "string" ||
+    entry.payload_hash !== payloadHash(entry.data)
+  )
+    return undefined
 
   const trace = replayCausalIRTrace(journal)
   if (!trace) return undefined
@@ -2280,6 +2479,15 @@ export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceD
   if (!isCompactFinalizationJournalData(entry.data) || !isCausalIRTraceEnvelope(entry.data.canonical)) return undefined
 
   const graph = entry.data.graph
+  const canonical = entry.data.canonical
+  const summary = canonical.journal
+  const manifestRunID = canonical.manifest.run_id
+  const manifestCaseID = canonical.manifest.case_id
+  const preceding = summary.last_sequence > 0 ? journal[summary.last_sequence - 1] : undefined
+  const precedingPayloadHash =
+    preceding && typeof preceding === "object" && !Array.isArray(preceding)
+      ? (preceding as Partial<CausalIRJournalEntry>).payload_hash
+      : undefined
   if (
     graph.version !== CAUSAL_IR_VERSION ||
     !Number.isSafeInteger(graph.nodes) ||
@@ -2291,16 +2499,38 @@ export function replayFinalizedCausalIRTrace(journal: unknown[]): CausalIRTraceD
     graph.artifacts < 0 ||
     graph.diagnostics < 0 ||
     typeof graph.integrity_hash !== "string" ||
-    !graph.integrity_hash
+    !graph.integrity_hash ||
+    !summary ||
+    summary.schema_version !== CAUSAL_IR_VERSION ||
+    summary.format !== "causal-ir-jsonl" ||
+    summary.path !== "records.jsonl" ||
+    summary.summary_scope !== "entries_before_lifecycle_entry" ||
+    !Number.isSafeInteger(summary.entry_count) ||
+    !Number.isSafeInteger(summary.last_sequence) ||
+    summary.entry_count !== summary.last_sequence ||
+    summary.last_sequence + 1 !== entry.sequence ||
+    summary.poisoned !== false ||
+    precedingPayloadHash !== summary.last_payload_hash ||
+    typeof manifestRunID !== "string" ||
+    !manifestRunID ||
+    typeof manifestCaseID !== "string" ||
+    !manifestCaseID ||
+    entry.run_id !== manifestRunID ||
+    entry.case_id !== manifestCaseID ||
+    entry.entity_id !== manifestCaseID ||
+    entry.record_type !== "finish" ||
+    payloadHash(entry.data.data) !== payloadHash(canonical.manifest)
   )
     return undefined
   const snapshot = replayCausalIRJournal(journal)
   if (
+    snapshot.runID !== manifestRunID ||
+    snapshot.caseID !== manifestCaseID ||
     snapshot.nodes.length !== graph.nodes ||
     snapshot.edges.length !== graph.edges ||
     snapshot.artifacts.length !== graph.artifacts ||
     snapshot.diagnostics.length !== graph.diagnostics ||
-    graph.integrity_hash !== causalIRGraphIntegrityHash(snapshot)
+    graph.integrity_hash !== causalIRFinalizationIntegrityHash(snapshot, canonical)
   )
     return undefined
   return trace
