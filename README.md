@@ -41,9 +41,9 @@ flowchart LR
 新增的模型协议。模型解析、Provider 选择和认证仍由 OpenCode 原生配置负责。
 
 ```bash
-export MODEL="compatible/deepseek-v4-flash"
-export APIKEY="<your-api-key>"
-export URL="https://api.deepseek.com"
+export MODEL="<provider-model-id>"
+export URL="https://<openai-compatible-host>/v1"
+export APIKEY="<api-key>"
 
 export OPENCODE_CONFIG_CONTENT='{
   "model": "compatible/{env:MODEL}",
@@ -54,8 +54,8 @@ export OPENCODE_CONFIG_CONTENT='{
       "options": {
         "baseURL": "{env:URL}",
         "apiKey": "{env:APIKEY}",
-        "timeout": "720000",
-        "chunkTimeout": "720000"
+        "timeout": 720000,
+        "chunkTimeout": 720000
       },
       "models": {
         "{env:MODEL}": {"name": "{env:MODEL}"}
@@ -71,6 +71,11 @@ export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
 
 opencode /data/repos/target-project
 ```
+
+这里的 `MODEL` 是兼容接口直接接收的模型 ID，例如 `glm-5.1`，不要添加
+`compatible/` 前缀。OpenCode 使用固定 Provider ID `compatible`，最终选择的完整模型标识为
+`compatible/$MODEL`。`URL` 必须填写服务实际要求的 Base URL；如果接口路径是
+`/v1/chat/completions`，通常应以 `/v1` 结尾。
 
 在 TUI 中完成提问后正常退出。终端会打印本次 root session 的 `trace.json` 和
 `partial/latest.json` 路径。HTML 仅由独立 renderer 在离线时生成。HTTP benchmark 使用方式见
@@ -177,34 +182,30 @@ OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/openc
       "name": "OpenAI Compatible",
       "options": {
         "baseURL": "{env:URL}",
-        "apiKey": "{env:APIKEY}"
+        "apiKey": "{env:APIKEY}",
+        "timeout": 720000,
+        "chunkTimeout": 720000
       },
       "models": {
-        "glm-4.5": { "name": "GLM 4.5" },
-        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+        "{env:MODEL}": { "name": "{env:MODEL}" }
       }
     }
   }
 }
 ```
 
-其中 `MODEL` 必须是完整模型标识，例如 `compatible/glm-4.5`；`APIKEY` 和 `URL`
-分别提供该兼容服务的认证和地址。它们只是此模板选用的环境变量占位符，可以替换为
-企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。若使用 OpenCode
-内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
+其中 `MODEL` 是 Provider 接口直接接收的原始模型 ID，不包含 `compatible/` 前缀；
+`APIKEY` 和 `URL` 分别提供该兼容服务的认证和 Base URL。它们只是此模板选用的环境变量
+占位符，可以替换为企业自己的变量名，并不是 Observable OpenCode 的特殊运行时环境变量。
+若使用 OpenCode 内置 Provider，应优先使用该 Provider 的原生认证和配置方式。
 
-常见兼容接口可以按下面的方式替换环境变量；URL 必须以供应商或企业网关的实际文档为准：
+使用任意 OpenAI 兼容接口时，只需要替换下面三个环境变量。URL 必须以供应商或企业网关的
+实际文档为准：
 
 ```bash
-# DeepSeek 示例
-export MODEL="compatible/deepseek-v4-flash"
-export APIKEY="<your-deepseek-api-key>"
-export URL="https://api.deepseek.com"
-
-# GLM 或企业兼容网关示例
-# export MODEL="compatible/glm-4.5"
-# export APIKEY="<your-compatible-api-key>"
-# export URL="https://<compatible-endpoint>/v1"
+export MODEL="<provider-model-id>"
+export URL="https://<openai-compatible-host>/v1"
+export APIKEY="<api-key>"
 ```
 
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
@@ -228,7 +229,7 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CONFIG` | 否 | 指向额外的 OpenCode 原生配置文件。 |
 | `OPENCODE_CONFIG_DIR` | 否 | 指定 OpenCode 原生配置目录。 |
 | `OPENCODE_CONFIG_CONTENT` | 否 | 直接注入 OpenCode 原生 JSON 配置，适合 CI 或 benchmark。 |
-| `MODEL` | 取决于配置 | 本文模板使用的完整模型标识，例如 `compatible/deepseek-v4-flash`。 |
+| `MODEL` | 取决于配置 | 本文兼容接口模板使用的原始模型 ID，不包含 `compatible/` 前缀。 |
 | `APIKEY` | 取决于配置 | 本文模板使用的 Provider API Key。请通过 Secret 注入，不要写入仓库。 |
 | `URL` | 取决于配置 | 本文模板使用的兼容 API Base URL。 |
 | `OPENCODE_DISABLE_MODELS_FETCH` | 推荐 | 设为 `1` 时跳过启动阶段的 `models.dev` 请求，使用内置模型快照。 |
@@ -263,9 +264,9 @@ Cannot find module '@opencode-ai/plugin' from '/path/to/project/.opencode/...'
 目标项目：
 
 ```bash
-export MODEL="compatible/glm-4.5"
-export APIKEY="<your-compatible-api-key>"
-export URL="https://api.example.com/v1"
+export MODEL="<provider-model-id>"
+export URL="https://<openai-compatible-host>/v1"
+export APIKEY="<api-key>"
 
 export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_CASE_TRACE=1
