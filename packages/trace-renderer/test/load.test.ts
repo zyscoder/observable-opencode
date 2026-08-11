@@ -3,7 +3,12 @@ import { createHash } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { CausalIRStore, projectProvenanceTrace, replayFinalizedCausalIRTrace } from "opencode/observability/causal-ir"
+import {
+  CausalIRStore,
+  projectProvenanceTrace,
+  replayFinalizedCausalIRTrace,
+  validateCausalIRJournal,
+} from "opencode/observability/causal-ir"
 import { loadRenderableTrace } from "../src/load"
 
 function withCaseDirectory(run: (caseDir: string) => void) {
@@ -369,6 +374,59 @@ describe("loadRenderableTrace", () => {
         expect(() => loadRenderableTrace(journalFile), label).toThrow(`records.jsonl:${terminalLine}`)
       })
     }
+  })
+
+  test("binds a legacy lifecycle journal summary to the actual terminal prefix", () => {
+    const cases: Array<[string, (summary: any) => void]> = [
+      [
+        "entry count and sequence",
+        (summary) => {
+          summary.entry_count = 999
+          summary.last_sequence = 999
+        },
+      ],
+      [
+        "preceding payload hash",
+        (summary) => {
+          summary.last_payload_hash = "0".repeat(64)
+        },
+      ],
+      [
+        "poisoned journal",
+        (summary) => {
+          summary.poisoned = true
+        },
+      ],
+    ]
+
+    for (const [label, tamper] of cases) {
+      withCaseDirectory((caseDir) => {
+        const journal = createLegacyLifecycleFinalizedJournal() as any[]
+        const terminal = journal.at(-1)
+        tamper(terminal.data.trace.journal)
+        rehashEntry(terminal)
+        const journalFile = path.join(caseDir, "records.jsonl")
+        fs.writeFileSync(journalFile, journal.map((entry) => JSON.stringify(entry)).join("\n"))
+
+        expect(() => loadRenderableTrace(journalFile), label).toThrow(`records.jsonl:${journal.length}`)
+      })
+    }
+  })
+
+  test("requires an empty legacy lifecycle prefix to omit its last payload hash", () => {
+    const terminal = structuredClone((createLegacyLifecycleFinalizedJournal() as any[]).at(-1))
+    terminal.sequence = 1
+    terminal.previous_payload_hash = undefined
+    terminal.data.trace.journal.entry_count = 0
+    terminal.data.trace.journal.last_sequence = 0
+    terminal.data.trace.journal.last_payload_hash = undefined
+    rehashEntry(terminal)
+
+    expect(() => validateCausalIRJournal([terminal])).not.toThrow()
+
+    terminal.data.trace.journal.last_payload_hash = "0".repeat(64)
+    rehashEntry(terminal)
+    expect(() => validateCausalIRJournal([terminal])).toThrow("malformed lifecycle finalization entry")
   })
 
   test("rejects a compact finalization whose integrity hash does not match the replayed graph", () => {

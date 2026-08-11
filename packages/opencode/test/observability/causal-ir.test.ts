@@ -433,6 +433,26 @@ describe("causal IR store", () => {
     expect(() => validateCausalIRJournal(journal)).not.toThrow()
   })
 
+  test("keeps checkpoint payload data separate from bounded entity hash candidates", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_checkpoint_collision",
+      caseID: "case_checkpoint_collision",
+      append: (entry) => journal.push(entry),
+    })
+    const created = store.createNode(node("node_checkpoint_collision", { chosen_action: "original" }))
+    created.data = { chosen_action: "mutated-reference" }
+    store.checkpoint({ reason: "nodes.replaced" })
+    store.updateNode(created)
+
+    expect(journal[2]?.previous_payload_hash).toBe(journal[0]?.payload_hash)
+    expect(() => validateCausalIRJournal(journal)).not.toThrow()
+
+    const tampered = structuredClone(journal)
+    tampered[2]!.previous_payload_hash = "0".repeat(64)
+    expect(() => validateCausalIRJournal(tampered)).toThrow("previous payload hash does not match entity history")
+  })
+
   test("chains canonical payload hashes using locale-independent lexical key ordering", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({ runID: "run_hash", caseID: "case_hash", append: (entry) => journal.push(entry) })

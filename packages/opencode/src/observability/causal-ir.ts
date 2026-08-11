@@ -1608,6 +1608,20 @@ function lifecycleSnapshotMatchesTrace(data: CausalIRLifecycleJournalData) {
   )
 }
 
+function lifecycleJournalSummaryMatchesPrefix(
+  summary: CausalIRJournalSummary,
+  terminalSequence: number,
+  precedingPayloadHash: string | undefined,
+) {
+  const prefixLength = terminalSequence - 1
+  return (
+    summary.entry_count === prefixLength &&
+    summary.last_sequence === prefixLength &&
+    summary.poisoned === false &&
+    (prefixLength === 0 ? summary.last_payload_hash === undefined : summary.last_payload_hash === precedingPayloadHash)
+  )
+}
+
 function journalEntryHashKey(operation: CausalIRJournalEntry["operation"], entityID: string) {
   switch (operation) {
     case "node.created":
@@ -1626,19 +1640,27 @@ function journalEntryHashKey(operation: CausalIRJournalEntry["operation"], entit
   }
 }
 
-function rebuildJournalEntityPayloadHashes<T extends Record<string, unknown>>(
-  payloadHashes: Map<string, string>,
+function establishSnapshotPayloadHashCandidates<T extends Record<string, unknown>>(
+  payloadHashCandidates: Map<string, Set<string | undefined>>,
   hashType: string,
   items: T[],
   idKey: keyof T,
 ) {
   const prefix = `${hashType}:`
-  for (const key of payloadHashes.keys()) {
-    if (key.startsWith(prefix)) payloadHashes.delete(key)
-  }
+  const snapshotHashes = new Map<string, string>()
   for (const item of items) {
     const entityID = item[idKey]
-    if (typeof entityID === "string") payloadHashes.set(`${hashType}:${entityID}`, payloadHash(item))
+    if (typeof entityID === "string") snapshotHashes.set(entityID, payloadHash(item))
+  }
+
+  const keys = new Set([
+    ...[...payloadHashCandidates.keys()].filter((key) => key.startsWith(prefix)),
+    ...[...snapshotHashes.keys()].map((entityID) => `${prefix}${entityID}`),
+  ])
+  for (const key of keys) {
+    const candidates = payloadHashCandidates.get(key) ?? new Set<string | undefined>([undefined])
+    candidates.add(snapshotHashes.get(key.slice(prefix.length)))
+    payloadHashCandidates.set(key, candidates)
   }
 }
 
@@ -1646,7 +1668,8 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
   if (!journal.length) throw new CausalIRJournalValidationError(1, "journal is empty")
   let runID = ""
   let caseID = ""
-  const payloadHashes = new Map<string, string>()
+  let precedingJournalPayloadHash: string | undefined
+  const payloadHashCandidates = new Map<string, Set<string | undefined>>()
 
   for (let index = 0; index < journal.length; index++) {
     const line = index + 1
@@ -1672,7 +1695,8 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
     if (item.payload_hash !== entryPayloadHash)
       throw new CausalIRJournalValidationError(line, "journal payload hash does not match data")
     const hashKey = journalEntryHashKey(operation, item.entity_id)
-    if (item.previous_payload_hash !== payloadHashes.get(hashKey))
+    const candidates = payloadHashCandidates.get(hashKey) ?? new Set<string | undefined>([undefined])
+    if (!candidates.has(item.previous_payload_hash as string | undefined))
       throw new CausalIRJournalValidationError(line, "previous payload hash does not match entity history")
 
     switch (operation) {
@@ -1708,12 +1732,10 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
           throw new CausalIRJournalValidationError(line, "malformed checkpoint entry")
         if (item.entity_id !== caseID)
           throw new CausalIRJournalValidationError(line, "checkpoint case identity does not match journal")
-        if (journalRecord(item.data.data) && item.data.data.reason === "nodes.replaced") {
-          rebuildJournalEntityPayloadHashes(payloadHashes, "node", item.data.snapshot.nodes, "node_id")
-          rebuildJournalEntityPayloadHashes(payloadHashes, "edge", item.data.snapshot.edges, "edge_id")
-        } else if (journalRecord(item.data.data) && item.data.data.reason === "edges.replaced") {
-          rebuildJournalEntityPayloadHashes(payloadHashes, "edge", item.data.snapshot.edges, "edge_id")
-        }
+        // A public checkpoint and a replacement checkpoint have the same wire shape.
+        // Preserve both legitimate states until the next entity mutation disambiguates them.
+        establishSnapshotPayloadHashCandidates(payloadHashCandidates, "node", item.data.snapshot.nodes, "node_id")
+        establishSnapshotPayloadHashCandidates(payloadHashCandidates, "edge", item.data.snapshot.edges, "edge_id")
         break
       case "case.finalized":
         if (item.entity_id !== caseID)
@@ -1725,12 +1747,14 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
           !isLifecycleJournalData(item.data) ||
           !replayableSnapshot(item.data.snapshot, runID, caseID) ||
           !replayableLifecycleTrace(item.data.trace, runID, caseID) ||
-          !lifecycleSnapshotMatchesTrace(item.data)
+          !lifecycleSnapshotMatchesTrace(item.data) ||
+          !lifecycleJournalSummaryMatchesPrefix(item.data.trace.journal, line, precedingJournalPayloadHash)
         )
           throw new CausalIRJournalValidationError(line, "malformed lifecycle finalization entry")
         break
     }
-    payloadHashes.set(hashKey, entryPayloadHash)
+    payloadHashCandidates.set(hashKey, new Set([entryPayloadHash]))
+    precedingJournalPayloadHash = entryPayloadHash
   }
 
   if (options.requireInitialRunNode) {
