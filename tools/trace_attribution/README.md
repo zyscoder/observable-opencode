@@ -55,6 +55,10 @@ defective merely because the later executable test command is defective.
 The module is offline with respect to opencode execution. It never writes back to trace
 files and never feeds attribution results back into the agent.
 
+`trace.html` is a separate, optional human-viewing artifact. It is never an attribution
+input: pass the canonical `trace.json` to the attribution CLI even when an HTML view has
+already been rendered.
+
 Each attribution JSON also includes `trace_improvement_report`. This report describes
 where backward taint analysis became weak or blocked, which trace facts were missing,
 and which component should emit richer semantics in the next trace iteration.
@@ -82,6 +86,23 @@ python3 -m pip install anthropic
 
 ## Run
 
+### Render a case for viewing
+
+The standalone `observable-trace` binary renders a case directory without changing the
+semantic Trace inputs:
+
+```bash
+observable-trace render /data/case-traces/case_xxx
+```
+
+When `<case>/trace.json` exists, rendering uses that finalized canonical Trace. When a
+case has only `records.jsonl`, the renderer replays the durable journal and marks the
+HTML as incomplete recovery; it is not a completed case. `SIGKILL` cannot run OpenCode's
+finalizer, so it cannot promise a final `trace.json`; recovery is limited to journal data
+already durable before the kill.
+
+### Attribute a finalized semantic Trace
+
 ```bash
 export ANTHROPIC_API_KEY="..."
 export CLAUDE_MODEL="claude-sonnet-4-5"
@@ -92,6 +113,18 @@ python3 -m trace_attribution \
   --out /tmp/observable-opencode-attribution/tool-failure.attribution.json \
   --objective "Find why the final answer quality was poor."
 ```
+
+For question-based attribution, keep rendering separate and provide the canonical JSON,
+not HTML:
+
+```bash
+trace-attribution \
+  --trace /data/case-traces/case_xxx/trace.json \
+  --question "为什么本次修改编译失败？"
+```
+
+In a source checkout, invoke that CLI as `PYTHONPATH=tools/trace_attribution python3 -m
+trace_attribution` and retain the same `--trace` and `--question` arguments.
 
 The compatibility engine remains the default for existing objective-based runs. For a
 user question, the recommended command is `--engine recursive-agentic`: it runs the
@@ -229,7 +262,6 @@ request binds that session to the case, so the receipt can look like:
   case: case_xxx
   status: cancelled
   directory: /data/case-traces/case_xxx
-  html: /data/case-traces/case_xxx/trace.html
   json: /data/case-traces/case_xxx/trace.json
   partial: /data/case-traces/case_xxx/partial/latest.json
 ```
@@ -237,9 +269,9 @@ request binds that session to the case, so the receipt can look like:
 The example uses `SIGTERM`, so its terminal status is `cancelled`. In general, `status`
 is `completed`, `failed`, `cancelled`, or `partial`. The `partial:` line
 is shown whenever the durable `partial/latest.json` copy exists, including when the
-complete `trace.json` and `trace.html` are also present. The status is downgraded to
-`partial` only when `partial/latest.json` exists and either `trace.json` or `trace.html`
-is incomplete. Set `OPENCODE_CASE_TRACE_QUIET=1` to suppress this location receipt.
+complete `trace.json` is also present. The status is downgraded to `partial` only when
+`partial/latest.json` exists and `trace.json` is incomplete. Set
+`OPENCODE_CASE_TRACE_QUIET=1` to suppress this location receipt.
 Quiet mode does not disable trace collection or remove files; it only suppresses the
 stderr diagnostic. With the variable unset or set to another value, the receipt remains
 enabled. If no session was bound, the `session:` line may be omitted. The command
@@ -260,8 +292,8 @@ The recursive Python attribution service installs graceful handling for `SIGINT`
 an interrupted/inconclusive or partial report that can be resumed with the same command.
 It does not claim a Python-side graceful `SIGHUP` handler. For either process, `SIGKILL`
 cannot run a handler: no final receipt, in-memory work, or post-kill persistence is
-guaranteed. Only journal, partial, HTML, or output-transaction state already durably
-written before the kill is available for recovery.
+guaranteed. Only journal, partial, or output-transaction state already durably written
+before the kill is available for recovery.
 
 The recursive defaults are `--max-frontier-items 96`, `--max-depth 20`,
 `--max-hypotheses 24`, `--max-investigation-rounds 12`,

@@ -32,8 +32,43 @@ jobs:
       - name: Typecheck opencode package
         run: bun run --cwd packages/opencode typecheck
 
+      - name: Typecheck trace renderer package
+        run: bun run --cwd packages/trace-renderer typecheck
+
+      - name: Test trace renderer package
+        run: bun run --cwd packages/trace-renderer test
+
       - name: Build CLI binaries
         run: bun run --cwd packages/opencode build --skip-embed-web-ui
+
+      - name: Build trace renderer binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          targets=(
+            linux-x64
+            linux-x64-baseline
+            linux-x64-musl
+            linux-x64-baseline-musl
+            linux-arm64
+            linux-arm64-musl
+            darwin-arm64
+            darwin-x64
+            darwin-x64-baseline
+          )
+
+          for target in "${targets[@]}"; do
+            asset="release/observable-trace-${target}"
+            bun build --compile --target="bun-${target}" packages/trace-renderer/src/cli.ts --outfile "$asset"
+            if [ ! -f "$asset" ]; then
+              echo "Missing expected renderer binary: $asset" >&2
+              exit 1
+            fi
+
+            chmod +x "$asset"
+          done
 
       - name: Prepare release assets
         shell: bash
@@ -63,15 +98,26 @@ jobs:
             asset="release/${target/opencode-/opencode-observable-}"
             cp "$source" "$asset"
             chmod +x "$asset"
+
+            renderer_asset="release/observable-trace-${target/opencode-/}"
+            if [ ! -f "$renderer_asset" ]; then
+              echo "Missing expected renderer binary: $renderer_asset" >&2
+              exit 1
+            fi
           done
 
-          (cd release && sha256sum opencode-observable-* > SHA256SUMS)
+          (cd release && sha256sum opencode-observable-* observable-trace-* > SHA256SUMS)
 
       - name: Write release notes
         shell: bash
         run: |
           cat > release/RELEASE_NOTES.md <<'EOF'
-          Observable opencode binaries with benchmark case trace support.
+          Observable opencode binaries and offline trace renderer binaries.
+
+          Every supported platform has a matching pair:
+
+          - opencode-observable-<platform>: records the semantic case trace at runtime
+          - observable-trace-<platform>: renders an existing case directory offline
 
           Recommended asset for most x86_64 enterprise Linux hosts:
 
@@ -91,12 +137,20 @@ jobs:
           - opencode-observable-darwin-x64: macOS Intel
           - opencode-observable-darwin-x64-baseline: macOS Intel without AVX2
 
+          The matching `observable-trace-<platform>` assets use the same platform suffixes.
+
           Enable trace at runtime with:
 
           ```bash
           export OPENCODE_CASE_TRACE=1
           export OPENCODE_CASE_ID="T1-001"
           export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/opencode-traces"
+          ```
+
+          After a case completes, render it on the matching platform with:
+
+          ```bash
+          observable-trace-linux-x64 render /data/evo-bench/opencode-traces/T1-001
           ```
           EOF
 
@@ -115,10 +169,11 @@ jobs:
           set -euo pipefail
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" release/opencode-observable-* release/SHA256SUMS --clobber
+            gh release upload "$TAG_NAME" release/opencode-observable-* release/observable-trace-* release/SHA256SUMS --clobber
           else
             gh release create "$TAG_NAME" \
               release/opencode-observable-* \
+              release/observable-trace-* \
               release/SHA256SUMS \
               --title "$TAG_NAME" \
               --notes-file release/RELEASE_NOTES.md \

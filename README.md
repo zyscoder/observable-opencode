@@ -11,7 +11,7 @@ OpenCode Agent 原有执行行为的前提下，被动记录任务编排、上�
 ## 核心能力
 
 - **可评估**：可以用 benchmark case、评审事实和外部 evaluation 结果描述最终表现。
-- **可观测**：每个 case 生成一份结构化 Trace，并用 `trace.html` 展示完整 Agent 流程和组件数据流。
+- **可观测**：每个 case 生成一份结构化 Trace；可用独立的离线 renderer 生成 `trace.html` 查看完整 Agent 流程和组件数据流。
 - **可归因**：基于 Causal IR、重建的数据流和 LLM 判断执行后向语义污点分析。
 - **可优化**：把根因、因果链、证据引用和语义缺口转化为 Harness 的下一轮优化输入。
 - **行为隔离**：Trace 插装只被动记录；归因模块离线运行，不把分析结果反馈给正在执行的 Agent。
@@ -27,7 +27,8 @@ flowchart LR
     L -. "request / response" .-> C
     T -. "input / output" .-> C
     S -. "delegation / result" .-> C
-    C --> V["trace.html"]
+    C --> V["Offline Trace Renderer"]
+    V --> H["trace.html"]
     C --> R["Offline Attribution"]
     Q["User Defect Question"] --> R
     R --> O["Root Cause / Causal Chain / Evidence / Gaps"]
@@ -69,8 +70,8 @@ export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
 opencode /data/repos/target-project
 ```
 
-在 TUI 中完成提问后正常退出。终端会打印本次 root session 的 `trace.html`、
-`trace.json` 和 `partial/latest.json` 路径。HTTP benchmark 使用方式见
+在 TUI 中完成提问后正常退出。终端会打印本次 root session 的 `trace.json` 和
+`partial/latest.json` 路径。HTML 仅由独立 renderer 在离线时生成。HTTP benchmark 使用方式见
 [启动 HTTP Server 并记录 Trace](#启动-http-server-并记录-trace)，离线分析方式见
 [使用离线归因 CLI](#使用离线归因-cli)。
 
@@ -80,26 +81,30 @@ GitHub Actions 会发布 Linux 与 macOS 的独立可执行文件，不需要在
 执行 `bun install`。从 [Releases](https://github.com/zyscoder/observable-opencode/releases)
 选择对应资产：
 
-| 系统 | 推荐资产 |
-| --- | --- |
-| Linux x86_64 | `opencode-observable-linux-x64` |
-| 旧 x86_64 CPU（无 AVX2） | `opencode-observable-linux-x64-baseline` |
-| Alpine/musl x86_64 | `opencode-observable-linux-x64-musl` |
-| Linux arm64 | `opencode-observable-linux-arm64` |
-| macOS Apple Silicon | `opencode-observable-darwin-arm64` |
-| macOS Intel | `opencode-observable-darwin-x64` |
+| 系统 | Runtime 资产 | 离线 Renderer 资产 |
+| --- | --- | --- |
+| Linux x86_64 | `opencode-observable-linux-x64` | `observable-trace-linux-x64` |
+| 旧 x86_64 CPU（无 AVX2） | `opencode-observable-linux-x64-baseline` | `observable-trace-linux-x64-baseline` |
+| Alpine/musl x86_64 | `opencode-observable-linux-x64-musl` | `observable-trace-linux-x64-musl` |
+| Linux arm64 | `opencode-observable-linux-arm64` | `observable-trace-linux-arm64` |
+| macOS Apple Silicon | `opencode-observable-darwin-arm64` | `observable-trace-darwin-arm64` |
+| macOS Intel | `opencode-observable-darwin-x64` | `observable-trace-darwin-x64` |
 
 以 Linux x86_64 为例：
 
 ```bash
 RELEASE_TAG="<Releases 页面中的版本，例如 v1.2.3-observable.1>"
 ASSET="opencode-observable-linux-x64"
+TRACE_ASSET="observable-trace-linux-x64"
 BASE_URL="https://github.com/zyscoder/observable-opencode/releases/download/${RELEASE_TAG}"
 
 curl -fL -o "$ASSET" "$BASE_URL/$ASSET"
+curl -fL -o "$TRACE_ASSET" "$BASE_URL/$TRACE_ASSET"
 curl -fL -o SHA256SUMS "$BASE_URL/SHA256SUMS"
 grep "  $ASSET$" SHA256SUMS | sha256sum --check
+grep "  $TRACE_ASSET$" SHA256SUMS | sha256sum --check
 chmod +x "$ASSET"
+chmod +x "$TRACE_ASSET"
 ./"$ASSET" --version
 ```
 
@@ -119,12 +124,16 @@ macOS 校验可执行：
 ```bash
 RELEASE_TAG="<Releases 页面中的版本，例如 v1.2.3-observable.1>"
 ASSET="opencode-observable-darwin-arm64"
+TRACE_ASSET="observable-trace-darwin-arm64"
 BASE_URL="https://github.com/zyscoder/observable-opencode/releases/download/${RELEASE_TAG}"
 
 curl -fL -o "$ASSET" "$BASE_URL/$ASSET"
+curl -fL -o "$TRACE_ASSET" "$BASE_URL/$TRACE_ASSET"
 curl -fL -o SHA256SUMS "$BASE_URL/SHA256SUMS"
 grep "  $ASSET$" SHA256SUMS | shasum -a 256 --check
+grep "  $TRACE_ASSET$" SHA256SUMS | shasum -a 256 --check
 chmod +x "$ASSET"
+chmod +x "$TRACE_ASSET"
 ./"$ASSET" --version
 ```
 
@@ -270,15 +279,14 @@ opencode /data/repos/target-project
   case: benchmark-case-001
   status: cancelled
   directory: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4
-  html: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.html
   json: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
   partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
 ```
 
 可捕获的中断会保留有效 Trace，状态通常为 `cancelled`；仅有阶段性快照时为 `partial`。
 `SIGKILL` 无法执行任何用户态退出处理，只能依赖进程运行期间已经原子写入的
-`partial/latest.json`。设置 `OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，
-不会关闭 Trace。
+`records.jsonl` journal（以及已存在的 `partial/latest.json`）进行恢复。设置
+`OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，不会关闭 Trace。
 
 ## 启动 HTTP Server 并记录 Trace
 
@@ -348,7 +356,6 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
 
 ```text
 <trace-directory>/
-├── trace.html                 # 可视化入口
 ├── trace.json                 # Causal IR 语义 Trace
 ├── provenance-trace.json      # 归因事实投影
 ├── legacy-trace.json          # 兼容投影
@@ -361,9 +368,23 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
     └── latest.json            # 运行中/异常退出恢复快照
 ```
 
-直接在浏览器中打开所需 root 的 `trace.html`，即可查看主 Agent、Subagent、任务编排、
-上下文压缩、message 多层转换、LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的
-完整数据流。大文本保存在 `artifacts/` 中，在 HTML 内按需展开。
+## 离线渲染 Trace
+
+运行时不会生成 HTML。下载与 OpenCode runtime 相同平台后缀的
+`observable-trace-<platform>`，并在 case 完成后显式运行：
+
+```bash
+./observable-trace-linux-x64 render /data/evo-bench/traces/benchmark-case-001
+```
+
+默认输出是 `<case-dir>/trace.html`；也可用 `--output <path>` 写到报告目录。若 case
+已有已完成的 `trace.json`，renderer 会生成完整视图。若只有 `records.jsonl`，renderer 会
+回放 journal 并在 HTML 中标记为不完整恢复，不能把它当作成功完成的 case。`SIGKILL` 无法
+执行 finalizer，因此只能依赖被杀前已持久化的 journal；之后可渲染 journal-only 恢复结果。
+
+生成的 HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 多层转换、
+LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因不读取 HTML，也不应将
+`trace.html` 作为输入；归因始终读取 `trace.json`。
 
 ## 使用离线归因 CLI
 
@@ -394,6 +415,11 @@ python -m trace_attribution \
   --judge-timeout-sec 3600 \
   --judge-max-tokens 16000
 ```
+
+渲染和归因是两个独立的离线步骤：使用 `observable-trace render <case-dir>` 查看 HTML，
+使用 `trace-attribution --trace <case-dir>/trace.json --question "..."`（源码 checkout 中为
+上面的 `python -m trace_attribution` 命令）执行归因。即使已经渲染过 HTML，也必须把
+`trace.json` 而不是 `trace.html` 传给归因 CLI。
 
 归因 Judge 通过 Anthropic SDK 调用 Anthropic 兼容接口。它和运行 Observable OpenCode 的
 模型相互独立，因此可以用一个模型执行 case、另一个模型离线归因。环境变量含义如下：
