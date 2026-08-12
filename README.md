@@ -239,6 +239,7 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
 | `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
 | `OPENCODE_CASE_TRACE_QUIET` | 否 | 设为 `1` 隐藏退出时的 Trace 路径提示，不影响落盘。 |
+| `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` | 否 | TUI 退出后等待 worker 清理资源并完成 Trace 持久化的最大时长（毫秒）；启用 Trace 时默认 `3600000`，未启用时默认 `5000`。它不限制 Agent 或 LLM 的执行时长。 |
 | `OPENCODE_SERVER_PASSWORD` | HTTP 推荐 | 为 `opencode serve` 启用 Basic Auth，用户名固定为 `opencode`。 |
 
 高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
@@ -291,6 +292,26 @@ opencode /data/repos/target-project
   json: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
   partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
 ```
+
+在 TUI 中，`Ctrl-C` 是 `app.exit` 快捷键，主线程会先请求 worker 停止并等待
+`trace.json` 完成持久化，再终止 worker。启用 Trace 时默认最多等待一小时；若企业环境中的
+长 session 需要更多时间，可提高 `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS`。等待超时时终端会明确
+提示 `trace.json may be unavailable`，而不是静默只留下 `records.jsonl`。
+
+该时长只作用于退出阶段，包括释放 Session、Tool、MCP 和内部 Server，收尾未关闭的语义节点，
+追加 Causal IR 的 `case.finalized`，以及原子写入 `trace.json`、`manifest.json` 和
+`partial/latest.json`。它不是 LLM 请求超时、Tool 超时或 case 执行超时。`3600000` 只是等待
+上限，并不意味着每次退出都会等待一小时；worker 完成持久化后，TUI 会立即退出。通常无需
+显式设置。确需覆盖时可使用：
+
+```bash
+# 允许复杂长 session 在 Ctrl-C 后最多用两小时完成资源清理和 Trace 持久化
+export OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS=7200000
+```
+
+不要为了加快退出而把它设置得过短，否则主线程可能在 finalization 完成前终止 worker，表现为
+case 目录中已有持续追加的 `records.jsonl`，但没有最终的 `trace.json`。该配置无法改变
+`SIGKILL` 的行为，因为 `SIGKILL` 不允许进程执行任何用户态收尾逻辑。
 
 可捕获的中断会执行 terminal finalizer，写入状态通常为 `cancelled` 的语义 Trace 和终端兼容
 输出。运行期间不会生成完整 partial snapshot。`SIGKILL` 无法执行任何用户态退出处理，

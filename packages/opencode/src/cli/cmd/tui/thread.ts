@@ -28,6 +28,30 @@ declare global {
 
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
 
+const DEFAULT_TUI_WORKER_SHUTDOWN_TIMEOUT_MS = 5_000
+const TRACED_TUI_WORKER_SHUTDOWN_TIMEOUT_MS = 60 * 60 * 1_000
+
+function traceEnabled(env: NodeJS.ProcessEnv | Record<string, string | undefined>) {
+  const value = env.OPENCODE_CASE_TRACE?.trim().toLowerCase()
+  return value === "1" || value === "true" || value === "yes" || value === "on"
+}
+
+export function resolveTuiWorkerShutdownTimeout(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+) {
+  const configured = Number(env.OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS)
+  if (Number.isSafeInteger(configured) && configured > 0) return configured
+  return traceEnabled(env) ? TRACED_TUI_WORKER_SHUTDOWN_TIMEOUT_MS : DEFAULT_TUI_WORKER_SHUTDOWN_TIMEOUT_MS
+}
+
+export function waitForTuiWorkerShutdown<T>(
+  shutdown: Promise<T>,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+) {
+  const timeout = resolveTuiWorkerShutdownTimeout(env)
+  return withTimeout(shutdown, timeout, `TUI worker shutdown timed out after ${timeout}ms`)
+}
+
 function createWorkerFetch(client: RpcClient): typeof fetch {
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
@@ -178,10 +202,15 @@ export const TuiThreadCommand = cmd({
         process.off("uncaughtException", error)
         process.off("unhandledRejection", error)
         process.off("SIGUSR2", reload)
-        await withTimeout(client.call("shutdown", undefined), 5000).catch((error) => {
+        await waitForTuiWorkerShutdown(client.call("shutdown", undefined)).catch((error) => {
           Log.Default.warn("worker shutdown failed", {
             error: errorMessage(error),
           })
+          if (traceEnabled(process.env)) {
+            process.stderr.write(
+              `[observable-opencode] Worker shutdown did not complete; trace.json may be unavailable: ${errorMessage(error)}\n`,
+            )
+          }
         })
         worker.terminate()
       }

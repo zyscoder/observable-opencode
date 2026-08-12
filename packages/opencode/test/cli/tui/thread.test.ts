@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { tmpdir } from "../../fixture/fixture"
-import { resolveThreadDirectory } from "../../../src/cli/cmd/tui/thread"
+import {
+  resolveThreadDirectory,
+  resolveTuiWorkerShutdownTimeout,
+  waitForTuiWorkerShutdown,
+} from "../../../src/cli/cmd/tui/thread"
 
 describe("tui thread", () => {
   async function check(project?: string) {
@@ -24,5 +28,28 @@ describe("tui thread", () => {
 
   test("uses the real cwd after resolving a relative project from PWD", async () => {
     await check(".")
+  })
+
+  test("gives traced worker shutdown enough time to finalize after the legacy five-second boundary", async () => {
+    let finalized = false
+    const shutdown = Bun.sleep(5_100).then(() => {
+      finalized = true
+    })
+
+    await waitForTuiWorkerShutdown(shutdown, { OPENCODE_CASE_TRACE: "1" })
+
+    expect(finalized).toBe(true)
+  }, 10_000)
+
+  test("honors an explicit TUI shutdown timeout", async () => {
+    const env = {
+      OPENCODE_CASE_TRACE: "1",
+      OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS: "10",
+    }
+
+    expect(resolveTuiWorkerShutdownTimeout(env)).toBe(10)
+    await expect(waitForTuiWorkerShutdown(Bun.sleep(100), env)).rejects.toThrow(
+      "TUI worker shutdown timed out after 10ms",
+    )
   })
 })
