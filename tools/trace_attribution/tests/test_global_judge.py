@@ -54,6 +54,66 @@ class GlobalPageRepairBudgetTest(unittest.TestCase):
         )
 
 
+class GlobalJudgePromptProjectionTest(unittest.TestCase):
+    def test_large_canonical_capsule_is_bounded_only_at_prompt_boundary(self):
+        request = sample_request()
+        huge_text = "private-build-log " * 30_000
+        first = request.capsules[0]
+        enlarged = replace(
+            first,
+            candidate={
+                **dict(first.candidate),
+                "validation_only_large_payload": huge_text,
+            },
+        )
+        enlarged_request = replace(
+            request,
+            capsules=(enlarged, *request.capsules[1:]),
+        )
+
+        canonical = enlarged_request.validation_envelope()
+        prompt_payload = json.loads(
+            build_global_candidate_prompt(enlarged_request)
+        )
+        projected = prompt_payload["request"]
+
+        self.assertEqual(
+            canonical["candidate_evidence_capsules"][0]["candidate"]
+            ["validation_only_large_payload"],
+            huge_text,
+        )
+        self.assertNotIn(
+            "validation_only_large_payload",
+            projected["candidate_evidence_capsules"][0]["candidate"],
+        )
+        self.assertLess(
+            len(stable_json(projected).encode("utf-8")),
+            len(stable_json(canonical).encode("utf-8")) // 4,
+        )
+        manifest = projected["prompt_projection"]
+        self.assertEqual(
+            manifest["schema"], "global-judge-prompt-projection/v1"
+        )
+        self.assertEqual(
+            manifest["canonical_request_sha256"],
+            __import__("hashlib").sha256(
+                stable_json(enlarged_request.to_dict()).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertIn(
+            "candidate.validation_only_large_payload",
+            manifest["omitted_sections"],
+        )
+        self.assertEqual(
+            projected["offered_candidate_refs"],
+            list(enlarged_request.offered_candidate_refs),
+        )
+        self.assertEqual(
+            projected["candidate_evidence_capsules"][0]["downstream_path"],
+            list(enlarged.downstream_path),
+        )
+
+
 def sample_request(
     *,
     decision_edge_fields: dict | None = None,

@@ -505,6 +505,69 @@ class GlobalCandidateJudgeRequest:
             ],
         }
 
+    def judge_prompt_projection(self) -> JsonDict:
+        """Build the bounded factual view sent to the Global Judge."""
+        canonical = self.to_dict()
+        canonical_json = stable_json(canonical)
+        omitted_sections: List[str] = []
+        projected: JsonDict = {
+            "case_id": self.case_id,
+            "objective": self.objective,
+            "analysis_perspective": self.analysis_perspective,
+            "seed_ref": self.seed_ref,
+            "active_defect": self.active_defect.to_dict(),
+            "active_focus_text": self.active_focus_text,
+            "active_focus_text_hash": self.active_focus_text_hash,
+            "start_refs": list(self.start_refs),
+            "active_focus": copy.deepcopy(canonical["active_focus"]),
+            "factual_context": copy.deepcopy(canonical["factual_context"]),
+            "trace_health": copy.deepcopy(canonical["trace_health"]),
+            "evidence_expansions": copy.deepcopy(
+                canonical["evidence_expansions"]
+            ),
+            "restoration_obligations": copy.deepcopy(
+                canonical["restoration_obligations"]
+            ),
+            "offered_candidate_refs": list(self.offered_candidate_refs),
+            "open_authored_root_candidate_refs": list(
+                self.open_authored_root_candidate_refs
+            ),
+            "retrieval_is_not_causal_verdict": True,
+            "grounded_refs": list(self.grounded_refs),
+            "candidate_evidence_capsules": [
+                item.judge_prompt_dict(
+                    omitted_sections=omitted_sections
+                )
+                for item in self.capsules
+            ],
+            "evidence_context_capsules": [
+                item.judge_prompt_dict(
+                    omitted_sections=omitted_sections
+                )
+                for item in self.evidence_context_capsules
+            ],
+        }
+        projected_json = stable_json(projected)
+        projected["prompt_projection"] = {
+            "schema": "global-judge-prompt-projection/v1",
+            "canonical_request_sha256": hashlib.sha256(
+                canonical_json.encode("utf-8")
+            ).hexdigest(),
+            "canonical_request_bytes": len(
+                canonical_json.encode("utf-8")
+            ),
+            "projected_fact_bytes": len(
+                projected_json.encode("utf-8")
+            ),
+            "omitted_sections": sorted(set(omitted_sections)),
+            "omitted_section_count": len(set(omitted_sections)),
+            "candidate_count": len(self.capsules),
+            "evidence_context_count": len(
+                self.evidence_context_capsules
+            ),
+        }
+        return projected
+
 
 def global_candidate_request_from_validation_envelope(
     value: Any,
@@ -1317,7 +1380,7 @@ def build_global_candidate_prompt(request: GlobalCandidateJudgeRequest) -> str:
     request.validate()
     return stable_json(
         {
-            "request": request.to_dict(),
+            "request": request.judge_prompt_projection(),
             "candidate_comparison_contract": (
                 global_candidate_comparison_contract(request)
             ),

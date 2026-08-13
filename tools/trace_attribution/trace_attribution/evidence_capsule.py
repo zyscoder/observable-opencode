@@ -34,6 +34,8 @@ CALL_ID_KEYS = ("call_id", "callID", "tool_call_id", "toolCallID")
 MAX_VALIDATION_SOURCE_BYTES = 16384
 GLOBAL_FUSION_MAX_PAYLOAD_BYTES = 65_536
 GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES = 3
+JUDGE_PROMPT_STRING_CHARS = 1600
+JUDGE_PROMPT_COLLECTION_ITEMS = 12
 VALIDATION_SOURCE_KEYS = frozenset(
     {
         "candidate_ref",
@@ -520,6 +522,79 @@ class CandidateEvidenceCapsule:
             ):
                 hydration.pop(key, None)
         return value
+
+    def judge_prompt_dict(self, *, omitted_sections: List[str]) -> JsonDict:
+        """Return bounded Judge facts without changing canonical evidence."""
+        candidate = _thaw(self.candidate)
+        allowed_candidate_keys = {
+            "ref",
+            "source",
+            "retrieval_is_not_causal_verdict",
+            "evidence_eligible",
+            "root_candidate_eligible",
+            "active_graph_facts",
+            "retrieval_edge",
+            "node",
+        }
+        for key in sorted(set(candidate) - allowed_candidate_keys):
+            omitted_sections.append("candidate.{0}".format(key))
+            candidate.pop(key, None)
+        return {
+            "schema_version": CAPSULE_SCHEMA_VERSION,
+            "candidate_ref": self.candidate_ref,
+            "candidate": _bounded_prompt_value(
+                candidate,
+                path="candidate",
+                omitted_sections=omitted_sections,
+            ),
+            "downstream_path": list(self.downstream_path),
+            "downstream_path_references": _bounded_prompt_value(
+                _thaw(self.downstream_path_references),
+                path="downstream_path_references",
+                omitted_sections=omitted_sections,
+            ),
+            "causal_path_edges": _bounded_prompt_value(
+                _thaw(self.causal_path_edges),
+                path="causal_path_edges",
+                omitted_sections=omitted_sections,
+            ),
+            "start_refs": list(self.start_refs),
+            "action_group": _bounded_prompt_value(
+                _thaw(self.action_group),
+                path="action_group",
+                omitted_sections=omitted_sections,
+            ),
+            "incoming_edges": _bounded_prompt_value(
+                _thaw(self.incoming_edges),
+                path="incoming_edges",
+                omitted_sections=omitted_sections,
+            ),
+            "outgoing_edges": _bounded_prompt_value(
+                _thaw(self.outgoing_edges),
+                path="outgoing_edges",
+                omitted_sections=omitted_sections,
+            ),
+            "evidence_references": _bounded_prompt_value(
+                _thaw(self.evidence_references),
+                path="evidence_references",
+                omitted_sections=omitted_sections,
+            ),
+            "artifact_hydration": _bounded_prompt_value(
+                _thaw(self.artifact_hydration),
+                path="artifact_hydration",
+                omitted_sections=omitted_sections,
+            ),
+            "restoration_obligations": _bounded_prompt_value(
+                _thaw(self.restoration_obligations),
+                path="restoration_obligations",
+                omitted_sections=omitted_sections,
+            ),
+            "episode_facts": _bounded_prompt_value(
+                _thaw(self.episode_facts),
+                path="episode_facts",
+                omitted_sections=omitted_sections,
+            ),
+        }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":
@@ -2081,6 +2156,61 @@ def _grounded_node_snapshot(
     snapshot = graph.sanitize_judge_node(node).compact(max_chars=max_chars)
     snapshot["source_refs"] = list(snapshot.get("source_refs") or ())
     return snapshot
+
+
+def _bounded_prompt_value(
+    value: Any,
+    *,
+    path: str,
+    omitted_sections: List[str],
+    depth: int = 0,
+) -> Any:
+    if depth >= 10:
+        omitted_sections.append(path)
+        return {"omitted": True, "reason": "maximum_projection_depth"}
+    if isinstance(value, str):
+        if len(value) <= JUDGE_PROMPT_STRING_CHARS:
+            return value
+        omitted_sections.append(path)
+        raw = value.encode("utf-8")
+        return "{0}\n...[omitted bytes={1} sha256={2}]".format(
+            value[:JUDGE_PROMPT_STRING_CHARS],
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded_prompt_value(
+                item,
+                path="{0}.{1}".format(path, key),
+                omitted_sections=omitted_sections,
+                depth=depth + 1,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        selected = items[:JUDGE_PROMPT_COLLECTION_ITEMS]
+        if len(items) > len(selected):
+            omitted_sections.append(path)
+        projected = [
+            _bounded_prompt_value(
+                item,
+                path="{0}[{1}]".format(path, index),
+                omitted_sections=omitted_sections,
+                depth=depth + 1,
+            )
+            for index, item in enumerate(selected)
+        ]
+        if len(items) > len(selected):
+            projected.append(
+                {
+                    "omitted_item_count": len(items) - len(selected),
+                    "original_item_count": len(items),
+                }
+            )
+        return projected
+    return copy.deepcopy(value)
 
 
 __all__ = [
