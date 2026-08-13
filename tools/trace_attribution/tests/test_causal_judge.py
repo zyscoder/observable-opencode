@@ -2616,6 +2616,20 @@ class ClaudeTransportAdapterTest(unittest.TestCase):
 
 
 class ProviderFailureClassificationTest(unittest.TestCase):
+    def test_context_window_bad_request_is_non_retryable_even_with_numeric_code(self):
+        disposition = provider_errors.classify_provider_failure(
+            status=400,
+            code="400",
+            reason=(
+                "BadRequestError: This model's maximum context length is 202752 "
+                "tokens. Your prompt contains 254400 input tokens."
+            ),
+        )
+
+        self.assertFalse(disposition.retryable)
+        self.assertEqual(disposition.category, "context_window_exceeded")
+        self.assertEqual(disposition.error_code, "context_window_exceeded")
+
     def test_structured_provider_failures_have_stable_retry_dispositions(self):
         cases = (
             (400, "invalid_request_error", False),

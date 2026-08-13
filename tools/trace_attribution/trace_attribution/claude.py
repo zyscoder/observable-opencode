@@ -26,6 +26,12 @@ from .errors import (
     provider_failure_reason,
 )
 from .models import NodeJudgment, TraceNode, judgment_from_dict, stable_json
+from .judge_budget import (
+    DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS,
+    JudgeContextBudget,
+    JudgeContextBudgetExceeded,
+)
 
 T = TypeVar("T")
 
@@ -84,6 +90,10 @@ class ClaudeJudgeClient(JudgeClient):
         thinking_mode: str = "auto",
         cache_path: str = "",
         provider_error_threshold: int = 3,
+        context_window_tokens: int = DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS,
+        context_safety_margin_tokens: int = (
+            DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS
+        ),
     ):
         try:
             from anthropic import Anthropic
@@ -107,6 +117,11 @@ class ClaudeJudgeClient(JudgeClient):
         self.timeout_seconds = timeout
         self.client = Anthropic(**client_kwargs)
         self.max_tokens = max_tokens
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_tokens,
+            safety_margin_tokens=context_safety_margin_tokens,
+        )
         self.repair_max_tokens = repair_max_tokens
         self.request_count = 0
         self.thinking_mode = thinking_mode or os.environ.get("CLAUDE_THINKING_MODE") or "auto"
@@ -575,6 +590,21 @@ class ClaudeJudgeClient(JudgeClient):
                 ),
                 physical_requests=0,
             )
+        context_budget = getattr(self, "context_budget", None)
+        if context_budget is not None:
+            try:
+                measurement = context_budget.measure(
+                    system=system,
+                    messages=messages,
+                    max_output_tokens=max_tokens,
+                )
+            except Exception as exc:
+                raise TransportCallError(exc, physical_requests=0) from exc
+            if not measurement.fits:
+                raise TransportCallError(
+                    JudgeContextBudgetExceeded(measurement),
+                    physical_requests=0,
+                )
         try:
             timeout_seconds = self.timeout_seconds
             if timeout_seconds is not None and timeout_seconds > 0:

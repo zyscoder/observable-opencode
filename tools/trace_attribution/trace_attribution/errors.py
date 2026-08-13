@@ -69,6 +69,25 @@ def classify_provider_failure(
     """Classify a Provider failure without relying on its human-readable text."""
     status_code = status if type(status) is int else None
     error_code = str(code or "").strip().lower()
+    normalized_reason = str(reason or "").strip().lower()
+    context_window_markers = (
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "prompt is too long",
+        "too many input tokens",
+        "input tokens exceed",
+    )
+    if status_code == 400 and any(
+        marker in normalized_reason for marker in context_window_markers
+    ):
+        return ProviderFailureDisposition(
+            False,
+            "context_window_exceeded",
+            status_code,
+            "context_window_exceeded",
+            reason,
+        )
     transient_markers = (
         "temporary",
         "timeout",

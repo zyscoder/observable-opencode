@@ -671,6 +671,8 @@ class AttributionRequestTest(unittest.TestCase):
         self.assertEqual(options.base_url_env, "ANTHROPIC_BASE_URL")
         self.assertEqual(options.judge_timeout_sec, 3600.0)
         self.assertEqual(options.judge_max_tokens, 4096)
+        self.assertEqual(options.judge_context_window_tokens, 200_000)
+        self.assertEqual(options.judge_context_safety_margin_tokens, 8_192)
         self.assertEqual(options.thinking_mode, "auto")
         self.assertEqual(options.provider_error_threshold, 3)
 
@@ -680,7 +682,12 @@ class AttributionRequestTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "judge_timeout_sec"):
                     AttributionOptions(judge_timeout_sec=value)
 
-        for name in ("judge_max_tokens", "provider_error_threshold"):
+        for name in (
+            "judge_max_tokens",
+            "judge_context_window_tokens",
+            "judge_context_safety_margin_tokens",
+            "provider_error_threshold",
+        ):
             for value in ("12", True, False, 0, -1, 1.5, math.inf, math.nan):
                 with self.subTest(field=name, value=value):
                     with self.assertRaisesRegex(ValueError, name):
@@ -691,6 +698,13 @@ class AttributionRequestTest(unittest.TestCase):
             AttributionOptions(judge_timeout_sec=12).judge_timeout_sec,
             float,
         )
+
+        with self.assertRaisesRegex(ValueError, "effective input budget"):
+            AttributionOptions(
+                judge_context_window_tokens=10_000,
+                judge_max_tokens=8_000,
+                judge_context_safety_margin_tokens=2_000,
+            )
 
     def test_python_service_uses_question_as_effective_objective_and_preserves_request(self) -> None:
         service = importlib.import_module("trace_attribution.service")
@@ -774,6 +788,8 @@ class AttributionRequestTest(unittest.TestCase):
                 base_url="",
                 base_url_env="ANTHROPIC_BASE_URL",
                 max_tokens=4096,
+                context_window_tokens=200_000,
+                context_safety_margin_tokens=8_192,
                 timeout_seconds=3600.0,
                 thinking_mode="auto",
                 cache_path=str(

@@ -96,6 +96,10 @@ def analyze(request: AttributionRequest) -> AttributionResult:
         base_url=options.base_url,
         base_url_env=options.base_url_env,
         max_tokens=options.judge_max_tokens,
+        context_window_tokens=options.judge_context_window_tokens,
+        context_safety_margin_tokens=(
+            options.judge_context_safety_margin_tokens
+        ),
         timeout_seconds=options.judge_timeout_sec,
         thinking_mode=options.thinking_mode,
         cache_path=str(cache_path),
@@ -168,6 +172,7 @@ def _run_recursive_analysis(
             "base_url": transport.base_url,
             "thinking": transport.thinking_config,
             "max_tokens": transport.max_tokens,
+            "context_budget": transport.context_budget.to_dict(),
             "provider_error_threshold": transport.provider_error_threshold,
             "fusion_mode": options.fusion_mode,
             "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,

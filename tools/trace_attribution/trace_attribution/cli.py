@@ -91,6 +91,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Max output tokens for each judge call; reasoning models may need extra room for JSON text.",
     )
     parser.add_argument(
+        "--judge-context-window-tokens",
+        type=int,
+        default=200_000,
+        help="Total model context window used for local Judge request preflight.",
+    )
+    parser.add_argument(
+        "--judge-context-safety-margin-tokens",
+        type=int,
+        default=8_192,
+        help="Tokens reserved beyond Judge output to absorb estimator and provider framing differences.",
+    )
+    parser.add_argument(
         "--thinking-mode",
         choices=("auto", "enabled", "disabled"),
         default="auto",
@@ -161,6 +173,10 @@ def main() -> int:
                 base_url_env=args.base_url_env,
                 judge_timeout_sec=args.judge_timeout_sec,
                 judge_max_tokens=args.judge_max_tokens,
+                judge_context_window_tokens=args.judge_context_window_tokens,
+                judge_context_safety_margin_tokens=(
+                    args.judge_context_safety_margin_tokens
+                ),
                 thinking_mode=args.thinking_mode,
                 provider_error_threshold=args.provider_error_threshold,
             ),

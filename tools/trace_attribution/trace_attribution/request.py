@@ -12,6 +12,11 @@ from types import MappingProxyType
 from typing import Any
 
 from .claude import default_judge_timeout_seconds
+from .judge_budget import (
+    DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS,
+    JudgeContextBudget,
+)
 
 QUESTION_SCHEMA_VERSION = "attribution-question/v1"
 MAX_QUESTION_CHARS = 16_384
@@ -137,6 +142,10 @@ class AttributionOptions:
     base_url_env: str = "ANTHROPIC_BASE_URL"
     judge_timeout_sec: float = field(default_factory=default_judge_timeout_seconds)
     judge_max_tokens: int = 4096
+    judge_context_window_tokens: int = DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS
+    judge_context_safety_margin_tokens: int = (
+        DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS
+    )
     thinking_mode: str = "auto"
     provider_error_threshold: int = 3
 
@@ -166,10 +175,20 @@ class AttributionOptions:
         ):
             raise ValueError("judge_timeout_sec must be a positive finite number")
         object.__setattr__(self, "judge_timeout_sec", float(timeout))
-        for name in ("judge_max_tokens", "provider_error_threshold"):
+        for name in (
+            "judge_max_tokens",
+            "judge_context_window_tokens",
+            "judge_context_safety_margin_tokens",
+            "provider_error_threshold",
+        ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError("{0} must be a positive integer".format(name))
+        JudgeContextBudget(
+            context_window_tokens=self.judge_context_window_tokens,
+            max_output_tokens=self.judge_max_tokens,
+            safety_margin_tokens=self.judge_context_safety_margin_tokens,
+        )
         for name in (
             "max_depth",
             "max_nodes",
