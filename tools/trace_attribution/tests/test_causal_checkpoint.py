@@ -1999,8 +1999,11 @@ class CausalCheckpointTest(unittest.TestCase):
             config["global_judgment_contract"],
             "global-candidate-judgment/v11+validation-envelope/v11+capsule/v8"
             "+evidence-policy/v5+local-state-owner/v1"
-            "+global-pass-identity/v1+failure-action/v3"
-            "+failure-projection/v4+terminal-record-schema/v3"
+            "+global-pass-identity/v1+failure-action/v4"
+            "+failure-projection/v5+terminal-record-schema/v3"
+            "+prompt-projection/v2+planning-diagnostics/v3"
+            "+run-semantic-authority/v2+convergence-lineage/v1"
+            "+final-comparison-preflight/v1"
             "+judge-lifecycle/v1+graph-seed-authority/v1"
             "+objective-authority/v1"
             "+candidate-set-closure/v1+comparison-matrix-closure/v1"
@@ -2028,15 +2031,15 @@ class CausalCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v25",
+            "recursive-analysis-actions/v26",
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
         self.assertEqual(
             OUTPUT_SCHEMA_VERSION,
-            "recursive-attribution-output/v15",
+            "recursive-attribution-output/v16",
         )
 
     def test_legal_v27_checkpoint_migrates_runtime_and_provider_defaults(self):
@@ -2070,7 +2073,7 @@ class CausalCheckpointTest(unittest.TestCase):
 
         self.assertEqual(
             restored.config["schema_version"],
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
         self.assertEqual(restored.config["runtime_identity"]["fusion_mode"], "off")
         self.assertEqual(state.provider_state["schema"], "recursive-provider-state/v3")
@@ -5445,10 +5448,13 @@ class CausalCheckpointTest(unittest.TestCase):
         self.assertEqual(resumed_judge.global_calls, [])
         by_ref = {item.start_ref: item for item in resumed.seed_results}
         self.assertEqual(by_ref["record:defect_one"].outcome, "no_defect")
-        self.assertEqual(by_ref["record:defect_two"].outcome, "evidence_gap")
-        self.assertIn(
-            "global_judge_interrupted",
-            by_ref["record:defect_two"].blocking_reasons,
+        self.assertEqual(
+            by_ref["record:defect_two"].outcome,
+            "execution_failed",
+        )
+        self.assertEqual(
+            by_ref["record:defect_two"].execution_failures[0]["reason"],
+            "analysis_interrupted",
         )
 
     def test_tail_repair_audit_is_persisted_in_report_metadata(self):

@@ -16,7 +16,8 @@ responses, unresolved refs, and traversal limits remain `unknown`/`inconclusive`
 never promoted to root causes. Every observed defect is traversed independently and emitted
 under `defect_branches`, with its own judgments, visited order, limits, paths, and roots.
 Reports expose `analysis_outcome` as `root_found`, `partial_root_found`, `no_defect`, or
-`inconclusive`, plus a separate `termination_reason`. `partial_root_found` means at least one
+`inconclusive`, plus `execution_failed` when semantic attribution could not run to completion
+and a separate `termination_reason`. `partial_root_found` means at least one
 observed defect reached a root while at least one other defect branch did not.
 
 Root candidates are grouped into confirmed causal episodes before reporting. An episode may
@@ -317,6 +318,8 @@ Optional:
 --base-url https://api.deepseek.com/anthropic
 --judge-cache /tmp/observable-opencode-attribution/tool-failure.judge-cache.jsonl
 --judge-max-tokens 4096
+--judge-context-window-tokens 200000
+--judge-context-safety-margin-tokens 8192
 --judge-timeout-sec 3600
 --provider-error-threshold 3
 --thinking-mode auto
@@ -331,6 +334,35 @@ Each judge or JSON-repair request waits up to 3600 seconds by default. Override 
 `--thinking-mode auto` disables thinking on DeepSeek's Anthropic-compatible endpoint so the output
 budget is spent on the structured judgment; use `enabled` explicitly when deeper online reasoning is
 worth the additional latency and token cost.
+
+Set `--judge-context-window-tokens` to the total context window advertised by the selected
+Anthropic-compatible model. The analyzer reserves `--judge-max-tokens` for output and
+`--judge-context-safety-margin-tokens` for provider framing and estimator uncertainty. Its maximum
+input budget is therefore:
+
+```text
+judge context window - maximum Judge output - safety margin
+```
+
+Global candidate pages are split deterministically until each projected prompt fits this budget.
+The complete Causal IR and canonical validation envelope remain unchanged; only the LLM-facing
+projection omits large repeated snapshots and records their hashes, refs, and byte counts. If even
+a minimal one-candidate projection does not fit, the request is rejected locally and consumes zero
+physical provider requests.
+
+The built-in tokenizer-independent estimator treats every UTF-8 byte as at most one input token,
+then adds a small per-message framing allowance. This is deliberately stricter than typical model
+tokenizers: it prioritizes avoiding provider-side context overflow over maximizing each page size.
+The projection keeps every reference and edge on the candidate's causal path; bounded auxiliary
+collections record an omission manifest with owner ref, field path, original byte length, SHA-256,
+original item count, and retained item count.
+
+Each token-aware page plan also persists the canonical validation envelope, request identity,
+prompt-projection identity, exact conservative measurement, and every parent-to-child split. Report
+and checkpoint validation rebuild the request against the active Trace graph, recompute the prompt
+and measurement, replay the ordered split lineage, and require convergence to reference the last
+durably planned page set for that seed. An unexecuted final-comparison plan is therefore auditable
+without trusting self-consistent stored hashes.
 
 `--max-depth` and `--max-nodes` apply independently to every defect branch. This prevents a
 large or difficult branch from consuming the search budget needed to analyze other observed
@@ -384,9 +416,31 @@ events and counts are persisted in `commit.json` and exposed as `metadata.checkp
 Resume by running the exact same command. A custom directory can be selected with
 `--checkpoint-dir /path/to/case.checkpoint`. The compatibility fingerprint binds the effective
 Trace (including an injected review), objective, start refs, perspective, every recursive budget,
-model, effective endpoint, thinking configuration, maximum output tokens, request timeout,
-Provider threshold, and Judge cache path. Changing any of those values requires a new checkpoint
-directory.
+model, effective endpoint, thinking configuration, maximum output tokens, context window, context
+safety margin, request timeout, Provider threshold, and Judge cache path. Changing any of those
+values requires a new checkpoint directory.
+
+Checkpoint schema `recursive-attribution-checkpoint/v28` is intentionally not replayed by this
+version. Its fixed-page and failure semantics predate token-aware paging and typed execution
+failures, so silently interpreting it under the current policy could change the meaning of a
+completed run. Preserve the old directory for audit and start with a new checkpoint path. The
+explicit v27 migration remains available for its separately validated legacy contract.
+
+The current pagination persistence contract includes `planning-diagnostics/v3`,
+`run-semantic-authority/v2`, `convergence-lineage/v1`, and
+`final-comparison-preflight/v1`. Every planned request is checked against the report-level analysis
+perspective, seed-derived restoration obligations, and authoritative evidence-context selection.
+Evidence-context authority is replayed from the candidate manifest, active TraceGraph causal paths,
+reconstructed omission-gap identities, and the deterministic candidate budget. The request funnel is
+only a checked projection: deleting context capsules and re-signing request identities, projections,
+or token measurements cannot change the authoritative selection. A re-signed manifest also cannot
+invent a causal path that is absent from the active graph.
+Convergence is replayed from the latest completed candidate round. A large final comparison also
+persists its canonical request, bounded prompt projection, context budget, and measured fit
+decision. Terminal convergence status must agree with durable final-page facts. Context-budget
+execution failures must match the final-comparison preflight, and the report-level failure summary
+must bijectively match per-seed failures. Checkpoints whose compatibility fingerprint names an
+earlier contract are rejected rather than silently reinterpreted.
 
 Validated completed Judge and confirmation results, completed investigations, physical/logical
 budgets, artifact bytes, and Provider circuit state are replayed without repeating calls. A call
@@ -421,6 +475,40 @@ Consecutive connection or timeout failures open a provider circuit after
 fallback `unknown` judgments. `metadata.judge_cache` reports loaded entries, hits, misses, and
 writes; `metadata.provider_circuit` reports provider failures and circuit state. Delete or point
 `--judge-cache` to a new path only when a complete re-evaluation is intended.
+
+### Execution failure is not missing semantic evidence
+
+The recursive report keeps failures of the attribution process separate from deficiencies in the
+Trace evidence:
+
+- `outcome=evidence_gap` means semantic analysis completed far enough to identify concrete facts
+  that are absent or insufficient;
+- `outcome=execution_failed` means the affected seed did not receive a completed semantic
+  judgment, for example because of local context overflow, interruption, an unavailable Judge
+  capability, invalid adapter output, or an exhausted Judge request budget;
+- `metadata.analysis_execution_failures` contains the stage, reason, retryability, affected seed
+  refs, exact or conservative physical-request count, detail, and prompt-budget diagnostics;
+- `termination_reason=analysis_execution_failed` means no root-cause conclusion was attempted for
+  at least one terminally failed analysis path. A mixed run retains valid completed seed results
+  and reports `analysis_outcome=partial`.
+
+Inspect these fields with:
+
+```bash
+jq '{
+  analysis_outcome,
+  termination_reason: .metadata.termination_reason,
+  execution_failures: .metadata.analysis_execution_failures,
+  seeds: [.seed_results[] | {
+    start_ref, outcome, missing_evidence, blocking_reasons, execution_failures
+  }],
+  physical_requests: .metadata.physical_judge_request_count
+}' /path/to/case.attribution.json
+```
+
+For a clean rerun after changing the model or any context-budget option, choose new `--out`,
+`--checkpoint-dir`, and `--judge-cache` paths. This preserves the prior failed run for audit and
+prevents incompatible checkpoint or cache state from being reused.
 
 When `--lineage-out` is omitted, the CLI writes `<attribution-output-stem>.message-lineage.json`
 next to the attribution report. The lineage output contains normalized agent turns, prompt/context/

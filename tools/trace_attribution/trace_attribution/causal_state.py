@@ -91,7 +91,22 @@ BLOCKING_METADATA_KEYS = frozenset(
         "blocking_reason",
     }
 )
-MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v22"
+MODERN_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v23"
+ANALYSIS_EXECUTION_FAILURE_SCHEMA = "analysis-execution-failure/v1"
+ANALYSIS_EXECUTION_FAILURE_KEYS = frozenset(
+    {
+        "schema",
+        "kind",
+        "stage",
+        "reason",
+        "retryable",
+        "physical_requests",
+        "physical_request_exact",
+        "affected_start_refs",
+        "detail",
+        "budget",
+    }
+)
 PREVIOUS_REPORT_SCHEMA_VERSION = "recursive-attribution-report/v2"
 FACTOR_ROLE_PUBLICATION_CONTRACT_VERSION = "factor-role-publication/v2"
 MODERN_FACTOR_AUDIT_METADATA_KEYS = frozenset(
@@ -176,7 +191,10 @@ GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION = "global-candidate-judgment/v11"
 GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION = (
     "global-candidate-judgment/v11+validation-envelope/v11+capsule/v8"
     "+evidence-policy/v5+local-state-owner/v1+global-pass-identity/v1"
-    "+failure-action/v3+failure-projection/v4+terminal-record-schema/v3"
+    "+failure-action/v4+failure-projection/v5+terminal-record-schema/v3"
+    "+prompt-projection/v2+planning-diagnostics/v3"
+    "+run-semantic-authority/v2+convergence-lineage/v1"
+    "+final-comparison-preflight/v1"
     "+judge-lifecycle/v1"
     "+graph-seed-authority/v1+objective-authority/v1"
     "+candidate-set-closure/v1"
@@ -4704,6 +4722,43 @@ def canonical_factor_role_publication(
     return expected
 
 
+def validate_analysis_execution_failure(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping) or set(value) != set(
+        ANALYSIS_EXECUTION_FAILURE_KEYS
+    ):
+        raise ValueError("analysis execution failure schema mismatch")
+    payload = _thaw(value)
+    affected = payload.get("affected_start_refs")
+    budget = payload.get("budget")
+    if (
+        payload.get("schema") != ANALYSIS_EXECUTION_FAILURE_SCHEMA
+        or payload.get("kind") != "analysis_execution_failed"
+        or not isinstance(payload.get("stage"), str)
+        or not payload["stage"].strip()
+        or not isinstance(payload.get("reason"), str)
+        or not payload["reason"].strip()
+        or type(payload.get("retryable")) is not bool
+        or type(payload.get("physical_requests")) is not int
+        or payload["physical_requests"] < 0
+        or type(payload.get("physical_request_exact")) is not bool
+        or not isinstance(affected, list)
+        or not affected
+        or any(not isinstance(item, str) or not item for item in affected)
+        or len(affected) != len(set(affected))
+        or not isinstance(payload.get("detail"), str)
+        or not payload["detail"].strip()
+        or not isinstance(budget, Mapping)
+    ):
+        raise ValueError("analysis execution failure is invalid")
+    payload["stage"] = payload["stage"].strip()
+    payload["reason"] = payload["reason"].strip()
+    payload["detail"] = payload["detail"].strip()
+    payload["affected_start_refs"] = sorted(affected)
+    payload["budget"] = _thaw(budget)
+    stable_json(payload)
+    return payload
+
+
 @dataclass(frozen=True)
 class SeedAttributionResult:
     start_ref: str
@@ -4718,6 +4773,7 @@ class SeedAttributionResult:
     decisive_evidence: Tuple[JsonDict, ...] = field(default_factory=tuple)
     missing_evidence: Tuple[str, ...] = field(default_factory=tuple)
     blocking_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    execution_failures: Tuple[JsonDict, ...] = field(default_factory=tuple)
     global_judgment: JsonDict = field(default_factory=FrozenMapping)
     expansion_history: Tuple[JsonDict, ...] = field(default_factory=tuple)
 
@@ -4726,6 +4782,7 @@ class SeedAttributionResult:
             "confirmed_root",
             "no_defect",
             "evidence_gap",
+            "execution_failed",
             "inconclusive",
         }:
             raise ValueError("unsupported per-seed attribution outcome")
@@ -4751,6 +4808,24 @@ class SeedAttributionResult:
                 name,
                 tuple(sorted(set(_concrete_seed_strings(getattr(self, name), name)))),
             )
+        execution_failures = tuple(
+            FrozenMapping(validate_analysis_execution_failure(item))
+            for item in self.execution_failures
+        )
+        execution_failures = tuple(
+            sorted(
+                {stable_json(_thaw(item)): item for item in execution_failures}.values(),
+                key=lambda item: stable_json(_thaw(item)),
+            )
+        )
+        if any(
+            self.start_ref not in item["affected_start_refs"]
+            for item in execution_failures
+        ):
+            raise ValueError(
+                "per-seed execution failure must affect its owning start_ref"
+            )
+        object.__setattr__(self, "execution_failures", execution_failures)
         object.__setattr__(
             self,
             "global_judgment",
@@ -4771,6 +4846,7 @@ class SeedAttributionResult:
             confirmed_root_refs=self.confirmed_root_refs,
             missing_evidence=self.missing_evidence,
             blocking_reasons=self.blocking_reasons,
+            execution_failures=self.execution_failures,
         )
 
     @property
@@ -4792,6 +4868,9 @@ class SeedAttributionResult:
             "decisive_evidence": [_thaw(item) for item in self.decisive_evidence],
             "missing_evidence": list(self.missing_evidence),
             "blocking_reasons": list(self.blocking_reasons),
+            "execution_failures": [
+                _thaw(item) for item in self.execution_failures
+            ],
             "global_judgment": _thaw(self.global_judgment),
             "expansion_history": [_thaw(item) for item in self.expansion_history],
         }
@@ -4818,6 +4897,21 @@ class SeedAttributionResult:
                         field_name
                     )
                 )
+        raw_execution_failures = value.get("execution_failures") or ()
+        if not isinstance(raw_execution_failures, (list, tuple)):
+            raise ValueError(
+                "persisted seed attribution execution_failures must be a list"
+            )
+        validated_execution_failures = tuple(
+            validate_analysis_execution_failure(item)
+            for item in raw_execution_failures
+        )
+        if len(validated_execution_failures) != len(
+            {stable_json(item) for item in validated_execution_failures}
+        ):
+            raise ValueError(
+                "persisted seed attribution execution_failures contains duplicates"
+            )
         defect_state = DefectState.from_dict(_json_dict(value.get("defect_state")))
         global_judgment = _json_dict(value.get("global_judgment"))
         candidate_refs = _string_list(value.get("candidate_refs"))
@@ -4875,6 +4969,7 @@ class SeedAttributionResult:
             blocking_reasons=_seed_json_string_list(
                 value.get("blocking_reasons"), "blocking_reasons"
             ),
+            execution_failures=validated_execution_failures,
             global_judgment=global_judgment,
             expansion_history=tuple(
                 item
@@ -5091,13 +5186,18 @@ def validate_confirmation_ownership(
             not is_definitive_confirmation(confirmation)
             and identity not in non_blocking_unresolved
             and (
-                owner.outcome not in {"evidence_gap", "inconclusive"}
-                or not (owner.missing_evidence or owner.blocking_reasons)
+                owner.outcome
+                not in {"evidence_gap", "execution_failed", "inconclusive"}
+                or not (
+                    owner.missing_evidence
+                    or owner.blocking_reasons
+                    or owner.execution_failures
+                )
             )
         ):
             raise ValueError(
-                "{0} unresolved confirmation requires an evidence_gap or inconclusive "
-                "owning seed with concrete blocking or missing-evidence facts".format(
+                "{0} unresolved confirmation requires an evidence_gap, execution_failed, "
+                "or inconclusive owning seed with concrete unresolved or execution facts".format(
                     label
                 )
             )
@@ -5119,11 +5219,16 @@ def validate_seed_outcome_payload(
     confirmed_root_refs: Iterable[str],
     missing_evidence: Iterable[str],
     blocking_reasons: Iterable[str],
+    execution_failures: Iterable[Mapping[str, Any]] = (),
 ) -> None:
     """Reject terminal seed payloads that contradict their declared outcome."""
     roots = tuple(confirmed_root_refs)
     unresolved_facts = _concrete_seed_strings(missing_evidence, "missing_evidence")
     blockers = _concrete_seed_strings(blocking_reasons, "blocking_reasons")
+    failures = tuple(
+        validate_analysis_execution_failure(item)
+        for item in execution_failures
+    )
     if outcome in {"confirmed_root", "no_defect"} and (
         unresolved_facts or blockers
     ):
@@ -5133,6 +5238,14 @@ def validate_seed_outcome_payload(
     if outcome == "evidence_gap" and not unresolved_facts:
         raise ValueError(
             "seed outcome payload requires concrete unresolved evidence for evidence_gap"
+        )
+    if outcome == "execution_failed" and not failures:
+        raise ValueError(
+            "seed execution_failed outcome requires a structured execution failure"
+        )
+    if failures and outcome != "execution_failed":
+        raise ValueError(
+            "seed execution failures require outcome=execution_failed"
         )
     if outcome != "confirmed_root" and roots:
         raise ValueError(
@@ -5144,6 +5257,8 @@ def _aggregate_seed_outcomes(
     seed_results: Tuple[SeedAttributionResult, ...],
 ) -> str:
     outcomes = tuple(item.outcome for item in seed_results)
+    if outcomes and all(item == "execution_failed" for item in outcomes):
+        return "execution_failed"
     if outcomes and all(item == "no_defect" for item in outcomes):
         return "no_defect"
     if outcomes and all(

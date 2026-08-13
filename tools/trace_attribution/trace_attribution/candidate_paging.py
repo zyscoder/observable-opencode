@@ -18,9 +18,9 @@ CANDIDATE_PAGE_SIZE = 8
 DEFAULT_FINALIST_SOFT_LIMIT = 48
 GLOBAL_CANDIDATE_MAX_COMPARISON_ROUNDS = 4
 GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP = 6
-GLOBAL_CANDIDATE_PAGING_POLICY_SCHEMA = "global-candidate-paging-policy/v3"
+GLOBAL_CANDIDATE_PAGING_POLICY_SCHEMA = "global-candidate-paging-policy/v4"
 CANDIDATE_PAGE_SCHEMA = "global-candidate-page/v2"
-CANDIDATE_PAGE_PLAN_SCHEMA = "global-candidate-page-plan/v2"
+CANDIDATE_PAGE_PLAN_SCHEMA = "global-candidate-page-plan/v3"
 CANDIDATE_PAGE_OUTCOME_SCHEMA = "global-candidate-page-outcome/v1"
 CANDIDATE_ROUND_SUMMARY_SCHEMA = "global-candidate-round-summary/v1"
 
@@ -48,6 +48,7 @@ def global_candidate_paging_policy() -> JsonDict:
         "page_physical_request_cap": (
             GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP
         ),
+        "page_size_semantics": "dynamic_token_fit_upper_bound",
     }
 _FACTOR_ROLES = frozenset(
     {"contributing_condition", "amplifying_factor", "outcome_evidence"}
@@ -581,29 +582,30 @@ class CandidatePagePlan:
         pages = tuple(self.pages)
         if any(not isinstance(page, CandidatePage) for page in pages):
             raise TypeError("candidate page plan pages must be CandidatePage values")
-        expected_page_count = (
-            (len(candidate_refs) + CANDIDATE_PAGE_SIZE - 1)
-            // CANDIDATE_PAGE_SIZE
-        )
-        if len(pages) != expected_page_count:
+        if bool(candidate_refs) != bool(pages):
             raise ValueError(
                 "candidate page plan pages must cover the candidate set exactly once"
             )
+        cursor = 0
         for page_index, page in enumerate(pages):
-            start = page_index * CANDIDATE_PAGE_SIZE
-            end = start + CANDIDATE_PAGE_SIZE
+            end = cursor + len(page.candidate_refs)
             if (
                 page.input_identity != input_identity
                 or page.round_index != round_index
                 or page.page_index != page_index
-                or page.candidate_refs != candidate_refs[start:end]
-                or page.candidate_identities != candidate_identities[start:end]
+                or page.candidate_refs != candidate_refs[cursor:end]
+                or page.candidate_identities != candidate_identities[cursor:end]
                 or page.attribution_only_gap_identities
-                != gap_identities[start:end]
+                != gap_identities[cursor:end]
             ):
                 raise ValueError(
                     "candidate page plan page order or membership does not match"
                 )
+            cursor = end
+        if cursor != len(candidate_refs):
+            raise ValueError(
+                "candidate page plan pages must cover the candidate set exactly once"
+            )
         flattened_refs = tuple(
             ref for page in pages for ref in page.candidate_refs
         )
@@ -731,8 +733,9 @@ def build_candidate_page_plan(
     defect_fingerprint: str,
     capsules: Sequence[Any],
     round_index: int,
+    page_sizes: Sequence[int] | None = None,
 ) -> CandidatePagePlan:
-    """Project ordered complete capsules into fixed-size deterministic pages."""
+    """Project ordered complete capsules into bounded deterministic pages."""
     canonical_seed_ref = _require_non_empty_string(
         seed_ref, "candidate page plan seed_ref"
     )
@@ -766,29 +769,50 @@ def build_candidate_page_plan(
         raise ValueError(
             "candidate page plan capsules contain a duplicate capsule identity"
         )
+    if page_sizes is None:
+        canonical_page_sizes = tuple(
+            min(CANDIDATE_PAGE_SIZE, len(candidate_refs) - start)
+            for start in range(0, len(candidate_refs), CANDIDATE_PAGE_SIZE)
+        )
+    else:
+        if isinstance(page_sizes, (str, bytes)) or not isinstance(
+            page_sizes, Sequence
+        ):
+            raise TypeError("candidate page sizes must be an ordered sequence")
+        canonical_page_sizes = tuple(page_sizes)
+        if any(
+            type(size) is not int or size <= 0 or size > CANDIDATE_PAGE_SIZE
+            for size in canonical_page_sizes
+        ):
+            raise ValueError(
+                "candidate page sizes must be positive integers no greater than {0}".format(
+                    CANDIDATE_PAGE_SIZE
+                )
+            )
+        if sum(canonical_page_sizes) != len(candidate_refs):
+            raise ValueError(
+                "candidate page sizes must cover the candidate set exactly once"
+            )
     input_identity = _page_input_identity(
         seed_ref=canonical_seed_ref,
         defect_fingerprint=canonical_fingerprint,
         candidate_identities=candidate_identities,
         attribution_only_gap_identities=gap_identities,
     )
-    pages = tuple(
-        CandidatePage.create(
+    pages_list = []
+    start = 0
+    for page_index, page_size in enumerate(canonical_page_sizes):
+        end = start + page_size
+        pages_list.append(CandidatePage.create(
             input_identity=input_identity,
             round_index=canonical_round_index,
             page_index=page_index,
-            candidate_refs=candidate_refs[start : start + CANDIDATE_PAGE_SIZE],
-            candidate_identities=candidate_identities[
-                start : start + CANDIDATE_PAGE_SIZE
-            ],
-            attribution_only_gap_identities=gap_identities[
-                start : start + CANDIDATE_PAGE_SIZE
-            ],
-        )
-        for page_index, start in enumerate(
-            range(0, len(candidate_refs), CANDIDATE_PAGE_SIZE)
-        )
-    )
+            candidate_refs=candidate_refs[start:end],
+            candidate_identities=candidate_identities[start:end],
+            attribution_only_gap_identities=gap_identities[start:end],
+        ))
+        start = end
+    pages = tuple(pages_list)
     unsigned = _plan_unsigned_payload(
         seed_ref=canonical_seed_ref,
         defect_fingerprint=canonical_fingerprint,

@@ -74,12 +74,16 @@ def classify_provider_failure(
         "maximum context length",
         "context length exceeded",
         "context window exceeded",
+        "context_length_exceeded",
+        "context_window_exceeded",
         "prompt is too long",
         "too many input tokens",
         "input tokens exceed",
     )
     if status_code == 400 and any(
-        marker in normalized_reason for marker in context_window_markers
+        marker in value
+        for marker in context_window_markers
+        for value in (error_code, normalized_reason)
     ):
         return ProviderFailureDisposition(
             False,
@@ -96,18 +100,9 @@ def classify_provider_failure(
         "rate_limit",
         "try_again",
     )
-    stable_400_markers = (
-        "invalid_request",
-        "schema",
-        "validation_error",
-        "model",
-        "endpoint",
-    )
     if status_code == 400:
-        retryable = not (
-            error_code
-            and not any(marker in error_code for marker in transient_markers)
-            and any(marker in error_code for marker in stable_400_markers)
+        retryable = bool(error_code) and any(
+            marker in error_code for marker in transient_markers
         )
         return ProviderFailureDisposition(
             retryable,

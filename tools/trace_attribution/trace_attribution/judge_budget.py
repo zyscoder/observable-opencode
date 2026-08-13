@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 
 DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS = 200_000
 DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS = 8_192
-TOKEN_ESTIMATOR_ID = "utf8-bytes-div-3-plus-message-overhead/v1"
+TOKEN_ESTIMATOR_ID = "utf8-byte-upper-bound-plus-message-overhead/v2"
 
 
 def _positive_integer(value: Any, name: str) -> int:
@@ -45,7 +44,7 @@ def estimate_prompt_tokens(
     """Conservatively estimate input tokens without a provider tokenizer."""
     _, byte_count = _prompt_bytes(system=system, messages=messages)
     framing_tokens = 16 + (8 * len(messages))
-    return max(1, int(math.ceil(byte_count / 3.0)) + framing_tokens)
+    return max(1, byte_count + framing_tokens)
 
 
 @dataclass(frozen=True)

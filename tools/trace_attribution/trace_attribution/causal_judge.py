@@ -4714,7 +4714,7 @@ class ClaudeCausalJudge(
             system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
             prompt=prompt,
             node_ref="global:{0}:{1}".format(request.case_id, request.seed_ref),
-            request_context=request.to_dict(),
+            request_context=request.judge_prompt_projection(),
             validator=lambda value: validate_global_candidate_payload(
                 value, request=request
             ),

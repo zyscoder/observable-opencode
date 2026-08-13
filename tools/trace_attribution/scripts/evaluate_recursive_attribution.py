@@ -20,6 +20,7 @@ from trace_attribution.causal_state import (
     seed_binding_identity_for,
     semantic_anchor_index,
     semantic_occurrence_index,
+    validate_analysis_execution_failure,
     validate_modern_report_shape,
     validate_seed_outcome_payload,
 )
@@ -115,6 +116,7 @@ SEED_RESULT_KEYS = frozenset(
         "decisive_evidence",
         "missing_evidence",
         "blocking_reasons",
+        "execution_failures",
         "global_judgment",
         "expansion_history",
     }
@@ -753,6 +755,7 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
             "no_defect",
             "evidence_gap",
             "inconclusive",
+            "execution_failed",
         }:
             raise EvaluationSchemaError("unsupported seed result outcome")
         _mapping(item.get("defect_state"), "seed result defect_state")
@@ -766,9 +769,15 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
             "decisive_evidence",
             "missing_evidence",
             "blocking_reasons",
+            "execution_failures",
             "expansion_history",
         ):
             _list(item.get(key), "seed result {0}".format(key))
+        for failure in item["execution_failures"]:
+            try:
+                validate_analysis_execution_failure(failure)
+            except ValueError as exc:
+                raise EvaluationSchemaError(str(exc)) from exc
         decisive_refs = []
         for evidence_index, evidence in enumerate(item["decisive_evidence"]):
             evidence = _mapping(
@@ -819,6 +828,7 @@ def _validate_report_shape(report: Mapping[str, Any], labels: Mapping[str, Any])
                 confirmed_root_refs=item.get("confirmed_root_refs") or (),
                 missing_evidence=item.get("missing_evidence") or (),
                 blocking_reasons=item.get("blocking_reasons") or (),
+                execution_failures=item.get("execution_failures") or (),
             )
         except ValueError as exc:
             raise EvaluationSchemaError(str(exc)) from exc

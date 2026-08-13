@@ -7636,7 +7636,7 @@ class FactorRolePublicationTest(unittest.TestCase):
         payload = report.to_dict()
         self.assertEqual(
             payload["schema_version"],
-            "recursive-attribution-report/v22",
+            "recursive-attribution-report/v23",
         )
         self.assertEqual(len(payload["downstream_materializations"]), 1)
         validate_modern_report_shape(payload)

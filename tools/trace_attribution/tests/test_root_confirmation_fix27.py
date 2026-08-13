@@ -358,7 +358,7 @@ class RealGlobalJudgeTypedFailureTest(unittest.TestCase):
             analysis_perspective="",
         )
         by_ref = {item.start_ref: item for item in report.seed_results}
-        self.assertEqual(by_ref["record:seed_one"].outcome, "evidence_gap")
+        self.assertEqual(by_ref["record:seed_one"].outcome, "execution_failed")
         self.assertEqual(by_ref["record:seed_two"].outcome, "no_defect")
         failures = [
             item
@@ -798,15 +798,21 @@ class GlobalFailureProjectionBijectionTest(unittest.TestCase):
             )
             episode["failure_projection"]["detail"] = "mutated diagnostic"
 
-        def duplicate_seed_gap(metadata, seeds):
+        def duplicate_seed_failure(metadata, seeds):
             seed = next(
                 item
                 for item in seeds
                 if item["start_ref"] == "record:seed_one"
             )
-            seed["missing_evidence"].append(seed["missing_evidence"][0])
+            seed["execution_failures"].append(
+                copy.deepcopy(seed["execution_failures"][0])
+            )
 
-        for mutation in (mutate_seed, mutate_episode, duplicate_seed_gap):
+        for mutation in (
+            mutate_seed,
+            mutate_episode,
+            duplicate_seed_failure,
+        ):
             with self.subTest(mutation=mutation.__name__):
                 self.assert_report_and_evaluator_reject(mutation)
 
@@ -999,20 +1005,20 @@ class Fix27VersionIdentityTest(unittest.TestCase):
             "graph-external-evidence-eligibility/v5",
         )
         self.assertIn(
-            "failure-projection/v4",
+            "failure-projection/v5",
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
             "confirmation-request-identity/v3",
             ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
         )
-        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v22")
+        self.assertEqual(MODERN_REPORT_SCHEMA_VERSION, "recursive-attribution-report/v23")
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v26")
 
     def test_old_fix26_report_and_capsule_identities_are_rejected(self):
         capsule = sample_request().capsules[0].to_dict()

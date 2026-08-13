@@ -92,7 +92,7 @@ class GlobalJudgePromptProjectionTest(unittest.TestCase):
         )
         manifest = projected["prompt_projection"]
         self.assertEqual(
-            manifest["schema"], "global-judge-prompt-projection/v1"
+            manifest["schema"], "global-judge-prompt-projection/v2"
         )
         self.assertEqual(
             manifest["canonical_request_sha256"],
@@ -111,6 +111,120 @@ class GlobalJudgePromptProjectionTest(unittest.TestCase):
         self.assertEqual(
             projected["candidate_evidence_capsules"][0]["downstream_path"],
             list(enlarged.downstream_path),
+        )
+
+    def test_long_causal_path_remains_complete_and_other_omissions_are_auditable(self):
+        request = sample_request()
+        first = request.capsules[0]
+        path = (
+            first.candidate_ref,
+            *("record:path-{0:02d}".format(index) for index in range(18)),
+            request.seed_ref,
+        )
+        path_references = tuple(
+            {
+                "raw_ref": ref,
+                "resolved_ref": ref,
+                "canonical_ref": ref,
+                "resolution_status": "resolved",
+            }
+            for ref in path
+        )
+        causal_edges = tuple(
+            {
+                "from_ref": source,
+                "to_ref": target,
+                "relation": "decision_guided_change",
+                "evidence_type": "confirmed",
+                "eligible_for_attribution": True,
+                "edge_origin": "trace.dataflow_edges",
+            }
+            for source, target in zip(path, path[1:])
+        )
+        incoming_edges = tuple(
+            {
+                "from_ref": "record:incoming-{0:02d}".format(index),
+                "to_ref": first.candidate_ref,
+                "relation": "context",
+            }
+            for index in range(20)
+        )
+        enlarged = replace(
+            first,
+            downstream_path=path,
+            downstream_path_references=path_references,
+            causal_path_edges=causal_edges,
+            incoming_edges=incoming_edges,
+            validation_source={
+                **dict(first.validation_source),
+                "downstream_path": path,
+            },
+            episode_facts={
+                **dict(first.episode_facts),
+                "grounded_hops": len(path) - 1,
+            },
+        )
+        projected = replace(
+            request,
+            capsules=(enlarged, *request.capsules[1:]),
+        ).judge_prompt_projection()
+        capsule = projected["candidate_evidence_capsules"][0]
+
+        self.assertEqual(capsule["downstream_path"], list(path))
+        self.assertEqual(
+            len(capsule["downstream_path_references"]), len(path)
+        )
+        self.assertEqual(len(capsule["causal_path_edges"]), len(path) - 1)
+        self.assertEqual(len(capsule["incoming_edges"]), 13)
+        manifest = projected["prompt_projection"]["omission_manifest"]
+        incoming_omission = next(
+            item for item in manifest if item["path"] == "incoming_edges"
+        )
+        incoming_json = stable_json(list(incoming_edges)).encode("utf-8")
+        self.assertEqual(incoming_omission["reason"], "collection_truncated")
+        self.assertEqual(incoming_omission["original_utf8_bytes"], len(incoming_json))
+        self.assertEqual(
+            incoming_omission["original_sha256"],
+            __import__("hashlib").sha256(incoming_json).hexdigest(),
+        )
+        self.assertEqual(incoming_omission["original_item_count"], 20)
+        self.assertEqual(incoming_omission["retained_item_count"], 12)
+        projected_facts = copy.deepcopy(projected)
+        projected_facts.pop("prompt_projection")
+        self.assertEqual(
+            projected["prompt_projection"]["projected_facts_sha256"],
+            __import__("hashlib").sha256(
+                stable_json(projected_facts).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            projected["prompt_projection"]["omission_manifest_sha256"],
+            __import__("hashlib").sha256(
+                stable_json(manifest).encode("utf-8")
+            ).hexdigest(),
+        )
+        policy = projected["prompt_projection"]["projection_policy"]
+        self.assertEqual(
+            projected["prompt_projection"]["projection_policy_sha256"],
+            __import__("hashlib").sha256(
+                stable_json(policy).encode("utf-8")
+            ).hexdigest(),
+        )
+        identity_facts = {
+            key: projected["prompt_projection"][key]
+            for key in (
+                "schema",
+                "canonical_request_sha256",
+                "projected_facts_sha256",
+                "omission_manifest_sha256",
+                "projection_policy_sha256",
+            )
+        }
+        self.assertEqual(
+            projected["prompt_projection"]["projection_identity"],
+            __import__("hashlib").sha256(
+                stable_json(identity_facts).encode("utf-8")
+            ).hexdigest(),
         )
 
 
@@ -3093,7 +3207,13 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
         self.assertNotIn("original_prompt", repair_payload)
         self.assertEqual(
             repair_payload["canonical_request_context"],
-            request.to_dict(),
+            request.judge_prompt_projection(),
+        )
+        self.assertEqual(
+            repair_payload["canonical_request_context"]["prompt_projection"]
+            ["canonical_request_sha256"],
+            request.judge_prompt_projection()["prompt_projection"]
+            ["canonical_request_sha256"],
         )
         self.assertEqual(
             repair_payload["repair_constraints"]["required_field_corrections"][0][

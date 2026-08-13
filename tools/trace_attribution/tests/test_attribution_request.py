@@ -1667,6 +1667,98 @@ class AttributionRequestTest(unittest.TestCase):
             ],
         )
 
+    def test_question_payload_distinguishes_execution_failure_from_evidence_gap(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "question-execution-failure",
+                "records": [
+                    {
+                        "record_id": "observed",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                    }
+                ],
+            }
+        )
+        failure = {
+            "schema": "analysis-execution-failure/v1",
+            "kind": "analysis_execution_failed",
+            "stage": "global_candidate_judgment",
+            "reason": "context_window_exceeded",
+            "retryable": False,
+            "physical_requests": 0,
+            "physical_request_exact": True,
+            "affected_start_refs": ["record:observed"],
+            "detail": "The prompt exceeded the local context budget.",
+            "budget": {"max_input_tokens": 100},
+        }
+
+        payload = service.question_bound_output_payload(
+            {
+                "analysis_outcome": "execution_failed",
+                "metadata": {
+                    "analysis_execution_failures": [failure],
+                    "termination_reason": "analysis_execution_failed",
+                },
+            },
+            graph,
+            binding=AttributionQuestion.create("Why was no root found?"),
+            starts=("record:observed",),
+        )
+
+        self.assertEqual(
+            payload["conclusion"],
+            "execution_failed: semantic attribution did not complete; no root-cause conclusion was attempted.",
+        )
+        self.assertEqual(payload["unresolved_gaps"], [failure])
+
+    def test_question_payload_keeps_partial_execution_failure_out_of_evidence_gap(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "question-partial-execution-failure",
+                "records": [
+                    {
+                        "record_id": "observed",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                    }
+                ],
+            }
+        )
+        failure = {
+            "schema": "analysis-execution-failure/v1",
+            "kind": "analysis_execution_failed",
+            "stage": "global_candidate_judgment",
+            "reason": "analysis_adapter_invalid",
+            "retryable": False,
+            "physical_requests": 1,
+            "physical_request_exact": True,
+            "affected_start_refs": ["record:observed"],
+            "detail": "The Judge output did not satisfy the response schema.",
+            "budget": {},
+        }
+
+        payload = service.question_bound_output_payload(
+            {
+                "analysis_outcome": "partial",
+                "metadata": {
+                    "analysis_execution_failures": [failure],
+                    "termination_reason": "analysis_execution_failed",
+                },
+            },
+            graph,
+            binding=AttributionQuestion.create("Why is the answer incomplete?"),
+            starts=("record:observed",),
+        )
+
+        self.assertEqual(
+            payload["conclusion"],
+            "partial: semantic attribution completed only for some seeds; no root-cause conclusion was attempted for the failed seeds.",
+        )
+        self.assertEqual(payload["unresolved_gaps"], [failure])
+
     def test_objective_mode_payload_shape_is_unchanged(self) -> None:
         service = importlib.import_module("trace_attribution.service")
         graph = TraceGraph.from_trace(

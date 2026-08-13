@@ -19,6 +19,7 @@ from .causal_judge import (
     CausalStepRequest,
     FACTOR_ROLE_REQUEST_IDENTITY_PREFIX,
     FactorRoleRequest,
+    GLOBAL_CANDIDATE_SYSTEM_PROMPT,
     OfflineJudgeCapability,
     ROOT_CONFIRMATION_REQUEST_IDENTITY_PREFIX,
     RootConfirmationRequest,
@@ -36,6 +37,7 @@ from .causal_judge import (
 )
 from .candidate_budget import (
     NO_ACTIVE_SEED_CAUSAL_PATH,
+    quality_first_candidate_budget,
     select_global_candidates,
 )
 from .candidate_clustering import (
@@ -100,6 +102,7 @@ from .causal_state import (
     RejectedCandidate,
     RootConfirmation,
     SeedAttributionResult,
+    ANALYSIS_EXECUTION_FAILURE_SCHEMA,
     TERMINAL_FACTOR_ROLE_QUEUE_ALLOWED_KEYS,
     TERMINAL_FACTOR_ROLE_QUEUE_REQUIRED_KEYS,
     active_failure_causal_role_for,
@@ -128,6 +131,7 @@ from .causal_state import (
     seed_binding_identity_for,
     validate_confirmation_ownership,
     validate_modern_report_shape,
+    validate_analysis_execution_failure,
     validate_root_confirmation_substantive_invariants,
 )
 from .checkpoint import (
@@ -170,11 +174,13 @@ from .global_judge import (
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
     active_focus_text_sha256,
+    build_global_candidate_prompt,
     global_candidate_request_from_validation_envelope,
     global_judge_diagnostics,
     validate_active_focus_binding,
     validate_global_candidate_request_against_graph,
     validate_global_candidate_payload,
+    validate_global_judge_prompt_projection,
     validate_global_judge_diagnostics,
 )
 from .graph import TraceGraph
@@ -194,6 +200,7 @@ from .judgment_context import (
     task_obligations,
 )
 from .models import JsonDict, TraceNode, stable_json
+from .judge_budget import JudgeContextBudget, TOKEN_ESTIMATOR_ID
 from .reconstruction import obligation_gap_candidate_audit
 from .restoration_obligation import RestorationObligation
 
@@ -215,7 +222,7 @@ EVALUATION_START_EVENTS = frozenset(
 FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v2"
 LEGACY_FRONTIER_STATE_SCHEMA = "recursive-analysis-frontier/v1"
 HYPOTHESIS_STATE_SCHEMA = "recursive-analysis-hypotheses/v1"
-ACTION_STATE_SCHEMA = "recursive-analysis-actions/v25"
+ACTION_STATE_SCHEMA = "recursive-analysis-actions/v26"
 GLOBAL_EVIDENCE_EXPANSION_MAX_ROUNDS = 3
 GLOBAL_EVIDENCE_EXPANSION_MAX_NODES = 8
 GLOBAL_EVIDENCE_EXPANSION_MAX_BYTES = 65_536
@@ -440,7 +447,7 @@ GLOBAL_JUDGE_FAILED_PAYLOAD_KEYS = frozenset(
         "provider_state",
     }
 )
-GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v4"
+GLOBAL_FAILURE_PROJECTION_SCHEMA = "global-candidate-failure-projection/v5"
 GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
     {
         "schema",
@@ -453,11 +460,70 @@ GLOBAL_FAILURE_PROJECTION_KEYS = frozenset(
         "reason",
         "detail",
         "missing_evidence",
+        "execution_failure",
         "physical_request_delta",
         "physical_request_exact",
         "owner",
     }
 )
+
+
+def _execution_failure_reason(blocker: str, detail: str) -> str:
+    normalized = "{0} {1}".format(blocker, detail).lower()
+    if (
+        "context_budget_exceeded" in normalized
+        or "contextbudgetexceeded" in normalized
+        or "context_window_exceeded" in normalized
+        or "context window" in normalized
+        or "context budget" in normalized
+    ):
+        return "context_window_exceeded"
+    if "interrupted" in normalized:
+        return "analysis_interrupted"
+    if "capability_missing" in normalized:
+        return "judge_capability_unavailable"
+    if "validation" in normalized or "output_invalid" in normalized:
+        return "analysis_adapter_invalid"
+    if "request_budget_exhausted" in normalized:
+        return "analysis_request_budget_exhausted"
+    return "judge_execution_failed"
+
+
+def _analysis_execution_failure(
+    *,
+    seed_ref: str,
+    blocker: str,
+    detail: str,
+    physical_requests: int,
+    physical_request_exact: bool,
+    budget: Optional[Mapping[str, Any]] = None,
+) -> JsonDict:
+    reason = _execution_failure_reason(blocker, detail)
+    return {
+        "schema": ANALYSIS_EXECUTION_FAILURE_SCHEMA,
+        "kind": "analysis_execution_failed",
+        "stage": "global_candidate_judgment",
+        "reason": reason,
+        "retryable": reason
+        in {"analysis_interrupted", "judge_execution_failed"},
+        "physical_requests": physical_requests,
+        "physical_request_exact": physical_request_exact,
+        "affected_start_refs": [seed_ref],
+        "detail": detail,
+        "budget": copy.deepcopy(dict(budget or {})),
+    }
+
+
+def _execution_failure_terminates_seed(
+    failure: Mapping[str, Any],
+) -> bool:
+    return str(failure.get("reason") or "") in {
+        "context_window_exceeded",
+        "judge_capability_unavailable",
+        "analysis_adapter_invalid",
+        "analysis_request_budget_exhausted",
+        "analysis_interrupted",
+    }
 COMPLETED_GLOBAL_PASS_KEYS = frozenset(
     {
         "kind",
@@ -532,7 +598,57 @@ GLOBAL_CANDIDATE_PAGE_PLAN_EVENT_KEYS = frozenset(
         "plan_identity",
         "page_phase",
         "plan",
+        "planning_diagnostics",
         "behavior_impact",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_PLANNING_SCHEMA = (
+    "global-candidate-page-planning/v3"
+)
+GLOBAL_CANDIDATE_FINAL_COMPARISON_PREFLIGHT_SCHEMA = (
+    "global-candidate-final-comparison-preflight/v1"
+)
+GLOBAL_CANDIDATE_FINAL_COMPARISON_PREFLIGHT_KEYS = frozenset(
+    {
+        "schema",
+        "request_identity",
+        "validation_envelope",
+        "context_budget",
+        "measurement",
+        "projection",
+        "behavior_impact",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_PLANNING_KEYS = frozenset(
+    {
+        "schema",
+        "planning_intent",
+        "budget_enforced",
+        "context_budget",
+        "split_history",
+        "pages",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_PLANNING_PAGE_KEYS = frozenset(
+    {
+        "page_identity",
+        "candidate_refs",
+        "request_identity",
+        "validation_envelope",
+        "measurement",
+        "projection",
+    }
+)
+GLOBAL_CANDIDATE_PAGE_PLANNING_SPLIT_KEYS = frozenset(
+    {
+        "parent_page_identity",
+        "candidate_refs",
+        "request_identity",
+        "validation_envelope",
+        "measurement",
+        "projection",
+        "child_page_sizes",
+        "reason",
     }
 )
 GLOBAL_CANDIDATE_PAGE_EVENT_BASE_KEYS = frozenset(
@@ -573,6 +689,7 @@ GLOBAL_CANDIDATE_PAGE_FAILED_EVENT_KEYS = frozenset(
         *GLOBAL_CANDIDATE_PAGE_EVENT_BASE_KEYS,
         "blocker",
         "detail",
+        "execution_failure",
         "judge_diagnostics",
     }
 )
@@ -601,6 +718,7 @@ GLOBAL_CANDIDATE_CONVERGENCE_EVENT_KEYS = frozenset(
         "failed_page_count",
         "supported_finalist_refs",
         "unresolved_refs",
+        "final_comparison_preflight",
         "physical_request_delta",
         "behavior_impact",
     }
@@ -1804,7 +1922,7 @@ def _quarantine_stale_seed_report_payload(
     graph: TraceGraph, value: Mapping[str, Any]
 ) -> JsonDict:
     """Conservatively remove every conclusion owned by a stale report seed."""
-    payload = copy.deepcopy(dict(value))
+    payload = _checkpoint_json(value)
     source_metadata = (
         payload.get("metadata")
         if isinstance(payload.get("metadata"), Mapping)
@@ -5118,18 +5236,703 @@ def _validate_global_pass_derivations(
         )
 
 
+def _validate_global_page_context_budget(value: Any) -> JsonDict:
+    required = {
+        "schema",
+        "estimator",
+        "context_window_tokens",
+        "max_output_tokens",
+        "safety_margin_tokens",
+        "max_input_tokens",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError("global candidate planning diagnostics context budget mismatch")
+    payload = _checkpoint_json(value)
+    if (
+        payload.get("schema") != "judge-context-budget/v1"
+        or payload.get("estimator") != TOKEN_ESTIMATOR_ID
+        or any(
+            type(payload.get(key)) is not int or payload[key] <= 0
+            for key in (
+                "context_window_tokens",
+                "max_output_tokens",
+                "safety_margin_tokens",
+                "max_input_tokens",
+            )
+        )
+        or payload["max_input_tokens"]
+        != payload["context_window_tokens"]
+        - payload["max_output_tokens"]
+        - payload["safety_margin_tokens"]
+    ):
+        raise ValueError("global candidate planning diagnostics context budget is invalid")
+    return payload
+
+
+def _validate_global_page_measurement(
+    value: Any,
+    *,
+    context_budget: Mapping[str, Any],
+) -> JsonDict:
+    required = {
+        "schema",
+        "estimator",
+        "character_count",
+        "utf8_byte_count",
+        "estimated_input_tokens",
+        "context_window_tokens",
+        "max_output_tokens",
+        "safety_margin_tokens",
+        "max_input_tokens",
+        "fits",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError("global candidate planning diagnostics measurement mismatch")
+    payload = _checkpoint_json(value)
+    if (
+        payload.get("schema") != "judge-prompt-budget-measurement/v1"
+        or payload.get("estimator") != TOKEN_ESTIMATOR_ID
+        or any(
+            type(payload.get(key)) is not int or payload[key] < 0
+            for key in (
+                "character_count",
+                "utf8_byte_count",
+                "estimated_input_tokens",
+            )
+        )
+        or any(
+            payload.get(key) != context_budget.get(key)
+            for key in (
+                "context_window_tokens",
+                "max_output_tokens",
+                "safety_margin_tokens",
+                "max_input_tokens",
+            )
+        )
+        or type(payload.get("fits")) is not bool
+        or payload["fits"]
+        is not (
+            payload["estimated_input_tokens"]
+            <= payload["max_input_tokens"]
+        )
+    ):
+        raise ValueError("global candidate planning diagnostics measurement is invalid")
+    return payload
+
+
+def _expected_global_evidence_context_refs(
+    request: GlobalCandidateJudgeRequest,
+) -> Tuple[str, ...]:
+    compression = request.trace_health.get("candidate_compression")
+    funnel = (
+        compression.get("candidate_funnel")
+        if isinstance(compression, Mapping)
+        else None
+    )
+    if not isinstance(funnel, Mapping):
+        return ()
+    refs = funnel.get("evidence_context_refs")
+    if not isinstance(refs, (list, tuple)) or any(
+        not isinstance(ref, str) or not ref for ref in refs
+    ):
+        raise ValueError(
+            "global candidate request candidate funnel has invalid evidence context refs"
+        )
+    return tuple(refs)
+
+
+def _global_manifest_evidence_context_authority(
+    investigation_journal: Iterable[Any],
+    *,
+    graph: TraceGraph,
+) -> Dict[str, JsonDict]:
+    authority: Dict[str, JsonDict] = {}
+    reconstructed_gap_identities: Dict[str, Set[str]] = {}
+    for candidate in obligation_gap_causal_candidates(graph):
+        reconstructed_gap_identities.setdefault(candidate.ref, set()).update(
+            gap.identity
+            for gap in obligation_gaps_for_candidate(candidate)
+        )
+    for value in investigation_journal:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("kind") != "candidate_cluster_manifest_shadow"
+        ):
+            continue
+        seed_binding = str(value.get("seed_binding_identity") or "")
+        manifest = validate_candidate_cluster_shadow_event(
+            _checkpoint_json(value),
+            graph=graph,
+            expected_seed_binding_identity=seed_binding,
+        )
+        for fact in manifest.candidate_facts:
+            expected_gap_identities = tuple(
+                sorted(reconstructed_gap_identities.get(fact.ref, set()))
+            )
+            if (
+                fact.attribution_only_gap_identities
+                != expected_gap_identities
+            ):
+                raise ValueError(
+                    "candidate manifest graph-bound path has forged "
+                    "obligation-gap authority"
+                )
+            if expected_gap_identities:
+                continue
+            expected_path = _grounded_downstream_path(
+                graph,
+                fact.ref,
+                (manifest.seed_ref,),
+            )
+            if len(expected_path) < 2 and fact.root_candidate_eligible:
+                process_trajectory = candidate_process_trajectory_context(
+                    graph=graph,
+                    current_ref=fact.ref,
+                    path=[fact.ref, manifest.seed_ref],
+                )
+                if process_trajectory.get("episode_summaries"):
+                    expected_path = (fact.ref, manifest.seed_ref)
+            if fact.path_refs != (expected_path or (fact.ref,)):
+                raise ValueError(
+                    "candidate manifest graph-bound path contradicts "
+                    "the active trace"
+                )
+        ineligible_refs = tuple(
+            fact.ref
+            for fact in manifest.candidate_facts
+            if len(fact.path_refs) < 2
+            and not fact.attribution_only_gap_identities
+        )
+        policy = quality_first_candidate_budget(
+            manifest.discovered_count
+        )
+        offered_count = min(
+            manifest.discovered_count - len(ineligible_refs),
+            policy.total_limit,
+        )
+        expected_context_refs = ineligible_refs[
+            : max(0, policy.total_limit - offered_count)
+        ]
+        persisted_context_refs = tuple(
+            fact.ref
+            for fact in manifest.candidate_facts
+            if next(
+                disposition
+                for cluster in manifest.clusters
+                for ref, disposition in cluster.member_dispositions
+                if ref == fact.ref
+            )
+            == "evidence_context"
+        )
+        if persisted_context_refs != expected_context_refs:
+            raise ValueError(
+                "candidate manifest evidence context contradicts its "
+                "graph-bound path and budget facts"
+            )
+        projection = {
+            "source_selection_identity": (
+                manifest.source_selection_identity
+            ),
+            "evidence_context_refs": expected_context_refs,
+        }
+        if seed_binding in authority:
+            if authority[seed_binding] != projection:
+                raise ValueError(
+                    "candidate evidence context authority conflicts"
+                )
+            continue
+        authority[seed_binding] = projection
+    return authority
+
+
+def _validate_global_request_run_authority(
+    request: GlobalCandidateJudgeRequest,
+    *,
+    graph: TraceGraph,
+    analysis_perspective: str,
+    evidence_context_authority: Optional[Mapping[str, Any]] = None,
+) -> None:
+    expected_defect = seed_defect_state(
+        graph.nodes[graph.resolve(request.seed_ref) or request.seed_ref],
+        request.objective,
+    )
+    expected_obligations = _restoration_obligations_for_active_seed(
+        graph,
+        seed_ref=request.seed_ref,
+        defect_state=expected_defect,
+    )
+    funnel_context_refs = _expected_global_evidence_context_refs(request)
+    expected_context_refs = funnel_context_refs
+    if evidence_context_authority is not None:
+        expected_context_refs = tuple(
+            evidence_context_authority.get("evidence_context_refs") or ()
+        )
+        compression = request.trace_health.get("candidate_compression")
+        funnel = (
+            compression.get("candidate_funnel")
+            if isinstance(compression, Mapping)
+            else None
+        )
+        if (
+            not isinstance(funnel, Mapping)
+            or funnel.get("selection_identity")
+            != evidence_context_authority.get(
+                "source_selection_identity"
+            )
+            or funnel_context_refs != expected_context_refs
+        ):
+            raise ValueError(
+                "global candidate request evidence context drifts from "
+                "the candidate manifest authority"
+            )
+    actual_context_refs = tuple(
+        capsule.candidate_ref
+        for capsule in request.evidence_context_capsules
+    )
+    if request.analysis_perspective != analysis_perspective:
+        raise ValueError(
+            "global candidate request analysis perspective drifts from the run authority"
+        )
+    if request.restoration_obligations != expected_obligations:
+        raise ValueError(
+            "global candidate request restoration obligations drift from the seed authority"
+        )
+    if actual_context_refs != expected_context_refs:
+        raise ValueError(
+            "global candidate request evidence context drifts from the candidate funnel authority"
+        )
+
+
+def _validate_global_page_planning_diagnostics(
+    value: Any,
+    *,
+    graph: TraceGraph,
+    objective: str,
+    analysis_perspective: str,
+    authoritative_candidates: Sequence[CausalCandidate],
+    plan: CandidatePagePlan,
+    phase: str,
+    evidence_context_authority: Optional[Mapping[str, Any]] = None,
+) -> JsonDict:
+    def validate_page_binding(
+        request: GlobalCandidateJudgeRequest,
+        *,
+        owning_plan: CandidatePagePlan,
+        owning_page: CandidatePage,
+    ) -> None:
+        compression = request.trace_health.get("candidate_compression")
+        page_binding = (
+            compression.get("candidate_page")
+            if isinstance(compression, Mapping)
+            else None
+        )
+        expected = {
+            "schema": "global-candidate-page-execution/v1",
+            "plan_identity": owning_plan.identity,
+            "round_index": owning_page.round_index,
+            "page_index": owning_page.page_index,
+            "page_count": len(owning_plan.pages),
+            "page_identity": owning_page.identity,
+            "page_phase": phase,
+            "candidate_count": len(owning_page.candidate_refs),
+        }
+        if page_binding != expected:
+            raise ValueError(
+                "global candidate planning diagnostics planned request page "
+                "binding contradicts the canonical plan"
+            )
+
+    if not isinstance(value, Mapping) or set(value) != set(
+        GLOBAL_CANDIDATE_PAGE_PLANNING_KEYS
+    ):
+        raise ValueError("global candidate page planning diagnostics schema mismatch")
+    payload = _checkpoint_json(value)
+    intent = str(payload.get("planning_intent") or "")
+    if (
+        payload.get("schema") != GLOBAL_CANDIDATE_PAGE_PLANNING_SCHEMA
+        or intent not in {"initial", "comparison", "final_comparison"}
+        or (
+            intent == "initial" and phase != "initial"
+        )
+        or (
+            intent == "comparison" and phase != "comparison"
+        )
+        or (
+            intent == "final_comparison" and phase not in {"comparison", "final"}
+        )
+        or type(payload.get("budget_enforced")) is not bool
+        or not isinstance(payload.get("split_history"), list)
+        or not isinstance(payload.get("pages"), list)
+    ):
+        raise ValueError("global candidate page planning diagnostics are invalid")
+    if not payload["budget_enforced"]:
+        if (
+            payload.get("context_budget") is not None
+            or payload["split_history"]
+            or payload["pages"]
+        ):
+            raise ValueError("unenforced planning diagnostics must not claim budget facts")
+        return payload
+    context_budget = _validate_global_page_context_budget(
+        payload.get("context_budget")
+    )
+    if len(payload["pages"]) != len(plan.pages):
+        raise ValueError("planning diagnostics pages do not cover the canonical plan")
+    planned_capsules: List[CandidateEvidenceCapsule] = []
+    for page, diagnostic in zip(plan.pages, payload["pages"]):
+        if not isinstance(diagnostic, Mapping) or set(diagnostic) != set(
+            GLOBAL_CANDIDATE_PAGE_PLANNING_PAGE_KEYS
+        ):
+            raise ValueError("global candidate planning diagnostics page schema mismatch")
+        measurement = _validate_global_page_measurement(
+            diagnostic.get("measurement"),
+            context_budget=context_budget,
+        )
+        try:
+            projection = validate_global_judge_prompt_projection(
+                diagnostic.get("projection")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "global candidate planning diagnostics projection is invalid: "
+                + str(exc)
+            ) from exc
+        try:
+            planned_envelope = diagnostic.get("validation_envelope")
+            planned_request = global_candidate_request_from_validation_envelope(
+                planned_envelope,
+                graph=graph,
+                authoritative_candidates=(
+                    _global_envelope_authoritative_candidates(
+                        graph,
+                        planned_envelope,
+                        authoritative_candidates,
+                    )
+                ),
+                authoritative_objective=objective,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "global candidate planning diagnostics planned request is invalid: "
+                + str(exc)
+            ) from exc
+        actual_projection = planned_request.judge_prompt_projection().get(
+            "prompt_projection"
+        )
+        _validate_global_request_run_authority(
+            planned_request,
+            graph=graph,
+            analysis_perspective=analysis_perspective,
+            evidence_context_authority=evidence_context_authority,
+        )
+        actual_measurement = JudgeContextBudget(
+            context_window_tokens=context_budget["context_window_tokens"],
+            max_output_tokens=context_budget["max_output_tokens"],
+            safety_margin_tokens=context_budget["safety_margin_tokens"],
+        ).measure(
+            system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": build_global_candidate_prompt(planned_request),
+                }
+            ],
+        ).to_dict()
+        validate_page_binding(
+            planned_request,
+            owning_plan=plan,
+            owning_page=page,
+        )
+        if diagnostic.get("page_identity") != page.identity:
+            raise ValueError("global candidate planning diagnostics page identity mismatch")
+        if tuple(diagnostic.get("candidate_refs") or ()) != page.candidate_refs:
+            raise ValueError("global candidate planning diagnostics candidate refs mismatch")
+        if (
+            planned_request.seed_ref != plan.seed_ref
+            or planned_request.active_defect.fingerprint
+            != plan.defect_fingerprint
+            or planned_request.offered_candidate_refs != page.candidate_refs
+            or diagnostic.get("request_identity")
+            != _global_judge_request_identity(planned_request)
+            or projection != actual_projection
+            or measurement != actual_measurement
+        ):
+            raise ValueError(
+                "global candidate planning diagnostics planned request contradicts "
+                "its projection or budget measurement"
+            )
+        if projection["candidate_count"] != len(page.candidate_refs):
+            raise ValueError("global candidate planning diagnostics candidate count mismatch")
+        if not measurement["fits"] and len(page.candidate_refs) != 1:
+            raise ValueError("global candidate planning diagnostics retained an oversized multi-candidate page")
+        planned_capsules.extend(planned_request.capsules)
+    if tuple(capsule.candidate_ref for capsule in planned_capsules) != plan.candidate_refs:
+        raise ValueError(
+            "global candidate planning diagnostics planned requests do not cover the plan"
+        )
+    split_entries: List[Tuple[JsonDict, GlobalCandidateJudgeRequest]] = []
+    for split in payload["split_history"]:
+        if not isinstance(split, Mapping) or set(split) != set(
+            GLOBAL_CANDIDATE_PAGE_PLANNING_SPLIT_KEYS
+        ):
+            raise ValueError("global candidate planning split history schema mismatch")
+        candidate_refs = split.get("candidate_refs")
+        child_sizes = split.get("child_page_sizes")
+        measurement = _validate_global_page_measurement(
+            split.get("measurement"),
+            context_budget=context_budget,
+        )
+        try:
+            projection = validate_global_judge_prompt_projection(
+                split.get("projection")
+            )
+            parent_envelope = split.get("validation_envelope")
+            parent_request = global_candidate_request_from_validation_envelope(
+                parent_envelope,
+                graph=graph,
+                authoritative_candidates=(
+                    _global_envelope_authoritative_candidates(
+                        graph,
+                        parent_envelope,
+                        authoritative_candidates,
+                    )
+                ),
+                authoritative_objective=objective,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "global candidate planning split history request is invalid: "
+                + str(exc)
+            ) from exc
+        actual_projection = parent_request.judge_prompt_projection().get(
+            "prompt_projection"
+        )
+        _validate_global_request_run_authority(
+            parent_request,
+            graph=graph,
+            analysis_perspective=analysis_perspective,
+            evidence_context_authority=evidence_context_authority,
+        )
+        actual_measurement = JudgeContextBudget(
+            context_window_tokens=context_budget["context_window_tokens"],
+            max_output_tokens=context_budget["max_output_tokens"],
+            safety_margin_tokens=context_budget["safety_margin_tokens"],
+        ).measure(
+            system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": build_global_candidate_prompt(parent_request),
+                }
+            ],
+        ).to_dict()
+        if (
+            not isinstance(split.get("parent_page_identity"), str)
+            or not split["parent_page_identity"]
+            or not isinstance(candidate_refs, list)
+            or any(not isinstance(ref, str) or not ref for ref in candidate_refs)
+            or not isinstance(child_sizes, list)
+            or any(type(size) is not int or size <= 0 for size in child_sizes)
+            or sum(child_sizes) != len(candidate_refs)
+            or split.get("reason") != "projected_prompt_exceeds_context_budget"
+            or measurement["fits"] is not False
+            or tuple(candidate_refs or ())
+            != parent_request.offered_candidate_refs
+            or split.get("request_identity")
+            != _global_judge_request_identity(parent_request)
+            or projection != actual_projection
+            or measurement != actual_measurement
+        ):
+            raise ValueError("global candidate planning split history is invalid")
+        split_entries.append((split, parent_request))
+
+    page_sizes: Optional[Tuple[int, ...]] = None
+    remaining_splits = list(split_entries)
+    split_parent_identities = [
+        str(entry["parent_page_identity"])
+        for entry, _ in remaining_splits
+    ]
+    if len(split_parent_identities) != len(set(split_parent_identities)):
+        raise ValueError(
+            "global candidate planning split history contains a duplicate parent"
+        )
+    while True:
+        replay_plan = build_candidate_page_plan(
+            seed_ref=plan.seed_ref,
+            defect_fingerprint=plan.defect_fingerprint,
+            capsules=planned_capsules,
+            round_index=plan.round_index,
+            page_sizes=page_sizes,
+        )
+        split_by_parent = {
+            str(entry["parent_page_identity"]): (entry, request)
+            for entry, request in remaining_splits
+            if str(entry["parent_page_identity"])
+            in {page.identity for page in replay_plan.pages}
+        }
+        if not split_by_parent:
+            if remaining_splits or replay_plan != plan:
+                raise ValueError(
+                    "global candidate planning split history does not replay to "
+                    "the canonical plan"
+                )
+            break
+        expected_parent_order = [
+            page.identity
+            for page in replay_plan.pages
+            if page.identity in split_by_parent
+        ]
+        actual_parent_prefix = [
+            str(entry["parent_page_identity"])
+            for entry, _ in remaining_splits[: len(expected_parent_order)]
+        ]
+        if actual_parent_prefix != expected_parent_order:
+            raise ValueError(
+                "global candidate planning split history order is not canonical"
+            )
+        next_sizes: List[int] = []
+        consumed: Set[str] = set()
+        for replay_page in replay_plan.pages:
+            split_entry = split_by_parent.get(replay_page.identity)
+            if split_entry is None:
+                next_sizes.append(len(replay_page.candidate_refs))
+                continue
+            split, parent_request = split_entry
+            size = len(replay_page.candidate_refs)
+            expected_child_sizes = [size // 2, size - (size // 2)]
+            if (
+                list(split["candidate_refs"])
+                != list(replay_page.candidate_refs)
+                or split["child_page_sizes"] != expected_child_sizes
+            ):
+                raise ValueError(
+                    "global candidate planning split history contradicts its parent page"
+                )
+            validate_page_binding(
+                parent_request,
+                owning_plan=replay_plan,
+                owning_page=replay_page,
+            )
+            next_sizes.extend(expected_child_sizes)
+            consumed.add(replay_page.identity)
+        remaining_splits = remaining_splits[len(consumed) :]
+        page_sizes = tuple(next_sizes)
+    return payload
+
+
+def _validate_global_final_comparison_preflight(
+    value: Any,
+    *,
+    graph: TraceGraph,
+    objective: str,
+    analysis_perspective: str,
+    authoritative_candidates: Sequence[CausalCandidate],
+    expected_candidate_refs: Sequence[str],
+    evidence_context_authority: Optional[Mapping[str, Any]] = None,
+) -> JsonDict:
+    if not isinstance(value, Mapping) or set(value) != set(
+        GLOBAL_CANDIDATE_FINAL_COMPARISON_PREFLIGHT_KEYS
+    ):
+        raise ValueError("global candidate final comparison preflight schema mismatch")
+    payload = _checkpoint_json(value)
+    if (
+        payload.get("schema")
+        != GLOBAL_CANDIDATE_FINAL_COMPARISON_PREFLIGHT_SCHEMA
+        or payload.get("behavior_impact")
+        != "none_offline_analysis_only"
+    ):
+        raise ValueError("global candidate final comparison preflight is invalid")
+    context_budget = _validate_global_page_context_budget(
+        payload.get("context_budget")
+    )
+    measurement = _validate_global_page_measurement(
+        payload.get("measurement"),
+        context_budget=context_budget,
+    )
+    try:
+        projection = validate_global_judge_prompt_projection(
+            payload.get("projection")
+        )
+        envelope = payload.get("validation_envelope")
+        request = global_candidate_request_from_validation_envelope(
+            envelope,
+            graph=graph,
+            authoritative_candidates=(
+                _global_envelope_authoritative_candidates(
+                    graph,
+                    envelope,
+                    authoritative_candidates,
+                )
+            ),
+            authoritative_objective=objective,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "global candidate final comparison preflight request is invalid: "
+            + str(exc)
+        ) from exc
+    _validate_global_request_run_authority(
+        request,
+        graph=graph,
+        analysis_perspective=analysis_perspective,
+        evidence_context_authority=evidence_context_authority,
+    )
+    actual_projection = request.judge_prompt_projection().get(
+        "prompt_projection"
+    )
+    actual_measurement = JudgeContextBudget(
+        context_window_tokens=context_budget["context_window_tokens"],
+        max_output_tokens=context_budget["max_output_tokens"],
+        safety_margin_tokens=context_budget["safety_margin_tokens"],
+    ).measure(
+        system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": build_global_candidate_prompt(request),
+            }
+        ],
+    ).to_dict()
+    if (
+        request.offered_candidate_refs != tuple(expected_candidate_refs)
+        or payload.get("request_identity")
+        != _global_judge_request_identity(request)
+        or projection != actual_projection
+        or measurement != actual_measurement
+    ):
+        raise ValueError(
+            "global candidate final comparison preflight contradicts its "
+            "canonical request or budget measurement"
+        )
+    return payload
+
+
 def _validate_global_pagination_journal(
     investigation_journal: Iterable[Any],
     *,
+    graph: TraceGraph,
+    objective: str,
+    analysis_perspective: str,
+    authoritative_candidates: Sequence[CausalCandidate],
     action_records: Optional[Iterable[Any]] = None,
-) -> None:
-    plans: Dict[str, Tuple[CandidatePagePlan, str, str]] = {}
+) -> Dict[str, JsonDict]:
+    evidence_context_authority_by_seed = (
+        _global_manifest_evidence_context_authority(
+            investigation_journal,
+            graph=graph,
+        )
+    )
+    plans: Dict[
+        str, Tuple[CandidatePagePlan, str, str, JsonDict]
+    ] = {}
     page_events: Dict[str, JsonDict] = {}
     page_event_attempts: Dict[str, List[JsonDict]] = {}
     page_outcomes: Dict[str, CandidatePageOutcome] = {}
     round_summaries: Dict[str, CandidateRoundSummary] = {}
     round_summary_seed_bindings: Dict[str, str] = {}
+    round_summary_order_by_seed: Dict[str, List[CandidateRoundSummary]] = {}
     convergence_by_seed: Dict[str, JsonDict] = {}
+    plan_order_by_seed: Dict[str, List[str]] = {}
     for index, raw_event in enumerate(investigation_journal):
         if not isinstance(raw_event, Mapping):
             continue
@@ -5152,6 +5955,26 @@ def _validate_global_pagination_journal(
             seed_binding = str(
                 raw_event.get("seed_binding_identity") or ""
             )
+            if seed_binding in convergence_by_seed:
+                raise ValueError(
+                    "global candidate page plan appears after convergence"
+                )
+            planning_diagnostics = (
+                _validate_global_page_planning_diagnostics(
+                    raw_event.get("planning_diagnostics"),
+                    graph=graph,
+                    objective=objective,
+                    analysis_perspective=analysis_perspective,
+                    authoritative_candidates=authoritative_candidates,
+                    plan=plan,
+                    phase=phase,
+                    evidence_context_authority=(
+                        evidence_context_authority_by_seed.get(
+                            seed_binding
+                        )
+                    ),
+                )
+            )
             if (
                 raw_event.get("status") != "planned"
                 or raw_event.get("behavior_impact")
@@ -5172,7 +5995,62 @@ def _validate_global_pagination_journal(
                     "global candidate page plan event contradicts its "
                     "canonical plan"
                 )
-            plans[plan_identity] = (plan, phase, seed_binding)
+            prior_plans = plan_order_by_seed.get(seed_binding, [])
+            prior_rounds = round_summary_order_by_seed.get(seed_binding, [])
+            if not prior_plans:
+                if phase != "initial" or plan.round_index != 0:
+                    raise ValueError(
+                        "global candidate pagination must begin with round zero initial plan"
+                    )
+            else:
+                if not prior_rounds:
+                    raise ValueError(
+                        "global candidate follow-up plan has no completed prior round"
+                    )
+                latest_round = prior_rounds[-1]
+                retained_factors = tuple(
+                    dict.fromkeys(
+                        ref
+                        for summary in prior_rounds
+                        for ref in summary.non_root_factor_refs
+                    )
+                )
+                if phase == "comparison":
+                    expected_refs = latest_round.finalist_candidate_refs
+                elif phase == "final":
+                    expected_refs = tuple(
+                        dict.fromkeys(
+                            (
+                                *latest_round.finalist_candidate_refs,
+                                *tuple(
+                                    ref
+                                    for ref in retained_factors
+                                    if ref
+                                    not in latest_round.finalist_candidate_refs
+                                )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES],
+                            )
+                        )
+                    )
+                else:
+                    raise ValueError(
+                        "global candidate pagination contains a second initial plan"
+                    )
+                if (
+                    plan.round_index != latest_round.round_index + 1
+                    or plan.candidate_refs != expected_refs
+                ):
+                    raise ValueError(
+                        "global candidate follow-up plan does not derive from the latest round"
+                    )
+            plans[plan_identity] = (
+                plan,
+                phase,
+                seed_binding,
+                planning_diagnostics,
+            )
+            plan_order_by_seed.setdefault(seed_binding, []).append(
+                plan_identity
+            )
             continue
         if kind == "global_candidate_page":
             status = str(raw_event.get("status") or "")
@@ -5200,7 +6078,11 @@ def _validate_global_pagination_journal(
                 raise ValueError(
                     "global candidate page event has no prior page plan"
                 )
-            plan, phase, seed_binding = plan_entry
+            plan, phase, seed_binding, planning_diagnostics = plan_entry
+            if seed_binding in convergence_by_seed:
+                raise ValueError(
+                    "global candidate page event appears after convergence"
+                )
             page_index = raw_event.get("page_index")
             if (
                 type(page_index) is not int
@@ -5216,6 +6098,51 @@ def _validate_global_pagination_journal(
                     raw_event.get("validation_envelope")
                 )
             )
+            _validate_global_request_run_authority(
+                request,
+                graph=graph,
+                analysis_perspective=analysis_perspective,
+                evidence_context_authority=(
+                    evidence_context_authority_by_seed.get(seed_binding)
+                ),
+            )
+            if planning_diagnostics["budget_enforced"]:
+                planned_page = planning_diagnostics["pages"][page_index]
+                actual_projection = request.judge_prompt_projection().get(
+                    "prompt_projection"
+                )
+                if actual_projection != planned_page["projection"]:
+                    raise ValueError(
+                        "global candidate page planning diagnostics projection "
+                        "contradicts the executed request"
+                    )
+                actual_measurement = JudgeContextBudget(
+                    context_window_tokens=planning_diagnostics[
+                        "context_budget"
+                    ]["context_window_tokens"],
+                    max_output_tokens=planning_diagnostics[
+                        "context_budget"
+                    ]["max_output_tokens"],
+                    safety_margin_tokens=planning_diagnostics[
+                        "context_budget"
+                    ]["safety_margin_tokens"],
+                ).measure(
+                    system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": build_global_candidate_prompt(
+                                request
+                            ),
+                        }
+                    ],
+                ).to_dict()
+                planned_measurement = planned_page["measurement"]
+                if planned_measurement != actual_measurement:
+                    raise ValueError(
+                        "global candidate page planning diagnostics measurement "
+                        "contradicts the executed request"
+                    )
             page_identity = str(
                 raw_event.get("page_identity") or ""
             )
@@ -5318,6 +6245,21 @@ def _validate_global_pagination_journal(
                 raise ValueError(
                     "failed global candidate page event is invalid"
                 )
+            elif status == "failed":
+                execution_failure = validate_analysis_execution_failure(
+                    raw_event.get("execution_failure")
+                )
+                if (
+                    execution_failure["affected_start_refs"]
+                    != [plan.seed_ref]
+                    or execution_failure["physical_requests"] != delta
+                    or execution_failure["physical_request_exact"] is not exact
+                    or execution_failure["detail"]
+                    != raw_event.get("detail")
+                ):
+                    raise ValueError(
+                        "failed global candidate page execution facts contradict the event"
+                    )
             continue
         if kind == "global_candidate_round_summary":
             if {str(key) for key in raw_event} != set(
@@ -5336,7 +6278,7 @@ def _validate_global_pagination_journal(
                 raise ValueError(
                     "global candidate round summary has no page plan"
                 )
-            plan, _, seed_binding = plan_entry
+            plan, _, seed_binding, _ = plan_entry
             expected_outcomes = tuple(
                 page_outcomes.get(page.identity)
                 for page in plan.pages
@@ -5376,6 +6318,9 @@ def _validate_global_pagination_journal(
                 )
             round_summaries[summary.identity] = summary
             round_summary_seed_bindings[summary.identity] = seed_binding
+            round_summary_order_by_seed.setdefault(seed_binding, []).append(
+                summary
+            )
             continue
         if kind == "global_candidate_convergence":
             if {str(key) for key in raw_event} != set(
@@ -5399,9 +6344,33 @@ def _validate_global_pagination_journal(
                 if round_summary_seed_bindings.get(identity)
                 == seed_binding
             ]
+            active_plan_identity = str(
+                raw_event.get("active_plan_identity") or ""
+            )
+            active_plan_entry = plans.get(active_plan_identity)
+            status = str(raw_event.get("status") or "")
+            allowed_statuses = {
+                "interrupted",
+                "page_failure",
+                "unresolved_candidates",
+                "no_defect",
+                "no_supported_finalists",
+                "final_comparison_context_budget_exceeded",
+                "final_judgment_completed",
+                "final_page_failure",
+                "stalled",
+                "round_budget_exhausted",
+            }
             if (
                 not seed_binding
                 or seed_binding in convergence_by_seed
+                or status not in allowed_statuses
+                or active_plan_entry is None
+                or active_plan_entry[2]
+                != seed_binding
+                or not plan_order_by_seed.get(seed_binding)
+                or active_plan_identity
+                != plan_order_by_seed[seed_binding][-1]
                 or raw_event.get("round_count")
                 != len(matching_rounds)
                 or raw_event.get("completed_page_count")
@@ -5423,14 +6392,185 @@ def _validate_global_pagination_journal(
                 != "none_offline_analysis_only"
             ):
                 raise ValueError(
-                    "global candidate convergence contradicts its pages"
+                    "global candidate convergence active plan or page facts are invalid"
+                )
+            assert active_plan_entry is not None
+            active_plan, active_phase, _, active_diagnostics = active_plan_entry
+            latest_round = matching_rounds[-1] if matching_rounds else None
+            supported_refs = tuple(
+                raw_event.get("supported_finalist_refs") or ()
+            )
+            unresolved_refs = tuple(raw_event.get("unresolved_refs") or ())
+            retained_factors = tuple(
+                dict.fromkeys(
+                    ref
+                    for summary in matching_rounds
+                    for ref in summary.non_root_factor_refs
+                )
+            )
+            if status in {
+                "final_comparison_context_budget_exceeded",
+                "stalled",
+                "round_budget_exhausted",
+            }:
+                if (
+                    latest_round is None
+                    or supported_refs
+                    != latest_round.finalist_candidate_refs
+                    or unresolved_refs
+                    != latest_round.unresolved_root_hypothesis_refs
+                ):
+                    raise ValueError(
+                        "global candidate convergence does not match the latest round"
+                    )
+            elif status in {"final_judgment_completed", "final_page_failure"}:
+                if (
+                    latest_round is None
+                    or supported_refs
+                    != latest_round.finalist_candidate_refs
+                    or unresolved_refs
+                    != latest_round.unresolved_root_hypothesis_refs
+                    or active_phase != "final"
+                    or active_plan.candidate_refs
+                    != tuple(
+                        dict.fromkeys(
+                            (
+                                *latest_round.finalist_candidate_refs,
+                                *tuple(
+                                    ref
+                                    for ref in retained_factors
+                                    if ref
+                                    not in latest_round.finalist_candidate_refs
+                                )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES],
+                            )
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "global candidate final convergence does not match the latest round or final plan"
+                    )
+            elif status in {"no_defect", "no_supported_finalists"}:
+                if (
+                    latest_round is None
+                    or latest_round.finalist_candidate_refs
+                    or supported_refs != latest_round.candidate_refs
+                    or unresolved_refs
+                    != latest_round.unresolved_root_hypothesis_refs
+                ):
+                    raise ValueError(
+                        "global candidate terminal convergence contradicts the latest round"
+                    )
+            elif status == "unresolved_candidates":
+                if (
+                    latest_round is None
+                    or supported_refs != latest_round.candidate_refs
+                    or unresolved_refs
+                    != latest_round.unresolved_root_hypothesis_refs
+                ):
+                    raise ValueError(
+                        "global candidate unresolved convergence contradicts the latest round"
+                    )
+
+            expected_comparison_refs = tuple(
+                dict.fromkeys(
+                    (
+                        *supported_refs,
+                        *tuple(
+                            ref
+                            for ref in retained_factors
+                            if ref not in supported_refs
+                        )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES],
+                    )
+                )
+            )
+            preflight_value = raw_event.get("final_comparison_preflight")
+            if status in {
+                "final_comparison_context_budget_exceeded",
+                "stalled",
+            } and active_phase == "comparison" and active_diagnostics.get(
+                "budget_enforced"
+            ):
+                preflight = _validate_global_final_comparison_preflight(
+                    preflight_value,
+                    graph=graph,
+                    objective=objective,
+                    analysis_perspective=analysis_perspective,
+                    authoritative_candidates=authoritative_candidates,
+                    expected_candidate_refs=expected_comparison_refs,
+                    evidence_context_authority=(
+                        evidence_context_authority_by_seed.get(
+                            seed_binding
+                        )
+                    ),
+                )
+                expected_fits = status == "stalled"
+                if preflight["measurement"]["fits"] is not expected_fits:
+                    raise ValueError(
+                        "global candidate final comparison preflight contradicts convergence status"
+                    )
+            elif preflight_value is not None:
+                raise ValueError(
+                    "global candidate convergence has an unexpected final comparison preflight"
+                )
+            elif (
+                status == "final_comparison_context_budget_exceeded"
+                and active_phase == "comparison"
+            ):
+                raise ValueError(
+                    "global candidate context budget convergence lacks a final comparison preflight"
+                )
+            if status == "final_comparison_context_budget_exceeded" and (
+                (
+                    active_phase == "final"
+                    and (
+                        active_diagnostics.get("planning_intent")
+                        != "final_comparison"
+                        or len(active_plan.pages) <= 1
+                    )
+                )
+                or (
+                    active_phase == "comparison"
+                    and len(supported_refs) <= CANDIDATE_PAGE_SIZE
+                )
+            ):
+                raise ValueError(
+                    "global candidate final comparison split status contradicts its active plan"
+                )
+            final_plan_page_events = [
+                event
+                for event in matching_pages
+                if event.get("plan_identity") == active_plan_identity
+                and event.get("page_phase") == "final"
+            ]
+            if status == "final_judgment_completed" and (
+                len(final_plan_page_events) != 1
+                or final_plan_page_events[0].get("status") != "completed"
+                or not isinstance(
+                    final_plan_page_events[0].get("judgment"), Mapping
+                )
+            ):
+                raise ValueError(
+                    "global candidate convergence status contradicts terminal facts"
+                )
+            if status == "final_page_failure" and (
+                len(final_plan_page_events) != 1
+                or final_plan_page_events[0].get("status") != "failed"
+            ):
+                raise ValueError(
+                    "global candidate convergence status contradicts terminal facts"
+                )
+            if status in {"stalled", "round_budget_exhausted"} and (
+                active_phase == "final" or final_plan_page_events
+            ):
+                raise ValueError(
+                    "global candidate convergence status contradicts terminal facts"
                 )
             convergence_by_seed[seed_binding] = copy.deepcopy(
                 dict(raw_event)
             )
 
     if action_records is None:
-        return
+        return convergence_by_seed
     action_history = _validated_global_judge_page_action_history(
         action_records
     )
@@ -5503,6 +6643,7 @@ def _validate_global_pagination_journal(
                 raise ValueError(
                     "global candidate page event contradicts its terminal action"
                 )
+    return convergence_by_seed
 
 
 def _validate_restored_report_local_state_owners(
@@ -5515,6 +6656,15 @@ def _validate_restored_report_local_state_owners(
     ] = None,
 ) -> None:
     metadata = report.to_dict()["metadata"]
+    _require_canonical_bijection(
+        (
+            failure
+            for seed in report.seed_results
+            for failure in seed.execution_failures
+        ),
+        metadata.get("analysis_execution_failures") or (),
+        label="report analysis execution failures",
+    )
     frontier_payload = metadata.get("frontier_checkpoint")
     hypothesis_payload = metadata.get("hypothesis_snapshot")
     if not isinstance(frontier_payload, Mapping) or not isinstance(
@@ -5538,6 +6688,7 @@ def _validate_restored_report_local_state_owners(
         defect_states={
             item.fingerprint: item for item in report.defect_states
         },
+        causal_candidates=list(report.causal_candidates),
         causal_relations=list(report.causal_relations),
         step_judgments=list(report.step_judgments),
         step_action_projection=copy.deepcopy(
@@ -8541,6 +9692,13 @@ def _global_failure_projection(
         raise ValueError(
             "global failure projection physical request exactness is invalid"
         )
+    execution_failure = _analysis_execution_failure(
+        seed_ref=builder.start_ref,
+        blocker=blocker,
+        detail=detail,
+        physical_requests=physical_request_delta,
+        physical_request_exact=physical_request_exact,
+    )
     return {
         "schema": GLOBAL_FAILURE_PROJECTION_SCHEMA,
         "terminal_status": "failed",
@@ -8551,7 +9709,8 @@ def _global_failure_projection(
         "blocker": blocker.strip(),
         "reason": detail.strip(),
         "detail": detail.strip(),
-        "missing_evidence": [detail.strip()],
+        "missing_evidence": [],
+        "execution_failure": execution_failure,
         "physical_request_delta": physical_request_delta,
         "physical_request_exact": physical_request_exact,
         "owner": _global_pass_owner(builder).to_dict(),
@@ -8587,13 +9746,27 @@ def _validated_global_failure_projection(value: Any) -> JsonDict:
         or not str(projection.get("blocker") or "")
         or not str(projection.get("reason") or "")
         or projection.get("reason") != projection.get("detail")
-        or list(projection.get("missing_evidence") or ())
-        != [projection.get("detail")]
+        or list(projection.get("missing_evidence") or ()) != []
         or type(projection.get("physical_request_delta")) is not int
         or projection["physical_request_delta"] < 0
         or type(projection.get("physical_request_exact")) is not bool
     ):
         raise ValueError("global failure projection is not canonical")
+    execution_failure = validate_analysis_execution_failure(
+        projection.get("execution_failure")
+    )
+    if (
+        execution_failure["affected_start_refs"]
+        != [projection["seed_ref"]]
+        or execution_failure["physical_requests"]
+        != projection["physical_request_delta"]
+        or execution_failure["physical_request_exact"]
+        is not projection["physical_request_exact"]
+        or execution_failure["detail"] != projection["detail"]
+    ):
+        raise ValueError(
+            "global failure execution projection contradicts terminal facts"
+        )
     owner = LocalStateOwner.from_dict(projection.get("owner"))
     if owner != expected_owner:
         raise ValueError("global failure projection owner is malformed")
@@ -8617,8 +9790,11 @@ def _global_failure_projection_from_action(
         "blocker": str(action.get("blocker") or ""),
         "reason": str(action.get("reason") or ""),
         "detail": str(action.get("reason") or ""),
-        "missing_evidence": copy.deepcopy(
-            list(action.get("missing_evidence") or ())
+        "missing_evidence": [],
+        "execution_failure": copy.deepcopy(
+            action.get("failure_projection", {}).get("execution_failure")
+            if isinstance(action.get("failure_projection"), Mapping)
+            else None
         ),
         "physical_request_delta": action.get("physical_request_delta"),
         "physical_request_exact": action.get("physical_request_exact"),
@@ -8632,7 +9808,7 @@ def _global_failure_projection_from_action(
         or not projection["defect_fingerprint"]
         or not projection["blocker"]
         or not projection["reason"]
-        or projection["missing_evidence"] != [projection["detail"]]
+        or list(action.get("missing_evidence") or ()) != []
         or isinstance(projection["physical_request_delta"], bool)
         or not isinstance(projection["physical_request_delta"], int)
         or projection["physical_request_delta"] < 0
@@ -8816,6 +9992,7 @@ class SeedAttributionBuilder:
     decisive_evidence: List[JsonDict] = field(default_factory=list)
     missing_evidence: Set[str] = field(default_factory=set)
     blocking_reasons: Set[str] = field(default_factory=set)
+    execution_failures: List[JsonDict] = field(default_factory=list)
     global_judgment: JsonDict = field(default_factory=dict)
     expansion_history: List[JsonDict] = field(default_factory=list)
     no_defect: bool = False
@@ -8838,6 +10015,20 @@ class SeedAttributionBuilder:
                 normalized_reason
             )
         )
+
+    def mark_execution_failed(self, failure: Mapping[str, Any]) -> None:
+        from .causal_state import validate_analysis_execution_failure
+
+        canonical = validate_analysis_execution_failure(failure)
+        if self.start_ref not in canonical["affected_start_refs"]:
+            raise ValueError(
+                "execution failure does not affect its owning seed"
+            )
+        identity = stable_json(canonical)
+        if identity not in {
+            stable_json(item) for item in self.execution_failures
+        }:
+            self.execution_failures.append(canonical)
 
     def record_global_judgment(
         self,
@@ -8946,7 +10137,9 @@ class SeedAttributionBuilder:
             )
 
     def to_result(self) -> SeedAttributionResult:
-        if self.blocking_reasons or self.missing_evidence:
+        if self.execution_failures:
+            outcome = "execution_failed"
+        elif self.blocking_reasons or self.missing_evidence:
             outcome = "evidence_gap"
         elif self.confirmed_root_refs:
             outcome = "confirmed_root"
@@ -8970,6 +10163,7 @@ class SeedAttributionBuilder:
             decisive_evidence=tuple(self.decisive_evidence),
             missing_evidence=tuple(self.missing_evidence),
             blocking_reasons=tuple(self.blocking_reasons),
+            execution_failures=tuple(self.execution_failures),
             global_judgment=self.global_judgment,
             expansion_history=tuple(self.expansion_history),
         )
@@ -8995,6 +10189,9 @@ class SeedAttributionBuilder:
             decisive_evidence=copy.deepcopy(result.to_dict()["decisive_evidence"]),
             missing_evidence=set(result.missing_evidence),
             blocking_reasons=set(result.blocking_reasons),
+            execution_failures=copy.deepcopy(
+                result.to_dict()["execution_failures"]
+            ),
             global_judgment=copy.deepcopy(result.to_dict()["global_judgment"]),
             expansion_history=copy.deepcopy(result.to_dict()["expansion_history"]),
             no_defect=bool(value.get("no_defect", result.outcome == "no_defect")),
@@ -10278,10 +11475,63 @@ class RecursiveAnalysisState:
     ) -> None:
         if action_records is not None:
             action_records = tuple(action_records)
-        _validate_global_pagination_journal(
+        convergence_by_seed = _validate_global_pagination_journal(
             self.investigation_journal,
+            graph=self.graph,
+            objective=self.objective,
+            analysis_perspective=self.analysis_perspective,
+            authoritative_candidates=self.causal_candidates,
             action_records=action_records,
         )
+        for seed_binding, convergence in convergence_by_seed.items():
+            if (
+                convergence.get("status")
+                != "final_comparison_context_budget_exceeded"
+            ):
+                continue
+            preflight = convergence.get("final_comparison_preflight")
+            if preflight is None:
+                continue
+            if not isinstance(preflight, Mapping):
+                raise ValueError(
+                    "global candidate final comparison execution failure "
+                    "has an invalid canonical preflight"
+                )
+            builder = self.seed_ledger.get(seed_binding)
+            if builder is None:
+                raise ValueError(
+                    "global candidate final comparison execution failure "
+                    "has no owning seed"
+                )
+            matching_failures = [
+                validate_analysis_execution_failure(failure)
+                for failure in builder.execution_failures
+                if str(failure.get("stage") or "")
+                == "global_candidate_judgment"
+                and str(failure.get("reason") or "")
+                == "context_window_exceeded"
+                and failure.get("physical_requests") == 0
+                and failure.get("physical_request_exact") is True
+            ]
+            expected_budget = {
+                **copy.deepcopy(dict(preflight["context_budget"])),
+                "final_comparison_measurement": copy.deepcopy(
+                    dict(preflight["measurement"])
+                ),
+            }
+            if (
+                len(matching_failures) != 1
+                or matching_failures[0]["affected_start_refs"]
+                != [builder.start_ref]
+                or stable_json(
+                    _checkpoint_json(matching_failures[0]["budget"])
+                )
+                != stable_json(_checkpoint_json(expected_budget))
+            ):
+                raise ValueError(
+                    "global candidate final comparison execution failure "
+                    "budget contradicts its canonical preflight"
+                )
         lifecycle_records = (
             _validated_global_judge_action_history(action_records)
             if action_records is not None
@@ -10482,9 +11732,13 @@ class RecursiveAnalysisState:
                     or episodes[0].get("node_ref")
                     != projection["seed_ref"]
                     or set(builder.blocking_reasons)
-                    != {projection["blocker"]}
-                    or set(builder.missing_evidence)
-                    != set(projection["missing_evidence"])
+                    != set()
+                    or set(builder.missing_evidence) != set()
+                    or [
+                        validate_analysis_execution_failure(item)
+                        for item in builder.execution_failures
+                    ]
+                    != [projection["execution_failure"]]
                 ):
                     raise ValueError(
                         "failed global pass action has no bijective unresolved episode"
@@ -13922,6 +15176,11 @@ class RecursiveAnalysisState:
                 _global_failure_projection_from_action(item)
                 for item in failed_global_passes
             ],
+            "analysis_execution_failures": [
+                copy.deepcopy(item)
+                for seed in self.seed_results()
+                for item in seed.execution_failures
+            ],
             "unresolved_page_refs": unresolved_page_refs,
             "candidate_cluster_triage_metrics": (
                 candidate_cluster_triage_metrics
@@ -13939,6 +15198,10 @@ class RecursiveAnalysisState:
                 not in terminal_pass_seed_bindings
             ) + directory_physical_request_count,
         }
+        if metadata["analysis_execution_failures"]:
+            metadata["termination_reason"] = (
+                "analysis_execution_failed"
+            )
         return RecursiveAttributionReport(
             case_id=self.graph.case_id,
             objective=self.objective,
@@ -16803,6 +18066,8 @@ class AgenticRecursiveAnalyzer:
         final_result: Optional[GlobalJudgePageExecutionResult] = None
         final_plan: Optional[CandidatePagePlan] = None
         final_page: Optional[CandidatePage] = None
+        final_comparison_execution_failure: Optional[JsonDict] = None
+        final_comparison_preflight: Optional[JsonDict] = None
         convergence_status = "inconclusive"
         prior_convergence = [
             event
@@ -16844,6 +18109,21 @@ class AgenticRecursiveAnalyzer:
             )
             if prior_failure_detail:
                 builder.missing_evidence.discard(prior_failure_detail)
+            prior_execution_failure_identities = {
+                stable_json(
+                    validate_analysis_execution_failure(
+                        event.get("execution_failure")
+                    )
+                )
+                for event in prior_failed_pages
+                if isinstance(event.get("execution_failure"), Mapping)
+            }
+            builder.execution_failures = [
+                failure
+                for failure in builder.execution_failures
+                if stable_json(failure)
+                not in prior_execution_failure_identities
+            ]
             builder.missing_evidence.discard(
                 "Signal interruption left the active Global Judge page plan incomplete."
             )
@@ -16921,19 +18201,143 @@ class AgenticRecursiveAnalyzer:
                 page_compression,
             )
 
+        def budgeted_plan_for(
+            *,
+            page_capsules: Sequence[CandidateEvidenceCapsule],
+            round_index: int,
+            phase: str,
+        ) -> Tuple[CandidatePagePlan, JsonDict]:
+            planning_intent = (
+                "final_comparison" if phase == "final" else phase
+            )
+            page_sizes: Optional[Tuple[int, ...]] = None
+            transport = _judge_transport(self.judge)
+            context_budget = getattr(transport, "context_budget", None)
+            if not callable(getattr(context_budget, "measure", None)):
+                return build_candidate_page_plan(
+                    seed_ref=builder.start_ref,
+                    defect_fingerprint=builder.defect_state.fingerprint,
+                    capsules=page_capsules,
+                    round_index=round_index,
+                ), {
+                    "schema": GLOBAL_CANDIDATE_PAGE_PLANNING_SCHEMA,
+                    "planning_intent": planning_intent,
+                    "budget_enforced": False,
+                    "context_budget": None,
+                    "split_history": [],
+                    "pages": [],
+                }
+
+            split_history = []
+            while True:
+                plan = build_candidate_page_plan(
+                    seed_ref=builder.start_ref,
+                    defect_fingerprint=builder.defect_state.fingerprint,
+                    capsules=page_capsules,
+                    round_index=round_index,
+                    page_sizes=page_sizes,
+                )
+                oversized_indices = []
+                page_diagnostics = []
+                for page in plan.pages:
+                    request, _, _, _ = request_for(
+                        refs=page.candidate_refs,
+                        page=page,
+                        plan=plan,
+                        phase=phase,
+                    )
+                    measurement = context_budget.measure(
+                        system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": build_global_candidate_prompt(
+                                    request
+                                ),
+                            }
+                        ],
+                        max_output_tokens=int(
+                            getattr(transport, "max_tokens", 4096)
+                        ),
+                    )
+                    projection = request.judge_prompt_projection().get(
+                        "prompt_projection"
+                    )
+                    page_diagnostics.append(
+                        {
+                            "page_identity": page.identity,
+                            "candidate_refs": list(page.candidate_refs),
+                            "request_identity": (
+                                _global_judge_request_identity(request)
+                            ),
+                            "validation_envelope": (
+                                request.validation_envelope()
+                            ),
+                            "measurement": measurement.to_dict(),
+                            "projection": copy.deepcopy(
+                                dict(projection)
+                                if isinstance(projection, Mapping)
+                                else {}
+                            ),
+                        }
+                    )
+                    if not measurement.fits and len(page.candidate_refs) > 1:
+                        oversized_indices.append(page.page_index)
+                if not oversized_indices:
+                    return plan, {
+                        "schema": GLOBAL_CANDIDATE_PAGE_PLANNING_SCHEMA,
+                        "planning_intent": planning_intent,
+                        "budget_enforced": True,
+                        "context_budget": context_budget.to_dict(),
+                        "split_history": split_history,
+                        "pages": page_diagnostics,
+                    }
+                split_indices = set(oversized_indices)
+                next_page_sizes = []
+                for page in plan.pages:
+                    size = len(page.candidate_refs)
+                    if page.page_index not in split_indices:
+                        next_page_sizes.append(size)
+                        continue
+                    left_size = size // 2
+                    split_history.append(
+                        {
+                            "parent_page_identity": page.identity,
+                            "candidate_refs": list(page.candidate_refs),
+                            "request_identity": page_diagnostics[
+                                page.page_index
+                            ]["request_identity"],
+                            "validation_envelope": page_diagnostics[
+                                page.page_index
+                            ]["validation_envelope"],
+                            "measurement": page_diagnostics[
+                                page.page_index
+                            ]["measurement"],
+                            "projection": page_diagnostics[
+                                page.page_index
+                            ]["projection"],
+                            "child_page_sizes": [
+                                left_size,
+                                size - left_size,
+                            ],
+                            "reason": "projected_prompt_exceeds_context_budget",
+                        }
+                    )
+                    next_page_sizes.extend((left_size, size - left_size))
+                page_sizes = tuple(next_page_sizes)
+
         for round_index in range(
             GLOBAL_CANDIDATE_MAX_COMPARISON_ROUNDS
         ):
             round_capsules = tuple(
                 capsule_by_ref[ref] for ref in current_refs
             )
-            plan = build_candidate_page_plan(
-                seed_ref=builder.start_ref,
-                defect_fingerprint=builder.defect_state.fingerprint,
-                capsules=round_capsules,
-                round_index=round_index,
-            )
             phase = "initial" if round_index == 0 else "comparison"
+            plan, planning_diagnostics = budgeted_plan_for(
+                page_capsules=round_capsules,
+                round_index=round_index,
+                phase=phase,
+            )
             plan_identity = plan.identity
             if not any(
                 isinstance(event, Mapping)
@@ -16954,6 +18358,9 @@ class AgenticRecursiveAnalyzer:
                         "plan_identity": plan_identity,
                         "page_phase": phase,
                         "plan": plan.to_dict(),
+                        "planning_diagnostics": copy.deepcopy(
+                            planning_diagnostics
+                        ),
                         "behavior_impact": (
                             "none_offline_analysis_only"
                         ),
@@ -16970,6 +18377,9 @@ class AgenticRecursiveAnalyzer:
                 GlobalCandidateJudgment
             ] = []
             for page in plan.pages:
+                page_planning = planning_diagnostics["pages"][
+                    page.page_index
+                ] if planning_diagnostics["budget_enforced"] else None
                 if self.stop_requested():
                     completed_page_ids = {
                         str(event.get("page_identity") or "")
@@ -17015,6 +18425,7 @@ class AgenticRecursiveAnalyzer:
                             ),
                             "supported_finalist_refs": list(current_refs),
                             "unresolved_refs": unfinished_page_ids,
+                            "final_comparison_preflight": None,
                             "physical_request_delta": sum(
                                 int(event.get("physical_request_delta") or 0)
                                 for event in matching_page_events
@@ -17097,18 +18508,51 @@ class AgenticRecursiveAnalyzer:
                     )
                     break
 
-                execution = self._execute_global_judge_page(
-                    state=state,
-                    graph=graph,
-                    builder=builder,
-                    item=item,
-                    candidates=page_candidates,
-                    request=request,
-                    candidate_compression=page_compression,
-                    plan=plan,
-                    page=page,
-                    page_phase=phase,
-                )
+                if (
+                    isinstance(page_planning, Mapping)
+                    and not page_planning["measurement"]["fits"]
+                ):
+                    measurement = page_planning["measurement"]
+                    execution = self._record_global_judge_page_without_request(
+                        state=state,
+                        builder=builder,
+                        item=item,
+                        request=request,
+                        candidate_compression=page_compression,
+                        plan=plan,
+                        page=page,
+                        page_phase=phase,
+                        physical_requests_reserved=min(
+                            max(
+                                0,
+                                self.max_judge_requests
+                                - state.judge_requests,
+                            ),
+                            GLOBAL_CANDIDATE_PAGE_PHYSICAL_REQUEST_CAP,
+                        ),
+                        blocker="global_judge_context_budget_exceeded",
+                        detail=(
+                            "The minimal Global Judge page exceeds the local "
+                            "context budget before transport: estimated {0} "
+                            "input tokens, maximum {1}."
+                        ).format(
+                            measurement["estimated_input_tokens"],
+                            measurement["max_input_tokens"],
+                        ),
+                    )
+                else:
+                    execution = self._execute_global_judge_page(
+                        state=state,
+                        graph=graph,
+                        builder=builder,
+                        item=item,
+                        candidates=page_candidates,
+                        request=request,
+                        candidate_compression=page_compression,
+                        plan=plan,
+                        page=page,
+                        page_phase=phase,
+                    )
                 page_results.append(execution)
                 event: JsonDict = {
                     "kind": "global_candidate_page",
@@ -17185,11 +18629,29 @@ class AgenticRecursiveAnalyzer:
                         }
                     )
                 else:
+                    execution_failure = _analysis_execution_failure(
+                        seed_ref=builder.start_ref,
+                        blocker=execution.blocker,
+                        detail=execution.blocker_detail,
+                        physical_requests=execution.physical_requests,
+                        physical_request_exact=(
+                            execution.physical_request_exact
+                        ),
+                        budget=(
+                            planning_diagnostics.get("context_budget")
+                            if isinstance(
+                                planning_diagnostics.get("context_budget"),
+                                Mapping,
+                            )
+                            else None
+                        ),
+                    )
                     round_failed = True
                     event.update(
                         {
                             "blocker": execution.blocker,
                             "detail": execution.blocker_detail,
+                            "execution_failure": execution_failure,
                         }
                     )
                     failed_pages.append(copy.deepcopy(event))
@@ -17201,7 +18663,10 @@ class AgenticRecursiveAnalyzer:
                 if (
                     _provider_circuit(self.judge).get("open")
                     or execution.blocker
-                    == "judge_request_budget_exhausted"
+                    in {
+                        "judge_request_budget_exhausted",
+                        "global_judge_context_budget_exceeded",
+                    }
                 ):
                     break
 
@@ -17316,6 +18781,7 @@ class AgenticRecursiveAnalyzer:
                 for ref in retained_factor_refs
                 if ref not in finalists
             )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES]
+            current_refs = finalists
             if (
                 len(finalists) + len(final_factor_refs)
                 <= CANDIDATE_PAGE_SIZE
@@ -17328,15 +18794,12 @@ class AgenticRecursiveAnalyzer:
                 final_capsules = tuple(
                     capsule_by_ref[ref] for ref in final_refs
                 )
-                final_plan = build_candidate_page_plan(
-                    seed_ref=builder.start_ref,
-                    defect_fingerprint=(
-                        builder.defect_state.fingerprint
-                    ),
-                    capsules=final_capsules,
+                final_plan, final_planning_diagnostics = budgeted_plan_for(
+                    page_capsules=final_capsules,
                     round_index=final_round_index,
+                    phase="final",
                 )
-                final_page = final_plan.pages[0]
+                final_plan_phase = "final"
                 if not any(
                     isinstance(event, Mapping)
                     and event.get("kind")
@@ -17355,8 +18818,11 @@ class AgenticRecursiveAnalyzer:
                                 builder.defect_state.fingerprint
                             ),
                             "plan_identity": final_plan.identity,
-                            "page_phase": "final",
+                            "page_phase": final_plan_phase,
                             "plan": final_plan.to_dict(),
+                            "planning_diagnostics": copy.deepcopy(
+                                final_planning_diagnostics
+                            ),
                             "behavior_impact": (
                                 "none_offline_analysis_only"
                             ),
@@ -17368,6 +18834,42 @@ class AgenticRecursiveAnalyzer:
                             final_plan.identity
                         ),
                     )
+                if len(final_plan.pages) != 1:
+                    final_comparison_execution_failure = (
+                        _analysis_execution_failure(
+                            seed_ref=builder.start_ref,
+                            blocker=(
+                                "global_judge_final_comparison_"
+                                "context_budget_exceeded"
+                            ),
+                            detail=(
+                                "The final comparison cannot fit every retained "
+                                "candidate in one Judge request under the configured "
+                                "context budget; page-local judgments cannot establish "
+                                "a complete cross-page root comparison."
+                            ),
+                            physical_requests=0,
+                            physical_request_exact=True,
+                            budget=(
+                                final_planning_diagnostics.get(
+                                    "context_budget"
+                                )
+                                if isinstance(
+                                    final_planning_diagnostics.get(
+                                        "context_budget"
+                                    ),
+                                    Mapping,
+                                )
+                                else None
+                            ),
+                        )
+                    )
+                    convergence_status = (
+                        "final_comparison_context_budget_exceeded"
+                    )
+                    current_refs = finalists
+                    break
+                final_page = final_plan.pages[0]
                 final_plan_interrupted = self.stop_requested()
                 (
                     final_request,
@@ -17496,10 +18998,32 @@ class AgenticRecursiveAnalyzer:
                         "final_judgment_completed"
                     )
                 else:
+                    execution_failure = _analysis_execution_failure(
+                        seed_ref=builder.start_ref,
+                        blocker=final_result.blocker,
+                        detail=final_result.blocker_detail,
+                        physical_requests=final_result.physical_requests,
+                        physical_request_exact=(
+                            final_result.physical_request_exact
+                        ),
+                        budget=(
+                            final_planning_diagnostics.get(
+                                "context_budget"
+                            )
+                            if isinstance(
+                                final_planning_diagnostics.get(
+                                    "context_budget"
+                                ),
+                                Mapping,
+                            )
+                            else None
+                        ),
+                    )
                     final_event.update(
                         {
                             "blocker": final_result.blocker,
                             "detail": final_result.blocker_detail,
+                            "execution_failure": execution_failure,
                         }
                     )
                     failed_pages.append(copy.deepcopy(final_event))
@@ -17516,7 +19040,139 @@ class AgenticRecursiveAnalyzer:
                 break
 
             if finalists in seen_finalist_sets:
-                convergence_status = "stalled"
+                transport = _judge_transport(self.judge)
+                context_budget = getattr(
+                    transport, "context_budget", None
+                )
+                if callable(getattr(context_budget, "measure", None)):
+                    comparison_refs = tuple(
+                        dict.fromkeys(
+                            (
+                                *finalists,
+                                *tuple(
+                                    ref
+                                    for ref in retained_factor_refs
+                                    if ref not in finalists
+                                )[:MAX_NON_ROOT_CONFIRMATION_CANDIDATES],
+                            )
+                        )
+                    )
+                    comparison_capsules = tuple(
+                        capsule_by_ref[ref] for ref in comparison_refs
+                    )
+                    comparison_request = GlobalCandidateJudgeRequest(
+                        case_id=graph.case_id,
+                        objective=state.objective,
+                        analysis_perspective=state.analysis_perspective,
+                        seed_ref=builder.start_ref,
+                        active_defect=builder.defect_state,
+                        active_focus_text=builder.defect_state.actual,
+                        active_focus_text_hash=active_focus_text_sha256(
+                            builder.defect_state.actual
+                        ),
+                        start_refs=(builder.start_ref,),
+                        capsules=comparison_capsules,
+                        restoration_obligations=tuple(
+                            restoration_obligations
+                        ),
+                        evidence_context_capsules=(
+                            evidence_context_capsules
+                        ),
+                        trace_health={
+                            "missing_artifact_count": sum(
+                                len(capsule.missing_evidence_refs)
+                                for capsule in (
+                                    *comparison_capsules,
+                                    *evidence_context_capsules,
+                                )
+                            ),
+                            "candidate_compression": copy.deepcopy(
+                                dict(candidate_compression)
+                            ),
+                        },
+                    )
+                    effective_context_budget = (
+                        context_budget.with_max_output_tokens(
+                            int(getattr(transport, "max_tokens", 4096))
+                        )
+                    )
+                    comparison_measurement = effective_context_budget.measure(
+                        system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": build_global_candidate_prompt(
+                                    comparison_request
+                                ),
+                            }
+                        ],
+                    )
+                    comparison_projection = (
+                        comparison_request.judge_prompt_projection().get(
+                            "prompt_projection"
+                        )
+                    )
+                    final_comparison_preflight = {
+                        "schema": (
+                            GLOBAL_CANDIDATE_FINAL_COMPARISON_PREFLIGHT_SCHEMA
+                        ),
+                        "request_identity": (
+                            _global_judge_request_identity(
+                                comparison_request
+                            )
+                        ),
+                        "validation_envelope": (
+                            comparison_request.validation_envelope()
+                        ),
+                        "context_budget": (
+                            effective_context_budget.to_dict()
+                        ),
+                        "measurement": comparison_measurement.to_dict(),
+                        "projection": copy.deepcopy(
+                            dict(comparison_projection)
+                            if isinstance(comparison_projection, Mapping)
+                            else {}
+                        ),
+                        "behavior_impact": (
+                            "none_offline_analysis_only"
+                        ),
+                    }
+                    if not comparison_measurement.fits:
+                        final_comparison_execution_failure = (
+                            _analysis_execution_failure(
+                                seed_ref=builder.start_ref,
+                                blocker=(
+                                    "global_judge_final_comparison_"
+                                    "context_budget_exceeded"
+                                ),
+                                detail=(
+                                    "The final comparison cannot fit every "
+                                    "retained candidate in one Judge request "
+                                    "under the configured context budget, and "
+                                    "page-local comparison rounds did not reduce "
+                                    "the finalist set: estimated {0} input "
+                                    "tokens, maximum {1}."
+                                ).format(
+                                    comparison_measurement.estimated_input_tokens,
+                                    comparison_measurement.max_input_tokens,
+                                ),
+                                physical_requests=0,
+                                physical_request_exact=True,
+                                budget={
+                                    **effective_context_budget.to_dict(),
+                                    "final_comparison_measurement": (
+                                        comparison_measurement.to_dict()
+                                    ),
+                                },
+                            )
+                        )
+                        convergence_status = (
+                            "final_comparison_context_budget_exceeded"
+                        )
+                    else:
+                        convergence_status = "stalled"
+                else:
+                    convergence_status = "stalled"
                 current_refs = finalists
                 break
             seen_finalist_sets.append(finalists)
@@ -17575,6 +19231,9 @@ class AgenticRecursiveAnalyzer:
                     if round_summaries
                     else list(current_refs)
                 ),
+                "final_comparison_preflight": copy.deepcopy(
+                    final_comparison_preflight
+                ),
                 "physical_request_delta": total_physical_requests,
                 "behavior_impact": "none_offline_analysis_only",
             }
@@ -17597,12 +19256,62 @@ class AgenticRecursiveAnalyzer:
                 "Global candidate pagination did not reach a final judgment: "
                 + convergence_status
             ]
-            builder.mark_unresolved(
-                "global_candidate_pagination_{0}".format(
-                    convergence_status
+            execution_page = next(
+                (
+                    event
+                    for event in failed_pages
+                    if isinstance(
+                        event.get("execution_failure"), Mapping
+                    )
                 ),
-                "; ".join(missing),
+                None,
             )
+            if execution_page is not None:
+                builder.mark_execution_failed(
+                    execution_page["execution_failure"]
+                )
+            elif final_comparison_execution_failure is not None:
+                builder.mark_execution_failed(
+                    final_comparison_execution_failure
+                )
+            else:
+                builder.mark_unresolved(
+                    "global_candidate_pagination_{0}".format(
+                        convergence_status
+                    ),
+                    "; ".join(missing),
+                )
+            terminal_execution_failure = (
+                execution_page["execution_failure"]
+                if execution_page is not None
+                else final_comparison_execution_failure
+            )
+            if (
+                terminal_execution_failure is not None
+                and _execution_failure_terminates_seed(
+                    terminal_execution_failure
+                )
+            ):
+                for failed_item in seed_items:
+                    hypothesis = state.ledger.get(
+                        failed_item.hypothesis_id
+                    )
+                    if hypothesis.status in {"active", "supported"}:
+                        state.ledger.reject_with_frontier(
+                            hypothesis.hypothesis_id,
+                            str(
+                                terminal_execution_failure.get(
+                                    "detail"
+                                )
+                                or ""
+                            ),
+                            opposing_refs=(),
+                            frontier=state.frontier,
+                            evidence_hash=pass_identity,
+                        )
+                    state.unresolved_hypothesis_ids.add(
+                        failed_item.hypothesis_id
+                    )
             state.unresolved_refs.append(builder.start_ref)
             self._checkpoint_state(
                 state,
@@ -17797,7 +19506,7 @@ class AgenticRecursiveAnalyzer:
                 "owner": owner.to_dict(),
                 "blocker": blocker,
                 "reason": detail,
-                "missing_evidence": [detail],
+                "missing_evidence": [],
                 "physical_request_delta": physical_request_delta,
                 "physical_request_exact": physical_request_exact,
                 "candidate_compression": copy.deepcopy(
@@ -17807,7 +19516,9 @@ class AgenticRecursiveAnalyzer:
                 "behavior_impact": "none_offline_analysis_only",
             }
             state.investigation_journal.append(event)
-            builder.mark_unresolved(blocker, detail)
+            builder.mark_execution_failed(
+                failure_projection["execution_failure"]
+            )
             state.unresolved_refs.append(builder.start_ref)
             state.unresolved_branches.append(
                 {

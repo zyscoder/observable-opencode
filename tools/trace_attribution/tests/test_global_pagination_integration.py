@@ -9,6 +9,7 @@ from pathlib import Path
 from trace_attribution.causal_judge import (
     BoundedJudgeCallError,
     BoundedJudgeCallResult,
+    GLOBAL_CANDIDATE_SYSTEM_PROMPT,
 )
 from trace_attribution.causal_state import (
     CausalCandidate,
@@ -30,7 +31,10 @@ from trace_attribution.global_judge import (
     GlobalCandidateAssessment,
     GlobalCandidateJudgment,
     GlobalJudgeCapability,
+    build_global_candidate_prompt,
+    global_candidate_request_from_validation_envelope,
 )
+from trace_attribution.judge_budget import JudgeContextBudget
 from trace_attribution.graph import TraceGraph
 from trace_attribution.checkpoint import (
     CheckpointBundle,
@@ -170,6 +174,28 @@ class _NoDefectPagingJudge(GlobalJudgeCapability):
                 },
             ),
             1,
+        )
+
+
+class _BudgetedNoDefectPagingJudge(_NoDefectPagingJudge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_tokens = 4096
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=60_288,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
+        )
+
+
+class _TinyBudgetNoDefectPagingJudge(_NoDefectPagingJudge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_tokens = 4096
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=13_000,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
         )
 
 
@@ -343,6 +369,24 @@ class _LateRootPagingJudge(_NoDefectPagingJudge):
         )
 
 
+class _BudgetedOnePerPageRootJudge(_LateRootPagingJudge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_tokens = 4096
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=34_588,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
+        )
+
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        self.target_ref = request.capsules[0].candidate_ref
+        return super().judge_candidates_bounded(
+            request,
+            max_physical_requests=max_physical_requests,
+        )
+
+
 class _FirstPageInvalidJudge(_NoDefectPagingJudge):
     def judge_candidates_bounded(self, request, *, max_physical_requests):
         if not self.global_requests:
@@ -487,6 +531,58 @@ class _AllCandidatesRemainPlausibleJudge(_NoDefectPagingJudge):
                 },
             ),
             1,
+        )
+
+
+class _LargeBudgetAllCandidatesRemainPlausibleJudge(
+    _AllCandidatesRemainPlausibleJudge
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_tokens = 4096
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=1_000_000,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
+        )
+
+
+class _BudgetedAllCandidatesRemainPlausibleJudge(
+    _AllCandidatesRemainPlausibleJudge
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_tokens = 4096
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=34_288,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
+        )
+
+
+class _BudgetedEightFinalistsJudge(
+    _BudgetedAllCandidatesRemainPlausibleJudge
+):
+    excluded_ref = "record:decision-008"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_budget = JudgeContextBudget(
+            context_window_tokens=34_588,
+            max_output_tokens=self.max_tokens,
+            safety_margin_tokens=8_192,
+        )
+
+    def judge_candidates_bounded(self, request, *, max_physical_requests):
+        if request.offered_candidate_refs == (self.excluded_ref,):
+            return _NoDefectPagingJudge.judge_candidates_bounded(
+                self,
+                request,
+                max_physical_requests=max_physical_requests,
+            )
+        return super().judge_candidates_bounded(
+            request,
+            max_physical_requests=max_physical_requests,
         )
 
 
@@ -1070,6 +1166,37 @@ class _StopAfterMalformedDirectoryPageTerminalCheckpoint(CheckpointBundle):
 
 class GlobalPaginationIntegrationTest(unittest.TestCase):
     @staticmethod
+    def _resign_planned_request_diagnostic(
+        diagnostic: dict,
+        *,
+        context_budget: dict,
+    ) -> None:
+        request = global_candidate_request_from_validation_envelope(
+            diagnostic["validation_envelope"]
+        )
+        diagnostic["request_identity"] = "global_request:v1:{0}".format(
+            hashlib.sha256(
+                stable_json(request.validation_envelope()).encode("utf-8")
+            ).hexdigest()
+        )
+        diagnostic["projection"] = request.judge_prompt_projection()[
+            "prompt_projection"
+        ]
+        diagnostic["measurement"] = JudgeContextBudget(
+            context_window_tokens=context_budget["context_window_tokens"],
+            max_output_tokens=context_budget["max_output_tokens"],
+            safety_margin_tokens=context_budget["safety_margin_tokens"],
+        ).measure(
+            system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": build_global_candidate_prompt(request),
+                }
+            ],
+        ).to_dict()
+
+    @staticmethod
     def _checkpoint_config(
         trace: dict,
         *,
@@ -1153,6 +1280,111 @@ class GlobalPaginationIntegrationTest(unittest.TestCase):
         self.assertEqual(
             [event["candidate_count"] for event in page_events],
             [8, 8, 8, 1],
+        )
+
+    def test_global_pages_split_before_transport_when_prompt_budget_is_tighter(self):
+        judge = _BudgetedNoDefectPagingJudge()
+        report = _FixedPoolAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            TraceGraph.from_trace(paginated_trace()),
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+
+        page_sizes = [len(request.capsules) for request in judge.global_requests]
+        self.assertEqual(page_sizes, [4, 4, 4, 4, 4, 4, 1])
+        self.assertEqual(sum(page_sizes), 25)
+        self.assertTrue(
+            all(
+                judge.context_budget.measure(
+                    system=GLOBAL_CANDIDATE_SYSTEM_PROMPT,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": build_global_candidate_prompt(request),
+                        }
+                    ],
+                ).fits
+                for request in judge.global_requests
+            )
+        )
+        plan_events = [
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_page_plan"
+        ]
+        self.assertEqual(len(plan_events), 1)
+        self.assertEqual(
+            [len(page["candidate_refs"]) for page in plan_events[0]["plan"]["pages"]],
+            page_sizes,
+        )
+        planning = plan_events[0]["planning_diagnostics"]
+        self.assertTrue(planning["split_history"])
+        self.assertTrue(
+            all(page["measurement"]["fits"] for page in planning["pages"])
+        )
+
+    def test_single_candidate_overflow_fails_locally_without_provider_request(self):
+        judge = _TinyBudgetNoDefectPagingJudge()
+        report = _FixedPoolAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            TraceGraph.from_trace(paginated_trace(candidate_count=9)),
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+
+        self.assertEqual(judge.request_count, 0)
+        self.assertEqual(judge.global_requests, [])
+        page_events = [
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_page"
+        ]
+        self.assertEqual(len(page_events), 1)
+        self.assertEqual(page_events[0]["status"], "failed")
+        self.assertEqual(
+            page_events[0]["blocker"],
+            "global_judge_context_budget_exceeded",
+        )
+        self.assertEqual(page_events[0]["physical_request_delta"], 0)
+        self.assertIs(page_events[0]["physical_request_exact"], True)
+        plan_event = next(
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_page_plan"
+        )
+        measurement = plan_event["planning_diagnostics"]["pages"][0][
+            "measurement"
+        ]
+        self.assertIs(measurement["fits"], False)
+        self.assertGreater(
+            measurement["estimated_input_tokens"],
+            measurement["max_input_tokens"],
+        )
+        self.assertEqual(report.analysis_outcome, "execution_failed")
+        self.assertEqual(report.seed_results[0].outcome, "execution_failed")
+        self.assertEqual(report.seed_results[0].missing_evidence, ())
+        self.assertEqual(
+            report.seed_results[0].execution_failures[0]["reason"],
+            "context_window_exceeded",
+        )
+        self.assertEqual(
+            report.metadata["termination_reason"],
+            "analysis_execution_failed",
+        )
+        self.assertEqual(
+            report.metadata["analysis_execution_failures"][0][
+                "physical_requests"
+            ],
+            0,
         )
 
     def test_cluster_triage_expands_originals_before_strict_pagination(self):
@@ -2820,6 +3052,729 @@ class GlobalPaginationIntegrationTest(unittest.TestCase):
             ),
         )
 
+    def test_budget_split_finalists_are_not_judged_as_one_partial_final_page(self):
+        judge = _BudgetedEightFinalistsJudge()
+        report = _FixedPoolAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            TraceGraph.from_trace(paginated_trace(candidate_count=9)),
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+
+        final_plans = [
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_page_plan"
+            and event.get("planning_diagnostics", {}).get(
+                "planning_intent"
+            ) == "final_comparison"
+        ]
+        self.assertTrue(final_plans)
+        self.assertTrue(
+            any(len(event["plan"]["pages"]) > 1 for event in final_plans)
+        )
+        self.assertTrue(
+            all(event["page_phase"] == "final" for event in final_plans)
+        )
+        convergence = next(
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        self.assertIn(
+            convergence["active_plan_identity"],
+            {event["plan_identity"] for event in final_plans},
+        )
+        self.assertFalse(
+            any(
+                event.get("kind") == "global_candidate_page"
+                and event.get("page_phase") == "final"
+                and event.get("candidate_count")
+                < len(
+                    next(
+                        plan["plan"]["candidate_refs"]
+                        for plan in final_plans
+                        if plan["plan_identity"] == event["plan_identity"]
+                    )
+                )
+                for event in report.investigation_journal
+            )
+        )
+        self.assertEqual(report.analysis_outcome, "execution_failed")
+        seed = report.seed_results[0]
+        self.assertEqual(seed.outcome, "execution_failed")
+        self.assertEqual(seed.missing_evidence, ())
+        self.assertEqual(seed.blocking_reasons, ())
+        self.assertEqual(
+            seed.execution_failures[0]["reason"],
+            "context_window_exceeded",
+        )
+        self.assertIn(
+            "final comparison",
+            seed.execution_failures[0]["detail"].lower(),
+        )
+
+    def test_report_validation_rejects_tampered_page_planning_projection(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedNoDefectPagingJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        plan = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+        )
+        plan["planning_diagnostics"]["pages"][0]["projection"][
+            "projection_identity"
+        ] = "f" * 64
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "planning diagnostics",
+        ):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered planning projection",
+            )
+
+    def test_report_validation_requires_convergence_active_plan_to_exist(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_NoDefectPagingJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        convergence = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        convergence["active_plan_identity"] = "f" * 64
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "active plan",
+        ):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered convergence plan",
+            )
+
+    def test_report_validation_requires_convergence_to_reference_latest_plan(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedEightFinalistsJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        plans = [
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+        ]
+        self.assertGreaterEqual(len(plans), 2)
+        convergence = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        convergence["active_plan_identity"] = plans[0]["plan_identity"]
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "active plan"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="stale convergence plan",
+            )
+
+    def test_unexecuted_final_plan_projection_is_bound_to_canonical_request(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedEightFinalistsJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        final_plan = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+            and event.get("planning_diagnostics", {}).get("planning_intent")
+            == "final_comparison"
+        )
+        projection = final_plan["planning_diagnostics"]["pages"][0][
+            "projection"
+        ]
+        projection["canonical_request_sha256"] = "e" * 64
+        projection["projection_identity"] = hashlib.sha256(
+            stable_json(
+                {
+                    key: projection[key]
+                    for key in (
+                        "schema",
+                        "canonical_request_sha256",
+                        "projected_facts_sha256",
+                        "omission_manifest_sha256",
+                        "projection_policy_sha256",
+                    )
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "planned request"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="resigned unexecuted final plan",
+            )
+
+    def test_resigned_planned_request_cannot_drift_from_run_analysis_perspective(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedEightFinalistsJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+            analysis_perspective="Honor the requested build workflow.",
+        )
+        payload = report.to_dict()
+        final_plan = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+            and event.get("planning_diagnostics", {}).get("planning_intent")
+            == "final_comparison"
+        )
+        diagnostics = final_plan["planning_diagnostics"]
+        page = diagnostics["pages"][0]
+        page["validation_envelope"]["analysis_perspective"] = (
+            "Ignore the requested build workflow."
+        )
+        self._resign_planned_request_diagnostic(
+            page,
+            context_budget=diagnostics["context_budget"],
+        )
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "analysis perspective"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="resigned perspective drift",
+            )
+
+    def test_resigned_planning_request_cannot_remove_authoritative_evidence_context(self):
+        trace = paginated_trace(candidate_count=9)
+        trace["records"].insert(
+            -1,
+            {
+                "record_id": "test-result",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {
+                    "tool_name": "bash",
+                    "args": {"command": "run focused verification"},
+                    "metadata": {"exit": 0, "output": "9 passing"},
+                },
+            },
+        )
+        graph = TraceGraph.from_trace(trace)
+        report = AgenticRecursiveAnalyzer(
+            judge=_BudgetedNoDefectPagingJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Determine whether required behavior was verified.",
+        )
+        payload = report.to_dict()
+        manifest = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "candidate_cluster_manifest_shadow"
+        )
+        self.assertIn(
+            "record:test-result",
+            [
+                fact["ref"]
+                for fact in manifest["manifest"]["candidate_facts"]
+                if any(
+                    disposition == "evidence_context"
+                    for disposition in (
+                        cluster["member_dispositions"].get(fact["ref"])
+                        for cluster in manifest["manifest"]["clusters"]
+                        if fact["ref"] in cluster["member_refs"]
+                    )
+                )
+            ],
+        )
+
+        def remove_context(envelope: dict) -> None:
+            envelope["evidence_context_capsules"] = []
+            funnel = envelope["trace_health"]["candidate_compression"][
+                "candidate_funnel"
+            ]
+            funnel["evidence_context_refs"] = []
+            funnel["evidence_context_count"] = 0
+
+        for event in payload["investigation_journal"]:
+            if event.get("kind") == "global_candidate_page_plan":
+                diagnostics = event["planning_diagnostics"]
+                for diagnostic in (
+                    *diagnostics["pages"],
+                    *diagnostics["split_history"],
+                ):
+                    remove_context(diagnostic["validation_envelope"])
+                    self._resign_planned_request_diagnostic(
+                        diagnostic,
+                        context_budget=diagnostics["context_budget"],
+                    )
+            if event.get("kind") == "global_candidate_page":
+                remove_context(event["validation_envelope"])
+                request = global_candidate_request_from_validation_envelope(
+                    event["validation_envelope"]
+                )
+                event["request_identity"] = "global_request:v1:{0}".format(
+                    hashlib.sha256(
+                        stable_json(request.validation_envelope()).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                )
+                event["candidate_compression"] = copy.deepcopy(
+                    dict(request.trace_health["candidate_compression"])
+                )
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "evidence context"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="resigned evidence-context removal",
+            )
+
+    def test_resigned_manifest_cannot_forge_a_causal_path_to_remove_evidence_context(self):
+        trace = paginated_trace(candidate_count=9)
+        trace["records"].insert(
+            -1,
+            {
+                "record_id": "test-result",
+                "component": "tool",
+                "event_type": "tool.result",
+                "data": {
+                    "tool_name": "bash",
+                    "args": {"command": "run focused verification"},
+                    "metadata": {"exit": 0, "output": "9 passing"},
+                },
+            },
+        )
+        graph = TraceGraph.from_trace(trace)
+        report = AgenticRecursiveAnalyzer(
+            judge=_BudgetedNoDefectPagingJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Determine whether required behavior was verified.",
+        )
+        payload = report.to_dict()
+        shadow = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "candidate_cluster_manifest_shadow"
+        )
+        planning = next(
+            event["planning_diagnostics"]
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+        )
+        funnel = planning["pages"][0]["validation_envelope"][
+            "trace_health"
+        ]["candidate_compression"]["candidate_funnel"]
+        forged_audit = copy.deepcopy(funnel["candidate_audit"])
+        test_result_audit = next(
+            item
+            for item in forged_audit
+            if item["ref"] == "record:test-result"
+        )
+        test_result_audit["disposition"] = "offered"
+        test_result_audit["reason"] = "input_order"
+        test_result_audit["context_rank"] = None
+        test_result_audit["offered_rank"] = 9
+        candidate_paths = {
+            fact["ref"]: tuple(fact["path_refs"])
+            for fact in shadow["manifest"]["candidate_facts"]
+        }
+        candidate_paths["record:test-result"] = (
+            "record:test-result",
+            "record:observed-defect",
+        )
+        manifest_candidates = []
+        seen_candidate_identities = set()
+        for diagnostic in planning["pages"]:
+            envelope = diagnostic["validation_envelope"]
+            for capsule in (
+                *envelope["candidate_evidence_capsules"],
+                *envelope["evidence_context_capsules"],
+            ):
+                source = capsule["validation_source"]
+                candidate = CausalCandidate(
+                    ref=capsule["candidate_ref"],
+                    node=graph.nodes[capsule["candidate_ref"]],
+                    source=source["candidate_source"],
+                    edge=source["candidate_edge"],
+                    evidence_refs=tuple(
+                        source["candidate_evidence_refs"]
+                    ),
+                )
+                audit_identity = next(
+                    item["candidate_identity"]
+                    for item in forged_audit
+                    if item["ref"] == candidate.ref
+                )
+                if audit_identity in seen_candidate_identities:
+                    continue
+                seen_candidate_identities.add(audit_identity)
+                manifest_candidates.append(candidate)
+        forged_manifest = build_candidate_cluster_manifest(
+            graph=graph,
+            candidates=manifest_candidates,
+            candidate_paths=candidate_paths,
+            candidate_audit=forged_audit,
+            source_selection_identity=shadow["source_selection_identity"],
+            seed_ref="record:observed-defect",
+            defect_fingerprint=shadow["manifest"]["defect_fingerprint"],
+        )
+        payload["investigation_journal"][
+            payload["investigation_journal"].index(shadow)
+        ] = build_candidate_cluster_shadow_event(
+            manifest=forged_manifest,
+            seed_binding_identity=shadow["seed_binding_identity"],
+        )
+
+        def remove_context(envelope: dict) -> None:
+            envelope["evidence_context_capsules"] = []
+            local_funnel = envelope["trace_health"][
+                "candidate_compression"
+            ]["candidate_funnel"]
+            local_funnel["evidence_context_refs"] = []
+            local_funnel["evidence_context_count"] = 0
+
+        for event in payload["investigation_journal"]:
+            if event.get("kind") == "global_candidate_page_plan":
+                diagnostics = event["planning_diagnostics"]
+                for diagnostic in (
+                    *diagnostics["pages"],
+                    *diagnostics["split_history"],
+                ):
+                    remove_context(diagnostic["validation_envelope"])
+                    self._resign_planned_request_diagnostic(
+                        diagnostic,
+                        context_budget=diagnostics["context_budget"],
+                    )
+            if event.get("kind") == "global_candidate_page":
+                remove_context(event["validation_envelope"])
+                request = global_candidate_request_from_validation_envelope(
+                    event["validation_envelope"]
+                )
+                event["request_identity"] = "global_request:v1:{0}".format(
+                    hashlib.sha256(
+                        stable_json(request.validation_envelope()).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                )
+                event["candidate_compression"] = copy.deepcopy(
+                    dict(request.trace_health["candidate_compression"])
+                )
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "graph-bound path"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="resigned manifest path forgery",
+            )
+
+    def test_convergence_finalists_must_match_latest_round_summary(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedEightFinalistsJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        convergence = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        convergence["supported_finalist_refs"] = convergence[
+            "supported_finalist_refs"
+        ][:1]
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "latest round"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered convergence finalists",
+            )
+
+    def test_convergence_status_must_match_terminal_page_facts(self):
+        trace = paginated_trace(candidate_count=9)
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedEightFinalistsJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        convergence = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        convergence["status"] = "final_judgment_completed"
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "terminal facts"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered convergence status",
+            )
+
+    def test_large_final_comparison_persists_replayable_budget_preflight(self):
+        trace = paginated_trace()
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedOnePerPageRootJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        convergence = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        self.assertEqual(
+            convergence["status"],
+            "final_comparison_context_budget_exceeded",
+        )
+        preflight = convergence["final_comparison_preflight"]
+        self.assertEqual(
+            preflight["schema"],
+            "global-candidate-final-comparison-preflight/v1",
+        )
+        self.assertFalse(preflight["measurement"]["fits"])
+        preflight["measurement"]["estimated_input_tokens"] = 1
+        preflight["measurement"]["fits"] = True
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "final comparison preflight"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered final comparison preflight",
+            )
+
+    def test_final_preflight_measurement_must_match_execution_failure_projection(self):
+        trace = paginated_trace()
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedOnePerPageRootJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=64,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        for failure in (
+            payload["seed_results"][0]["execution_failures"][0],
+            payload["metadata"]["analysis_execution_failures"][0],
+        ):
+            measurement = failure["budget"][
+                "final_comparison_measurement"
+            ]
+            measurement["estimated_input_tokens"] = 1
+            measurement["fits"] = True
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "execution failure"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered execution failure budget",
+            )
+
+    def test_report_validation_replays_split_parent_lineage(self):
+        trace = paginated_trace()
+        graph = TraceGraph.from_trace(trace)
+        report = _FixedPoolAnalyzer(
+            judge=_BudgetedNoDefectPagingJudge(),
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            graph,
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+        payload = report.to_dict()
+        plan = next(
+            event
+            for event in payload["investigation_journal"]
+            if event.get("kind") == "global_candidate_page_plan"
+            and event.get("planning_diagnostics", {}).get("split_history")
+        )
+        plan["planning_diagnostics"]["split_history"][0][
+            "parent_page_identity"
+        ] = "f" * 64
+        tampered = RecursiveAttributionReport.from_dict(payload)
+
+        with self.assertRaisesRegex(ValueError, "split history"):
+            validate_recursive_report_against_graph(
+                graph,
+                tampered,
+                label="tampered split parent",
+            )
+
+    def test_stalled_pages_are_not_mislabeled_when_full_comparison_fits_budget(self):
+        judge = _LargeBudgetAllCandidatesRemainPlausibleJudge()
+        report = _FixedPoolAnalyzer(
+            judge=judge,
+            fusion_mode="retrieval-global",
+            max_judge_requests=16,
+            max_hypotheses=64,
+        ).analyze(
+            TraceGraph.from_trace(paginated_trace()),
+            start_refs=["record:observed-defect"],
+            objective="Find the authored decision that introduced the defect.",
+        )
+
+        self.assertEqual(report.analysis_outcome, "inconclusive")
+        self.assertEqual(report.seed_results[0].execution_failures, ())
+        convergence = next(
+            event
+            for event in report.investigation_journal
+            if event.get("kind") == "global_candidate_convergence"
+        )
+        self.assertEqual(convergence["status"], "stalled")
+
+    def test_final_comparison_budget_failure_replays_without_provider_calls(self):
+        trace = paginated_trace()
+        config = self._checkpoint_config(trace, max_judge_requests=64)
+        with tempfile.TemporaryDirectory() as tempdir:
+            checkpoint_root = Path(tempdir) / "final-budget.checkpoint"
+            first_judge = _BudgetedOnePerPageRootJudge()
+            first = _FixedPoolAnalyzer(
+                judge=first_judge,
+                fusion_mode="retrieval-global",
+                max_judge_requests=64,
+                max_hypotheses=64,
+                checkpoint=CheckpointBundle(checkpoint_root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed-defect"],
+                objective=(
+                    "Find the authored decision that introduced the defect."
+                ),
+            )
+            resumed_judge = _BudgetedOnePerPageRootJudge()
+            resumed = _FixedPoolAnalyzer(
+                judge=resumed_judge,
+                fusion_mode="retrieval-global",
+                max_judge_requests=64,
+                max_hypotheses=64,
+                checkpoint=CheckpointBundle(checkpoint_root),
+                checkpoint_config=config,
+            ).analyze(
+                TraceGraph.from_trace(trace),
+                start_refs=["record:observed-defect"],
+                objective=(
+                    "Find the authored decision that introduced the defect."
+                ),
+            )
+
+        self.assertEqual(first.analysis_outcome, "execution_failed")
+        self.assertGreater(len(first_judge.global_requests), 0)
+        self.assertEqual(resumed.analysis_outcome, "execution_failed")
+        self.assertEqual(resumed_judge.global_requests, [])
+        self.assertEqual(
+            resumed.seed_results[0].execution_failures,
+            first.seed_results[0].execution_failures,
+        )
+
     def test_final_page_uses_the_same_owner_bound_schema_through_build_report(self):
         judge = _LateRootPagingJudge()
         report = _FixedPoolAnalyzer(
@@ -2895,9 +3850,13 @@ class GlobalPaginationIntegrationTest(unittest.TestCase):
                 for event in state.investigation_journal
             )
         )
-        self.assertIn(
-            "global_candidate_pagination_page_failure",
-            state.seed_results()[0].blocking_reasons,
+        seed = state.seed_results()[0]
+        self.assertEqual(seed.outcome, "execution_failed")
+        self.assertEqual(seed.blocking_reasons, ())
+        self.assertEqual(seed.missing_evidence, ())
+        self.assertEqual(
+            seed.execution_failures[0]["reason"],
+            "analysis_adapter_invalid",
         )
 
     def test_completed_paginated_checkpoint_replays_with_zero_provider_calls(self):

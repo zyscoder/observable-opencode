@@ -26,12 +26,12 @@ from .graph import EVIDENCE_ELIGIBILITY_POLICY_IDENTITY
 from .models import JsonDict, stable_json
 
 
-CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v28"
+CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v29"
 LEGACY_CHECKPOINT_SCHEMA_VERSION = "recursive-attribution-checkpoint/v27"
 SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS = frozenset(
     {CHECKPOINT_SCHEMA_VERSION, LEGACY_CHECKPOINT_SCHEMA_VERSION}
 )
-OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v15"
+OUTPUT_SCHEMA_VERSION = "recursive-attribution-output/v16"
 CHECKPOINT_CONFIG_KEYS = frozenset(
     {
         "schema_version",

@@ -341,9 +341,10 @@ class EnabledGlobalFailureTest(unittest.TestCase):
             for item in report.seed_results
             if item.start_ref == "record:seed_one"
         )
-        self.assertEqual(seed.outcome, "evidence_gap")
-        self.assertIn(blocker, seed.blocking_reasons)
-        self.assertTrue(seed.missing_evidence)
+        self.assertEqual(seed.outcome, "execution_failed")
+        self.assertEqual(seed.blocking_reasons, ())
+        self.assertEqual(seed.missing_evidence, ())
+        self.assertEqual(len(seed.execution_failures), 1)
         self.assertFalse(seed.confirmed_root_refs)
         self.assertFalse(report.confirmed_roots)
         failures = [
@@ -405,7 +406,7 @@ class EnabledGlobalFailureTest(unittest.TestCase):
             starts=STARTS,
         )
         by_ref = {item.start_ref: item for item in report.seed_results}
-        self.assertEqual(by_ref["record:seed_one"].outcome, "evidence_gap")
+        self.assertEqual(by_ref["record:seed_one"].outcome, "execution_failed")
         self.assertEqual(
             by_ref["record:seed_two"].outcome,
             "confirmed_root",
@@ -1093,16 +1094,16 @@ class Fix26VersionIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v22",
+            "recursive-attribution-report/v23",
         )
         self.assertEqual(REPORT_SCHEMA_VERSION, MODERN_REPORT_SCHEMA_VERSION)
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
         self.assertEqual(
             ACTION_STATE_SCHEMA,
-            "recursive-analysis-actions/v25",
+            "recursive-analysis-actions/v26",
         )
         self.assertEqual(
             EVIDENCE_ELIGIBILITY_POLICY_IDENTITY,

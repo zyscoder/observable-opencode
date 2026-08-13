@@ -3541,6 +3541,37 @@ class RecursiveRootRankingTest(unittest.TestCase):
 
 
 class RetrievalGlobalFusionTest(unittest.TestCase):
+    def test_single_page_bounded_failure_is_execution_failure_not_evidence_gap(self):
+        class FailingGlobalJudge(FusionScriptedJudge):
+            def judge_candidates_bounded(
+                self, request, *, max_physical_requests
+            ):
+                raise BoundedJudgeCallError(
+                    "JudgeContextBudgetExceeded: prompt exceeds context budget",
+                    physical_requests=0,
+                )
+
+        report = AgenticRecursiveAnalyzer(
+            judge=FailingGlobalJudge(global_outcome="no_defect"),
+            fusion_mode="retrieval-global",
+        ).analyze(
+            TraceGraph.from_trace(observed_trace()),
+            start_refs=["record:observed_defect"],
+            objective="Find the trace-grounded introduction.",
+        )
+
+        self.assertEqual(report.analysis_outcome, "execution_failed")
+        self.assertEqual(report.seed_results[0].outcome, "execution_failed")
+        self.assertEqual(report.seed_results[0].missing_evidence, ())
+        failure = report.seed_results[0].execution_failures[0]
+        self.assertEqual(failure["kind"], "analysis_execution_failed")
+        self.assertEqual(failure["reason"], "context_window_exceeded")
+        self.assertEqual(failure["physical_requests"], 0)
+        self.assertEqual(
+            report.metadata["termination_reason"],
+            "analysis_execution_failed",
+        )
+
     def test_global_candidate_funnel_is_seed_local_when_later_pool_fails(self):
         trace = observed_trace()
         observed = next(

@@ -273,11 +273,9 @@ class NoDefectOpenCandidateClosureTest(unittest.TestCase):
             objective="Determine whether the observed defect is supported.",
         )
 
-        self.assertEqual(report.seed_results[0].outcome, "evidence_gap")
-        self.assertIn(
-            "global_judge_output_invalid",
-            report.seed_results[0].blocking_reasons,
-        )
+        self.assertEqual(report.seed_results[0].outcome, "execution_failed")
+        self.assertEqual(report.seed_results[0].blocking_reasons, ())
+        self.assertEqual(len(report.seed_results[0].execution_failures), 1)
         self.assertFalse(report.seed_results[0].global_judgment)
 
 
@@ -769,7 +767,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
             "global-candidate-validation-envelope/v11",
         )
         self.assertIn(
-            "failure-projection/v4",
+            "failure-projection/v5",
             GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
         )
         self.assertIn(
@@ -782,12 +780,12 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             GLOBAL_FAILURE_PROJECTION_SCHEMA,
-            "global-candidate-failure-projection/v4",
+            "global-candidate-failure-projection/v5",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v26")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v22",
+            "recursive-attribution-report/v23",
         )
         self.assertEqual(
             EVALUATOR_REPORT_SCHEMA_VERSION,
@@ -795,7 +793,7 @@ class Fix29PersistenceVersionTest(unittest.TestCase):
         )
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
 
     def test_old_global_envelope_and_report_are_rejected(self):

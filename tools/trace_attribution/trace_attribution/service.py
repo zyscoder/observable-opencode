@@ -375,9 +375,16 @@ def _question_report_projection(
         confirmed_roots,
         graph,
     )
+    metadata = report.get("metadata")
+    execution_failures = (
+        list(metadata.get("analysis_execution_failures") or ())
+        if isinstance(metadata, Mapping)
+        else []
+    )
     rootless_gaps = (
         []
         if confirmed_roots
+        or execution_failures
         else [
             {
                 "kind": "no_confirmed_root_cause",
@@ -387,7 +394,11 @@ def _question_report_projection(
     )
     outcome = str(report.get("analysis_outcome") or "inconclusive")
     return {
-        "conclusion": _question_conclusion(confirmed_roots, outcome),
+        "conclusion": _question_conclusion(
+            confirmed_roots,
+            outcome,
+            has_execution_failures=bool(execution_failures),
+        ),
         "causal_chain": _taint_paths(
             report.get("taint_paths"),
             starts=starts,
@@ -400,7 +411,12 @@ def _question_report_projection(
             supported_root_indexes=supported_root_indexes,
         ),
         "unresolved_gaps": _dedupe_report_values(
-            [*_unresolved_gaps(report), *evidence_gaps, *rootless_gaps]
+            [
+                *execution_failures,
+                *_unresolved_gaps(report),
+                *evidence_gaps,
+                *rootless_gaps,
+            ]
         ),
     }
 
@@ -436,9 +452,24 @@ def _root_identity(root: Mapping[str, Any]) -> str:
     return ""
 
 
-def _question_conclusion(roots: Iterable[Mapping[str, Any]], outcome: str) -> str:
+def _question_conclusion(
+    roots: Iterable[Mapping[str, Any]],
+    outcome: str,
+    *,
+    has_execution_failures: bool = False,
+) -> str:
     roots = list(roots)
     if not roots:
+        if outcome == "execution_failed":
+            return (
+                "execution_failed: semantic attribution did not complete; "
+                "no root-cause conclusion was attempted."
+            )
+        if has_execution_failures:
+            return (
+                "{0}: semantic attribution completed only for some seeds; "
+                "no root-cause conclusion was attempted for the failed seeds."
+            ).format(outcome)
         return "{0}: no confirmed root cause; evidence is insufficient.".format(outcome)
     return "\n".join(
         "{0}: {1}".format(

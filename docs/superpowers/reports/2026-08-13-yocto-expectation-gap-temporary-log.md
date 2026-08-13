@@ -331,6 +331,73 @@ Trace 侧需要增加或完善：
 任务义务或改进建议字段已经在当前代码中实现。当前可用能力仍以仓库 README 和实际 CLI
 schema 为准。
 
+## 9.1 归因执行可靠性修复与重跑方式
+
+下文第 10.1 节实际输出进一步证明：该次运行在处理任何递归 frontier 之前，Global Judge 的输入
+已达到 231,282 至 254,400 tokens，超过模型上下文窗口。HTTP 400 被旧实现错误标记为可重试，
+连续发出 3 次请求后打开 Provider circuit；随后又把“归因没有执行完成”错误投影成
+`evidence_gap`。因此该份报告既没有回答 Yocto/GCC 偏差，也不能用于评价递归归因算法的语义
+判断质量。
+
+本轮可靠性修复后：
+
+1. 每个 Judge 物理请求前都会执行本地上下文预算检查；
+2. Global Judge 只接收与完整 Causal IR 哈希绑定的有界事实投影；
+3. 候选页按 token 预算动态拆分，8 仅是页大小上限；
+4. 单候选最小投影仍超限时，本地终止且 `physical_requests=0`；
+5. Provider 返回上下文超限 HTTP 400 时不再重试；
+6. 未完成语义判断的 seed 输出结构化 `execution_failed`，不再伪装成 `evidence_gap`。
+7. 每个分页计划持久化规范请求 envelope，并在恢复时结合当前 Trace 重建请求、prompt 与预算测量；
+8. convergence 只能引用该 seed 最后落盘的计划，父子拆分页必须按顺序完整重放。
+
+使用新路径重跑，保留旧输出用于审计：
+
+```bash
+ROOT=/path/to/observable-opencode
+TRACE=/tmp/evo-bench/traces/stupid-build/trace.json
+REVIEW=/path/to/yocto-review.json
+RUN=/tmp/evo-bench/attribution/stupid-build-reliability-v1
+
+mkdir -p "$RUN"
+
+PYTHONPATH="$ROOT/tools/trace_attribution" \
+python3 -m trace_attribution \
+  --engine recursive-agentic \
+  --fusion-mode retrieval-global \
+  --trace "$TRACE" \
+  --review "$REVIEW" \
+  --start-ref record:quality_gap_authoritative_build_workflow_adherence \
+  --question "为什么执行路径偏离了项目的 Yocto 构建要求，下一次应改进哪个组件？" \
+  --model "${CLAUDE_MODEL}" \
+  --judge-context-window-tokens 200000 \
+  --judge-context-safety-margin-tokens 8192 \
+  --judge-max-tokens 4096 \
+  --judge-timeout-sec 3600 \
+  --checkpoint-dir "$RUN/case.checkpoint" \
+  --judge-cache "$RUN/case.judge-cache.jsonl" \
+  --out "$RUN/case.attribution.json"
+```
+
+`--judge-context-window-tokens` 必须按实际模型能力配置；示例值不是 DeepSeek 专用值。若换用
+GLM、Claude 或其他 Anthropic 兼容服务，应使用该模型公布的上下文窗口。重跑后先检查：
+
+```bash
+jq '{
+  analysis_outcome,
+  termination_reason: .metadata.termination_reason,
+  execution_failures: .metadata.analysis_execution_failures,
+  processed_frontier_items: .metadata.processed_frontier_items,
+  physical_requests: .metadata.physical_judge_request_count,
+  seeds: [.seed_results[] | {
+    start_ref, outcome, execution_failures, missing_evidence
+  }]
+}' "$RUN/case.attribution.json"
+```
+
+只有 `processed_frontier_items` 已推进且目标 seed 没有 `execution_failed`，才应继续评价 Yocto
+偏差归因是否准确。若仍为 `execution_failed`，应先根据 `reason`、`budget` 和
+`physical_requests` 修复归因执行环境，而不是把它解释为“没有根因”或“证据不足”。
+
 ## 10. 针对本次实际输出的诊断与操作建议
 
 本次报告显示：

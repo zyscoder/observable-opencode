@@ -26,6 +26,9 @@ from .confirmation_path import (
 )
 from .evidence_capsule import (
     CandidateEvidenceCapsule,
+    JUDGE_PROMPT_COLLECTION_ITEMS,
+    JUDGE_PROMPT_MAXIMUM_DEPTH,
+    JUDGE_PROMPT_STRING_CHARS,
     validate_candidate_evidence_capsules_against_graph,
 )
 from .evidence_expansion import (
@@ -41,6 +44,48 @@ from .restoration_obligation import RestorationObligation
 
 GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
 GLOBAL_JUDGE_DIAGNOSTICS_SCHEMA = "global-judge-diagnostics/v1"
+GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA = "global-judge-prompt-projection/v2"
+GLOBAL_JUDGE_PROMPT_PROJECTION_POLICY = {
+    "schema": "global-judge-prompt-projection-policy/v1",
+    "string_char_limit": JUDGE_PROMPT_STRING_CHARS,
+    "collection_item_limit": JUDGE_PROMPT_COLLECTION_ITEMS,
+    "maximum_depth": JUDGE_PROMPT_MAXIMUM_DEPTH,
+    "causal_path_collections": [
+        "downstream_path",
+        "downstream_path_references",
+        "causal_path_edges",
+    ],
+    "causal_path_collection_policy": "preserve_complete",
+}
+GLOBAL_JUDGE_PROMPT_PROJECTION_KEYS = frozenset(
+    {
+        "schema",
+        "canonical_request_sha256",
+        "projected_facts_sha256",
+        "omission_manifest_sha256",
+        "projection_policy_sha256",
+        "projection_identity",
+        "projection_policy",
+        "canonical_request_bytes",
+        "projected_fact_bytes",
+        "omitted_sections",
+        "omitted_section_count",
+        "omission_manifest",
+        "candidate_count",
+        "evidence_context_count",
+    }
+)
+GLOBAL_JUDGE_OMISSION_MANIFEST_KEYS = frozenset(
+    {
+        "owner_ref",
+        "path",
+        "reason",
+        "original_utf8_bytes",
+        "original_sha256",
+        "original_item_count",
+        "retained_item_count",
+    }
+)
 MAX_ROOT_CONFIRMATION_CANDIDATES = 3
 GLOBAL_OUTCOMES = frozenset(
     {
@@ -111,6 +156,124 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     return value
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_global_judge_prompt_projection(value: Any) -> JsonDict:
+    if not isinstance(value, Mapping) or set(value) != set(
+        GLOBAL_JUDGE_PROMPT_PROJECTION_KEYS
+    ):
+        raise ValueError("global Judge prompt projection schema mismatch")
+    payload = _thaw(value)
+    if payload.get("schema") != GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA:
+        raise ValueError("global Judge prompt projection version is unsupported")
+    for key in (
+        "canonical_request_sha256",
+        "projected_facts_sha256",
+        "omission_manifest_sha256",
+        "projection_policy_sha256",
+        "projection_identity",
+    ):
+        if not _is_sha256(payload.get(key)):
+            raise ValueError("global Judge prompt projection identity is invalid")
+    policy = payload.get("projection_policy")
+    if policy != GLOBAL_JUDGE_PROMPT_PROJECTION_POLICY:
+        raise ValueError("global Judge prompt projection policy mismatch")
+    expected_policy_hash = hashlib.sha256(
+        stable_json(policy).encode("utf-8")
+    ).hexdigest()
+    if payload["projection_policy_sha256"] != expected_policy_hash:
+        raise ValueError("global Judge prompt projection policy hash mismatch")
+    omitted_sections = payload.get("omitted_sections")
+    manifest = payload.get("omission_manifest")
+    if (
+        not isinstance(omitted_sections, list)
+        or any(
+            not isinstance(item, str) or not item
+            for item in omitted_sections
+        )
+        or omitted_sections != sorted(set(omitted_sections))
+        or not isinstance(manifest, list)
+    ):
+        raise ValueError("global Judge prompt projection omissions are invalid")
+    for item in manifest:
+        if not isinstance(item, Mapping) or set(item) != set(
+            GLOBAL_JUDGE_OMISSION_MANIFEST_KEYS
+        ):
+            raise ValueError("global Judge omission manifest schema mismatch")
+        if (
+            not isinstance(item.get("owner_ref"), str)
+            or not isinstance(item.get("path"), str)
+            or not item["path"]
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"]
+            or type(item.get("original_utf8_bytes")) is not int
+            or item["original_utf8_bytes"] < 0
+            or not _is_sha256(item.get("original_sha256"))
+            or (
+                item.get("original_item_count") is not None
+                and (
+                    type(item["original_item_count"]) is not int
+                    or item["original_item_count"] < 0
+                )
+            )
+            or (
+                item.get("retained_item_count") is not None
+                and (
+                    type(item["retained_item_count"]) is not int
+                    or item["retained_item_count"] < 0
+                )
+            )
+        ):
+            raise ValueError("global Judge omission manifest entry is invalid")
+    if manifest != sorted(
+        manifest,
+        key=lambda item: (
+            str(item.get("owner_ref") or ""),
+            str(item.get("path") or ""),
+            str(item.get("reason") or ""),
+        ),
+    ):
+        raise ValueError("global Judge omission manifest order is invalid")
+    expected_manifest_hash = hashlib.sha256(
+        stable_json(manifest).encode("utf-8")
+    ).hexdigest()
+    if payload["omission_manifest_sha256"] != expected_manifest_hash:
+        raise ValueError("global Judge omission manifest hash mismatch")
+    for key in (
+        "canonical_request_bytes",
+        "projected_fact_bytes",
+        "omitted_section_count",
+        "candidate_count",
+        "evidence_context_count",
+    ):
+        if type(payload.get(key)) is not int or payload[key] < 0:
+            raise ValueError("global Judge prompt projection counts are invalid")
+    if payload["omitted_section_count"] != len(omitted_sections):
+        raise ValueError("global Judge prompt projection omission count mismatch")
+    identity_facts = {
+        key: payload[key]
+        for key in (
+            "schema",
+            "canonical_request_sha256",
+            "projected_facts_sha256",
+            "omission_manifest_sha256",
+            "projection_policy_sha256",
+        )
+    }
+    expected_identity = hashlib.sha256(
+        stable_json(identity_facts).encode("utf-8")
+    ).hexdigest()
+    if payload["projection_identity"] != expected_identity:
+        raise ValueError("global Judge prompt projection identity mismatch")
+    return payload
 
 
 def _strings(value: Any, field_name: str) -> Tuple[str, ...]:
@@ -510,6 +673,7 @@ class GlobalCandidateJudgeRequest:
         canonical = self.to_dict()
         canonical_json = stable_json(canonical)
         omitted_sections: List[str] = []
+        omission_manifest: List[JsonDict] = []
         projected: JsonDict = {
             "case_id": self.case_id,
             "objective": self.objective,
@@ -536,23 +700,56 @@ class GlobalCandidateJudgeRequest:
             "grounded_refs": list(self.grounded_refs),
             "candidate_evidence_capsules": [
                 item.judge_prompt_dict(
-                    omitted_sections=omitted_sections
+                    omitted_sections=omitted_sections,
+                    omission_manifest=omission_manifest,
                 )
                 for item in self.capsules
             ],
             "evidence_context_capsules": [
                 item.judge_prompt_dict(
-                    omitted_sections=omitted_sections
+                    omitted_sections=omitted_sections,
+                    omission_manifest=omission_manifest,
                 )
                 for item in self.evidence_context_capsules
             ],
         }
         projected_json = stable_json(projected)
+        sorted_manifest = sorted(
+            omission_manifest,
+            key=lambda item: (
+                str(item.get("owner_ref") or ""),
+                str(item.get("path") or ""),
+                str(item.get("reason") or ""),
+            ),
+        )
+        projected_facts_sha256 = hashlib.sha256(
+            projected_json.encode("utf-8")
+        ).hexdigest()
+        omission_manifest_sha256 = hashlib.sha256(
+            stable_json(sorted_manifest).encode("utf-8")
+        ).hexdigest()
+        projection_policy = copy.deepcopy(
+            GLOBAL_JUDGE_PROMPT_PROJECTION_POLICY
+        )
+        projection_policy_sha256 = hashlib.sha256(
+            stable_json(projection_policy).encode("utf-8")
+        ).hexdigest()
+        canonical_request_sha256 = hashlib.sha256(
+            canonical_json.encode("utf-8")
+        ).hexdigest()
+        projection_identity_facts = {
+            "schema": GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA,
+            "canonical_request_sha256": canonical_request_sha256,
+            "projected_facts_sha256": projected_facts_sha256,
+            "omission_manifest_sha256": omission_manifest_sha256,
+            "projection_policy_sha256": projection_policy_sha256,
+        }
         projected["prompt_projection"] = {
-            "schema": "global-judge-prompt-projection/v1",
-            "canonical_request_sha256": hashlib.sha256(
-                canonical_json.encode("utf-8")
+            **projection_identity_facts,
+            "projection_identity": hashlib.sha256(
+                stable_json(projection_identity_facts).encode("utf-8")
             ).hexdigest(),
+            "projection_policy": projection_policy,
             "canonical_request_bytes": len(
                 canonical_json.encode("utf-8")
             ),
@@ -561,6 +758,7 @@ class GlobalCandidateJudgeRequest:
             ),
             "omitted_sections": sorted(set(omitted_sections)),
             "omitted_section_count": len(set(omitted_sections)),
+            "omission_manifest": sorted_manifest,
             "candidate_count": len(self.capsules),
             "evidence_context_count": len(
                 self.evidence_context_capsules
@@ -2236,6 +2434,7 @@ def _expansion_payload_refs(value: Any) -> Tuple[str, ...]:
 
 __all__ = [
     "GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION",
+    "GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA",
     "GLOBAL_JUDGE_DIAGNOSTICS_SCHEMA",
     "MAX_ROOT_CONFIRMATION_CANDIDATES",
     "GlobalCandidateAssessment",
@@ -2253,5 +2452,6 @@ __all__ = [
     "validate_active_focus_binding",
     "validate_global_candidate_request_against_graph",
     "validate_global_candidate_payload",
+    "validate_global_judge_prompt_projection",
     "validate_global_judge_diagnostics",
 ]

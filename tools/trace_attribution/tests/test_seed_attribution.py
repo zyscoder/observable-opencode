@@ -1180,6 +1180,47 @@ class SeedAttributionIntegrationTests(unittest.TestCase):
 
 
 class SeedAttributionModelTests(unittest.TestCase):
+    def test_execution_failure_preserves_prior_semantic_gap_without_crashing(self):
+        state = defect("execution-after-semantic-gap")
+        builder = SeedAttributionBuilder(
+            start_ref="record:seed",
+            defect_state=state,
+        )
+        builder.mark_unresolved(
+            "root_confirmation_unknown",
+            "Independent confirmation evidence is incomplete.",
+        )
+        builder.mark_execution_failed(
+            {
+                "schema": "analysis-execution-failure/v1",
+                "kind": "analysis_execution_failed",
+                "stage": "global_candidate_judgment",
+                "reason": "analysis_adapter_invalid",
+                "retryable": False,
+                "physical_requests": 1,
+                "physical_request_exact": True,
+                "affected_start_refs": ["record:seed"],
+                "detail": "The later Judge response failed schema validation.",
+                "budget": {},
+            }
+        )
+
+        result = builder.to_result()
+
+        self.assertEqual(result.outcome, "execution_failed")
+        self.assertEqual(
+            result.missing_evidence,
+            ("Independent confirmation evidence is incomplete.",),
+        )
+        self.assertEqual(
+            result.blocking_reasons,
+            ("root_confirmation_unknown",),
+        )
+        self.assertEqual(
+            result.execution_failures[0]["reason"],
+            "analysis_adapter_invalid",
+        )
+
     def test_unresolved_confirmation_requires_blocking_owner_seed_semantics(self):
         base_seed = seed_result("record:seed", "inconclusive")
         raw = RootConfirmation.unknown(
@@ -1242,6 +1283,37 @@ class SeedAttributionModelTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unresolved confirmation"):
             RecursiveAttributionReport.from_dict(payload)
+
+        execution_failure = {
+            "schema": "analysis-execution-failure/v1",
+            "kind": "analysis_execution_failed",
+            "stage": "root_confirmation",
+            "reason": "analysis_adapter_invalid",
+            "retryable": False,
+            "physical_requests": 1,
+            "physical_request_exact": True,
+            "affected_start_refs": [base_seed.start_ref],
+            "detail": "The confirmation response failed schema validation.",
+            "budget": {},
+        }
+        failed_owner = replace(
+            base_seed,
+            outcome="execution_failed",
+            confirmation_identities=(confirmation.confirmation_identity,),
+            missing_evidence=(),
+            blocking_reasons=(),
+            execution_failures=(execution_failure,),
+        )
+        failed_report = RecursiveAttributionReport(
+            case_id="unresolved-owner-execution-failed",
+            objective="Bind unresolved confirmation to its execution failure.",
+            start_refs=(failed_owner.start_ref,),
+            seed_results=(failed_owner,),
+            defect_states=(failed_owner.defect_state,),
+            confirmations=(confirmation,),
+            unresolved_refs=(confirmation.candidate_ref,),
+        )
+        self.assertEqual(failed_report.analysis_outcome, "execution_failed")
 
     def test_unknown_counterfactual_rejection_requires_blocking_owner_seed_semantics(self):
         base_seed = seed_result("record:seed", "inconclusive")
@@ -2041,6 +2113,7 @@ class SeedAttributionModelTests(unittest.TestCase):
                 "decisive_evidence",
                 "missing_evidence",
                 "blocking_reasons",
+                "execution_failures",
                 "global_judgment",
                 "expansion_history",
             },
@@ -2091,7 +2164,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         report = run_fixture("multi_seed_claims.json")
         payload = report.to_dict()
 
-        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v22")
+        self.assertEqual(payload["schema_version"], "recursive-attribution-report/v23")
         self.assertEqual(RecursiveAttributionReport.from_dict(payload).to_dict(), payload)
 
         v11_payload = json.loads(json.dumps(payload))
@@ -2104,7 +2177,7 @@ class SeedAttributionModelTests(unittest.TestCase):
         v2_payload.pop("seed_results")
         migrated = RecursiveAttributionReport.from_dict(v2_payload)
 
-        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v22")
+        self.assertEqual(migrated.schema_version, "recursive-attribution-report/v23")
         self.assertEqual(
             [item.start_ref for item in migrated.seed_results],
             sorted(v2_payload["start_refs"]),

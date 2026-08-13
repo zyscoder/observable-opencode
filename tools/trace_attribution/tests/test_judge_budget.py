@@ -43,6 +43,20 @@ class JudgeContextBudgetTest(unittest.TestCase):
         )
         self.assertTrue(first.fits)
 
+    def test_estimator_uses_utf8_byte_upper_bound_for_adversarial_text(self) -> None:
+        content = "identifier_A9f0_{}[]\\\"" * 2_000
+        messages = [{"role": "user", "content": content}]
+        raw_bytes = len("system".encode("utf-8")) + len(
+            "user".encode("utf-8")
+        ) + len(content.encode("utf-8"))
+
+        estimated = estimate_prompt_tokens(
+            system="system",
+            messages=messages,
+        )
+
+        self.assertGreaterEqual(estimated, raw_bytes)
+
     def test_transport_preflight_blocks_oversized_prompt_without_a_request(self) -> None:
         class Messages:
             def __init__(self) -> None:

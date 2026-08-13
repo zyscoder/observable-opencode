@@ -2630,6 +2630,17 @@ class ProviderFailureClassificationTest(unittest.TestCase):
         self.assertEqual(disposition.category, "context_window_exceeded")
         self.assertEqual(disposition.error_code, "context_window_exceeded")
 
+    def test_structured_context_code_is_non_retryable_without_english_message(self):
+        disposition = provider_errors.classify_provider_failure(
+            status=400,
+            code="context_length_exceeded",
+            reason="请求参数不符合服务限制",
+        )
+
+        self.assertFalse(disposition.retryable)
+        self.assertEqual(disposition.category, "context_window_exceeded")
+        self.assertEqual(disposition.error_code, "context_window_exceeded")
+
     def test_structured_provider_failures_have_stable_retry_dispositions(self):
         cases = (
             (400, "invalid_request_error", False),
@@ -2637,9 +2648,9 @@ class ProviderFailureClassificationTest(unittest.TestCase):
             (400, "validation_error", False),
             (400, "unsupported_model", False),
             (400, "invalid_endpoint", False),
-            (400, "bad_request", True),
+            (400, "bad_request", False),
             (400, "temporarily_unavailable", True),
-            (400, "", True),
+            (400, "", False),
             (401, "authentication_error", False),
             (402, "invalid_request_error", False),
             (403, "permission_error", False),

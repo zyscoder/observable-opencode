@@ -180,6 +180,39 @@ class CandidatePagePlanTest(unittest.TestCase):
         self.assertEqual(len(flattened_refs), len(set(flattened_refs)))
         self.assertEqual(len(flattened_identities), len(set(flattened_identities)))
 
+    def test_explicit_dynamic_page_sizes_preserve_complete_ordered_membership(self):
+        capsules = _capsules(8)
+        plan = build_candidate_page_plan(
+            seed_ref="record:seed",
+            defect_fingerprint="defect-1",
+            capsules=capsules,
+            round_index=1,
+            page_sizes=(3, 2, 3),
+        )
+
+        self.assertEqual(
+            [len(page.candidate_refs) for page in plan.pages],
+            [3, 2, 3],
+        )
+        self.assertEqual(
+            tuple(ref for page in plan.pages for ref in page.candidate_refs),
+            tuple(capsule.candidate_ref for capsule in capsules),
+        )
+        self.assertEqual(CandidatePagePlan.from_dict(plan.to_dict()), plan)
+
+    def test_dynamic_page_sizes_must_be_positive_bounded_and_complete(self):
+        invalid_page_sizes = ((0, 8), (9,), (4, 3))
+        for page_sizes in invalid_page_sizes:
+            with self.subTest(page_sizes=page_sizes):
+                with self.assertRaises(ValueError):
+                    build_candidate_page_plan(
+                        seed_ref="record:seed",
+                        defect_fingerprint="defect-1",
+                        capsules=_capsules(8),
+                        round_index=1,
+                        page_sizes=page_sizes,
+                    )
+
     def test_identity_is_stable_and_input_order_sensitive(self):
         capsules = _capsules(25)
         first = build_candidate_page_plan(

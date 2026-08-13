@@ -695,12 +695,12 @@ class LocalStateOwnerRestoreTest(unittest.TestCase):
     def test_persisted_local_owner_contract_versions_are_current(self):
         self.assertEqual(
             CHECKPOINT_SCHEMA_VERSION,
-            "recursive-attribution-checkpoint/v28",
+            "recursive-attribution-checkpoint/v29",
         )
-        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v25")
+        self.assertEqual(ACTION_STATE_SCHEMA, "recursive-analysis-actions/v26")
         self.assertEqual(
             MODERN_REPORT_SCHEMA_VERSION,
-            "recursive-attribution-report/v22",
+            "recursive-attribution-report/v23",
         )
 
 

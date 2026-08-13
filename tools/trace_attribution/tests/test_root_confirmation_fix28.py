@@ -709,11 +709,16 @@ class ImmediateTypedGlobalFailureCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(
             seed["blocking_reasons"],
-            [failure["blocker"]],
+            [],
         )
         self.assertEqual(
             seed["missing_evidence"],
-            failure["missing_evidence"],
+            [],
+        )
+        self.assertEqual(seed["outcome"], "execution_failed")
+        self.assertEqual(
+            seed["execution_failures"],
+            [failure["failure_projection"]["execution_failure"]],
         )
 
         replay_judge = OneRequestSelectiveJudge()
@@ -731,8 +736,14 @@ class ImmediateTypedGlobalFailureCheckpointTest(unittest.TestCase):
         self.assertNotIn("record:seed_one", replay_judge.seed_calls)
         self.assertIn("record:seed_two", replay_judge.seed_calls)
         by_ref = {item.start_ref: item for item in report.seed_results}
-        self.assertEqual(by_ref["record:seed_one"].outcome, "evidence_gap")
-        self.assertNotEqual(by_ref["record:seed_two"].outcome, "evidence_gap")
+        self.assertEqual(
+            by_ref["record:seed_one"].outcome,
+            "execution_failed",
+        )
+        self.assertNotEqual(
+            by_ref["record:seed_two"].outcome,
+            "execution_failed",
+        )
         self.assertEqual(report.metadata["physical_judge_request_count"], 1)
 
 

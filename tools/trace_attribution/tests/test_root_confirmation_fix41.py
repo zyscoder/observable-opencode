@@ -206,8 +206,12 @@ class ResumableGlobalJudgeLifecycleTest(unittest.TestCase):
 
         self.assertEqual(replay_judge.global_calls, 0)
         seed = report.seed_results[0]
-        self.assertEqual(seed.outcome, "evidence_gap")
-        self.assertIn("global_judge_interrupted", seed.blocking_reasons)
+        self.assertEqual(seed.outcome, "execution_failed")
+        self.assertEqual(seed.blocking_reasons, ())
+        self.assertEqual(
+            seed.execution_failures[0]["reason"],
+            "analysis_interrupted",
+        )
         failure = next(
             item
             for item in report.investigation_journal
@@ -539,14 +543,8 @@ class ResumableGlobalJudgeLifecycleTest(unittest.TestCase):
             1,
         )
         by_ref = {item.start_ref: item for item in report.seed_results}
-        self.assertIn(
-            "global_judge_interrupted",
-            by_ref["record:seed_one"].blocking_reasons,
-        )
-        self.assertIn(
-            "judge_request_budget_exhausted",
-            by_ref["record:seed_two"].blocking_reasons,
-        )
+        self.assertEqual(by_ref["record:seed_one"].outcome, "execution_failed")
+        self.assertEqual(by_ref["record:seed_two"].outcome, "execution_failed")
 
     def test_checkpoint_budget_mismatch_is_rejected_before_lifecycle_write(self):
         with self.assertRaisesRegex(
@@ -640,10 +638,11 @@ class ResumableGlobalJudgeLifecycleTest(unittest.TestCase):
         )
 
         seed = report.seed_results[0]
-        self.assertEqual(seed.outcome, "evidence_gap")
+        self.assertEqual(seed.outcome, "execution_failed")
+        self.assertEqual(seed.blocking_reasons, ())
         self.assertEqual(
-            seed.blocking_reasons,
-            ("global_judge_interrupted",),
+            seed.execution_failures[0]["reason"],
+            "analysis_interrupted",
         )
         failure = next(
             item

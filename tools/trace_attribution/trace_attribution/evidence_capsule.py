@@ -6,7 +6,7 @@ import copy
 import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .candidate_budget import (
     AUTHORED_DECISION,
@@ -36,6 +36,7 @@ GLOBAL_FUSION_MAX_PAYLOAD_BYTES = 65_536
 GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES = 3
 JUDGE_PROMPT_STRING_CHARS = 1600
 JUDGE_PROMPT_COLLECTION_ITEMS = 12
+JUDGE_PROMPT_MAXIMUM_DEPTH = 10
 VALIDATION_SOURCE_KEYS = frozenset(
     {
         "candidate_ref",
@@ -523,8 +524,14 @@ class CandidateEvidenceCapsule:
                 hydration.pop(key, None)
         return value
 
-    def judge_prompt_dict(self, *, omitted_sections: List[str]) -> JsonDict:
+    def judge_prompt_dict(
+        self,
+        *,
+        omitted_sections: List[str],
+        omission_manifest: Optional[List[JsonDict]] = None,
+    ) -> JsonDict:
         """Return bounded Judge facts without changing canonical evidence."""
+        manifest = omission_manifest if omission_manifest is not None else []
         candidate = _thaw(self.candidate)
         allowed_candidate_keys = {
             "ref",
@@ -537,8 +544,18 @@ class CandidateEvidenceCapsule:
             "node",
         }
         for key in sorted(set(candidate) - allowed_candidate_keys):
-            omitted_sections.append("candidate.{0}".format(key))
-            candidate.pop(key, None)
+            path = "candidate.{0}".format(key)
+            omitted_sections.append(path)
+            omitted = candidate.pop(key, None)
+            manifest.append(
+                _omission_manifest_entry(
+                    owner_ref=self.candidate_ref,
+                    path=path,
+                    value=omitted,
+                    reason="field_not_in_prompt_projection",
+                    retained_item_count=0,
+                )
+            )
         return {
             "schema_version": CAPSULE_SCHEMA_VERSION,
             "candidate_ref": self.candidate_ref,
@@ -546,53 +563,75 @@ class CandidateEvidenceCapsule:
                 candidate,
                 path="candidate",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "downstream_path": list(self.downstream_path),
             "downstream_path_references": _bounded_prompt_value(
                 _thaw(self.downstream_path_references),
                 path="downstream_path_references",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
+                preserve_current_collection=True,
             ),
             "causal_path_edges": _bounded_prompt_value(
                 _thaw(self.causal_path_edges),
                 path="causal_path_edges",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
+                preserve_current_collection=True,
             ),
             "start_refs": list(self.start_refs),
             "action_group": _bounded_prompt_value(
                 _thaw(self.action_group),
                 path="action_group",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "incoming_edges": _bounded_prompt_value(
                 _thaw(self.incoming_edges),
                 path="incoming_edges",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "outgoing_edges": _bounded_prompt_value(
                 _thaw(self.outgoing_edges),
                 path="outgoing_edges",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "evidence_references": _bounded_prompt_value(
                 _thaw(self.evidence_references),
                 path="evidence_references",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "artifact_hydration": _bounded_prompt_value(
                 _thaw(self.artifact_hydration),
                 path="artifact_hydration",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "restoration_obligations": _bounded_prompt_value(
                 _thaw(self.restoration_obligations),
                 path="restoration_obligations",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
             "episode_facts": _bounded_prompt_value(
                 _thaw(self.episode_facts),
                 path="episode_facts",
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=self.candidate_ref,
             ),
         }
 
@@ -2158,21 +2197,63 @@ def _grounded_node_snapshot(
     return snapshot
 
 
+def _omission_manifest_entry(
+    *,
+    owner_ref: str,
+    path: str,
+    value: Any,
+    reason: str,
+    retained_item_count: Optional[int] = None,
+) -> JsonDict:
+    canonical = stable_json(_thaw(value))
+    raw = canonical.encode("utf-8")
+    original_item_count = len(value) if isinstance(value, (list, tuple)) else None
+    return {
+        "owner_ref": owner_ref,
+        "path": path,
+        "reason": reason,
+        "original_utf8_bytes": len(raw),
+        "original_sha256": hashlib.sha256(raw).hexdigest(),
+        "original_item_count": original_item_count,
+        "retained_item_count": retained_item_count,
+    }
+
+
 def _bounded_prompt_value(
     value: Any,
     *,
     path: str,
     omitted_sections: List[str],
+    omission_manifest: Optional[List[JsonDict]] = None,
+    owner_ref: str = "",
+    preserve_current_collection: bool = False,
     depth: int = 0,
 ) -> Any:
-    if depth >= 10:
+    manifest = omission_manifest if omission_manifest is not None else []
+    if depth >= JUDGE_PROMPT_MAXIMUM_DEPTH:
         omitted_sections.append(path)
+        manifest.append(
+            _omission_manifest_entry(
+                owner_ref=owner_ref,
+                path=path,
+                value=value,
+                reason="maximum_projection_depth",
+            )
+        )
         return {"omitted": True, "reason": "maximum_projection_depth"}
     if isinstance(value, str):
         if len(value) <= JUDGE_PROMPT_STRING_CHARS:
             return value
         omitted_sections.append(path)
         raw = value.encode("utf-8")
+        manifest.append(
+            _omission_manifest_entry(
+                owner_ref=owner_ref,
+                path=path,
+                value=value,
+                reason="string_truncated",
+            )
+        )
         return "{0}\n...[omitted bytes={1} sha256={2}]".format(
             value[:JUDGE_PROMPT_STRING_CHARS],
             len(raw),
@@ -2184,20 +2265,37 @@ def _bounded_prompt_value(
                 item,
                 path="{0}.{1}".format(path, key),
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=owner_ref,
                 depth=depth + 1,
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         items = list(value)
-        selected = items[:JUDGE_PROMPT_COLLECTION_ITEMS]
+        selected = (
+            items
+            if preserve_current_collection
+            else items[:JUDGE_PROMPT_COLLECTION_ITEMS]
+        )
         if len(items) > len(selected):
             omitted_sections.append(path)
+            manifest.append(
+                _omission_manifest_entry(
+                    owner_ref=owner_ref,
+                    path=path,
+                    value=items,
+                    reason="collection_truncated",
+                    retained_item_count=len(selected),
+                )
+            )
         projected = [
             _bounded_prompt_value(
                 item,
                 path="{0}[{1}]".format(path, index),
                 omitted_sections=omitted_sections,
+                omission_manifest=manifest,
+                owner_ref=owner_ref,
                 depth=depth + 1,
             )
             for index, item in enumerate(selected)
@@ -2216,6 +2314,9 @@ def _bounded_prompt_value(
 __all__ = [
     "CAPSULE_SCHEMA_VERSION",
     "MAX_VALIDATION_SOURCE_BYTES",
+    "JUDGE_PROMPT_COLLECTION_ITEMS",
+    "JUDGE_PROMPT_MAXIMUM_DEPTH",
+    "JUDGE_PROMPT_STRING_CHARS",
     "CandidateEvidenceCapsule",
     "build_action_group_context",
     "build_candidate_evidence_capsules",
