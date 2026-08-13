@@ -330,3 +330,181 @@ Trace 侧需要增加或完善：
 本文件是临时问题日志和正式改造输入，不表示上述 `expectation_gap` 模式、构建命令分类、
 任务义务或改进建议字段已经在当前代码中实现。当前可用能力仍以仓库 README 和实际 CLI
 schema 为准。
+
+## 10. 针对本次实际输出的诊断与操作建议
+
+本次报告显示：
+
+```json
+{
+  "selected_starts": [
+    "record:missing_semantic_final_test_result",
+    "record:observed_defect_missing_verification_after_change"
+  ],
+  "branches": [],
+  "conclusion": "inconclusive: no confirmed root cause; evidence is insufficient."
+}
+```
+
+这首先说明分析问题没有被转换成 Yocto/GCC 的预期偏差起点。归因引擎实际分析的是 Trace
+自动生成的“修改后缺少验证结果”健康检查节点，因此即使递归和 LLM 判断本身正常，也不会
+稳定回答“为何没有按要求使用 Yocto”。这是**分析目标错位**，应先修正起点，再判断归因
+能力是否不足。
+
+另外，使用 `recursive-agentic` 引擎时，递归结果主要保存在 `seed_results` 和
+`metadata.unresolved_branches` 中。旧投影字段 `defect_branches` 为空，不等于没有执行递归。
+同理，顶层 `unresolved_gaps[].kind == "unresolved_ref"` 是一个有损汇总标签，不能单独证明
+节点不存在；真实原因可能是候选不足、Judge 判断不确定、版本资格过滤、预算耗尽或模型服务
+中断。
+
+### 10.1 查看递归引擎的真实执行结果
+
+不要只查看 `defect_branches`。对当前报告执行：
+
+```bash
+REPORT=/path/to/current-attribution.json
+
+jq '{
+  analysis_outcome,
+  seed_results: [
+    .seed_results[]? | {
+      start_ref,
+      outcome,
+      candidate_refs,
+      selected_candidate_refs,
+      confirmed_root_refs,
+      missing_evidence,
+      blocking_reasons,
+      global_judgment: (
+        .global_judgment | {
+          outcome,
+          reason,
+          missing_evidence,
+          selected_candidate_refs,
+          decisive_evidence_refs
+        }
+      )
+    }
+  ],
+  unresolved_branches: .metadata.unresolved_branches,
+  exhausted_budgets: .metadata.exhausted_budgets,
+  provider_circuit: .metadata.provider_circuit,
+  processed_frontier_items: .metadata.processed_frontier_items,
+  judge_request_count: .metadata.judge_request_count
+}' "$REPORT"
+```
+
+应按下列顺序解释结果：
+
+1. `blocking_reasons` 包含 `start_ref_unresolved`：起点确实没有进入有效归因图；
+2. `candidate_refs` 为空：数据流回溯没有找到可供 Judge 判断的上游候选；
+3. `global_judgment.outcome` 为 `inconclusive`：候选存在，但语义证据不足以确认；
+4. `exhausted_budgets` 非空：分析可能被候选、深度、请求或时间预算截断；
+5. `provider_circuit` 打开或 `judge_request_count` 为零：需要先排查 LLM 服务调用；
+6. `unresolved_branches` 出现版本资格原因：检查候选节点是否被 active-revision 规则过滤。
+
+### 10.2 在 Trace 中定位 Yocto 证据引用
+
+先搜索用户要求、Skill、上下文、决策和构建工具事实：
+
+```bash
+TRACE=/path/to/case/trace.json
+
+jq -r '
+  .records[]
+  | select(
+      ((.title // "") + " " + (.data | tostring))
+      | test("yocto|bitbake|kas|gcc|clang|skill"; "i")
+    )
+  | [
+      .record_id,
+      .event_type,
+      .component,
+      (.title // ""),
+      ((.source_refs // []) | join(","))
+    ]
+  | @tsv
+' "$TRACE" | less -S
+```
+
+至少确认并记录以下真实引用：
+
+- 用户明确要求使用构建 Skill 或 Yocto 的节点；
+- 发给模型的请求中包含该要求的节点；
+- Skill 可用性、加载结果和 Skill 内容节点；
+- 首次选择 GCC 或跳过 Yocto 的决策节点；
+- GCC 命令调用及结果节点；
+- 最终验证结论或完成声明节点。
+
+如果某一类引用不存在，应把“Trace 缺少该事实”作为观测缺口保留，不能用人工推测的引用
+替代。
+
+### 10.3 使用定向 Review 重新归因
+
+按第 5.1 节构造 `yocto-review.json`，其中 `gap_context_refs` 必须替换为上一步找到的真实
+引用。然后显式指定唯一的质量偏差起点：
+
+```bash
+PYTHONPATH=/path/to/observable-opencode/tools/trace_attribution \
+python -m trace_attribution \
+  --engine recursive-agentic \
+  --fusion-mode retrieval-global \
+  --trace "$TRACE" \
+  --review /path/to/yocto-review.json \
+  --start-ref record:quality_gap_authoritative_build_workflow_adherence \
+  --question "为什么执行路径偏离了项目的 Yocto 构建要求，下一次应改进哪个组件？" \
+  --out /path/to/yocto-expectation-gap.attribution.json
+```
+
+每次修改 Review、起点或问题后，应使用新的输出目录或输出文件，避免旧 checkpoint 让新配置
+看起来没有生效。
+
+### 10.4 验证分析目标已经纠正
+
+```bash
+REPORT=/path/to/yocto-expectation-gap.attribution.json
+
+jq '{
+  selected_starts: .analysis_question.selected_start_refs,
+  start_refs,
+  seed_results: [
+    .seed_results[]? | {
+      start_ref,
+      outcome,
+      selected_candidate_refs,
+      confirmed_root_refs,
+      missing_evidence,
+      blocking_reasons
+    }
+  ],
+  conclusion,
+  unresolved_gaps
+}' "$REPORT"
+```
+
+第一项验收条件是：
+
+```json
+{
+  "selected_starts": [
+    "record:quality_gap_authoritative_build_workflow_adherence"
+  ]
+}
+```
+
+如果仍然选择 `missing_semantic_final_test_result`，说明 Review 未加载、起点 ID 不匹配，或实际
+查看的是旧报告。只有在定向起点生效后，才能继续评价候选召回、LLM 判断和根因确认能力。
+
+### 10.5 当前结果应如何下结论
+
+基于现有输出，目前只能得出：
+
+- 当前归因请求分析了错误的问题起点；
+- 当前报告不能证明 Skill、上下文或 Agent 决策中的任何一个是根因；
+- `no confirmed root cause` 不能解释为“没有问题”，也不能解释为“Trace 中完全没有有效信息”；
+- 应先按上述步骤重跑定向归因，再依据 `seed_results` 判断是数据流缺失、语义证据缺失、LLM
+  判断不确定，还是预算或服务问题。
+
+该操作方案是当前版本的临时办法。长期方案仍是第 7 节的 `expectation_gap` 模式：由用户问题
+建立待验证的预期契约和偏差起点，但只有在 Trace 证据证明该预期真实存在后，才将其用于递归
+后向分析，避免把用户事后偏好直接当作既定事实。
