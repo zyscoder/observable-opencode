@@ -143,6 +143,50 @@ jq '{
 `observed_defect_missing_verification_after_change`，则可以确认 Yocto 预期偏差没有被建模为
 本次分析目标。单纯修改 `--question` 不能改变该事实。
 
+查询结果如下：
+```bash
+((observable-opencode-attribution) ) root@myide:/tmp/evo-bench/traces/stupid-build$ jq '{
+>   selected_starts: .analysis_question.selected_start_refs,
+>   start_refs,
+>   branches: [
+>     .defect_branches[]? | {
+>       start_ref,
+>       observed_defect_ref,
+>       analysis_outcome,
+>       termination_reason
+>     }
+>   ],
+>   conclusion,
+>   unresolved_gaps
+> }' "$REPORT"
+{
+  "selected_starts": [
+    "record:missing_semantic_final_test_result",
+    "record:observed_defect_missing_verification_after_change"
+  ],
+  "start_refs": [
+    "record:missing_semantic_final_test_result",
+    "record:observed_defect_missing_verification_after_change"
+  ],
+  "branches": [],
+  "conclusion": "inconclusive: no confirmed root cause; evidence is insufficient.",
+  "unresolved_gaps": [
+    {
+      "kind": "unresolved_ref",
+      "ref": "record:missing_semantic_final_test_result"
+    },
+    {
+      "kind": "unresolved_ref",
+      "ref": "record:observed_defect_missing_verification_after_change"
+    },
+    {
+      "kind": "no_confirmed_root_cause",
+      "reason": "evidence_insufficient"
+    }
+  ]
+}
+```
+
 ## 5. 临时规避方案
 
 在正式支持 `expectation_gap` 前，可使用离线 Review 显式注入一个质量偏差，再通过
