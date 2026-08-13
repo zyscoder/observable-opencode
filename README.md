@@ -517,13 +517,94 @@ Trace 引用收窄起点；若不知道节点，保持自动候选检索即可�
 
 若 `--out` 为 `/data/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
 message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程重启后，可使用相同
-参数继续分析，避免重复消耗已经完成的 Judge 请求。最终重点查看：
+参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会在终端最后一行
+打印 `--out` 指定的路径；该 JSON 是最终归因报告，也是查看分析结果的首要入口。
+
+以上述 `--out` 为例，默认会得到：
+
+```text
+/data/evo-bench/attribution/
+├── case-001.json                       # 最终归因报告，主要查看它
+├── case-001.message-lineage.json       # 离线重建的消息、上下文和数据流
+├── case-001.judge-cache.jsonl          # 已完成的 LLM Judge 判断缓存
+└── case-001.checkpoint/                # 递归分析断点，用于中断续跑
+```
+
+`trace.html` 只用于人工查看 Agent 的原始执行流程，不承载归因结论。归因结果中的 Trace 引用
+可以回到同一 case 的 `trace.html` 或 `trace.json` 核验，但不要把 HTML 当作归因输入。
+
+#### 查看分析结果
+
+先指定报告路径：
+
+```bash
+REPORT=/data/evo-bench/attribution/case-001.json
+```
+
+查看面向用户的核心结论：
+
+```bash
+jq '{
+  analysis_question,
+  analysis_outcome,
+  conclusion,
+  confidence,
+  causal_chain,
+  supporting_evidence_refs,
+  rejected_hypotheses,
+  unresolved_gaps
+}' "$REPORT"
+```
+
+其中 `analysis_outcome` 表示整体判定状态：
+
+- `root_found`：至少一个缺陷分支已经找到并确认根因；
+- `partial_root_found`：部分缺陷分支已确认根因，其他分支仍未收敛；
+- `no_defect`：现有证据没有确认用户所描述的缺陷；
+- `inconclusive`：Trace、Judge 或搜索证据不足，无法可靠确认。
+
+查看已确认根因及其置信度、理由和证据：
+
+```bash
+jq '{
+  outcome: .analysis_outcome,
+  conclusion,
+  roots: .confirmed_roots,
+  confidence
+}' "$REPORT"
+```
+
+查看完整后向因果链：
+
+```bash
+jq '.causal_chain' "$REPORT"
+```
+
+查看各缺陷分支的节点判断、遍历路径和终止原因：
+
+```bash
+jq '.defect_branches' "$REPORT" | less
+```
+
+查看哪些 Trace 语义缺失或仍阻碍归因：
+
+```bash
+jq '{
+  unresolved_gaps,
+  trace_improvement_report
+}' "$REPORT"
+```
+
+最终重点字段如下：
 
 - `conclusion`：确认的根因或证据不足结论；
+- `analysis_outcome`：整体判定状态，区分找到根因、部分找到、无缺陷和证据不足；
+- `confirmed_roots`：已独立确认的根因节点、原因、置信度和证据；
 - `causal_chain`：从表象缺陷后向回溯到引入位置的路径；
 - `supporting_evidence_refs`：可回到 Trace 核验的证据引用；
 - `rejected_hypotheses`：已排除候选及排除依据；
-- `unresolved_gaps`：仍需补充的 Trace 语义信息。
+- `unresolved_gaps`：仍需补充的 Trace 语义信息；
+- `trace_improvement_report`：本次归因暴露出的 Trace 插装改进建议。
 
 ## Python API
 
