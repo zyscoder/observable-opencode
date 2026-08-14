@@ -260,3 +260,73 @@ issues, no changed Task 4 source or test file appears in the typecheck output.
   disables the store; `records.jsonl` remains the source for any later full rebuild.
 - The package-wide typecheck baseline remains RED outside Task 4 scope.
 - The unrelated environment-sensitive `trace.artifacts[0]` test was intentionally not changed.
+
+## Fix Round 2
+
+### Status
+
+The remaining routing-ownership bound finding is addressed on top of Fix Round 1 commit
+`1d94c55984527c21c79fa9c2431acbbdaec41925`. Routing state now has fixed category cardinality,
+at most 256 retained reference keys per normalized category, and at most 256 recent trace owners
+per retained key. This state remains observer-only and cannot feed Agent decisions or output.
+
+### RED Evidence
+
+Two tests were added before the production change and failed for the expected reasons:
+
+```text
+bun test test/observability/case-trace-session.test.ts \
+  -t "retains at most 256 recent owners|normalizes arbitrary reference prefixes" \
+  --timeout 30000
+
+0 pass, 2 fail, 4 expect() calls
+```
+
+- After 257 traces claimed `span:shared`, the oldest trace still routed through that key.
+- After 257 distinct arbitrary prefixes were remembered, the oldest unknown-prefix key still
+  routed to its owner, proving that arbitrary prefixes could grow the category map without bound.
+
+### Fix
+
+- Derived a fixed known-category set from the typed reference keys emitted by `traceRouteHint`.
+  Untyped refs use `untyped`; every unknown prefix shares the single `other` category.
+- Kept the existing 256-key per-category insertion-order bound. Evicting a key from its category
+  also deletes its `owners` entry, so the category index and reverse ownership map cannot diverge.
+- Made each retained key's owner set a 256-entry recent-owner LRU using deterministic JavaScript
+  `Set` insertion order. Re-remembering an owner refreshes it; adding owner 257 evicts the oldest.
+
+### GREEN Verification
+
+```text
+bun test test/observability/case-trace-session.test.ts \
+  -t "retains at most 256 recent owners|normalizes arbitrary reference prefixes" \
+  --timeout 30000
+2 pass, 0 fail, 6 expect() calls
+
+bun test test/observability/case-trace-session.test.ts --timeout 30000
+26 pass, 0 fail, 81 expect() calls
+
+bun test test/observability/case-trace-runtime.test.ts --timeout 120000
+28 pass, 0 fail, 7332 expect() calls
+
+bun test test/observability/case-trace-memory.test.ts --timeout 120000
+1 pass, 0 fail, 3 expect() calls
+```
+
+The memory acceptance test again kept 10,000 observations within its 128 MiB RSS-growth bound.
+`bun typecheck` still exits `2` only for the pre-existing TUI/plugin/SDK/dependency errors recorded
+above; neither Fix Round 2 file appears in its output.
+
+### Files Changed in Fix Round 2
+
+- `packages/opencode/src/observability/case-trace-session.ts`
+- `packages/opencode/test/observability/case-trace-session.test.ts`
+- `.superpowers/sdd/2026-08-14-bounded-segmented-trace-runtime/task-4-report.md`
+
+### Semantic-equivalence Risk
+
+- Unknown typed prefixes now compete inside one 256-key observer-routing category. Evicted unknown
+  refs use the existing process/isolated trace fallback; this can reduce observer attribution
+  precision for stale refs but cannot alter Agent-visible behavior.
+- Root/alias lifecycle ownership is outside this finding. This round bounds only the recent
+  reference-routing indexes identified by review and does not broaden session lifecycle behavior.

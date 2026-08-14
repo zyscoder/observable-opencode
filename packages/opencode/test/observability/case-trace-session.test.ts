@@ -102,6 +102,33 @@ test("retains at most 256 recent routing references per category", () => {
   expect(evicted).not.toBe(other)
 })
 
+test("retains at most 256 recent owners for one routing reference", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const traces = Array.from({ length: 257 }, (_, index) =>
+    registry.resolve({ sessionID: `ses_owner_${index}` }),
+  )
+
+  for (const trace of traces) registry.remember(trace, ["span:shared"])
+
+  expect(registry.resolve({ sessionID: "ses_owner_256", refs: ["span:shared"] })).toBe(traces[256])
+  const evicted = registry.resolve({ sessionID: "ses_owner_0", refs: ["span:shared"] })
+  expect(evicted).not.toBe(traces[0])
+  expect(evicted).not.toBe(traces[256])
+})
+
+test("normalizes arbitrary reference prefixes into one bounded category", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const owner = registry.resolve({ sessionID: "ses_owner" })
+  const other = registry.resolve({ sessionID: "ses_other" })
+
+  for (let index = 0; index < 257; index++) registry.remember(owner, [`arbitrary_${index}:ref_${index}`])
+
+  expect(registry.resolve({ refs: ["arbitrary_256:ref_256"] })).toBe(owner)
+  const evicted = registry.resolve({ refs: ["arbitrary_0:ref_0"] })
+  expect(evicted).not.toBe(owner)
+  expect(evicted).not.toBe(other)
+})
+
 test("routes explicit sessions with conflicting reference owners to the process trace", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const first = registry.resolve({ sessionID: "ses_a" })

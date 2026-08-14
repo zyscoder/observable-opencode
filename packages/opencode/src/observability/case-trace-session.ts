@@ -27,10 +27,14 @@ const referenceKeys = new Map<string, string[]>([
 ])
 const referenceContainers = new Set(["source_refs", "evidence_refs", "aliases"])
 const maxRecentReferencesPerCategory = 256
+const maxRecentOwnersPerReference = 256
+const knownReferenceCategories = new Set([...referenceKeys.values()].flat())
 
 function referenceCategory(ref: string) {
   const separator = ref.indexOf(":")
-  return separator > 0 ? ref.slice(0, separator) : "untyped"
+  if (separator <= 0) return "untyped"
+  const category = ref.slice(0, separator)
+  return knownReferenceCategories.has(category) ? category : "other"
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -252,7 +256,13 @@ export class SessionTraceRegistry<T extends object> {
         owners = new Set<T>()
         this.owners.set(ref, owners)
       }
+      owners.delete(trace)
       owners.add(trace)
+      while (owners.size > maxRecentOwnersPerReference) {
+        const evicted = owners.values().next().value
+        if (evicted === undefined) break
+        owners.delete(evicted)
+      }
     }
   }
 
