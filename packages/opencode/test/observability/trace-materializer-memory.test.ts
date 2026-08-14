@@ -6,24 +6,40 @@ import { CausalIRStore } from "@/observability/causal-ir"
 
 const GIB = 1024 * 1024 * 1024
 const MAX_RSS_BYTES = 256 * 1024 * 1024
+const FINAL_ARTIFACT_PAYLOAD = "final sparse artifact"
 const childMode = process.env.OPENCODE_TRACE_MATERIALIZER_MEMORY_CHILD === "1"
 
 if (childMode) {
   test("materializer memory measurement child", async () => {
     const { materializeTrace } = await import("@/observability/trace-materializer")
-    const { loadRenderableTrace } = await import("../../../trace-renderer/src/load")
     const caseDir = process.env.OPENCODE_TRACE_MATERIALIZER_MEMORY_DIR!
+    const phase = (name: string) =>
+      process.stdout.write(
+        `\nTRACE_MATERIALIZER_PHASE ${JSON.stringify({ phase: name, journalBytes: fs.statSync(path.join(caseDir, "records.jsonl")).size, rss: process.memoryUsage().rss, maxRSS: process.resourceUsage().maxRSS })}\n`,
+      )
 
     Bun.gc(true)
+    phase("child_ready")
     const result = materializeTrace({ caseDir })
+    Bun.gc(true)
+    const materializerMaxRSS = process.resourceUsage().maxRSS
+    phase("materializer_gc_complete")
+    const { loadRenderableTrace } = await import("../../../trace-renderer/src/load")
     const loaded = loadRenderableTrace(result.traceFile)
     Bun.gc(true)
+    phase("renderer_loaded")
 
     expect(result.completeness).toBe("complete")
     expect(loaded.source).toBe("trace.json")
     expect(loaded.incomplete).toBe(false)
     expect(loaded.trace.artifacts).toHaveLength(1)
-    process.stdout.write(`\nTRACE_MATERIALIZER_MEMORY ${JSON.stringify({ maxRSS: process.resourceUsage().maxRSS })}\n`)
+    expect(loaded.trace.artifacts[0]).toEqual(
+      expect.objectContaining({ artifact_id: "bounded_artifact", payload: FINAL_ARTIFACT_PAYLOAD }),
+    )
+    const finalMaxRSS = process.resourceUsage().maxRSS
+    process.stdout.write(
+      `\nTRACE_MATERIALIZER_MEMORY ${JSON.stringify({ materializerMaxRSS, finalMaxRSS, maxRSS: Math.max(materializerMaxRSS, finalMaxRSS) })}\n`,
+    )
   }, 600_000)
 } else {
   test("materializes a sparse 1 GiB journal below the 256 MiB peak RSS bound", async () => {
@@ -56,6 +72,11 @@ if (childMode) {
       }
       store.createArtifact(artifact)
       while (fs.fstatSync(fd).size < GIB) store.reuseArtifact(artifact)
+      store.reuseArtifact({
+        ...artifact,
+        hash: "sha256:final-sparse-artifact",
+        payload: FINAL_ARTIFACT_PAYLOAD,
+      })
       store.closeRuntime({
         format: "runtime_close",
         status: "success",
@@ -81,6 +102,7 @@ if (childMode) {
             ...process.env,
             OPENCODE_TRACE_MATERIALIZER_MEMORY_CHILD: "1",
             OPENCODE_TRACE_MATERIALIZER_MEMORY_DIR: caseDir,
+            OPENCODE_TRACE_MATERIALIZER_MEMORY_PHASES: "1",
           },
           stdout: "pipe",
           stderr: "pipe",
@@ -92,9 +114,15 @@ if (childMode) {
         new Response(child.stderr).text(),
       ])
       const match = stdout.match(/TRACE_MATERIALIZER_MEMORY (\{[^\n]+\})/)
+      process.stdout.write(`${stdout.match(/TRACE_MATERIALIZER_PHASE [^\n]+/g)?.join("\n") ?? ""}\n`)
 
       expect(match, `${stdout}\n${stderr}`).not.toBeNull()
-      const measurement = JSON.parse(match![1]!) as { maxRSS: number }
+      const measurement = JSON.parse(match![1]!) as {
+        materializerMaxRSS: number
+        finalMaxRSS: number
+        maxRSS: number
+      }
+      expect(measurement.maxRSS).toBe(Math.max(measurement.materializerMaxRSS, measurement.finalMaxRSS))
       expect(measurement.maxRSS).toBeLessThanOrEqual(MAX_RSS_BYTES)
       expect(exitCode, stderr).toBe(0)
     } finally {

@@ -46,6 +46,9 @@ type OwnerRow = { node_id: string }
 type LegacyRow = { legacy_ref: string }
 type OccurrenceRow = { owner_type: "node" | "edge"; owner_id: string; field: string }
 
+const MATERIALIZER_GC_BYTES = 4 * 1024 * 1024
+const MEMORY_WATERMARK_BYTES = 128 * 1024 * 1024
+
 const OPERATIONS = new Set<CausalIRJournalEntry["operation"]>([
   "node.created",
   "node.updated",
@@ -116,6 +119,12 @@ function normalizedValidationEntry(entry: CausalIRJournalEntry) {
   return normalized
 }
 
+function isLegacyLifecycleFinalization(entry: CausalIRJournalEntry) {
+  if (entry.operation !== "case.finalized") return false
+  const data = record(entry.data)
+  return data?.format !== "compact_causal_ir_finalization" && record(data?.trace) !== undefined
+}
+
 function validateEntryShape(entry: CausalIRJournalEntry, requireInitialRunNode: boolean) {
   validateCausalIRJournal([normalizedValidationEntry(entry)], { requireInitialRunNode })
 }
@@ -141,22 +150,26 @@ class ReplayIndex {
         entity_id TEXT PRIMARY KEY,
         ordinal INTEGER NOT NULL,
         kind TEXT NOT NULL,
+        wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE edges (
         entity_id TEXT PRIMARY KEY,
         ordinal INTEGER NOT NULL,
+        wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE artifacts (
         entity_id TEXT PRIMARY KEY,
         ordinal INTEGER NOT NULL,
+        wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE diagnostics (
         entity_id TEXT PRIMARY KEY,
         ordinal INTEGER NOT NULL,
         kind TEXT,
+        wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE payload_hashes (
@@ -211,22 +224,22 @@ class ReplayIndex {
     if (!OPERATIONS.has(entry.operation)) this.validationError(`unknown operation ${String(entry.operation)}`)
     if (!nonemptyString(entry.record_type) || !nonemptyString(entry.entity_id) || !nonemptyString(entry.payload_hash))
       this.validationError("missing record type, entity identity, or payload hash")
-    if (entry.payload_hash !== causalIRPayloadHash(entry.data))
+    if (isLegacyLifecycleFinalization(entry) && entry.payload_hash !== causalIRPayloadHash(entry.data))
       this.validationError("journal payload hash does not match data")
-    const previous = this.db
-      .query<HashRow, [string]>("SELECT payload_hash FROM payload_hashes WHERE hash_key = ?")
-      .get(hashKey(entry.operation, entry.entity_id))?.payload_hash
-    if (entry.previous_payload_hash !== previous)
-      this.validationError("previous payload hash does not match entity history")
     try {
       validateEntryShape(entry, line === 1)
     } catch (error) {
       if (error instanceof CausalIRJournalValidationError) this.validationError(error.message)
       throw error
     }
+    const previous = this.db
+      .query<HashRow, [string]>("SELECT payload_hash FROM payload_hashes WHERE hash_key = ?")
+      .get(hashKey(entry.operation, entry.entity_id))?.payload_hash
+    if (entry.previous_payload_hash !== previous)
+      this.validationError("previous payload hash does not match entity history")
   }
 
-  apply(input: unknown) {
+  apply(input: unknown, rawLine: string) {
     if (!record(input)) this.validationError("expected a journal entry object")
     const entry = input as CausalIRJournalEntry
     this.validate(entry)
@@ -235,16 +248,16 @@ class ReplayIndex {
     this.db.transaction(() => {
       if ((entry.operation === "node.created" || entry.operation === "node.updated") && record(entry.data)) {
         const node = entry.data as CausalIRNode
-        this.putNode(node, entry.sequence)
+        this.putNode(node, entry.sequence, rawLine, true)
       } else if (entry.operation === "edge.created" && record(entry.data)) {
         this.putEdge(canonicalCausalIREdge(entry.data as CausalIREdge), entry.sequence)
       } else if (
         (entry.operation === "artifact.created" || entry.operation === "artifact.reused") &&
         record(entry.data)
       ) {
-        this.putArtifact(entry.data as ArtifactLike, entry.sequence)
+        this.putArtifact(entry.data as ArtifactLike, entry.sequence, rawLine, true)
       } else if (entry.operation === "diagnostic.created" && record(entry.data)) {
-        this.putDiagnostic(entry.data as CausalIRDiagnosticLike, entry.sequence)
+        this.putDiagnostic(entry.data as CausalIRDiagnosticLike, entry.sequence, rawLine, true)
       } else if ((entry.operation === "case.checkpointed" || entry.operation === "case.finalized") && snapshot) {
         this.replaceSnapshot(snapshot)
       }
@@ -272,52 +285,58 @@ class ReplayIndex {
     this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : undefined
   }
 
-  private putNode(node: CausalIRNode, ordinal: number) {
+  private putNode(node: CausalIRNode, ordinal: number, json = JSON.stringify(node), wrapped = false) {
     this.db
       .query(
         `
-        INSERT INTO nodes(entity_id, ordinal, kind, json) VALUES (?, ?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, json = excluded.json
+        INSERT INTO nodes(entity_id, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(node.node_id, ordinal, node.kind, JSON.stringify(node))
+      .run(node.node_id, ordinal, node.kind, wrapped ? 1 : 0, json)
   }
 
   private putEdge(edge: CausalIREdge, ordinal: number) {
     this.db
       .query(
         `
-        INSERT INTO edges(entity_id, ordinal, json) VALUES (?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET json = excluded.json
+        INSERT INTO edges(entity_id, ordinal, wrapped, json) VALUES (?, ?, 0, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
       `,
       )
       .run(edge.edge_id, ordinal, JSON.stringify(edge))
   }
 
-  private putArtifact(artifact: ArtifactLike, ordinal: number) {
+  private putArtifact(artifact: ArtifactLike, ordinal: number, json = JSON.stringify(artifact), wrapped = false) {
     this.db
       .query(
         `
-        INSERT INTO artifacts(entity_id, ordinal, json) VALUES (?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET json = excluded.json
+        INSERT INTO artifacts(entity_id, ordinal, wrapped, json) VALUES (?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(artifact.artifact_id, ordinal, JSON.stringify(artifact))
+      .run(artifact.artifact_id, ordinal, wrapped ? 1 : 0, json)
   }
 
-  private putDiagnostic(diagnostic: CausalIRDiagnosticLike, ordinal: number) {
+  private putDiagnostic(
+    diagnostic: CausalIRDiagnosticLike,
+    ordinal: number,
+    json = JSON.stringify(diagnostic),
+    wrapped = false,
+  ) {
     this.db
       .query(
         `
-        INSERT INTO diagnostics(entity_id, ordinal, kind, json) VALUES (?, ?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, json = excluded.json
+        INSERT INTO diagnostics(entity_id, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
       .run(
         diagnostic.diagnostic_id,
         ordinal,
         typeof diagnostic.kind === "string" ? diagnostic.kind : null,
-        JSON.stringify(diagnostic),
+        wrapped ? 1 : 0,
+        json,
       )
   }
 
@@ -355,7 +374,7 @@ class ReplayIndex {
 
   reconcileDiagnostics() {
     this.db.exec("DELETE FROM aliases; DELETE FROM unresolved_occurrences; DELETE FROM generated_diagnostics")
-    for (const row of this.db.query<JsonRow, []>("SELECT json FROM nodes ORDER BY ordinal").iterate()) {
+    for (const row of this.entityRows("nodes")) {
       const node = JSON.parse(row.json) as CausalIRNode
       for (const alias of node.aliases)
         this.db.query("INSERT OR IGNORE INTO aliases(alias, node_id) VALUES (?, ?)").run(alias, node.node_id)
@@ -368,7 +387,7 @@ class ReplayIndex {
       for (const [index, ref] of (node.derivation?.input_refs ?? []).entries())
         this.inspectReference("node", node.node_id, `derivation.input_refs[${index}]`, ref)
     }
-    for (const row of this.db.query<JsonRow, []>("SELECT json FROM edges ORDER BY ordinal").iterate()) {
+    for (const row of this.entityRows("edges")) {
       const edge = JSON.parse(row.json) as CausalIREdge
       if (edge.normalized_relation === "derived_from" && edge.derivation_method === "unknown_relation_fallback") {
         this.putGeneratedDiagnostic({
@@ -437,9 +456,17 @@ class ReplayIndex {
     return count
   }
 
+  private entityRows(table: "nodes" | "edges" | "artifacts") {
+    return this.db
+      .query<
+        JsonRow,
+        []
+      >(`SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json FROM ${table} ORDER BY ordinal`)
+      .iterate()
+  }
+
   *rawEntities(table: "nodes" | "edges" | "artifacts") {
-    for (const row of this.db.query<JsonRow, []>(`SELECT json FROM ${table} ORDER BY ordinal`).iterate())
-      yield streamingJsonRawItem(row.json)
+    for (const row of this.entityRows(table)) yield streamingJsonRawItem(row.json)
   }
 
   *diagnosticItems() {
@@ -447,7 +474,7 @@ class ReplayIndex {
       .query<
         JsonRow,
         []
-      >("SELECT json FROM diagnostics WHERE kind IS NULL OR kind NOT IN ('unknown_relation', 'alias_collision', 'unresolved_ref') ORDER BY ordinal")
+      >("SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json FROM diagnostics WHERE kind IS NULL OR kind NOT IN ('unknown_relation', 'alias_collision', 'unresolved_ref') ORDER BY ordinal")
       .iterate())
       yield streamingJsonRawItem(row.json)
     for (const row of this.db
@@ -457,7 +484,7 @@ class ReplayIndex {
   }
 
   *compatibilityRecords(manifest: Record<string, unknown>, metrics: Record<string, unknown>) {
-    for (const row of this.db.query<JsonRow, []>("SELECT json FROM nodes ORDER BY ordinal").iterate()) {
+    for (const row of this.entityRows("nodes")) {
       const node = JSON.parse(row.json) as CausalIRNode
       const projection = projectProvenanceTrace(
         {
@@ -480,7 +507,7 @@ class ReplayIndex {
   }
 
   *compatibilityEdges(manifest: Record<string, unknown>, metrics: Record<string, unknown>) {
-    for (const row of this.db.query<JsonRow, []>("SELECT json FROM edges ORDER BY ordinal").iterate()) {
+    for (const row of this.entityRows("edges")) {
       const edge = JSON.parse(row.json) as CausalIREdge
       const projection = projectProvenanceTrace(
         {
@@ -505,37 +532,68 @@ class ReplayIndex {
   closeIndex() {
     this.db.close(false)
   }
+
+  releaseTransientBindings() {
+    const database = this.db as unknown as { clearQueryCache(): void }
+    database.clearQueryCache()
+  }
 }
 
-function* physicalLines(file: string) {
+function memoryPhase(phase: string, journalBytes = 0) {
+  if (process.env.OPENCODE_TRACE_MATERIALIZER_MEMORY_PHASES !== "1") return
+  process.stdout.write(
+    `\nTRACE_MATERIALIZER_PHASE ${JSON.stringify({ phase, journalBytes, rss: process.memoryUsage().rss, maxRSS: process.resourceUsage().maxRSS })}\n`,
+  )
+}
+
+function readPhysicalLines(
+  file: string,
+  visit: (line: string, lineNumber: number, terminal: boolean) => void,
+  afterLine: (sourceBytes: number) => void,
+) {
   const fd = fs.openSync(file, "r")
+  const fileSize = fs.fstatSync(fd).size
   const decoder = new StringDecoder("utf8")
   const chunk = Buffer.allocUnsafe(64 * 1024)
-  let pending = ""
+  let parts: string[] = []
+  let lineBytes = 0
   let lineNumber = 0
+  let fileOffset = 0
   try {
     while (true) {
       const bytes = fs.readSync(fd, chunk, 0, chunk.length, null)
       if (!bytes) break
-      const text = decoder.write(chunk.subarray(0, bytes))
+      const chunkOffset = fileOffset
+      fileOffset += bytes
       let start = 0
-      for (let index = text.indexOf("\n", start); index !== -1; index = text.indexOf("\n", start)) {
-        let line = pending + text.slice(start, index)
-        pending = ""
+      for (let index = chunk.indexOf(0x0a, start); index !== -1 && index < bytes; index = chunk.indexOf(0x0a, start)) {
+        lineBytes += index - start
+        parts.push(decoder.write(chunk.subarray(start, index)))
+        let line: string | undefined = parts.join("")
+        parts = []
         if (line.endsWith("\r")) line = line.slice(0, -1)
-        yield { line, lineNumber: ++lineNumber }
+        visit(line, ++lineNumber, chunkOffset + index === fileSize - 1)
+        line = undefined
+        afterLine(lineBytes + 1)
+        lineBytes = 0
         start = index + 1
       }
-      pending += text.slice(start)
+      lineBytes += bytes - start
+      parts.push(decoder.write(chunk.subarray(start, bytes)))
     }
-    pending += decoder.end()
-    if (pending) {
-      if (pending.endsWith("\r")) pending = pending.slice(0, -1)
-      yield { line: pending, lineNumber: ++lineNumber }
+    parts.push(decoder.end())
+    if (lineBytes > 0) {
+      let line: string | undefined = parts.join("")
+      parts = []
+      if (line.endsWith("\r")) line = line.slice(0, -1)
+      visit(line, ++lineNumber, true)
+      line = undefined
+      afterLine(lineBytes)
     }
   } finally {
     fs.closeSync(fd)
   }
+  return lineNumber
 }
 
 class JournalJsonError extends Error {}
@@ -553,30 +611,47 @@ function parseLine(line: string) {
 }
 
 function recoverJournal(recordsFile: string, index: ReplayIndex) {
-  let pending: { line: string; lineNumber: number } | undefined
-  let sawLine = false
+  let droppedLines = 0
+  let journalBytes = 0
+  let bytesSinceGC = 0
+  let nextWatermark = MEMORY_WATERMARK_BYTES
 
-  const process = (current: { line: string; lineNumber: number }, terminal: boolean) => {
+  const processLine = (line: string, lineNumber: number, terminal: boolean) => {
     try {
-      index.apply(parseLine(current.line))
+      index.apply(parseLine(line), line)
     } catch (error) {
-      if (terminal && index.recoveredLines > 0) return 1
+      if (terminal && index.recoveredLines > 0) {
+        droppedLines = 1
+        return
+      }
       if (terminal && index.recoveredLines === 0) throw new Error(`${recordsFile}:1: journal is empty`)
       if (error instanceof JournalJsonError)
-        throw new Error(`${recordsFile}:${current.lineNumber}: invalid JSONL entry (${error.message})`)
+        throw new Error(`${recordsFile}:${lineNumber}: invalid JSONL entry (${error.message})`)
       const detail = error instanceof Error ? error.message : String(error)
-      throw new Error(`${recordsFile}:${current.lineNumber}: ${detail}`)
+      throw new Error(`${recordsFile}:${lineNumber}: ${detail}`)
     }
-    return 0
   }
 
-  for (const current of physicalLines(recordsFile)) {
-    sawLine = true
-    if (pending) process(pending, false)
-    pending = current
+  const lineCount = readPhysicalLines(recordsFile, processLine, (sourceBytes) => {
+    journalBytes += sourceBytes
+    bytesSinceGC += sourceBytes
+    if (bytesSinceGC >= MATERIALIZER_GC_BYTES) {
+      index.releaseTransientBindings()
+      Bun.gc(true)
+      bytesSinceGC = 0
+    }
+    while (journalBytes >= nextWatermark) {
+      memoryPhase("replay_watermark", journalBytes)
+      nextWatermark += MEMORY_WATERMARK_BYTES
+    }
+  })
+  if (!lineCount) throw new Error(`${recordsFile}:1: journal is empty`)
+  if (bytesSinceGC > 0) {
+    index.releaseTransientBindings()
+    Bun.gc(true)
   }
-  if (!sawLine || !pending) throw new Error(`${recordsFile}:1: journal is empty`)
-  return process(pending, true)
+  memoryPhase("replay_complete", journalBytes)
+  return { droppedLines, journalBytes }
 }
 
 function traceMembers(
@@ -622,8 +697,11 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
   )
   const index = new ReplayIndex(indexPath)
   try {
-    const droppedLines = recoverJournal(recordsFile, index)
+    memoryPhase("materialize_start")
+    const recovered = recoverJournal(recordsFile, index)
+    const droppedLines = recovered.droppedLines
     index.reconcileDiagnostics()
+    memoryPhase("diagnostics_complete", recovered.journalBytes)
     const close = index.close
     const complete = droppedLines === 0 && close !== undefined
     const completeness = complete ? "complete" : "incomplete"
@@ -665,8 +743,11 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
     const manifestFile = path.join(caseDir, "manifest.json")
     const partialFile = path.join(caseDir, "partial", "latest.json")
     writeStreamingJsonObjectAtomic(traceFile, traceMembers(index, manifest, metrics))
+    memoryPhase("trace_complete", recovered.journalBytes)
     writeStreamingJsonObjectAtomic(manifestFile, Object.entries(manifest))
+    memoryPhase("manifest_complete", recovered.journalBytes)
     writeStreamingJsonObjectAtomic(partialFile, traceMembers(index, manifest, metrics))
+    memoryPhase("partial_complete", recovered.journalBytes)
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
   } finally {
     index.closeIndex()

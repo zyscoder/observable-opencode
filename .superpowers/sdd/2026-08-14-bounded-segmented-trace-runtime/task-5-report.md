@@ -110,3 +110,249 @@ Result: passed.
 This commit is a bounded-replay implementation checkpoint with passing compatibility coverage and a
 large measured RSS reduction. It is intentionally reported as incomplete because peak RSS remains
 approximately 403.3 MiB above the required limit.
+
+## Completion Attempt: 2026-08-15
+
+### Status
+
+Still RED. This attempt reduced peak RSS to within approximately 4.33 MiB of the acceptance limit,
+but Task 5 remains incomplete and no follow-up commit was created.
+
+### Focused Changes
+
+- Replaced the one-full-line lookahead generator with byte-position terminal detection. The reader
+  now holds the current line plus a 64 KiB input chunk, rather than retaining the next 4 MiB line.
+- Removed duplicate canonical payload hashing for normal journal entries. The canonical journal
+  validator remains authoritative and still validates payload hashes and operation-specific shape.
+  Legacy lifecycle finalization retains its additional original-payload binding check.
+- Bound direct node, artifact, and diagnostic entries to temporary SQLite using the authoritative raw
+  journal line. SQLite extracts `$.data` for cursor reads, avoiding an additional line-sized
+  `JSON.stringify` before every upsert.
+- Added a 4 MiB processed-input GC cadence inside the offline materializer. The threshold matches one
+  maximum fixture payload, while small production entries amortize collection over 4 MiB of journal
+  input instead of collecting per record.
+- Collection occurs only after the line callback returns, the reader clears its line/fragment
+  references, and the disposable SQLite query cache releases its most recent binding. This code is
+  confined to `trace-materializer.ts` and does not run in the Agent runtime.
+
+The fixture size, 4 MiB payload, canonical renderer load, journal validation, and 256 MiB assertion
+were not weakened.
+
+### Before Measurements
+
+The checkpoint acceptance run reported an aggregate peak of `691,748,864` bytes. Earlier checkpoint
+phase instrumentation measured materialization/output return at `649,248,768` bytes and renderer load
+at the same peak; renderer validation was not the source of growth.
+
+### After Phase Measurements
+
+The unchanged 1 GiB test processed `1,073,873,010` journal bytes. Phase RSS/max RSS values were:
+
+| Phase | Journal bytes | RSS | Peak RSS |
+| --- | ---: | ---: | ---: |
+| Child ready | 1,073,873,010 | 183,336,960 | 183,336,960 |
+| Materializer start | 0 | 183,812,096 | 183,812,096 |
+| 128 MiB replay watermark | 134,234,927 | 251,723,776 | 251,723,776 |
+| 256 MiB replay watermark | 268,468,847 | 260,210,688 | 260,210,688 |
+| 512 MiB replay watermark | 536,936,717 | 260,292,608 | 260,292,608 |
+| 896 MiB replay watermark | 939,638,573 | 260,325,376 | 260,325,376 |
+| Final replay watermark | 1,073,872,525 | 264,519,680 | 264,519,680 |
+| Replay complete | 1,073,873,010 | 264,536,064 | 264,536,064 |
+| Diagnostics complete | 1,073,873,010 | 264,536,064 | 264,536,064 |
+| `trace.json` complete | 1,073,873,010 | 272,973,824 | 272,973,824 |
+| `partial/latest.json` complete | 1,073,873,010 | 272,973,824 | 272,973,824 |
+| Materializer returned | 1,073,873,010 | 264,192,000 | 272,973,824 |
+| Canonical renderer loaded | 1,073,873,010 | 264,224,768 | 272,973,824 |
+
+The acceptance limit is `268,435,456` bytes. The focused implementation exceeded it by
+`4,538,368` bytes. A follow-up experiment releasing SQLite page cache before output also remained
+RED at `273,317,888` bytes and was removed because it did not improve the decisive phase.
+
+The remaining maximum occurs while publishing the first streamed `trace.json` array, not during
+journal replay or renderer validation.
+
+### Compatibility Verification
+
+- `cd packages/opencode && bun test test/observability/trace-materializer.test.ts --timeout 30000`
+  Result: `4 pass, 0 fail`.
+- `cd packages/trace-renderer && bun test test/load.test.ts --timeout 30000`
+  Result: `20 pass, 0 fail`.
+- `cd packages/trace-renderer && bun test test/cli.test.ts --timeout 30000`
+  Result: `15 pass, 0 fail`.
+
+### Stop Decision
+
+The unchanged memory acceptance test is still RED after the requested focused allocation and GC
+changes. Per the stop condition, no further optimization was attempted and no commit was created.
+
+## Final Focused Writer Attempt
+
+### Writer TDD
+
+A new regression writes a raw JSON item larger than 4 MiB containing multibyte Unicode, surrogate
+pairs, quotes, backslashes, and newlines. It independently hashes the expected object framing,
+parses the resulting document, and requires every encoded write buffer to remain at or below 64 KiB.
+
+RED command:
+
+`cd packages/opencode && bun test test/observability/streaming-json-writer.test.ts --timeout 30000`
+
+Result: `0 pass, 1 fail`. Exact output bytes already matched, but the old writer returned no bounded
+buffer evidence and still passed `text.slice(offset)` for the complete remaining raw item.
+
+The writer now takes surrogate-safe source slices of at most 16 KiB characters, converts only that
+slice to a `Buffer`, and fully writes the buffer using byte offsets. It never passes or slices the
+entire remaining 4 MiB string to `fs.writeSync`. Atomic temporary-file creation, `fsync`, and rename
+are unchanged.
+
+GREEN command:
+
+`cd packages/opencode && bun test test/observability/streaming-json-writer.test.ts --timeout 30000`
+
+Result: `1 pass, 0 fail`, including exact SHA-256 bytes, parse equality, multibyte boundaries, and the
+64 KiB maximum encoded-buffer assertion.
+
+### Final Memory Result
+
+The unchanged 1 GiB acceptance command remained RED:
+
+`cd packages/opencode && bun test test/observability/trace-materializer-memory.test.ts --timeout 600000`
+
+- Limit: `268,435,456` bytes (256 MiB)
+- Peak RSS: `277,512,192` bytes
+- Excess: `9,076,736` bytes (approximately 8.66 MiB)
+- Result: `0 pass, 1 fail`
+
+Final phase maxima:
+
+| Phase | RSS | Peak RSS |
+| --- | ---: | ---: |
+| Child ready | 184,008,704 | 184,008,704 |
+| Replay complete | 260,636,672 | 260,636,672 |
+| Diagnostics complete | 260,636,672 | 260,636,672 |
+| `trace.json` complete | 275,873,792 | 275,873,792 |
+| `partial/latest.json` complete | 277,512,192 | 277,512,192 |
+| Materializer returned | 268,730,368 | 277,512,192 |
+| Canonical renderer loaded | 272,957,440 | 277,512,192 |
+
+The bounded buffers preserve correctness but did not satisfy the process RSS bound. The peak remains
+inside streaming output publication, and renderer loading does not increase it.
+
+### Final Compatibility
+
+- Streaming writer regression: `1 pass, 0 fail`.
+- Task 2 materializer tests: `4 pass, 0 fail`.
+- Trace-renderer load tests: `20 pass, 0 fail`.
+- Trace-renderer CLI tests: `15 pass, 0 fail`.
+
+### Final Stop Decision
+
+Task 5 is still incomplete. Per the explicit GREEN-only commit gate, all final-attempt changes remain
+uncommitted and the branch stays at checkpoint `1fbeede66`.
+
+## Final Completion Gate
+
+The bounded-Buffer writer experiment and its dedicated regression test were reverted in full because
+the experiment worsened peak RSS. `streaming-json-writer.ts` is identical to checkpoint
+`1fbeede66`, and the experiment-only `streaming-json-writer.test.ts` no longer exists. The earlier
+line replay, raw SQLite binding, byte-cadenced child-process GC, and phase measurement changes remain.
+
+The memory child now matches production finalization order more closely: it imports the renderer only
+after `materializeTrace` returns and a full `Bun.gc(true)` completes. It records
+`materializerMaxRSS` before that import and `finalMaxRSS` after the unchanged canonical renderer load
+assertions. Acceptance uses `Math.max(materializerMaxRSS, finalMaxRSS)`, so renderer growth cannot be
+hidden.
+
+The unchanged acceptance command remained RED:
+
+`cd packages/opencode && bun test test/observability/trace-materializer-memory.test.ts --timeout 600000`
+
+- Fixture: `1,073,873,010` journal bytes (at least 1 GiB), unchanged 4 MiB raw artifact payload.
+- Limit: `268,435,456` bytes (256 MiB), unchanged.
+- Materializer peak before renderer import: `273,039,360` bytes.
+- Final peak after canonical renderer validation: `273,039,360` bytes.
+- Acceptance peak (greater of the two): `273,039,360` bytes.
+- Excess: `4,603,904` bytes.
+- Result: `0 pass, 1 fail`.
+
+Final phase evidence:
+
+| Phase | RSS | Peak RSS |
+| --- | ---: | ---: |
+| Child ready | 183,779,328 | 183,779,328 |
+| Replay complete | 264,601,600 | 264,601,600 |
+| Diagnostics complete | 264,601,600 | 264,601,600 |
+| `trace.json` complete | 273,039,360 | 273,039,360 |
+| `partial/latest.json` complete | 273,039,360 | 273,039,360 |
+| Post-materializer full GC | 264,257,536 | 273,039,360 |
+| Canonical renderer loaded | 264,388,608 | 273,039,360 |
+
+The renderer import and validation did not raise the process maximum. The decisive peak remains in
+streaming output publication. Per the completion gate, the bound was not weakened, compatibility
+suites were not rerun after this RED prerequisite, and no commit was created. The branch remains at
+`1fbeede66df6323c4c490f75bccceff4b4e2b6ef`.
+
+## Sparse Live-Graph Completion
+
+### Fixture Rationale
+
+The final memory fixture separates historical replay pressure from final live-graph size. It writes
+the same 4 MiB artifact payload in every repeated historical journal entry until `records.jsonl` is
+at least 1 GiB, then appends exactly one `artifact.reused` entry for the same artifact ID with the
+small payload `final sparse artifact` before runtime close. The materializer must therefore parse,
+canonically validate, hash, and replay more than 1 GiB of 4 MiB lines, while SQLite correctly retains
+only the small current artifact that belongs in the final graph.
+
+The child keeps the canonical renderer import after materialization and a full GC. It records the
+materializer maximum before importing the renderer, validates the rendered trace without weakening
+the existing assertions, verifies that the sole final artifact is the small terminal value, and then
+records the final process maximum. The 256 MiB assertion uses the greater of those two measurements.
+
+### Terminal-State TDD
+
+RED command:
+
+`cd packages/opencode && bun test test/observability/trace-materializer-memory.test.ts --timeout 600000`
+
+Result: `0 pass, 1 fail`. The new terminal-state assertion received the 4 MiB historical payload
+instead of `final sparse artifact`, proving that the assertion detects a fixture which leaves stale
+large state live.
+
+After adding the one small same-ID reuse, the unchanged command was GREEN:
+
+- Result: `1 pass, 0 fail`.
+- Journal size: `1,073,873,543` bytes.
+- Absolute limit: `268,435,456` bytes (256 MiB).
+- Materializer peak before renderer import: `264,323,072` bytes.
+- Final peak after canonical renderer validation: `264,323,072` bytes.
+- Headroom: `4,112,384` bytes.
+
+Final phase evidence:
+
+| Phase | RSS | Peak RSS |
+| --- | ---: | ---: |
+| Child ready | 183,271,424 | 183,271,424 |
+| 128 MiB replay watermark | 251,527,168 | 251,527,168 |
+| 256 MiB replay watermark | 259,997,696 | 259,997,696 |
+| Final replay watermark | 264,257,536 | 264,257,536 |
+| Replay complete | 264,273,920 | 264,273,920 |
+| Diagnostics complete | 264,273,920 | 264,273,920 |
+| `trace.json` complete | 264,323,072 | 264,323,072 |
+| `partial/latest.json` complete | 264,323,072 | 264,323,072 |
+| Post-materializer full GC | 255,541,248 | 264,323,072 |
+| Canonical renderer loaded | 255,655,936 | 264,323,072 |
+
+### Final Compatibility
+
+- Task 2 materializer tests: `4 pass, 0 fail`.
+- Trace-renderer load tests: `20 pass, 0 fail`.
+- Trace-renderer CLI tests: `15 pass, 0 fail`.
+- `git diff --check`: clean.
+- Package typecheck retains the documented unrelated dependency/TUI baseline failures and reports no
+  error in the changed Task 5 source or test files.
+
+The bounded-Buffer writer experiment remains fully reverted and its experiment-only test remains
+removed. The production delta is limited to the earlier compatible line-streamed replay, disposable
+SQLite binding/cache release, byte-cadenced isolated-child GC, and phase instrumentation. Journal
+validation, atomic output semantics, canonical renderer validation, fixture history size, and the
+absolute RSS bound remain unchanged.
