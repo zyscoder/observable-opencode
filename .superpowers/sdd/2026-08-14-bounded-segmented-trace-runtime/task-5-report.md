@@ -356,3 +356,102 @@ removed. The production delta is limited to the earlier compatible line-streamed
 SQLite binding/cache release, byte-cadenced isolated-child GC, and phase instrumentation. Journal
 validation, atomic output semantics, canonical renderer validation, fixture history size, and the
 absolute RSS bound remain unchanged.
+
+## Reviewer Fix Round 1/5
+
+### Finding 1: Deterministic RSS Headroom
+
+The reviewer reproduced a RED peak of `270,286,848` bytes. Three unmodified local baselines peaked at
+`265,175,040`, `267,714,560`, and `264,863,744` bytes; the second run left only `720,896` bytes of
+headroom and confirmed that the prior pass was not deterministic.
+
+`readPhysicalLines` now accumulates each physical line in one reusable growable byte buffer, decodes
+UTF-8 exactly once at the newline, resets only the used length, and reuses capacity. The former array
+of decoded fragments and `StringDecoder` join are gone. A characterization test places the first two
+bytes of an emoji at the end of a 64 KiB read chunk, then appends an unterminated invalid UTF-8 tail;
+the valid prefix is decoded exactly and the torn tail remains recoverable.
+
+After full hash-chain and canonical shape validation, replay now skips the SQLite entity JSON upsert
+when the incoming payload hash is identical to the current hash for that entity. Those historical
+lines are still read, decoded, parsed, hashed, structurally validated, sequence-checked, and chained.
+They cannot change live graph state. The final small artifact has a different hash and is still
+persisted and asserted by the canonical renderer test. This removed the remaining 4 MiB transient
+SQLite binding from identical historical reuses.
+
+Several ordering implementations were measured and rejected before the final design: `RETURNING`
+upserts peaked at `273,203,200` bytes, trigger counters at `272,203,776`, and ID lookups at
+`272,531,456`. Restoring the one-upsert hot path isolated the peak at `267,845,632`. The final scalar
+table counters reset during snapshot replacement and advance only when replay applies changed live
+state; conflict updates preserve the stored ordinal while new IDs append.
+
+Three clean final child runs used the unchanged `1,073,873,543` byte fixture and absolute
+`268,435,456` byte limit:
+
+| Run | Materializer peak before renderer import | Final peak after renderer validation | Headroom |
+| --- | ---: | ---: | ---: |
+| 1 | 255,426,560 | 255,426,560 | 13,008,896 |
+| 2 | 256,442,368 | 256,442,368 | 11,993,088 |
+| 3 | 255,000,576 | 255,000,576 | 13,434,880 |
+
+All three runs were `1 pass, 0 fail`. Renderer import and unchanged canonical validation did not raise
+the process maximum in any run.
+
+### Finding 2: Legacy Prefix Binding
+
+RED: a rehashed legacy lifecycle terminal with `entry_count = 999` materialized instead of failing.
+The previous final-tail recovery path also treated semantic validation errors as torn data.
+
+GREEN: the original, unnormalized lifecycle summary is now checked against the preceding prefix
+length and payload hash before normalized single-entry shape validation. Separate rehashed cases for
+`entry_count`, `last_sequence`, and `last_payload_hash` all fail at the terminal line. Tail recovery is
+limited to an unterminated JSON parse failure; parsed semantic corruption is never dropped.
+
+### Finding 3: Table-Local Ordering
+
+RED: after a line-2 snapshot replaced the node table with seven rows, a later new node appeared
+between replacement rows 3 and 4 because global journal sequence was reused as the table ordinal.
+
+GREEN: each table has a scalar monotonic ordinal. Snapshot replacement resets each scalar and replay
+rebuilds it to that table's replacement length. Changed updates advance the scalar but retain their
+stored ordinal through SQLite conflict handling; genuinely new entities receive the next value and
+append. The exact replacement order, in-place update, and later tail insertion now pass.
+
+### Finding 4: Multibyte Short Writes
+
+RED: a simulated seven-byte `fs.writeSync` returned byte counts to the old UTF-16 string-offset loop,
+which dropped CJK and emoji bytes.
+
+GREEN: the writer takes surrogate-safe slices of at most 16 KiB characters, converts only each slice
+to a Buffer, and fully writes it by byte offset. The regression forces short writes, places a
+surrogate pair on the slice boundary, checks exact output bytes and parse equality, rejects string
+writes, and verifies no requested Buffer exceeds 64 KiB. Atomic open, fsync, close, cleanup, and
+rename behavior is unchanged.
+
+### Finding 5: Bounded Diagnostics
+
+RED: a 2,048-owner integration fixture replaced the two owner-query `.all()` methods with throwing
+guards and failed in alias reconciliation.
+
+GREEN: alias owners and unresolved occurrences are consumed through SQLite cursors. Diagnostic JSON
+prefixes, individual owner fragments, and suffixes are spooled into the disposable SQLite index.
+The atomic writer streams those fragments as one raw JSON value without building graph-sized JS
+arrays or strings. The high-cardinality test forbids both `.all()` paths and verifies exact complete
+alias-collision and unresolved-reference diagnostics, including owner order and counts.
+
+### Round Verification
+
+- Materializer tests: `7 pass, 0 fail`.
+- Bounded short-write writer test: `1 pass, 0 fail`.
+- High-cardinality diagnostic test: `1 pass, 0 fail`.
+- Memory acceptance: three runs, each `1 pass, 0 fail` with peaks listed above.
+- Trace-renderer load tests: `20 pass, 0 fail`.
+- Trace-renderer CLI tests: `15 pass, 0 fail`.
+- `oxlint` on changed TypeScript files: exit `0`, no errors.
+- `git diff --check`: clean.
+- Package typecheck retains only the documented unrelated TUI/SDK/dependency baseline failures and
+  reports no changed-file error.
+
+The disposable diagnostic fragment table can grow with diagnostic output size, intentionally moving
+that state to disk while keeping JS retention bounded. Identical-payload replay relies on the existing
+canonical SHA-256 payload hash contract; hash-equal entries preserve the previously stored equivalent
+JSON representation while parsed trace semantics remain unchanged.

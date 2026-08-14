@@ -1,12 +1,10 @@
 import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import path from "node:path"
-import { StringDecoder } from "node:string_decoder"
 import {
   CAUSAL_IR_VERSION,
   CausalIRJournalValidationError,
   canonicalCausalIREdge,
-  causalIRAliasCollisionDiagnostic,
   causalIRLegacyRef,
   causalIRPayloadHash,
   projectProvenanceTrace,
@@ -23,6 +21,7 @@ import {
 } from "./causal-ir"
 import {
   streamingJsonArray,
+  streamingJsonRawChunks,
   streamingJsonRawItem,
   writeStreamingJsonObjectAtomic,
   type StreamingJsonObjectMember,
@@ -45,6 +44,7 @@ type HashRow = { payload_hash: string }
 type OwnerRow = { node_id: string }
 type LegacyRow = { legacy_ref: string }
 type OccurrenceRow = { owner_type: "node" | "edge"; owner_id: string; field: string }
+type DiagnosticIDRow = { diagnostic_id: string }
 
 const MATERIALIZER_GC_BYTES = 4 * 1024 * 1024
 const MEMORY_WATERMARK_BYTES = 128 * 1024 * 1024
@@ -125,6 +125,22 @@ function isLegacyLifecycleFinalization(entry: CausalIRJournalEntry) {
   return data?.format !== "compact_causal_ir_finalization" && record(data?.trace) !== undefined
 }
 
+function legacyLifecycleSummaryMatchesPrefix(
+  entry: CausalIRJournalEntry,
+  prefixLength: number,
+  precedingPayloadHash: string | undefined,
+) {
+  const data = record(entry.data)
+  const trace = record(data?.trace)
+  const summary = record(trace?.journal)
+  if (!summary) return false
+  return (
+    summary.entry_count === prefixLength &&
+    summary.last_sequence === prefixLength &&
+    (prefixLength === 0 ? summary.last_payload_hash === undefined : summary.last_payload_hash === precedingPayloadHash)
+  )
+}
+
 function validateEntryShape(entry: CausalIRJournalEntry, requireInitialRunNode: boolean) {
   validateCausalIRJournal([normalizedValidationEntry(entry)], { requireInitialRunNode })
 }
@@ -137,6 +153,7 @@ class ReplayIndex {
   private terminalClose: CausalIRRuntimeCloseData | undefined
   private lastOperation: CausalIRJournalEntry["operation"] | undefined
   private lastPayloadHash: string | undefined
+  private readonly nextOrdinal = { nodes: 0, edges: 0, artifacts: 0, diagnostics: 0 }
   recoveredLines = 0
 
   constructor(readonly indexPath: string) {
@@ -188,9 +205,11 @@ class ReplayIndex {
         owner_id TEXT NOT NULL,
         field TEXT NOT NULL
       );
-      CREATE TABLE generated_diagnostics (
-        diagnostic_id TEXT PRIMARY KEY,
-        json TEXT NOT NULL
+      CREATE TABLE generated_diagnostic_fragments (
+        diagnostic_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        json TEXT NOT NULL,
+        PRIMARY KEY (diagnostic_id, ordinal)
       );
     `)
   }
@@ -226,6 +245,11 @@ class ReplayIndex {
       this.validationError("missing record type, entity identity, or payload hash")
     if (isLegacyLifecycleFinalization(entry) && entry.payload_hash !== causalIRPayloadHash(entry.data))
       this.validationError("journal payload hash does not match data")
+    if (
+      isLegacyLifecycleFinalization(entry) &&
+      !legacyLifecycleSummaryMatchesPrefix(entry, line - 1, this.lastPayloadHash)
+    )
+      this.validationError("malformed lifecycle finalization entry")
     try {
       validateEntryShape(entry, line === 1)
     } catch (error) {
@@ -237,27 +261,34 @@ class ReplayIndex {
       .get(hashKey(entry.operation, entry.entity_id))?.payload_hash
     if (entry.previous_payload_hash !== previous)
       this.validationError("previous payload hash does not match entity history")
+    return previous
   }
 
   apply(input: unknown, rawLine: string) {
     if (!record(input)) this.validationError("expected a journal entry object")
     const entry = input as CausalIRJournalEntry
-    this.validate(entry)
+    const previous = this.validate(entry)
+    const unchanged = previous === entry.payload_hash
     const snapshot = lifecycleSnapshot(entry.data)
 
     this.db.transaction(() => {
-      if ((entry.operation === "node.created" || entry.operation === "node.updated") && record(entry.data)) {
+      if (
+        !unchanged &&
+        (entry.operation === "node.created" || entry.operation === "node.updated") &&
+        record(entry.data)
+      ) {
         const node = entry.data as CausalIRNode
-        this.putNode(node, entry.sequence, rawLine, true)
-      } else if (entry.operation === "edge.created" && record(entry.data)) {
-        this.putEdge(canonicalCausalIREdge(entry.data as CausalIREdge), entry.sequence)
+        this.putNode(node, rawLine, true)
+      } else if (!unchanged && entry.operation === "edge.created" && record(entry.data)) {
+        this.putEdge(canonicalCausalIREdge(entry.data as CausalIREdge))
       } else if (
+        !unchanged &&
         (entry.operation === "artifact.created" || entry.operation === "artifact.reused") &&
         record(entry.data)
       ) {
-        this.putArtifact(entry.data as ArtifactLike, entry.sequence, rawLine, true)
-      } else if (entry.operation === "diagnostic.created" && record(entry.data)) {
-        this.putDiagnostic(entry.data as CausalIRDiagnosticLike, entry.sequence, rawLine, true)
+        this.putArtifact(entry.data as ArtifactLike, rawLine, true)
+      } else if (!unchanged && entry.operation === "diagnostic.created" && record(entry.data)) {
+        this.putDiagnostic(entry.data as CausalIRDiagnosticLike, rawLine, true)
       } else if ((entry.operation === "case.checkpointed" || entry.operation === "case.finalized") && snapshot) {
         this.replaceSnapshot(snapshot)
       }
@@ -285,7 +316,7 @@ class ReplayIndex {
     this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : undefined
   }
 
-  private putNode(node: CausalIRNode, ordinal: number, json = JSON.stringify(node), wrapped = false) {
+  private putNode(node: CausalIRNode, json = JSON.stringify(node), wrapped = false) {
     this.db
       .query(
         `
@@ -293,10 +324,10 @@ class ReplayIndex {
         ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(node.node_id, ordinal, node.kind, wrapped ? 1 : 0, json)
+      .run(node.node_id, ++this.nextOrdinal.nodes, node.kind, wrapped ? 1 : 0, json)
   }
 
-  private putEdge(edge: CausalIREdge, ordinal: number) {
+  private putEdge(edge: CausalIREdge) {
     this.db
       .query(
         `
@@ -304,10 +335,10 @@ class ReplayIndex {
         ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(edge.edge_id, ordinal, JSON.stringify(edge))
+      .run(edge.edge_id, ++this.nextOrdinal.edges, JSON.stringify(edge))
   }
 
-  private putArtifact(artifact: ArtifactLike, ordinal: number, json = JSON.stringify(artifact), wrapped = false) {
+  private putArtifact(artifact: ArtifactLike, json = JSON.stringify(artifact), wrapped = false) {
     this.db
       .query(
         `
@@ -315,15 +346,10 @@ class ReplayIndex {
         ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(artifact.artifact_id, ordinal, wrapped ? 1 : 0, json)
+      .run(artifact.artifact_id, ++this.nextOrdinal.artifacts, wrapped ? 1 : 0, json)
   }
 
-  private putDiagnostic(
-    diagnostic: CausalIRDiagnosticLike,
-    ordinal: number,
-    json = JSON.stringify(diagnostic),
-    wrapped = false,
-  ) {
+  private putDiagnostic(diagnostic: CausalIRDiagnosticLike, json = JSON.stringify(diagnostic), wrapped = false) {
     this.db
       .query(
         `
@@ -333,7 +359,7 @@ class ReplayIndex {
       )
       .run(
         diagnostic.diagnostic_id,
-        ordinal,
+        ++this.nextOrdinal.diagnostics,
         typeof diagnostic.kind === "string" ? diagnostic.kind : null,
         wrapped ? 1 : 0,
         json,
@@ -342,10 +368,14 @@ class ReplayIndex {
 
   private replaceSnapshot(snapshot: CausalIRStoreSnapshot) {
     this.db.exec("DELETE FROM nodes; DELETE FROM edges; DELETE FROM artifacts; DELETE FROM diagnostics")
-    for (const [index, node] of snapshot.nodes.entries()) this.putNode(node, index + 1)
-    for (const [index, edge] of snapshot.edges.entries()) this.putEdge(canonicalCausalIREdge(edge), index + 1)
-    for (const [index, artifact] of snapshot.artifacts.entries()) this.putArtifact(artifact, index + 1)
-    for (const [index, diagnostic] of snapshot.diagnostics.entries()) this.putDiagnostic(diagnostic, index + 1)
+    this.nextOrdinal.nodes = 0
+    this.nextOrdinal.edges = 0
+    this.nextOrdinal.artifacts = 0
+    this.nextOrdinal.diagnostics = 0
+    for (const node of snapshot.nodes) this.putNode(node)
+    for (const edge of snapshot.edges) this.putEdge(canonicalCausalIREdge(edge))
+    for (const artifact of snapshot.artifacts) this.putArtifact(artifact)
+    for (const diagnostic of snapshot.diagnostics) this.putDiagnostic(diagnostic)
   }
 
   private replacePayloadHashes(
@@ -373,7 +403,7 @@ class ReplayIndex {
   }
 
   reconcileDiagnostics() {
-    this.db.exec("DELETE FROM aliases; DELETE FROM unresolved_occurrences; DELETE FROM generated_diagnostics")
+    this.db.exec("DELETE FROM aliases; DELETE FROM unresolved_occurrences; DELETE FROM generated_diagnostic_fragments")
     for (const row of this.entityRows("nodes")) {
       const node = JSON.parse(row.json) as CausalIRNode
       for (const alias of node.aliases)
@@ -407,42 +437,95 @@ class ReplayIndex {
     for (const row of this.db
       .query<{ alias: string }, []>("SELECT alias FROM aliases GROUP BY alias HAVING COUNT(*) > 1")
       .iterate()) {
-      const owners = this.db
-        .query<OwnerRow, [string]>("SELECT node_id FROM aliases WHERE alias = ? ORDER BY node_id")
-        .all(row.alias)
-        .map((owner) => owner.node_id)
-      const diagnostic = causalIRAliasCollisionDiagnostic(row.alias, owners)
-      if (diagnostic) this.putGeneratedDiagnostic(diagnostic)
+      const diagnosticID = `alias_collision:${causalIRPayloadHash(row.alias).slice(0, 16)}`
+      const head = {
+        diagnostic_id: diagnosticID,
+        kind: "alias_collision",
+        level: "warning",
+        message: `Ambiguous causal alias: ${row.alias}`,
+        alias: row.alias,
+      }
+      this.spoolGeneratedDiagnostic(
+        diagnosticID,
+        `${JSON.stringify(head).slice(0, -1)},"owner_ids":[`,
+        this.db
+          .query<OwnerRow, [string]>("SELECT node_id FROM aliases WHERE alias = ? ORDER BY node_id")
+          .iterate(row.alias),
+        (owner) => JSON.stringify(owner.node_id),
+        "]}",
+      )
     }
     for (const row of this.db
       .query<LegacyRow, []>("SELECT legacy_ref FROM unresolved_occurrences GROUP BY legacy_ref")
       .iterate()) {
-      const affected = this.db
+      const first = this.db
         .query<
           OccurrenceRow,
           [string]
-        >("SELECT owner_type, owner_id, field FROM unresolved_occurrences WHERE legacy_ref = ? ORDER BY ordinal")
-        .all(row.legacy_ref)
-      const first = affected[0]
-      this.putGeneratedDiagnostic({
-        diagnostic_id: `unresolved_ref:${causalIRPayloadHash(row.legacy_ref).slice(0, 16)}`,
+        >("SELECT owner_type, owner_id, field FROM unresolved_occurrences WHERE legacy_ref = ? ORDER BY ordinal LIMIT 1")
+        .get(row.legacy_ref)
+      const count = this.db
+        .query<CountRow, [string]>("SELECT COUNT(*) AS count FROM unresolved_occurrences WHERE legacy_ref = ?")
+        .get(row.legacy_ref)!.count
+      const diagnosticID = `unresolved_ref:${causalIRPayloadHash(row.legacy_ref).slice(0, 16)}`
+      const head = {
+        diagnostic_id: diagnosticID,
         kind: "unresolved_ref",
         level: "warning",
         message: `Unresolved causal reference: ${row.legacy_ref}`,
         legacy_ref: row.legacy_ref,
-        occurrence_count: affected.length,
-        affected_owners: affected,
+        occurrence_count: count,
+      }
+      const tail = {
         owner_type: first?.owner_type,
         field: first?.field,
         ...(first?.owner_type === "node" ? { node_id: first.owner_id } : first ? { edge_id: first.owner_id } : {}),
-      })
+      }
+      this.spoolGeneratedDiagnostic(
+        diagnosticID,
+        `${JSON.stringify(head).slice(0, -1)},"affected_owners":[`,
+        this.db
+          .query<
+            OccurrenceRow,
+            [string]
+          >("SELECT owner_type, owner_id, field FROM unresolved_occurrences WHERE legacy_ref = ? ORDER BY ordinal")
+          .iterate(row.legacy_ref),
+        (owner) => JSON.stringify(owner),
+        `],${JSON.stringify(tail).slice(1)}`,
+      )
     }
   }
 
   private putGeneratedDiagnostic(diagnostic: CausalIRDiagnosticLike) {
-    this.db
-      .query("INSERT OR REPLACE INTO generated_diagnostics(diagnostic_id, json) VALUES (?, ?)")
-      .run(diagnostic.diagnostic_id, JSON.stringify(diagnostic))
+    this.db.transaction(() => {
+      this.db.query("DELETE FROM generated_diagnostic_fragments WHERE diagnostic_id = ?").run(diagnostic.diagnostic_id)
+      this.db
+        .query("INSERT INTO generated_diagnostic_fragments(diagnostic_id, ordinal, json) VALUES (?, 0, ?)")
+        .run(diagnostic.diagnostic_id, JSON.stringify(diagnostic))
+    })()
+  }
+
+  private spoolGeneratedDiagnostic<T>(
+    diagnosticID: string,
+    prefix: string,
+    rows: Iterable<T>,
+    serialize: (row: T) => string,
+    suffix: string,
+  ) {
+    this.db.transaction(() => {
+      const insert = this.db.query(
+        "INSERT INTO generated_diagnostic_fragments(diagnostic_id, ordinal, json) VALUES (?, ?, ?)",
+      )
+      this.db.query("DELETE FROM generated_diagnostic_fragments WHERE diagnostic_id = ?").run(diagnosticID)
+      let ordinal = 0
+      insert.run(diagnosticID, ordinal++, prefix)
+      let first = true
+      for (const row of rows) {
+        insert.run(diagnosticID, ordinal++, `${first ? "" : ","}${serialize(row)}`)
+        first = false
+      }
+      insert.run(diagnosticID, ordinal, suffix)
+    })()
   }
 
   count(table: "nodes" | "edges" | "artifacts") {
@@ -478,9 +561,22 @@ class ReplayIndex {
       .iterate())
       yield streamingJsonRawItem(row.json)
     for (const row of this.db
-      .query<JsonRow, []>("SELECT json FROM generated_diagnostics ORDER BY diagnostic_id")
+      .query<
+        DiagnosticIDRow,
+        []
+      >("SELECT DISTINCT diagnostic_id FROM generated_diagnostic_fragments ORDER BY diagnostic_id")
       .iterate())
-      yield streamingJsonRawItem(row.json)
+      yield streamingJsonRawChunks(this.generatedDiagnosticChunks(row.diagnostic_id))
+  }
+
+  private *generatedDiagnosticChunks(diagnosticID: string) {
+    for (const row of this.db
+      .query<
+        JsonRow,
+        [string]
+      >("SELECT json FROM generated_diagnostic_fragments WHERE diagnostic_id = ? ORDER BY ordinal")
+      .iterate(diagnosticID))
+      yield row.json
   }
 
   *compatibilityRecords(manifest: Record<string, unknown>, metrics: Record<string, unknown>) {
@@ -548,48 +644,51 @@ function memoryPhase(phase: string, journalBytes = 0) {
 
 function readPhysicalLines(
   file: string,
-  visit: (line: string, lineNumber: number, terminal: boolean) => void,
+  visit: (line: string, lineNumber: number, recoverableTail: boolean) => void,
   afterLine: (sourceBytes: number) => void,
 ) {
   const fd = fs.openSync(file, "r")
-  const fileSize = fs.fstatSync(fd).size
-  const decoder = new StringDecoder("utf8")
   const chunk = Buffer.allocUnsafe(64 * 1024)
-  let parts: string[] = []
-  let lineBytes = 0
+  let lineBuffer = Buffer.allocUnsafe(64 * 1024)
+  let lineLength = 0
   let lineNumber = 0
-  let fileOffset = 0
+
+  const append = (start: number, end: number) => {
+    const sourceLength = end - start
+    const required = lineLength + sourceLength
+    if (required > lineBuffer.length) {
+      let capacity = lineBuffer.length
+      while (capacity < required) capacity += Math.max(64 * 1024, Math.ceil(capacity / 2 / (64 * 1024)) * 64 * 1024)
+      const grown = Buffer.allocUnsafe(capacity)
+      lineBuffer.copy(grown, 0, 0, lineLength)
+      lineBuffer = grown
+    }
+    chunk.copy(lineBuffer, lineLength, start, end)
+    lineLength = required
+  }
+
+  const emit = (recoverableTail: boolean, newlineBytes: number) => {
+    const decodedLength = lineLength > 0 && lineBuffer[lineLength - 1] === 0x0d ? lineLength - 1 : lineLength
+    let line: string | undefined = lineBuffer.toString("utf8", 0, decodedLength)
+    visit(line, ++lineNumber, recoverableTail)
+    line = undefined
+    afterLine(lineLength + newlineBytes)
+    lineLength = 0
+  }
+
   try {
     while (true) {
       const bytes = fs.readSync(fd, chunk, 0, chunk.length, null)
       if (!bytes) break
-      const chunkOffset = fileOffset
-      fileOffset += bytes
       let start = 0
       for (let index = chunk.indexOf(0x0a, start); index !== -1 && index < bytes; index = chunk.indexOf(0x0a, start)) {
-        lineBytes += index - start
-        parts.push(decoder.write(chunk.subarray(start, index)))
-        let line: string | undefined = parts.join("")
-        parts = []
-        if (line.endsWith("\r")) line = line.slice(0, -1)
-        visit(line, ++lineNumber, chunkOffset + index === fileSize - 1)
-        line = undefined
-        afterLine(lineBytes + 1)
-        lineBytes = 0
+        append(start, index)
+        emit(false, 1)
         start = index + 1
       }
-      lineBytes += bytes - start
-      parts.push(decoder.write(chunk.subarray(start, bytes)))
+      append(start, bytes)
     }
-    parts.push(decoder.end())
-    if (lineBytes > 0) {
-      let line: string | undefined = parts.join("")
-      parts = []
-      if (line.endsWith("\r")) line = line.slice(0, -1)
-      visit(line, ++lineNumber, true)
-      line = undefined
-      afterLine(lineBytes)
-    }
+    if (lineLength > 0) emit(true, 0)
   } finally {
     fs.closeSync(fd)
   }
@@ -616,15 +715,15 @@ function recoverJournal(recordsFile: string, index: ReplayIndex) {
   let bytesSinceGC = 0
   let nextWatermark = MEMORY_WATERMARK_BYTES
 
-  const processLine = (line: string, lineNumber: number, terminal: boolean) => {
+  const processLine = (line: string, lineNumber: number, recoverableTail: boolean) => {
     try {
       index.apply(parseLine(line), line)
     } catch (error) {
-      if (terminal && index.recoveredLines > 0) {
+      if (recoverableTail && error instanceof JournalJsonError && index.recoveredLines > 0) {
         droppedLines = 1
         return
       }
-      if (terminal && index.recoveredLines === 0) throw new Error(`${recordsFile}:1: journal is empty`)
+      if (recoverableTail && index.recoveredLines === 0) throw new Error(`${recordsFile}:1: journal is empty`)
       if (error instanceof JournalJsonError)
         throw new Error(`${recordsFile}:${lineNumber}: invalid JSONL entry (${error.message})`)
       const detail = error instanceof Error ? error.message : String(error)
