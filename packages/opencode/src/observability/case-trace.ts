@@ -18,6 +18,7 @@ import {
   type CausalIRNode,
   type CausalIROrigin,
   type CausalIRRef,
+  type CausalIRRuntimeCloseData,
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
@@ -1060,10 +1061,18 @@ type TraceEventInput = {
   data?: unknown
 }
 
-type FinishTraceInput = {
+export type FinishTraceInput = {
   status?: Exclude<TraceStatus, "running">
   result?: Record<string, unknown>
   error?: unknown
+}
+
+export type TraceMaterializationRequest = {
+  caseDir: string
+  caseID: string
+  runID: string
+  sessionID?: string
+  recordsFile: string
 }
 
 type ContextSnapshotInput = Omit<TraceContextSnapshot, "snapshot_id" | "messages" | "system" | "tools" | "metadata"> & {
@@ -2135,6 +2144,10 @@ class TraceOwnedCausalIRStore {
 
   finalize(data: unknown): CausalIRCommitResult {
     return this.store.finalize(data)
+  }
+
+  closeRuntime(data: CausalIRRuntimeCloseData): CausalIRCommitResult {
+    return this.store.closeRuntime(this.copy(data))
   }
 
   snapshot(): CausalIRStoreSnapshot {
@@ -8756,6 +8769,55 @@ class ActiveCaseTrace {
     }
   }
 
+  closeRuntime(input?: FinishTraceInput): TraceMaterializationRequest | undefined {
+    if (this.finished || (this.signalFinalized && !this.signalFinalizationInProgress)) return
+    const error = input?.error ? errorInfo(input.error) : undefined
+    const status = input?.status ?? (error ? "error" : "success")
+    const closedAt = nowIso()
+    let cancelledSpans = 0
+    for (const span of this.spans.values()) {
+      if (span.status !== "running") continue
+      cancelledSpans += 1
+      span.status = "cancelled"
+      span.end_time = closedAt
+      span.end_ms = Date.now() - this.startedAt
+      span.duration_ms = Math.max(0, span.end_ms - span.start_ms)
+      span.metadata = {
+        ...(span.metadata ?? {}),
+        finalized_status: "runtime_close",
+        finalized_reason: "worker_shutdown",
+      }
+    }
+    const result =
+      input?.result === undefined
+        ? this.result
+        : (sanitizeTraceJson(input.result, "result", ["runtime_close", "result"]) as Record<string, unknown>)
+    this.causalIR.closeRuntime({
+      format: "runtime_close",
+      status,
+      closed_at: closedAt,
+      result: {
+        ...(result ?? {}),
+        open_lifecycle: { cancelled_spans: cancelledSpans },
+      },
+      ...(error ? { error } : {}),
+      manifest: {
+        case_id: this.caseID,
+        run_id: this.runID,
+        ...(this.sessionID ? { session_id: this.sessionID } : {}),
+      },
+    })
+    this.responseSourceBySegmentID.clear()
+    this.finished = true
+    return Object.freeze({
+      caseDir: this.caseDir,
+      caseID: this.caseID,
+      runID: this.runID,
+      ...(this.sessionID ? { sessionID: this.sessionID } : {}),
+      recordsFile: this.recordsFile,
+    })
+  }
+
   flushForSignal(signal: NodeJS.Signals) {
     if (this.signalFinalized) return
     this.signalFinalized = signal
@@ -11708,6 +11770,20 @@ export namespace CaseTrace {
     } catch {} finally {
       compatibilityFinished = true
     }
+  }
+
+  export function closeAll(input?: FinishTraceInput): TraceMaterializationRequest[] {
+    if (!enabledFromEnv()) return []
+    const requests: TraceMaterializationRequest[] = []
+    try {
+      registry?.finishAll((trace) => {
+        const request = trace.closeRuntime(input)
+        if (request) requests.push(request)
+      })
+    } catch {} finally {
+      compatibilityFinished = true
+    }
+    return requests
   }
 
   export function finish(input?: FinishTraceInput) {

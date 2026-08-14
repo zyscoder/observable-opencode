@@ -424,6 +424,7 @@ export type CausalIRJournalEntry = {
     | "diagnostic.created"
     | "case.checkpointed"
     | "case.finalized"
+    | "case.runtime_closed"
   record_type: string
   entity_id?: string
   previous_payload_hash?: string
@@ -448,6 +449,19 @@ export type CausalIRCommitResult = {
   sequence: number
   payload_hash: string | undefined
   poisoned: boolean
+}
+
+export type CausalIRRuntimeCloseData = {
+  format: "runtime_close"
+  status: "success" | "error" | "cancelled"
+  closed_at: string
+  result?: unknown
+  error?: unknown
+  manifest: {
+    case_id: string
+    run_id: string
+    session_id?: string
+  }
 }
 
 export type CausalIRStoreSnapshot = {
@@ -1427,6 +1441,18 @@ function isCompactFinalizationJournalData(input: unknown): input is CausalIRFina
   )
 }
 
+function isRuntimeCloseJournalData(input: unknown, runID: string, caseID: string): input is CausalIRRuntimeCloseData {
+  if (!journalRecord(input) || !journalRecord(input.manifest)) return false
+  return (
+    input.format === "runtime_close" &&
+    (input.status === "success" || input.status === "error" || input.status === "cancelled") &&
+    journalString(input.closed_at) &&
+    input.manifest.case_id === caseID &&
+    input.manifest.run_id === runID &&
+    (input.manifest.session_id === undefined || journalString(input.manifest.session_id))
+  )
+}
+
 function isCausalIRTraceEnvelope(input: unknown): input is CausalIRTraceEnvelope {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
   const value = input as Partial<CausalIRTraceEnvelope>
@@ -1479,6 +1505,7 @@ const causalIRJournalOperations = new Set<CausalIRJournalEntry["operation"]>([
   "diagnostic.created",
   "case.checkpointed",
   "case.finalized",
+  "case.runtime_closed",
 ])
 
 function journalRecord(input: unknown): input is Record<string, unknown> {
@@ -1643,6 +1670,7 @@ function journalEntryHashKey(operation: CausalIRJournalEntry["operation"], entit
       return `diagnostic:${entityID}`
     case "case.checkpointed":
     case "case.finalized":
+    case "case.runtime_closed":
       return `case:${entityID}`
   }
 }
@@ -1668,11 +1696,13 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
   let runID = ""
   let caseID = ""
   let precedingJournalPayloadHash: string | undefined
+  let runtimeClosed = false
   const payloadHashes = new Map<string, string>()
 
   for (let index = 0; index < journal.length; index++) {
     const line = index + 1
     const item = journal[index]
+    if (runtimeClosed) throw new CausalIRJournalValidationError(line, "entry follows runtime close terminal")
     if (!journalRecord(item)) throw new CausalIRJournalValidationError(line, "expected a journal entry object")
     if (!Number.isSafeInteger(item.sequence) || item.sequence !== line)
       throw new CausalIRJournalValidationError(line, `expected contiguous sequence ${line}`)
@@ -1758,6 +1788,15 @@ export function validateCausalIRJournal(journal: unknown[], options: CausalIRJou
           !lifecycleJournalSummaryMatchesPrefix(item.data.trace.journal, line, precedingJournalPayloadHash)
         )
           throw new CausalIRJournalValidationError(line, "malformed lifecycle finalization entry")
+        break
+      case "case.runtime_closed":
+        if (item.entity_id !== caseID)
+          throw new CausalIRJournalValidationError(line, "runtime close case identity does not match journal")
+        if (item.record_type !== "runtime_close")
+          throw new CausalIRJournalValidationError(line, "runtime close record type does not match journal")
+        if (!isRuntimeCloseJournalData(item.data, runID, caseID))
+          throw new CausalIRJournalValidationError(line, "malformed runtime close entry")
+        runtimeClosed = true
         break
     }
     payloadHashes.set(hashKey, entryPayloadHash)
@@ -1945,6 +1984,10 @@ export class CausalIRStore {
       ...(canonical ? { canonical } : {}),
     }
     return this.append("case.finalized", "finish", this.input.caseID, compact, "case")
+  }
+
+  closeRuntime(data: CausalIRRuntimeCloseData): CausalIRCommitResult {
+    return this.append("case.runtime_closed", "runtime_close", this.input.caseID, data, "case")
   }
 
   synchronize(): CausalIRStoreSnapshot {

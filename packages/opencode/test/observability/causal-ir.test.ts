@@ -366,6 +366,79 @@ describe("causal IR store", () => {
     expect(replayCausalIRJournal(journal)).toEqual(store.snapshot())
   })
 
+  test("records a compact runtime close as the terminal journal entry", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_runtime_close",
+      caseID: "case_runtime_close",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("node_before_runtime_close"))
+    store.checkpoint({ reason: "runtime_close_hash_chain" })
+    const beforeClose = journal.at(-1)
+
+    const result = store.closeRuntime({
+      format: "runtime_close",
+      status: "cancelled",
+      closed_at: "2026-08-14T12:00:00.000Z",
+      result: { reason: "worker.shutdown" },
+      manifest: {
+        case_id: "case_runtime_close",
+        run_id: "run_runtime_close",
+        session_id: "ses_runtime_close",
+      },
+    })
+
+    const terminal = journal.at(-1)
+    expect(result).toMatchObject({ committed: true, operation: "case.runtime_closed" })
+    expect(terminal).toMatchObject({
+      operation: "case.runtime_closed",
+      record_type: "runtime_close",
+      entity_id: "case_runtime_close",
+      previous_payload_hash: beforeClose?.payload_hash,
+      data: {
+        format: "runtime_close",
+        status: "cancelled",
+        result: { reason: "worker.shutdown" },
+        manifest: {
+          case_id: "case_runtime_close",
+          run_id: "run_runtime_close",
+          session_id: "ses_runtime_close",
+        },
+      },
+    })
+    expect(() => validateCausalIRJournal(journal)).not.toThrow()
+  })
+
+  test("rejects journal entries after a runtime close terminal", () => {
+    const journal: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_runtime_terminal",
+      caseID: "case_runtime_terminal",
+      append: (entry) => journal.push(entry),
+    })
+    store.createNode(node("node_before_runtime_terminal"))
+    store.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-14T12:00:00.000Z",
+      manifest: { case_id: "case_runtime_terminal", run_id: "run_runtime_terminal" },
+    })
+    const first = journal[0]!
+    const terminal = journal.at(-1)!
+
+    journal.push({
+      ...first,
+      sequence: terminal.sequence + 1,
+      operation: "node.updated",
+      record_type: "node.update",
+      previous_payload_hash: first.payload_hash,
+      data: first.data,
+    })
+
+    expect(() => validateCausalIRJournal(journal)).toThrow("entry follows runtime close terminal")
+  })
+
   test("keeps finalization compact regardless of graph payload size", () => {
     const journal: CausalIRJournalEntry[] = []
     const store = new CausalIRStore({
@@ -987,6 +1060,7 @@ describe("causal IR store", () => {
       "diagnostic.created": "diagnostic",
       "case.checkpointed": "checkpoint",
       "case.finalized": "finish",
+      "case.runtime_closed": "runtime_close",
     }
     for (const [index, entry] of journal.entries()) {
       expect(entry.sequence).toBe(index + 1)

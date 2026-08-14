@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import * as CausalIRModule from "@/observability/causal-ir"
-import { replayCausalIRJournal } from "@/observability/causal-ir"
+import { replayCausalIRJournal, validateCausalIRJournal } from "@/observability/causal-ir"
 import type { ProvenanceTraceSummary, TraceSummary } from "@/observability/case-trace"
 
 process.env.OPENCODE_CASE_TRACE_QUIET = "1"
@@ -321,6 +321,80 @@ function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partia
 }
 
 describe("case trace", () => {
+  test("closes all active traces into runtime materialization requests without writing trace projections", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-runtime-close-"))
+    const packageDir = path.resolve(import.meta.dir, "../..")
+    const script = path.join(dir, "runtime-close.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    try {
+      await fs.writeFile(
+        script,
+        [
+          `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+          `CaseTrace.configure({ caseID: "runtime-close" })`,
+          `CaseTrace.event({ component: "runtime", event_type: "root.lifecycle", data: { sessionID: "ses_runtime_close" } })`,
+          `CaseTrace.startSpan({ component: "run", operation: "execute", trace_scope: "process" })`,
+          `process.stdout.write(JSON.stringify(CaseTrace.closeAll({ status: "success", result: { reason: "worker.shutdown" } })))`,
+        ].join("\n"),
+      )
+
+      const proc = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: "1",
+          OPENCODE_CASE_TRACE_DIR: dir,
+          OPENCODE_CASE_TRACE_QUIET: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(await proc.exited).toBe(0)
+      expect(await new Response(proc.stderr).text()).toBe("")
+
+      const requests = JSON.parse(await new Response(proc.stdout).text()) as Array<{
+        caseDir: string
+        caseID: string
+        runID: string
+        sessionID?: string
+        recordsFile: string
+      }>
+      expect(requests).toHaveLength(2)
+      expect(requests.map((request) => request.sessionID).sort()).toEqual(["ses_runtime_close", undefined])
+      for (const request of requests) {
+        const caseDir = request.caseDir
+        expect(request).toMatchObject({
+          caseDir: expect.any(String),
+          caseID: expect.any(String),
+          runID: expect.any(String),
+          recordsFile: path.join(caseDir, "records.jsonl"),
+        })
+        expect(await exists(path.join(caseDir, "trace.json"))).toBe(false)
+        const journal = (await fs.readFile(request.recordsFile, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        expect(() => validateCausalIRJournal(journal)).not.toThrow()
+        expect(journal.at(-1)).toMatchObject({
+          operation: "case.runtime_closed",
+          data: {
+            format: "runtime_close",
+            status: "success",
+            result: expect.objectContaining({ reason: "worker.shutdown" }),
+            manifest: {
+              case_id: request.caseID,
+              run_id: request.runID,
+              ...(request.sessionID ? { session_id: request.sessionID } : {}),
+            },
+          },
+        })
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("isolates root sessions and keeps child aliases in the parent trace", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-trace-session-routing-"))
     const packageDir = path.resolve(import.meta.dir, "../..")
