@@ -67,6 +67,8 @@ export type CausalIRDiagnosticQuery = {
   reverse?: boolean
 }
 
+export type CausalIRRuntimeStoreFault = "mutation" | "query" | "transaction"
+
 type CausalIRRuntimeStoreInput = {
   runID: string
   caseID: string
@@ -74,6 +76,7 @@ type CausalIRRuntimeStoreInput = {
   append?: (entry: CausalIRJournalEntry) => unknown
   hotNodeLimit?: number
   hotEdgeLimit?: number
+  fault?: (operation: CausalIRRuntimeStoreFault) => void
 }
 
 type EntityRow = {
@@ -204,6 +207,8 @@ export class CausalIRRuntimeStore {
   private poisoned = false
   private lastJournalPayloadHash: string | undefined
   private closed = false
+  private disabled = false
+  private durableTransactionPrefix: CausalIRJournalEntry[] | undefined
 
   constructor(private readonly input: CausalIRRuntimeStoreInput) {
     this.hotNodes = new LRU(input.hotNodeLimit ?? 512)
@@ -300,6 +305,13 @@ export class CausalIRRuntimeStore {
   }
 
   resolveReference(input: string | CausalIRRef | CausalEdgeLike["from"]): CausalIRRef {
+    const fallback = typedCausalIRReference(input)
+    return this.passiveQuery({ ...fallback, ref_type: fallback.ref_type === "node" ? "external" : fallback.ref_type }, () =>
+      this.resolveReferenceUnsafe(input),
+    )
+  }
+
+  private resolveReferenceUnsafe(input: string | CausalIRRef | CausalEdgeLike["from"]): CausalIRRef {
     const ref = typedCausalIRReference(input)
     if (ref.ref_type !== "node") return ref
     const legacy = causalIRLegacyRef(ref)
@@ -320,15 +332,21 @@ export class CausalIRRuntimeStore {
   }
 
   createNode<T extends CausalNodeLike>(node: T): T {
-    return this.upsertNode(copyCausalIRJournalData(node), "node.created", "node")
+    const copied = copyCausalIRJournalData(node)
+    return this.passiveMutation(copied, () => this.upsertNode(copied, "node.created", "node"))
   }
 
   updateNode<T extends CausalNodeLike>(node: T): T {
-    return this.upsertNode(copyCausalIRJournalData(node), "node.updated", "node.update")
+    const copied = copyCausalIRJournalData(node)
+    return this.passiveMutation(copied, () => this.upsertNode(copied, "node.updated", "node.update"))
   }
 
   replaceNodes(nodes: CausalNodeLike[]): void {
     const copied = copyCausalIRJournalData(nodes)
+    this.passiveMutation(undefined, () => this.replaceNodesUnsafe(copied))
+  }
+
+  private replaceNodesUnsafe(copied: CausalNodeLike[]): void {
     const nodeIDs = new Set(copied.map((node) => node.node_id))
     const aliases = new Map<string, Set<string>>()
     for (const node of copied) {
@@ -388,6 +406,11 @@ export class CausalIRRuntimeStore {
 
   createEdge<T extends CausalEdgeLike>(edge: T): T {
     const copied = canonicalCausalEdge(copyCausalIRJournalData(edge))
+    return this.passiveMutation(copyCausalIRJournalData(copied) as T, () => this.createEdgeUnsafe(copied) as T)
+  }
+
+  private createEdgeUnsafe<T extends CausalEdgeLike>(edge: T): T {
+    const copied = edge
     const canonical = canonicalCausalIREdge(copied, this.resolveReference.bind(this))
     const stored = this.transact(() => {
       const order = this.edgeOrder(copied.edge_id) ?? ++this.edgeSequence
@@ -405,6 +428,10 @@ export class CausalIRRuntimeStore {
 
   replaceEdges(edges: CausalEdgeLike[]): void {
     const copied = normalizeCausalIREdges(copyCausalIRJournalData(edges))
+    this.passiveMutation(undefined, () => this.replaceEdgesUnsafe(copied))
+  }
+
+  private replaceEdgesUnsafe(copied: CausalEdgeLike[]): void {
     this.transact(() => {
       this.db.exec("DELETE FROM refs WHERE owner_type = 'edge'; DELETE FROM edges")
       this.clearPayloadHashes("edge")
@@ -424,6 +451,10 @@ export class CausalIRRuntimeStore {
 
   createArtifact<T extends ArtifactLike>(artifact: T): T {
     const copied = copyCausalIRJournalData(artifact)
+    return this.passiveMutation(copied, () => this.createArtifactUnsafe(copied))
+  }
+
+  private createArtifactUnsafe<T extends ArtifactLike>(copied: T): T {
     this.transact(() => {
       const order = ++this.artifactSequence
       const committed = this.append("artifact.created", "artifact", copied.artifact_id, copied)
@@ -435,6 +466,10 @@ export class CausalIRRuntimeStore {
 
   reuseArtifact<T extends ArtifactLike>(artifact: T): T {
     const copied = copyCausalIRJournalData(artifact)
+    return this.passiveMutation(copied, () => this.reuseArtifactUnsafe(copied))
+  }
+
+  private reuseArtifactUnsafe<T extends ArtifactLike>(copied: T): T {
     this.transact(() => {
       const order = this.artifactOrder(copied.artifact_id) ?? ++this.artifactSequence
       const committed = this.append("artifact.reused", "artifact.reuse", copied.artifact_id, copied, "artifact")
@@ -446,6 +481,10 @@ export class CausalIRRuntimeStore {
 
   createDiagnostic<T extends CausalIRDiagnosticLike>(diagnostic: T): T {
     const copied = copyCausalIRJournalData(diagnostic)
+    return this.passiveMutation(copied, () => this.createDiagnosticUnsafe(copied))
+  }
+
+  private createDiagnosticUnsafe<T extends CausalIRDiagnosticLike>(copied: T): T {
     this.transact(() => {
       const committed = this.append("diagnostic.created", "diagnostic", copied.diagnostic_id, copied)
       if (!committed.committed) throw ROLLBACK
@@ -455,6 +494,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryNodes(query: CausalIRNodeQuery = {}): CausalNodeLike[] {
+    return this.passiveQuery([], () => this.queryNodesUnsafe(query))
+  }
+
+  private queryNodesUnsafe(query: CausalIRNodeQuery): CausalNodeLike[] {
     if (query.ids?.length === 0 || query.kinds?.length === 0) return []
     const clauses: string[] = []
     const parameters: Array<string | number> = []
@@ -491,6 +534,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryNodesReferencing(refs: string[], query: CausalIRNodeQuery = {}) {
+    return this.passiveQuery([] as CausalNodeLike[], () => this.queryNodesReferencingUnsafe(refs, query))
+  }
+
+  private queryNodesReferencingUnsafe(refs: string[], query: CausalIRNodeQuery) {
     if (!refs.length) return []
     const ids = this.db
       .query<IDRow, string[]>(
@@ -502,6 +549,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryEdges(query: CausalIREdgeQuery = {}): CausalEdgeLike[] {
+    return this.passiveQuery([], () => this.queryEdgesUnsafe(query))
+  }
+
+  private queryEdgesUnsafe(query: CausalIREdgeQuery): CausalEdgeLike[] {
     if (query.ids?.length === 0 || query.fromIDs?.length === 0 || query.toIDs?.length === 0 || query.relations?.length === 0)
       return []
     const clauses: string[] = []
@@ -531,6 +582,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryEdgesReferencing(nodeIDs: string[], query: CausalIREdgeQuery = {}) {
+    return this.passiveQuery([] as CausalEdgeLike[], () => this.queryEdgesReferencingUnsafe(nodeIDs, query))
+  }
+
+  private queryEdgesReferencingUnsafe(nodeIDs: string[], query: CausalIREdgeQuery) {
     if (!nodeIDs.length) return []
     const ids = this.db
       .query<IDRow, string[]>(
@@ -542,6 +597,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryArtifacts(query: CausalIRArtifactQuery = {}): ArtifactLike[] {
+    return this.passiveQuery([], () => this.queryArtifactsUnsafe(query))
+  }
+
+  private queryArtifactsUnsafe(query: CausalIRArtifactQuery): ArtifactLike[] {
     if (query.ids?.length === 0 || query.hashes?.length === 0) return []
     const clauses: string[] = []
     const parameters: Array<string | number> = []
@@ -564,6 +623,10 @@ export class CausalIRRuntimeStore {
   }
 
   queryDiagnostics(query: CausalIRDiagnosticQuery = {}): CausalIRDiagnosticLike[] {
+    return this.passiveQuery([], () => this.queryDiagnosticsUnsafe(query))
+  }
+
+  private queryDiagnosticsUnsafe(query: CausalIRDiagnosticQuery): CausalIRDiagnosticLike[] {
     if (query.ids?.length === 0 || query.kinds?.length === 0) return []
     const clauses: string[] = []
     const parameters: Array<string | number> = []
@@ -586,14 +649,23 @@ export class CausalIRRuntimeStore {
   }
 
   nodeOrder(nodeID: string) {
-    return this.db.query<SequenceRow, [string]>("SELECT sequence FROM nodes WHERE node_id = ?").get(nodeID)?.sequence
+    return this.passiveQuery(undefined as number | undefined, () =>
+      this.db.query<SequenceRow, [string]>("SELECT sequence FROM nodes WHERE node_id = ?").get(nodeID)?.sequence,
+    )
   }
 
   checkpoint(data: unknown): void {
-    this.transact(() => this.appendSnapshotData(data))
+    this.passiveMutation(undefined, () => {
+      this.transact(() => this.appendSnapshotData(data))
+    })
   }
 
   finalize(data: unknown): CausalIRCommitResult {
+    const fallback = this.passiveCommit("case.finalized")
+    return this.passiveMutation(fallback, () => this.finalizeUnsafe(data) ?? fallback)
+  }
+
+  private finalizeUnsafe(data: unknown): CausalIRCommitResult | undefined {
     const snapshot = this.synchronize()
     const trace = traceDocument(data) ? data : undefined
     const canonical = trace
@@ -627,16 +699,31 @@ export class CausalIRRuntimeStore {
         },
         "case",
       ),
-    ) as CausalIRCommitResult
+    )
   }
 
   closeRuntime(data: CausalIRRuntimeCloseData): CausalIRCommitResult {
-    return this.transact(() =>
-      this.append("case.runtime_closed", "runtime_close", this.input.caseID, copyCausalIRJournalData(data), "case"),
-    ) as CausalIRCommitResult
+    const fallback = this.passiveCommit("case.runtime_closed")
+    return this.passiveMutation(
+      fallback,
+      () =>
+        this.transact(() =>
+          this.append(
+            "case.runtime_closed",
+            "runtime_close",
+            this.input.caseID,
+            copyCausalIRJournalData(data),
+            "case",
+          ),
+        ) ?? fallback,
+    )
   }
 
   snapshot(): CausalIRStoreSnapshot {
+    return this.passiveQuery(this.emptySnapshot(), () => this.snapshotUnsafe())
+  }
+
+  private snapshotUnsafe(): CausalIRStoreSnapshot {
     const nodes = this.db
       .query<{ runtime_json: string; sequence: number }, []>(
         "SELECT runtime_json, sequence FROM nodes ORDER BY sequence",
@@ -687,7 +774,12 @@ export class CausalIRRuntimeStore {
     this.closed = true
     this.hotNodes.clear()
     this.hotEdges.clear()
-    this.db.close(false)
+    try {
+      this.db.close(false)
+    } catch {
+      this.disabled = true
+      this.poisoned = true
+    }
   }
 
   private upsertNode<T extends CausalNodeLike>(
@@ -737,13 +829,22 @@ export class CausalIRRuntimeStore {
   }
 
   private transact<T>(fn: () => T): T | undefined {
-    if (this.closed) throw new Error("CausalIRRuntimeStore is closed")
+    if (this.closed || this.disabled) return undefined
+    const durablePrefix: CausalIRJournalEntry[] = []
+    this.durableTransactionPrefix = durablePrefix
     try {
+      this.input.fault?.("transaction")
       return this.db.transaction(fn)()
     } catch (error) {
-      if (error === ROLLBACK) return undefined
-      this.poisoned = true
+      const recovered = durablePrefix.length === 0 || this.materializeDurablePrefix(durablePrefix)
+      if (error === ROLLBACK && recovered) {
+        if (this.poisoned) this.disable()
+        return undefined
+      }
+      this.disable()
       throw error
+    } finally {
+      this.durableTransactionPrefix = undefined
     }
   }
 
@@ -780,12 +881,167 @@ export class CausalIRRuntimeStore {
       this.poisoned = true
       return { committed: false, operation, sequence: this.sequence, payload_hash: undefined, poisoned: true }
     }
+    this.durableTransactionPrefix?.push(entry)
     this.sequence = entry.sequence
     this.lastJournalPayloadHash = payloadHash
     if (entityID) this.setPayloadHash(hashType, entityID, payloadHash)
     this.setMetadata("sequence", this.sequence)
     this.setMetadata("last_journal_payload_hash", payloadHash)
     return { committed: true, operation, sequence: entry.sequence, payload_hash: payloadHash, poisoned: false }
+  }
+
+  private passiveMutation<T>(fallback: T, fn: () => T): T {
+    if (this.closed || this.disabled) return fallback
+    try {
+      this.input.fault?.("mutation")
+      return fn()
+    } catch {
+      this.disable()
+      return fallback
+    }
+  }
+
+  private passiveQuery<T>(fallback: T, fn: () => T): T {
+    if (this.closed || this.disabled) return fallback
+    try {
+      this.input.fault?.("query")
+      return fn()
+    } catch (error) {
+      if (this.durableTransactionPrefix) throw error
+      this.disable()
+      return fallback
+    }
+  }
+
+  private passiveCommit(operation: CausalIRJournalEntry["operation"]): CausalIRCommitResult {
+    return {
+      committed: false,
+      operation,
+      sequence: this.sequence,
+      payload_hash: undefined,
+      poisoned: true,
+    }
+  }
+
+  private emptySnapshot(): CausalIRStoreSnapshot {
+    return {
+      version: CAUSAL_IR_VERSION,
+      runID: this.input.runID,
+      caseID: this.input.caseID,
+      nodes: [],
+      edges: [],
+      artifacts: [],
+      diagnostics: [],
+    }
+  }
+
+  private disable() {
+    if (this.disabled) return
+    this.disabled = true
+    this.poisoned = true
+    this.closed = true
+    this.hotNodes.clear()
+    this.hotEdges.clear()
+    try {
+      this.db.close(false)
+    } catch {}
+  }
+
+  private materializeDurablePrefix(entries: CausalIRJournalEntry[]) {
+    try {
+      this.db.transaction(() => {
+        for (const entry of entries) this.materializeDurableEntry(entry)
+      })()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private materializeDurableEntry(entry: CausalIRJournalEntry) {
+    const payloadHash = entry.payload_hash
+    if (!payloadHash) throw new Error("durable journal entry is missing its payload hash")
+    if ((entry.operation === "node.created" || entry.operation === "node.updated") && entry.data) {
+      const canonical = copyCausalIRJournalData(entry.data) as CausalIRNode
+      const runtime = canonical as unknown as CausalNodeLike
+      const order = canonical.order?.sequence ?? entry.sequence
+      this.db.query("DELETE FROM aliases WHERE node_id = ?").run(canonical.node_id)
+      this.putNode(runtime, canonical, order)
+      for (const alias of canonical.aliases ?? causalIRNodeAliases(runtime, runtime.data ?? {})) {
+        this.db.query("INSERT OR IGNORE INTO aliases(alias, node_id) VALUES (?, ?)").run(alias, canonical.node_id)
+      }
+      this.indexNodeReferences(runtime)
+      this.nodeSequence = Math.max(this.nodeSequence, order)
+      this.setPayloadHash("node", canonical.node_id, payloadHash)
+    } else if (entry.operation === "edge.created" && entry.data) {
+      const canonical = copyCausalIRJournalData(entry.data) as CausalIREdge
+      const runtime = this.runtimeEdge(canonical)
+      const order = this.edgeOrder(canonical.edge_id) ?? ++this.edgeSequence
+      this.putEdge(runtime, canonical, order)
+      this.indexEdgeReferences(runtime)
+      this.setPayloadHash("edge", canonical.edge_id, payloadHash)
+    } else if ((entry.operation === "artifact.created" || entry.operation === "artifact.reused") && entry.data) {
+      const artifact = copyCausalIRJournalData(entry.data) as ArtifactLike
+      const order = this.artifactOrder(artifact.artifact_id) ?? ++this.artifactSequence
+      this.putArtifact(artifact, order)
+      this.setPayloadHash("artifact", artifact.artifact_id, payloadHash)
+    } else if (entry.operation === "diagnostic.created" && entry.data) {
+      this.putDiagnostic(copyCausalIRJournalData(entry.data) as CausalIRDiagnosticLike)
+      if (entry.entity_id) this.setPayloadHash("diagnostic", entry.entity_id, payloadHash)
+    } else if (entry.operation === "case.checkpointed") {
+      const data = record(entry.data)
+      const snapshot = data?.snapshot
+      if (snapshot && typeof snapshot === "object") this.materializeSnapshot(snapshot as CausalIRStoreSnapshot)
+      if (entry.entity_id) this.setPayloadHash("case", entry.entity_id, payloadHash)
+    } else if (entry.entity_id) {
+      this.setPayloadHash("case", entry.entity_id, payloadHash)
+    }
+    this.setMetadata("sequence", entry.sequence)
+    this.setMetadata("last_journal_payload_hash", payloadHash)
+  }
+
+  private materializeSnapshot(snapshot: CausalIRStoreSnapshot) {
+    this.db.exec(`
+      DELETE FROM aliases;
+      DELETE FROM refs;
+      DELETE FROM nodes;
+      DELETE FROM edges;
+      DELETE FROM artifacts;
+      DELETE FROM diagnostics;
+      DELETE FROM payload_hashes WHERE hash_type IN ('node', 'edge', 'artifact', 'diagnostic');
+    `)
+    for (const node of snapshot.nodes) {
+      const order = node.order?.sequence ?? ++this.nodeSequence
+      const runtime = node as unknown as CausalNodeLike
+      this.putNode(runtime, node, order)
+      for (const alias of node.aliases ?? [])
+        this.db.query("INSERT OR IGNORE INTO aliases(alias, node_id) VALUES (?, ?)").run(alias, node.node_id)
+      this.indexNodeReferences(runtime)
+      this.setPayloadHash("node", node.node_id, causalIRPayloadHash(node))
+    }
+    for (const canonical of snapshot.edges) {
+      const runtime = this.runtimeEdge(canonical)
+      this.putEdge(runtime, canonical, ++this.edgeSequence)
+      this.indexEdgeReferences(runtime)
+      this.setPayloadHash("edge", canonical.edge_id, causalIRPayloadHash(canonical))
+    }
+    for (const artifact of snapshot.artifacts) this.putArtifact(artifact, ++this.artifactSequence)
+    for (const diagnostic of snapshot.diagnostics) this.putDiagnostic(diagnostic)
+  }
+
+  private runtimeEdge(canonical: CausalIREdge): CausalEdgeLike {
+    return {
+      edge_id: canonical.edge_id,
+      from: { type: canonical.from.ref_type, id: canonical.from.ref_id },
+      to: { type: canonical.to.ref_type, id: canonical.to.ref_id },
+      relation: canonical.original_relation,
+      evidence_refs: canonical.evidence_refs.map(
+        (ref) => ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`,
+      ),
+      confidence: canonical.confidence,
+      label: canonical.label,
+      metadata: canonical.metadata,
+    }
   }
 
   private appendSnapshot(reason: string, replacement: "nodes_and_edges" | "edges") {

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -205,6 +206,123 @@ test("failed journal append does not commit a SQLite index mutation", async () =
   } finally {
     runtime.close()
   }
+})
+
+test("a failed second append preserves the SQLite materialization of the durable prefix", async () => {
+  await using tmp = await tmpdir()
+  const indexPath = path.join(tmp.path, "index.sqlite")
+  const durable: CausalIRJournalEntry[] = []
+  let attempts = 0
+  const runtime = new CausalIRRuntimeStore({
+    runID: "run_durable_prefix",
+    caseID: "case_durable_prefix",
+    indexPath,
+    append: (entry) => {
+      attempts += 1
+      if (attempts === 2) return false
+      durable.push(entry)
+      return true
+    },
+  })
+
+  try {
+    runtime.createNode({ ...node("durable_node"), source_refs: ["node:missing_source"] })
+
+    expect(durable.map((entry) => entry.operation)).toEqual(["node.created"])
+    expect(runtime.queryNodes()).toEqual([])
+    const index = new Database(indexPath)
+    try {
+      expect(index.query("SELECT node_id FROM nodes ORDER BY sequence").all()).toEqual([
+        { node_id: "durable_node" },
+      ])
+      expect(index.query("SELECT diagnostic_id FROM diagnostics").all()).toEqual([])
+      expect(index.query("SELECT value FROM metadata WHERE key = 'sequence'").get()).toEqual({ value: "1" })
+    } finally {
+      index.close(false)
+    }
+  } finally {
+    runtime.close()
+  }
+})
+
+test("post-initialization SQLite faults and closed stores stay passive", async () => {
+  await using tmp = await tmpdir()
+  let fault: "mutation" | "query" | undefined
+  const runtime = new CausalIRRuntimeStore({
+    runID: "run_passive_fault",
+    caseID: "case_passive_fault",
+    indexPath: path.join(tmp.path, "fault.sqlite"),
+    append: () => true,
+    fault: (operation) => {
+      if (operation === fault) throw new Error(`injected ${operation} fault`)
+    },
+  })
+
+  runtime.createNode(node("warm_node"))
+  fault = "mutation"
+  expect(() => runtime.createNode(node("after_mutation_fault"))).not.toThrow()
+  expect(runtime.queryNodes()).toEqual([])
+  expect(runtime.journalSummary()).toMatchObject({ poisoned: true })
+  expect(() => runtime.close()).not.toThrow()
+  expect(() => runtime.createNode(node("after_close"))).not.toThrow()
+  expect(runtime.queryNodes()).toEqual([])
+
+  fault = undefined
+  const queryRuntime = new CausalIRRuntimeStore({
+    runID: "run_passive_query_fault",
+    caseID: "case_passive_query_fault",
+    indexPath: path.join(tmp.path, "query-fault.sqlite"),
+    append: () => true,
+    fault: (operation) => {
+      if (operation === fault) throw new Error(`injected ${operation} fault`)
+    },
+  })
+  queryRuntime.createNode(node("query_warm_node"))
+  fault = "query"
+  expect(() => queryRuntime.queryNodes()).not.toThrow()
+  expect(queryRuntime.queryNodes()).toEqual([])
+  expect(queryRuntime.journalSummary()).toMatchObject({ poisoned: true })
+  expect(() => queryRuntime.close()).not.toThrow()
+
+  let transactionFault = false
+  const transactionRuntime = new CausalIRRuntimeStore({
+    runID: "run_passive_transaction_fault",
+    caseID: "case_passive_transaction_fault",
+    indexPath: path.join(tmp.path, "transaction-fault.sqlite"),
+    append: () => true,
+    fault: (operation) => {
+      if (operation === "transaction" && transactionFault) throw new Error("injected transaction fault")
+    },
+  })
+  transactionRuntime.createNode(node("transaction_warm_node"))
+  transactionFault = true
+  expect(() => transactionRuntime.finalize({ status: "success" })).not.toThrow()
+  expect(transactionRuntime.finalize({ status: "success" })).toMatchObject({ committed: false, poisoned: true })
+  expect(transactionRuntime.queryNodes()).toEqual([])
+  expect(() => transactionRuntime.close()).not.toThrow()
+
+  let snapshotFault = false
+  const snapshotRuntime = new CausalIRRuntimeStore({
+    runID: "run_passive_snapshot_fault",
+    caseID: "case_passive_snapshot_fault",
+    indexPath: path.join(tmp.path, "snapshot-fault.sqlite"),
+    append: () => true,
+    fault: (operation) => {
+      if (operation === "query" && snapshotFault) throw new Error("injected snapshot fault")
+    },
+  })
+  snapshotRuntime.createNode(node("snapshot_warm_node"))
+  snapshotFault = true
+  expect(snapshotRuntime.finalize({ status: "success" })).toMatchObject({ committed: false, poisoned: true })
+  expect(
+    snapshotRuntime.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-14T00:00:00.000Z",
+      manifest: { case_id: "case_passive_snapshot_fault", run_id: "run_passive_snapshot_fault" },
+    }),
+  ).toMatchObject({ committed: false, poisoned: true })
+  expect(() => snapshotRuntime.close()).not.toThrow()
 })
 
 test("bulk node and edge replacements preserve replay and reference indexes", async () => {

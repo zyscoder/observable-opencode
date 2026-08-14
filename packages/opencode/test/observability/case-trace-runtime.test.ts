@@ -444,6 +444,50 @@ describe("case trace runtime persistence", () => {
     }
   })
 
+  test("discards late observer events and a signal after session finish", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-late-after-finish-"))
+    const packageDir = packageDirForTest()
+    const script = path.join(dir, "late-after-finish.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    try {
+      await fs.writeFile(
+        script,
+        [
+          `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+          `CaseTrace.configure({ caseID: "late-after-finish", traceDir: ${JSON.stringify(dir)} })`,
+          `CaseTrace.setSessionID("ses_finished")`,
+          `CaseTrace.observation({ session_id: "ses_finished", source: "runtime", category: "before", summary: "before finish" })`,
+          `CaseTrace.finishSession("ses_finished", { status: "success" })`,
+          `CaseTrace.observation({ session_id: "ses_finished", source: "runtime", category: "late", summary: "must be discarded" })`,
+          `process.stdout.write("agent-result-stable")`,
+          `process.kill(process.pid, "SIGTERM")`,
+        ].join("\n"),
+      )
+
+      const child = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: { ...process.env, OPENCODE_CASE_TRACE: "1" },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ])
+
+      expect(exitCode).toBe(143)
+      expect(stdout).toBe("agent-result-stable")
+      expect(stderr).toBe("")
+      const trace = await fs.readFile(path.join(dir, "late-after-finish", "trace.json"), "utf8")
+      expect(trace).toContain("before finish")
+      expect(trace).not.toContain("must be discarded")
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test("normalizes and sanitizes direct cyclic results with stable path markers", () => {
     const cycle: Record<string, unknown> = {
       answer: "cycle-safe-result",

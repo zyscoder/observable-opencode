@@ -87,6 +87,21 @@ test("routes reference-only records to their owner", () => {
   expect(registry.resolve({ refs: ["span:span_1", "span:unknown"] })).toBe(owner)
 })
 
+test("retains at most 256 recent routing references per category", () => {
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
+  const owner = registry.resolve({ sessionID: "ses_owner" })
+  const other = registry.resolve({ sessionID: "ses_other" })
+
+  registry.remember(owner, ["node:independent"])
+  for (let index = 0; index < 257; index++) registry.remember(owner, [`span:span_${index}`])
+
+  expect(registry.resolve({ refs: ["span:span_256"] })).toBe(owner)
+  expect(registry.resolve({ refs: ["node:independent"] })).toBe(owner)
+  const evicted = registry.resolve({ refs: ["span:span_0"] })
+  expect(evicted).not.toBe(owner)
+  expect(evicted).not.toBe(other)
+})
+
 test("routes explicit sessions with conflicting reference owners to the process trace", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
   const first = registry.resolve({ sessionID: "ses_a" })

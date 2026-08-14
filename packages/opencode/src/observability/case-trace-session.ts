@@ -26,6 +26,12 @@ const referenceKeys = new Map<string, string[]>([
   ["lifecycle_id", ["lifecycle"]],
 ])
 const referenceContainers = new Set(["source_refs", "evidence_refs", "aliases"])
+const maxRecentReferencesPerCategory = 256
+
+function referenceCategory(ref: string) {
+  const separator = ref.indexOf(":")
+  return separator > 0 ? ref.slice(0, separator) : "untyped"
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -133,6 +139,7 @@ export class SessionTraceRegistry<T extends object> {
   private readonly orphans = new Set<T>()
   private readonly aliases = new Map<string, string>()
   private readonly owners = new Map<string, Set<T>>()
+  private readonly recentOwnerRefs = new Map<string, Set<string>>()
   private finalized = new WeakSet<T>()
   private processTrace: T | undefined
   private compatibilityTrace: T | undefined
@@ -176,6 +183,11 @@ export class SessionTraceRegistry<T extends object> {
     return this.resolveProcess()
   }
 
+  resolveActive(hint?: Partial<TraceRouteHint>): T | undefined {
+    const trace = this.resolve(hint)
+    return this.finalized.has(trace) ? undefined : trace
+  }
+
   hasRoots(): boolean {
     return this.roots.size > 0
   }
@@ -186,6 +198,11 @@ export class SessionTraceRegistry<T extends object> {
     if (this.roots.size > 1) return this.resolve()
     this.compatibilityTrace = this.create(undefined, 0, "compatibility")
     return this.compatibilityTrace
+  }
+
+  resolveCompatibilityActive(): T | undefined {
+    const trace = this.resolveCompatibility()
+    return this.finalized.has(trace) ? undefined : trace
   }
 
   claimCompatibility(sessionID: string): T | undefined {
@@ -216,8 +233,20 @@ export class SessionTraceRegistry<T extends object> {
   }
 
   remember(trace: T, refs: string[]): void {
+    if (this.finalized.has(trace)) return
     for (const ref of refs) {
       if (!ref) continue
+      const category = referenceCategory(ref)
+      const recent = this.recentOwnerRefs.get(category) ?? new Set<string>()
+      recent.delete(ref)
+      recent.add(ref)
+      this.recentOwnerRefs.set(category, recent)
+      while (recent.size > maxRecentReferencesPerCategory) {
+        const evicted = recent.values().next().value
+        if (evicted === undefined) break
+        recent.delete(evicted)
+        this.owners.delete(evicted)
+      }
       let owners = this.owners.get(ref)
       if (!owners) {
         owners = new Set<T>()
@@ -260,6 +289,7 @@ export class SessionTraceRegistry<T extends object> {
       this.orphans.clear()
       this.aliases.clear()
       this.owners.clear()
+      this.recentOwnerRefs.clear()
       this.processTrace = undefined
       this.compatibilityTrace = undefined
       this.compatibilitySessionID = undefined

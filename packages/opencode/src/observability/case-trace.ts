@@ -5880,7 +5880,7 @@ class ActiveCaseTrace {
       if (callID) {
         const entries = this.toolOutcomeRefsByCallID.get(callID) ?? []
         entries.push({ sourceRef: `node:${node.node_id}`, sessionID, messageID })
-        this.toolOutcomeRefsByCallID.set(callID, entries.slice(-8))
+        this.rememberBoundedMap(this.toolOutcomeRefsByCallID, callID, entries.slice(-8))
       }
       this.backfillToolOutcomeRef({
         callID,
@@ -6208,7 +6208,8 @@ class ActiveCaseTrace {
         label: "Prompt assembly consumed source record",
       })
     }
-    for (const name of requestedSkillNames([input.input, input.parts])) this.requestedSkillNames.add(name)
+    for (const name of requestedSkillNames([input.input, input.parts]))
+      this.rememberBoundedSet(this.requestedSkillNames, name)
     return node
   }
 
@@ -6347,7 +6348,7 @@ class ActiveCaseTrace {
       },
       { trackGeneration: false },
     )
-    this.contextSetNodeIDsByKey.set(key, node.node_id)
+    this.rememberBoundedMap(this.contextSetNodeIDsByKey, key, node.node_id)
     if (input.kind === "confirmed_tool_selection") {
       for (const ref of memberRefs) {
         const parsed = this.parseSourceRef(ref)
@@ -7140,7 +7141,7 @@ class ActiveCaseTrace {
       metadata,
     }
     this.responseSegments.push(segment)
-    this.responseSourceBySegmentID.set(segment.segment_id, input.text)
+    this.rememberBoundedMap(this.responseSourceBySegmentID, segment.segment_id, input.text)
     this.write("semantic.response_output", segment)
     const record = this.node({
       node_id: `responsenode_${segment.segment_id}`,
@@ -8000,7 +8001,7 @@ class ActiveCaseTrace {
           },
         })
       }
-      this.claimedResponseSegmentIDs.add(segment.segment_id)
+      this.rememberBoundedSet(this.claimedResponseSegmentIDs, segment.segment_id)
       this.responseSourceBySegmentID.delete(segment.segment_id)
     }
   }
@@ -8270,7 +8271,7 @@ class ActiveCaseTrace {
       source_locations: sourceLocations,
       metadata: input.metadata,
     })
-    if (dedupeKey) this.semanticFactNodeIDsByKey.set(dedupeKey, node.node_id)
+    if (dedupeKey) this.rememberBoundedMap(this.semanticFactNodeIDsByKey, dedupeKey, node.node_id)
     if (recordKind === "evidence.semantic_fact") this.remember(this.recentEvidenceNodeIDs, node.node_id)
     for (const ref of sourceRefs ?? []) {
       const parsed = this.parseSourceRef(ref)
@@ -8386,7 +8387,7 @@ class ActiveCaseTrace {
     if (contextSet.node_id === node.node_id) return
     const key = `${contextSet.node_id}->${node.node_id}`
     if (this.temporalAdvisoryEdgeKeys.has(key)) return
-    this.temporalAdvisoryEdgeKeys.add(key)
+    this.rememberBoundedSet(this.temporalAdvisoryEdgeKeys, key)
     this.causalIR.createEdge({
       edge_id: this.nextCausalEdgeID(),
       from: { type: "node", id: contextSet.node_id, label: contextSet.kind },
@@ -10688,8 +10689,21 @@ class ActiveCaseTrace {
   }
 
   private remember(target: string[], id: string, limit = 12) {
+    limit = Math.min(limit, 256)
     target.push(id)
     if (target.length > limit) target.splice(0, target.length - limit)
+  }
+
+  private rememberBoundedMap<K, V>(target: Map<K, V>, key: K, value: V) {
+    target.delete(key)
+    target.set(key, value)
+    while (target.size > 256) target.delete(target.keys().next().value!)
+  }
+
+  private rememberBoundedSet<T>(target: Set<T>, value: T) {
+    target.delete(value)
+    target.add(value)
+    while (target.size > 256) target.delete(target.values().next().value!)
   }
 
   private evaluateConstraints() {
@@ -10752,7 +10766,7 @@ class ActiveCaseTrace {
     const availableSet = new Set(available)
     for (const skillName of this.requestedSkillNames) {
       if (this.recordedSkillRequestNames.has(skillName)) continue
-      this.recordedSkillRequestNames.add(skillName)
+      this.rememberBoundedSet(this.recordedSkillRequestNames, skillName)
       const requestStatus = availableSet.has(skillName) ? "requested" : "missing"
       this.node({
         node_id: `skillrequest_${hash(skillName).slice(0, 8)}`,
@@ -11257,7 +11271,7 @@ class ActiveCaseTrace {
       fs.writeFileSync(temp, storedContent)
       fs.renameSync(temp, target)
       this.causalIR.createArtifact(artifact)
-      this.artifactByDedupeKey.set(dedupeKey, artifact)
+      this.rememberBoundedMap(this.artifactByDedupeKey, dedupeKey, artifact)
       this.write("artifact.write", artifact)
       return artifact
     } catch {
@@ -11552,10 +11566,10 @@ function routed(input?: unknown, definitionKeys: readonly string[] = []) {
   const router = traceRegistry()
   if (!hint.scope && !hint.sessionID && !router.hasRoots()) {
     compatibilityBindingAllowed = true
-    return router.resolveCompatibility()
+    return router.resolveCompatibilityActive()
   }
   if (hint.sessionID) claimCompatibilitySession(hint.sessionID)
-  return router.resolve(hint)
+  return router.resolveActive(hint)
 }
 
 function remember<T>(trace: ActiveCaseTrace | undefined, value: T): T {
@@ -11702,7 +11716,7 @@ export namespace CaseTrace {
     if (!enabledFromEnv() || compatibilityFinished) return undefined
     ensureLifecycle()
     if (!compatibilitySessionID) compatibilityBindingAllowed = true
-    return traceRegistry().resolveCompatibility()
+    return traceRegistry().resolveCompatibilityActive()
   }
 
   export function setSessionID(sessionID: string | undefined) {
