@@ -5,7 +5,9 @@ import { tmpdir } from "../../fixture/fixture"
 import {
   finalizeTuiWorker,
   resolveThreadDirectory,
+  resolveTuiWorkerTraceCloseTimeout,
   resolveTuiWorkerShutdownTimeout,
+  waitForTuiWorkerTraceClose,
   waitForTuiWorkerShutdown,
 } from "../../../src/cli/cmd/tui/thread"
 
@@ -31,27 +33,26 @@ describe("tui thread", () => {
     await check(".")
   })
 
-  test("gives traced worker shutdown enough time to finalize after the legacy five-second boundary", async () => {
+  test("gives only traced journal close enough time to finalize after the legacy five-second boundary", async () => {
     let finalized = false
     const shutdown = Bun.sleep(5_100).then(() => {
       finalized = true
     })
 
-    await waitForTuiWorkerShutdown(shutdown, { OPENCODE_CASE_TRACE: "1" })
+    await waitForTuiWorkerTraceClose(shutdown, { OPENCODE_CASE_TRACE: "1" })
 
     expect(finalized).toBe(true)
   }, 10_000)
 
-  test("honors an explicit TUI shutdown timeout", async () => {
+  test("keeps ordinary worker shutdown timeout separate from the trace close timeout", async () => {
     const env = {
       OPENCODE_CASE_TRACE: "1",
       OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS: "10",
     }
 
-    expect(resolveTuiWorkerShutdownTimeout(env)).toBe(10)
-    await expect(waitForTuiWorkerShutdown(Bun.sleep(100), env)).rejects.toThrow(
-      "TUI worker shutdown timed out after 10ms",
-    )
+    expect(resolveTuiWorkerShutdownTimeout(env)).toBe(5_000)
+    expect(resolveTuiWorkerTraceCloseTimeout(env)).toBe(10)
+    await expect(waitForTuiWorkerTraceClose(Bun.sleep(100), env)).rejects.toThrow("TUI worker trace close timed out after 10ms")
   })
 
   test("closes and terminates the worker before materializing and publishing traces for normal and Ctrl-C exits", async () => {
@@ -68,7 +69,11 @@ describe("tui thread", () => {
       await finalizeTuiWorker({
         shutdown: async () => {
           calls.push(`${exit}:close`)
-          return [request]
+          return {}
+        },
+        closeTraces: async () => {
+          calls.push(`${exit}:journal-close`)
+          return { requests: [request] }
         },
         terminate: () => {
           calls.push(`${exit}:terminate`)
@@ -84,6 +89,7 @@ describe("tui thread", () => {
 
       expect(calls).toEqual([
         `${exit}:close`,
+        `${exit}:journal-close`,
         `${exit}:terminate`,
         `${exit}:materialize:1`,
         `${exit}:publish`,
@@ -91,22 +97,51 @@ describe("tui thread", () => {
     }
   })
 
-  test("keeps the TUI shutdown result when trace materialization fails", async () => {
+  test("materializes requests returned with a runtime shutdown failure", async () => {
+    const calls: string[] = []
+    await finalizeTuiWorker({
+      shutdown: async () => ({ failure: "server stop failed" }),
+      closeTraces: async () => ({
+        requests: [{ caseDir: "/tmp/case", caseID: "case", runID: "run", recordsFile: "/tmp/case/records.jsonl" }],
+        failure: "server stop failed",
+      }),
+      terminate: () => {
+        calls.push("terminate")
+      },
+      materialize: async (requests) => {
+        calls.push(`materialize:${requests.length}`)
+        return []
+      },
+      publish: () => {},
+      onShutdownFailure: () => {
+        calls.push("shutdown-warning")
+      },
+    })
+    expect(calls).toEqual(["shutdown-warning", "terminate", "materialize:1"])
+  })
+
+  test("continues trace materialization after worker termination rejects", async () => {
     const calls: string[] = []
     await expect(
       finalizeTuiWorker({
-        shutdown: async () => [{ caseDir: "/tmp/case", caseID: "case", runID: "run", recordsFile: "/tmp/case/records.jsonl" }],
-        terminate: () => {
+        shutdown: async () => ({}),
+        closeTraces: async () => ({
+          requests: [{ caseDir: "/tmp/case", caseID: "case", runID: "run", recordsFile: "/tmp/case/records.jsonl" }],
+        }),
+        terminate: async () => {
           calls.push("terminate")
+          throw new Error("terminate failed")
         },
-        materialize: async () => {
-          throw new Error("materializer failed")
+        materialize: async (requests) => {
+          calls.push(`materialize:${requests.length}`)
+          return []
         },
-        publish: () => {
-          calls.push("publish")
+        publish: () => {},
+        onTerminateFailure: () => {
+          calls.push("terminate-warning")
         },
       }),
     ).resolves.toBeUndefined()
-    expect(calls).toEqual(["terminate"])
+    expect(calls).toEqual(["terminate", "terminate-warning", "materialize:1"])
   })
 })

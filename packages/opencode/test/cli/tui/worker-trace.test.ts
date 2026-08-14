@@ -5,7 +5,7 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { finalizeWorkerTraces } from "@/cli/cmd/tui/worker-trace"
 
-test("worker trace helper returns journal materialization requests without creating trace projections", async () => {
+test("worker trace helper returns journal materialization requests with the shutdown failure", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "opencode-worker-trace-"))
   const packageDir = path.resolve(import.meta.dir, "../../..")
   const script = path.join(dir, "worker-trace.ts")
@@ -23,10 +23,11 @@ test("worker trace helper returns journal materialization requests without creat
         `CaseTrace.event({ component: "runtime", event_type: "root.a", data: { sessionID: "ses_worker_a" } })`,
         `CaseTrace.event({ component: "runtime", event_type: "root.b", data: { sessionID: "ses_worker_b" } })`,
         `CaseTrace.startSpan({ component: "run", operation: "execute", trace_scope: "process" })?.end({ status: "success" })`,
-        `const requests = await finalizeWorkerTraces()`,
+        `const result = await finalizeWorkerTraces()`,
+        `const requests = result.requests`,
         `const count = readdirSync(${JSON.stringify(dir)}, { withFileTypes: true }).filter((entry) => entry.isDirectory() && existsSync(${JSON.stringify(dir)} + "/" + entry.name + "/trace.json")).length`,
         `if (count !== 0 || requests.length !== 3) process.exitCode = 4`,
-        `process.stdout.write(JSON.stringify(requests))`,
+        `process.stdout.write(JSON.stringify(result))`,
       ].join("\n"),
     )
 
@@ -47,13 +48,18 @@ test("worker trace helper returns journal materialization requests without creat
     expect(directories).toHaveLength(3)
     expect(stderr).toBe("")
 
-    const requests = JSON.parse(await new Response(proc.stdout).text()) as Array<{
-      caseDir: string
-      caseID: string
-      runID: string
-      sessionID?: string
-      recordsFile: string
-    }>
+    const result = JSON.parse(await new Response(proc.stdout).text()) as {
+      requests: Array<{
+        caseDir: string
+        caseID: string
+        runID: string
+        sessionID?: string
+        recordsFile: string
+      }>
+      failure?: string
+    }
+    expect(result.failure).toBeUndefined()
+    const requests = result.requests
     expect(requests.map((request) => request.sessionID).sort()).toEqual(["ses_worker_a", "ses_worker_b", undefined])
     for (const request of requests) {
       expect(request.recordsFile).toBe(path.join(request.caseDir, "records.jsonl"))
@@ -64,20 +70,26 @@ test("worker trace helper returns journal materialization requests without creat
   }
 })
 
-test("worker trace helper returns no requests when journal close throws", async () => {
+test("worker trace helper preserves runtime shutdown failure alongside materialization requests", async () => {
   const calls: unknown[] = []
   const failure = new Error("server stop failed")
+  const request = {
+    caseDir: "/tmp/case",
+    caseID: "case",
+    runID: "run",
+    recordsFile: "/tmp/case/records.jsonl",
+  }
   await expect(
     finalizeWorkerTraces({
       failure,
       trace: {
         closeAll(input) {
           calls.push(input)
-          throw new Error("trace write failed")
+          return [request]
         },
       },
     }),
-  ).resolves.toEqual([])
+  ).resolves.toEqual({ requests: [request], failure: "server stop failed" })
   expect(calls).toEqual([
     expect.objectContaining({
       status: "error",
@@ -85,4 +97,18 @@ test("worker trace helper returns no requests when journal close throws", async 
       result: { reason: "worker.shutdown" },
     }),
   ])
+})
+
+test("worker trace helper returns an empty request list when journal close throws", async () => {
+  const failure = new Error("server stop failed")
+  await expect(
+    finalizeWorkerTraces({
+      failure,
+      trace: {
+        closeAll() {
+          throw new Error("trace write failed")
+        },
+      },
+    }),
+  ).resolves.toEqual({ requests: [], failure: "server stop failed" })
 })

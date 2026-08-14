@@ -23,7 +23,7 @@ import {
 import { validateSession } from "./validate-session"
 import { materializeWorkerTraces } from "./trace-materializer-process"
 import { reportTracePublication } from "@/observability/trace-publication"
-import type { TraceMaterializationRequest } from "@/observability/case-trace"
+import type { WorkerTraceCloseResult } from "./worker-trace"
 
 declare global {
   const OPENCODE_WORKER_PATH: string
@@ -42,6 +42,12 @@ function traceEnabled(env: NodeJS.ProcessEnv | Record<string, string | undefined
 export function resolveTuiWorkerShutdownTimeout(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
 ) {
+  return DEFAULT_TUI_WORKER_SHUTDOWN_TIMEOUT_MS
+}
+
+export function resolveTuiWorkerTraceCloseTimeout(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+) {
   const configured = Number(env.OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS)
   if (Number.isSafeInteger(configured) && configured > 0) return configured
   return traceEnabled(env) ? TRACED_TUI_WORKER_SHUTDOWN_TIMEOUT_MS : DEFAULT_TUI_WORKER_SHUTDOWN_TIMEOUT_MS
@@ -55,24 +61,51 @@ export function waitForTuiWorkerShutdown<T>(
   return withTimeout(shutdown, timeout, `TUI worker shutdown timed out after ${timeout}ms`)
 }
 
+export function waitForTuiWorkerTraceClose<T>(
+  close: Promise<T>,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+) {
+  const timeout = resolveTuiWorkerTraceCloseTimeout(env)
+  return withTimeout(close, timeout, `TUI worker trace close timed out after ${timeout}ms`)
+}
+
 export async function finalizeTuiWorker(input: {
-  shutdown: () => Promise<TraceMaterializationRequest[]>
+  shutdown: () => Promise<{ failure?: string }>
+  closeTraces: () => Promise<WorkerTraceCloseResult>
   terminate: () => unknown
   materialize?: typeof materializeWorkerTraces
   publish?: typeof reportTracePublication
   onShutdownFailure?: (error: unknown) => unknown
+  onTerminateFailure?: (error: unknown) => unknown
   onMaterializerFailure?: (error: unknown) => unknown
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>
 }): Promise<void> {
-  const requests = await waitForTuiWorkerShutdown(input.shutdown(), input.env).catch((error) => {
+  const shutdown = await waitForTuiWorkerShutdown(input.shutdown(), input.env).catch((error) => {
     try {
       input.onShutdownFailure?.(error)
     } catch {}
-    return []
+    return undefined
   })
-  await input.terminate()
+  const trace: WorkerTraceCloseResult = shutdown
+    ? await waitForTuiWorkerTraceClose(input.closeTraces(), input.env).catch((error) => {
+        try {
+          input.onShutdownFailure?.(error)
+        } catch {}
+        return { requests: [] }
+      })
+    : { requests: [] }
+  if (trace.failure) {
+    try {
+      input.onShutdownFailure?.(new Error(trace.failure))
+    } catch {}
+  }
+  await Promise.resolve().then(input.terminate).catch((error) => {
+    try {
+      input.onTerminateFailure?.(error)
+    } catch {}
+  })
   try {
-    const publications = await (input.materialize ?? materializeWorkerTraces)(requests)
+    const publications = await (input.materialize ?? materializeWorkerTraces)(trace.requests)
     const publish = input.publish ?? reportTracePublication
     publications.forEach((publication) => {
       try {
@@ -238,6 +271,7 @@ export const TuiThreadCommand = cmd({
         process.off("SIGUSR2", reload)
         await finalizeTuiWorker({
           shutdown: async () => await client.call("shutdown", undefined),
+          closeTraces: async () => await client.call("closeTraces", undefined),
           terminate: () => worker.terminate(),
           materialize: (requests) =>
             materializeWorkerTraces(requests, {
@@ -250,12 +284,17 @@ export const TuiThreadCommand = cmd({
             })
             if (traceEnabled(process.env)) {
               process.stderr.write(
-                `[observable-opencode] Worker shutdown did not complete; trace.json may be unavailable: ${errorMessage(error)}\n`,
+                `[observable-opencode] Worker shutdown or trace close did not complete; trace.json may be unavailable: ${errorMessage(error)}\n`,
               )
             }
           },
           onMaterializerFailure(error) {
             Log.Default.warn("trace materialization failed", {
+              error: errorMessage(error),
+            })
+          },
+          onTerminateFailure(error) {
+            Log.Default.warn("worker termination failed", {
               error: errorMessage(error),
             })
           },

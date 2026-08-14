@@ -47,6 +47,7 @@ GlobalBus.on("event", (event) => {
 })
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
+let shutdownFailure: unknown
 
 export const rpc = {
   async fetch(input: { url: string; method: string; headers: Record<string, string>; body?: string }) {
@@ -97,16 +98,19 @@ export const rpc = {
   async shutdown() {
     Log.Default.info("worker shutting down")
 
-    let failure: unknown
+    shutdownFailure = undefined
     try {
       await InstanceRuntime.disposeAllInstances()
       if (server) await server.stop(true)
     } catch (error) {
-      failure = error
+      shutdownFailure = error
     }
-    const requests = await finalizeWorkerTraces({ failure })
-    if (failure) throw failure
-    return requests
+    return shutdownFailure ? { failure: shutdownFailure instanceof Error ? shutdownFailure.message : String(shutdownFailure) } : {}
+  },
+  async closeTraces() {
+    const failure = shutdownFailure
+    shutdownFailure = undefined
+    return finalizeWorkerTraces({ failure })
   },
 }
 
