@@ -103,10 +103,10 @@ export const rpc = {
       if (server) await server.stop(true)
     } catch (error) {
       failure = error
-      throw error
-    } finally {
-      await finalizeWorkerTraces({ failure })
     }
+    const requests = await finalizeWorkerTraces({ failure })
+    if (failure) throw failure
+    return requests
   },
 }
 

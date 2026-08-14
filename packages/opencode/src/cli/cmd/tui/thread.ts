@@ -21,6 +21,9 @@ import {
   sanitizedProcessEnv,
 } from "@opencode-ai/core/util/opencode-process"
 import { validateSession } from "./validate-session"
+import { materializeWorkerTraces } from "./trace-materializer-process"
+import { reportTracePublication } from "@/observability/trace-publication"
+import type { TraceMaterializationRequest } from "@/observability/case-trace"
 
 declare global {
   const OPENCODE_WORKER_PATH: string
@@ -50,6 +53,37 @@ export function waitForTuiWorkerShutdown<T>(
 ) {
   const timeout = resolveTuiWorkerShutdownTimeout(env)
   return withTimeout(shutdown, timeout, `TUI worker shutdown timed out after ${timeout}ms`)
+}
+
+export async function finalizeTuiWorker(input: {
+  shutdown: () => Promise<TraceMaterializationRequest[]>
+  terminate: () => unknown
+  materialize?: typeof materializeWorkerTraces
+  publish?: typeof reportTracePublication
+  onShutdownFailure?: (error: unknown) => unknown
+  onMaterializerFailure?: (error: unknown) => unknown
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>
+}): Promise<void> {
+  const requests = await waitForTuiWorkerShutdown(input.shutdown(), input.env).catch((error) => {
+    try {
+      input.onShutdownFailure?.(error)
+    } catch {}
+    return []
+  })
+  await input.terminate()
+  try {
+    const publications = await (input.materialize ?? materializeWorkerTraces)(requests)
+    const publish = input.publish ?? reportTracePublication
+    publications.forEach((publication) => {
+      try {
+        publish(publication)
+      } catch {}
+    })
+  } catch (error) {
+    try {
+      input.onMaterializerFailure?.(error)
+    } catch {}
+  }
 }
 
 function createWorkerFetch(client: RpcClient): typeof fetch {
@@ -202,17 +236,30 @@ export const TuiThreadCommand = cmd({
         process.off("uncaughtException", error)
         process.off("unhandledRejection", error)
         process.off("SIGUSR2", reload)
-        await waitForTuiWorkerShutdown(client.call("shutdown", undefined)).catch((error) => {
-          Log.Default.warn("worker shutdown failed", {
-            error: errorMessage(error),
-          })
-          if (traceEnabled(process.env)) {
-            process.stderr.write(
-              `[observable-opencode] Worker shutdown did not complete; trace.json may be unavailable: ${errorMessage(error)}\n`,
-            )
-          }
+        await finalizeTuiWorker({
+          shutdown: async () => await client.call("shutdown", undefined),
+          terminate: () => worker.terminate(),
+          materialize: (requests) =>
+            materializeWorkerTraces(requests, {
+              onWarning: (warning) => process.stderr.write(warning),
+            }),
+          env: process.env,
+          onShutdownFailure(error) {
+            Log.Default.warn("worker shutdown failed", {
+              error: errorMessage(error),
+            })
+            if (traceEnabled(process.env)) {
+              process.stderr.write(
+                `[observable-opencode] Worker shutdown did not complete; trace.json may be unavailable: ${errorMessage(error)}\n`,
+              )
+            }
+          },
+          onMaterializerFailure(error) {
+            Log.Default.warn("trace materialization failed", {
+              error: errorMessage(error),
+            })
+          },
         })
-        worker.terminate()
       }
 
       const prompt = await input(args.prompt)

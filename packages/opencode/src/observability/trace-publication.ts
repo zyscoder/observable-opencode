@@ -1,5 +1,6 @@
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
+import type { TraceMaterializationRequest } from "./case-trace"
 
 export type TracePublicationStatus = "completed" | "failed" | "cancelled" | "partial"
 
@@ -42,6 +43,26 @@ export function collectTracePublication(input: TracePublicationInput): TracePubl
     traceFile,
     partialFile,
   }
+}
+
+export function collectMaterializedTracePublication(input: TraceMaterializationRequest): TracePublication | undefined {
+  const manifestFile = path.join(input.caseDir, "manifest.json")
+  let status: TracePublicationStatus = "completed"
+  try {
+    const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as { status?: unknown }
+    if (manifest.status === "error") status = "failed"
+    if (manifest.status === "cancelled") status = "cancelled"
+  } catch {
+    // The finalized JSON remains useful even if its manifest cannot be read.
+  }
+  return collectTracePublication({
+    sessionID: input.sessionID,
+    caseID: input.caseID,
+    status,
+    caseDir: input.caseDir,
+    traceFile: path.join(input.caseDir, "trace.json"),
+    partialFile: path.join(input.caseDir, "partial", "latest.json"),
+  })
 }
 
 export function formatTracePublication(input: TracePublication): string {

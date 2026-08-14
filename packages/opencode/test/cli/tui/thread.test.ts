@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import path from "path"
 import { tmpdir } from "../../fixture/fixture"
 import {
+  finalizeTuiWorker,
   resolveThreadDirectory,
   resolveTuiWorkerShutdownTimeout,
   waitForTuiWorkerShutdown,
@@ -51,5 +52,61 @@ describe("tui thread", () => {
     await expect(waitForTuiWorkerShutdown(Bun.sleep(100), env)).rejects.toThrow(
       "TUI worker shutdown timed out after 10ms",
     )
+  })
+
+  test("closes and terminates the worker before materializing and publishing traces for normal and Ctrl-C exits", async () => {
+    const request = { caseDir: "/tmp/case", caseID: "case", runID: "run", recordsFile: "/tmp/case/records.jsonl" }
+    const publication = {
+      caseDir: "/tmp/case",
+      caseID: "case",
+      status: "completed" as const,
+      traceFile: "/tmp/case/trace.json",
+    }
+
+    for (const exit of ["normal", "ctrl-c"]) {
+      const calls: string[] = []
+      await finalizeTuiWorker({
+        shutdown: async () => {
+          calls.push(`${exit}:close`)
+          return [request]
+        },
+        terminate: () => {
+          calls.push(`${exit}:terminate`)
+        },
+        materialize: async (requests) => {
+          calls.push(`${exit}:materialize:${requests.length}`)
+          return [publication]
+        },
+        publish: () => {
+          calls.push(`${exit}:publish`)
+        },
+      })
+
+      expect(calls).toEqual([
+        `${exit}:close`,
+        `${exit}:terminate`,
+        `${exit}:materialize:1`,
+        `${exit}:publish`,
+      ])
+    }
+  })
+
+  test("keeps the TUI shutdown result when trace materialization fails", async () => {
+    const calls: string[] = []
+    await expect(
+      finalizeTuiWorker({
+        shutdown: async () => [{ caseDir: "/tmp/case", caseID: "case", runID: "run", recordsFile: "/tmp/case/records.jsonl" }],
+        terminate: () => {
+          calls.push("terminate")
+        },
+        materialize: async () => {
+          throw new Error("materializer failed")
+        },
+        publish: () => {
+          calls.push("publish")
+        },
+      }),
+    ).resolves.toBeUndefined()
+    expect(calls).toEqual(["terminate"])
   })
 })
