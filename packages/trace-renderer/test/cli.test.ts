@@ -192,6 +192,34 @@ describe("observable-trace render", () => {
     })
   })
 
+  test("reports a materialized incomplete journal as incomplete", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      const journal: unknown[] = []
+      const store = new CausalIRStore({
+        runID: "run_materialized_recovery",
+        caseID: "materialized-recovery-case",
+        append: (entry) => journal.push(entry),
+      })
+      store.createNode({
+        node_id: "run_start",
+        kind: "run.start",
+        component: "run",
+        timestamp: "2026-08-14T00:00:00.000Z",
+        time_ms: 0,
+        data: { run_id: "run_materialized_recovery", case_id: "materialized-recovery-case" },
+      })
+      await fs.writeFile(path.join(caseDir, "records.jsonl"), `${journal.map((entry) => JSON.stringify(entry)).join("\n")}\n`)
+
+      expect(run("finalize", caseDir).exitCode).toBe(0)
+      const rendered = run("render", caseDir)
+
+      expect(rendered.exitCode).toBe(0)
+      expect(Buffer.from(rendered.stdout).toString()).toContain("source: trace.json")
+      expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: incomplete")
+      expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toContain("Incomplete journal recovery")
+    })
+  })
+
   test("writes to an explicitly requested absolute output path", async () => {
     await withCaseDirectory(async (caseDir) => {
       await writeFinalizedCase(caseDir)

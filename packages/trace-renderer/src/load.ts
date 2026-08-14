@@ -310,7 +310,7 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
       trace: projectDocument(document),
       caseDir: selected.caseDir,
       source: selected.source,
-      incomplete: false,
+      incomplete: document.manifest.recovery_status === "incomplete_journal_replay",
     }
   }
 
