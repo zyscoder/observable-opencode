@@ -1339,6 +1339,25 @@ function canonicalNodeFromUnknown(
   return canonicalNodeEnvelope(input as CausalNodeLike, context)
 }
 
+export {
+  aliasCollisionDiagnostic as causalIRAliasCollisionDiagnostic,
+  canonicalEdge as canonicalCausalEdge,
+  canonicalEdgeEnvelope as canonicalCausalIREdge,
+  canonicalNodeEnvelope as canonicalCausalIRNode,
+  causalIRFinalizationIntegrityHash,
+  journalData as copyCausalIRJournalData,
+  legacyRef as causalIRLegacyRef,
+  nodeAliases as causalIRNodeAliases,
+  normalizeEdges as normalizeCausalIREdges,
+  payloadHash as causalIRPayloadHash,
+  reconciledGraphDiagnostics as reconcileCausalIRGraphDiagnostics,
+  referenceAliasCandidates as causalIRReferenceAliasCandidates,
+  typedRef as typedCausalIRReference,
+  unknownRelationDiagnostic as causalIRUnknownRelationDiagnostic,
+  unresolvedReferenceOccurrenceDiagnostic as causalIRUnresolvedReferenceOccurrenceDiagnostic,
+  validateNodeProvenance as validateCausalIRNodeProvenance,
+}
+
 function isCanonicalEdge(input: unknown): input is CausalIREdge {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false
   const value = input as Partial<CausalIREdge>

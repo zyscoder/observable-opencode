@@ -3,7 +3,6 @@ import fs from "fs"
 import path from "path"
 import { Global } from "@opencode-ai/core/global"
 import {
-  CausalIRStore,
   normalizeTemporalReferences,
   projectProvenanceTrace,
   writeJsonDocumentAtomic,
@@ -22,6 +21,11 @@ import {
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
+import {
+  CausalIRRuntimeStore,
+  type CausalIREdgeQuery,
+  type CausalIRNodeQuery,
+} from "./causal-ir-runtime-store"
 import { SessionTraceRegistry, traceRouteHint } from "./case-trace-session"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
@@ -2080,26 +2084,15 @@ function isSensitiveKey(input: string, path: readonly string[] = [], value?: unk
 }
 
 class TraceOwnedCausalIRStore {
-  private readonly store: CausalIRStore
+  private readonly store: CausalIRRuntimeStore
 
-  constructor(input: { runID: string; caseID: string; append?: (entry: CausalIRJournalEntry) => unknown }) {
-    this.store = new CausalIRStore(input)
-  }
-
-  get nodes() {
-    return this.store.nodes
-  }
-
-  get edges() {
-    return this.store.edges
-  }
-
-  get artifacts() {
-    return this.store.artifacts
-  }
-
-  get diagnostics() {
-    return this.store.diagnostics
+  constructor(input: {
+    runID: string
+    caseID: string
+    indexPath: string
+    append?: (entry: CausalIRJournalEntry) => unknown
+  }) {
+    this.store = new CausalIRRuntimeStore(input)
   }
 
   createNode<T extends CausalNodeLike>(node: T): T {
@@ -2138,6 +2131,26 @@ class TraceOwnedCausalIRStore {
     return this.store.resolveReference(input)
   }
 
+  queryNodes(query: CausalIRNodeQuery = {}) {
+    return this.store.queryNodes(query)
+  }
+
+  queryNodesReferencing(refs: string[], query: CausalIRNodeQuery = {}) {
+    return this.store.queryNodesReferencing(refs, query)
+  }
+
+  queryEdges(query: CausalIREdgeQuery = {}) {
+    return this.store.queryEdges(query)
+  }
+
+  queryArtifacts() {
+    return this.store.queryArtifacts()
+  }
+
+  nodeOrder(nodeID: string) {
+    return this.store.nodeOrder(nodeID)
+  }
+
   checkpoint(data: unknown): void {
     this.store.checkpoint(this.copy(data))
   }
@@ -2160,6 +2173,10 @@ class TraceOwnedCausalIRStore {
 
   synchronize(): CausalIRStoreSnapshot {
     return this.store.synchronize()
+  }
+
+  close(): void {
+    this.store.close()
   }
 
   private copy<T>(input: T): T {
@@ -5252,14 +5269,28 @@ class ActiveCaseTrace {
   private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
   private readonly causalIR: TraceOwnedCausalIRStore
-  private get causalNodes() {
-    return this.causalIR.nodes as CausalNode[]
+  private queryCausalNodes(query: CausalIRNodeQuery = {}) {
+    return this.causalIR.queryNodes(query) as CausalNode[]
   }
-  private get causalEdges() {
-    return this.causalIR.edges as CausalEdge[]
+
+  private findCausalNode(nodeID: string) {
+    return this.queryCausalNodes({ ids: [nodeID], limit: 1 })[0]
   }
-  private get artifacts() {
-    return this.causalIR.artifacts as TraceArtifact[]
+
+  private queryCausalEdges(query: CausalIREdgeQuery = {}) {
+    return this.causalIR.queryEdges(query) as CausalEdge[]
+  }
+
+  private queryArtifacts() {
+    return this.causalIR.queryArtifacts() as TraceArtifact[]
+  }
+
+  private nextCausalNodeID(prefix: string) {
+    return semanticID(prefix, ++this.causalNodeSequence)
+  }
+
+  private nextCausalEdgeID() {
+    return semanticID("cedge", ++this.causalEdgeSequence)
   }
   private artifactByDedupeKey = new Map<string, TraceArtifact>()
   private diagnosticSequence = 0
@@ -5268,6 +5299,8 @@ class ActiveCaseTrace {
   private contextSnapshots: TraceContextSnapshot[] = []
   private semanticDecisions: TraceSemanticDecision[] = []
   private semanticEdgeSequence = 0
+  private causalNodeSequence = 0
+  private causalEdgeSequence = 0
   private verificationRecords: TraceVerificationRecord[] = []
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
@@ -5335,11 +5368,31 @@ class ActiveCaseTrace {
       pid: process.pid,
       ...config.environment,
     }
-    this.causalIR = new TraceOwnedCausalIRStore({
-      runID: this.runID,
-      caseID: this.caseID,
-      append: (entry) => this.writeCausalIRRecord(entry),
-    })
+    let indexPath = path.join(this.caseDir, "index.sqlite")
+    try {
+      fs.mkdirSync(this.caseDir, { recursive: true })
+      for (const suffix of ["", "-wal", "-shm"])
+        fs.rmSync(`${indexPath}${suffix}`, { force: true })
+    } catch {
+      this.writable = false
+      indexPath = ":memory:"
+    }
+    try {
+      this.causalIR = new TraceOwnedCausalIRStore({
+        runID: this.runID,
+        caseID: this.caseID,
+        indexPath,
+        append: (entry) => this.writeCausalIRRecord(entry),
+      })
+    } catch {
+      this.writable = false
+      this.causalIR = new TraceOwnedCausalIRStore({
+        runID: this.runID,
+        caseID: this.caseID,
+        indexPath: ":memory:",
+        append: () => false,
+      })
+    }
     this.open()
   }
 
@@ -5449,7 +5502,7 @@ class ActiveCaseTrace {
     this.write("span.end", span)
     const nodeID = this.spanNodeIDs.get(id)
     if (nodeID) {
-      const node = this.causalNodes.find((item) => item.node_id === nodeID)
+      const node = this.findCausalNode(nodeID)
       if (node) {
         const output =
           span.component === "task" ? enrichSubagentOutput(input?.output, nodeID, this.caseDir) : input?.output
@@ -5593,7 +5646,7 @@ class ActiveCaseTrace {
       quality_flags: qualityFlags,
     }
     const callID = firstStringField(input, ["callID", "call_id"])
-    const skillNode = this.causalNodes.find((item) => {
+    const skillNode = this.queryCausalNodes({ kinds: ["skill.load"], status: "running", reverse: true }).find((item) => {
       if (item.kind !== "skill.load") return false
       if (item.status !== "running") return false
       if (item.title === skillName) return true
@@ -5699,7 +5752,12 @@ class ActiveCaseTrace {
 
     if (eventType === "tool.call") {
       const nodeID = scopedCallID ? `toolcall_${scopedCallID}` : undefined
-      const existing = this.causalNodes.find((node) => {
+      const existing = this.queryCausalNodes({
+        kinds: ["tool.call"],
+        ...(callID ? { callID } : {}),
+        ...(sessionID ? { sessionID } : {}),
+        reverse: true,
+      }).find((node) => {
         if (node.kind !== "tool.call") return false
         if (nodeID && node.node_id === nodeID) return true
         if (input.span_id && node.span_id === input.span_id) return true
@@ -5774,7 +5832,7 @@ class ActiveCaseTrace {
     const isError = eventType === "tool.error"
     const error = isError ? errorInfo(payload.error ?? input.data) : undefined
     const nodeID = scopedCallID ? `${isError ? "toolerror" : "toolresult"}_${scopedCallID}` : undefined
-    const existing = nodeID ? this.causalNodes.find((node) => node.node_id === nodeID) : undefined
+    const existing = nodeID ? this.findCausalNode(nodeID) : undefined
     if (existing) return existing
     const node = this.node({
       node_id: nodeID,
@@ -5858,7 +5916,12 @@ class ActiveCaseTrace {
     sessionID?: string,
   ) {
     if (!callID) return
-    const node = this.causalNodes.find((item) => {
+    const node = this.queryCausalNodes({
+      kinds: ["tool.call"],
+      callID,
+      ...(sessionID ? { sessionID } : {}),
+      reverse: true,
+    }).find((item) => {
       if (item.kind !== "tool.call") return false
       if (item.status !== "running" && item.data?.outcome_record_id) return false
       const input = objectField(item.data, "input")
@@ -5897,7 +5960,11 @@ class ActiveCaseTrace {
     if (input.callID) targetRefs.add(`tool_call:${input.callID}`)
     if (input.spanID) targetRefs.add(`span:${input.spanID}`)
 
-    const matchingCallNodes = this.causalNodes.filter((node) => {
+    const matchingCallNodes = this.queryCausalNodes({
+      kinds: ["tool.call"],
+      ...(input.callID ? { callID: input.callID } : {}),
+      ...(input.sessionID ? { sessionID: input.sessionID } : {}),
+    }).filter((node) => {
       if (node.kind !== "tool.call" || !input.callID) return false
       const nodeInput = recordFromUnknown(node.data?.input)
       const matchesCall =
@@ -5917,7 +5984,10 @@ class ActiveCaseTrace {
     let changed = true
     while (changed) {
       changed = false
-      for (const node of this.causalNodes) {
+      const candidates = this.causalIR.queryNodesReferencing([...targetRefs], {
+        kinds: ["execution.observation", "observation", "evidence.fact", "evidence.semantic_fact"],
+      }) as CausalNode[]
+      for (const node of candidates) {
         if (!this.canBackfillToolOutcome(node)) continue
         const sourceRefs = node.source_refs ?? []
         if (sourceRefs.includes(input.canonicalOutcomeRef)) continue
@@ -5971,7 +6041,7 @@ class ActiveCaseTrace {
   }
 
   private hasCausalEdge(from: TraceRef, toNodeID: string, relation: string) {
-    return this.causalEdges.some(
+    return this.queryCausalEdges({ fromIDs: [from.id], toIDs: [toNodeID], relations: [relation] }).some(
       (edge) =>
         edge.relation === relation &&
         edge.from.type === from.type &&
@@ -6250,7 +6320,7 @@ class ActiveCaseTrace {
     const key = [input.kind, input.sessionID ?? "", input.messageID ?? "", ...memberRefs].join("|")
     const existingID = this.contextSetNodeIDsByKey.get(key)
     if (existingID) {
-      const existing = this.causalNodes.find((node) => node.node_id === existingID)
+      const existing = this.findCausalNode(existingID)
       if (existing) return existing
     }
     const node = this.node(
@@ -6414,7 +6484,7 @@ class ActiveCaseTrace {
   }
 
   private syncVerificationNode(verification: TraceVerificationRecord) {
-    const node = this.causalNodes.find((item) => item.node_id === `vernode_${verification.verification_id}`)
+    const node = this.findCausalNode(`vernode_${verification.verification_id}`)
     if (!node) return
     node.data = {
       ...(node.data ?? {}),
@@ -6427,7 +6497,7 @@ class ActiveCaseTrace {
     node.artifact_refs = this.collectArtifactRefs(node.data)
     this.causalIR.updateNode(node)
     const verificationRef = `verification:${verification.verification_id}`
-    for (const derived of this.causalNodes) {
+    for (const derived of this.causalIR.queryNodesReferencing([verificationRef]) as CausalNode[]) {
       if (derived.node_id === node.node_id) continue
       const provenance = this.verificationFactProvenance(derived.source_refs ?? [], derived.span_id)
       if (!provenance?.verification_refs.includes(verificationRef)) continue
@@ -6766,11 +6836,17 @@ class ActiveCaseTrace {
       firstStringField(node.data ?? {}, fields) ??
       firstStringField(recordFromUnknown(node.data?.input) ?? {}, fields) ??
       firstStringField(node.metadata ?? {}, fields)
-    const nodePosition = (node: CausalNode) =>
-      this.causalNodes.findIndex((candidate) => candidate.node_id === node.node_id)
+    const candidateIDs = dedupeStrings([
+      ...this.recentPromptNodeIDs,
+      ...this.recentContextNodeIDs,
+      ...this.recentLLMNodeIDs,
+      ...this.recentContextSnapshotIDs.map((snapshotID) => `ctxnode_${snapshotID}`),
+    ])
+    const nodesByID = new Map(this.queryCausalNodes({ ids: candidateIDs }).map((node) => [node.node_id, node]))
+    const nodePosition = (node: CausalNode) => this.causalIR.nodeOrder(node.node_id) ?? -1
     const exactContextAnchor = [...this.recentContextNodeIDs]
       .reverse()
-      .map((id) => this.causalNodes.find((candidate) => candidate.node_id === id))
+      .map((id) => nodesByID.get(id))
       .find((node) => {
         if (!node || !messageID) return false
         if (sessionID && nodeScopeValue(node, ["session_id", "sessionID"]) !== sessionID) return false
@@ -6780,7 +6856,7 @@ class ActiveCaseTrace {
     const scopedNodeIDs = (nodeIDs: string[], limit: number, matchMessage: boolean) =>
       nodeIDs
         .filter((id) => {
-          const node = this.causalNodes.find((candidate) => candidate.node_id === id)
+          const node = nodesByID.get(id)
           if (!node) return false
           if (sessionID && nodeScopeValue(node, ["session_id", "sessionID"]) !== sessionID) return false
           if (matchMessage && messageID) {
@@ -6801,13 +6877,13 @@ class ActiveCaseTrace {
     const llmRefs = llmNodeIDs.map((id) => `node:${id}`)
     const selectedLLMSpanIDs = new Set(
       llmNodeIDs
-        .map((id) => this.causalNodes.find((node) => node.node_id === id)?.span_id)
+        .map((id) => nodesByID.get(id)?.span_id)
         .filter((id): id is string => Boolean(id)),
     )
     const contextSnapshotRefs = this.recentContextSnapshotIDs
       .map((snapshotID) => ({
         snapshotID,
-        node: this.causalNodes.find((node) => node.node_id === `ctxnode_${snapshotID}`),
+        node: nodesByID.get(`ctxnode_${snapshotID}`),
       }))
       .filter(({ node }) => {
         if (!node) return false
@@ -6819,7 +6895,7 @@ class ActiveCaseTrace {
       .slice(-2)
       .map(({ snapshotID }) => `context_snapshot:${snapshotID}`)
     const contextNodes = contextNodeIDs
-      .map((id) => this.causalNodes.find((node) => node.node_id === id))
+      .map((id) => nodesByID.get(id))
       .filter((node): node is CausalNode => Boolean(node))
     const messageTransforms = contextNodes.map((node) => ({
       node_ref: `node:${node.node_id}`,
@@ -6896,7 +6972,9 @@ class ActiveCaseTrace {
       ])
       return outcomeRefs.some((ref) => selectedIdentities.has(ref))
     }
-    const candidateRefs = this.causalNodes.flatMap((node) => {
+    const candidateRefs = this.queryCausalNodes({
+      kinds: ["evidence.semantic_fact", "verification", "change"],
+    }).flatMap((node) => {
       if (!isSelectedGenerationEvidence(node)) return []
       if (node.kind === "evidence.semantic_fact") return [`evidence:${node.node_id}`]
       if (node.kind === "verification") {
@@ -6977,7 +7055,7 @@ class ActiveCaseTrace {
           label: "LLM generation produced response output",
         })
       }
-      const llmNode = this.causalNodes.find((node) => node.node_id === parsed.id)
+      const llmNode = this.findCausalNode(parsed.id)
       if (!llmNode) continue
       const currentData = llmNode.data ?? {}
       llmNode.data = {
@@ -7131,7 +7209,7 @@ class ActiveCaseTrace {
     for (const ref of refs) {
       const parsed = this.parseSourceRef(ref)
       if (!parsed || parsed.type !== "verification") continue
-      const node = this.causalNodes.find(
+      const node = this.queryCausalNodes({ kinds: ["verification"] }).find(
         (item) => item.kind === "verification" && item.data?.verification_id === parsed.id,
       )
       const riskFlags = stringArrayField(node?.data ?? {}, [
@@ -7333,7 +7411,7 @@ class ActiveCaseTrace {
       ...(verificationAfterTestChangeRefs.length ? ["verification_after_test_change"] : []),
     ])
     const claim: TraceResponseClaimRecord = {
-      claim_id: input.claim_id ?? semanticID("claim", this.causalNodes.length + 1),
+      claim_id: input.claim_id ?? this.nextCausalNodeID("claim"),
       claim_key: input.claim_key,
       response_segment_id: input.response_segment_id,
       text: this.summarizeText(claimText, "result.response.claim"),
@@ -7739,7 +7817,7 @@ class ActiveCaseTrace {
         is_final_for_case: segment.is_final_for_case,
         finality_source: segment.finality_source,
       }
-      const node = this.causalNodes.find((item) => item.node_id === `responsenode_${segment.segment_id}`)
+      const node = this.findCausalNode(`responsenode_${segment.segment_id}`)
       if (!node?.data) continue
       node.data.response_role = segment.response_role
       node.data.is_final_for_case = segment.is_final_for_case
@@ -7795,11 +7873,11 @@ class ActiveCaseTrace {
     if (!staleDesignIDs.size) return
 
     this.designRecords = retainedDesignRecords
-    this.causalIR.replaceNodes(this.causalNodes.filter((node) => !staleDesignIDs.has(node.node_id)))
+    this.causalIR.replaceNodes(this.queryCausalNodes().filter((node) => !staleDesignIDs.has(node.node_id)))
     const referencesStaleDesign = (edge: { from: TraceRef; to: TraceRef }) =>
       (edge.from.type === "design_record" && staleDesignIDs.has(edge.from.id)) ||
       (edge.to.type === "design_record" && staleDesignIDs.has(edge.to.id))
-    this.causalIR.replaceEdges(this.causalEdges.filter((edge) => !referencesStaleDesign(edge)))
+    this.causalIR.replaceEdges(this.queryCausalEdges().filter((edge) => !referencesStaleDesign(edge)))
     this.write("semantic.design_record.pruned", {
       design_ids: [...staleDesignIDs],
       reason: "source response segment is no longer the final user-visible answer",
@@ -7829,7 +7907,7 @@ class ActiveCaseTrace {
       finality_reason: "exit_gate_has_final_answer",
       finality_gate_message_id: input.message_id,
     }
-    const node = this.causalNodes.find((item) => item.node_id === `responsenode_${segment.segment_id}`)
+    const node = this.findCausalNode(`responsenode_${segment.segment_id}`)
     if (node?.data) {
       node.data.response_role = "final_answer"
       node.data.is_final_for_case = true
@@ -7859,11 +7937,11 @@ class ActiveCaseTrace {
       if (segment.is_final_for_case !== true) continue
       if (caseStatus !== "success" && segment.finality_source !== "explicit") continue
       const responseNodeID = `responsenode_${segment.segment_id}`
-      const responseNode = this.causalNodes.find((item) => item.node_id === responseNodeID)
+      const responseNode = this.findCausalNode(responseNodeID)
       const responseText = this.responseSourceBySegmentID.get(segment.segment_id) ?? responseNode?.data?.text ?? fieldSummaryText(segment.text)
       const claims = atomizeResponseClaims(responseText)
       const plannedClaims = claims.map((claim, index) => {
-        const claimID = semanticID("claim", this.causalNodes.length + index + 1)
+        const claimID = this.nextCausalNodeID("claim")
         return {
           claim,
           claim_id: claimID,
@@ -7972,7 +8050,7 @@ class ActiveCaseTrace {
   }
 
   llmTurn(input: LlmTurnInput) {
-    const turnID = input.turn_id ?? input.span_id ?? semanticID("llmturn", this.causalNodes.length + 1)
+    const turnID = input.turn_id ?? input.span_id ?? this.nextCausalNodeID("llmturn")
     const usage = input.token_usage ? normalizeTokenUsage(input.token_usage) : undefined
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const data: Record<string, unknown> = omitUndefined({
@@ -7998,7 +8076,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     })
     const nodeID = `llmturn_${turnID}`
-    const existing = this.causalNodes.find((item) => item.node_id === nodeID)
+    const existing = this.findCausalNode(nodeID)
     if (existing) {
       existing.status = input.status ?? existing.status
       existing.data = {
@@ -8035,7 +8113,7 @@ class ActiveCaseTrace {
   agentLifecycle(input: AgentLifecycleInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     return this.node({
-      node_id: `lifecycle_${input.lifecycle_id ?? semanticID("life", this.causalNodes.length + 1)}`,
+      node_id: `lifecycle_${input.lifecycle_id ?? this.nextCausalNodeID("life")}`,
       kind: "agent.lifecycle",
       component: "processor",
       span_id: input.span_id,
@@ -8058,7 +8136,7 @@ class ActiveCaseTrace {
   }
 
   exitGate(input: ExitGateInput) {
-    const gateID = input.gate_id ?? semanticID("gate", this.causalNodes.length + 1)
+    const gateID = input.gate_id ?? this.nextCausalNodeID("gate")
     const finalSegment = this.promoteFinalResponseFromExitGate(input)
     const normalizedSourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const sourceRefs = mergeRefs(
@@ -8101,7 +8179,7 @@ class ActiveCaseTrace {
   }
 
   evidenceFact(input: EvidenceFactInput) {
-    const factID = input.fact_id ?? semanticID("fact", this.causalNodes.length + 1)
+    const factID = input.fact_id ?? this.nextCausalNodeID("fact")
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const verificationProvenance = this.verificationFactProvenance(sourceRefs, input.span_id)
     const sourceLocations = dedupeSourceLocations([
@@ -8115,7 +8193,7 @@ class ActiveCaseTrace {
     const dedupeKey =
       recordKind === "evidence.semantic_fact" ? semanticFactDedupeKey(input, canonical, sourceLocations) : undefined
     const existingID = dedupeKey ? this.semanticFactNodeIDsByKey.get(dedupeKey) : undefined
-    const existing = existingID ? this.causalNodes.find((node) => node.node_id === existingID) : undefined
+    const existing = existingID ? this.findCausalNode(existingID) : undefined
     if (existing) {
       const existingData = existing.data ?? {}
       const occurrenceCount = optionalNumber(existingData.occurrence_count) ?? 1
@@ -8261,7 +8339,7 @@ class ActiveCaseTrace {
       : normalized.data
     const timestamp = nowIso()
     const node: CausalNode = {
-      node_id: normalized.node_id ?? semanticID("node", this.causalNodes.length + 1),
+      node_id: normalized.node_id ?? this.nextCausalNodeID("node"),
       kind: normalized.kind,
       component: normalized.component,
       span_id: normalized.span_id,
@@ -8310,7 +8388,7 @@ class ActiveCaseTrace {
     if (this.temporalAdvisoryEdgeKeys.has(key)) return
     this.temporalAdvisoryEdgeKeys.add(key)
     this.causalIR.createEdge({
-      edge_id: semanticID("cedge", this.causalEdges.length + 1),
+      edge_id: this.nextCausalEdgeID(),
       from: { type: "node", id: contextSet.node_id, label: contextSet.kind },
       to: { type: "node", id: node.node_id, label: node.kind },
       relation: "derived_from",
@@ -8332,7 +8410,7 @@ class ActiveCaseTrace {
     const temporal = normalizeTemporalReferences(input)
     const normalized = temporal.value
     const edge: CausalEdgeInput & { edge_id: string } = {
-      edge_id: normalized.edge_id ?? semanticID("cedge", this.causalEdges.length + 1),
+      edge_id: normalized.edge_id ?? this.nextCausalEdgeID(),
       from: normalized.from,
       to: normalized.to,
       relation: normalized.relation,
@@ -8348,7 +8426,7 @@ class ActiveCaseTrace {
     }
     const stored = this.causalIR.createEdge(edge) as CausalEdge
     if (temporal.selectors.length) {
-      const target = this.causalNodes.find((node) => node.node_id === normalized.to.id)
+      const target = this.findCausalNode(normalized.to.id)
       if (target) this.createTemporalAdvisoryEdges(target, this.currentSourceRefs())
     }
     return stored
@@ -8585,8 +8663,7 @@ class ActiveCaseTrace {
       .map((item) => normalizeSourcePath(item))
       .filter((item): item is string => Boolean(item))
     const refs: string[] = []
-    for (const node of this.causalNodes) {
-      if (node.kind !== "evidence.semantic_fact" && node.kind !== "evidence.fact") continue
+    for (const node of this.queryCausalNodes({ kinds: ["evidence.semantic_fact", "evidence.fact"] })) {
       const data = node.data ?? {}
       const structured = recordFromUnknown(data.structured_claim)
       const span = recordFromUnknown(structured?.source_span)
@@ -8636,9 +8713,8 @@ class ActiveCaseTrace {
   }
 
   private enrichSemanticFactApplicabilityAndConflicts() {
-    const facts = this.causalNodes.filter((node) => node.kind === "evidence.semantic_fact")
-    const changePoints: SemanticFactChangePoint[] = this.causalNodes
-      .filter((node) => node.kind === "change")
+    const facts = this.queryCausalNodes({ kinds: ["evidence.semantic_fact"] })
+    const changePoints: SemanticFactChangePoint[] = this.queryCausalNodes({ kinds: ["change"] })
       .map((node) => ({
         time_ms: node.time_ms,
         files: stringArrayField(node.data ?? {}, ["files"]) ?? [],
@@ -8766,6 +8842,7 @@ class ActiveCaseTrace {
       this.publishTerminalLocation(this.tracePublicationStatus(status))
     } finally {
       this.responseSourceBySegmentID.clear()
+      if (this.finished) this.causalIR.close()
     }
   }
 
@@ -8792,21 +8869,25 @@ class ActiveCaseTrace {
       input?.result === undefined
         ? this.result
         : (sanitizeTraceJson(input.result, "result", ["runtime_close", "result"]) as Record<string, unknown>)
-    this.causalIR.closeRuntime({
-      format: "runtime_close",
-      status,
-      closed_at: closedAt,
-      result: {
-        ...(result ?? {}),
-        open_lifecycle: { cancelled_spans: cancelledSpans },
-      },
-      ...(error ? { error } : {}),
-      manifest: {
-        case_id: this.caseID,
-        run_id: this.runID,
-        ...(this.sessionID ? { session_id: this.sessionID } : {}),
-      },
-    })
+    try {
+      this.causalIR.closeRuntime({
+        format: "runtime_close",
+        status,
+        closed_at: closedAt,
+        result: {
+          ...(result ?? {}),
+          open_lifecycle: { cancelled_spans: cancelledSpans },
+        },
+        ...(error ? { error } : {}),
+        manifest: {
+          case_id: this.caseID,
+          run_id: this.runID,
+          ...(this.sessionID ? { session_id: this.sessionID } : {}),
+        },
+      })
+    } finally {
+      this.causalIR.close()
+    }
     this.responseSourceBySegmentID.clear()
     this.finished = true
     return Object.freeze({
@@ -8838,6 +8919,7 @@ class ActiveCaseTrace {
       this.persistSignalSnapshotBestEffort(signal, result)
     } finally {
       this.signalFinalizationInProgress = false
+      if (this.finished) this.causalIR.close()
     }
   }
 
@@ -9023,7 +9105,7 @@ class ActiveCaseTrace {
       token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
       spans: [...this.spans.values()],
       events: this.events,
-      artifacts: this.artifacts,
+      artifacts: this.queryArtifacts(),
       errors: this.errors,
       result: this.result,
       context_snapshots: this.contextSnapshots,
@@ -9221,7 +9303,9 @@ class ActiveCaseTrace {
   }
 
   private syncCaseDiagnosticNodes(traceHealth: TraceHealthMetrics, completionDiagnosticsEligible: boolean) {
-    const current = this.causalNodes.filter((node) => this.isCaseDiagnosticKind(node.kind))
+    const current = this.queryCausalNodes({
+      kinds: ["case.missing_semantic", "case.observed_defect", "case.trace_quality"],
+    }).filter((node) => this.isCaseDiagnosticKind(node.kind))
     const currentByID = new Map(current.map((node) => [node.node_id, node]))
     const desired = this.caseDiagnosticNodes(traceHealth, currentByID, completionDiagnosticsEligible)
     const desiredIDs = new Set(desired.map((node) => node.node_id))
@@ -9237,7 +9321,7 @@ class ActiveCaseTrace {
 
     if (current.some((node) => !desiredIDs.has(node.node_id))) {
       this.causalIR.replaceNodes(
-        this.causalNodes.filter((node) => !this.isCaseDiagnosticKind(node.kind) || desiredIDs.has(node.node_id)),
+        this.queryCausalNodes().filter((node) => !this.isCaseDiagnosticKind(node.kind) || desiredIDs.has(node.node_id)),
       )
     }
   }
@@ -9384,9 +9468,7 @@ class ActiveCaseTrace {
   }
 
   private observedCaseStatus(): TraceStatus | undefined {
-    const caseRecord = [...this.causalNodes]
-      .reverse()
-      .find((node) => node.kind === "case.completed" || node.kind === "case.failed")
+    const caseRecord = this.queryCausalNodes({ kinds: ["case.completed", "case.failed"], reverse: true, limit: 1 })[0]
     const status = caseRecord?.data?.case_status ?? caseRecord?.status
     return status === "success" || status === "error" || status === "cancelled" ? status : undefined
   }
@@ -9482,9 +9564,10 @@ class ActiveCaseTrace {
   private finalizedOpenRecordRefsForCase(caseStatus: TraceStatus) {
     if (caseStatus === "success") return []
     return dedupeStrings(
-      this.causalNodes
+      this.queryCausalNodes({ reverse: true })
         .filter((node) => node.data?.finalized_status === "finalized_without_close")
-        .slice(-16)
+        .slice(0, 16)
+        .reverse()
         .map((node) => `node:${node.node_id}`),
     )
   }
@@ -9520,8 +9603,7 @@ class ActiveCaseTrace {
 
   private taskObligations() {
     const obligations = [...taskObligationsFromInput(this.input)]
-    for (const node of this.causalNodes) {
-      if (node.kind !== "prompt.assembly") continue
+    for (const node of this.queryCausalNodes({ kinds: ["prompt.assembly"] })) {
       const stage = typeof node.data?.stage === "string" ? node.data.stage : ""
       if (!["initial_user_request", "user_message_created"].includes(stage)) continue
       obligations.push(
@@ -9549,8 +9631,7 @@ class ActiveCaseTrace {
       }
     }
     if (obligation.obligation_type === "mcp_required") {
-      const refs = this.causalNodes
-        .filter((node) => node.kind === "mcp.call")
+      const refs = this.queryCausalNodes({ kinds: ["mcp.call"] })
         .map((node) => this.recordRefForNode(node))
       return {
         status: refs.length ? "fulfilled" : "unmet",
@@ -9559,8 +9640,7 @@ class ActiveCaseTrace {
       }
     }
     if (obligation.obligation_type === "subagent_required") {
-      const refs = this.causalNodes
-        .filter((node) => node.kind === "subagent.call")
+      const refs = this.queryCausalNodes({ kinds: ["subagent.call"] })
         .map((node) => this.recordRefForNode(node))
       return {
         status: refs.length ? "fulfilled" : "unmet",
@@ -9614,8 +9694,7 @@ class ActiveCaseTrace {
         finalized_reason: finalizedReason,
       }
     }
-    for (const node of this.causalNodes) {
-      if (node.status !== "running") continue
+    for (const node of this.queryCausalNodes({ status: "running" })) {
       node.status = finalStatus
       node.data = {
         ...(node.data ?? {}),
@@ -9630,8 +9709,8 @@ class ActiveCaseTrace {
   }
 
   private backfillCompactionEstimates() {
-    const checks = this.causalNodes.filter((node) => node.kind === "context.compaction_check")
-    for (const compaction of this.causalNodes.filter((node) => node.kind === "context.compaction")) {
+    const checks = this.queryCausalNodes({ kinds: ["context.compaction_check"] })
+    for (const compaction of this.queryCausalNodes({ kinds: ["context.compaction"] })) {
       if (!compaction.data) continue
       if (optionalNumber(compaction.data.token_estimate_before) !== undefined) continue
       const match = nearestCompactionCheck(compaction, checks)
@@ -9671,12 +9750,12 @@ class ActiveCaseTrace {
   }
 
   private enrichInlineSubagentRefs() {
-    const subagentNodes = this.causalNodes.filter((node) => node.kind === "subagent.call")
+    const subagentNodes = this.queryCausalNodes({ kinds: ["subagent.call"] })
     for (const subagent of subagentNodes) {
       if (!subagent.data) continue
       const childSessionID = firstStringField(subagent.data, ["child_session_id", "childSessionID"])
       if (!childSessionID) continue
-      const childRecords = this.causalNodes.filter(
+      const childRecords = this.queryCausalNodes({ sessionID: childSessionID }).filter(
         (node) => node.node_id !== subagent.node_id && causalNodeReferencesSession(node, childSessionID),
       )
       if (!childRecords.length) continue
@@ -9790,15 +9869,18 @@ class ActiveCaseTrace {
     const parentSessionID =
       firstStringField(subagent.data, ["parent_session_id", "parentSessionID"]) ??
       firstStringField(subagentInput, ["parent_session_id", "parentSessionID", "session_id", "sessionID"])
-    const subagentPosition = this.causalNodes.findIndex((node) => node.node_id === subagent.node_id)
-    const childCompletionPositions = this.causalNodes.flatMap((node, index) => {
+    const subagentPosition = this.causalIR.nodeOrder(subagent.node_id) ?? -1
+    const childCompletionPositions = this.queryCausalNodes({
+      kinds: ["response.output", "agent.lifecycle"],
+      ...(childSessionID ? { sessionID: childSessionID } : {}),
+    }).flatMap((node) => {
       if (!childSessionID || !causalNodeReferencesSession(node, childSessionID)) return []
-      if (node.kind === "response.output") return [index]
+      if (node.kind === "response.output") return [this.causalIR.nodeOrder(node.node_id) ?? -1]
       if (
         node.kind === "agent.lifecycle" &&
         /response\.completed|turn\.completed|completed/.test(firstStringField(node.data, ["phase"]) ?? "")
       )
-        return [index]
+        return [this.causalIR.nodeOrder(node.node_id) ?? -1]
       return []
     })
     const completionPosition = Math.max(subagentPosition, ...childCompletionPositions)
@@ -9813,17 +9895,25 @@ class ActiveCaseTrace {
     const childPhrases = dedupeStrings(
       [
         ...collectTextCandidates(subagent.data?.output),
-        ...this.causalNodes
-          .filter(
-            (node) =>
-              childSessionID && node.kind === "response.output" && causalNodeReferencesSession(node, childSessionID),
-          )
+        ...this.queryCausalNodes({
+          kinds: ["response.output"],
+          ...(childSessionID ? { sessionID: childSessionID } : {}),
+        })
+          .filter((node) => childSessionID && causalNodeReferencesSession(node, childSessionID))
           .flatMap((node) => collectTextCandidates(node.data)),
       ]
         .map((item) => normalizeMatchText(item))
         .filter((item) => item.length >= 16 && item.length <= 2000),
     )
-    return this.causalNodes.flatMap<SubagentConsumptionEvidence>((node, position) => {
+    const candidates = new Map<string, CausalNode>()
+    for (const node of this.causalIR.queryNodesReferencing(refs) as CausalNode[]) candidates.set(node.node_id, node)
+    for (const node of this.queryCausalNodes({
+      kinds: [...contentConsumerKinds],
+      ...(parentSessionID ? { sessionID: parentSessionID } : {}),
+    }))
+      candidates.set(node.node_id, node)
+    return [...candidates.values()].flatMap<SubagentConsumptionEvidence>((node) => {
+      const position = this.causalIR.nodeOrder(node.node_id) ?? -1
       if (node.node_id === subagent.node_id) return []
       if (position <= completionPosition) return []
       if (childSessionID && causalNodeReferencesSession(node, childSessionID)) return []
@@ -9856,7 +9946,7 @@ class ActiveCaseTrace {
   }
 
   private enrichMcpConsumptionRefs() {
-    const mcpNodes = this.causalNodes.filter((node) => node.kind === "mcp.call")
+    const mcpNodes = this.queryCausalNodes({ kinds: ["mcp.call"] })
     for (const mcp of mcpNodes) {
       if (!mcp.data) continue
       const sourceRefs = dedupeStrings([
@@ -9864,7 +9954,7 @@ class ActiveCaseTrace {
         ...(mcp.span_id ? [`span:${mcp.span_id}`] : []),
         ...(mcp.source_refs ?? []),
       ])
-      const consumers = this.causalNodes.filter((node) => {
+      const consumers = (this.causalIR.queryNodesReferencing(sourceRefs) as CausalNode[]).filter((node) => {
         if (node.node_id === mcp.node_id) return false
         const refs = node.source_refs ?? []
         return refs.some((ref) => sourceRefs.includes(ref))
@@ -10266,7 +10356,7 @@ class ActiveCaseTrace {
         },
       })
     }
-    const payloadDuplicationGroups = this.artifacts.filter((artifact) => (artifact.occurrences ?? 1) > 1).length
+    const payloadDuplicationGroups = this.queryArtifacts().filter((artifact) => (artifact.occurrences ?? 1) > 1).length
     const rawStreamDeltaEvents = this.events.filter((event) => /delta/i.test(event.event_type)).length
     const compactionRecords = records.filter((record) => record.event_type === "context.compaction")
     const compactionCheckRecords = records.filter((record) => record.event_type === "context.compaction_check")
@@ -10423,7 +10513,7 @@ class ActiveCaseTrace {
   }
 
   private provenanceRecords(): ProvenanceRecord[] {
-    return this.causalNodes
+    return this.queryCausalNodes()
       .map((node) => ({
         node,
         eventType: node.kind === "final.claim" ? "response.output" : node.kind,
@@ -10685,11 +10775,13 @@ class ActiveCaseTrace {
   compactionCheck(input: CompactionCheckInput) {
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const temporalAdvisoryRefs = this.temporalSourceRefs(sourceRefs)
-    const checkID = input.check_id ?? semanticID("compactioncheck", this.causalNodes.length + 1)
+    const checkID = input.check_id ?? this.nextCausalNodeID("compactioncheck")
     const usage = input.token_usage ? normalizeTokenUsage(input.token_usage) : undefined
-    const previousContextRecord = [...this.causalNodes]
-      .reverse()
-      .find((node) => node.kind === "context.compaction_check" || node.kind === "context.compaction")
+    const previousContextRecord = this.queryCausalNodes({
+      kinds: ["context.compaction_check", "context.compaction"],
+      reverse: true,
+      limit: 1,
+    })[0]
     if (
       input.overflow === false &&
       previousContextRecord?.kind === "context.compaction_check" &&
@@ -10773,7 +10865,7 @@ class ActiveCaseTrace {
   private evidenceNodeForRef(ref: string) {
     const parsed = this.parseSourceRef(ref)
     if (!parsed || parsed.type !== "evidence") return undefined
-    return this.causalNodes.find((node) => node.node_id === parsed.id || node.node_id === `evidence_${parsed.id}`)
+    return this.queryCausalNodes({ ids: [parsed.id, `evidence_${parsed.id}`], limit: 1 })[0]
   }
 
   private sourceNodeForRef(ref: string) {
@@ -10781,28 +10873,28 @@ class ActiveCaseTrace {
     if (!parsed) return undefined
     if (parsed.type === "evidence") return this.evidenceNodeForRef(ref)
     if (parsed.type === "observation" || parsed.type === "node") {
-      return this.causalNodes.find((node) => node.node_id === parsed.id)
+      return this.findCausalNode(parsed.id)
     }
     if (parsed.type === "tool_error" || parsed.type === "tool_result") {
       const expectedKind = parsed.type === "tool_error" ? "tool.error" : "tool.result"
-      return this.causalNodes.find(
+      return this.queryCausalNodes({ kinds: [expectedKind], callID: parsed.id, reverse: true }).find(
         (node) =>
-          node.kind === expectedKind &&
-          (node.source_refs?.includes(ref) ||
+          node.source_refs?.includes(ref) ||
             firstStringField(node.data, ["call_id", "callID"]) === parsed.id ||
-            node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`)),
+            node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`),
       )
     }
     if (parsed.type === "change" || parsed.type === "verification") {
       const expectedKind = parsed.type
       const identityKeys = parsed.type === "change" ? ["change_id", "changeID"] : ["verification_id", "verificationID"]
-      return this.causalNodes.find(
+      return this.queryCausalNodes({ kinds: [expectedKind] }).find(
         (node) =>
-          node.kind === expectedKind &&
-          (node.node_id === parsed.id || firstStringField(node.data, identityKeys) === parsed.id),
+          node.node_id === parsed.id || firstStringField(node.data, identityKeys) === parsed.id,
       )
     }
-    return this.causalNodes.find((node) => node.source_refs?.includes(ref) || node.node_id === parsed.id)
+    const direct = this.findCausalNode(parsed.id)
+    if (direct) return direct
+    return (this.causalIR.queryNodesReferencing([ref]) as CausalNode[]).find((node) => node.source_refs?.includes(ref))
   }
 
   private toolOutcomeRefsFromSourceRefs(refs: string[]) {
