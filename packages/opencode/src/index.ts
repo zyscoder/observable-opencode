@@ -29,6 +29,7 @@ import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
 import { DbCommand } from "./cli/cmd/db"
+import { TraceFinalizeCommand } from "./cli/cmd/trace-finalize"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
@@ -110,7 +111,7 @@ const cli = yargs(args)
       run_id: processMetadata.runID,
     })
 
-    await runStartupJsonMigration()
+    if (args[0] !== "trace-finalize") await runStartupJsonMigration()
   })
   .usage("")
   .completion("completion", "generate shell completion script")
@@ -137,6 +138,7 @@ const cli = yargs(args)
   .command(SessionCommand)
   .command(PluginCommand)
   .command(DbCommand)
+  .command(TraceFinalizeCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||

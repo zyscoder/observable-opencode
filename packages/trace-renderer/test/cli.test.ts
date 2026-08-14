@@ -442,3 +442,42 @@ catch { console.error("render-failed"); process.exitCode = 1 }`,
     })
   })
 })
+
+describe("observable-trace finalize", () => {
+  test("materializes a journaled case and rejects non-semantic command inputs", async () => {
+    await withCaseDirectory(async (caseDir) => {
+      const journal: unknown[] = []
+      const store = new CausalIRStore({
+        runID: "run_renderer_finalize",
+        caseID: "case-renderer-finalize",
+        append: (entry) => journal.push(entry),
+      })
+      store.createNode({
+        node_id: "run_start",
+        kind: "run.start",
+        component: "run",
+        timestamp: "2026-08-14T12:00:00.000Z",
+        time_ms: 0,
+        data: { run_id: "run_renderer_finalize", case_id: "case-renderer-finalize" },
+      })
+      store.closeRuntime({
+        format: "runtime_close",
+        status: "success",
+        closed_at: "2026-08-14T12:00:01.000Z",
+        manifest: { case_id: "case-renderer-finalize", run_id: "run_renderer_finalize" },
+      })
+      await fs.writeFile(path.join(caseDir, "records.jsonl"), `${journal.map((entry) => JSON.stringify(entry)).join("\n")}\n`)
+      await fs.writeFile(path.join(caseDir, "trace.html"), "<html></html>")
+
+      const result = run("finalize", caseDir)
+
+      expect(result.exitCode).toBe(0)
+      expect(Buffer.from(result.stdout).toString()).toContain("completeness: complete")
+      expect(Buffer.from(result.stdout).toString()).toContain(`trace: ${path.join(caseDir, "trace.json")}`)
+      expect(run("finalize", caseDir, "--unknown").exitCode).not.toBe(0)
+      expect(Buffer.from(run("finalize", path.join(caseDir, "trace.html")).stderr).toString()).toContain(
+        "expected a case directory",
+      )
+    })
+  })
+})

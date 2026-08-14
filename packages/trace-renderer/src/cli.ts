@@ -4,15 +4,22 @@ import path from "node:path"
 import { writeProvenanceTraceHtmlFile } from "./html"
 import { loadRenderableTrace } from "./load"
 import { safeArtifactRelativePath } from "./viewer"
+import { materializeTrace } from "opencode/observability/trace-materializer"
 
-const usage = "usage: observable-trace render <case-dir-or-file> [--output <path>]"
+const renderUsage = "usage: observable-trace render <case-dir-or-file> [--output <path>]"
+const finalizeUsage = "usage: observable-trace finalize <case-dir>"
 
 function parseRenderArguments(argv: string[]) {
-  if (argv[0] !== "render") throw new Error(usage)
+  if (argv[0] !== "render") throw new Error(renderUsage)
   if (argv.length === 2 && !argv[1].startsWith("-")) return { input: argv[1] }
   if (argv.length === 4 && !argv[1].startsWith("-") && argv[2] === "--output" && !argv[3].startsWith("-"))
     return { input: argv[1], output: argv[3] }
-  throw new Error(usage)
+  throw new Error(renderUsage)
+}
+
+function parseFinalizeArguments(argv: string[]) {
+  if (argv[0] !== "finalize" || argv.length !== 2 || argv[1].startsWith("-")) throw new Error(finalizeUsage)
+  return { caseDir: argv[1] }
 }
 
 const semanticTraceFiles = [
@@ -82,12 +89,25 @@ export function render(argv: string[]) {
   return { source: loaded.source, incomplete: loaded.incomplete, output }
 }
 
+export function finalize(argv: string[]) {
+  return materializeTrace(parseFinalizeArguments(argv))
+}
+
 if (import.meta.main) {
   try {
-    const result = render(process.argv.slice(2))
-    console.log(`source: ${result.source}`)
-    console.log(`completeness: ${result.incomplete ? "incomplete" : "complete"}`)
-    console.log(`output: ${result.output}`)
+    const argv = process.argv.slice(2)
+    if (argv[0] === "finalize") {
+      const result = finalize(argv)
+      console.log(`completeness: ${result.completeness}`)
+      console.log(`trace: ${result.traceFile}`)
+      console.log(`manifest: ${result.manifestFile}`)
+      console.log(`partial: ${result.partialFile}`)
+    } else {
+      const result = render(argv)
+      console.log(`source: ${result.source}`)
+      console.log(`completeness: ${result.incomplete ? "incomplete" : "complete"}`)
+      console.log(`output: ${result.output}`)
+    }
   } catch (error) {
     console.error(`observable-trace: ${error instanceof Error ? error.message : String(error)}`)
     process.exitCode = 1
