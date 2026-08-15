@@ -189,7 +189,101 @@ function rehashEntry(entry: any) {
   entry.payload_hash = createHash("sha256").update(canonicalJSON(entry.data)).digest("hex")
 }
 
+function segmentedJournal(runID: string, marker: string) {
+  const journal: unknown[] = []
+  const store = new CausalIRStore({ runID, caseID: "segmented-renderer", append: (entry) => journal.push(entry) })
+  store.createNode({
+    node_id: "run_start",
+    kind: "run.start",
+    component: "run",
+    timestamp: "2026-08-15T00:00:00.000Z",
+    time_ms: 0,
+    status: "running",
+    data: { run_id: runID, case_id: "segmented-renderer" },
+  })
+  store.createNode({
+    node_id: "shared_response",
+    kind: "response.output",
+    component: "result",
+    timestamp: "2026-08-15T00:00:01.000Z",
+    time_ms: 1,
+    status: "success",
+    data: { text: `${marker} response` },
+  })
+  store.closeRuntime({
+    format: "runtime_close",
+    status: "success",
+    closed_at: "2026-08-15T00:00:02.000Z",
+    manifest: { case_id: "segmented-renderer", run_id: runID, session_id: "ses_segmented_renderer" },
+  })
+  return journal
+}
+
 describe("loadRenderableTrace", () => {
+  test("discovers session.json and loads all immutable segments as one renderable trace", () => {
+    withCaseDirectory((caseDir) => {
+      const descriptors = [
+        { runID: "run_renderer_first", marker: "first" },
+        { runID: "run_renderer_second", marker: "second" },
+      ].map((input, index) => {
+        const segment = path.join("segments", input.runID)
+        fs.mkdirSync(path.join(caseDir, segment), { recursive: true })
+        fs.writeFileSync(
+          path.join(caseDir, segment, "records.jsonl"),
+          segmentedJournal(input.runID, input.marker)
+            .map((entry) => JSON.stringify(entry))
+            .join("\n") + "\n",
+        )
+        return {
+          segment_id: input.runID,
+          run_id: input.runID,
+          case_id: "segmented-renderer",
+          session_id: "ses_segmented_renderer",
+          path: segment,
+          records: path.join(segment, "records.jsonl"),
+          artifacts: path.join(segment, "artifacts"),
+          index: path.join(segment, "index.sqlite"),
+          started_at: `2026-08-15T00:00:0${index}.000Z`,
+          status: "completed",
+          ...(index === 1 ? { continuation_of: "run_renderer_first" } : {}),
+        }
+      })
+      fs.writeFileSync(
+        path.join(caseDir, "session.json"),
+        JSON.stringify({
+          schema_version: "1.0",
+          logical_case_id: "segmented-renderer",
+          session_id: "ses_segmented_renderer",
+          created_at: "2026-08-15T00:00:00.000Z",
+          updated_at: "2026-08-15T00:00:01.000Z",
+          segments: descriptors,
+        }),
+      )
+
+      const result = loadRenderableTrace(caseDir)
+
+      expect(result).toMatchObject({ caseDir, source: "trace.json", incomplete: false })
+      expect(result.trace.manifest).toMatchObject({
+        case_id: "segmented-renderer",
+        run_id: "run_renderer_second",
+      })
+      expect(
+        result.trace.records
+          .filter((item: any) => item.event_type === "response.output")
+          .map((item: any) => item.data.text),
+      ).toEqual(["first response", "second response"])
+      expect(result.trace.dataflow_edges).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            relation: "continued_from",
+            metadata: expect.objectContaining({ provenance_type: "run.continuation" }),
+          }),
+        ]),
+      )
+      expect(fs.existsSync(path.join(caseDir, "trace.json"))).toBe(true)
+    })
+  })
+
   test("loads a finalized trace.json through the compatibility projection", () => {
     withCaseDirectory((caseDir) => {
       const { snapshot } = createJournal()

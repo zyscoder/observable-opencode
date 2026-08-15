@@ -413,6 +413,7 @@ export const RunCommand = effectCmd({
       }
 
       CaseTrace.configure({
+        sessionID: args.session && !args.fork ? args.session : undefined,
         input: {
           command: args.command,
           prompt: CaseTrace.summarizeText(initialInput ?? message),

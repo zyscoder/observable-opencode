@@ -15,6 +15,7 @@ import {
   type ProvenanceProjectionInput,
   type ProvenanceTraceProjection,
 } from "opencode/observability/causal-ir"
+import { materializeTrace } from "opencode/observability/trace-materializer"
 
 export type CompatibilityTraceProjection = {
   trace_version: string
@@ -150,8 +151,10 @@ function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument
     Array.isArray(input.dataflow_edges) &&
     isRecord(input.compatibility) &&
     input.journal.schema_version === "1.0" &&
-    input.journal.format === "causal-ir-jsonl" &&
-    input.journal.path === "records.jsonl" &&
+    ((input.journal.format === "causal-ir-jsonl" && input.journal.path === "records.jsonl") ||
+      (input.journal.format === "causal-ir-segmented-jsonl" &&
+        input.journal.path === "session.json" &&
+        Array.isArray(input.journal.segments))) &&
     input.journal.summary_scope === "entries_before_lifecycle_entry" &&
     typeof input.journal.entry_count === "number" &&
     typeof input.journal.last_sequence === "number" &&
@@ -163,17 +166,26 @@ function selectSource(input: string): { file: string; caseDir: string; source: T
   const target = path.resolve(input)
   const stats = fs.statSync(target)
   if (stats.isDirectory()) {
+    const session = path.join(target, "session.json")
+    if (fs.existsSync(session)) {
+      const materialized = materializeTrace({ caseDir: target })
+      return { file: materialized.traceFile, caseDir: target, source: "trace.json" }
+    }
     const trace = path.join(target, "trace.json")
     if (fs.existsSync(trace)) return { file: trace, caseDir: target, source: "trace.json" }
     const journal = path.join(target, "records.jsonl")
     if (fs.existsSync(journal)) return { file: journal, caseDir: target, source: "records.jsonl" }
-    throw new Error(`${target}: expected trace.json or records.jsonl`)
+    throw new Error(`${target}: expected session.json, trace.json, or records.jsonl`)
   }
-  if (!stats.isFile()) throw new Error(`${target}: expected a case directory, trace.json, or records.jsonl`)
+  if (!stats.isFile()) throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
 
+  if (path.basename(target) === "session.json") {
+    const materialized = materializeTrace({ caseDir: path.dirname(target) })
+    return { file: materialized.traceFile, caseDir: path.dirname(target), source: "trace.json" }
+  }
   const source = path.basename(target) as TraceSource
   if (source !== "trace.json" && source !== "records.jsonl")
-    throw new Error(`${target}: expected a case directory, trace.json, or records.jsonl`)
+    throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
   return { file: target, caseDir: path.dirname(target), source }
 }
 

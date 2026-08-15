@@ -27,6 +27,7 @@ import {
   type StreamingJsonObjectMember,
 } from "./streaming-json-writer"
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
+import type { TraceSegmentDescriptor, TraceSessionManifest } from "./trace-segment"
 
 export type TraceMaterializationResult = {
   caseDir: string
@@ -45,6 +46,22 @@ type OwnerRow = { node_id: string }
 type LegacyRow = { legacy_ref: string }
 type OccurrenceRow = { owner_type: "node" | "edge"; owner_id: string; field: string }
 type DiagnosticIDRow = { diagnostic_id: string }
+type EntityIDRow = { entity_id: string }
+
+type SegmentReplayScope = {
+  key: string
+  runID: string
+  caseID: string
+  pathPrefix: string
+  namespace: boolean
+}
+
+type ScopedCausalIREdge = CausalIREdge & {
+  scope?: {
+    run_id: string
+    case_id: string
+  }
+}
 
 const MATERIALIZER_GC_BYTES = 4 * 1024 * 1024
 const MEMORY_WATERMARK_BYTES = 128 * 1024 * 1024
@@ -67,6 +84,82 @@ function record(input: unknown): Record<string, unknown> | undefined {
 
 function nonemptyString(input: unknown): input is string {
   return typeof input === "string" && input.length > 0
+}
+
+function scopedEntityID(scope: SegmentReplayScope, type: "node" | "edge" | "artifact" | "diagnostic", id: string) {
+  return scope.namespace ? `${scope.runID}::${type}::${id}` : id
+}
+
+function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRRef {
+  if (ref.ref_type === "node") return { ...ref, ref_id: scopedEntityID(scope, "node", ref.ref_id) }
+  if (ref.ref_type === "artifact") return { ...ref, ref_id: scopedEntityID(scope, "artifact", ref.ref_id) }
+  if (ref.ref_type === "raw_event" && scope.namespace)
+    return { ...ref, ref_id: `${scope.runID}::raw_event::${ref.ref_id}` }
+  return ref
+}
+
+function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode {
+  if (!scope.namespace) return node
+  const nodeID = scopedEntityID(scope, "node", node.node_id)
+  return {
+    ...node,
+    node_id: nodeID,
+    scope: { ...node.scope, run_id: scope.runID, case_id: scope.caseID },
+    input_refs: node.input_refs.map((ref) => scopedReference(ref, scope)),
+    output_refs: node.output_refs.map((ref) => scopedReference(ref, scope)),
+    source_refs: node.source_refs.map((ref) => scopedReference(ref, scope)),
+    artifact_refs: node.artifact_refs.map((id) => scopedEntityID(scope, "artifact", id)),
+    aliases: [...node.aliases, `run:${scope.runID}:node:${node.node_id}`],
+    derivation: node.derivation
+      ? { ...node.derivation, input_refs: node.derivation.input_refs.map((ref) => scopedReference(ref, scope)) }
+      : null,
+  }
+}
+
+function scopedEdge(edge: CausalIREdge, scope: SegmentReplayScope): ScopedCausalIREdge {
+  if (!scope.namespace) return edge
+  return {
+    ...edge,
+    edge_id: scopedEntityID(scope, "edge", edge.edge_id),
+    from: scopedReference(edge.from, scope),
+    to: scopedReference(edge.to, scope),
+    evidence_refs: edge.evidence_refs.map((ref) => scopedReference(ref, scope)),
+    scope: { run_id: scope.runID, case_id: scope.caseID },
+  }
+}
+
+function scopedArtifact(artifact: ArtifactLike, scope: SegmentReplayScope): ArtifactLike {
+  if (!scope.namespace) return artifact
+  const relativePath = artifact.path.replaceAll("\\", "/").replace(/^\/+/, "")
+  if (relativePath.split("/").includes("..")) throw new Error(`unsafe artifact path: ${artifact.path}`)
+  return {
+    ...artifact,
+    artifact_id: scopedEntityID(scope, "artifact", artifact.artifact_id),
+    path: path.posix.join(scope.pathPrefix.replaceAll("\\", "/"), relativePath),
+  }
+}
+
+function scopedDiagnostic(diagnostic: CausalIRDiagnosticLike, scope: SegmentReplayScope): CausalIRDiagnosticLike {
+  if (!scope.namespace) return diagnostic
+  return {
+    ...diagnostic,
+    diagnostic_id: scopedEntityID(scope, "diagnostic", diagnostic.diagnostic_id),
+    ...(typeof diagnostic.artifact_id === "string"
+      ? { artifact_id: scopedEntityID(scope, "artifact", diagnostic.artifact_id) }
+      : {}),
+  }
+}
+
+function scopedSnapshot(snapshot: CausalIRStoreSnapshot, scope: SegmentReplayScope): CausalIRStoreSnapshot {
+  return {
+    ...snapshot,
+    runID: scope.runID,
+    caseID: scope.caseID,
+    nodes: snapshot.nodes.map((node) => scopedNode(node, scope)),
+    edges: snapshot.edges.map((edge) => scopedEdge(canonicalCausalIREdge(edge), scope)),
+    artifacts: snapshot.artifacts.map((artifact) => scopedArtifact(artifact, scope)),
+    diagnostics: snapshot.diagnostics.map((diagnostic) => scopedDiagnostic(diagnostic, scope)),
+  }
 }
 
 function hashKey(operation: CausalIRJournalEntry["operation"], entityID: string) {
@@ -145,8 +238,32 @@ function validateEntryShape(entry: CausalIRJournalEntry, requireInitialRunNode: 
   validateCausalIRJournal([normalizedValidationEntry(entry)], { requireInitialRunNode })
 }
 
+function finalizedClose(entry: CausalIRJournalEntry): CausalIRRuntimeCloseData | undefined {
+  if (entry.operation !== "case.finalized") return undefined
+  const data = record(entry.data)
+  const canonical = record(data?.canonical)
+  const legacyTrace = record(data?.trace)
+  const manifest = record(canonical?.manifest) ?? record(legacyTrace?.manifest) ?? record(data?.data)
+  if (!manifest) return undefined
+  const status = manifest.status
+  if (status !== "success" && status !== "error" && status !== "cancelled") return undefined
+  return {
+    format: "runtime_close",
+    status,
+    closed_at: typeof manifest.ended_at === "string" ? manifest.ended_at : entry.time,
+    ...(manifest.result === undefined ? {} : { result: manifest.result }),
+    ...(manifest.error === undefined ? {} : { error: manifest.error }),
+    manifest: {
+      case_id: entry.case_id,
+      run_id: entry.run_id,
+      ...(typeof manifest.session_id === "string" ? { session_id: manifest.session_id } : {}),
+    },
+  }
+}
+
 class ReplayIndex {
   readonly db: Database
+  private scope: SegmentReplayScope | undefined
   private runID = ""
   private caseID = ""
   private runtimeClosed = false
@@ -155,6 +272,7 @@ class ReplayIndex {
   private lastPayloadHash: string | undefined
   private readonly nextOrdinal = { nodes: 0, edges: 0, artifacts: 0, diagnostics: 0 }
   recoveredLines = 0
+  private segmentRecoveredLines = 0
 
   constructor(readonly indexPath: string) {
     this.db = new Database(indexPath, { create: true, strict: true })
@@ -165,6 +283,7 @@ class ReplayIndex {
     this.db.exec(`
       CREATE TABLE nodes (
         entity_id TEXT PRIMARY KEY,
+        segment_key TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
         kind TEXT NOT NULL,
         wrapped INTEGER NOT NULL,
@@ -172,18 +291,21 @@ class ReplayIndex {
       );
       CREATE TABLE edges (
         entity_id TEXT PRIMARY KEY,
+        segment_key TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
         wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE artifacts (
         entity_id TEXT PRIMARY KEY,
+        segment_key TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
         wrapped INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE diagnostics (
         entity_id TEXT PRIMARY KEY,
+        segment_key TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
         kind TEXT,
         wrapped INTEGER NOT NULL,
@@ -218,8 +340,26 @@ class ReplayIndex {
     return { runID: this.runID, caseID: this.caseID }
   }
 
+  get currentRecoveredLines() {
+    return this.segmentRecoveredLines
+  }
+
+  beginSegment(scope: SegmentReplayScope) {
+    this.scope = scope
+    this.runID = ""
+    this.caseID = ""
+    this.runtimeClosed = false
+    this.terminalClose = undefined
+    this.lastOperation = undefined
+    this.lastPayloadHash = undefined
+    this.segmentRecoveredLines = 0
+    this.db.exec("DELETE FROM payload_hashes")
+  }
+
   get close() {
-    return this.lastOperation === "case.runtime_closed" ? this.terminalClose : undefined
+    return this.lastOperation === "case.runtime_closed" || this.lastOperation === "case.finalized"
+      ? this.terminalClose
+      : undefined
   }
 
   get finalPayloadHash() {
@@ -227,11 +367,11 @@ class ReplayIndex {
   }
 
   private validationError(message: string): never {
-    throw new CausalIRJournalValidationError(this.recoveredLines + 1, message)
+    throw new CausalIRJournalValidationError(this.segmentRecoveredLines + 1, message)
   }
 
   private validate(entry: CausalIRJournalEntry) {
-    const line = this.recoveredLines + 1
+    const line = this.segmentRecoveredLines + 1
     if (this.runtimeClosed) this.validationError("entry follows runtime close terminal")
     if (!Number.isSafeInteger(entry.sequence) || entry.sequence !== line)
       this.validationError(`expected contiguous sequence ${line}`)
@@ -265,11 +405,13 @@ class ReplayIndex {
   }
 
   apply(input: unknown, rawLine: string) {
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     if (!record(input)) this.validationError("expected a journal entry object")
     const entry = input as CausalIRJournalEntry
     const previous = this.validate(entry)
     const unchanged = previous === entry.payload_hash
-    const snapshot = lifecycleSnapshot(entry.data)
+    const originalSnapshot = lifecycleSnapshot(entry.data)
+    const snapshot = originalSnapshot ? scopedSnapshot(originalSnapshot, this.scope) : undefined
 
     this.db.transaction(() => {
       if (
@@ -277,28 +419,34 @@ class ReplayIndex {
         (entry.operation === "node.created" || entry.operation === "node.updated") &&
         record(entry.data)
       ) {
-        const node = entry.data as CausalIRNode
-        this.putNode(node, rawLine, true)
+        const node = scopedNode(entry.data as CausalIRNode, this.scope!)
+        this.putNode(node, this.scope!.namespace ? JSON.stringify(node) : rawLine, !this.scope!.namespace)
       } else if (!unchanged && entry.operation === "edge.created" && record(entry.data)) {
-        this.putEdge(canonicalCausalIREdge(entry.data as CausalIREdge))
+        this.putEdge(scopedEdge(canonicalCausalIREdge(entry.data as CausalIREdge), this.scope!))
       } else if (
         !unchanged &&
         (entry.operation === "artifact.created" || entry.operation === "artifact.reused") &&
         record(entry.data)
       ) {
-        this.putArtifact(entry.data as ArtifactLike, rawLine, true)
+        const artifact = scopedArtifact(entry.data as ArtifactLike, this.scope!)
+        this.putArtifact(artifact, this.scope!.namespace ? JSON.stringify(artifact) : rawLine, !this.scope!.namespace)
       } else if (!unchanged && entry.operation === "diagnostic.created" && record(entry.data)) {
-        this.putDiagnostic(entry.data as CausalIRDiagnosticLike, rawLine, true)
+        const diagnostic = scopedDiagnostic(entry.data as CausalIRDiagnosticLike, this.scope!)
+        this.putDiagnostic(
+          diagnostic,
+          this.scope!.namespace ? JSON.stringify(diagnostic) : rawLine,
+          !this.scope!.namespace,
+        )
       } else if ((entry.operation === "case.checkpointed" || entry.operation === "case.finalized") && snapshot) {
         this.replaceSnapshot(snapshot)
       }
 
       const data = record(entry.data)
       if (entry.operation === "case.checkpointed" && data?.hash_state_replacement === "nodes_and_edges") {
-        this.replacePayloadHashes("node", snapshot?.nodes ?? [], "node_id")
-        this.replacePayloadHashes("edge", snapshot?.edges ?? [], "edge_id")
+        this.replacePayloadHashes("node", originalSnapshot?.nodes ?? [], "node_id")
+        this.replacePayloadHashes("edge", originalSnapshot?.edges ?? [], "edge_id")
       } else if (entry.operation === "case.checkpointed" && data?.hash_state_replacement === "edges") {
-        this.replacePayloadHashes("edge", snapshot?.edges ?? [], "edge_id")
+        this.replacePayloadHashes("edge", originalSnapshot?.edges ?? [], "edge_id")
       }
       this.db
         .query("INSERT OR REPLACE INTO payload_hashes(hash_key, payload_hash) VALUES (?, ?)")
@@ -309,56 +457,62 @@ class ReplayIndex {
       this.runID = entry.run_id
       this.caseID = entry.case_id
     }
-    this.recoveredLines = entry.sequence
+    this.segmentRecoveredLines = entry.sequence
+    this.recoveredLines += 1
     this.lastOperation = entry.operation
     this.lastPayloadHash = entry.payload_hash
     this.runtimeClosed = entry.operation === "case.runtime_closed"
-    this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : undefined
+    this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : finalizedClose(entry)
   }
 
   private putNode(node: CausalIRNode, json = JSON.stringify(node), wrapped = false) {
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     this.db
       .query(
         `
-        INSERT INTO nodes(entity_id, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
+        INSERT INTO nodes(entity_id, segment_key, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET segment_key = excluded.segment_key, kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(node.node_id, ++this.nextOrdinal.nodes, node.kind, wrapped ? 1 : 0, json)
+      .run(node.node_id, this.scope.key, ++this.nextOrdinal.nodes, node.kind, wrapped ? 1 : 0, json)
   }
 
   private putEdge(edge: CausalIREdge) {
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     this.db
       .query(
         `
-        INSERT INTO edges(entity_id, ordinal, wrapped, json) VALUES (?, ?, 0, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
+        INSERT INTO edges(entity_id, segment_key, ordinal, wrapped, json) VALUES (?, ?, ?, 0, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET segment_key = excluded.segment_key, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(edge.edge_id, ++this.nextOrdinal.edges, JSON.stringify(edge))
+      .run(edge.edge_id, this.scope.key, ++this.nextOrdinal.edges, JSON.stringify(edge))
   }
 
   private putArtifact(artifact: ArtifactLike, json = JSON.stringify(artifact), wrapped = false) {
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     this.db
       .query(
         `
-        INSERT INTO artifacts(entity_id, ordinal, wrapped, json) VALUES (?, ?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET wrapped = excluded.wrapped, json = excluded.json
+        INSERT INTO artifacts(entity_id, segment_key, ordinal, wrapped, json) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET segment_key = excluded.segment_key, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
-      .run(artifact.artifact_id, ++this.nextOrdinal.artifacts, wrapped ? 1 : 0, json)
+      .run(artifact.artifact_id, this.scope.key, ++this.nextOrdinal.artifacts, wrapped ? 1 : 0, json)
   }
 
   private putDiagnostic(diagnostic: CausalIRDiagnosticLike, json = JSON.stringify(diagnostic), wrapped = false) {
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     this.db
       .query(
         `
-        INSERT INTO diagnostics(entity_id, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(entity_id) DO UPDATE SET kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
+        INSERT INTO diagnostics(entity_id, segment_key, ordinal, kind, wrapped, json) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entity_id) DO UPDATE SET segment_key = excluded.segment_key, kind = excluded.kind, wrapped = excluded.wrapped, json = excluded.json
       `,
       )
       .run(
         diagnostic.diagnostic_id,
+        this.scope.key,
         ++this.nextOrdinal.diagnostics,
         typeof diagnostic.kind === "string" ? diagnostic.kind : null,
         wrapped ? 1 : 0,
@@ -367,11 +521,11 @@ class ReplayIndex {
   }
 
   private replaceSnapshot(snapshot: CausalIRStoreSnapshot) {
-    this.db.exec("DELETE FROM nodes; DELETE FROM edges; DELETE FROM artifacts; DELETE FROM diagnostics")
-    this.nextOrdinal.nodes = 0
-    this.nextOrdinal.edges = 0
-    this.nextOrdinal.artifacts = 0
-    this.nextOrdinal.diagnostics = 0
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
+    this.db.query("DELETE FROM nodes WHERE segment_key = ?").run(this.scope.key)
+    this.db.query("DELETE FROM edges WHERE segment_key = ?").run(this.scope.key)
+    this.db.query("DELETE FROM artifacts WHERE segment_key = ?").run(this.scope.key)
+    this.db.query("DELETE FROM diagnostics WHERE segment_key = ?").run(this.scope.key)
     for (const node of snapshot.nodes) this.putNode(node)
     for (const edge of snapshot.edges) this.putEdge(canonicalCausalIREdge(edge))
     for (const artifact of snapshot.artifacts) this.putArtifact(artifact)
@@ -537,6 +691,55 @@ class ReplayIndex {
     for (const row of this.db.query<KindRow, []>("SELECT kind FROM nodes").iterate())
       if (isFormalRecordType(row.kind === "final.claim" ? "response.output" : row.kind)) count += 1
     return count
+  }
+
+  addContinuation(input: {
+    segmentKey: string
+    runID: string
+    caseID: string
+    previousRunID: string
+    fromSegmentKey: string
+  }) {
+    const current = this.db
+      .query<
+        EntityIDRow,
+        [string]
+      >("SELECT entity_id FROM nodes WHERE segment_key = ? AND kind = 'run.start' ORDER BY ordinal LIMIT 1")
+      .get(input.segmentKey)?.entity_id
+    const previous = this.db
+      .query<
+        EntityIDRow,
+        [string]
+      >("SELECT entity_id FROM nodes WHERE segment_key = ? AND kind = 'run.start' ORDER BY ordinal LIMIT 1")
+      .get(input.fromSegmentKey)?.entity_id
+    if (!current || !previous) return
+    const priorScope = this.scope
+    this.scope = {
+      key: input.segmentKey,
+      runID: input.runID,
+      caseID: input.caseID,
+      pathPrefix: "",
+      namespace: true,
+    }
+    this.putEdge({
+      edge_id: `${input.runID}::edge::run.continuation::${input.previousRunID}`,
+      from: { ref_type: "node", ref_id: current },
+      to: { ref_type: "node", ref_id: previous },
+      original_relation: "continued_from",
+      normalized_relation: "continued_from",
+      evidence_tier: "confirmed",
+      eligible_for_attribution: false,
+      derivation_method: "session_manifest_continuation_v1",
+      evidence_refs: [],
+      label: "Run continued from the preceding immutable session segment",
+      scope: { run_id: input.runID, case_id: input.caseID },
+      metadata: {
+        provenance_type: "run.continuation",
+        continuation_of: input.previousRunID,
+        run_id: input.runID,
+      },
+    } as ScopedCausalIREdge)
+    this.scope = priorScope
   }
 
   private entityRows(table: "nodes" | "edges" | "artifacts") {
@@ -719,11 +922,11 @@ function recoverJournal(recordsFile: string, index: ReplayIndex) {
     try {
       index.apply(parseLine(line), line)
     } catch (error) {
-      if (recoverableTail && error instanceof JournalJsonError && index.recoveredLines > 0) {
+      if (recoverableTail && error instanceof JournalJsonError && index.currentRecoveredLines > 0) {
         droppedLines = 1
         return
       }
-      if (recoverableTail && index.recoveredLines === 0) throw new Error(`${recordsFile}:1: journal is empty`)
+      if (recoverableTail && index.currentRecoveredLines === 0) throw new Error(`${recordsFile}:1: journal is empty`)
       if (error instanceof JournalJsonError)
         throw new Error(`${recordsFile}:${lineNumber}: invalid JSONL entry (${error.message})`)
       const detail = error instanceof Error ? error.message : String(error)
@@ -757,6 +960,7 @@ function traceMembers(
   index: ReplayIndex,
   manifest: Record<string, unknown>,
   metrics: Record<string, unknown>,
+  journal: Record<string, unknown>,
 ): StreamingJsonObjectMember[] {
   return [
     ["trace_version", TRACE_VERSION],
@@ -765,19 +969,7 @@ function traceMembers(
     ["nodes", streamingJsonArray(index.rawEntities("nodes"))],
     ["edges", streamingJsonArray(index.rawEntities("edges"))],
     ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
-    [
-      "journal",
-      {
-        schema_version: CAUSAL_IR_VERSION,
-        format: "causal-ir-jsonl",
-        path: "records.jsonl",
-        summary_scope: "entries_before_lifecycle_entry",
-        entry_count: index.recoveredLines,
-        last_sequence: index.recoveredLines,
-        last_payload_hash: index.finalPayloadHash,
-        poisoned: false,
-      },
-    ],
+    ["journal", journal],
     ["metrics", metrics],
     ["diagnostics", streamingJsonArray(index.diagnosticItems())],
     ["compatibility", { provenance_projection: "provenance-trace.json" }],
@@ -786,10 +978,76 @@ function traceMembers(
   ]
 }
 
+type MaterializationSource = {
+  key: string
+  runID?: string
+  caseID?: string
+  pathPrefix: string
+  recordsFile: string
+  descriptor?: TraceSegmentDescriptor
+}
+
+function resolveWithin(root: string, relative: string) {
+  const resolved = path.resolve(root, relative)
+  if (resolved !== root && !resolved.startsWith(root + path.sep))
+    throw new Error(`${relative}: path escapes case directory`)
+  return resolved
+}
+
+function readSession(caseDir: string) {
+  const file = path.join(caseDir, "session.json")
+  if (!fs.existsSync(file)) return undefined
+  const input = record(JSON.parse(fs.readFileSync(file, "utf8")) as unknown)
+  if (
+    !input ||
+    input.schema_version !== "1.0" ||
+    !nonemptyString(input.logical_case_id) ||
+    !Array.isArray(input.segments)
+  )
+    throw new Error(`${file}: invalid trace session manifest`)
+  const session = input as TraceSessionManifest
+  if (!session.segments.length) throw new Error(`${file}: trace session has no segments`)
+  const runIDs = new Set<string>()
+  for (const descriptor of session.segments) {
+    if (
+      !record(descriptor) ||
+      !nonemptyString(descriptor.segment_id) ||
+      !nonemptyString(descriptor.run_id) ||
+      !nonemptyString(descriptor.case_id) ||
+      !nonemptyString(descriptor.path) ||
+      !nonemptyString(descriptor.records)
+    )
+      throw new Error(`${file}: invalid trace segment descriptor`)
+    if (runIDs.has(descriptor.run_id)) throw new Error(`${file}: duplicate run ${descriptor.run_id}`)
+    runIDs.add(descriptor.run_id)
+  }
+  return session
+}
+
+function materializationSources(caseDir: string, session: TraceSessionManifest | undefined): MaterializationSource[] {
+  if (!session)
+    return [
+      {
+        key: "legacy-flat",
+        pathPrefix: "",
+        recordsFile: path.join(caseDir, "records.jsonl"),
+      },
+    ]
+  return session.segments.map((descriptor) => ({
+    key: descriptor.segment_id,
+    runID: descriptor.run_id,
+    caseID: descriptor.case_id,
+    pathPrefix: descriptor.path,
+    recordsFile: resolveWithin(caseDir, descriptor.records),
+    descriptor,
+  }))
+}
+
 export function materializeTrace(input: { caseDir: string }): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
   if (!fs.statSync(caseDir).isDirectory()) throw new Error(`${caseDir}: expected a case directory`)
-  const recordsFile = path.join(caseDir, "records.jsonl")
+  const session = readSession(caseDir)
+  const sources = materializationSources(caseDir, session)
   const indexPath = path.join(
     caseDir,
     `.trace-materializer.${process.pid}.${Math.random().toString(16).slice(2)}.sqlite`,
@@ -797,15 +1055,53 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
   const index = new ReplayIndex(indexPath)
   try {
     memoryPhase("materialize_start")
-    const recovered = recoverJournal(recordsFile, index)
-    const droppedLines = recovered.droppedLines
+    const replays = sources.map((source) => {
+      index.beginSegment({
+        key: source.key,
+        runID: source.runID ?? "",
+        caseID: source.caseID ?? "",
+        pathPrefix: source.pathPrefix,
+        namespace: session !== undefined,
+      })
+      const recovered = recoverJournal(source.recordsFile, index)
+      const identities = index.identities
+      if (source.runID && identities.runID !== source.runID)
+        throw new Error(`${source.recordsFile}: descriptor run identity does not match journal`)
+      if (source.caseID && identities.caseID !== source.caseID)
+        throw new Error(`${source.recordsFile}: descriptor case identity does not match journal`)
+      return {
+        source,
+        identities,
+        close: index.close,
+        recoveredLines: index.currentRecoveredLines,
+        lastPayloadHash: index.finalPayloadHash,
+        ...recovered,
+      }
+    })
+    const byRunID = new Map(replays.map((replay) => [replay.identities.runID, replay]))
+    for (const replay of replays) {
+      const previousRunID = replay.source.descriptor?.continuation_of
+      if (!previousRunID) continue
+      const previous = byRunID.get(previousRunID)
+      if (!previous) throw new Error(`${replay.source.recordsFile}: continuation run ${previousRunID} is missing`)
+      index.addContinuation({
+        segmentKey: replay.source.key,
+        runID: replay.identities.runID,
+        caseID: replay.identities.caseID,
+        previousRunID,
+        fromSegmentKey: previous.source.key,
+      })
+    }
+    const droppedLines = replays.reduce((total, replay) => total + replay.droppedLines, 0)
+    const journalBytes = replays.reduce((total, replay) => total + replay.journalBytes, 0)
     index.reconcileDiagnostics()
-    memoryPhase("diagnostics_complete", recovered.journalBytes)
-    const close = index.close
-    const complete = droppedLines === 0 && close !== undefined
+    memoryPhase("diagnostics_complete", journalBytes)
+    const latest = replays.at(-1)!
+    const complete = droppedLines === 0 && replays.every((replay) => replay.close !== undefined)
     const completeness = complete ? "complete" : "incomplete"
-    const status = complete ? close.status : "error"
-    const { runID, caseID } = index.identities
+    const status = complete ? latest.close!.status : "error"
+    const runID = latest.identities.runID
+    const caseID = session?.logical_case_id ?? latest.identities.caseID
     const manifest: Record<string, unknown> = {
       trace_version: TRACE_VERSION,
       case_id: caseID,
@@ -814,19 +1110,32 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
       server_status: status,
       process_status: status,
       case_status: status,
-      ...(close?.manifest.session_id ? { session_id: close.manifest.session_id } : {}),
-      ...(close?.result === undefined ? {} : { result: close.result }),
-      ...(close?.error === undefined ? {} : { error: close.error }),
+      ...((session?.session_id ?? latest.close?.manifest.session_id)
+        ? { session_id: session?.session_id ?? latest.close?.manifest.session_id }
+        : {}),
+      ...(session ? { segments: session.segments } : {}),
+      ...(latest.close?.result === undefined ? {} : { result: latest.close.result }),
+      ...(latest.close?.error === undefined ? {} : { error: latest.close.error }),
       files: {
         trace: "trace.json",
-        records: "records.jsonl",
+        records: session ? "session.json" : "records.jsonl",
         partial_latest: "partial/latest.json",
       },
       ...(completeness === "complete"
         ? {}
         : {
             recovery_status: "incomplete_journal_replay",
-            recovery: { dropped_lines: droppedLines },
+            recovery: {
+              dropped_lines: droppedLines,
+              segments: replays
+                .filter((replay) => replay.droppedLines > 0 || !replay.close)
+                .map((replay) => ({
+                  run_id: replay.identities.runID,
+                  path: path.relative(caseDir, replay.source.recordsFile),
+                  dropped_lines: replay.droppedLines,
+                  status: replay.close ? "recovered" : "interrupted_unfinalized",
+                })),
+            },
           }),
     }
     const metrics = {
@@ -838,15 +1147,44 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
       dataflow_edges: index.count("edges"),
       artifacts: index.count("artifacts"),
     }
+    const journal = session
+      ? {
+          schema_version: CAUSAL_IR_VERSION,
+          format: "causal-ir-segmented-jsonl",
+          path: "session.json",
+          summary_scope: "entries_before_lifecycle_entry",
+          entry_count: index.recoveredLines,
+          last_sequence: index.recoveredLines,
+          last_payload_hash: latest.lastPayloadHash,
+          poisoned: false,
+          segments: replays.map((replay) => ({
+            run_id: replay.identities.runID,
+            path: path.relative(caseDir, replay.source.recordsFile),
+            entry_count: replay.recoveredLines,
+            last_sequence: replay.recoveredLines,
+            last_payload_hash: replay.lastPayloadHash,
+            dropped_lines: replay.droppedLines,
+          })),
+        }
+      : {
+          schema_version: CAUSAL_IR_VERSION,
+          format: "causal-ir-jsonl",
+          path: "records.jsonl",
+          summary_scope: "entries_before_lifecycle_entry",
+          entry_count: index.recoveredLines,
+          last_sequence: index.recoveredLines,
+          last_payload_hash: index.finalPayloadHash,
+          poisoned: false,
+        }
     const traceFile = path.join(caseDir, "trace.json")
     const manifestFile = path.join(caseDir, "manifest.json")
     const partialFile = path.join(caseDir, "partial", "latest.json")
-    writeStreamingJsonObjectAtomic(traceFile, traceMembers(index, manifest, metrics))
-    memoryPhase("trace_complete", recovered.journalBytes)
+    writeStreamingJsonObjectAtomic(traceFile, traceMembers(index, manifest, metrics, journal))
+    memoryPhase("trace_complete", journalBytes)
     writeStreamingJsonObjectAtomic(manifestFile, Object.entries(manifest))
-    memoryPhase("manifest_complete", recovered.journalBytes)
-    writeStreamingJsonObjectAtomic(partialFile, traceMembers(index, manifest, metrics))
-    memoryPhase("partial_complete", recovered.journalBytes)
+    memoryPhase("manifest_complete", journalBytes)
+    writeStreamingJsonObjectAtomic(partialFile, traceMembers(index, manifest, metrics, journal))
+    memoryPhase("partial_complete", journalBytes)
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
   } finally {
     index.closeIndex()

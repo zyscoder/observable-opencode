@@ -35,6 +35,8 @@ import {
   reportTracePublication,
   type TracePublicationStatus,
 } from "./trace-publication"
+import { openTraceSegment, type TraceSegment } from "./trace-segment"
+import { materializeTrace } from "./trace-materializer"
 
 export type TraceStatus = "running" | "success" | "error" | "cancelled"
 
@@ -1018,6 +1020,7 @@ export type TraceSummary = {
 
 type CaseTraceConfig = {
   caseID?: string
+  sessionID?: string
   traceDir?: string
   subjectRevision?: string
   input?: Record<string, unknown>
@@ -5241,6 +5244,7 @@ class ActiveCaseTrace {
   readonly caseID: string
   readonly runID = crypto.randomUUID()
   readonly rootDir: string
+  readonly logicalCaseDir: string
   readonly caseDir: string
   readonly artifactDir: string
   readonly eventsFile: string
@@ -5260,6 +5264,7 @@ class ActiveCaseTrace {
   private signalFinalized: NodeJS.Signals | undefined
   private signalFinalizationInProgress = false
   private sessionID: string | undefined
+  private segment: TraceSegment | undefined
   private input: Record<string, unknown> | undefined
   private result: Record<string, unknown> | undefined
   private environment: Record<string, unknown>
@@ -5337,9 +5342,22 @@ class ActiveCaseTrace {
     config: CaseTraceConfig,
     private readonly bindSession?: (sessionID: string) => boolean,
   ) {
-    this.caseID = safeCaseID(config.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
+    const requestedCaseID = safeCaseID(config.caseID ?? process.env.OPENCODE_CASE_ID ?? "")
     this.rootDir = config.traceDir ?? defaultTraceDir()
-    this.caseDir = path.join(this.rootDir, this.caseID)
+    this.sessionID = config.sessionID
+    try {
+      this.segment = openTraceSegment({
+        rootDir: this.rootDir,
+        logicalCaseID: requestedCaseID,
+        sessionID: this.sessionID,
+        runID: this.runID,
+      })
+    } catch {
+      this.writable = false
+    }
+    this.caseID = this.segment?.logicalCaseID ?? requestedCaseID
+    this.logicalCaseDir = this.segment?.logicalRoot ?? path.join(this.rootDir, this.caseID)
+    this.caseDir = this.segment?.segmentDir ?? this.logicalCaseDir
     this.artifactDir = path.join(this.caseDir, "artifacts")
     this.eventsFile = path.join(this.caseDir, "events.jsonl")
     this.rawEventsFile = path.join(this.caseDir, "raw-events.jsonl")
@@ -5368,8 +5386,9 @@ class ActiveCaseTrace {
       pid: process.pid,
       ...config.environment,
     }
-    let indexPath = path.join(this.caseDir, "index.sqlite")
+    let indexPath = this.writable ? path.join(this.caseDir, "index.sqlite") : ":memory:"
     try {
+      if (!this.writable) throw new Error("trace segment unavailable")
       fs.mkdirSync(this.caseDir, { recursive: true })
       for (const suffix of ["", "-wal", "-shm"])
         fs.rmSync(`${indexPath}${suffix}`, { force: true })
@@ -5397,9 +5416,11 @@ class ActiveCaseTrace {
   }
 
   setSessionID(sessionID: string | undefined) {
-    if (!sessionID || this.sessionID) return
+    if (!sessionID || this.sessionID === sessionID) return
+    if (this.sessionID) return
     if (this.bindSession && !this.bindSession(sessionID)) return
     this.sessionID = sessionID
+    this.segment?.bindSessionID(sessionID)
     this.write("trace.session", { session_id: sessionID })
   }
 
@@ -8891,8 +8912,9 @@ class ActiveCaseTrace {
     }
     this.responseSourceBySegmentID.clear()
     this.finished = true
+    this.segment?.finalize(status === "success" ? "completed" : status === "error" ? "failed" : "cancelled")
     return Object.freeze({
-      caseDir: this.caseDir,
+      caseDir: this.logicalCaseDir,
       caseID: this.caseID,
       runID: this.runID,
       ...(this.sessionID ? { sessionID: this.sessionID } : {}),
@@ -8973,14 +8995,23 @@ class ActiveCaseTrace {
   }
 
   private publishTerminalLocation(status: TracePublicationStatus) {
-    if (this.locationReported || process.env.OPENCODE_CASE_TRACE_QUIET === "1") return
+    if (this.locationReported) return
+    this.segment?.finalize(status === "completed" ? "completed" : status === "failed" ? "failed" : "cancelled")
+    let traceFile = this.traceFile
+    let partialFile = this.partialFile
+    try {
+      const materialized = materializeTrace({ caseDir: this.logicalCaseDir })
+      traceFile = materialized.traceFile
+      partialFile = materialized.partialFile
+    } catch {}
+    if (process.env.OPENCODE_CASE_TRACE_QUIET === "1") return
     const publication = collectTracePublication({
       sessionID: this.sessionID,
       caseID: this.caseID,
       status,
-      caseDir: this.caseDir,
-      traceFile: this.traceFile,
-      partialFile: this.partialFile,
+      caseDir: this.logicalCaseDir,
+      traceFile,
+      partialFile,
     })
     if (!publication) return
     this.locationReported = true
@@ -11471,11 +11502,13 @@ function configuredBaseCaseID(input: CaseTraceConfig) {
 function traceRegistry() {
   if (registry) return registry
   registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal, kind) => {
+    const resolvedSessionID = sessionID ?? baseConfig.sessionID
     let trace: ActiveCaseTrace
     trace = new ActiveCaseTrace(
       {
         ...baseConfig,
-        caseID: allocateRoutedCaseID(baseCaseID, sessionID, ordinal, kind),
+        caseID: allocateRoutedCaseID(baseCaseID, resolvedSessionID, ordinal, kind),
+        sessionID: resolvedSessionID,
       },
       kind === "compatibility" ? (boundSessionID) => bindCompatibilityTrace(trace, boundSessionID) : undefined,
     )
