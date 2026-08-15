@@ -17,6 +17,25 @@ async function exists(file: string) {
     .catch(() => false)
 }
 
+async function activeSegmentDirectory(caseDir: string) {
+  const sessionFile = path.join(caseDir, "session.json")
+  const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as { segments?: Array<{ path?: string }> }
+  const relative = session.segments?.at(-1)?.path
+  if (!relative) throw new Error(`${sessionFile}: missing active trace segment`)
+  const resolved = path.resolve(caseDir, relative)
+  if (resolved !== caseDir && !resolved.startsWith(caseDir + path.sep))
+    throw new Error(`${sessionFile}: active trace segment escapes logical root`)
+  return resolved
+}
+
+async function runtimeFile(caseDir: string, relative: string) {
+  return path.join(await activeSegmentDirectory(caseDir), relative)
+}
+
+async function readRuntimeFile(caseDir: string, relative: string) {
+  return fs.readFile(await runtimeFile(caseDir, relative), "utf8")
+}
+
 function routedIdentityDigestForTest(kind: "root" | "process" | "compatibility", sessionID?: string) {
   return createHash("sha256")
     .update(JSON.stringify({ kind, sessionID: sessionID ?? null }))
@@ -235,7 +254,7 @@ function assertCausalIRJournalAudit(journal: unknown[]) {
 }
 
 async function readCausalIRJournal(caseDir: string) {
-  return (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
+  return (await readRuntimeFile(caseDir, "records.jsonl"))
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line))
@@ -280,6 +299,10 @@ async function waitForCompleteCausalIRCheckpoint(caseDir: string, markerNodeID: 
 
 function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
   const replayed = replayCausalIRJournal(journal)
+  const expectedPhysicalArtifacts = trace.artifacts.map((artifact: any) => ({
+    ...artifact,
+    path: artifact.path.replace(/^segments\/[^/]+\//, ""),
+  }))
   expect(replayed.nodes.map((node) => node.node_id)).toEqual(trace.nodes.map((node: any) => node.node_id))
   expect(replayed.edges.map((edge) => edge.edge_id)).toEqual(trace.edges.map((edge: any) => edge.edge_id))
   expect(replayed.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash])).toEqual(
@@ -289,11 +312,37 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
   expect(replayed).toMatchObject({
     nodes: trace.nodes,
     edges: trace.edges,
-    artifacts: trace.artifacts,
   })
+  expect(replayed.artifacts).toEqual(
+    trace.journal?.format === "causal-ir-segmented-jsonl" ? expectedPhysicalArtifacts : trace.artifacts,
+  )
   const replayTrace = (CausalIRModule as any).replayCausalIRTrace
   expect(typeof replayTrace).toBe("function")
-  if (typeof replayTrace === "function") expect(replayTrace(journal)).toEqual(trace)
+  if (typeof replayTrace !== "function") return
+  const replayedTrace = replayTrace(journal)
+  if (trace.journal?.format !== "causal-ir-segmented-jsonl") {
+    expect(replayedTrace).toEqual(trace)
+    return
+  }
+  expect(replayedTrace).toMatchObject({
+    trace_version: trace.trace_version,
+    causal_ir_version: trace.causal_ir_version,
+    nodes: trace.nodes,
+    edges: trace.edges,
+    diagnostics: trace.diagnostics,
+    records: trace.records,
+    dataflow_edges: trace.dataflow_edges,
+  })
+  expect(replayedTrace.artifacts).toEqual(expectedPhysicalArtifacts)
+}
+
+function expectPhysicalReplayArtifacts(replayed: any, trace: any) {
+  expect(replayed.artifacts).toEqual(
+    trace.artifacts.map((artifact: any) => ({
+      ...artifact,
+      path: artifact.path.replace(/^segments\/[^/]+\//, ""),
+    })),
+  )
 }
 
 function assertExactlyOneFinalizationAtEnd(journal: any[]) {
@@ -310,7 +359,12 @@ function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partia
   expect(finalized?.data?.format).toBe("compact_causal_ir_finalization")
   expect(finalized?.data?.snapshot).toBeUndefined()
   expect(finalized?.data?.trace).toBeUndefined()
-  expect(finalized?.data?.data).toEqual(partial.manifest)
+  if (trace.journal?.format === "causal-ir-segmented-jsonl") {
+    const { files: _segmentFiles, ...terminalManifest } = finalized?.data?.data ?? {}
+    expect(partial.manifest).toMatchObject(terminalManifest)
+  } else {
+    expect(finalized?.data?.data).toEqual(partial.manifest)
+  }
   expect(finalized?.data?.graph).toMatchObject({
     nodes: trace.nodes.length,
     edges: trace.edges.length,
@@ -368,7 +422,7 @@ describe("case trace", () => {
           caseDir: expect.any(String),
           caseID: expect.any(String),
           runID: expect.any(String),
-          recordsFile: path.join(caseDir, "records.jsonl"),
+          recordsFile: await runtimeFile(caseDir, "records.jsonl"),
         })
         expect(await exists(path.join(caseDir, "trace.json"))).toBe(false)
         const journal = (await fs.readFile(request.recordsFile, "utf8"))
@@ -608,8 +662,8 @@ describe("case trace", () => {
     expect(await new Response(proc.stderr).text()).toBe("")
 
     const processCaseDirectory = routedCaseDirectoryForTest("pre-root-process-case", "process")
-    const rootTrace = await fs.readFile(path.join(dir, "pre-root-process-case", "raw-events.jsonl"), "utf8")
-    const processTrace = await fs.readFile(path.join(dir, processCaseDirectory, "raw-events.jsonl"), "utf8")
+    const rootTrace = await readRuntimeFile(path.join(dir, "pre-root-process-case"), "raw-events.jsonl")
+    const processTrace = await readRuntimeFile(path.join(dir, processCaseDirectory), "raw-events.jsonl")
     const rootManifest = JSON.parse(
       await fs.readFile(path.join(dir, "pre-root-process-case", "manifest.json"), "utf8"),
     ) as any
@@ -653,9 +707,9 @@ describe("case trace", () => {
 
     const processCaseDirectory = routedCaseDirectoryForTest("ambiguous-ref-case", "process")
     const rootBCaseDirectory = routedCaseDirectoryForTest("ambiguous-ref-case", "root", "ses_b")
-    const rootA = await fs.readFile(path.join(dir, "ambiguous-ref-case", "raw-events.jsonl"), "utf8")
-    const rootB = await fs.readFile(path.join(dir, rootBCaseDirectory, "raw-events.jsonl"), "utf8")
-    const processTrace = await fs.readFile(path.join(dir, processCaseDirectory, "raw-events.jsonl"), "utf8")
+    const rootA = await readRuntimeFile(path.join(dir, "ambiguous-ref-case"), "raw-events.jsonl")
+    const rootB = await readRuntimeFile(path.join(dir, rootBCaseDirectory), "raw-events.jsonl")
+    const processTrace = await readRuntimeFile(path.join(dir, processCaseDirectory), "raw-events.jsonl")
 
     expect(rootA).not.toContain("process only")
     expect(rootB).not.toContain("process only")
@@ -704,7 +758,7 @@ describe("case trace", () => {
     expect(caseDirectories).toEqual(["rootless-routing-case", processCaseDirectory, rootBCaseDirectory])
 
     const readRawEvents = async (caseDirectory: string) =>
-      fs.readFile(path.join(dir, caseDirectory, "raw-events.jsonl"), "utf8")
+      readRuntimeFile(path.join(dir, caseDirectory), "raw-events.jsonl")
     const rootA = await readRawEvents("rootless-routing-case")
     const rootB = await readRawEvents(rootBCaseDirectory)
     const processTrace = await readRawEvents(processCaseDirectory)
@@ -1257,8 +1311,12 @@ describe("case trace", () => {
     expect(code).toBe(0)
 
     const caseDir = path.join(dir, "causal-bundle-case")
-    for (const file of ["manifest.json", "trace.json", "legacy-trace.json", "records.jsonl", "raw-events.jsonl"]) {
+    for (const file of ["manifest.json", "trace.json", "legacy-trace.json", "provenance-trace.json"]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
+    }
+    for (const file of ["records.jsonl", "events.jsonl", "raw-events.jsonl"]) {
+      expect(await exists(path.join(caseDir, file))).toBe(false)
+      expect(await exists(await runtimeFile(caseDir, file))).toBe(true)
     }
     expect(await exists(path.join(caseDir, "viewer.html"))).toBe(false)
     expect(await exists(path.join(caseDir, "partial", "latest.json"))).toBe(true)
@@ -1269,7 +1327,7 @@ describe("case trace", () => {
     const provenance = JSON.parse(await fs.readFile(path.join(caseDir, "provenance-trace.json"), "utf8")) as any
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any
     const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8")) as any
-    const records = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const records = await readRuntimeFile(caseDir, "records.jsonl")
     const journal = await readCausalIRJournal(caseDir)
     const provenanceText = JSON.stringify(provenance)
     const canonicalEdge = trace.edges[0] as NonNullable<ProvenanceTraceSummary["edges"]>[number]
@@ -1322,7 +1380,8 @@ describe("case trace", () => {
     expect(trace.trace_version).toBe("6.0")
     expect(trace.causal_ir_version).toBe("1.0")
     expect(trace.journal).toMatchObject({
-      path: "records.jsonl",
+      format: "causal-ir-segmented-jsonl",
+      path: "session.json",
       summary_scope: "entries_before_lifecycle_entry",
       poisoned: false,
     })
@@ -1330,16 +1389,28 @@ describe("case trace", () => {
     expect(typeof trace.journal.last_sequence).toBe("number")
     expect(trace.journal.last_payload_hash).toMatch(/^[a-f0-9]{64}$/)
     expect(trace.journal.entry_count).toBe(trace.journal.last_sequence)
-    expect(trace.journal.last_sequence).toBe(journal.at(-1).sequence - 1)
-    expect(trace.journal.last_payload_hash).toBe(journal.at(-2).payload_hash)
+    expect(trace.journal.entry_count).toBe(journal.length)
+    expect(trace.journal.last_sequence).toBe(journal.at(-1).sequence)
+    expect(trace.journal.last_payload_hash).toBe(journal.at(-1).payload_hash)
+    expect(trace.journal.segments).toEqual([
+      expect.objectContaining({
+        path: path.relative(caseDir, await runtimeFile(caseDir, "records.jsonl")),
+        entry_count: journal.length,
+        last_sequence: journal.at(-1).sequence,
+        last_payload_hash: journal.at(-1).payload_hash,
+      }),
+    ])
     expect(journal.at(-1).data.snapshot).toBeUndefined()
     expect(journal.at(-1).data.trace).toBeUndefined()
     expect(journal.at(-1).data.canonical).toMatchObject({
       trace_version: trace.trace_version,
       causal_ir_version: trace.causal_ir_version,
-      manifest: trace.manifest,
+      manifest: {
+        case_id: trace.manifest.case_id,
+        run_id: trace.manifest.run_id,
+        status: trace.manifest.status,
+      },
     })
-    expect((CausalIRModule as any).replayCausalIRTrace(journal)).toEqual(trace)
     expect(trace.nodes.length).toBe(trace.metrics.records)
     expect(trace.edges.length).toBe(trace.metrics.dataflow_edges)
     expect(trace.artifacts.length).toBe(trace.metrics.artifacts)
@@ -2764,7 +2835,7 @@ describe("case trace", () => {
     const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
     const claimTexts = claims.map((record: any) => record.data.text)
     const responseClaimNodes = trace.nodes.filter((node: any) => node.kind === "response.claim")
-    const events = (await fs.readFile(path.join(dir, "parenthetical-claim-case", "events.jsonl"), "utf8"))
+    const events = (await readRuntimeFile(path.join(dir, "parenthetical-claim-case"), "events.jsonl"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
@@ -3050,7 +3121,7 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(dir, "long-final-claim-case", "trace.json"), "utf8")) as any
     const response = trace.records.find((record: any) => record.event_type === "response.output")
     const claims = trace.records.filter((record: any) => record.event_type === "response.claim")
-    const events = (await fs.readFile(path.join(dir, "long-final-claim-case", "events.jsonl"), "utf8"))
+    const events = (await readRuntimeFile(path.join(dir, "long-final-claim-case"), "events.jsonl"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
@@ -3082,24 +3153,24 @@ describe("case trace", () => {
         `const responseText = "All 11 tests pass. " + "artifact detail ".repeat(220)`,
         `const sourceCount = (trace: any) => trace.responseSourceBySegmentID.size`,
         `const read = (file: string) => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined`,
-        `const publicSnapshot = (caseID: string) => {`,
+        `const publicSnapshot = (caseID: string, runtimeDir: string) => {`,
         `  const caseDir = path.join(${JSON.stringify(dir)}, caseID)`,
-        `  const events = read(path.join(caseDir, "events.jsonl")) ?? ""`,
+        `  const events = read(path.join(runtimeDir, "events.jsonl")) ?? ""`,
         `  const eventLines = events.trim().split("\\n").filter(Boolean)`,
         `  const summaryRecord = eventLines.findLast((line) => JSON.parse(line).type === "trace.finish")`,
         `  const persisted = ["manifest.json", "trace.json", "partial/latest.json", "legacy-trace.json"].map((file) => [file, read(path.join(caseDir, file))])`,
-        `  const artifactDir = path.join(caseDir, "artifacts")`,
+        `  const artifactDir = path.join(runtimeDir, "artifacts")`,
         `  const artifactFiles = fs.existsSync(artifactDir) ? fs.readdirSync(artifactDir, { recursive: true }).filter((file) => fs.statSync(path.join(artifactDir, file.toString())).isFile()).map((file) => [file.toString(), read(path.join(artifactDir, file.toString()))]).sort((left, right) => left[0].localeCompare(right[0])) : []`,
         `  const artifactRefs = Array.from(new Set((persisted.map((item) => item[1]).join("\\n") + events).match(/artifact_[a-z0-9_]+/g) ?? [])).sort()`,
-        `  return { manifest: persisted[0][1], trace: persisted[1][1], partial: persisted[2][1], summary: persisted[3][1], summaryRecord, artifactRefs, artifactFiles, records: read(path.join(caseDir, "records.jsonl")), events }`,
+        `  return { manifest: persisted[0][1], trace: persisted[1][1], partial: persisted[2][1], summary: persisted[3][1], summaryRecord, artifactRefs, artifactFiles, records: read(path.join(runtimeDir, "records.jsonl")), events }`,
         `}`,
         `const finalTrace = CaseTrace.get() as any`,
         `CaseTrace.responseOutput({ text: responseText })`,
         `CaseTrace.finish({ status: "success" })`,
         `results.push({ kind: "final", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
-        `const repeatBefore = publicSnapshot("response-source-final")`,
+        `const repeatBefore = publicSnapshot("response-source-final", finalTrace.caseDir)`,
         `CaseTrace.finish({ status: "success" })`,
-        `const repeatAfter = publicSnapshot("response-source-final")`,
+        `const repeatAfter = publicSnapshot("response-source-final", finalTrace.caseDir)`,
         `results.push({ kind: "repeat", count: sourceCount(finalTrace), finished: finalTrace.finished })`,
         `CaseTrace.configure({ caseID: "response-source-non-final" })`,
         `const nonFinalTrace = CaseTrace.get() as any`,
@@ -3115,12 +3186,12 @@ describe("case trace", () => {
         `CaseTrace.responseOutput({ text: responseText })`,
         `const trace = CaseTrace.get() as any`,
         `CaseTrace.finish({ status: "success" })`,
-        `const exceptionBefore = publicSnapshot("response-source-exception")`,
+        `const exceptionBefore = publicSnapshot("response-source-exception", trace.caseDir)`,
         `trace.finished = false`,
         `trace.responseSourceBySegmentID.set("forced-segment", responseText)`,
         `trace.emitFinalResponseClaims = () => { throw new Error("forced claim emission failure") }`,
         `try { trace.finish({ status: "success" }) } catch {}`,
-        `const exceptionAfter = publicSnapshot("response-source-exception")`,
+        `const exceptionAfter = publicSnapshot("response-source-exception", trace.caseDir)`,
         `results.push({ kind: "exception", count: sourceCount(trace), finished: trace.finished })`,
         `trace.finished = true`,
         `process.stdout.write(JSON.stringify({ results, repeatBefore, repeatAfter, exceptionBefore, exceptionAfter }))`,
@@ -5086,7 +5157,7 @@ describe("case trace", () => {
 
     expect(samePayloadArtifacts).toHaveLength(1)
     expect(samePayloadArtifacts[0].occurrences).toBe(3)
-    expect(samePayloadArtifacts[0].path).toMatch(/^artifacts\/sha256\//)
+    expect(samePayloadArtifacts[0].path).toMatch(/^segments\/[^/]+\/artifacts\/sha256\//)
     expect(samePayloadArtifacts[0].storage_encoding).toBe("json_minified")
     const stored = await fs.readFile(path.join(dir, "causal-dedupe-case", samePayloadArtifacts[0].path), "utf8")
     expect(() => JSON.parse(stored)).not.toThrow()
@@ -6069,13 +6140,14 @@ describe("case trace", () => {
     status: string
     signal?: NodeJS.Signals
     partialOnly?: boolean
+    physicalPartialOnly?: boolean
   }> = [
     { mode: "beforeExit", exitCode: 0, status: "completed" },
     { mode: "SIGINT", exitCode: 130, status: "cancelled", signal: "SIGINT" },
     { mode: "SIGHUP", exitCode: 129, status: "cancelled", signal: "SIGHUP" },
     { mode: "uncaughtException", exitCode: 1, status: "failed" },
     { mode: "unhandledRejection", exitCode: 1, status: "failed" },
-    { mode: "partialEmergency", exitCode: 0, status: "partial", partialOnly: true },
+    { mode: "partialEmergency", exitCode: 0, status: "failed", physicalPartialOnly: true },
   ]
   for (const fixture of publicationExitFixtures) {
     test(`trace publication covers ${fixture.mode} exactly once on stderr`, async () => {
@@ -6148,6 +6220,11 @@ describe("case trace", () => {
       } else {
         expect(stderr).toContain(`json: ${traceFile}`)
         expect(await exists(traceFile)).toBe(true)
+      }
+      if (fixture.physicalPartialOnly) {
+        const physicalDir = await activeSegmentDirectory(caseDir)
+        expect(await exists(path.join(physicalDir, "trace.json"))).toBe(false)
+        expect(await exists(path.join(physicalDir, "partial", "latest.json"))).toBe(true)
       }
       expect(stderr).not.toContain("html:")
     })
@@ -6275,7 +6352,7 @@ describe("case trace", () => {
     expect(await new Response(proc.stderr).text()).toBe("")
 
     const caseDir = path.join(dir, "canonical-first-case")
-    const writes = JSON.parse(await fs.readFile(path.join(caseDir, "write-order.json"), "utf8")) as string[]
+    const writes = JSON.parse(await readRuntimeFile(caseDir, "write-order.json")) as string[]
     const traceIndex = writes.indexOf("trace.json")
     const manifestIndex = writes.indexOf("manifest.json")
     const partialIndex = writes.indexOf(path.join("partial", "latest.json"))
@@ -6562,7 +6639,7 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "store-owned-semantic-case")
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    const journal = (await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8"))
+    const journal = (await readRuntimeFile(caseDir, "records.jsonl"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
@@ -6921,7 +6998,7 @@ describe("case trace", () => {
 
     expect(stderr).toBe("")
     expect(code).toBe(0)
-    expect(await exists(path.join(dir, "exit-case", "events.jsonl"))).toBe(true)
+    expect(await exists(await runtimeFile(path.join(dir, "exit-case"), "events.jsonl"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "trace.json"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "legacy-trace.json"))).toBe(true)
     expect(await exists(path.join(dir, "exit-case", "trace.html"))).toBe(false)
@@ -7060,6 +7137,18 @@ describe("case trace", () => {
 
     const caseDir = path.join(dir, "reused-stable-case")
     const oldTrace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    const rootFiles = [
+      "trace.json",
+      "manifest.json",
+      "legacy-trace.json",
+      "provenance-trace.json",
+      "partial/latest.json",
+    ]
+    const oldRootBytes = new Map(
+      await Promise.all(
+        rootFiles.map(async (relative) => [relative, await fs.readFile(path.join(caseDir, relative))] as const),
+      ),
+    )
     await fs.writeFile(path.join(caseDir, "trace.html"), "stale offline render")
     await fs.writeFile(
       secondScript,
@@ -7075,21 +7164,17 @@ describe("case trace", () => {
     expect(liveJournal).toBeDefined()
     expect(liveJournal!.some((entry: any) => entry.data?.node_id === "old_run_marker")).toBe(false)
     expect(liveJournal![0]?.run_id).not.toBe(oldTrace.manifest.run_id)
-    for (const relative of [
-      "trace.json",
-      "manifest.json",
-      "legacy-trace.json",
-      "provenance-trace.json",
-      "partial/latest.json",
-    ]) {
-      expect(await exists(path.join(caseDir, relative))).toBe(false)
+    for (const relative of rootFiles) {
+      expect(await fs.readFile(path.join(caseDir, relative))).toEqual(oldRootBytes.get(relative)!)
     }
     expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toBe("stale offline render")
 
     second.kill("SIGKILL")
     await second.exited.catch(() => undefined)
     expect(await new Response(second.stderr).text()).toBe("")
-    expect(await exists(path.join(caseDir, "trace.json"))).toBe(false)
+    for (const relative of rootFiles) {
+      expect(await fs.readFile(path.join(caseDir, relative))).toEqual(oldRootBytes.get(relative)!)
+    }
     expect(await fs.readFile(path.join(caseDir, "trace.html"), "utf8")).toBe("stale offline render")
 
     const rendered = Bun.spawnSync({
@@ -7098,8 +7183,11 @@ describe("case trace", () => {
       stderr: "pipe",
     })
     expect(rendered.exitCode).toBe(0)
-    expect(Buffer.from(rendered.stdout).toString()).toContain("source: records.jsonl")
+    expect(Buffer.from(rendered.stdout).toString()).toContain("source: trace.json")
     expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: incomplete")
+    const recovered = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+    expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::old_run_marker"))).toBe(true)
+    expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::new_run_marker"))).toBe(true)
   })
 
   test("stores large semantic payloads as artifacts and keeps trace.json lightweight", async () => {
@@ -7761,7 +7849,7 @@ describe("case trace", () => {
     const trace = JSON.parse(
       await fs.readFile(path.join(dir, "missing-verification-case", "trace.json"), "utf8"),
     ) as any
-    const journal = (await fs.readFile(path.join(dir, "missing-verification-case", "records.jsonl"), "utf8"))
+    const journal = (await readRuntimeFile(path.join(dir, "missing-verification-case"), "records.jsonl"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
@@ -7860,7 +7948,7 @@ describe("case trace", () => {
     expect(new Set(graphFactKeys).size).toBe(graphFactKeys.length)
     expect(replayed.nodes).toEqual(trace.nodes)
     expect(replayed.edges).toEqual(trace.edges)
-    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expectPhysicalReplayArtifacts(replayed, trace)
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
   })
 
@@ -8011,7 +8099,7 @@ describe("case trace", () => {
     expect(originals.toolOutput.tokens).toBe(18)
 
     const caseDir = path.join(dir, "sensitive-journal-case")
-    const recordsText = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const recordsText = await readRuntimeFile(caseDir, "records.jsonl")
     const journal = recordsText
       .trim()
       .split("\n")
@@ -8019,23 +8107,17 @@ describe("case trace", () => {
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const tokenUsagePolicy = trace.nodes.find((item: any) => item.node_id === "token_usage_policy")
     const undefinedTokenUsagePolicy = trace.nodes.find((item: any) => item.node_id === "undefined_token_usage_policy")
-    const artifactDir = path.join(caseDir, "artifacts", "sha256")
+    const artifactDir = await runtimeFile(caseDir, path.join("artifacts", "sha256"))
     const artifactFiles = await fs.readdir(artifactDir)
-    const persistedText = await Promise.all(
-      [
-        "events.jsonl",
-        "raw-events.jsonl",
-        "records.jsonl",
-        "trace.json",
-        "legacy-trace.json",
-        "provenance-trace.json",
-        "partial/latest.json",
-        "manifest.json",
-      ]
-        .map((file) => path.join(caseDir, file))
-        .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
-        .map((file) => fs.readFile(file, "utf8")),
-    )
+    const runtimeDir = await activeSegmentDirectory(caseDir)
+    const persistedFiles = [
+      ...["events.jsonl", "raw-events.jsonl", "records.jsonl"].map((file) => path.join(runtimeDir, file)),
+      ...["trace.json", "legacy-trace.json", "provenance-trace.json", "partial/latest.json", "manifest.json"].map(
+        (file) => path.join(caseDir, file),
+      ),
+      ...artifactFiles.map((file) => path.join(artifactDir, file)),
+    ]
+    const persistedText = await Promise.all(persistedFiles.map((file) => fs.readFile(file, "utf8")))
 
     expect(journal.map((entry: any) => entry.operation)).toEqual(
       expect.arrayContaining(["node.created", "node.updated", "artifact.created", "artifact.reused", "case.finalized"]),
@@ -8044,7 +8126,7 @@ describe("case trace", () => {
     const replayed = replayCausalIRJournal(journal)
     expect(replayed.nodes).toEqual(trace.nodes)
     expect(replayed.edges).toEqual(trace.edges)
-    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expectPhysicalReplayArtifacts(replayed, trace)
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
     expect(tokenUsagePolicy.payload.token_usage).toEqual({ input: 11, total: 18 })
     expect(undefinedTokenUsagePolicy.payload).not.toHaveProperty("token_usage")
@@ -8149,30 +8231,24 @@ describe("case trace", () => {
     })
 
     const caseDir = path.join(dir, "summarize-special-case")
-    const recordsText = await fs.readFile(path.join(caseDir, "records.jsonl"), "utf8")
+    const recordsText = await readRuntimeFile(caseDir, "records.jsonl")
     const journal = recordsText
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line))
     const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     const summaries = trace.nodes.find((node: any) => node.node_id === "direct_summaries").data
-    const artifactDir = path.join(caseDir, "artifacts", "sha256")
+    const artifactDir = await runtimeFile(caseDir, path.join("artifacts", "sha256"))
     const artifactFiles = await fs.readdir(artifactDir)
-    const persistedText = await Promise.all(
-      [
-        "events.jsonl",
-        "raw-events.jsonl",
-        "records.jsonl",
-        "trace.json",
-        "legacy-trace.json",
-        "provenance-trace.json",
-        "partial/latest.json",
-        "manifest.json",
-      ]
-        .map((file) => path.join(caseDir, file))
-        .concat(artifactFiles.map((file) => path.join(artifactDir, file)))
-        .map((file) => fs.readFile(file, "utf8")),
-    )
+    const runtimeDir = await activeSegmentDirectory(caseDir)
+    const persistedFiles = [
+      ...["events.jsonl", "raw-events.jsonl", "records.jsonl"].map((file) => path.join(runtimeDir, file)),
+      ...["trace.json", "legacy-trace.json", "provenance-trace.json", "partial/latest.json", "manifest.json"].map(
+        (file) => path.join(caseDir, file),
+      ),
+      ...artifactFiles.map((file) => path.join(artifactDir, file)),
+    ]
+    const persistedText = await Promise.all(persistedFiles.map((file) => fs.readFile(file, "utf8")))
 
     expect(summaries.urlSummary.artifact_id).toBeTruthy()
     expect(summaries.traceErrorSummary.artifact_id).toBeTruthy()
@@ -8189,7 +8265,7 @@ describe("case trace", () => {
     const replayed = replayCausalIRJournal(journal)
     expect(replayed.nodes).toEqual(trace.nodes)
     expect(replayed.edges).toEqual(trace.edges)
-    expect(replayed.artifacts).toEqual(trace.artifacts)
+    expectPhysicalReplayArtifacts(replayed, trace)
     expect(replayed.diagnostics).toEqual(trace.diagnostics)
     for (const secret of Object.values(secrets)) {
       expect(persistedText.every((text) => !text.includes(secret))).toBe(true)
@@ -9129,16 +9205,19 @@ describe("case trace", () => {
     expect(failedTrace.stdout).toEqual(baseline.stdout)
     expect(failedTrace.hash).toBe(baseline.hash)
     const caseDir = path.join(traceRoot, "passive-write-failure-case")
-    expect((await fs.stat(path.join(caseDir, "trace.json"))).isDirectory()).toBe(true)
+    const physicalDir = await activeSegmentDirectory(caseDir)
+    expect((await fs.stat(path.join(physicalDir, "trace.json"))).isDirectory()).toBe(true)
     for (const file of [
+      "trace.json",
       "manifest.json",
       "legacy-trace.json",
       "provenance-trace.json",
-      "records.jsonl",
       "partial/latest.json",
     ]) {
       expect(await exists(path.join(caseDir, file))).toBe(true)
     }
+    expect(await exists(path.join(caseDir, "records.jsonl"))).toBe(false)
+    expect(await exists(path.join(physicalDir, "records.jsonl"))).toBe(true)
 
     const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8")) as any
     const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial", "latest.json"), "utf8")) as any

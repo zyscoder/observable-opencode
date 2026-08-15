@@ -118,3 +118,109 @@ The unrelated `artifact[0]` baseline assertion was not changed.
 ## Checkpoint Scope
 
 This commit is suitable for reproducing and reviewing the immutable-segment architecture and focused behavior. It should not be treated as fully complete Task 6 until the root compatibility outputs, single-segment ID compatibility, rich aggregate metadata, and concurrent manifest update policy are resolved and the broad `case-trace` suite is green apart from the explicitly excluded baseline.
+
+## Completion
+
+Status on 2026-08-15: **Task 6 complete within the explicitly excluded `artifact[0]` baseline**. This section supersedes the checkpoint blockers above.
+
+### Completed Behavior
+
+- New segmented runs expose only unified root `session.json`, `trace.json`, `manifest.json`, `partial/latest.json`, `legacy-trace.json`, and `provenance-trace.json`. They do not create root `records.jsonl`, `events.jsonl`, or `raw-events.jsonl`; runtime authority remains in the physical segment.
+- Root legacy compatibility artifact paths remain reachable through immutable content-addressed hardlinks/copies under root `artifacts/`. Unified canonical and provenance documents use unambiguous `segments/<segment-id>/artifacts/...` paths.
+- A single non-legacy segment preserves historical node, edge, and artifact IDs. Two or more segments use deterministic `<segment-id>::<entity-type>::<original-id>` identities, rewrite typed and legacy references, retain original IDs plus run/segment metadata, and add an explicit `run.continuation` edge.
+- Unified manifest construction starts with the newest valid terminal segment manifest and retains result/error, subject revision, shutdown, recovery, trace-health, and status fields before overlaying logical session and segment summaries.
+- Metrics aggregate numeric leaves by sum and arrays by ordered concatenation. Graph counts are recalculated from unique materialized entities. Multi-segment output documents this as `session_segments_v1` in `metrics.aggregation`.
+- Cross-process lock directories serialize root discovery, first creation, segment allocation, session binding, and finalization. The lock key is session ID when known and logical case otherwise; waits are bounded, dead/stale locks are recoverable, nonce ownership prevents deleting a successor lock, and observer failures remain passive.
+- `run.start` is now guaranteed to be the first causal journal entity even with an 8-byte summary limit: the store creates a minimal unsummarized node, then records artifact-backed startup detail as an update.
+- Root canonical and partial projections remain hardlinked on supported filesystems, while every replacement is atomic. A failed `session.json` replacement removes the unpublished segment and preserves the previous manifest bytes.
+
+### Final Directory Example
+
+```text
+$OPENCODE_CASE_TRACE_DIR/reused-stable-case/
+  session.json
+  trace.json
+  manifest.json
+  legacy-trace.json
+  provenance-trace.json
+  partial/latest.json
+  artifacts/sha256/<compatibility-hardlink>
+  segments/
+    7bf0.../
+      segment.json
+      records.jsonl
+      events.jsonl
+      raw-events.jsonl
+      index.sqlite
+      artifacts/sha256/<digest>
+    a219.../
+      segment.json
+      records.jsonl
+      events.jsonl
+      raw-events.jsonl
+      index.sqlite
+      artifacts/sha256/<digest>
+```
+
+There is no mutable or symlinked root journal alias. A pre-existing legacy root is the sole exception: its original root `records.jsonl`, `index.sqlite`, and artifacts remain immutable segment zero and are never moved or rewritten.
+
+### Completion RED/GREEN
+
+The original RED remains the byte-level reopen proof recorded above. Additional RED stages in this completion pass covered single-segment ID regression, colliding two-segment references, reduced aggregate metadata, concurrent lost updates, live/stale lock behavior, ultra-low-limit startup artifact ordering, root/physical TUI request confusion, and stale root projections after a resumed SIGKILL.
+
+Fresh GREEN evidence:
+
+```text
+cd packages/opencode
+bun test test/observability/trace-segment.test.ts
+# 14 pass, 0 fail, 223 expect() calls
+
+bun test test/observability/trace-materializer.test.ts
+# 7 pass, 0 fail, 21 expect() calls
+
+bun test test/cli/tui/worker-trace.test.ts test/cli/tui/trace-materializer-process.test.ts
+# 4 pass, 0 fail, 26 expect() calls
+
+cd packages/trace-renderer
+bun test test/load.test.ts test/cli.test.ts
+# 36 pass, 0 fail, 188 expect() calls
+
+bun run typecheck
+# pass
+```
+
+The full `case-trace` run completed with 161 pass and 2 reported failures. One was an unrelated timing outlier; its exact test immediately passed alone in 330 ms. The only reproducible failure is the explicitly excluded, unchanged `trace.artifacts[0]` baseline assertion in `persists semantic trace records with artifacts and redaction`: artifact zero is `run.start.environment`, while the assertion assumes it is the later semantic model-message artifact.
+
+`packages/opencode` typecheck still exits 2 only for the pre-existing sidebar implicit-any errors, duplicate worktree SDK private types, plugin overload/dependency resolution, and semver declaration issues listed in the command output. No Task 6 file appears in that error list. `git diff --check` passes.
+
+### Compatibility Risks
+
+- Root `legacy-trace.json` remains a latest-terminal compatibility projection rather than a merged legacy-schema history; the unified canonical/provenance projections are the complete multi-segment history.
+- Root compatibility artifacts are immutable content-addressed links/copies and may accumulate across resumes. Segment artifacts remain authoritative and are never rewritten.
+- Lock timing defaults are a 5-second bounded wait and 30-second stale threshold, configurable through `OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS` and `OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS`.
+- Session discovery scans immediate logical roots and rejects duplicate matches. The observer degrades passively if discovery or lock acquisition cannot establish a unique owner.
+- A reviewer subagent was unavailable in this environment; completion used a direct requirement/diff audit plus the focused and broad verification above.
+
+### Final Completion Checkpoint
+
+Per the stop-and-checkpoint request, no further implementation scope was added. The last fully completed broad run was:
+
+```text
+bun test test/observability/case-trace.test.ts
+# 161 pass, 2 fail, 2128 expect() calls
+```
+
+The two reported failures were:
+
+1. `keeps decision generation provenance within the decision session` timed out once after an abnormal 941,770 ms measurement; its immediate isolated rerun passed in 330 ms.
+2. `persists semantic trace records with artifacts and redaction` is the explicitly excluded unchanged `artifact[0]` baseline. It expects artifact zero to contain `semantic model message`, but artifact zero is the earlier `run.start.environment` JSON artifact.
+
+A later broad rerun was interrupted by the user after the formerly timed-out test had passed in-suite at 260 ms, so it is not claimed as a completed full-suite result. The final minimal reproducible command was:
+
+```text
+bun test test/observability/trace-segment.test.ts test/observability/case-trace.test.ts \
+  -t '(direct finish materializes and publishes|persists semantic trace records with artifacts and redaction)'
+# 1 pass, 1 fail, 40 expect() calls
+```
+
+The passing test verifies logical-root publication with physical segment runtime storage. The sole minimal failure is the exact excluded assertion above. Fresh focused completion totals remain segment 14/0, materializer 7/0, renderer load/CLI 36/0, and TUI worker/materializer 4/0.

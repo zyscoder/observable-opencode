@@ -62,7 +62,11 @@ test("worker trace helper returns journal materialization requests with the shut
     const requests = result.requests
     expect(requests.map((request) => request.sessionID).sort()).toEqual(["ses_worker_a", "ses_worker_b", undefined])
     for (const request of requests) {
-      expect(request.recordsFile).toBe(path.join(request.caseDir, "records.jsonl"))
+      expect(path.dirname(path.dirname(request.recordsFile))).toBe(path.join(request.caseDir, "segments"))
+      expect(path.basename(request.recordsFile)).toBe("records.jsonl")
+      await expect(readFile(path.join(request.caseDir, "records.jsonl"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      })
       expect(await readFile(request.recordsFile, "utf8")).toContain('"operation":"case.runtime_closed"')
     }
   } finally {

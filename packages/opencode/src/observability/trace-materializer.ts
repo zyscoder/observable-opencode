@@ -50,10 +50,16 @@ type EntityIDRow = { entity_id: string }
 
 type SegmentReplayScope = {
   key: string
+  segmentID: string
   runID: string
   caseID: string
   pathPrefix: string
   namespace: boolean
+}
+
+type TerminalEnvelope = {
+  manifest: Record<string, unknown>
+  metrics?: Record<string, unknown>
 }
 
 type ScopedCausalIREdge = CausalIREdge & {
@@ -87,12 +93,41 @@ function nonemptyString(input: unknown): input is string {
 }
 
 function scopedEntityID(scope: SegmentReplayScope, type: "node" | "edge" | "artifact" | "diagnostic", id: string) {
-  return scope.namespace ? `${scope.runID}::${type}::${id}` : id
+  return scope.namespace ? `${scope.segmentID}::${type}::${id}` : id
+}
+
+function scopedLegacyReference(value: string | undefined, scope: SegmentReplayScope) {
+  if (!value || !scope.namespace) return value
+  const separator = value.indexOf(":")
+  if (separator < 1 || separator === value.length - 1) return value
+  const reference = typedCausalIRReference(value)
+  const type = reference.ref_type === "node" ? "node" : reference.ref_type === "artifact" ? "artifact" : undefined
+  if (!type) return value
+  return `${value.slice(0, separator)}:${scopedEntityID(scope, type, value.slice(separator + 1))}`
+}
+
+function scopedPayloadReferences(value: unknown, scope: SegmentReplayScope): unknown {
+  if (!scope.namespace) return value
+  if (typeof value === "string") return scopedLegacyReference(value, scope) ?? value
+  if (Array.isArray(value)) return value.map((item) => scopedPayloadReferences(item, scope))
+  const object = record(value)
+  if (!object) return value
+  return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, scopedPayloadReferences(item, scope)]))
 }
 
 function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRRef {
-  if (ref.ref_type === "node") return { ...ref, ref_id: scopedEntityID(scope, "node", ref.ref_id) }
-  if (ref.ref_type === "artifact") return { ...ref, ref_id: scopedEntityID(scope, "artifact", ref.ref_id) }
+  if (ref.ref_type === "node")
+    return {
+      ...ref,
+      ref_id: scopedEntityID(scope, "node", ref.ref_id),
+      ...(ref.legacy_ref ? { legacy_ref: scopedLegacyReference(ref.legacy_ref, scope) } : {}),
+    }
+  if (ref.ref_type === "artifact")
+    return {
+      ...ref,
+      ref_id: scopedEntityID(scope, "artifact", ref.ref_id),
+      ...(ref.legacy_ref ? { legacy_ref: scopedLegacyReference(ref.legacy_ref, scope) } : {}),
+    }
   if (ref.ref_type === "raw_event" && scope.namespace)
     return { ...ref, ref_id: `${scope.runID}::raw_event::${ref.ref_id}` }
   return ref
@@ -101,15 +136,25 @@ function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRR
 function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode {
   if (!scope.namespace) return node
   const nodeID = scopedEntityID(scope, "node", node.node_id)
+  const payload = scopedPayloadReferences(node.payload, scope) as Record<string, unknown>
   return {
     ...node,
     node_id: nodeID,
     scope: { ...node.scope, run_id: scope.runID, case_id: scope.caseID },
+    payload,
+    data: payload,
     input_refs: node.input_refs.map((ref) => scopedReference(ref, scope)),
     output_refs: node.output_refs.map((ref) => scopedReference(ref, scope)),
     source_refs: node.source_refs.map((ref) => scopedReference(ref, scope)),
     artifact_refs: node.artifact_refs.map((id) => scopedEntityID(scope, "artifact", id)),
     aliases: [...node.aliases, `run:${scope.runID}:node:${node.node_id}`],
+    integrity: { ...node.integrity, payload_hash: causalIRPayloadHash(payload) },
+    metadata: {
+      ...(node.metadata ?? {}),
+      original_node_id: node.node_id,
+      segment_id: scope.segmentID,
+      run_id: scope.runID,
+    },
     derivation: node.derivation
       ? { ...node.derivation, input_refs: node.derivation.input_refs.map((ref) => scopedReference(ref, scope)) }
       : null,
@@ -125,17 +170,29 @@ function scopedEdge(edge: CausalIREdge, scope: SegmentReplayScope): ScopedCausal
     to: scopedReference(edge.to, scope),
     evidence_refs: edge.evidence_refs.map((ref) => scopedReference(ref, scope)),
     scope: { run_id: scope.runID, case_id: scope.caseID },
+    metadata: {
+      ...(edge.metadata ?? {}),
+      original_edge_id: edge.edge_id,
+      segment_id: scope.segmentID,
+      run_id: scope.runID,
+    },
   }
 }
 
 function scopedArtifact(artifact: ArtifactLike, scope: SegmentReplayScope): ArtifactLike {
-  if (!scope.namespace) return artifact
   const relativePath = artifact.path.replaceAll("\\", "/").replace(/^\/+/, "")
   if (relativePath.split("/").includes("..")) throw new Error(`unsafe artifact path: ${artifact.path}`)
+  const scopedPath =
+    scope.pathPrefix && scope.pathPrefix !== "."
+      ? path.posix.join(scope.pathPrefix.replaceAll("\\", "/"), relativePath)
+      : relativePath
+  if (!scope.namespace) return { ...artifact, path: scopedPath }
   return {
     ...artifact,
     artifact_id: scopedEntityID(scope, "artifact", artifact.artifact_id),
-    path: path.posix.join(scope.pathPrefix.replaceAll("\\", "/"), relativePath),
+    path: scopedPath,
+    original_artifact_id: artifact.artifact_id,
+    scope: { segment_id: scope.segmentID, run_id: scope.runID, case_id: scope.caseID },
   }
 }
 
@@ -144,6 +201,8 @@ function scopedDiagnostic(diagnostic: CausalIRDiagnosticLike, scope: SegmentRepl
   return {
     ...diagnostic,
     diagnostic_id: scopedEntityID(scope, "diagnostic", diagnostic.diagnostic_id),
+    original_diagnostic_id: diagnostic.diagnostic_id,
+    scope: { segment_id: scope.segmentID, run_id: scope.runID, case_id: scope.caseID },
     ...(typeof diagnostic.artifact_id === "string"
       ? { artifact_id: scopedEntityID(scope, "artifact", diagnostic.artifact_id) }
       : {}),
@@ -261,6 +320,33 @@ function finalizedClose(entry: CausalIRJournalEntry): CausalIRRuntimeCloseData |
   }
 }
 
+function terminalEnvelope(entry: CausalIRJournalEntry): TerminalEnvelope | undefined {
+  if (entry.operation === "case.runtime_closed") {
+    const close = record(entry.data)
+    const manifest = record(close?.manifest)
+    if (!close || !manifest) return undefined
+    return {
+      manifest: {
+        ...manifest,
+        status: close.status,
+        ended_at: close.closed_at,
+        ...(close.result === undefined ? {} : { result: close.result }),
+        ...(close.error === undefined ? {} : { error: close.error }),
+      },
+    }
+  }
+  if (entry.operation !== "case.finalized") return undefined
+  const data = record(entry.data)
+  const canonical = record(data?.canonical)
+  const legacyTrace = record(data?.trace)
+  const manifest = record(canonical?.manifest) ?? record(legacyTrace?.manifest) ?? record(data?.data)
+  if (!manifest) return undefined
+  return {
+    manifest,
+    metrics: record(canonical?.metrics) ?? record(legacyTrace?.metrics),
+  }
+}
+
 class ReplayIndex {
   readonly db: Database
   private scope: SegmentReplayScope | undefined
@@ -268,6 +354,7 @@ class ReplayIndex {
   private caseID = ""
   private runtimeClosed = false
   private terminalClose: CausalIRRuntimeCloseData | undefined
+  private terminal: TerminalEnvelope | undefined
   private lastOperation: CausalIRJournalEntry["operation"] | undefined
   private lastPayloadHash: string | undefined
   private readonly nextOrdinal = { nodes: 0, edges: 0, artifacts: 0, diagnostics: 0 }
@@ -350,6 +437,7 @@ class ReplayIndex {
     this.caseID = ""
     this.runtimeClosed = false
     this.terminalClose = undefined
+    this.terminal = undefined
     this.lastOperation = undefined
     this.lastPayloadHash = undefined
     this.segmentRecoveredLines = 0
@@ -364,6 +452,12 @@ class ReplayIndex {
 
   get finalPayloadHash() {
     return this.lastPayloadHash
+  }
+
+  get envelope() {
+    return this.lastOperation === "case.runtime_closed" || this.lastOperation === "case.finalized"
+      ? this.terminal
+      : undefined
   }
 
   private validationError(message: string): never {
@@ -428,8 +522,10 @@ class ReplayIndex {
         (entry.operation === "artifact.created" || entry.operation === "artifact.reused") &&
         record(entry.data)
       ) {
-        const artifact = scopedArtifact(entry.data as ArtifactLike, this.scope!)
-        this.putArtifact(artifact, this.scope!.namespace ? JSON.stringify(artifact) : rawLine, !this.scope!.namespace)
+        const original = entry.data as ArtifactLike
+        const artifact = scopedArtifact(original, this.scope!)
+        const transformed = this.scope!.namespace || artifact.path !== original.path
+        this.putArtifact(artifact, transformed ? JSON.stringify(artifact) : rawLine, !transformed)
       } else if (!unchanged && entry.operation === "diagnostic.created" && record(entry.data)) {
         const diagnostic = scopedDiagnostic(entry.data as CausalIRDiagnosticLike, this.scope!)
         this.putDiagnostic(
@@ -463,6 +559,7 @@ class ReplayIndex {
     this.lastPayloadHash = entry.payload_hash
     this.runtimeClosed = entry.operation === "case.runtime_closed"
     this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : finalizedClose(entry)
+    this.terminal = terminalEnvelope(entry)
   }
 
   private putNode(node: CausalIRNode, json = JSON.stringify(node), wrapped = false) {
@@ -686,6 +783,12 @@ class ReplayIndex {
     return this.db.query<CountRow, []>(`SELECT COUNT(*) AS count FROM ${table}`).get()!.count
   }
 
+  segmentCount(table: "nodes" | "edges" | "artifacts", segmentKey: string) {
+    return this.db
+      .query<CountRow, [string]>(`SELECT COUNT(*) AS count FROM ${table} WHERE segment_key = ?`)
+      .get(segmentKey)!.count
+  }
+
   recordCount() {
     let count = 0
     for (const row of this.db.query<KindRow, []>("SELECT kind FROM nodes").iterate())
@@ -716,13 +819,14 @@ class ReplayIndex {
     const priorScope = this.scope
     this.scope = {
       key: input.segmentKey,
+      segmentID: input.segmentKey,
       runID: input.runID,
       caseID: input.caseID,
       pathPrefix: "",
       namespace: true,
     }
     this.putEdge({
-      edge_id: `${input.runID}::edge::run.continuation::${input.previousRunID}`,
+      edge_id: `${input.segmentKey}::edge::run.continuation::${input.previousRunID}`,
       from: { ref_type: "node", ref_id: current },
       to: { ref_type: "node", ref_id: previous },
       original_relation: "continued_from",
@@ -736,6 +840,7 @@ class ReplayIndex {
       metadata: {
         provenance_type: "run.continuation",
         continuation_of: input.previousRunID,
+        segment_id: input.segmentKey,
         run_id: input.runID,
       },
     } as ScopedCausalIREdge)
@@ -978,6 +1083,147 @@ function traceMembers(
   ]
 }
 
+function provenanceMembers(
+  index: ReplayIndex,
+  manifest: Record<string, unknown>,
+  metrics: Record<string, unknown>,
+): StreamingJsonObjectMember[] {
+  return [
+    ["trace_version", TRACE_VERSION],
+    ["manifest", manifest],
+    ["records", streamingJsonArray(index.compatibilityRecords(manifest, metrics))],
+    ["dataflow_edges", streamingJsonArray(index.compatibilityEdges(manifest, metrics))],
+    ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
+    ["metrics", metrics],
+  ]
+}
+
+function mergeAdditive(target: unknown, source: unknown): unknown {
+  if (typeof target === "number" && typeof source === "number") return target + source
+  if (Array.isArray(target) && Array.isArray(source)) return [...target, ...source]
+  const targetRecord = record(target)
+  const sourceRecord = record(source)
+  if (targetRecord && sourceRecord) {
+    const merged: Record<string, unknown> = { ...targetRecord }
+    for (const [key, value] of Object.entries(sourceRecord))
+      merged[key] = key in merged ? mergeAdditive(merged[key], value) : value
+    return merged
+  }
+  return source
+}
+
+function aggregateMetrics(
+  replays: Array<{
+    envelope?: TerminalEnvelope
+    counts: { nodes: number; edges: number; artifacts: number }
+  }>,
+  index: ReplayIndex,
+  terminalManifestRunID: string,
+  segmented: boolean,
+) {
+  const aggregate = replays.reduce<Record<string, unknown>>((metrics, replay) => {
+    const fallback = {
+      spans: 0,
+      events: replay.counts.nodes,
+      token_usage: {},
+      stream_summary: {},
+      trace_health: { issues: [] },
+    }
+    return mergeAdditive(metrics, replay.envelope?.metrics ?? fallback) as Record<string, unknown>
+  }, {})
+  return {
+    ...aggregate,
+    spans: typeof aggregate.spans === "number" ? aggregate.spans : 0,
+    events: typeof aggregate.events === "number" ? aggregate.events : index.count("nodes"),
+    token_usage: record(aggregate.token_usage) ?? {},
+    trace_health: { issues: [], ...(record(aggregate.trace_health) ?? {}) },
+    records: index.count("nodes"),
+    dataflow_edges: index.count("edges"),
+    artifacts: index.count("artifacts"),
+    ...(segmented
+      ? {
+          aggregation: {
+            mode: "session_segments_v1",
+            terminal_manifest_run_id: terminalManifestRunID,
+            numeric_metrics: "sum",
+            graph_counts: "materialized_unique_entities",
+          },
+        }
+      : {}),
+  }
+}
+
+function copyFileAtomic(source: string, destination: string) {
+  if (path.resolve(source) === path.resolve(destination)) return
+  const temporary = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
+  )
+  let handle: number | undefined
+  try {
+    fs.copyFileSync(source, temporary)
+    handle = fs.openSync(temporary, "r")
+    fs.fsyncSync(handle)
+    fs.closeSync(handle)
+    handle = undefined
+    fs.renameSync(temporary, destination)
+  } catch (error) {
+    if (handle !== undefined) fs.closeSync(handle)
+    try {
+      fs.unlinkSync(temporary)
+    } catch {}
+    throw error
+  }
+}
+
+function linkFileAtomic(source: string, destination: string) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true })
+  const temporary = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
+  )
+  try {
+    fs.linkSync(source, temporary)
+    fs.renameSync(temporary, destination)
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {}
+    throw error
+  }
+}
+
+function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirectory: string) {
+  if (!fs.existsSync(sourceDirectory)) return
+  for (const entry of fs.readdirSync(sourceDirectory, { withFileTypes: true })) {
+    const source = path.join(sourceDirectory, entry.name)
+    const destination = path.join(destinationDirectory, entry.name)
+    if (entry.isDirectory()) {
+      fs.mkdirSync(destination, { recursive: true })
+      linkCompatibilityArtifacts(source, destination)
+      continue
+    }
+    if (!entry.isFile() || fs.existsSync(destination)) continue
+    fs.mkdirSync(path.dirname(destination), { recursive: true })
+    try {
+      fs.linkSync(source, destination)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue
+      const temporary = `${destination}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`
+      try {
+        fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL)
+        fs.linkSync(temporary, destination)
+      } catch (copyError) {
+        if ((copyError as NodeJS.ErrnoException).code !== "EEXIST") throw copyError
+      } finally {
+        try {
+          fs.unlinkSync(temporary)
+        } catch {}
+      }
+    }
+  }
+}
+
 type MaterializationSource = {
   key: string
   runID?: string
@@ -1055,13 +1301,15 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
   const index = new ReplayIndex(indexPath)
   try {
     memoryPhase("materialize_start")
+    const namespace = session !== undefined && sources.length > 1
     const replays = sources.map((source) => {
       index.beginSegment({
         key: source.key,
+        segmentID: source.key,
         runID: source.runID ?? "",
         caseID: source.caseID ?? "",
         pathPrefix: source.pathPrefix,
-        namespace: session !== undefined,
+        namespace,
       })
       const recovered = recoverJournal(source.recordsFile, index)
       const identities = index.identities
@@ -1073,6 +1321,12 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
         source,
         identities,
         close: index.close,
+        envelope: index.envelope,
+        counts: {
+          nodes: index.segmentCount("nodes", source.key),
+          edges: index.segmentCount("edges", source.key),
+          artifacts: index.segmentCount("artifacts", source.key),
+        },
         recoveredLines: index.currentRecoveredLines,
         lastPayloadHash: index.finalPayloadHash,
         ...recovered,
@@ -1097,34 +1351,67 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
     index.reconcileDiagnostics()
     memoryPhase("diagnostics_complete", journalBytes)
     const latest = replays.at(-1)!
+    const terminal = replays.findLast((replay) => replay.close && replay.envelope?.manifest) ?? latest
     const complete = droppedLines === 0 && replays.every((replay) => replay.close !== undefined)
     const completeness = complete ? "complete" : "incomplete"
-    const status = complete ? latest.close!.status : "error"
+    const terminalManifest = terminal.envelope?.manifest ?? {}
+    const status = complete
+      ? typeof terminalManifest.status === "string"
+        ? terminalManifest.status
+        : latest.close!.status
+      : "error"
     const runID = latest.identities.runID
     const caseID = session?.logical_case_id ?? latest.identities.caseID
+    const sourceFiles = record(terminalManifest.files) ?? {}
+    const activeRecords = latest.source.descriptor?.records ?? "records.jsonl"
+    const activeRawEvents = latest.source.descriptor
+      ? path.join(latest.source.descriptor.path, "raw-events.jsonl")
+      : "raw-events.jsonl"
     const manifest: Record<string, unknown> = {
+      ...terminalManifest,
       trace_version: TRACE_VERSION,
       case_id: caseID,
       run_id: runID,
       status,
-      server_status: status,
-      process_status: status,
-      case_status: status,
+      server_status: terminalManifest.server_status ?? status,
+      process_status: terminalManifest.process_status ?? status,
+      case_status: terminalManifest.case_status ?? status,
       ...((session?.session_id ?? latest.close?.manifest.session_id)
         ? { session_id: session?.session_id ?? latest.close?.manifest.session_id }
         : {}),
-      ...(session ? { segments: session.segments } : {}),
-      ...(latest.close?.result === undefined ? {} : { result: latest.close.result }),
-      ...(latest.close?.error === undefined ? {} : { error: latest.close.error }),
+      ...(session
+        ? {
+            segments: session.segments,
+            segment_summary: {
+              count: session.segments.length,
+              completed: session.segments.filter((segment) => segment.status === "completed").length,
+              failed: session.segments.filter((segment) => segment.status === "failed").length,
+              cancelled: session.segments.filter((segment) => segment.status === "cancelled").length,
+              interrupted_unfinalized: session.segments.filter(
+                (segment) => segment.status === "interrupted_unfinalized",
+              ).length,
+              running: session.segments.filter((segment) => segment.status === "running").length,
+            },
+          }
+        : {}),
       files: {
+        ...sourceFiles,
         trace: "trace.json",
-        records: session ? "session.json" : "records.jsonl",
+        legacy_trace: "legacy-trace.json",
+        provenance_trace: "provenance-trace.json",
+        session: session ? "session.json" : undefined,
+        records: activeRecords,
+        raw_events: activeRawEvents,
         partial_latest: "partial/latest.json",
       },
       ...(completeness === "complete"
         ? {}
         : {
             recovery_status: "incomplete_journal_replay",
+            ...(terminalManifest.recovery_status === undefined
+              ? {}
+              : { source_recovery_status: terminalManifest.recovery_status }),
+            ...(terminalManifest.recovery === undefined ? {} : { source_recovery: terminalManifest.recovery }),
             recovery: {
               dropped_lines: droppedLines,
               segments: replays
@@ -1138,15 +1425,11 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
             },
           }),
     }
-    const metrics = {
-      spans: 0,
-      events: index.count("nodes"),
-      token_usage: {},
-      trace_health: { issues: [] },
-      records: index.recordCount(),
-      dataflow_edges: index.count("edges"),
-      artifacts: index.count("artifacts"),
-    }
+    const metrics = aggregateMetrics(replays, index, terminal.identities.runID, namespace)
+    const poisoned = replays.some(
+      (replay) =>
+        replay.source.descriptor !== undefined && replay.source.descriptor.status !== "running" && !replay.close,
+    )
     const journal = session
       ? {
           schema_version: CAUSAL_IR_VERSION,
@@ -1156,7 +1439,7 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
           entry_count: index.recoveredLines,
           last_sequence: index.recoveredLines,
           last_payload_hash: latest.lastPayloadHash,
-          poisoned: false,
+          poisoned,
           segments: replays.map((replay) => ({
             run_id: replay.identities.runID,
             path: path.relative(caseDir, replay.source.recordsFile),
@@ -1179,12 +1462,26 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
     const traceFile = path.join(caseDir, "trace.json")
     const manifestFile = path.join(caseDir, "manifest.json")
     const partialFile = path.join(caseDir, "partial", "latest.json")
+    const provenanceFile = path.join(caseDir, "provenance-trace.json")
+    const legacyFile = path.join(caseDir, "legacy-trace.json")
     writeStreamingJsonObjectAtomic(traceFile, traceMembers(index, manifest, metrics, journal))
     memoryPhase("trace_complete", journalBytes)
     writeStreamingJsonObjectAtomic(manifestFile, Object.entries(manifest))
     memoryPhase("manifest_complete", journalBytes)
-    writeStreamingJsonObjectAtomic(partialFile, traceMembers(index, manifest, metrics, journal))
+    linkFileAtomic(traceFile, partialFile)
     memoryPhase("partial_complete", journalBytes)
+    writeStreamingJsonObjectAtomic(provenanceFile, provenanceMembers(index, manifest, metrics))
+    memoryPhase("provenance_complete", journalBytes)
+    const legacySource = replays.findLast((replay) =>
+      fs.existsSync(path.join(path.dirname(replay.source.recordsFile), "legacy-trace.json")),
+    )
+    if (legacySource) {
+      copyFileAtomic(path.join(path.dirname(legacySource.source.recordsFile), "legacy-trace.json"), legacyFile)
+      linkCompatibilityArtifacts(
+        path.join(path.dirname(legacySource.source.recordsFile), "artifacts"),
+        path.join(caseDir, "artifacts"),
+      )
+    }
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
   } finally {
     index.closeIndex()

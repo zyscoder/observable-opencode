@@ -8340,7 +8340,7 @@ class ActiveCaseTrace {
 
   node(
     input: CausalNodeInput,
-    options: { trackGeneration?: boolean } = {},
+    options: { trackGeneration?: boolean; summarizeData?: boolean } = {},
   ) {
     const temporal = normalizeTemporalReferences(input)
     const normalized = temporal.value
@@ -8376,7 +8376,9 @@ class ActiveCaseTrace {
       data:
         revisionBoundData === undefined
           ? undefined
-          : this.summarizeCausalObject(revisionBoundData, `${normalized.kind}.data`),
+          : options.summarizeData === false
+            ? (sanitizeForJson(revisionBoundData) as Record<string, unknown>)
+            : this.summarizeCausalObject(revisionBoundData, `${normalized.kind}.data`),
       source_refs: sourceRefs,
       source_locations: normalized.source_locations,
       typed_resources: normalized.typed_resources,
@@ -11339,18 +11341,34 @@ class ActiveCaseTrace {
         input: this.input,
         environment: this.environment,
       })
-      this.node({
-        kind: "run.start",
-        component: "run",
-        title: this.caseID,
-        status: "running",
-        data: {
-          case_id: this.caseID,
-          run_id: this.runID,
-          input: this.input,
-          environment: this.environment,
+      const runStart = this.node(
+        {
+          kind: "run.start",
+          component: "run",
+          title: this.caseID,
+          status: "running",
+          data: {
+            case_id: this.caseID,
+            run_id: this.runID,
+          },
         },
-      })
+        { trackGeneration: false, summarizeData: false },
+      )
+      const runStartData = {
+        case_id: this.caseID,
+        run_id: this.runID,
+        input: this.input,
+        environment: this.environment,
+        ...(this.subjectRevision
+          ? {
+              subject_revision: this.subjectRevision,
+              revision_provenance_status: "valid",
+            }
+          : {}),
+      }
+      runStart.data = this.summarizeCausalObject(runStartData, "run.start.data")
+      runStart.artifact_refs = this.collectArtifactRefs(runStart.data)
+      this.causalIR.updateNode(runStart)
     } catch {
       this.writable = false
     }
