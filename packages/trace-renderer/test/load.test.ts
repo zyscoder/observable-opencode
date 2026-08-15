@@ -205,7 +205,7 @@ function rehashEntry(entry: any) {
   entry.payload_hash = createHash("sha256").update(canonicalJSON(entry.data)).digest("hex")
 }
 
-function segmentedJournal(runID: string, marker: string) {
+function segmentedJournal(runID: string, marker: string, complete = true) {
   const journal: unknown[] = []
   const store = new CausalIRStore({ runID, caseID: "segmented-renderer", append: (entry) => journal.push(entry) })
   store.createNode({
@@ -226,12 +226,13 @@ function segmentedJournal(runID: string, marker: string) {
     status: "success",
     data: { text: `${marker} response` },
   })
-  store.closeRuntime({
-    format: "runtime_close",
-    status: "success",
-    closed_at: "2026-08-15T00:00:02.000Z",
-    manifest: { case_id: "segmented-renderer", run_id: runID, session_id: "ses_segmented_renderer" },
-  })
+  if (complete)
+    store.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-15T00:00:02.000Z",
+      manifest: { case_id: "segmented-renderer", run_id: runID, session_id: "ses_segmented_renderer" },
+    })
   return journal
 }
 
@@ -246,7 +247,7 @@ describe("loadRenderableTrace", () => {
         fs.mkdirSync(path.join(caseDir, segment), { recursive: true })
         fs.writeFileSync(
           path.join(caseDir, segment, "records.jsonl"),
-          segmentedJournal(input.runID, input.marker)
+          segmentedJournal(input.runID, input.marker, index === 0)
             .map((entry) => JSON.stringify(entry))
             .join("\n") + "\n",
         )
@@ -260,7 +261,7 @@ describe("loadRenderableTrace", () => {
           artifacts: path.join(segment, "artifacts"),
           index: path.join(segment, "index.sqlite"),
           started_at: `2026-08-15T00:00:0${index}.000Z`,
-          status: "completed",
+          status: index === 0 ? "completed" : "running",
           ...(index === 1 ? { continuation_of: "run_renderer_first" } : {}),
         }
       })
@@ -270,6 +271,8 @@ describe("loadRenderableTrace", () => {
           schema_version: "1.0",
           logical_case_id: "segmented-renderer",
           session_id: "ses_segmented_renderer",
+          lock_key: "trace-root-manifest-v1",
+          generation: 2,
           created_at: "2026-08-15T00:00:00.000Z",
           updated_at: "2026-08-15T00:00:01.000Z",
           segments: descriptors,
@@ -279,10 +282,11 @@ describe("loadRenderableTrace", () => {
 
       const result = loadRenderableTrace(caseDir)
 
-      expect(result).toMatchObject({ caseDir, source: "trace.json", incomplete: false })
+      expect(result).toMatchObject({ caseDir, source: "trace.json", incomplete: true })
       expect(result.trace.manifest).toMatchObject({
         case_id: "segmented-renderer",
-        run_id: "run_renderer_second",
+        run_id: "run_renderer_first",
+        historical_interruptions: true,
       })
       expect(
         result.trace.records
@@ -299,6 +303,68 @@ describe("loadRenderableTrace", () => {
       )
       expect(fs.existsSync(path.join(caseDir, "trace.json"))).toBe(false)
       expect(treeHashes(caseDir)).toEqual(before)
+    })
+  })
+
+  test("ignores a stale root trace and materializes every current segment without mutating the root", () => {
+    withCaseDirectory((caseDir) => {
+      const descriptors = [
+        { runID: "run_renderer_first", marker: "first", complete: true },
+        { runID: "run_renderer_second", marker: "second", complete: false },
+      ].map((input, index) => {
+        const segment = path.join("segments", input.runID)
+        fs.mkdirSync(path.join(caseDir, segment), { recursive: true })
+        fs.writeFileSync(
+          path.join(caseDir, segment, "records.jsonl"),
+          segmentedJournal(input.runID, input.marker, input.complete)
+            .map((entry) => JSON.stringify(entry))
+            .join("\n") + "\n",
+        )
+        return {
+          segment_id: input.runID,
+          run_id: input.runID,
+          case_id: "segmented-renderer",
+          session_id: "ses_segmented_renderer",
+          path: segment,
+          records: path.join(segment, "records.jsonl"),
+          artifacts: path.join(segment, "artifacts"),
+          index: path.join(segment, "index.sqlite"),
+          started_at: `2026-08-15T00:00:0${index}.000Z`,
+          status: input.complete ? "completed" : "running",
+          ...(index ? { continuation_of: "run_renderer_first" } : {}),
+        }
+      })
+      fs.writeFileSync(
+        path.join(caseDir, "session.json"),
+        JSON.stringify({
+          schema_version: "1.0",
+          logical_case_id: "segmented-renderer",
+          session_id: "ses_segmented_renderer",
+          lock_key: "trace-root-manifest-v1",
+          generation: 2,
+          created_at: "2026-08-15T00:00:00.000Z",
+          updated_at: "2026-08-15T00:00:01.000Z",
+          segments: descriptors,
+        }),
+      )
+      const { snapshot, store } = createJournal()
+      const stale = canonicalTrace(snapshot, store.journalSummary())
+      ;(stale.manifest as Record<string, unknown>).session_generation = 1
+      const traceFile = path.join(caseDir, "trace.json")
+      fs.writeFileSync(traceFile, JSON.stringify(stale))
+      const before = treeHashes(caseDir)
+
+      for (const input of [caseDir, traceFile]) {
+        const result = loadRenderableTrace(input)
+        expect(result).toMatchObject({ caseDir, source: "trace.json", incomplete: true })
+        expect(
+          result.trace.records
+            .filter((item: any) => item.event_type === "response.output")
+            .map((item: any) => item.data.text),
+        ).toEqual(["first response", "second response"])
+      }
+      expect(treeHashes(caseDir)).toEqual(before)
+      expect(JSON.parse(fs.readFileSync(traceFile, "utf8")).manifest.session_generation).toBe(1)
     })
   })
 
@@ -336,7 +402,6 @@ describe("loadRenderableTrace", () => {
           dataflow_edges: [],
         }),
       )
-      fs.writeFileSync(path.join(caseDir, "session.json"), JSON.stringify({ sentinel: "renderer must not read this" }))
       const before = treeHashes(caseDir)
 
       const result = loadRenderableTrace(caseDir)

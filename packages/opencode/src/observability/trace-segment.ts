@@ -50,6 +50,7 @@ type TraceSegmentLockOwner = {
 const DEFAULT_LOCK_WAIT_MS = 5_000
 const DEFAULT_LOCK_STALE_MS = 30_000
 const LOCK_POLL_MS = 10
+export const TRACE_MANIFEST_LOCK_KEY = "trace-root-manifest-v1"
 
 function isRecord(input: unknown): input is Record<string, unknown> {
   return Boolean(input) && typeof input === "object" && !Array.isArray(input)
@@ -63,18 +64,41 @@ function readSessionManifest(file: string): TraceSessionManifest | undefined {
     manifest.schema_version !== "1.0" ||
     typeof manifest.logical_case_id !== "string" ||
     typeof manifest.created_at !== "string" ||
+    typeof manifest.updated_at !== "string" ||
     !Array.isArray(manifest.segments)
   )
     throw new Error(`${file}: invalid trace session manifest`)
   const session = manifest as unknown as TraceSessionManifest
+  const runIDs = new Set<string>()
+  const segmentIDs = new Set<string>()
+  for (const descriptor of session.segments) {
+    if (
+      !isRecord(descriptor) ||
+      typeof descriptor.segment_id !== "string" ||
+      !descriptor.segment_id ||
+      typeof descriptor.run_id !== "string" ||
+      !descriptor.run_id ||
+      typeof descriptor.case_id !== "string" ||
+      !descriptor.case_id ||
+      typeof descriptor.path !== "string" ||
+      !descriptor.path ||
+      typeof descriptor.records !== "string" ||
+      !descriptor.records ||
+      typeof descriptor.started_at !== "string" ||
+      !descriptor.started_at ||
+      !["running", "completed", "failed", "cancelled", "interrupted_unfinalized"].includes(
+        descriptor.status as string,
+      ) ||
+      runIDs.has(descriptor.run_id) ||
+      segmentIDs.has(descriptor.segment_id)
+    )
+      throw new Error(`${file}: invalid trace segment descriptor`)
+    runIDs.add(descriptor.run_id)
+    segmentIDs.add(descriptor.segment_id)
+  }
   return {
     ...session,
-    lock_key:
-      typeof session.lock_key === "string" && session.lock_key
-        ? session.lock_key
-        : session.session_id
-          ? `session:${session.session_id}`
-          : `case:${session.logical_case_id}`,
+    lock_key: TRACE_MANIFEST_LOCK_KEY,
     generation: Number.isSafeInteger(session.generation) && session.generation >= 0 ? session.generation : 0,
   }
 }
@@ -316,19 +340,33 @@ export function withTraceSessionLock<T>(rootDir: string, key: string, operation:
   }
 }
 
-function resolveLogicalRoot(rootDir: string, requestedCaseID: string, sessionID: string | undefined) {
-  const fallback = path.join(rootDir, requestedCaseID)
-  if (!sessionID || !fs.existsSync(rootDir)) return fallback
+function sessionRoots(rootDir: string, sessionID: string) {
+  if (!fs.existsSync(rootDir)) return []
   const matches: string[] = []
   for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const candidate = path.join(rootDir, entry.name)
-    try {
-      if (readSessionManifest(path.join(candidate, "session.json"))?.session_id === sessionID) matches.push(candidate)
-    } catch {}
+    if (readSessionManifest(path.join(candidate, "session.json"))?.session_id === sessionID) matches.push(candidate)
   }
+  return matches
+}
+
+function resolveLogicalRoot(rootDir: string, requestedCaseID: string, sessionID: string | undefined) {
+  const fallback = path.join(rootDir, requestedCaseID)
+  if (!sessionID || !fs.existsSync(rootDir)) return fallback
+  const matches = sessionRoots(rootDir, sessionID)
   if (matches.length > 1) throw new Error(`${rootDir}: session ${sessionID} has multiple logical trace roots`)
   return matches[0] ?? fallback
+}
+
+function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined) {
+  if (!fs.existsSync(logicalRoot)) return { current: undefined, legacy: undefined }
+  if (!fs.statSync(logicalRoot).isDirectory()) throw new Error(`${logicalRoot}: expected a logical trace directory`)
+  const current = readSessionManifest(path.join(logicalRoot, "session.json"))
+  if (current?.session_id && sessionID && current.session_id !== sessionID)
+    throw new Error(`${logicalRoot}: session identity changed`)
+  const legacy = legacyRootDescriptor(logicalRoot, sessionID ?? current?.session_id)
+  return { current, legacy }
 }
 
 function fsyncDirectory(directory: string) {
@@ -387,132 +425,134 @@ export function openTraceSegment(input: {
 }): TraceSegment {
   const rootDir = path.resolve(input.rootDir)
   const requestedCaseID = safePart(input.logicalCaseID, "case")
-  let lockKey = input.sessionID ? `session:${input.sessionID}` : `case:${requestedCaseID}`
-  while (true) {
-    const opened = withTraceSessionLock(rootDir, lockKey, () => {
-      const logicalRoot = resolveLogicalRoot(rootDir, requestedCaseID, input.sessionID)
-      const sessionFile = path.join(logicalRoot, "session.json")
-      const segmentsDir = path.join(logicalRoot, "segments")
-      fs.mkdirSync(segmentsDir, { recursive: true })
-
-      const current = readSessionManifest(sessionFile)
-      if (current?.lock_key && current.lock_key !== lockKey) return { retryLockKey: current.lock_key } as const
-      const logicalCaseID = current?.logical_case_id ?? requestedCaseID
-      if (current?.session_id && input.sessionID && current.session_id !== input.sessionID)
-        throw new Error(`${sessionFile}: session identity changed`)
-      const legacy = current?.segments.some((segment) => segment.segment_id === "legacy-root")
-        ? undefined
-        : legacyRootDescriptor(logicalRoot, input.sessionID ?? current?.session_id)
-      const existingSegments = [...(legacy ? [legacy] : []), ...(current?.segments ?? [])]
-      if (existingSegments.some((segment) => segment.run_id === input.runID))
-        throw new Error(`${sessionFile}: run ${input.runID} already exists`)
-      const baseSegmentID = safePart(input.runID, "run")
-      let ordinal = 1
-      let segmentID = baseSegmentID
-      let segmentDir = path.join(segmentsDir, segmentID)
-      while (true) {
-        try {
-          fs.mkdirSync(segmentDir)
-          break
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-          segmentID = `${baseSegmentID}-${++ordinal}`
-          segmentDir = path.join(segmentsDir, segmentID)
-        }
-      }
-
-      const now = new Date().toISOString()
-      const relative = path.relative(logicalRoot, segmentDir)
-      const previous = existingSegments.at(-1)
-      const descriptor: TraceSegmentDescriptor = {
-        segment_id: segmentID,
-        run_id: input.runID,
-        case_id: logicalCaseID,
-        session_id: input.sessionID ?? current?.session_id,
-        path: relative,
-        records: path.join(relative, "records.jsonl"),
-        artifacts: path.join(relative, "artifacts"),
-        index: path.join(relative, "index.sqlite"),
-        started_at: now,
-        status: "running",
-        ...(previous ? { continuation_of: previous.run_id } : {}),
-      }
-      const segments = existingSegments.map((segment, index, items) =>
-        index === items.length - 1 && segment.status === "running"
-          ? { ...segment, status: "interrupted_unfinalized" as const }
-          : segment,
-      )
-      const manifest: TraceSessionManifest = {
-        schema_version: "1.0",
-        logical_case_id: logicalCaseID,
-        session_id: input.sessionID ?? current?.session_id,
-        lock_key: lockKey,
-        generation: (current?.generation ?? 0) + 1,
-        created_at: current?.created_at ?? now,
-        updated_at: now,
-        segments: [...segments, descriptor],
-      }
-      const segmentFile = path.join(segmentDir, "segment.json")
+  const lockKey = TRACE_MANIFEST_LOCK_KEY
+  return withTraceSessionLock(rootDir, lockKey, () => {
+    const logicalRoot = resolveLogicalRoot(rootDir, requestedCaseID, input.sessionID)
+    const sessionFile = path.join(logicalRoot, "session.json")
+    const segmentsDir = path.join(logicalRoot, "segments")
+    const logicalRootExisted = fs.existsSync(logicalRoot)
+    const segmentsDirExisted = fs.existsSync(segmentsDir)
+    const validated = validateLogicalRoot(logicalRoot, input.sessionID)
+    const current = validated.current
+    const logicalCaseID = current?.logical_case_id ?? requestedCaseID
+    const legacy = current?.segments.some((segment) => segment.segment_id === "legacy-root")
+      ? undefined
+      : validated.legacy
+    const existingSegments = [...(legacy ? [legacy] : []), ...(current?.segments ?? [])]
+    if (existingSegments.some((segment) => segment.run_id === input.runID))
+      throw new Error(`${sessionFile}: run ${input.runID} already exists`)
+    fs.mkdirSync(segmentsDir, { recursive: true })
+    const baseSegmentID = safePart(input.runID, "run")
+    let ordinal = 1
+    let segmentID = baseSegmentID
+    let segmentDir = path.join(segmentsDir, segmentID)
+    while (true) {
       try {
-        writeJsonAtomic(segmentFile, descriptor)
-        fsyncDirectory(segmentsDir)
-        writeJsonAtomic(sessionFile, manifest)
+        fs.mkdirSync(segmentDir)
+        break
       } catch (error) {
-        fs.rmSync(segmentDir, { recursive: true, force: true })
-        throw error
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        segmentID = `${baseSegmentID}-${++ordinal}`
+        segmentDir = path.join(segmentsDir, segmentID)
       }
-
-      return {
-        segment: {
-          logicalCaseID,
-          logicalRoot,
-          segmentDir,
-          segmentFile,
-          sessionFile,
-          lockKey,
-          descriptor,
-          bindSessionID(sessionID) {
-            try {
-              return withTraceSessionLock(rootDir, lockKey, () =>
-                replaceDescriptor(sessionFile, segmentID, (latest) => {
-                  if (latest.session_id && latest.session_id !== sessionID)
-                    throw new Error(`${sessionFile}: session identity changed`)
-                  return {
-                    ...latest,
-                    session_id: sessionID,
-                    generation: latest.generation + 1,
-                    updated_at: new Date().toISOString(),
-                    segments: latest.segments.map((item) =>
-                      item.segment_id === segmentID ? { ...item, session_id: sessionID } : item,
-                    ),
-                  }
-                }),
-              )
-            } catch {
-              return false
-            }
-          },
-          finalize(status) {
-            try {
-              return withTraceSessionLock(rootDir, lockKey, () =>
-                replaceDescriptor(sessionFile, segmentID, (latest) => ({
-                  ...latest,
-                  generation: latest.generation + 1,
-                  updated_at: new Date().toISOString(),
-                  segments: latest.segments.map((item) => (item.segment_id === segmentID ? { ...item, status } : item)),
-                })),
-              )
-            } catch {
-              return false
-            }
-          },
-        } as TraceSegment,
-      } as const
-    }) as { segment: TraceSegment } | { retryLockKey: string }
-    if ("retryLockKey" in opened) {
-      lockKey = opened.retryLockKey
-      continue
     }
-    return opened.segment
-  }
+
+    const now = new Date().toISOString()
+    const relative = path.relative(logicalRoot, segmentDir)
+    const previous = existingSegments.at(-1)
+    const descriptor: TraceSegmentDescriptor = {
+      segment_id: segmentID,
+      run_id: input.runID,
+      case_id: logicalCaseID,
+      session_id: input.sessionID ?? current?.session_id,
+      path: relative,
+      records: path.join(relative, "records.jsonl"),
+      artifacts: path.join(relative, "artifacts"),
+      index: path.join(relative, "index.sqlite"),
+      started_at: now,
+      status: "running",
+      ...(previous ? { continuation_of: previous.run_id } : {}),
+    }
+    const segments = existingSegments.map((segment, index, items) =>
+      index === items.length - 1 && segment.status === "running"
+        ? { ...segment, status: "interrupted_unfinalized" as const }
+        : segment,
+    )
+    const manifest: TraceSessionManifest = {
+      schema_version: "1.0",
+      logical_case_id: logicalCaseID,
+      session_id: input.sessionID ?? current?.session_id,
+      lock_key: lockKey,
+      generation: (current?.generation ?? 0) + 1,
+      created_at: current?.created_at ?? now,
+      updated_at: now,
+      segments: [...segments, descriptor],
+    }
+    const segmentFile = path.join(segmentDir, "segment.json")
+    try {
+      writeJsonAtomic(segmentFile, descriptor)
+      fsyncDirectory(segmentsDir)
+      writeJsonAtomic(sessionFile, manifest)
+    } catch (error) {
+      fs.rmSync(segmentDir, { recursive: true, force: true })
+      if (!segmentsDirExisted) {
+        try {
+          fs.rmdirSync(segmentsDir)
+        } catch {}
+      }
+      if (!logicalRootExisted) {
+        try {
+          fs.rmdirSync(logicalRoot)
+        } catch {}
+      }
+      throw error
+    }
+
+    return {
+      logicalCaseID,
+      logicalRoot,
+      segmentDir,
+      segmentFile,
+      sessionFile,
+      lockKey,
+      descriptor,
+      bindSessionID(sessionID) {
+        try {
+          return withTraceSessionLock(rootDir, lockKey, () => {
+            const latest = readSessionManifest(sessionFile)
+            if (!latest || !latest.segments.some((item) => item.segment_id === segmentID)) return false
+            if (latest.session_id === sessionID) return true
+            if (latest.session_id) return false
+            if (sessionRoots(rootDir, sessionID).some((root) => path.resolve(root) !== path.resolve(logicalRoot)))
+              return false
+            writeJsonAtomic(sessionFile, {
+              ...latest,
+              session_id: sessionID,
+              lock_key: lockKey,
+              generation: latest.generation + 1,
+              updated_at: new Date().toISOString(),
+              segments: latest.segments.map((item) => (item.session_id ? item : { ...item, session_id: sessionID })),
+            })
+            return true
+          })
+        } catch {
+          return false
+        }
+      },
+      finalize(status) {
+        try {
+          return withTraceSessionLock(rootDir, lockKey, () =>
+            replaceDescriptor(sessionFile, segmentID, (latest) => ({
+              ...latest,
+              generation: latest.generation + 1,
+              updated_at: new Date().toISOString(),
+              segments: latest.segments.map((item) => (item.segment_id === segmentID ? { ...item, status } : item)),
+            })),
+          )
+        } catch {
+          return false
+        }
+      },
+    } as TraceSegment
+  })
 }

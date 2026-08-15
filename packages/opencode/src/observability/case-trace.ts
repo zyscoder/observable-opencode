@@ -5400,12 +5400,14 @@ class ActiveCaseTrace {
   }
 
   setSessionID(sessionID: string | undefined) {
-    if (!sessionID || this.sessionID === sessionID) return
-    if (this.sessionID) return
-    if (this.bindSession && !this.bindSession(sessionID)) return
+    if (!sessionID) return false
+    if (this.sessionID === sessionID) return true
+    if (this.sessionID || !this.segment) return false
+    if (!this.segment.bindSessionID(sessionID)) return false
+    if (this.bindSession && !this.bindSession(sessionID)) return false
     this.sessionID = sessionID
-    this.segment?.bindSessionID(sessionID)
     this.write("trace.session", { session_id: sessionID })
+    return true
   }
 
   setInput(input: Record<string, unknown>) {

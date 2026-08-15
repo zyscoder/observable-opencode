@@ -306,3 +306,95 @@ The sole full case-trace failure is the unchanged, explicitly excluded `persists
 - Root legacy output remains the newest valid terminal's compatibility projection, not a merged legacy-schema history. Canonical and provenance outputs contain the complete segmented graph.
 - Content-addressed compatibility artifacts intentionally accumulate across resumes. Segment-local artifacts remain authoritative and are never changed.
 - Malformed locks recover only after the configured stale threshold; a syntactically valid lock owned by a live PID can require operator/process resolution rather than age-based eviction.
+
+## Fix Round 2/5 Completion
+
+Status on 2026-08-15: **review round 2 complete**, with only the explicitly excluded and unchanged `artifact[0]` baseline failing in the full case-trace suite.
+
+### RED
+
+The new regressions were run before the production changes. `trace-segment.test.ts` initially reported 17 pass and 9 fail; renderer load reported 20 pass and 2 fail. The failures proved:
+
+- malformed `session.json` and malformed root legacy journals gained a new `segments/` directory before validation, changing a full byte/tree SHA-256;
+- session/case lock keys bypassed a held global lock, and two independently allocated unknown traces could both bind the same session ID;
+- suffix matching rewrote `customer_node_id`, an unresolved artifact ID, an unresolved typed reference, and an HTTPS value in `documentation_ref`;
+- root derived files were independent regular files with no `.derived/current` generation boundary;
+- a stale root trace was loaded as complete after a resumed process was SIGKILLed instead of replaying all current immutable segments into temporary output.
+
+The publication regression injects failure at `generation_ready`, `root_links_ready`, `current_swap_ready`, and `current_swapped`. After each failure it compares both the stable compatibility-file hashes and a recursive tree hash, including `.derived`, against the old generation.
+
+### GREEN Behavior
+
+- `openTraceSegment` acquires one constant `trace-root-manifest-v1` lock for the configured trace root. Discovery, target-root validation, first creation, allocation, late bind, finalize, and publication all use this domain; no operation switches keys after a session becomes known.
+- Existing target roots are parsed before creating `segments/` or any child. Invalid session descriptors or invalid legacy identity lines throw without changing the pre-existing tree. Allocation cleanup removes newly created empty directories if manifest publication fails.
+- Late bind scans every manifest while holding the global lock. A duplicate session root is rejected, different session IDs bind independently, and `ActiveCaseTrace.sessionID` changes only after `TraceSegment.bindSessionID()` succeeds. Lock timeout leaves the active observer unbound and passive.
+- Entity declarations are pre-registered with a bounded JSONL line scan. Reference rewriting uses explicit node, edge, artifact, diagnostic, and reference-key sets; it rewrites only resolved IDs or explicit `node:`, `record:`, `edge:`, `artifact:`, and `diagnostic:` schemes. `documentation_ref`, URLs, paths, ordinary text, `customer_node_id`, and unknown typed fields remain unchanged. The unified graph validator checks every rewritten endpoint and artifact/diagnostic reference.
+- A published session generation is built under `.derived/generations/<session-generation>/`. Root compatibility paths are stable symlinks through `.derived/current`, and one atomic symlink rename switches the whole set. `trace.json` and `partial/latest.json` remain hardlinked inside the generation. Mid-install errors and injected post-swap errors restore the old links/current target and remove the uncommitted generation.
+- Legacy root journals, indexes, and artifact directories remain byte-identical segment zero. Their compatibility projection can address generated artifacts through `.derived/current/artifacts/...` without replacing the authoritative root `artifacts/` directory.
+- Renderer load compares `trace.manifest.session_generation` with `session.json.generation`. Equal generations read the committed root. Missing or stale output is materialized under the OS temporary directory, includes running/SIGKILL-interrupted segments, reports `incomplete`, and leaves every root hash unchanged.
+
+### Exact Derived Layout
+
+```text
+$OPENCODE_CASE_TRACE_DIR/session-case/
+  session.json
+  trace.json                 -> .derived/current/trace.json
+  manifest.json              -> .derived/current/manifest.json
+  legacy-trace.json          -> .derived/current/legacy-trace.json
+  provenance-trace.json      -> .derived/current/provenance-trace.json
+  partial/latest.json        -> ../.derived/current/partial/latest.json
+  artifacts                  -> .derived/current/artifacts
+  .derived/
+    current                  -> generations/6
+    generations/
+      4/
+        trace.json
+        manifest.json
+        legacy-trace.json
+        provenance-trace.json
+        partial/latest.json  # hardlink of this generation's trace.json
+        artifacts/...
+      6/
+        trace.json
+        manifest.json
+        legacy-trace.json
+        provenance-trace.json
+        partial/latest.json
+        artifacts/...
+  segments/
+    run-first/records.jsonl
+    run-second/records.jsonl
+```
+
+For a legacy segment-zero root, the original root `records.jsonl`, `index.sqlite`, and `artifacts/` remain regular authoritative paths and are not replaced by derived symlinks.
+
+### Final Verification
+
+```text
+packages/opencode:
+  trace-segment.test.ts                                  27 pass, 0 fail, 362 expects
+  trace-materializer.test.ts                             7 pass, 0 fail, 21 expects
+  trace-materializer-memory.test.ts                      1 pass, 0 fail, 5 expects
+  worker-trace.test.ts + thread.test.ts                 10 pass, 0 fail, 31 expects
+  case-trace.test.ts                                   162 pass, 1 fail, 2134 expects
+
+packages/trace-renderer:
+  load.test.ts + cli.test.ts                            37 pass, 0 fail, 196 expects
+  bun run typecheck                                     pass
+
+repository:
+  git diff --check                                      pass
+```
+
+The 1 GiB sparse-journal run measured peak RSS at 261,292,032 bytes, below the 268,435,456-byte limit. One combined materializer command emitted a spurious unnamed Bun hook timeout with an impossible 935,746 ms duration despite a roughly four-second wall clock; immediate independent reruns of the normal and 1 GiB files passed 7/7 and 1/1 and are the reported results.
+
+The full case-trace failure is exactly `persists semantic trace records with artifacts and redaction`. Its unchanged assertion assumes `trace.artifacts[0]` contains `semantic model message`; artifact zero is the earlier `run.start.environment` JSON artifact. No Task 6 code or test changes that baseline assertion.
+
+`packages/opencode` typecheck still exits 2 only for the pre-existing TUI sidebar implicit-any diagnostics, worktree/main SDK private-type duplication, plugin overload/dependency resolution, and missing semver declarations. Renderer typecheck imports the changed materializer and passes.
+
+### Compatibility Risks
+
+- Stable root compatibility paths are symlinks on platforms that support atomic symlink replacement. If symlink creation is unavailable, publication rolls back and leaves the prior generation visible rather than exposing a partial new set.
+- Derived generations are immutable once installed. Session finalization increments the manifest generation; read-only rendering of a still-running generation stays temporary and never publishes into the logical root.
+- Root `legacy-trace.json` remains the newest valid terminal's legacy projection. The canonical and provenance files are the complete multi-segment history.
+- A malformed unrelated session manifest encountered while scanning the configured trace root prevents session discovery and causes passive fallback. This favors uniqueness and evidence preservation over partial discovery.

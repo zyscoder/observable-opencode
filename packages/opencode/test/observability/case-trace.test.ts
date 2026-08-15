@@ -7184,7 +7184,8 @@ describe("case trace", () => {
     })
     expect(rendered.exitCode).toBe(0)
     expect(Buffer.from(rendered.stdout).toString()).toContain("source: trace.json")
-    expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: complete")
+    expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: incomplete")
+    expect(await fs.readFile(path.join(dir, "recovered.html"), "utf8")).toContain("new run marker")
     const recovered = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
     expect(recovered.nodes.some((node: any) => node.node_id === "old_run_marker")).toBe(true)
     expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::new_run_marker"))).toBe(false)

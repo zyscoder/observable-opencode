@@ -190,12 +190,25 @@ function materializeReadOnly(caseDir: string) {
   }
 }
 
+function rootTraceIsCurrent(caseDir: string, traceFile: string) {
+  const sessionFile = path.join(caseDir, "session.json")
+  if (!fs.existsSync(sessionFile)) return true
+  const session = readJSON(sessionFile)
+  if (!isRecord(session) || !Number.isSafeInteger(session.generation) || (session.generation as number) < 0)
+    throw new Error(`${sessionFile}: invalid trace session manifest`)
+  const trace = readJSON(traceFile)
+  return isRecord(trace) && isRecord(trace.manifest) && trace.manifest.session_generation === session.generation
+}
+
 function selectSource(input: string): { file: string; caseDir: string; source: TraceSource; cleanup?: () => void } {
   const target = path.resolve(input)
   const stats = fs.statSync(target)
   if (stats.isDirectory()) {
     const trace = path.join(target, "trace.json")
-    if (fs.existsSync(trace)) return { file: trace, caseDir: target, source: "trace.json" }
+    if (fs.existsSync(trace)) {
+      if (rootTraceIsCurrent(target, trace)) return { file: trace, caseDir: target, source: "trace.json" }
+      return materializeReadOnly(target)
+    }
     const session = path.join(target, "session.json")
     if (fs.existsSync(session)) return materializeReadOnly(target)
     const journal = path.join(target, "records.jsonl")
@@ -208,12 +221,15 @@ function selectSource(input: string): { file: string; caseDir: string; source: T
   if (path.basename(target) === "session.json") {
     const caseDir = path.dirname(target)
     const trace = path.join(caseDir, "trace.json")
-    if (fs.existsSync(trace)) return { file: trace, caseDir, source: "trace.json" }
+    if (fs.existsSync(trace) && rootTraceIsCurrent(caseDir, trace))
+      return { file: trace, caseDir, source: "trace.json" }
     return materializeReadOnly(caseDir)
   }
   const source = path.basename(target) as TraceSource
   if (source !== "trace.json" && source !== "records.jsonl")
     throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
+  if (source === "trace.json" && !rootTraceIsCurrent(path.dirname(target), target))
+    return materializeReadOnly(path.dirname(target))
   return { file: target, caseDir: path.dirname(target), source }
 }
 
@@ -359,7 +375,10 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
         trace: projectDocument(document),
         caseDir: selected.caseDir,
         source: selected.source,
-        incomplete: document.manifest.recovery_status === "incomplete_journal_replay",
+        incomplete:
+          document.manifest.recovery_status === "incomplete_journal_replay" ||
+          document.manifest.historical_interruptions === true ||
+          isRecord(document.manifest.session_recovery),
       }
     }
 

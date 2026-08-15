@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -12,6 +12,7 @@ const packageDir = path.resolve(import.meta.dir, "../..")
 const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 const segmentModule = pathToFileURL(path.join(packageDir, "src/observability/trace-segment.ts")).href
 const materializerModule = pathToFileURL(path.join(packageDir, "src/observability/trace-materializer.ts")).href
+const globalManifestLockKey = "trace-root-manifest-v1"
 
 async function waitForFile(file: string) {
   for (let attempt = 0; attempt < 200; attempt++) {
@@ -75,6 +76,29 @@ async function sha256(file: string) {
   return createHash("sha256")
     .update(await fs.readFile(file))
     .digest("hex")
+}
+
+async function treeHash(root: string) {
+  const hash = createHash("sha256")
+  const visit = async (directory: string) => {
+    const entries = (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name)
+      const relative = path.relative(root, file).replaceAll(path.sep, "/")
+      if (entry.isDirectory()) {
+        hash.update(`directory:${relative}\n`)
+        await visit(file)
+      } else if (entry.isSymbolicLink()) {
+        hash.update(`symlink:${relative}:${await fs.readlink(file)}\n`)
+      } else if (entry.isFile()) {
+        hash.update(`file:${relative}:`)
+        hash.update(await fs.readFile(file))
+        hash.update("\n")
+      }
+    }
+  }
+  await visit(root)
+  return hash.digest("hex")
 }
 
 async function fileExists(file: string) {
@@ -143,6 +167,60 @@ async function openSegmentsConcurrently(input: {
     output.push(JSON.parse(await fs.readFile(item.outputFile, "utf8")) as any)
   }
   return output
+}
+
+async function bindUnknownSegmentsConcurrently(input: { traceRoot: string; sessionIDs: [string, string] }) {
+  const invocation = randomUUID()
+  const script = path.join(input.traceRoot, `concurrent-bind-${randomUUID()}.ts`)
+  const gate = path.join(input.traceRoot, `concurrent-bind-${randomUUID()}.gate`)
+  await fs.writeFile(
+    script,
+    [
+      `import fs from "node:fs"`,
+      `import { openTraceSegment } from ${JSON.stringify(segmentModule)}`,
+      `const request = JSON.parse(process.argv[2])`,
+      `const segment = openTraceSegment(request.input)`,
+      `fs.writeFileSync(request.readyFile, JSON.stringify({ logicalRoot: segment.logicalRoot }))`,
+      `while (!fs.existsSync(request.gate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2)`,
+      `const bound = segment.bindSessionID(request.sessionID)`,
+      `fs.writeFileSync(request.outputFile, JSON.stringify({ bound, logicalRoot: segment.logicalRoot }))`,
+    ].join("\n"),
+  )
+  const children = input.sessionIDs.map((sessionID, index) => {
+    const readyFile = path.join(input.traceRoot, `bind-${index}.ready.json`)
+    const outputFile = path.join(input.traceRoot, `bind-${index}.output.json`)
+    const request = {
+      readyFile,
+      outputFile,
+      gate,
+      sessionID,
+      input: {
+        rootDir: input.traceRoot,
+        logicalCaseID: `unknown-bind-${invocation}-${index}`,
+        runID: `run_unknown_bind_${invocation}_${index}`,
+      },
+    }
+    return {
+      readyFile,
+      outputFile,
+      child: Bun.spawn([process.execPath, script, JSON.stringify(request)], {
+        cwd: packageDir,
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    }
+  })
+  for (const child of children) expect(await waitForFilePresence(child.readyFile)).toBe(true)
+  await fs.writeFile(gate, "go")
+  return Promise.all(
+    children.map(async (child) => {
+      const exitCode = await child.child.exited
+      const stderr = await new Response(child.child.stderr).text()
+      expect(exitCode, stderr).toBe(0)
+      expect(stderr).toBe("")
+      return JSON.parse(await fs.readFile(child.outputFile, "utf8")) as { bound: boolean; logicalRoot: string }
+    }),
+  )
 }
 
 async function waitForFilePresence(file: string, timeoutMs = 5000) {
@@ -260,7 +338,7 @@ test("serializes concurrent first creators into one logical session root without
     expect(new Set(session.segments.map((segment: any) => segment.run_id)).size).toBe(count)
     for (let index = 1; index < session.segments.length; index++)
       expect(session.segments[index].continuation_of).toBe(session.segments[index - 1].run_id)
-    expect(await fileExists(lockDirectory(traceRoot, "session:ses_concurrent_first"))).toBe(false)
+    expect(await fileExists(lockDirectory(traceRoot, globalManifestLockKey))).toBe(false)
   } finally {
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
@@ -312,7 +390,7 @@ test("serializes concurrent resumes without lost descriptors or changed prior ev
 test("recovers a stale session lock and always removes its ownership directory", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stale-segment-lock-"))
   const sessionID = "ses_stale_lock"
-  const lock = lockDirectory(traceRoot, `session:${sessionID}`)
+  const lock = lockDirectory(traceRoot, globalManifestLockKey)
   try {
     await fs.mkdir(lock, { recursive: true })
     await fs.writeFile(
@@ -336,7 +414,7 @@ test("recovers a stale session lock and always removes its ownership directory",
 test("keeps the observer passive when a live session lock exceeds its bounded wait", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-live-segment-lock-"))
   const sessionID = "ses_live_lock"
-  const lock = lockDirectory(traceRoot, `session:${sessionID}`)
+  const lock = lockDirectory(traceRoot, globalManifestLockKey)
   const script = path.join(traceRoot, "passive-lock.ts")
   try {
     await fs.mkdir(lock, { recursive: true })
@@ -379,7 +457,7 @@ test("keeps the observer passive when a live session lock exceeds its bounded wa
 test("lock timeout over a legacy root disables persistence without changing or adding bytes", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-legacy-lock-timeout-"))
   const logicalRoot = path.join(traceRoot, "legacy-lock-case")
-  const lock = lockDirectory(traceRoot, "case:legacy-lock-case")
+  const lock = lockDirectory(traceRoot, globalManifestLockKey)
   const script = path.join(traceRoot, "legacy-lock-timeout.ts")
   const files = [
     "records.jsonl",
@@ -447,7 +525,7 @@ test("lock timeout over a legacy root disables persistence without changing or a
 test("does not stale-evict an aged owner whose PID is still alive", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-aged-live-lock-"))
   const sessionID = "ses_aged_live"
-  const lock = lockDirectory(traceRoot, `session:${sessionID}`)
+  const lock = lockDirectory(traceRoot, globalManifestLockKey)
   const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
   const previousStale = process.env.OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS
   try {
@@ -481,7 +559,7 @@ test("does not stale-evict an aged owner whose PID is still alive", async () => 
 
 test("late session binding keeps the allocation lock key for competing identities", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stable-bind-lock-"))
-  const lock = lockDirectory(traceRoot, "case:stable-bind-case")
+  const lock = lockDirectory(traceRoot, globalManifestLockKey)
   const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
   try {
     const segment = openTraceSegment({
@@ -490,7 +568,7 @@ test("late session binding keeps the allocation lock key for competing identitie
       runID: "run_stable_bind",
     })
     const initial = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
-    expect(initial.lock_key).toBe("case:stable-bind-case")
+    expect(initial.lock_key).toBe(globalManifestLockKey)
     await fs.mkdir(lock, { recursive: true })
     await fs.writeFile(
       path.join(lock, "owner.json"),
@@ -508,6 +586,121 @@ test("late session binding keeps the allocation lock key for competing identitie
     else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
     await fs.rm(traceRoot, { recursive: true, force: true })
     await fs.rm(path.dirname(lock), { recursive: true, force: true })
+  }
+})
+
+test("keeps ActiveCaseTrace unbound when the manifest bind cannot acquire the global lock", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-active-bind-timeout-"))
+  const script = path.join(traceRoot, "active-bind-timeout.ts")
+  const readyFile = path.join(traceRoot, "active-bind.ready.json")
+  const gate = path.join(traceRoot, "active-bind.gate")
+  const outputFile = path.join(traceRoot, "active-bind.output.json")
+  let release: (() => void) | undefined
+  try {
+    await fs.writeFile(
+      script,
+      [
+        `import fs from "node:fs"`,
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const trace = CaseTrace.configure({ caseID: "active-bind-timeout" }) as any`,
+        `fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ sessionFile: trace.segment.sessionFile, recordsFile: trace.recordsFile }))`,
+        `while (!fs.existsSync(${JSON.stringify(gate)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2)`,
+        `const bound = trace.setSessionID("ses_active_bind_timeout")`,
+        `const manifest = JSON.parse(fs.readFileSync(trace.segment.sessionFile, "utf8"))`,
+        `const journal = fs.existsSync(trace.recordsFile) ? fs.readFileSync(trace.recordsFile, "utf8") : ""`,
+        `fs.writeFileSync(${JSON.stringify(outputFile)}, JSON.stringify({ bound, sessionID: trace.sessionID, manifestSessionID: manifest.session_id, journal }))`,
+      ].join("\n"),
+    )
+    const child = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: traceRoot,
+        OPENCODE_CASE_TRACE_QUIET: "1",
+        OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS: "20",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await waitForFilePresence(readyFile)).toBe(true)
+    release = acquireTraceSessionLock(traceRoot, globalManifestLockKey)
+    await fs.writeFile(gate, "go")
+    expect(await waitForFilePresence(outputFile)).toBe(true)
+    release()
+    release = undefined
+    expect(await child.exited).toBe(0)
+    expect(await new Response(child.stderr).text()).toBe("")
+    const output = JSON.parse(await fs.readFile(outputFile, "utf8")) as any
+    expect(output).toMatchObject({ bound: false })
+    expect(output.sessionID).toBeUndefined()
+    expect(output.manifestSessionID).toBeUndefined()
+    expect(output.journal).not.toContain("ses_active_bind_timeout")
+  } finally {
+    release?.()
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("rejects malformed session and legacy roots without changing their trees", async () => {
+  for (const fixture of [
+    { name: "session", file: "session.json", contents: '{"schema_version":"broken"}\n' },
+    { name: "legacy", file: "records.jsonl", contents: '{"not":"a causal journal"}\n' },
+  ]) {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-malformed-${fixture.name}-`))
+    const logicalRoot = path.join(traceRoot, "malformed-case")
+    try {
+      await fs.mkdir(path.join(logicalRoot, "preserved", "nested"), { recursive: true })
+      await fs.writeFile(path.join(logicalRoot, fixture.file), fixture.contents)
+      await fs.writeFile(path.join(logicalRoot, "preserved", "nested", "evidence.bin"), Buffer.from([0, 1, 2, 255]))
+      const before = await treeHash(logicalRoot)
+
+      expect(() =>
+        openTraceSegment({
+          rootDir: traceRoot,
+          logicalCaseID: "malformed-case",
+          sessionID: "ses_malformed",
+          runID: `run_malformed_${fixture.name}`,
+        }),
+      ).toThrow()
+
+      expect(await treeHash(logicalRoot)).toBe(before)
+      expect(await fileExists(path.join(logicalRoot, "segments"))).toBe(false)
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true })
+    }
+  }
+})
+
+test("globally serializes concurrent late bindings without duplicate session roots", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-global-bind-"))
+  try {
+    const same = await bindUnknownSegmentsConcurrently({
+      traceRoot,
+      sessionIDs: ["ses_same_global", "ses_same_global"],
+    })
+    expect(same.map((item) => item.bound).sort()).toEqual([false, true])
+    const sameManifests = await Promise.all(
+      same.map((item) => fs.readFile(path.join(item.logicalRoot, "session.json"), "utf8").then(JSON.parse)),
+    )
+    expect(sameManifests.filter((manifest) => manifest.session_id === "ses_same_global")).toHaveLength(1)
+    expect(new Set(same.map((item) => item.logicalRoot)).size).toBe(2)
+    expect(sameManifests.every((manifest) => manifest.lock_key === globalManifestLockKey)).toBe(true)
+
+    const different = await bindUnknownSegmentsConcurrently({
+      traceRoot,
+      sessionIDs: ["ses_different_a", "ses_different_b"],
+    })
+    expect(different.map((item) => item.bound)).toEqual([true, true])
+    const differentManifests = await Promise.all(
+      different.map((item) => fs.readFile(path.join(item.logicalRoot, "session.json"), "utf8").then(JSON.parse)),
+    )
+    expect(new Set(differentManifests.map((manifest) => manifest.session_id))).toEqual(
+      new Set(["ses_different_a", "ses_different_b"]),
+    )
+    expect(new Set(different.map((item) => item.logicalRoot)).size).toBe(2)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })
 
@@ -714,9 +907,18 @@ async function writeClosedSegment(
             output_path: "artifact:shared_artifact",
             ordinary_text: "node:run_start",
             node_id: "run_start",
+            parent_node_id: "run_start",
+            design_id: "run_start",
+            claim_id: "shared_fact",
+            customer_node_id: "run_start",
             artifact_id: "shared_artifact",
+            missing_artifact_id: "missing_artifact",
             typed_ref: { ref_type: "node", ref_id: "run_start", legacy_ref: "node:run_start" },
+            candidate_ref: { ref_type: "node", ref_id: "run_start", legacy_ref: "node:run_start" },
+            missing_typed_ref: { ref_type: "node", ref_id: "missing_node", legacy_ref: "node:missing_node" },
             legacy_refs: ["node:run_start", "artifact:shared_artifact"],
+            generation_context_ref: "node:run_start",
+            documentation_ref: "https://example.test/node:run_start",
           }
         : {}),
     },
@@ -864,7 +1066,7 @@ test("materializes two colliding segments as one scoped trace with continuation 
         segment_id: node.scope.run_id,
       })
       expect(node.input_refs[0].ref_id).toBe(`${node.scope.run_id}::node::run_start`)
-      expect(node.source_refs[0].legacy_ref).toBe(`evidence:${node.scope.run_id}::node::run_start`)
+      expect(node.source_refs[0].legacy_ref).toBe("evidence:run_start")
       expect(fact.input_refs).toEqual([`node:${node.scope.run_id}::node::run_start`])
     }
     for (const edge of localEdges) {
@@ -1103,6 +1305,21 @@ function expectValidScopedGraph(trace: any) {
   }
 }
 
+async function visibleDerivedState(caseDir: string) {
+  const files = ["trace.json", "manifest.json", "legacy-trace.json", "provenance-trace.json", "partial/latest.json"]
+  const hashes = await Promise.all(
+    files.map(async (relative) => [
+      relative,
+      (await fileExists(path.join(caseDir, relative))) ? await sha256(path.join(caseDir, relative)) : null,
+    ]),
+  )
+  const current = path.join(caseDir, ".derived", "current")
+  return {
+    current: (await fileExists(current)) ? await fs.readlink(current) : null,
+    hashes,
+  }
+}
+
 test("rewrites only schema-declared references with per-segment identity maps", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-schema-scoped-refs-"))
   try {
@@ -1115,6 +1332,7 @@ test("rewrites only schema-declared references with per-segment identity maps", 
           artifact_id: "shared_artifact",
           node_ref: "node:shared_fact",
           typed_ref: { ref_type: "node", ref_id: "shared_fact", legacy_ref: "node:shared_fact" },
+          verification_ref: "node:shared_fact",
           documentation_url: "https://example.test/node:shared_fact",
           ordinary_text: "artifact:shared_artifact",
         },
@@ -1163,13 +1381,26 @@ test("rewrites only schema-declared references with per-segment identity maps", 
       output_path: "artifact:shared_artifact",
       ordinary_text: "node:run_start",
       node_id: `${prefix}::node::run_start`,
+      parent_node_id: `${prefix}::node::run_start`,
+      design_id: `${prefix}::node::run_start`,
+      claim_id: `${prefix}::node::shared_fact`,
+      customer_node_id: "run_start",
       artifact_id: `${prefix}::artifact::shared_artifact`,
+      missing_artifact_id: "missing_artifact",
       typed_ref: {
         ref_type: "node",
         ref_id: `${prefix}::node::run_start`,
         legacy_ref: `node:${prefix}::node::run_start`,
       },
+      candidate_ref: {
+        ref_type: "node",
+        ref_id: `${prefix}::node::run_start`,
+        legacy_ref: `node:${prefix}::node::run_start`,
+      },
+      missing_typed_ref: { ref_type: "node", ref_id: "missing_node", legacy_ref: "node:missing_node" },
       legacy_refs: [`node:${prefix}::node::run_start`, `artifact:${prefix}::artifact::shared_artifact`],
+      generation_context_ref: `node:${prefix}::node::run_start`,
+      documentation_ref: "https://example.test/node:run_start",
     })
     const diagnostic = trace.diagnostics.find((item: any) => item.scope?.run_id === "run_schema_second")
     expect(diagnostic).toMatchObject({
@@ -1184,6 +1415,7 @@ test("rewrites only schema-declared references with per-segment identity maps", 
       artifact_id: `${prefix}::artifact::shared_artifact`,
       node_ref: `node:${prefix}::node::shared_fact`,
       typed_ref: { ref_type: "node", ref_id: `${prefix}::node::shared_fact` },
+      verification_ref: `node:${prefix}::node::shared_fact`,
       documentation_url: "https://example.test/node:shared_fact",
       ordinary_text: "artifact:shared_artifact",
     })
@@ -1199,6 +1431,66 @@ test("rewrites only schema-declared references with per-segment identity maps", 
     })
     expectValidScopedGraph(trace)
   } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("publishes each derived compatibility set through one atomic generation indirection", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-derived-generation-"))
+  const previousFailure = process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
+  try {
+    const first = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "derived-generation-case",
+      sessionID: "ses_derived_generation",
+      runID: "run_derived_first",
+    })
+    await writeClosedSegment(first, {
+      runID: "run_derived_first",
+      marker: "first",
+      caseID: "derived-generation-case",
+      terminal: { manifest: { status: "success", run_id: "run_derived_first" }, metrics: {} },
+    })
+    materializeTrace({ caseDir: first.logicalRoot })
+    const oldState = await visibleDerivedState(first.logicalRoot)
+    expect(oldState.current).toContain("generations/")
+    for (const relative of ["trace.json", "manifest.json", "legacy-trace.json", "provenance-trace.json"])
+      expect((await fs.lstat(path.join(first.logicalRoot, relative))).isSymbolicLink()).toBe(true)
+
+    const second = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "derived-generation-case",
+      sessionID: "ses_derived_generation",
+      runID: "run_derived_second",
+    })
+    await writeClosedSegment(second, {
+      runID: "run_derived_second",
+      marker: "second",
+      caseID: "derived-generation-case",
+      terminal: { manifest: { status: "success", run_id: "run_derived_second" }, metrics: {} },
+    })
+    const oldTree = await treeHash(first.logicalRoot)
+
+    for (const step of ["generation_ready", "root_links_ready", "current_swap_ready", "current_swapped"]) {
+      process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = step
+      expect(() => materializeTrace({ caseDir: first.logicalRoot }), step).toThrow(
+        `injected derived publication failure: ${step}`,
+      )
+      expect(await visibleDerivedState(first.logicalRoot), step).toEqual(oldState)
+      expect(await treeHash(first.logicalRoot), step).toBe(oldTree)
+    }
+
+    delete process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
+    materializeTrace({ caseDir: first.logicalRoot })
+    const newState = await visibleDerivedState(first.logicalRoot)
+    expect(newState.current).not.toBe(oldState.current)
+    expect(newState.hashes).not.toEqual(oldState.hashes)
+    const session = JSON.parse(await fs.readFile(first.sessionFile, "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(path.join(first.logicalRoot, "trace.json"), "utf8")) as any
+    expect(trace.manifest.session_generation).toBe(session.generation)
+  } finally {
+    if (previousFailure === undefined) delete process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
+    else process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = previousFailure
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })

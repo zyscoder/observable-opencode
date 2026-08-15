@@ -29,7 +29,12 @@ import {
   type StreamingJsonObjectMember,
 } from "./streaming-json-writer"
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
-import { withTraceSessionLock, type TraceSegmentDescriptor, type TraceSessionManifest } from "./trace-segment"
+import {
+  TRACE_MANIFEST_LOCK_KEY,
+  withTraceSessionLock,
+  type TraceSegmentDescriptor,
+  type TraceSessionManifest,
+} from "./trace-segment"
 
 export type TraceMaterializationResult = {
   caseDir: string
@@ -104,16 +109,194 @@ function scopedEntityID(scope: SegmentReplayScope, type: "node" | "edge" | "arti
   return scoped
 }
 
+function resolvedScopedEntityID(
+  scope: SegmentReplayScope,
+  type: "node" | "edge" | "artifact" | "diagnostic",
+  id: string,
+) {
+  if (!scope.namespace) return id
+  return scope.idMaps[type].get(id)
+}
+
+const NODE_ID_KEYS = new Set([
+  "node_id",
+  "parent_node_id",
+  "design_id",
+  "claim_id",
+  "claim_node_id",
+  "segment_id",
+  "record_id",
+  "parent_record_id",
+  "outcome_record_id",
+  "response_node_id",
+  "result_node_id",
+  "context_id",
+  "context_snapshot_id",
+  "input_context_snapshot_id",
+  "snapshot_id",
+  "assessment_id",
+  "change_id",
+  "check_id",
+  "compaction_id",
+  "constraint_id",
+  "evaluation_id",
+  "fact_id",
+  "decision_id",
+  "final_response_segment_id",
+  "finality_gate_message_id",
+  "gate_id",
+  "last_check_id",
+  "ledger_id",
+  "lifecycle_id",
+  "message_id",
+  "observation_id",
+  "obligation_id",
+  "request_id",
+  "response_id",
+  "response_segment_id",
+  "runtime_id",
+  "source_segment_id",
+  "task_id",
+  "tool_call_id",
+  "turn_id",
+  "verification_id",
+])
+const EDGE_ID_KEYS = new Set(["edge_id"])
+const ARTIFACT_ID_KEYS = new Set(["artifact_id", "output_artifact_id", "summary_artifact_id"])
+const DIAGNOSTIC_ID_KEYS = new Set(["diagnostic_id"])
+const REFERENCE_KEYS = new Set([
+  "reference",
+  "references",
+  "typed_ref",
+  "from",
+  "to",
+  "input_ref",
+  "input_refs",
+  "output_ref",
+  "output_refs",
+  "source_ref",
+  "source_refs",
+  "artifact_ref",
+  "artifact_refs",
+  "evidence_ref",
+  "evidence_refs",
+  "legacy_ref",
+  "legacy_refs",
+  "node_ref",
+  "node_refs",
+  "edge_ref",
+  "edge_refs",
+  "diagnostic_ref",
+  "diagnostic_refs",
+  "record_ref",
+  "record_refs",
+  "result_ref",
+  "result_refs",
+  "context_ref",
+  "context_refs",
+  "trace_ref",
+  "trace_refs",
+  "after_context_ref",
+  "auto_continue_prompt_ref",
+  "auto_continue_without_after_ref",
+  "before_context_ref",
+  "broad_response_ref",
+  "candidate_context_ref",
+  "candidate_evidence_ref",
+  "candidate_ref",
+  "candidate_source_ref",
+  "candidate_tool_outcome_ref",
+  "candidate_verification_ref",
+  "changed_docs_ref",
+  "changed_production_ref",
+  "changed_test_ref",
+  "child_key_evidence_ref",
+  "child_key_fact_ref",
+  "child_prompt_ref",
+  "child_record_ref",
+  "child_result_ref",
+  "child_trace_artifact_ref",
+  "child_trace_ref",
+  "code_ref",
+  "compatibility_from_ref",
+  "compatibility_to_ref",
+  "conflict_ref",
+  "conflicting_evidence_ref",
+  "consumed_by_ref",
+  "consumer_ref",
+  "dependency_tool_outcome_ref",
+  "derived_tool_outcome_ref",
+  "direct_evidence_ref",
+  "direct_support_ref",
+  "downstream_claim_ref",
+  "dropped_fact_ref",
+  "evaluation_ref",
+  "execution_ref",
+  "explicit_source_ref",
+  "finalized_open_record_ref",
+  "generated_response_ref",
+  "generation_context_ref",
+  "generation_grounding_candidate_ref",
+  "generation_llm_ref",
+  "generation_provenance_ref",
+  "generation_tool_outcome_ref",
+  "grounding_candidate_ref",
+  "inferred_tool_context_ref",
+  "inferred_tool_context_set_ref",
+  "input_context_ref",
+  "input_context_snapshot_ref",
+  "issue_ref",
+  "legacy_context_ref",
+  "legacy_input_ref",
+  "legacy_output_ref",
+  "legacy_source_ref",
+  "matched_evidence_ref",
+  "member_ref",
+  "message_transform_ref",
+  "next_claim_ref",
+  "no_evidence_ref",
+  "original_direct_evidence_ref",
+  "outcome_ref",
+  "parent_consumption_ref",
+  "parent_fact_ref",
+  "payload_ref",
+  "previous_claim_ref",
+  "prompt_transform_ref",
+  "raw_artifact_ref",
+  "replacement_evidence_ref",
+  "requirement_source_ref",
+  "retained_fact_ref",
+  "runtime_ref",
+  "selected_context_ref",
+  "serialized_tail_artifact_ref",
+  "summary_artifact_ref",
+  "superseded_by_ref",
+  "superseded_evidence_ref",
+  "supersedes_ref",
+  "target_ref",
+  "temporal_advisory_ref",
+  "tool_failure_context_ref",
+  "tool_failure_dependency_ref",
+  "tool_outcome_ref",
+  "tool_result_dependency_ref",
+  "tool_schema_ref",
+  "unmatched_direct_evidence_ref",
+  "unresolved_ref",
+  "verification_after_test_change_ref",
+  "verification_ref",
+  "verification_superseded_by_ref",
+  "verification_supersedes_ref",
+])
+
 function scopedLegacyReference(value: string | undefined, scope: SegmentReplayScope) {
   if (!value || !scope.namespace) return value
   const separator = value.indexOf(":")
   if (separator < 1 || separator === value.length - 1) return value
   const prefix = value.slice(0, separator)
-  const reference = typedCausalIRReference(value)
   const type =
-    reference.ref_type === "node"
+    prefix === "node" || prefix === "record"
       ? "node"
-      : reference.ref_type === "artifact"
+      : prefix === "artifact"
         ? "artifact"
         : prefix === "edge"
           ? "edge"
@@ -121,31 +304,21 @@ function scopedLegacyReference(value: string | undefined, scope: SegmentReplaySc
             ? "diagnostic"
             : undefined
   if (!type) return value
-  return `${prefix}:${scopedEntityID(scope, type, value.slice(separator + 1))}`
+  const id = value.slice(separator + 1)
+  return `${prefix}:${resolvedScopedEntityID(scope, type, id) ?? `${scope.segmentID}::${type}::${id}`}`
 }
 
 function referenceEntityType(key: string): "node" | "edge" | "artifact" | "diagnostic" | undefined {
   const normalized = key.toLowerCase()
-  for (const type of ["node", "edge", "artifact", "diagnostic"] as const) {
-    if (
-      normalized === `${type}_id` ||
-      normalized === `${type}_ids` ||
-      normalized.endsWith(`_${type}_id`) ||
-      normalized.endsWith(`_${type}_ids`)
-    )
-      return type
-  }
+  if (NODE_ID_KEYS.has(normalized)) return "node"
+  if (EDGE_ID_KEYS.has(normalized)) return "edge"
+  if (ARTIFACT_ID_KEYS.has(normalized)) return "artifact"
+  if (DIAGNOSTIC_ID_KEYS.has(normalized)) return "diagnostic"
   return undefined
 }
 
 function isReferenceKey(key: string) {
-  const normalized = key.toLowerCase()
-  return (
-    normalized === "reference" ||
-    normalized === "references" ||
-    normalized.endsWith("_ref") ||
-    normalized.endsWith("_refs")
-  )
+  return REFERENCE_KEYS.has(key.toLowerCase())
 }
 
 function canonicalReference(value: unknown): CausalIRRef | undefined {
@@ -166,12 +339,12 @@ function scopedSchemaReferences(value: unknown, scope: SegmentReplayScope, key =
   if (!scope.namespace) return value
   if (typeof value === "string") {
     const entityType = referenceEntityType(key)
-    if (entityType) return scopedEntityID(scope, entityType, value)
+    if (entityType) return resolvedScopedEntityID(scope, entityType, value) ?? value
     return isReferenceKey(key) ? (scopedLegacyReference(value, scope) ?? value) : value
   }
   if (Array.isArray(value)) return value.map((item) => scopedSchemaReferences(item, scope, key))
   const canonical = canonicalReference(value)
-  if (canonical) return scopedReference(canonical, scope)
+  if (canonical) return isReferenceKey(key) ? scopedReference(canonical, scope) : value
   const object = record(value)
   if (!object) return value
   return Object.fromEntries(
@@ -180,18 +353,24 @@ function scopedSchemaReferences(value: unknown, scope: SegmentReplayScope, key =
 }
 
 function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRRef {
-  if (ref.ref_type === "node")
+  if (ref.ref_type === "node") {
+    const refID = resolvedScopedEntityID(scope, "node", ref.ref_id)
+    if (!refID) return ref
     return {
       ...ref,
-      ref_id: scopedEntityID(scope, "node", ref.ref_id),
+      ref_id: refID,
       ...(ref.legacy_ref ? { legacy_ref: scopedLegacyReference(ref.legacy_ref, scope) } : {}),
     }
-  if (ref.ref_type === "artifact")
+  }
+  if (ref.ref_type === "artifact") {
+    const refID = resolvedScopedEntityID(scope, "artifact", ref.ref_id)
+    if (!refID) return ref
     return {
       ...ref,
-      ref_id: scopedEntityID(scope, "artifact", ref.ref_id),
+      ref_id: refID,
       ...(ref.legacy_ref ? { legacy_ref: scopedLegacyReference(ref.legacy_ref, scope) } : {}),
     }
+  }
   if (ref.ref_type === "raw_event" && scope.namespace)
     return { ...ref, ref_id: `${scope.runID}::raw_event::${ref.ref_id}` }
   return ref
@@ -211,7 +390,7 @@ function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode
     input_refs: node.input_refs.map((ref) => scopedReference(ref, scope)),
     output_refs: node.output_refs.map((ref) => scopedReference(ref, scope)),
     source_refs: node.source_refs.map((ref) => scopedReference(ref, scope)),
-    artifact_refs: node.artifact_refs.map((id) => scopedEntityID(scope, "artifact", id)),
+    artifact_refs: node.artifact_refs.map((id) => resolvedScopedEntityID(scope, "artifact", id) ?? id),
     aliases: [...node.aliases, `run:${scope.runID}:node:${node.node_id}`],
     integrity: { ...node.integrity, payload_hash: causalIRPayloadHash(payload) },
     metadata: {
@@ -1099,6 +1278,43 @@ function parseLine(line: string) {
   }
 }
 
+function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope) {
+  if (!scope.namespace) return
+  const register = (
+    type: "node" | "edge" | "artifact" | "diagnostic",
+    value: unknown,
+    key: "node_id" | "edge_id" | "artifact_id" | "diagnostic_id",
+  ) => {
+    const entity = record(value)
+    if (entity && nonemptyString(entity[key])) scopedEntityID(scope, type, entity[key] as string)
+  }
+  readPhysicalLines(
+    recordsFile,
+    (line) => {
+      let entry: Record<string, unknown>
+      try {
+        entry = parseLine(line) as Record<string, unknown>
+      } catch (error) {
+        if (error instanceof JournalJsonError) return
+        throw error
+      }
+      const operation = entry.operation
+      if (operation === "node.created" || operation === "node.updated") register("node", entry.data, "node_id")
+      if (operation === "edge.created") register("edge", entry.data, "edge_id")
+      if (operation === "artifact.created" || operation === "artifact.reused")
+        register("artifact", entry.data, "artifact_id")
+      if (operation === "diagnostic.created") register("diagnostic", entry.data, "diagnostic_id")
+      const snapshot = lifecycleSnapshot(entry.data)
+      if (!snapshot) return
+      for (const node of snapshot.nodes) register("node", node, "node_id")
+      for (const edge of snapshot.edges) register("edge", edge, "edge_id")
+      for (const artifact of snapshot.artifacts) register("artifact", artifact, "artifact_id")
+      for (const diagnostic of snapshot.diagnostics) register("diagnostic", diagnostic, "diagnostic_id")
+    },
+    () => {},
+  )
+}
+
 function recoverJournal(recordsFile: string, index: ReplayIndex) {
   let droppedLines = 0
   let journalBytes = 0
@@ -1363,7 +1579,12 @@ function publishCompatibilityArtifacts(sourceDirectory: string, caseDir: string)
   return rewrites
 }
 
-function rewriteCompatibilityArtifactProjection(file: string, caseDir: string, rewrites: Map<string, string>) {
+function rewriteCompatibilityArtifactProjection(
+  file: string,
+  caseDir: string,
+  rewrites: Map<string, string>,
+  publicPrefix = "",
+) {
   if (!fs.existsSync(file) || !rewrites.size) return
   const document = record(JSON.parse(fs.readFileSync(file, "utf8")) as unknown)
   if (!document || !Array.isArray(document.artifacts)) return
@@ -1377,62 +1598,258 @@ function rewriteCompatibilityArtifactProjection(file: string, caseDir: string, r
     const declared = typeof artifact.hash === "string" ? artifact.hash.replace(/^sha256:/, "") : undefined
     if (declared && /^[a-f0-9]{64}$/i.test(declared) && declared.toLowerCase() !== digest)
       throw new Error(`${file}: compatibility artifact ${sourcePath} hash does not match its bytes`)
-    if (rewritten === sourcePath) return input
-    return { ...artifact, path: rewritten, content_sha256: digest }
+    const publicPath = publicPrefix ? path.posix.join(publicPrefix, rewritten) : rewritten
+    if (publicPath === sourcePath) return input
+    return { ...artifact, path: publicPath, content_sha256: digest }
   })
   fs.writeFileSync(file, JSON.stringify(document))
 }
 
-function publishStagedTrace(stageDir: string, caseDir: string) {
-  const artifactRewrites = publishCompatibilityArtifacts(path.join(stageDir, "artifacts"), caseDir)
-  rewriteCompatibilityArtifactProjection(path.join(stageDir, "legacy-trace.json"), caseDir, artifactRewrites)
-  for (const relative of ["manifest.json", "provenance-trace.json", "legacy-trace.json"]) {
-    const source = path.join(stageDir, relative)
-    const destination = path.join(caseDir, relative)
-    if (fs.existsSync(source)) copyFileAtomic(source, destination)
-    else if (relative === "legacy-trace.json") {
-      try {
-        fs.unlinkSync(destination)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-      }
-    }
+function lstatExists(file: string) {
+  try {
+    fs.lstatSync(file)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
   }
-  publishTraceCommit(path.join(stageDir, "trace.json"), caseDir)
 }
 
-function publishTraceCommit(source: string, caseDir: string) {
-  const traceFile = path.join(caseDir, "trace.json")
-  const partialFile = path.join(caseDir, "partial", "latest.json")
-  const temporaryTrace = path.join(caseDir, `.trace.json.${process.pid}.${crypto.randomUUID()}.commit`)
-  const temporaryPartial = path.join(
-    path.dirname(partialFile),
-    `.latest.json.${process.pid}.${crypto.randomUUID()}.commit`,
-  )
-  let handle: number | undefined
+function fsyncDirectory(directory: string) {
+  const handle = fs.openSync(directory, "r")
   try {
-    fs.mkdirSync(path.dirname(partialFile), { recursive: true })
-    fs.copyFileSync(source, temporaryTrace, fs.constants.COPYFILE_EXCL)
-    handle = fs.openSync(temporaryTrace, "r")
     fs.fsyncSync(handle)
+  } finally {
     fs.closeSync(handle)
-    handle = undefined
-    fs.linkSync(temporaryTrace, temporaryPartial)
-    fs.renameSync(temporaryPartial, partialFile)
-    fs.renameSync(temporaryTrace, traceFile)
+  }
+}
+
+function swapSymlink(destination: string, target: string) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true })
+  const temporary = path.join(path.dirname(destination), `.${path.basename(destination)}.${crypto.randomUUID()}.tmp`)
+  try {
+    fs.symlinkSync(target, temporary)
+    fs.renameSync(temporary, destination)
   } catch (error) {
-    if (handle !== undefined) {
-      try {
-        fs.closeSync(handle)
-      } catch {}
-    }
     try {
-      fs.unlinkSync(temporaryPartial)
-    } catch {}
-    try {
-      fs.unlinkSync(temporaryTrace)
+      fs.unlinkSync(temporary)
     } catch {}
     throw error
+  }
+}
+
+function derivedPublicationFailure(step: string) {
+  if (process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP === step)
+    throw new Error(`injected derived publication failure: ${step}`)
+}
+
+function copyVisibleFile(source: string, destination: string) {
+  if (!fs.existsSync(source) || !fs.statSync(source).isFile()) return
+  copyFileAtomic(source, destination)
+}
+
+function ensurePreexistingGeneration(
+  caseDir: string,
+  derivedDir: string,
+  currentLink: string,
+  includeArtifacts: boolean,
+) {
+  if (lstatExists(currentLink)) return undefined
+  const relativeFiles = [
+    "trace.json",
+    "manifest.json",
+    "legacy-trace.json",
+    "provenance-trace.json",
+    "partial/latest.json",
+  ]
+  const hasVisibleSet = relativeFiles.some((relative) => fs.existsSync(path.join(caseDir, relative)))
+  if (!hasVisibleSet) return undefined
+  const name = `preexisting-${crypto.randomUUID()}`
+  const generationDir = path.join(derivedDir, "generations", name)
+  fs.mkdirSync(generationDir, { recursive: true })
+  for (const relative of relativeFiles)
+    copyVisibleFile(path.join(caseDir, relative), path.join(generationDir, relative))
+  if (includeArtifacts)
+    linkCompatibilityArtifacts(path.join(caseDir, "artifacts"), path.join(generationDir, "artifacts"))
+  try {
+    swapSymlink(currentLink, path.posix.join("generations", name))
+  } catch (error) {
+    fs.rmSync(generationDir, { recursive: true, force: true })
+    throw error
+  }
+  return path.posix.join("generations", name)
+}
+
+type RootLinkTransaction = {
+  backupDir: string
+  moved: Array<{ destination: string; backup: string }>
+  created: string[]
+  createdDirectories: string[]
+}
+
+function installRootCompatibilityLinks(caseDir: string, relativeFiles: string[]): RootLinkTransaction {
+  const transaction: RootLinkTransaction = {
+    backupDir: path.join(caseDir, ".derived", `link-backup-${crypto.randomUUID()}`),
+    moved: [],
+    created: [],
+    createdDirectories: [],
+  }
+  try {
+    for (const relative of relativeFiles) {
+      const destination = path.join(caseDir, relative)
+      const target = path.relative(path.dirname(destination), path.join(caseDir, ".derived", "current", relative))
+      if (
+        lstatExists(destination) &&
+        fs.lstatSync(destination).isSymbolicLink() &&
+        fs.readlinkSync(destination) === target
+      )
+        continue
+      const parent = path.dirname(destination)
+      if (!fs.existsSync(parent)) {
+        fs.mkdirSync(parent, { recursive: true })
+        transaction.createdDirectories.push(parent)
+      }
+      if (lstatExists(destination)) {
+        const backup = path.join(transaction.backupDir, relative)
+        fs.mkdirSync(path.dirname(backup), { recursive: true })
+        fs.renameSync(destination, backup)
+        transaction.moved.push({ destination, backup })
+      } else transaction.created.push(destination)
+      const temporary = path.join(parent, `.${path.basename(destination)}.${crypto.randomUUID()}.link`)
+      try {
+        fs.symlinkSync(target, temporary)
+        fs.renameSync(temporary, destination)
+      } catch (error) {
+        try {
+          fs.unlinkSync(temporary)
+        } catch {}
+        throw error
+      }
+    }
+  } catch (error) {
+    rollbackRootCompatibilityLinks(transaction)
+    throw error
+  }
+  return transaction
+}
+
+function rollbackRootCompatibilityLinks(transaction: RootLinkTransaction) {
+  for (const destination of [...transaction.created].reverse()) {
+    try {
+      fs.unlinkSync(destination)
+    } catch {}
+  }
+  for (const item of [...transaction.moved].reverse()) {
+    try {
+      fs.rmSync(item.destination, { recursive: true, force: true })
+      fs.renameSync(item.backup, item.destination)
+    } catch {}
+  }
+  fs.rmSync(transaction.backupDir, { recursive: true, force: true })
+  for (const directory of [...transaction.createdDirectories].reverse()) {
+    try {
+      fs.rmdirSync(directory)
+    } catch {}
+  }
+}
+
+function publishStagedTrace(stageDir: string, caseDir: string, generation: number) {
+  const derivedDir = path.join(caseDir, ".derived")
+  const generationsDir = path.join(derivedDir, "generations")
+  const currentLink = path.join(derivedDir, "current")
+  const legacyAuthority = fs.existsSync(path.join(caseDir, "records.jsonl"))
+  fs.mkdirSync(generationsDir, { recursive: true })
+  let preexistingGeneration: string | undefined
+  try {
+    preexistingGeneration = ensurePreexistingGeneration(caseDir, derivedDir, currentLink, !legacyAuthority)
+  } catch (error) {
+    for (const directory of [generationsDir, derivedDir]) {
+      try {
+        fs.rmdirSync(directory)
+      } catch {}
+    }
+    throw error
+  }
+  const oldCurrent = lstatExists(currentLink) ? fs.readlinkSync(currentLink) : undefined
+  const generationName = String(generation)
+  const generationDir = path.join(generationsDir, generationName)
+  const temporaryGeneration = path.join(generationsDir, `.${generationName}.${crypto.randomUUID()}.tmp`)
+  let links: RootLinkTransaction | undefined
+  let currentSwapped = false
+  let generationInstalled = false
+  try {
+    if (!fs.existsSync(generationDir)) {
+      fs.mkdirSync(temporaryGeneration, { recursive: true })
+      if (oldCurrent)
+        linkCompatibilityArtifacts(
+          path.join(derivedDir, "current", "artifacts"),
+          path.join(temporaryGeneration, "artifacts"),
+        )
+      for (const relative of [
+        "trace.json",
+        "manifest.json",
+        "provenance-trace.json",
+        "legacy-trace.json",
+      ])
+        copyVisibleFile(path.join(stageDir, relative), path.join(temporaryGeneration, relative))
+      linkFileAtomic(
+        path.join(temporaryGeneration, "trace.json"),
+        path.join(temporaryGeneration, "partial", "latest.json"),
+      )
+      const artifactRewrites = publishCompatibilityArtifacts(path.join(stageDir, "artifacts"), temporaryGeneration)
+      rewriteCompatibilityArtifactProjection(
+        path.join(temporaryGeneration, "legacy-trace.json"),
+        temporaryGeneration,
+        artifactRewrites,
+        legacyAuthority ? ".derived/current" : "",
+      )
+      fs.renameSync(temporaryGeneration, generationDir)
+      generationInstalled = true
+      try {
+        fsyncDirectory(generationsDir)
+      } catch {}
+    }
+    derivedPublicationFailure("generation_ready")
+    const rootFiles = [
+      "trace.json",
+      "manifest.json",
+      "legacy-trace.json",
+      "provenance-trace.json",
+      "partial/latest.json",
+      ...(!legacyAuthority ? ["artifacts"] : []),
+    ]
+    links = installRootCompatibilityLinks(caseDir, rootFiles)
+    derivedPublicationFailure("root_links_ready")
+    derivedPublicationFailure("current_swap_ready")
+    swapSymlink(currentLink, path.posix.join("generations", generationName))
+    currentSwapped = true
+    derivedPublicationFailure("current_swapped")
+    fs.rmSync(links.backupDir, { recursive: true, force: true })
+  } catch (error) {
+    if (currentSwapped) {
+      if (oldCurrent) swapSymlink(currentLink, oldCurrent)
+      else {
+        try {
+          fs.unlinkSync(currentLink)
+        } catch {}
+      }
+    }
+    if (links) rollbackRootCompatibilityLinks(links)
+    if (generationInstalled) fs.rmSync(generationDir, { recursive: true, force: true })
+    if (preexistingGeneration) {
+      try {
+        fs.unlinkSync(currentLink)
+      } catch {}
+      fs.rmSync(path.join(derivedDir, preexistingGeneration), { recursive: true, force: true })
+    }
+    for (const directory of [generationsDir, derivedDir]) {
+      try {
+        fs.rmdirSync(directory)
+      } catch {}
+    }
+    throw error
+  } finally {
+    fs.rmSync(temporaryGeneration, { recursive: true, force: true })
   }
 }
 
@@ -1466,11 +1883,7 @@ function readSession(caseDir: string) {
   const parsed = input as unknown as TraceSessionManifest
   const session: TraceSessionManifest = {
     ...parsed,
-    lock_key: nonemptyString(parsed.lock_key)
-      ? parsed.lock_key
-      : nonemptyString(parsed.session_id)
-        ? `session:${parsed.session_id}`
-        : `case:${parsed.logical_case_id}`,
+    lock_key: TRACE_MANIFEST_LOCK_KEY,
     generation: Number.isSafeInteger(parsed.generation) && parsed.generation >= 0 ? parsed.generation : 0,
   }
   if (!session.segments.length) throw new Error(`${file}: trace session has no segments`)
@@ -1530,7 +1943,7 @@ function materializeTraceSnapshot(input: {
     memoryPhase("materialize_start")
     const namespace = session !== undefined && sources.length > 1
     const replays = sources.map((source) => {
-      index.beginSegment({
+      const scope: SegmentReplayScope = {
         key: source.key,
         segmentID: source.key,
         runID: source.runID ?? "",
@@ -1543,7 +1956,9 @@ function materializeTraceSnapshot(input: {
           artifact: new Map(),
           diagnostic: new Map(),
         },
-      })
+      }
+      discoverSegmentEntityIDs(source.recordsFile, scope)
+      index.beginSegment(scope)
       const recovered = recoverJournal(source.recordsFile, index)
       const identities = index.identities
       if (source.runID && identities.runID !== source.runID)
@@ -1768,10 +2183,10 @@ export function materializeTrace(input: { caseDir: string; outputDir?: string })
       const readyFile = process.env.OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE
       if (readyFile) fs.writeFileSync(readyFile, `${session.generation}\n`)
       let published = false
-      withTraceSessionLock(path.dirname(caseDir), session.lock_key, () => {
+      withTraceSessionLock(path.dirname(caseDir), TRACE_MANIFEST_LOCK_KEY, () => {
         const latest = readSession(caseDir)
-        if (!latest || latest.lock_key !== session!.lock_key || latest.generation !== session!.generation) return
-        publishStagedTrace(stageDir, caseDir)
+        if (!latest || latest.generation !== session!.generation) return
+        publishStagedTrace(stageDir, caseDir, session!.generation)
         published = true
       })
       if (published)
