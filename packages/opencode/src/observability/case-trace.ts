@@ -21,20 +21,12 @@ import {
   type CausalIRStoreSnapshot,
   type CausalNodeLike,
 } from "./causal-ir"
-import {
-  CausalIRRuntimeStore,
-  type CausalIREdgeQuery,
-  type CausalIRNodeQuery,
-} from "./causal-ir-runtime-store"
+import { CausalIRRuntimeStore, type CausalIREdgeQuery, type CausalIRNodeQuery } from "./causal-ir-runtime-store"
 import { SessionTraceRegistry, traceRouteHint } from "./case-trace-session"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
 import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
-import {
-  collectTracePublication,
-  reportTracePublication,
-  type TracePublicationStatus,
-} from "./trace-publication"
+import { collectTracePublication, reportTracePublication, type TracePublicationStatus } from "./trace-publication"
 import { openTraceSegment, type TraceSegment } from "./trace-segment"
 import { materializeTrace } from "./trace-materializer"
 
@@ -438,11 +430,7 @@ export type TraceConstraintRecord = {
 type ClaimGroundingDecision = {
   candidate_ref: string
   candidate_origin: "confirmed_generation_context" | "explicit_response_source"
-  decision:
-    | "selected_direct_support"
-    | "rejected_no_match"
-    | "rejected_lower_ranked_match"
-    | "rejected_inapplicable"
+  decision: "selected_direct_support" | "rejected_no_match" | "rejected_lower_ranked_match" | "rejected_inapplicable"
   score: number
   reasons: string[]
   rejection_reason?:
@@ -1459,12 +1447,7 @@ function boundedRoutedCaseID(base: string, suffix: string, disambiguation?: numb
   return `${sanitized.slice(0, 160 - marker.length)}${marker}`
 }
 
-function routedCaseID(
-  base: string | undefined,
-  sessionID: string | undefined,
-  ordinal: number,
-  kind: RoutedCaseKind,
-) {
+function routedCaseID(base: string | undefined, sessionID: string | undefined, ordinal: number, kind: RoutedCaseKind) {
   if (kind === "compatibility") {
     if (base) return safeCaseID(base)
     return boundedRoutedCaseID(`case-${stamp()}-${process.pid}`, routedSuffix(kind, sessionID))
@@ -1641,10 +1624,7 @@ function asciiLowerCode(code: number) {
 
 function textWordCode(code: number) {
   return (
-    (code >= 0x30 && code <= 0x39) ||
-    (code >= 0x41 && code <= 0x5a) ||
-    code === 0x5f ||
-    (code >= 0x61 && code <= 0x7a)
+    (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || code === 0x5f || (code >= 0x61 && code <= 0x7a)
   )
 }
 
@@ -1688,7 +1668,8 @@ class TextFragmentCursor {
   startsWithIgnoreCase(expected: string, offset = 0) {
     for (let index = 0; index < expected.length; index++) {
       const character = this.peek(offset + index)
-      if (character === undefined || asciiLowerCode(character.charCodeAt(0)) !== expected.charCodeAt(index)) return false
+      if (character === undefined || asciiLowerCode(character.charCodeAt(0)) !== expected.charCodeAt(index))
+        return false
     }
     return true
   }
@@ -1851,7 +1832,11 @@ function* canonicalRedactTextChunks(fragments: Iterable<string>, limit: number):
     const key = cursorCredentialKey(cursor, 1)
     if (!key) return false
     const afterKey = cursor.peek(1 + key.length)
-    if (afterKey !== quote && afterKey !== ":" && (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0))))
+    if (
+      afterKey !== quote &&
+      afterKey !== ":" &&
+      (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0)))
+    )
       return false
     yield* readAndAppend(1 + key.length)
     if (cursor.peek() !== quote) {
@@ -1889,11 +1874,7 @@ function* canonicalRedactTextChunks(fragments: Iterable<string>, limit: number):
     const key = cursorCredentialKey(cursor)
     if (!key) return false
     const afterKey = cursor.peek(key.length)
-    if (
-      afterKey !== "=" &&
-      afterKey !== ":" &&
-      (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0)))
-    )
+    if (afterKey !== "=" && afterKey !== ":" && (afterKey === undefined || !textWhitespaceCode(afterKey.charCodeAt(0))))
       return false
     yield* readAndAppend(key.length)
     yield* appendWhitespace()
@@ -2032,11 +2013,7 @@ function* canonicalRedactTextChunks(fragments: Iterable<string>, limit: number):
 
 function json(input: unknown, label?: string) {
   const path = label?.split(".").filter(Boolean) ?? []
-  return JSON.stringify(
-    sanitizeTraceJson(input, path.at(-1) ?? "", path),
-    undefined,
-    0,
-  )
+  return JSON.stringify(sanitizeTraceJson(input, path.at(-1) ?? "", path), undefined, 0)
 }
 
 function normalizeKey(input: string) {
@@ -3123,9 +3100,12 @@ function normalizeLegacyResponseClaimAtomizationFacts(input: ResponseClaimInput)
   return {
     ...input,
     claim_group_id: `claim_group_${hash(
-      ["legacy_response_claim", input.response_segment_id ?? "", input.claim_id ?? input.claim_key ?? input.claim_index, sourceText].join(
-        "\0",
-      ),
+      [
+        "legacy_response_claim",
+        input.response_segment_id ?? "",
+        input.claim_id ?? input.claim_key ?? input.claim_index,
+        sourceText,
+      ].join("\0"),
     )}`,
     claim_count: 1,
     source_byte_range: [0, Buffer.byteLength(sourceText)],
@@ -3267,9 +3247,7 @@ function dedupeTaskObligations(input: TaskObligationDraft[]) {
 function normalizeMatchText(input: unknown) {
   return stringPreview(input, 6000)
     .toLowerCase()
-    .replace(/(\d+(?:\.\d+)?)\s*(?:%|percent\b)/g, (_match, value: string) =>
-      String(Number(value) / 100),
-    )
+    .replace(/(\d+(?:\.\d+)?)\s*(?:%|percent\b)/g, (_match, value: string) => String(Number(value) / 100))
     .replace(/_/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -3366,7 +3344,8 @@ function isVerificationClaimText(input: string) {
 }
 
 function verificationClaimExpectedStatus(input: string): TraceVerificationRecord["status"] | undefined {
-  const passed = /\bpass(?:ed)?\b|全部通过|测试通过|验证通过|成功|exit(?:[_ -]?code)?\s*[:=]?\s*0|退出码\s*[:=]?\s*0/i.test(input)
+  const passed =
+    /\bpass(?:ed)?\b|全部通过|测试通过|验证通过|成功|exit(?:[_ -]?code)?\s*[:=]?\s*0|退出码\s*[:=]?\s*0/i.test(input)
   const failed = /\bfail(?:ed|ure)?\b|测试失败|验证失败|失败|断言|assert(?:ion)?|error/i.test(input)
   if (passed === failed) return undefined
   return passed ? "passed" : "failed"
@@ -5337,6 +5316,12 @@ class ActiveCaseTrace {
   private recordedSkillRequestNames = new Set<string>()
   private tokenUsage: TraceTokenUsage = {}
   private writable = true
+  private persistenceEnabled = true
+
+  private disablePersistence() {
+    this.persistenceEnabled = false
+    this.writable = false
+  }
 
   constructor(
     config: CaseTraceConfig,
@@ -5353,7 +5338,7 @@ class ActiveCaseTrace {
         runID: this.runID,
       })
     } catch {
-      this.writable = false
+      this.disablePersistence()
     }
     this.caseID = this.segment?.logicalCaseID ?? requestedCaseID
     this.logicalCaseDir = this.segment?.logicalRoot ?? path.join(this.rootDir, this.caseID)
@@ -5386,14 +5371,13 @@ class ActiveCaseTrace {
       pid: process.pid,
       ...config.environment,
     }
-    let indexPath = this.writable ? path.join(this.caseDir, "index.sqlite") : ":memory:"
+    let indexPath = this.persistenceEnabled ? path.join(this.caseDir, "index.sqlite") : ":memory:"
     try {
-      if (!this.writable) throw new Error("trace segment unavailable")
+      if (!this.persistenceEnabled) throw new Error("trace segment unavailable")
       fs.mkdirSync(this.caseDir, { recursive: true })
-      for (const suffix of ["", "-wal", "-shm"])
-        fs.rmSync(`${indexPath}${suffix}`, { force: true })
+      for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${indexPath}${suffix}`, { force: true })
     } catch {
-      this.writable = false
+      this.disablePersistence()
       indexPath = ":memory:"
     }
     try {
@@ -5404,7 +5388,7 @@ class ActiveCaseTrace {
         append: (entry) => this.writeCausalIRRecord(entry),
       })
     } catch {
-      this.writable = false
+      this.disablePersistence()
       this.causalIR = new TraceOwnedCausalIRStore({
         runID: this.runID,
         caseID: this.caseID,
@@ -5667,16 +5651,18 @@ class ActiveCaseTrace {
       quality_flags: qualityFlags,
     }
     const callID = firstStringField(input, ["callID", "call_id"])
-    const skillNode = this.queryCausalNodes({ kinds: ["skill.load"], status: "running", reverse: true }).find((item) => {
-      if (item.kind !== "skill.load") return false
-      if (item.status !== "running") return false
-      if (item.title === skillName) return true
-      const itemInput = recordFromUnknown(item.data?.input)
-      return (
-        firstStringField(itemInput, ["name"]) === skillName ||
-        (callID !== undefined && firstStringField(itemInput, ["callID", "call_id"]) === callID)
-      )
-    })
+    const skillNode = this.queryCausalNodes({ kinds: ["skill.load"], status: "running", reverse: true }).find(
+      (item) => {
+        if (item.kind !== "skill.load") return false
+        if (item.status !== "running") return false
+        if (item.title === skillName) return true
+        const itemInput = recordFromUnknown(item.data?.input)
+        return (
+          firstStringField(itemInput, ["name"]) === skillName ||
+          (callID !== undefined && firstStringField(itemInput, ["callID", "call_id"]) === callID)
+        )
+      },
+    )
     if (!skillNode) return
     skillNode.status = "error"
     skillNode.data = {
@@ -6246,9 +6232,7 @@ class ActiveCaseTrace {
           selectionMethod: "tool_call_identity_in_message",
         })
       : undefined
-    const inferredToolContextSetRef = inferredToolContextSet
-      ? `node:${inferredToolContextSet.node_id}`
-      : undefined
+    const inferredToolContextSetRef = inferredToolContextSet ? `node:${inferredToolContextSet.node_id}` : undefined
     const sourceRefs = dedupeStrings([
       ...explicitSourceRefs,
       ...(inferredToolContextSetRef ? [inferredToolContextSetRef] : []),
@@ -6469,7 +6453,8 @@ class ActiveCaseTrace {
       }
       const node = this.sourceNodeForRef(ref)
       if (!node) return
-      for (const verificationRef of stringArrayField(node.data ?? {}, ["verification_refs", "verificationRefs"]) ?? []) {
+      for (const verificationRef of stringArrayField(node.data ?? {}, ["verification_refs", "verificationRefs"]) ??
+        []) {
         visit(verificationRef, depth + 1)
       }
       for (const sourceRef of node.source_refs ?? []) visit(sourceRef, depth + 1)
@@ -6898,9 +6883,7 @@ class ActiveCaseTrace {
     const contextRefs = contextNodeIDs.map((id) => `node:${id}`)
     const llmRefs = llmNodeIDs.map((id) => `node:${id}`)
     const selectedLLMSpanIDs = new Set(
-      llmNodeIDs
-        .map((id) => nodesByID.get(id)?.span_id)
-        .filter((id): id is string => Boolean(id)),
+      llmNodeIDs.map((id) => nodesByID.get(id)?.span_id).filter((id): id is string => Boolean(id)),
     )
     const contextSnapshotRefs = this.recentContextSnapshotIDs
       .map((snapshotID) => ({
@@ -6943,9 +6926,7 @@ class ActiveCaseTrace {
     }
   }
 
-  private generationGroundingCandidates(
-    provenance: GenerationProvenance,
-  ): GenerationGroundingCandidates {
+  private generationGroundingCandidates(provenance: GenerationProvenance): GenerationGroundingCandidates {
     const contextNodes = provenance.contextRefs
       .map((ref) => this.sourceNodeForRef(ref))
       .filter((node): node is CausalNode => Boolean(node))
@@ -7307,9 +7288,7 @@ class ActiveCaseTrace {
     const generationGroundingCandidateRefs = dedupeStrings(input.generation_grounding_candidate_refs ?? [])
     const groundingCandidateRefs = dedupeStrings([
       ...candidateClassifiedRefs.direct_evidence_refs,
-      ...classifiedRefs.execution_refs.filter(
-        (ref) => ref.startsWith("change:") || ref.startsWith("verification:"),
-      ),
+      ...classifiedRefs.execution_refs.filter((ref) => ref.startsWith("change:") || ref.startsWith("verification:")),
       ...generationGroundingCandidateRefs,
     ])
     const evidenceMatch = this.matchEvidenceForClaim(
@@ -7365,7 +7344,7 @@ class ActiveCaseTrace {
       evidenceMatch.weak && !(claimKind === "verification" && effectiveVerificationRefs.length > 0)
     const groundingDecisions: ClaimGroundingDecision[] = evidenceMatch.decisions.map((item) =>
       directSupportRefs.includes(item.candidate_ref)
-          ? {
+        ? {
             ...item,
             decision: "selected_direct_support",
             rejection_reason: undefined,
@@ -7406,8 +7385,7 @@ class ActiveCaseTrace {
       candidate_evidence_count: evidenceMatch.candidateRefs.length,
       grounding_candidate_count: groundingCandidateRefs.length,
       grounding_selected_count: directSupportRefs.length,
-      grounding_rejected_count: groundingDecisions.filter((item) => item.decision !== "selected_direct_support")
-        .length,
+      grounding_rejected_count: groundingDecisions.filter((item) => item.decision !== "selected_direct_support").length,
       context_ref_count: classifiedRefs.context_refs.length,
       execution_ref_count: classifiedRefs.execution_refs.length,
       legacy_context_count: legacyContextRefs.length,
@@ -7425,9 +7403,7 @@ class ActiveCaseTrace {
       ...(directSupportRefs.length ? [] : responseClaimQualityFlags(effectiveClassifiedRefs)),
       ...(isBrokenClaimFragment(input.text) ? ["broken_claim_fragment"] : []),
       ...(weakEvidenceMatch ? ["weak_evidence_match"] : []),
-      ...(groundingCandidateRefs.length && !evidenceMatch.refs.length
-        ? ["unmatched_direct_evidence_refs"]
-        : []),
+      ...(groundingCandidateRefs.length && !evidenceMatch.refs.length ? ["unmatched_direct_evidence_refs"] : []),
       ...(conflictInfo.conflictingEvidenceRefs.length ? ["conflicting_evidence"] : []),
       ...(conflictInfo.legacyEvidenceRefs.length ? ["legacy_evidence_used"] : []),
       ...(verificationAfterTestChangeRefs.length ? ["verification_after_test_change"] : []),
@@ -7960,7 +7936,10 @@ class ActiveCaseTrace {
       if (caseStatus !== "success" && segment.finality_source !== "explicit") continue
       const responseNodeID = `responsenode_${segment.segment_id}`
       const responseNode = this.findCausalNode(responseNodeID)
-      const responseText = this.responseSourceBySegmentID.get(segment.segment_id) ?? responseNode?.data?.text ?? fieldSummaryText(segment.text)
+      const responseText =
+        this.responseSourceBySegmentID.get(segment.segment_id) ??
+        responseNode?.data?.text ??
+        fieldSummaryText(segment.text)
       const claims = atomizeResponseClaims(responseText)
       const plannedClaims = claims.map((claim, index) => {
         const claimID = this.nextCausalNodeID("claim")
@@ -8338,10 +8317,7 @@ class ActiveCaseTrace {
     return node
   }
 
-  node(
-    input: CausalNodeInput,
-    options: { trackGeneration?: boolean; summarizeData?: boolean } = {},
-  ) {
+  node(input: CausalNodeInput, options: { trackGeneration?: boolean; summarizeData?: boolean } = {}) {
     const temporal = normalizeTemporalReferences(input)
     const normalized = temporal.value
     const requestedSourceRefs = input.source_refs ?? input.evidence_refs
@@ -8738,11 +8714,10 @@ class ActiveCaseTrace {
 
   private enrichSemanticFactApplicabilityAndConflicts() {
     const facts = this.queryCausalNodes({ kinds: ["evidence.semantic_fact"] })
-    const changePoints: SemanticFactChangePoint[] = this.queryCausalNodes({ kinds: ["change"] })
-      .map((node) => ({
-        time_ms: node.time_ms,
-        files: stringArrayField(node.data ?? {}, ["files"]) ?? [],
-      }))
+    const changePoints: SemanticFactChangePoint[] = this.queryCausalNodes({ kinds: ["change"] }).map((node) => ({
+      time_ms: node.time_ms,
+      files: stringArrayField(node.data ?? {}, ["files"]) ?? [],
+    }))
     const updated = new Set<string>()
     for (const fact of facts) {
       if (!fact.data) continue
@@ -8858,12 +8833,14 @@ class ActiveCaseTrace {
             ...causalIR,
             journal: this.causalIR.journalSummary(),
           }
-      const provenance = this.projectProvenanceSummary(emittedCausalIR)
-      const persisted = this.persistTerminalSnapshot(emittedCausalIR, provenance, summary)
-      if (!this.terminalSnapshotComplete(persisted)) {
-        this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, emittedCausalIR, summary)
+      if (this.persistenceEnabled) {
+        const provenance = this.projectProvenanceSummary(emittedCausalIR)
+        const persisted = this.persistTerminalSnapshot(emittedCausalIR, provenance, summary)
+        if (!this.terminalSnapshotComplete(persisted)) {
+          this.persistTerminalSnapshotEmergency(this.signalFinalized || undefined, emittedCausalIR, summary)
+        }
+        this.publishTerminalLocation(this.tracePublicationStatus(status))
       }
-      this.publishTerminalLocation(this.tracePublicationStatus(status))
     } finally {
       this.responseSourceBySegmentID.clear()
       if (this.finished) this.causalIR.close()
@@ -8914,6 +8891,7 @@ class ActiveCaseTrace {
     }
     this.responseSourceBySegmentID.clear()
     this.finished = true
+    if (!this.persistenceEnabled) return
     this.segment?.finalize(status === "success" ? "completed" : status === "error" ? "failed" : "cancelled")
     return Object.freeze({
       caseDir: this.logicalCaseDir,
@@ -8949,6 +8927,10 @@ class ActiveCaseTrace {
   }
 
   private persistSignalSnapshot(result: Record<string, unknown>) {
+    if (!this.persistenceEnabled) {
+      this.finished = true
+      return
+    }
     this.result = result
     const caseStatus = this.observedCaseStatus() ?? this.inferCaseStatus("cancelled", undefined)
     const causalIR = this.causalIRSummary("cancelled", caseStatus)
@@ -8963,6 +8945,10 @@ class ActiveCaseTrace {
   }
 
   private persistSignalSnapshotBestEffort(signal: NodeJS.Signals, result: Record<string, unknown>) {
+    if (!this.persistenceEnabled) {
+      this.finished = true
+      return
+    }
     let fallback: CausalIRTraceSummary | undefined
     this.result = result
     try {
@@ -8997,7 +8983,7 @@ class ActiveCaseTrace {
   }
 
   private publishTerminalLocation(status: TracePublicationStatus) {
-    if (this.locationReported) return
+    if (!this.persistenceEnabled || this.locationReported) return
     this.segment?.finalize(status === "completed" ? "completed" : status === "failed" ? "failed" : "cancelled")
     let traceFile = this.traceFile
     let partialFile = this.partialFile
@@ -9025,6 +9011,7 @@ class ActiveCaseTrace {
     provenance: ProvenanceTraceView,
     legacy: TraceSummary | undefined,
   ) {
+    if (!this.persistenceEnabled) return { trace: false, manifest: false, partial: false }
     const trace = this.safeWrite(this.traceFile, streamingJson(causalIR))
     const manifest = this.safeWrite(this.manifestFile, jsonPretty(causalIR.manifest))
     const partial = trace
@@ -9044,6 +9031,7 @@ class ActiveCaseTrace {
     persisted: CausalIRTraceSummary,
     legacy?: TraceSummary,
   ) {
+    if (!this.persistenceEnabled) return { trace: false, manifest: false, partial: false }
     const previousManifest = persisted.manifest as TraceManifest
     const completed = previousManifest.case_status === "success"
     const manifest: TraceManifest = signal
@@ -9083,6 +9071,7 @@ class ActiveCaseTrace {
   }
 
   private removeStaleCanonicalTrace() {
+    if (!this.persistenceEnabled) return false
     try {
       fs.unlinkSync(this.traceFile)
     } catch (error) {
@@ -9193,18 +9182,11 @@ class ActiveCaseTrace {
     }
   }
 
-  private causalIRSummary(
-    status: TraceStatus,
-    caseStatus?: TraceStatus,
-    synchronize = false,
-  ): CausalIRTraceSummary {
+  private causalIRSummary(status: TraceStatus, caseStatus?: TraceStatus, synchronize = false): CausalIRTraceSummary {
     const manifest = this.manifest(status, caseStatus)
     const records = this.provenanceRecords().filter((record) => !this.isCaseDiagnosticKind(record.event_type))
     const traceHealth = this.traceHealth(records)
-    this.syncCaseDiagnosticNodes(
-      traceHealth,
-      manifest.shutdown_disposition !== "interrupted_before_case_completion",
-    )
+    this.syncCaseDiagnosticNodes(traceHealth, manifest.shutdown_disposition !== "interrupted_before_case_completion")
     const causalIR = synchronize ? this.causalIR.synchronize() : this.causalIR.snapshot()
     const streamSummary = this.streamSummary()
     const provenance = this.projectCausalIRSnapshot(causalIR, manifest, {
@@ -9533,7 +9515,8 @@ class ActiveCaseTrace {
               shutdown_disposition: shutdown.disposition,
               server_shutdown_reason: shutdownReason,
               observation_source:
-                stringField(recordFromUnknown(this.result) ?? {}, ["trace_flush", "trace_html_flush"]) === "process_signal"
+                stringField(recordFromUnknown(this.result) ?? {}, ["trace_flush", "trace_html_flush"]) ===
+                "process_signal"
                   ? "process_signal_handler"
                   : "finish_result",
               sender_identity_available: false,
@@ -9665,8 +9648,7 @@ class ActiveCaseTrace {
       }
     }
     if (obligation.obligation_type === "mcp_required") {
-      const refs = this.queryCausalNodes({ kinds: ["mcp.call"] })
-        .map((node) => this.recordRefForNode(node))
+      const refs = this.queryCausalNodes({ kinds: ["mcp.call"] }).map((node) => this.recordRefForNode(node))
       return {
         status: refs.length ? "fulfilled" : "unmet",
         refs,
@@ -9674,8 +9656,7 @@ class ActiveCaseTrace {
       }
     }
     if (obligation.obligation_type === "subagent_required") {
-      const refs = this.queryCausalNodes({ kinds: ["subagent.call"] })
-        .map((node) => this.recordRefForNode(node))
+      const refs = this.queryCausalNodes({ kinds: ["subagent.call"] }).map((node) => this.recordRefForNode(node))
       return {
         status: refs.length ? "fulfilled" : "unmet",
         refs,
@@ -10927,16 +10908,15 @@ class ActiveCaseTrace {
       return this.queryCausalNodes({ kinds: [expectedKind], callID: parsed.id, reverse: true }).find(
         (node) =>
           node.source_refs?.includes(ref) ||
-            firstStringField(node.data, ["call_id", "callID"]) === parsed.id ||
-            node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`),
+          firstStringField(node.data, ["call_id", "callID"]) === parsed.id ||
+          node.node_id.endsWith(`_${safeNodeIDPart(parsed.id)}`),
       )
     }
     if (parsed.type === "change" || parsed.type === "verification") {
       const expectedKind = parsed.type
       const identityKeys = parsed.type === "change" ? ["change_id", "changeID"] : ["verification_id", "verificationID"]
       return this.queryCausalNodes({ kinds: [expectedKind] }).find(
-        (node) =>
-          node.node_id === parsed.id || firstStringField(node.data, identityKeys) === parsed.id,
+        (node) => node.node_id === parsed.id || firstStringField(node.data, identityKeys) === parsed.id,
       )
     }
     const direct = this.findCausalNode(parsed.id)
@@ -10996,27 +10976,18 @@ class ActiveCaseTrace {
       factKind === "verification_output" || ref.startsWith("verification:") || embeddedRefs.length > 0
     if (!isVerificationCandidate) return { temporallyEligible: true }
 
-    const verificationRefs = dedupeStrings([
-      ...(ref.startsWith("verification:") ? [ref] : []),
-      ...embeddedRefs,
-    ])
-    const repositoryRevision = optionalNumber(
-      data.verification_repository_revision ?? data.repository_revision,
-    )
+    const verificationRefs = dedupeStrings([...(ref.startsWith("verification:") ? [ref] : []), ...embeddedRefs])
+    const repositoryRevision = optionalNumber(data.verification_repository_revision ?? data.repository_revision)
     const phaseValue = firstStringField(data, ["verification_phase", "verificationPhase"])
-    const verificationPhase = ["baseline", "post_change", "post_test_change", "unknown"].includes(
-      phaseValue ?? "",
-    )
+    const verificationPhase = ["baseline", "post_change", "post_test_change", "unknown"].includes(phaseValue ?? "")
       ? (phaseValue as TraceVerificationRecord["verification_phase"])
       : undefined
-    const statusValue =
-      firstStringField(data, ["verification_status", "verificationStatus", "status"]) ?? node?.status
+    const statusValue = firstStringField(data, ["verification_status", "verificationStatus", "status"]) ?? node?.status
     const verificationStatus = ["passed", "failed", "unknown"].includes(statusValue ?? "")
       ? (statusValue as TraceVerificationRecord["status"])
       : undefined
     const effectiveValue = data.verification_effective_for_final_state ?? data.effective_for_final_state
-    const effectiveForFinalState =
-      typeof effectiveValue === "boolean" ? effectiveValue : undefined
+    const effectiveForFinalState = typeof effectiveValue === "boolean" ? effectiveValue : undefined
     const roleValue = firstStringField(data, ["verification_temporal_role", "verificationTemporalRole"])
     const temporalRole = ["current_effective", "superseded", "unknown"].includes(roleValue ?? "")
       ? (roleValue as VerificationFactProvenance["verification_temporal_role"])
@@ -11064,20 +11035,19 @@ class ActiveCaseTrace {
     const isVerificationClaim = isVerificationClaimText(claimPreview)
     const isChangeClaim = isChangeClaimText(claimPreview)
     const mentionsToolFailure = isToolFailureClaimText(claimPreview)
-    const analyzed = candidateRefs
-      .map((ref) => {
-        const node = this.sourceNodeForRef(ref)
-        const analysis = this.sourceRefMatchAnalysis(ref, claimText, node)
-        const verification = this.verificationCandidateSemantics(ref, node, stringPreview(claimText, 2000))
-        return {
-          ref,
-          score: analysis.score,
-          reasons: analysis.reasons,
-          weak: analysis.weak,
-          factKind: typeof node?.data?.fact_kind === "string" ? node.data.fact_kind : undefined,
-          verification,
-        }
-      })
+    const analyzed = candidateRefs.map((ref) => {
+      const node = this.sourceNodeForRef(ref)
+      const analysis = this.sourceRefMatchAnalysis(ref, claimText, node)
+      const verification = this.verificationCandidateSemantics(ref, node, stringPreview(claimText, 2000))
+      return {
+        ref,
+        score: analysis.score,
+        reasons: analysis.reasons,
+        weak: analysis.weak,
+        factKind: typeof node?.data?.fact_kind === "string" ? node.data.fact_kind : undefined,
+        verification,
+      }
+    })
     const hasScopedVerificationCandidate = analyzed.some(
       (item) =>
         item.verification.temporallyEligible &&
@@ -11127,10 +11097,7 @@ class ActiveCaseTrace {
         })
         selectionLimit = 4
       } else {
-        preferred = [
-          ...changeCandidates,
-          ...scored.filter((item) => !item.ref.startsWith("change:")),
-        ]
+        preferred = [...changeCandidates, ...scored.filter((item) => !item.ref.startsWith("change:"))]
       }
     }
     const refs = preferred.slice(0, selectionLimit).map((item) => item.ref)
@@ -11248,6 +11215,7 @@ class ActiveCaseTrace {
   }
 
   private writeArtifact(kind: TraceArtifact["kind"], label: string, content: string): TraceArtifact | undefined {
+    if (!this.persistenceEnabled) return undefined
     const redacted = redactText(content)
     let storedContent = redacted
     let storageEncoding: TraceArtifact["storage_encoding"] = "identity"
@@ -11325,22 +11293,28 @@ class ActiveCaseTrace {
   }
 
   private open() {
+    if (this.persistenceEnabled) {
+      try {
+        fs.mkdirSync(this.caseDir, { recursive: true })
+        this.invalidatePriorTerminalOutputs()
+        fs.writeFileSync(this.eventsFile, "")
+        fs.writeFileSync(this.rawEventsFile, "")
+        fs.writeFileSync(this.recordsFile, "")
+        this.write("trace.start", {
+          trace_version: TRACE_VERSION,
+          case_id: this.caseID,
+          run_id: this.runID,
+          started_at: this.startedIso,
+          root_dir: this.rootDir,
+          case_dir: this.caseDir,
+          input: this.input,
+          environment: this.environment,
+        })
+      } catch {
+        this.disablePersistence()
+      }
+    }
     try {
-      fs.mkdirSync(this.caseDir, { recursive: true })
-      this.invalidatePriorTerminalOutputs()
-      fs.writeFileSync(this.eventsFile, "")
-      fs.writeFileSync(this.rawEventsFile, "")
-      fs.writeFileSync(this.recordsFile, "")
-      this.write("trace.start", {
-        trace_version: TRACE_VERSION,
-        case_id: this.caseID,
-        run_id: this.runID,
-        started_at: this.startedIso,
-        root_dir: this.rootDir,
-        case_dir: this.caseDir,
-        input: this.input,
-        environment: this.environment,
-      })
       const runStart = this.node(
         {
           kind: "run.start",
@@ -11370,18 +11344,13 @@ class ActiveCaseTrace {
       runStart.artifact_refs = this.collectArtifactRefs(runStart.data)
       this.causalIR.updateNode(runStart)
     } catch {
-      this.writable = false
+      this.disablePersistence()
     }
   }
 
   private invalidatePriorTerminalOutputs() {
-    for (const relative of [
-      "trace.json",
-      "manifest.json",
-      "legacy-trace.json",
-      "provenance-trace.json",
-      "partial",
-    ]) {
+    if (!this.persistenceEnabled) return
+    for (const relative of ["trace.json", "manifest.json", "legacy-trace.json", "provenance-trace.json", "partial"]) {
       fs.rmSync(path.join(this.caseDir, relative), { recursive: true, force: true })
     }
     let directory: number | undefined
@@ -11394,7 +11363,7 @@ class ActiveCaseTrace {
   }
 
   private write(type: string, data: unknown) {
-    if (!this.writable) return
+    if (!this.persistenceEnabled || !this.writable) return
     if (this.finished && type !== "trace.finish") return
     try {
       fs.appendFileSync(
@@ -11417,7 +11386,7 @@ class ActiveCaseTrace {
   }
 
   private writeCausalIRRecord(entry: CausalIRJournalEntry) {
-    if (!this.writable) return false
+    if (!this.persistenceEnabled || !this.writable) return false
     try {
       fs.appendFileSync(this.recordsFile, JSON.stringify(entry) + "\n")
       return true
@@ -11427,6 +11396,7 @@ class ActiveCaseTrace {
   }
 
   private safeWrite(target: string, content: string | StreamingJsonContent) {
+    if (!this.persistenceEnabled) return false
     const temporary = path.join(
       path.dirname(target),
       `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.tmp`,
@@ -11453,6 +11423,7 @@ class ActiveCaseTrace {
   }
 
   private safeLinkOrWrite(source: string, target: string, fallbackContent: string | StreamingJsonContent) {
+    if (!this.persistenceEnabled) return false
     const temporary = path.join(
       path.dirname(target),
       `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.link`,
@@ -11491,9 +11462,7 @@ function streamingJson(value: unknown): StreamingJsonContent {
   return { [streamingJsonContent]: true, value }
 }
 
-function isStreamingJsonContent(
-  input: string | StreamingJsonContent,
-): input is StreamingJsonContent {
+function isStreamingJsonContent(input: string | StreamingJsonContent): input is StreamingJsonContent {
   return typeof input !== "string" && streamingJsonContent in input
 }
 
@@ -11520,7 +11489,7 @@ function configuredBaseCaseID(input: CaseTraceConfig) {
 function traceRegistry() {
   if (registry) return registry
   registry = new SessionTraceRegistry<ActiveCaseTrace>((sessionID, ordinal, kind) => {
-    const resolvedSessionID = sessionID ?? baseConfig.sessionID
+    const resolvedSessionID = kind === "process" ? sessionID : (sessionID ?? baseConfig.sessionID)
     let trace: ActiveCaseTrace
     trace = new ActiveCaseTrace(
       {
@@ -11740,7 +11709,8 @@ export namespace CaseTrace {
         } else {
           registry?.reset()
         }
-      } catch {} finally {
+      } catch {
+      } finally {
         beginLifecycle(input)
       }
       return get()
@@ -11924,7 +11894,8 @@ export namespace CaseTrace {
     if (!enabledFromEnv()) return
     try {
       registry?.finishAll((trace) => trace.finish(input))
-    } catch {} finally {
+    } catch {
+    } finally {
       compatibilityFinished = true
     }
   }
@@ -11937,7 +11908,8 @@ export namespace CaseTrace {
         const request = trace.closeRuntime(input)
         if (request) requests.push(request)
       })
-    } catch {} finally {
+    } catch {
+    } finally {
       compatibilityFinished = true
     }
     return requests

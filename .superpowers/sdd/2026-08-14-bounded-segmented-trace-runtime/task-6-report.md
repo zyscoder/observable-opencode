@@ -224,3 +224,85 @@ bun test test/observability/trace-segment.test.ts test/observability/case-trace.
 ```
 
 The passing test verifies logical-root publication with physical segment runtime storage. The sole minimal failure is the exact excluded assertion above. Fresh focused completion totals remain segment 14/0, materializer 7/0, renderer load/CLI 36/0, and TUI worker/materializer 4/0.
+
+## Fix Round 1/5 Completion
+
+Status on 2026-08-15: **review round 1 complete**, with the explicitly excluded `artifact[0]` assertion still unchanged.
+
+### RED
+
+Fresh failing regressions were added before each production fix:
+
+- A live lock over an existing legacy root allowed terminal emergency paths to run after allocation failure. The child wrote a persistence-failure diagnostic instead of remaining fully memory-only. Byte hashes covered root records, index, artifacts, canonical/legacy/provenance projections, manifest, and partial output.
+- An aged lock owned by the current live PID was eligible for stale recovery; late session binding changed lock identity; and release did not provide a nonce-owned rename boundary against successor deletion.
+- Recursive colon rewriting changed `https://...`, ordinary text, and paths while failing to rewrite bare `artifact_id`, `node_id`, typed `ref_id`, diagnostic refs, and terminal/metric refs.
+- Renderer session discovery created root derived outputs and preferred `session.json` over an existing `trace.json`.
+- Incomplete history forced a valid successful terminal to `error`, legacy terminal lines over 4 MiB were classified as interrupted, process traces inherited the configured session, and same-path compatibility artifacts silently retained older bytes.
+- A staged publication race test held the stable root lock, advanced `session.json.generation` after staging, and proved the old commit marker remained until the changed snapshot was discarded and regenerated.
+
+### GREEN Behavior
+
+- Segment allocation failure now permanently sets `persistenceEnabled=false` for that trace. Every file open/truncate/append/remove, artifact, segment finalize, materialize, and publication path is gated; in-memory causal recording remains available.
+- `session.json` stores one immutable `lock_key` plus monotonically increasing `generation`. Allocation, late binding, finalization, and publication use that same key. Confirmed live PIDs are never age-evicted; dead owners and sufficiently old malformed locks recover. Release verifies the nonce and atomically renames the owned lock directory to a nonce-specific tombstone before deletion.
+- Segment identity maps drive schema-aware rewriting. Canonical typed refs/endpoints, declared `*_ref`/`*_refs` fields, semantic node/edge/artifact/diagnostic ID fields, diagnostics, terminal result, and metrics are rewritten; URLs, paths, and ordinary strings are untouched. The regression includes a unified graph-reference validator.
+- Segmented publication materializes to an OS staging directory from one session snapshot, acquires the stable root lock, compares generation, retries changed snapshots, publishes compatibility files first, and renames `trace.json` last as the commit marker. Root `trace.json` and `partial/latest.json` retain one inode on supported filesystems.
+- Renderer loading reads an existing root trace directly. If only `session.json` exists it materializes into an OS temporary directory, reads it, and removes it; recursive root file hashes are identical before and after loading.
+- One newest valid terminal supplies run ID, status, result/error/recovery, source files, and legacy projection consistently. Other interrupted segments set `historical_interruptions` and `session_recovery` without changing a successful terminal status.
+- Compatibility artifact publication hashes source and destination bytes. Different content at the same path is stored immutably at `artifacts/sha256/<full-sha256>` and the latest legacy projection is rewritten; the old path and bytes remain unchanged.
+- Legacy terminal discovery scans backward with a reusable 64 KiB buffer and parses the actual final complete line, including a tested terminal over 5 MiB. Physical segment creation is followed by `fsync(segmentsDir)` before publishing the session manifest.
+
+### Exact Layout
+
+```text
+$OPENCODE_CASE_TRACE_DIR/session-case/
+  session.json                 # lock_key + generation + ordered descriptors
+  trace.json                   # last-published commit marker
+  manifest.json
+  legacy-trace.json
+  provenance-trace.json
+  partial/latest.json          # hardlink of trace.json where supported
+  artifacts/
+    fact.txt                   # older immutable compatibility bytes
+    sha256/<full-sha256>       # collided latest compatibility bytes
+  segments/
+    run-first/
+      segment.json
+      records.jsonl
+      index.sqlite
+      artifacts/...
+    run-second/
+      segment.json
+      records.jsonl
+      index.sqlite
+      artifacts/...
+```
+
+No new segmented run creates root `records.jsonl`, `events.jsonl`, or `raw-events.jsonl`. A pre-existing root journal remains immutable legacy segment zero.
+
+### Final Verification
+
+```text
+packages/opencode:
+  trace-segment.test.ts                                  23 pass, 0 fail, 307 expects
+  trace-materializer.test.ts + diagnostics              8 pass, 0 fail, 24 expects
+  trace-materializer-process.test.ts                    1 pass, 0 fail, 6 expects
+  case-trace.test.ts                                    162 pass, 1 fail, 2133 expects
+
+packages/trace-renderer:
+  load.test.ts + cli.test.ts                            36 pass, 0 fail, 190 expects
+  bun run typecheck                                     pass
+
+repository:
+  git diff --check                                      pass
+```
+
+The sole full case-trace failure is the unchanged, explicitly excluded `persists semantic trace records with artifacts and redaction` baseline. It assumes `trace.artifacts[0]` is the semantic-message artifact; artifact zero is the earlier `run.start.environment` artifact.
+
+`packages/opencode` typecheck exits 2 only for pre-existing sidebar implicit-any errors, worktree/main SDK private-type duplication, plugin overload/dependency resolution, and the semver declaration. No observability or Task 6 file remains in the error list.
+
+### Compatibility Risks
+
+- An existing root `trace.json` is a committed snapshot and renderer loading does not replace it. Explicit materialization/finalization is required to publish a newer session generation.
+- Root legacy output remains the newest valid terminal's compatibility projection, not a merged legacy-schema history. Canonical and provenance outputs contain the complete segmented graph.
+- Content-addressed compatibility artifacts intentionally accumulate across resumes. Segment-local artifacts remain authoritative and are never changed.
+- Malformed locks recover only after the configured stale threshold; a syntactically valid lock owned by a live PID can require operator/process resolution rather than age-based eviction.

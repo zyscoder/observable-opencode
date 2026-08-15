@@ -6,11 +6,12 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { CausalIRStore, type CausalIRJournalEntry } from "@/observability/causal-ir"
 import { materializeTrace } from "@/observability/trace-materializer"
-import { openTraceSegment } from "@/observability/trace-segment"
+import { acquireTraceSessionLock, openTraceSegment } from "@/observability/trace-segment"
 
 const packageDir = path.resolve(import.meta.dir, "../..")
 const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
 const segmentModule = pathToFileURL(path.join(packageDir, "src/observability/trace-segment.ts")).href
+const materializerModule = pathToFileURL(path.join(packageDir, "src/observability/trace-materializer.ts")).href
 
 async function waitForFile(file: string) {
   for (let attempt = 0; attempt < 200; attempt++) {
@@ -375,6 +376,164 @@ test("keeps the observer passive when a live session lock exceeds its bounded wa
   }
 })
 
+test("lock timeout over a legacy root disables persistence without changing or adding bytes", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-legacy-lock-timeout-"))
+  const logicalRoot = path.join(traceRoot, "legacy-lock-case")
+  const lock = lockDirectory(traceRoot, "case:legacy-lock-case")
+  const script = path.join(traceRoot, "legacy-lock-timeout.ts")
+  const files = [
+    "records.jsonl",
+    "index.sqlite",
+    "artifacts/sha256/legacy.txt",
+    "trace.json",
+    "manifest.json",
+    "legacy-trace.json",
+    "provenance-trace.json",
+    "partial/latest.json",
+  ]
+  try {
+    await fs.mkdir(path.join(logicalRoot, "artifacts", "sha256"), { recursive: true })
+    await fs.mkdir(path.join(logicalRoot, "partial"), { recursive: true })
+    for (const relative of files) {
+      const target = path.join(logicalRoot, relative)
+      await fs.mkdir(path.dirname(target), { recursive: true })
+      await fs.writeFile(target, `immutable:${relative}`)
+    }
+    const before = new Map(
+      await Promise.all(files.map(async (file) => [file, await sha256(path.join(logicalRoot, file))] as const)),
+    )
+    await fs.mkdir(lock, { recursive: true })
+    await fs.writeFile(
+      path.join(lock, "owner.json"),
+      JSON.stringify({ pid: process.pid, nonce: "legacy-live-owner", acquired_at_ms: Date.now() }),
+    )
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const trace = CaseTrace.configure({ caseID: "legacy-lock-case" }) as any`,
+        `CaseTrace.node({ node_id: "must_stay_memory_only", kind: "execution.observation", component: "test", data: { payload: "x".repeat(4096) } })`,
+        `CaseTrace.finish({ status: "success", result: { persisted: false } })`,
+        `process.stdout.write(JSON.stringify({ writable: trace.writable, persistenceEnabled: trace.persistenceEnabled }))`,
+      ].join("\n"),
+    )
+    const child = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: traceRoot,
+        OPENCODE_CASE_TRACE_QUIET: "1",
+        OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS: "20",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await child.exited).toBe(0)
+    expect(await new Response(child.stderr).text()).toBe("")
+    expect(JSON.parse(await new Response(child.stdout).text())).toEqual({
+      writable: false,
+      persistenceEnabled: false,
+    })
+    for (const relative of files) expect(await sha256(path.join(logicalRoot, relative))).toBe(before.get(relative)!)
+    for (const relative of ["events.jsonl", "raw-events.jsonl", "segments", "session.json"])
+      expect(await fileExists(path.join(logicalRoot, relative))).toBe(false)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+    await fs.rm(path.dirname(lock), { recursive: true, force: true })
+  }
+})
+
+test("does not stale-evict an aged owner whose PID is still alive", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-aged-live-lock-"))
+  const sessionID = "ses_aged_live"
+  const lock = lockDirectory(traceRoot, `session:${sessionID}`)
+  const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+  const previousStale = process.env.OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS
+  try {
+    process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = "20"
+    process.env.OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS = "1"
+    await fs.mkdir(lock, { recursive: true })
+    await fs.writeFile(
+      path.join(lock, "owner.json"),
+      JSON.stringify({ pid: process.pid, nonce: "aged-live-owner", acquired_at_ms: 1 }),
+    )
+    expect(() =>
+      openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "aged-live-case",
+        sessionID,
+        runID: "run_must_not_evict",
+      }),
+    ).toThrow("timed out waiting for trace session lock")
+    expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+      nonce: "aged-live-owner",
+    })
+  } finally {
+    if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+    else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+    if (previousStale === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS
+    else process.env.OPENCODE_TRACE_SEGMENT_LOCK_STALE_MS = previousStale
+    await fs.rm(traceRoot, { recursive: true, force: true })
+    await fs.rm(path.dirname(lock), { recursive: true, force: true })
+  }
+})
+
+test("late session binding keeps the allocation lock key for competing identities", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stable-bind-lock-"))
+  const lock = lockDirectory(traceRoot, "case:stable-bind-case")
+  const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+  try {
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "stable-bind-case",
+      runID: "run_stable_bind",
+    })
+    const initial = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
+    expect(initial.lock_key).toBe("case:stable-bind-case")
+    await fs.mkdir(lock, { recursive: true })
+    await fs.writeFile(
+      path.join(lock, "owner.json"),
+      JSON.stringify({ pid: process.pid, nonce: "competing-owner", acquired_at_ms: Date.now() }),
+    )
+    process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = "0"
+    expect(segment.bindSessionID("ses_late_a")).toBe(false)
+    expect((JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any).session_id).toBeUndefined()
+    await fs.rm(lock, { recursive: true, force: true })
+    expect(segment.bindSessionID("ses_late_a")).toBe(true)
+    expect(segment.bindSessionID("ses_late_b")).toBe(false)
+    expect((JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any).session_id).toBe("ses_late_a")
+  } finally {
+    if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+    else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+    await fs.rm(traceRoot, { recursive: true, force: true })
+    await fs.rm(path.dirname(lock), { recursive: true, force: true })
+  }
+})
+
+test("an old release cannot remove a successor acquired under the same lock key", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-lock-release-race-"))
+  const key = "case:release-race"
+  const lock = lockDirectory(traceRoot, key)
+  try {
+    const releaseOld = acquireTraceSessionLock(traceRoot, key)
+    const oldOwner = JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8")) as any
+    releaseOld()
+    const releaseSuccessor = acquireTraceSessionLock(traceRoot, key)
+    const successor = JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8")) as any
+    expect(successor.nonce).not.toBe(oldOwner.nonce)
+    releaseOld()
+    expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+      nonce: successor.nonce,
+    })
+    releaseSuccessor()
+    expect(await fileExists(lock)).toBe(false)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+    await fs.rm(path.dirname(lock), { recursive: true, force: true })
+  }
+})
+
 test("disambiguates orphan segment paths and rejects duplicate run identities without changing the manifest", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-collision-"))
   const logicalRoot = path.join(traceRoot, "collision-case")
@@ -517,6 +676,7 @@ async function writeClosedSegment(
     runID: string
     marker: string
     caseID?: string
+    referenceFixture?: boolean
     terminal?: {
       manifest: Record<string, unknown>
       metrics: Record<string, unknown>
@@ -546,7 +706,20 @@ async function writeClosedSegment(
     timestamp: "2026-08-15T00:00:01.000Z",
     time_ms: 1,
     status: "success",
-    data: { claim: `${input.marker} fact` },
+    data: {
+      claim: `${input.marker} fact`,
+      ...(input.referenceFixture
+        ? {
+            documentation_url: "https://example.test/node:run_start",
+            output_path: "artifact:shared_artifact",
+            ordinary_text: "node:run_start",
+            node_id: "run_start",
+            artifact_id: "shared_artifact",
+            typed_ref: { ref_type: "node", ref_id: "run_start", legacy_ref: "node:run_start" },
+            legacy_refs: ["node:run_start", "artifact:shared_artifact"],
+          }
+        : {}),
+    },
     input_refs: ["node:run_start"],
     source_refs: ["evidence:run_start"],
     artifact_refs: ["shared_artifact"],
@@ -564,6 +737,16 @@ async function writeClosedSegment(
     hash: createHash("sha256").update(input.marker).digest("hex"),
     path: "artifacts/fact.txt",
   })
+  if (input.referenceFixture) {
+    store.createDiagnostic({
+      diagnostic_id: "shared_diagnostic",
+      artifact_id: "shared_artifact",
+      node_id: "shared_fact",
+      edge_id: "shared_edge",
+      reference: { ref_type: "artifact", ref_id: "shared_artifact", legacy_ref: "artifact:shared_artifact" },
+      documentation_url: "https://example.test/artifact:shared_artifact",
+    })
+  }
   if (input.terminal) {
     const snapshot = store.snapshot()
     store.finalize({
@@ -601,7 +784,18 @@ async function writeClosedSegment(
   if (input.terminal) {
     await fs.writeFile(
       path.join(segment.segmentDir, "legacy-trace.json"),
-      JSON.stringify({ trace_version: "1.3", run_id: input.runID, marker: input.marker }),
+      JSON.stringify({
+        trace_version: "1.3",
+        run_id: input.runID,
+        marker: input.marker,
+        artifacts: [
+          {
+            artifact_id: "legacy_fact",
+            path: "artifacts/fact.txt",
+            hash: createHash("sha256").update(`${input.marker} artifact`).digest("hex"),
+          },
+        ],
+      }),
     )
   }
   expect(segment.finalize(input.terminal?.manifest.status === "error" ? "failed" : "completed")).toBe(true)
@@ -695,6 +889,366 @@ test("materializes two colliding segments as one scoped trace with continuation 
         trace.artifacts.map((artifact: any) => fs.readFile(path.join(first.logicalRoot, artifact.path), "utf8")),
       ),
     ).toEqual(["first artifact", "second artifact"])
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+async function writeUnclosedSegment(
+  segment: ReturnType<typeof openTraceSegment>,
+  input: { runID: string; caseID: string; marker: string },
+) {
+  const entries: CausalIRJournalEntry[] = []
+  const store = new CausalIRStore({ runID: input.runID, caseID: input.caseID, append: (entry) => entries.push(entry) })
+  store.createNode({
+    node_id: "run_start",
+    kind: "run.start",
+    component: "run",
+    timestamp: "2026-08-15T00:00:00.000Z",
+    time_ms: 0,
+    status: "running",
+    data: { marker: input.marker, run_id: input.runID, case_id: input.caseID },
+  })
+  await fs.writeFile(
+    path.join(segment.segmentDir, "records.jsonl"),
+    entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+  )
+}
+
+test("uses one newest valid terminal segment despite historical and later interruptions", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-terminal-selection-"))
+  try {
+    const first = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "terminal-case",
+      sessionID: "ses_terminal",
+      runID: "run_interrupted_before",
+    })
+    await writeUnclosedSegment(first, {
+      runID: "run_interrupted_before",
+      caseID: "terminal-case",
+      marker: "before",
+    })
+    const terminal = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "terminal-case",
+      sessionID: "ses_terminal",
+      runID: "run_terminal_success",
+    })
+    await writeClosedSegment(terminal, {
+      runID: "run_terminal_success",
+      marker: "terminal",
+      caseID: "terminal-case",
+      terminal: {
+        manifest: {
+          status: "success",
+          server_status: "success",
+          process_status: "success",
+          case_status: "success",
+          case_id: "terminal-case",
+          run_id: "run_terminal_success",
+          result: { marker: "terminal result" },
+          recovery_status: "terminal_recovery_preserved",
+          recovery: { source: "terminal" },
+        },
+        metrics: { spans: 2, events: 3, token_usage: {}, trace_health: { issues: [] } },
+      },
+    })
+    const later = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "terminal-case",
+      sessionID: "ses_terminal",
+      runID: "run_interrupted_after",
+    })
+    await writeUnclosedSegment(later, {
+      runID: "run_interrupted_after",
+      caseID: "terminal-case",
+      marker: "after",
+    })
+
+    const result = materializeTrace({ caseDir: first.logicalRoot })
+    const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8")) as any
+    const legacy = JSON.parse(await fs.readFile(path.join(first.logicalRoot, "legacy-trace.json"), "utf8")) as any
+    expect(result.completeness).toBe("incomplete")
+    expect(trace.manifest).toMatchObject({
+      run_id: "run_terminal_success",
+      status: "success",
+      server_status: "success",
+      process_status: "success",
+      case_status: "success",
+      result: { marker: "terminal result" },
+      recovery_status: "terminal_recovery_preserved",
+      recovery: { source: "terminal" },
+      historical_interruptions: true,
+      segment_summary: { interrupted_unfinalized: 1, running: 1 },
+    })
+    expect(legacy).toMatchObject({ run_id: "run_terminal_success", marker: "terminal" })
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("detects a legacy terminal journal line larger than four MiB without changing its bytes", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-large-legacy-terminal-"))
+  const logicalRoot = path.join(traceRoot, "large-legacy")
+  try {
+    const entries: CausalIRJournalEntry[] = []
+    const store = new CausalIRStore({
+      runID: "run_large_legacy",
+      caseID: "large-legacy",
+      append: (entry) => entries.push(entry),
+    })
+    store.createNode({
+      node_id: "run_start",
+      kind: "run.start",
+      component: "run",
+      timestamp: "2026-08-15T00:00:00.000Z",
+      time_ms: 0,
+      status: "running",
+      data: { marker: "legacy" },
+    })
+    store.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-15T00:00:01.000Z",
+      result: { padding: "x".repeat(5 * 1024 * 1024) },
+      manifest: { case_id: "large-legacy", run_id: "run_large_legacy", session_id: "ses_large_legacy" },
+    })
+    await fs.mkdir(logicalRoot, { recursive: true })
+    const recordsFile = path.join(logicalRoot, "records.jsonl")
+    await fs.writeFile(recordsFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n")
+    const before = await sha256(recordsFile)
+
+    const resumed = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "large-legacy",
+      sessionID: "ses_large_legacy",
+      runID: "run_after_large_legacy",
+    })
+    const session = JSON.parse(await fs.readFile(resumed.sessionFile, "utf8")) as any
+    expect(session.segments[0]).toMatchObject({ segment_id: "legacy-root", status: "completed" })
+    expect(session.segments[1].continuation_of).toBe("run_large_legacy")
+    expect(await sha256(recordsFile)).toBe(before)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("content-addresses compatibility artifacts when a resumed segment reuses a path with different bytes", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-compat-artifact-collision-"))
+  try {
+    const first = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "compat-artifact-case",
+      sessionID: "ses_compat_artifact",
+      runID: "run_artifact_first",
+    })
+    await writeClosedSegment(first, {
+      runID: "run_artifact_first",
+      marker: "first",
+      caseID: "compat-artifact-case",
+      terminal: { manifest: { status: "success", run_id: "run_artifact_first" }, metrics: {} },
+    })
+    materializeTrace({ caseDir: first.logicalRoot })
+    expect(await fs.readFile(path.join(first.logicalRoot, "artifacts/fact.txt"), "utf8")).toBe("first artifact")
+
+    const second = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "compat-artifact-case",
+      sessionID: "ses_compat_artifact",
+      runID: "run_artifact_second",
+    })
+    await writeClosedSegment(second, {
+      runID: "run_artifact_second",
+      marker: "second",
+      caseID: "compat-artifact-case",
+      terminal: { manifest: { status: "success", run_id: "run_artifact_second" }, metrics: {} },
+    })
+    materializeTrace({ caseDir: first.logicalRoot })
+    const legacy = JSON.parse(await fs.readFile(path.join(first.logicalRoot, "legacy-trace.json"), "utf8")) as any
+    const projectedPath = legacy.artifacts[0].path as string
+    expect(projectedPath).not.toBe("artifacts/fact.txt")
+    expect(projectedPath).toStartWith("artifacts/sha256/")
+    expect(await fs.readFile(path.join(first.logicalRoot, projectedPath), "utf8")).toBe("second artifact")
+    expect(await fs.readFile(path.join(first.logicalRoot, "artifacts/fact.txt"), "utf8")).toBe("first artifact")
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+function expectValidScopedGraph(trace: any) {
+  const nodes = new Set(trace.nodes.map((node: any) => node.node_id))
+  const edges = new Set(trace.edges.map((edge: any) => edge.edge_id))
+  const artifacts = new Set(trace.artifacts.map((artifact: any) => artifact.artifact_id))
+  const diagnostics = new Set(trace.diagnostics.map((diagnostic: any) => diagnostic.diagnostic_id))
+  const expectRef = (ref: any) => {
+    if (ref.ref_type === "node") expect(nodes.has(ref.ref_id)).toBe(true)
+    if (ref.ref_type === "artifact") expect(artifacts.has(ref.ref_id)).toBe(true)
+  }
+  for (const node of trace.nodes) {
+    for (const ref of [...node.input_refs, ...node.output_refs, ...node.source_refs]) expectRef(ref)
+    for (const artifactID of node.artifact_refs) expect(artifacts.has(artifactID)).toBe(true)
+  }
+  for (const edge of trace.edges) {
+    expectRef(edge.from)
+    expectRef(edge.to)
+    for (const ref of edge.evidence_refs) expectRef(ref)
+  }
+  for (const diagnostic of trace.diagnostics) {
+    expect(diagnostics.has(diagnostic.diagnostic_id)).toBe(true)
+    if (diagnostic.node_id) expect(nodes.has(diagnostic.node_id)).toBe(true)
+    if (diagnostic.edge_id) expect(edges.has(diagnostic.edge_id)).toBe(true)
+    if (diagnostic.artifact_id) expect(artifacts.has(diagnostic.artifact_id)).toBe(true)
+    if (diagnostic.reference) expectRef(diagnostic.reference)
+  }
+}
+
+test("rewrites only schema-declared references with per-segment identity maps", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-schema-scoped-refs-"))
+  try {
+    const terminal = (runID: string, marker: string) => ({
+      manifest: {
+        status: "success",
+        case_id: "schema-ref-case",
+        run_id: runID,
+        result: {
+          artifact_id: "shared_artifact",
+          node_ref: "node:shared_fact",
+          typed_ref: { ref_type: "node", ref_id: "shared_fact", legacy_ref: "node:shared_fact" },
+          documentation_url: "https://example.test/node:shared_fact",
+          ordinary_text: "artifact:shared_artifact",
+        },
+      },
+      metrics: {
+        result_node_id: "shared_fact",
+        evidence_refs: ["node:shared_fact", "artifact:shared_artifact"],
+        documentation_url: "https://example.test/artifact:shared_artifact",
+      },
+    })
+    const first = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "schema-ref-case",
+      sessionID: "ses_schema_refs",
+      runID: "run_schema_first",
+    })
+    await writeClosedSegment(first, {
+      runID: "run_schema_first",
+      marker: "first",
+      caseID: "schema-ref-case",
+      referenceFixture: true,
+      terminal: terminal("run_schema_first", "first"),
+    })
+    const second = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "schema-ref-case",
+      sessionID: "ses_schema_refs",
+      runID: "run_schema_second",
+    })
+    await writeClosedSegment(second, {
+      runID: "run_schema_second",
+      marker: "second",
+      caseID: "schema-ref-case",
+      referenceFixture: true,
+      terminal: terminal("run_schema_second", "second"),
+    })
+
+    const result = materializeTrace({ caseDir: first.logicalRoot })
+    const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8")) as any
+    const fact = trace.nodes.find(
+      (node: any) => node.scope?.run_id === "run_schema_second" && node.metadata?.original_node_id === "shared_fact",
+    )
+    const prefix = "run_schema_second"
+    expect(fact.payload).toMatchObject({
+      documentation_url: "https://example.test/node:run_start",
+      output_path: "artifact:shared_artifact",
+      ordinary_text: "node:run_start",
+      node_id: `${prefix}::node::run_start`,
+      artifact_id: `${prefix}::artifact::shared_artifact`,
+      typed_ref: {
+        ref_type: "node",
+        ref_id: `${prefix}::node::run_start`,
+        legacy_ref: `node:${prefix}::node::run_start`,
+      },
+      legacy_refs: [`node:${prefix}::node::run_start`, `artifact:${prefix}::artifact::shared_artifact`],
+    })
+    const diagnostic = trace.diagnostics.find((item: any) => item.scope?.run_id === "run_schema_second")
+    expect(diagnostic).toMatchObject({
+      diagnostic_id: `${prefix}::diagnostic::shared_diagnostic`,
+      artifact_id: `${prefix}::artifact::shared_artifact`,
+      node_id: `${prefix}::node::shared_fact`,
+      edge_id: `${prefix}::edge::shared_edge`,
+      reference: { ref_type: "artifact", ref_id: `${prefix}::artifact::shared_artifact` },
+      documentation_url: "https://example.test/artifact:shared_artifact",
+    })
+    expect(trace.manifest.result).toMatchObject({
+      artifact_id: `${prefix}::artifact::shared_artifact`,
+      node_ref: `node:${prefix}::node::shared_fact`,
+      typed_ref: { ref_type: "node", ref_id: `${prefix}::node::shared_fact` },
+      documentation_url: "https://example.test/node:shared_fact",
+      ordinary_text: "artifact:shared_artifact",
+    })
+    expect(trace.metrics).toMatchObject({
+      result_node_id: `${prefix}::node::shared_fact`,
+      evidence_refs: [
+        "node:run_schema_first::node::shared_fact",
+        "artifact:run_schema_first::artifact::shared_artifact",
+        `node:${prefix}::node::shared_fact`,
+        `artifact:${prefix}::artifact::shared_artifact`,
+      ],
+      documentation_url: "https://example.test/artifact:shared_artifact",
+    })
+    expectValidScopedGraph(trace)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("publishes only a generation-matched session snapshot with trace.json as the commit marker", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-generation-publication-"))
+  const readyFile = path.join(traceRoot, "stage.ready")
+  const script = path.join(traceRoot, "materialize.ts")
+  try {
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "generation-case",
+      sessionID: "ses_generation",
+      runID: "run_generation",
+    })
+    await writeClosedSegment(segment, { runID: "run_generation", marker: "generation", caseID: "generation-case" })
+    const staleCommitMarker = "stale trace commit marker"
+    await fs.writeFile(path.join(segment.logicalRoot, "trace.json"), staleCommitMarker)
+    await fs.writeFile(
+      script,
+      [
+        `import { materializeTrace } from ${JSON.stringify(materializerModule)}`,
+        `const result = materializeTrace({ caseDir: ${JSON.stringify(segment.logicalRoot)} })`,
+        `process.stdout.write(JSON.stringify(result))`,
+      ].join("\n"),
+    )
+
+    const release = acquireTraceSessionLock(traceRoot, segment.lockKey)
+    const child = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: { ...process.env, OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE: readyFile },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await waitForFilePresence(readyFile)).toBe(true)
+    expect(await fs.readFile(path.join(segment.logicalRoot, "trace.json"), "utf8")).toBe(staleCommitMarker)
+
+    const manifest = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
+    manifest.generation += 1
+    manifest.updated_at = "2026-08-15T23:59:59.000Z"
+    await fs.writeFile(segment.sessionFile, JSON.stringify(manifest, undefined, 2) + "\n")
+    release()
+
+    expect(await child.exited).toBe(0)
+    expect(await new Response(child.stderr).text()).toBe("")
+    const output = JSON.parse(await new Response(child.stdout).text()) as any
+    const trace = JSON.parse(await fs.readFile(output.traceFile, "utf8")) as any
+    expect(trace.manifest.session_generation).toBe(manifest.generation)
+    expect(trace.manifest.run_id).toBe("run_generation")
+    expect(await fs.readFile(path.join(segment.logicalRoot, "trace.json"), "utf8")).not.toBe(staleCommitMarker)
   } finally {
     await fs.rm(traceRoot, { recursive: true, force: true })
   }

@@ -20,6 +20,22 @@ function withCaseDirectory(run: (caseDir: string) => void) {
   }
 }
 
+function treeHashes(root: string) {
+  const result: Array<[string, string]> = []
+  const visit = (directory: string) => {
+    for (const entry of fs
+      .readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(directory, entry.name)
+      if (entry.isDirectory()) visit(file)
+      else if (entry.isFile())
+        result.push([path.relative(root, file), createHash("sha256").update(fs.readFileSync(file)).digest("hex")])
+    }
+  }
+  visit(root)
+  return result
+}
+
 function createJournal() {
   const journal: unknown[] = []
   const store = new CausalIRStore({
@@ -259,6 +275,7 @@ describe("loadRenderableTrace", () => {
           segments: descriptors,
         }),
       )
+      const before = treeHashes(caseDir)
 
       const result = loadRenderableTrace(caseDir)
 
@@ -280,7 +297,8 @@ describe("loadRenderableTrace", () => {
           }),
         ]),
       )
-      expect(fs.existsSync(path.join(caseDir, "trace.json"))).toBe(true)
+      expect(fs.existsSync(path.join(caseDir, "trace.json"))).toBe(false)
+      expect(treeHashes(caseDir)).toEqual(before)
     })
   })
 
@@ -318,6 +336,8 @@ describe("loadRenderableTrace", () => {
           dataflow_edges: [],
         }),
       )
+      fs.writeFileSync(path.join(caseDir, "session.json"), JSON.stringify({ sentinel: "renderer must not read this" }))
+      const before = treeHashes(caseDir)
 
       const result = loadRenderableTrace(caseDir)
       const directResult = loadRenderableTrace(traceFile)
@@ -330,6 +350,7 @@ describe("loadRenderableTrace", () => {
         { edge_id: "input_to_response", relation: "produced", eligible_for_attribution: true },
       ])
       expect(directResult).toMatchObject({ caseDir, source: "trace.json", incomplete: false })
+      expect(treeHashes(caseDir)).toEqual(before)
     })
   })
 

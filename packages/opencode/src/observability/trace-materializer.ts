@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite"
+import crypto from "node:crypto"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import {
   CAUSAL_IR_VERSION,
@@ -27,7 +29,7 @@ import {
   type StreamingJsonObjectMember,
 } from "./streaming-json-writer"
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
-import type { TraceSegmentDescriptor, TraceSessionManifest } from "./trace-segment"
+import { withTraceSessionLock, type TraceSegmentDescriptor, type TraceSessionManifest } from "./trace-segment"
 
 export type TraceMaterializationResult = {
   caseDir: string
@@ -55,6 +57,7 @@ type SegmentReplayScope = {
   caseID: string
   pathPrefix: string
   namespace: boolean
+  idMaps: Record<"node" | "edge" | "artifact" | "diagnostic", Map<string, string>>
 }
 
 type TerminalEnvelope = {
@@ -93,26 +96,87 @@ function nonemptyString(input: unknown): input is string {
 }
 
 function scopedEntityID(scope: SegmentReplayScope, type: "node" | "edge" | "artifact" | "diagnostic", id: string) {
-  return scope.namespace ? `${scope.segmentID}::${type}::${id}` : id
+  if (!scope.namespace) return id
+  const existing = scope.idMaps[type].get(id)
+  if (existing) return existing
+  const scoped = `${scope.segmentID}::${type}::${id}`
+  scope.idMaps[type].set(id, scoped)
+  return scoped
 }
 
 function scopedLegacyReference(value: string | undefined, scope: SegmentReplayScope) {
   if (!value || !scope.namespace) return value
   const separator = value.indexOf(":")
   if (separator < 1 || separator === value.length - 1) return value
+  const prefix = value.slice(0, separator)
   const reference = typedCausalIRReference(value)
-  const type = reference.ref_type === "node" ? "node" : reference.ref_type === "artifact" ? "artifact" : undefined
+  const type =
+    reference.ref_type === "node"
+      ? "node"
+      : reference.ref_type === "artifact"
+        ? "artifact"
+        : prefix === "edge"
+          ? "edge"
+          : prefix === "diagnostic"
+            ? "diagnostic"
+            : undefined
   if (!type) return value
-  return `${value.slice(0, separator)}:${scopedEntityID(scope, type, value.slice(separator + 1))}`
+  return `${prefix}:${scopedEntityID(scope, type, value.slice(separator + 1))}`
 }
 
-function scopedPayloadReferences(value: unknown, scope: SegmentReplayScope): unknown {
+function referenceEntityType(key: string): "node" | "edge" | "artifact" | "diagnostic" | undefined {
+  const normalized = key.toLowerCase()
+  for (const type of ["node", "edge", "artifact", "diagnostic"] as const) {
+    if (
+      normalized === `${type}_id` ||
+      normalized === `${type}_ids` ||
+      normalized.endsWith(`_${type}_id`) ||
+      normalized.endsWith(`_${type}_ids`)
+    )
+      return type
+  }
+  return undefined
+}
+
+function isReferenceKey(key: string) {
+  const normalized = key.toLowerCase()
+  return (
+    normalized === "reference" ||
+    normalized === "references" ||
+    normalized.endsWith("_ref") ||
+    normalized.endsWith("_refs")
+  )
+}
+
+function canonicalReference(value: unknown): CausalIRRef | undefined {
+  const candidate = record(value)
+  if (
+    !candidate ||
+    !nonemptyString(candidate.ref_id) ||
+    (candidate.ref_type !== "node" &&
+      candidate.ref_type !== "artifact" &&
+      candidate.ref_type !== "raw_event" &&
+      candidate.ref_type !== "external")
+  )
+    return undefined
+  return candidate as CausalIRRef
+}
+
+function scopedSchemaReferences(value: unknown, scope: SegmentReplayScope, key = ""): unknown {
   if (!scope.namespace) return value
-  if (typeof value === "string") return scopedLegacyReference(value, scope) ?? value
-  if (Array.isArray(value)) return value.map((item) => scopedPayloadReferences(item, scope))
+  if (typeof value === "string") {
+    const entityType = referenceEntityType(key)
+    if (entityType) return scopedEntityID(scope, entityType, value)
+    return isReferenceKey(key) ? (scopedLegacyReference(value, scope) ?? value) : value
+  }
+  if (Array.isArray(value)) return value.map((item) => scopedSchemaReferences(item, scope, key))
+  const canonical = canonicalReference(value)
+  if (canonical) return scopedReference(canonical, scope)
   const object = record(value)
   if (!object) return value
-  return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, scopedPayloadReferences(item, scope)]))
+  return Object.fromEntries(
+    Object.entries(object).map(([childKey, item]) => [childKey, scopedSchemaReferences(item, scope, childKey)]),
+  )
 }
 
 function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRRef {
@@ -136,9 +200,10 @@ function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRR
 function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode {
   if (!scope.namespace) return node
   const nodeID = scopedEntityID(scope, "node", node.node_id)
-  const payload = scopedPayloadReferences(node.payload, scope) as Record<string, unknown>
+  const transformed = scopedSchemaReferences(node, scope) as CausalIRNode
+  const payload = scopedSchemaReferences(node.payload, scope) as Record<string, unknown>
   return {
-    ...node,
+    ...transformed,
     node_id: nodeID,
     scope: { ...node.scope, run_id: scope.runID, case_id: scope.caseID },
     payload,
@@ -163,6 +228,7 @@ function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode
 
 function scopedEdge(edge: CausalIREdge, scope: SegmentReplayScope): ScopedCausalIREdge {
   if (!scope.namespace) return edge
+  const metadata = scopedSchemaReferences(edge.metadata, scope) as Record<string, unknown> | undefined
   return {
     ...edge,
     edge_id: scopedEntityID(scope, "edge", edge.edge_id),
@@ -171,7 +237,7 @@ function scopedEdge(edge: CausalIREdge, scope: SegmentReplayScope): ScopedCausal
     evidence_refs: edge.evidence_refs.map((ref) => scopedReference(ref, scope)),
     scope: { run_id: scope.runID, case_id: scope.caseID },
     metadata: {
-      ...(edge.metadata ?? {}),
+      ...(metadata ?? {}),
       original_edge_id: edge.edge_id,
       segment_id: scope.segmentID,
       run_id: scope.runID,
@@ -187,8 +253,9 @@ function scopedArtifact(artifact: ArtifactLike, scope: SegmentReplayScope): Arti
       ? path.posix.join(scope.pathPrefix.replaceAll("\\", "/"), relativePath)
       : relativePath
   if (!scope.namespace) return { ...artifact, path: scopedPath }
+  const transformed = scopedSchemaReferences(artifact, scope) as ArtifactLike
   return {
-    ...artifact,
+    ...transformed,
     artifact_id: scopedEntityID(scope, "artifact", artifact.artifact_id),
     path: scopedPath,
     original_artifact_id: artifact.artifact_id,
@@ -198,14 +265,12 @@ function scopedArtifact(artifact: ArtifactLike, scope: SegmentReplayScope): Arti
 
 function scopedDiagnostic(diagnostic: CausalIRDiagnosticLike, scope: SegmentReplayScope): CausalIRDiagnosticLike {
   if (!scope.namespace) return diagnostic
+  const transformed = scopedSchemaReferences(diagnostic, scope) as CausalIRDiagnosticLike
   return {
-    ...diagnostic,
+    ...transformed,
     diagnostic_id: scopedEntityID(scope, "diagnostic", diagnostic.diagnostic_id),
     original_diagnostic_id: diagnostic.diagnostic_id,
     scope: { segment_id: scope.segmentID, run_id: scope.runID, case_id: scope.caseID },
-    ...(typeof diagnostic.artifact_id === "string"
-      ? { artifact_id: scopedEntityID(scope, "artifact", diagnostic.artifact_id) }
-      : {}),
   }
 }
 
@@ -558,8 +623,19 @@ class ReplayIndex {
     this.lastOperation = entry.operation
     this.lastPayloadHash = entry.payload_hash
     this.runtimeClosed = entry.operation === "case.runtime_closed"
-    this.terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : finalizedClose(entry)
-    this.terminal = terminalEnvelope(entry)
+    const terminalClose = this.runtimeClosed ? (entry.data as CausalIRRuntimeCloseData) : finalizedClose(entry)
+    this.terminalClose = terminalClose
+      ? (scopedSchemaReferences(terminalClose, this.scope) as CausalIRRuntimeCloseData)
+      : undefined
+    const terminal = terminalEnvelope(entry)
+    this.terminal = terminal
+      ? {
+          manifest: scopedSchemaReferences(terminal.manifest, this.scope) as Record<string, unknown>,
+          ...(terminal.metrics
+            ? { metrics: scopedSchemaReferences(terminal.metrics, this.scope) as Record<string, unknown> }
+            : {}),
+        }
+      : undefined
   }
 
   private putNode(node: CausalIRNode, json = JSON.stringify(node), wrapped = false) {
@@ -824,6 +900,12 @@ class ReplayIndex {
       caseID: input.caseID,
       pathPrefix: "",
       namespace: true,
+      idMaps: {
+        node: new Map(),
+        edge: new Map(),
+        artifact: new Map(),
+        diagnostic: new Map(),
+      },
     }
     this.putEdge({
       edge_id: `${input.segmentKey}::edge::run.continuation::${input.previousRunID}`,
@@ -1155,6 +1237,7 @@ function aggregateMetrics(
 
 function copyFileAtomic(source: string, destination: string) {
   if (path.resolve(source) === path.resolve(destination)) return
+  fs.mkdirSync(path.dirname(destination), { recursive: true })
   const temporary = path.join(
     path.dirname(destination),
     `.${path.basename(destination)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
@@ -1195,6 +1278,7 @@ function linkFileAtomic(source: string, destination: string) {
 
 function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirectory: string) {
   if (!fs.existsSync(sourceDirectory)) return
+  if (!fs.statSync(sourceDirectory).isDirectory()) return
   for (const entry of fs.readdirSync(sourceDirectory, { withFileTypes: true })) {
     const source = path.join(sourceDirectory, entry.name)
     const destination = path.join(destinationDirectory, entry.name)
@@ -1221,6 +1305,134 @@ function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirector
         } catch {}
       }
     }
+  }
+}
+
+function fileContentHash(file: string) {
+  const hash = crypto.createHash("sha256")
+  const handle = fs.openSync(file, "r")
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  try {
+    while (true) {
+      const bytes = fs.readSync(handle, buffer, 0, buffer.length, null)
+      if (!bytes) break
+      hash.update(buffer.subarray(0, bytes))
+    }
+  } finally {
+    fs.closeSync(handle)
+  }
+  return hash.digest("hex")
+}
+
+function publishCompatibilityArtifacts(sourceDirectory: string, caseDir: string) {
+  const rewrites = new Map<string, string>()
+  if (!fs.existsSync(sourceDirectory)) return rewrites
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const source = path.join(directory, entry.name)
+      if (entry.isDirectory()) {
+        visit(source)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const sourceRelative = path.posix.join(
+        "artifacts",
+        path.relative(sourceDirectory, source).replaceAll(path.sep, "/"),
+      )
+      const digest = fileContentHash(source)
+      const requestedDestination = path.join(caseDir, sourceRelative)
+      if (!fs.existsSync(requestedDestination)) {
+        copyFileAtomic(source, requestedDestination)
+        rewrites.set(sourceRelative, sourceRelative)
+        continue
+      }
+      if (fileContentHash(requestedDestination) === digest) {
+        rewrites.set(sourceRelative, sourceRelative)
+        continue
+      }
+      const contentRelative = path.posix.join("artifacts", "sha256", digest)
+      const contentDestination = path.join(caseDir, contentRelative)
+      if (fs.existsSync(contentDestination)) {
+        if (fileContentHash(contentDestination) !== digest)
+          throw new Error(`${contentDestination}: content-addressed artifact hash collision`)
+      } else copyFileAtomic(source, contentDestination)
+      rewrites.set(sourceRelative, contentRelative)
+    }
+  }
+  visit(sourceDirectory)
+  return rewrites
+}
+
+function rewriteCompatibilityArtifactProjection(file: string, caseDir: string, rewrites: Map<string, string>) {
+  if (!fs.existsSync(file) || !rewrites.size) return
+  const document = record(JSON.parse(fs.readFileSync(file, "utf8")) as unknown)
+  if (!document || !Array.isArray(document.artifacts)) return
+  document.artifacts = document.artifacts.map((input) => {
+    const artifact = record(input)
+    if (!artifact || !nonemptyString(artifact.path)) return input
+    const sourcePath = artifact.path.replaceAll("\\", "/").replace(/^\/+/, "")
+    const rewritten = rewrites.get(sourcePath)
+    if (!rewritten) return input
+    const digest = fileContentHash(path.join(caseDir, rewritten))
+    const declared = typeof artifact.hash === "string" ? artifact.hash.replace(/^sha256:/, "") : undefined
+    if (declared && /^[a-f0-9]{64}$/i.test(declared) && declared.toLowerCase() !== digest)
+      throw new Error(`${file}: compatibility artifact ${sourcePath} hash does not match its bytes`)
+    if (rewritten === sourcePath) return input
+    return { ...artifact, path: rewritten, content_sha256: digest }
+  })
+  fs.writeFileSync(file, JSON.stringify(document))
+}
+
+function publishStagedTrace(stageDir: string, caseDir: string) {
+  const artifactRewrites = publishCompatibilityArtifacts(path.join(stageDir, "artifacts"), caseDir)
+  rewriteCompatibilityArtifactProjection(path.join(stageDir, "legacy-trace.json"), caseDir, artifactRewrites)
+  for (const relative of ["manifest.json", "provenance-trace.json", "legacy-trace.json"]) {
+    const source = path.join(stageDir, relative)
+    const destination = path.join(caseDir, relative)
+    if (fs.existsSync(source)) copyFileAtomic(source, destination)
+    else if (relative === "legacy-trace.json") {
+      try {
+        fs.unlinkSync(destination)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+    }
+  }
+  publishTraceCommit(path.join(stageDir, "trace.json"), caseDir)
+}
+
+function publishTraceCommit(source: string, caseDir: string) {
+  const traceFile = path.join(caseDir, "trace.json")
+  const partialFile = path.join(caseDir, "partial", "latest.json")
+  const temporaryTrace = path.join(caseDir, `.trace.json.${process.pid}.${crypto.randomUUID()}.commit`)
+  const temporaryPartial = path.join(
+    path.dirname(partialFile),
+    `.latest.json.${process.pid}.${crypto.randomUUID()}.commit`,
+  )
+  let handle: number | undefined
+  try {
+    fs.mkdirSync(path.dirname(partialFile), { recursive: true })
+    fs.copyFileSync(source, temporaryTrace, fs.constants.COPYFILE_EXCL)
+    handle = fs.openSync(temporaryTrace, "r")
+    fs.fsyncSync(handle)
+    fs.closeSync(handle)
+    handle = undefined
+    fs.linkSync(temporaryTrace, temporaryPartial)
+    fs.renameSync(temporaryPartial, partialFile)
+    fs.renameSync(temporaryTrace, traceFile)
+  } catch (error) {
+    if (handle !== undefined) {
+      try {
+        fs.closeSync(handle)
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(temporaryPartial)
+    } catch {}
+    try {
+      fs.unlinkSync(temporaryTrace)
+    } catch {}
+    throw error
   }
 }
 
@@ -1251,7 +1463,16 @@ function readSession(caseDir: string) {
     !Array.isArray(input.segments)
   )
     throw new Error(`${file}: invalid trace session manifest`)
-  const session = input as TraceSessionManifest
+  const parsed = input as unknown as TraceSessionManifest
+  const session: TraceSessionManifest = {
+    ...parsed,
+    lock_key: nonemptyString(parsed.lock_key)
+      ? parsed.lock_key
+      : nonemptyString(parsed.session_id)
+        ? `session:${parsed.session_id}`
+        : `case:${parsed.logical_case_id}`,
+    generation: Number.isSafeInteger(parsed.generation) && parsed.generation >= 0 ? parsed.generation : 0,
+  }
   if (!session.segments.length) throw new Error(`${file}: trace session has no segments`)
   const runIDs = new Set<string>()
   for (const descriptor of session.segments) {
@@ -1289,13 +1510,19 @@ function materializationSources(caseDir: string, session: TraceSessionManifest |
   }))
 }
 
-export function materializeTrace(input: { caseDir: string }): TraceMaterializationResult {
+function materializeTraceSnapshot(input: {
+  caseDir: string
+  outputDir?: string
+  sessionSnapshot?: TraceSessionManifest | null
+}): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
   if (!fs.statSync(caseDir).isDirectory()) throw new Error(`${caseDir}: expected a case directory`)
-  const session = readSession(caseDir)
+  const outputDir = path.resolve(input.outputDir ?? caseDir)
+  fs.mkdirSync(outputDir, { recursive: true })
+  const session = input.sessionSnapshot === undefined ? readSession(caseDir) : (input.sessionSnapshot ?? undefined)
   const sources = materializationSources(caseDir, session)
   const indexPath = path.join(
-    caseDir,
+    outputDir,
     `.trace-materializer.${process.pid}.${Math.random().toString(16).slice(2)}.sqlite`,
   )
   const index = new ReplayIndex(indexPath)
@@ -1310,6 +1537,12 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
         caseID: source.caseID ?? "",
         pathPrefix: source.pathPrefix,
         namespace,
+        idMaps: {
+          node: new Map(),
+          edge: new Map(),
+          artifact: new Map(),
+          diagnostic: new Map(),
+        },
       })
       const recovered = recoverJournal(source.recordsFile, index)
       const identities = index.identities
@@ -1351,21 +1584,29 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
     index.reconcileDiagnostics()
     memoryPhase("diagnostics_complete", journalBytes)
     const latest = replays.at(-1)!
-    const terminal = replays.findLast((replay) => replay.close && replay.envelope?.manifest) ?? latest
+    const validTerminal = replays.findLast((replay) => replay.close && replay.envelope?.manifest)
+    const terminal = validTerminal ?? latest
     const complete = droppedLines === 0 && replays.every((replay) => replay.close !== undefined)
     const completeness = complete ? "complete" : "incomplete"
     const terminalManifest = terminal.envelope?.manifest ?? {}
-    const status = complete
-      ? typeof terminalManifest.status === "string"
+    const terminalStatus =
+      terminalManifest.status === "success" ||
+      terminalManifest.status === "error" ||
+      terminalManifest.status === "cancelled"
         ? terminalManifest.status
-        : latest.close!.status
-      : "error"
-    const runID = latest.identities.runID
+        : (terminal.close?.status ?? "error")
+    const historicalInterruptions = Boolean(
+      session &&
+        validTerminal &&
+        replays.some((replay) => replay !== terminal && (replay.droppedLines > 0 || !replay.close)),
+    )
+    const status = complete || historicalInterruptions ? terminalStatus : "error"
+    const runID = terminal.identities.runID
     const caseID = session?.logical_case_id ?? latest.identities.caseID
     const sourceFiles = record(terminalManifest.files) ?? {}
-    const activeRecords = latest.source.descriptor?.records ?? "records.jsonl"
-    const activeRawEvents = latest.source.descriptor
-      ? path.join(latest.source.descriptor.path, "raw-events.jsonl")
+    const activeRecords = terminal.source.descriptor?.records ?? "records.jsonl"
+    const activeRawEvents = terminal.source.descriptor
+      ? path.join(terminal.source.descriptor.path, "raw-events.jsonl")
       : "raw-events.jsonl"
     const manifest: Record<string, unknown> = {
       ...terminalManifest,
@@ -1376,11 +1617,12 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
       server_status: terminalManifest.server_status ?? status,
       process_status: terminalManifest.process_status ?? status,
       case_status: terminalManifest.case_status ?? status,
-      ...((session?.session_id ?? latest.close?.manifest.session_id)
-        ? { session_id: session?.session_id ?? latest.close?.manifest.session_id }
+      ...((session?.session_id ?? terminal.close?.manifest.session_id)
+        ? { session_id: session?.session_id ?? terminal.close?.manifest.session_id }
         : {}),
       ...(session
         ? {
+            session_generation: session.generation,
             segments: session.segments,
             segment_summary: {
               count: session.segments.length,
@@ -1406,24 +1648,40 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
       },
       ...(completeness === "complete"
         ? {}
-        : {
-            recovery_status: "incomplete_journal_replay",
-            ...(terminalManifest.recovery_status === undefined
-              ? {}
-              : { source_recovery_status: terminalManifest.recovery_status }),
-            ...(terminalManifest.recovery === undefined ? {} : { source_recovery: terminalManifest.recovery }),
-            recovery: {
-              dropped_lines: droppedLines,
-              segments: replays
-                .filter((replay) => replay.droppedLines > 0 || !replay.close)
-                .map((replay) => ({
-                  run_id: replay.identities.runID,
-                  path: path.relative(caseDir, replay.source.recordsFile),
-                  dropped_lines: replay.droppedLines,
-                  status: replay.close ? "recovered" : "interrupted_unfinalized",
-                })),
-            },
-          }),
+        : historicalInterruptions
+          ? {
+              historical_interruptions: true,
+              session_recovery: {
+                status: "incomplete_segment_history",
+                dropped_lines: droppedLines,
+                segments: replays
+                  .filter((replay) => replay.droppedLines > 0 || !replay.close)
+                  .map((replay) => ({
+                    run_id: replay.identities.runID,
+                    path: path.relative(caseDir, replay.source.recordsFile),
+                    dropped_lines: replay.droppedLines,
+                    status: replay.close ? "recovered" : "interrupted_unfinalized",
+                  })),
+              },
+            }
+          : {
+              recovery_status: "incomplete_journal_replay",
+              ...(terminalManifest.recovery_status === undefined
+                ? {}
+                : { source_recovery_status: terminalManifest.recovery_status }),
+              ...(terminalManifest.recovery === undefined ? {} : { source_recovery: terminalManifest.recovery }),
+              recovery: {
+                dropped_lines: droppedLines,
+                segments: replays
+                  .filter((replay) => replay.droppedLines > 0 || !replay.close)
+                  .map((replay) => ({
+                    run_id: replay.identities.runID,
+                    path: path.relative(caseDir, replay.source.recordsFile),
+                    dropped_lines: replay.droppedLines,
+                    status: replay.close ? "recovered" : "interrupted_unfinalized",
+                  })),
+              },
+            }),
     }
     const metrics = aggregateMetrics(replays, index, terminal.identities.runID, namespace)
     const poisoned = replays.some(
@@ -1459,11 +1717,11 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
           last_payload_hash: index.finalPayloadHash,
           poisoned: false,
         }
-    const traceFile = path.join(caseDir, "trace.json")
-    const manifestFile = path.join(caseDir, "manifest.json")
-    const partialFile = path.join(caseDir, "partial", "latest.json")
-    const provenanceFile = path.join(caseDir, "provenance-trace.json")
-    const legacyFile = path.join(caseDir, "legacy-trace.json")
+    const traceFile = path.join(outputDir, "trace.json")
+    const manifestFile = path.join(outputDir, "manifest.json")
+    const partialFile = path.join(outputDir, "partial", "latest.json")
+    const provenanceFile = path.join(outputDir, "provenance-trace.json")
+    const legacyFile = path.join(outputDir, "legacy-trace.json")
     writeStreamingJsonObjectAtomic(traceFile, traceMembers(index, manifest, metrics, journal))
     memoryPhase("trace_complete", journalBytes)
     writeStreamingJsonObjectAtomic(manifestFile, Object.entries(manifest))
@@ -1472,14 +1730,14 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
     memoryPhase("partial_complete", journalBytes)
     writeStreamingJsonObjectAtomic(provenanceFile, provenanceMembers(index, manifest, metrics))
     memoryPhase("provenance_complete", journalBytes)
-    const legacySource = replays.findLast((replay) =>
-      fs.existsSync(path.join(path.dirname(replay.source.recordsFile), "legacy-trace.json")),
-    )
+    const legacySource = fs.existsSync(path.join(path.dirname(terminal.source.recordsFile), "legacy-trace.json"))
+      ? terminal
+      : undefined
     if (legacySource) {
       copyFileAtomic(path.join(path.dirname(legacySource.source.recordsFile), "legacy-trace.json"), legacyFile)
       linkCompatibilityArtifacts(
         path.join(path.dirname(legacySource.source.recordsFile), "artifacts"),
-        path.join(caseDir, "artifacts"),
+        path.join(outputDir, "artifacts"),
       )
     }
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
@@ -1489,4 +1747,46 @@ export function materializeTrace(input: { caseDir: string }): TraceMaterializati
       fs.unlinkSync(indexPath)
     } catch {}
   }
+}
+
+export function materializeTrace(input: { caseDir: string; outputDir?: string }): TraceMaterializationResult {
+  const caseDir = path.resolve(input.caseDir)
+  if (input.outputDir)
+    return materializeTraceSnapshot({
+      caseDir,
+      outputDir: input.outputDir,
+      sessionSnapshot: readSession(caseDir) ?? null,
+    })
+
+  let session = readSession(caseDir)
+  if (!session) return materializeTraceSnapshot({ caseDir, sessionSnapshot: null })
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-publication-"))
+    try {
+      const staged = materializeTraceSnapshot({ caseDir, outputDir: stageDir, sessionSnapshot: session })
+      const readyFile = process.env.OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE
+      if (readyFile) fs.writeFileSync(readyFile, `${session.generation}\n`)
+      let published = false
+      withTraceSessionLock(path.dirname(caseDir), session.lock_key, () => {
+        const latest = readSession(caseDir)
+        if (!latest || latest.lock_key !== session!.lock_key || latest.generation !== session!.generation) return
+        publishStagedTrace(stageDir, caseDir)
+        published = true
+      })
+      if (published)
+        return {
+          ...staged,
+          caseDir,
+          traceFile: path.join(caseDir, "trace.json"),
+          manifestFile: path.join(caseDir, "manifest.json"),
+          partialFile: path.join(caseDir, "partial", "latest.json"),
+        }
+      session = readSession(caseDir)
+      if (!session) throw new Error(`${caseDir}: trace session disappeared during materialization`)
+    } finally {
+      fs.rmSync(stageDir, { recursive: true, force: true })
+    }
+  }
+  throw new Error(`${caseDir}: trace session changed repeatedly during materialization`)
 }

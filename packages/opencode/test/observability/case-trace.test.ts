@@ -386,7 +386,7 @@ describe("case trace", () => {
         script,
         [
           `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-          `CaseTrace.configure({ caseID: "runtime-close" })`,
+          `CaseTrace.configure({ caseID: "runtime-close", sessionID: "ses_runtime_close" })`,
           `CaseTrace.event({ component: "runtime", event_type: "root.lifecycle", data: { sessionID: "ses_runtime_close" } })`,
           `CaseTrace.startSpan({ component: "run", operation: "execute", trace_scope: "process" })`,
           `process.stdout.write(JSON.stringify(CaseTrace.closeAll({ status: "success", result: { reason: "worker.shutdown" } })))`,
@@ -7184,10 +7184,13 @@ describe("case trace", () => {
     })
     expect(rendered.exitCode).toBe(0)
     expect(Buffer.from(rendered.stdout).toString()).toContain("source: trace.json")
-    expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: incomplete")
+    expect(Buffer.from(rendered.stdout).toString()).toContain("completeness: complete")
     const recovered = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
-    expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::old_run_marker"))).toBe(true)
-    expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::new_run_marker"))).toBe(true)
+    expect(recovered.nodes.some((node: any) => node.node_id === "old_run_marker")).toBe(true)
+    expect(recovered.nodes.some((node: any) => node.node_id.endsWith("::node::new_run_marker"))).toBe(false)
+    for (const relative of rootFiles) {
+      expect(await fs.readFile(path.join(caseDir, relative))).toEqual(oldRootBytes.get(relative)!)
+    }
   })
 
   test("stores large semantic payloads as artifacts and keeps trace.json lightweight", async () => {

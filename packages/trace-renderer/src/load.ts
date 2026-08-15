@@ -1,4 +1,5 @@
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import {
   CausalIRJournalValidationError,
@@ -119,7 +120,12 @@ function isCausalIREdge(input: unknown): input is CausalIREdge {
 }
 
 function isArtifact(input: unknown) {
-  return isRecord(input) && isNonEmptyString(input.artifact_id) && isNonEmptyString(input.hash) && isNonEmptyString(input.path)
+  return (
+    isRecord(input) &&
+    isNonEmptyString(input.artifact_id) &&
+    isNonEmptyString(input.hash) &&
+    isNonEmptyString(input.path)
+  )
 }
 
 function isDiagnostic(input: unknown) {
@@ -131,11 +137,17 @@ function isManifest(input: unknown) {
 }
 
 function isMetrics(input: unknown) {
-  return isRecord(input) && isRecord(input.token_usage) && isRecord(input.trace_health) && Array.isArray(input.trace_health.issues)
+  return (
+    isRecord(input) &&
+    isRecord(input.token_usage) &&
+    isRecord(input.trace_health) &&
+    Array.isArray(input.trace_health.issues)
+  )
 }
 
 function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument {
-  if (!isRecord(input) || !isManifest(input.manifest) || !isMetrics(input.metrics) || !isRecord(input.journal)) return false
+  if (!isRecord(input) || !isManifest(input.manifest) || !isMetrics(input.metrics) || !isRecord(input.journal))
+    return false
   return (
     isNonEmptyString(input.trace_version) &&
     input.causal_ir_version === "1.0" &&
@@ -162,26 +174,42 @@ function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument
   )
 }
 
-function selectSource(input: string): { file: string; caseDir: string; source: TraceSource } {
+function materializeReadOnly(caseDir: string) {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-renderer-"))
+  try {
+    const materialized = materializeTrace({ caseDir, outputDir: temporary })
+    return {
+      file: materialized.traceFile,
+      caseDir,
+      source: "trace.json" as const,
+      cleanup: () => fs.rmSync(temporary, { recursive: true, force: true }),
+    }
+  } catch (error) {
+    fs.rmSync(temporary, { recursive: true, force: true })
+    throw error
+  }
+}
+
+function selectSource(input: string): { file: string; caseDir: string; source: TraceSource; cleanup?: () => void } {
   const target = path.resolve(input)
   const stats = fs.statSync(target)
   if (stats.isDirectory()) {
-    const session = path.join(target, "session.json")
-    if (fs.existsSync(session)) {
-      const materialized = materializeTrace({ caseDir: target })
-      return { file: materialized.traceFile, caseDir: target, source: "trace.json" }
-    }
     const trace = path.join(target, "trace.json")
     if (fs.existsSync(trace)) return { file: trace, caseDir: target, source: "trace.json" }
+    const session = path.join(target, "session.json")
+    if (fs.existsSync(session)) return materializeReadOnly(target)
     const journal = path.join(target, "records.jsonl")
     if (fs.existsSync(journal)) return { file: journal, caseDir: target, source: "records.jsonl" }
     throw new Error(`${target}: expected session.json, trace.json, or records.jsonl`)
   }
-  if (!stats.isFile()) throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
+  if (!stats.isFile())
+    throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
 
   if (path.basename(target) === "session.json") {
-    const materialized = materializeTrace({ caseDir: path.dirname(target) })
-    return { file: materialized.traceFile, caseDir: path.dirname(target), source: "trace.json" }
+    const caseDir = path.dirname(target)
+    const trace = path.join(caseDir, "trace.json")
+    if (fs.existsSync(trace)) return { file: trace, caseDir, source: "trace.json" }
+    return materializeReadOnly(caseDir)
   }
   const source = path.basename(target) as TraceSource
   if (source !== "trace.json" && source !== "records.jsonl")
@@ -198,7 +226,12 @@ function readJSON(file: string) {
   }
 }
 
-function project(snapshot: CausalIRStoreSnapshot, traceVersion: string, manifest: Record<string, unknown>, metrics: Record<string, unknown>) {
+function project(
+  snapshot: CausalIRStoreSnapshot,
+  traceVersion: string,
+  manifest: Record<string, unknown>,
+  metrics: Record<string, unknown>,
+) {
   return projectProvenanceTrace(snapshot, {
     traceVersion,
     manifest: manifest as ProvenanceProjectionInput["manifest"],
@@ -284,8 +317,10 @@ function recoveryManifest(
   return {
     ...manifest,
     trace_version: typeof manifest.trace_version === "string" ? manifest.trace_version : "6.0",
-    case_id: typeof manifest.case_id === "string" && manifest.case_id ? manifest.case_id : snapshot.caseID || "recovered-case",
-    run_id: typeof manifest.run_id === "string" && manifest.run_id ? manifest.run_id : snapshot.runID || "recovered-run",
+    case_id:
+      typeof manifest.case_id === "string" && manifest.case_id ? manifest.case_id : snapshot.caseID || "recovered-case",
+    run_id:
+      typeof manifest.run_id === "string" && manifest.run_id ? manifest.run_id : snapshot.runID || "recovered-run",
     status: "error",
     server_status: "error",
     process_status: "error",
@@ -299,63 +334,68 @@ function recoveryMetrics(trace: CausalIRTraceDocument | undefined): Record<strin
   return {
     ...metrics,
     token_usage: isRecord(metrics.token_usage) ? metrics.token_usage : {},
-    trace_health: isRecord(metrics.trace_health) && Array.isArray(metrics.trace_health.issues)
-      ? metrics.trace_health
-      : { issues: [] },
+    trace_health:
+      isRecord(metrics.trace_health) && Array.isArray(metrics.trace_health.issues)
+        ? metrics.trace_health
+        : { issues: [] },
   }
 }
 
 export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
   const selected = selectSource(input)
-  if (selected.source === "trace.json") {
-    const document = readJSON(selected.file)
-    if (isCompatibilityTraceDocument(document)) {
+  try {
+    if (selected.source === "trace.json") {
+      const document = readJSON(selected.file)
+      if (isCompatibilityTraceDocument(document)) {
+        return {
+          trace: projectCompatibilityDocument(document),
+          caseDir: selected.caseDir,
+          source: selected.source,
+          incomplete: false,
+        }
+      }
+      if (!isCausalIRTraceDocument(document)) throw new Error(`${selected.file}: invalid Causal IR trace document`)
       return {
-        trace: projectCompatibilityDocument(document),
+        trace: projectDocument(document),
+        caseDir: selected.caseDir,
+        source: selected.source,
+        incomplete: document.manifest.recovery_status === "incomplete_journal_replay",
+      }
+    }
+
+    const journal = readJournal(selected.file)
+    try {
+      validateCausalIRJournal(journal, { requireInitialRunNode: true })
+    } catch (error) {
+      if (error instanceof CausalIRJournalValidationError) {
+        throw new Error(`${selected.file}:${error.line}: ${error.message}`)
+      }
+      throw error
+    }
+    const replayedTrace = replayCausalIRTrace(journal)
+    const finalizedTrace = replayFinalizedCausalIRTrace(journal)
+    if (finalizedTrace) {
+      return {
+        trace: projectDocument(finalizedTrace),
         caseDir: selected.caseDir,
         source: selected.source,
         incomplete: false,
       }
     }
-    if (!isCausalIRTraceDocument(document)) throw new Error(`${selected.file}: invalid Causal IR trace document`)
+
+    const snapshot = replayCausalIRJournal(journal)
     return {
-      trace: projectDocument(document),
+      trace: project(
+        snapshot,
+        replayedTrace?.trace_version ?? "6.0",
+        recoveryManifest(snapshot, replayedTrace),
+        recoveryMetrics(replayedTrace),
+      ),
       caseDir: selected.caseDir,
       source: selected.source,
-      incomplete: document.manifest.recovery_status === "incomplete_journal_replay",
+      incomplete: true,
     }
-  }
-
-  const journal = readJournal(selected.file)
-  try {
-    validateCausalIRJournal(journal, { requireInitialRunNode: true })
-  } catch (error) {
-    if (error instanceof CausalIRJournalValidationError) {
-      throw new Error(`${selected.file}:${error.line}: ${error.message}`)
-    }
-    throw error
-  }
-  const replayedTrace = replayCausalIRTrace(journal)
-  const finalizedTrace = replayFinalizedCausalIRTrace(journal)
-  if (finalizedTrace) {
-    return {
-      trace: projectDocument(finalizedTrace),
-      caseDir: selected.caseDir,
-      source: selected.source,
-      incomplete: false,
-    }
-  }
-
-  const snapshot = replayCausalIRJournal(journal)
-  return {
-    trace: project(
-      snapshot,
-      replayedTrace?.trace_version ?? "6.0",
-      recoveryManifest(snapshot, replayedTrace),
-      recoveryMetrics(replayedTrace),
-    ),
-    caseDir: selected.caseDir,
-    source: selected.source,
-    incomplete: true,
+  } finally {
+    selected.cleanup?.()
   }
 }
