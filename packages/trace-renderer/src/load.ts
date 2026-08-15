@@ -17,6 +17,12 @@ import {
   type ProvenanceTraceProjection,
 } from "opencode/observability/causal-ir"
 import { materializeTrace } from "opencode/observability/trace-materializer"
+import {
+  readTraceSessionManifest,
+  traceSessionLockRootForCase,
+  TRACE_MANIFEST_LOCK_KEY,
+  withTraceSessionLock,
+} from "opencode/observability/trace-segment"
 
 export type CompatibilityTraceProjection = {
   trace_version: string
@@ -177,7 +183,7 @@ function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument
 function materializeReadOnly(caseDir: string) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-renderer-"))
   try {
-    const materialized = materializeTrace({ caseDir, outputDir: temporary })
+    const materialized = materializeTrace({ caseDir, outputDir: temporary, _lockHeld: true })
     return {
       file: materialized.traceFile,
       caseDir,
@@ -192,10 +198,8 @@ function materializeReadOnly(caseDir: string) {
 
 function rootTraceIsCurrent(caseDir: string, traceFile: string) {
   const sessionFile = path.join(caseDir, "session.json")
-  if (!fs.existsSync(sessionFile)) return true
-  const session = readJSON(sessionFile)
-  if (!isRecord(session) || !Number.isSafeInteger(session.generation) || (session.generation as number) < 0)
-    throw new Error(`${sessionFile}: invalid trace session manifest`)
+  const session = readTraceSessionManifest(sessionFile)
+  if (!session) return true
   const trace = readJSON(traceFile)
   return isRecord(trace) && isRecord(trace.manifest) && trace.manifest.session_generation === session.generation
 }
@@ -357,7 +361,7 @@ function recoveryMetrics(trace: CausalIRTraceDocument | undefined): Record<strin
   }
 }
 
-export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
+function loadRenderableTraceLocked(input: string): RenderableTraceLoadResult {
   const selected = selectSource(input)
   try {
     if (selected.source === "trace.json") {
@@ -417,4 +421,13 @@ export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
   } finally {
     selected.cleanup?.()
   }
+}
+
+export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
+  const target = path.resolve(input)
+  const stats = fs.statSync(target)
+  const caseDir = stats.isDirectory() ? target : path.dirname(target)
+  return withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, () =>
+    loadRenderableTraceLocked(target),
+  )
 }

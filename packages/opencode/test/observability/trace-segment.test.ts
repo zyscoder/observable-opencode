@@ -672,6 +672,113 @@ test("rejects malformed session and legacy roots without changing their trees", 
   }
 })
 
+test("validates every session manifest and descriptor field before mutating a logical root", async () => {
+  const validManifest = () => ({
+    schema_version: "1.0",
+    logical_case_id: "validated-case",
+    session_id: "ses_validated",
+    lock_key: globalManifestLockKey,
+    generation: 1,
+    created_at: "2026-08-15T00:00:00.000Z",
+    updated_at: "2026-08-15T00:00:01.000Z",
+    segments: [
+      {
+        segment_id: "run_existing",
+        run_id: "run_existing",
+        case_id: "validated-case",
+        session_id: "ses_validated",
+        path: "segments/run_existing",
+        records: "segments/run_existing/records.jsonl",
+        artifacts: "segments/run_existing/artifacts",
+        index: "segments/run_existing/index.sqlite",
+        started_at: "2026-08-15T00:00:00.000Z",
+        status: "completed",
+      },
+    ],
+  })
+  const invalid: Array<[string, (manifest: any) => void]> = [
+    ["logical_case_id", (manifest) => (manifest.logical_case_id = 7)],
+    ["session_id", (manifest) => (manifest.session_id = 7)],
+    ["lock_key", (manifest) => (manifest.lock_key = "case:old-domain")],
+    ["generation", (manifest) => (manifest.generation = -1)],
+    ["created_at", (manifest) => (manifest.created_at = "yesterday")],
+    ["updated_at", (manifest) => (manifest.updated_at = 7)],
+    ["timestamp_order", (manifest) => (manifest.updated_at = "2026-08-14T23:59:59.000Z")],
+    ["segments", (manifest) => (manifest.segments = {})],
+    ["segment_id", (manifest) => (manifest.segments[0].segment_id = 7)],
+    ["run_id", (manifest) => (manifest.segments[0].run_id = "")],
+    ["case_id", (manifest) => (manifest.segments[0].case_id = 7)],
+    ["descriptor_session_id", (manifest) => (manifest.segments[0].session_id = 7)],
+    [
+      "descriptor_session_without_manifest",
+      (manifest) => {
+        delete manifest.session_id
+      },
+    ],
+    ["path", (manifest) => (manifest.segments[0].path = "../outside")],
+    [
+      "path_segment_mismatch",
+      (manifest) => {
+        manifest.segments[0].path = "segments/other"
+        manifest.segments[0].records = "segments/other/records.jsonl"
+        manifest.segments[0].artifacts = "segments/other/artifacts"
+        manifest.segments[0].index = "segments/other/index.sqlite"
+      },
+    ],
+    ["records", (manifest) => (manifest.segments[0].records = "/tmp/records.jsonl")],
+    ["records_contract", (manifest) => (manifest.segments[0].records = "segments/run_existing/other.jsonl")],
+    ["artifacts", (manifest) => delete manifest.segments[0].artifacts],
+    ["index", (manifest) => (manifest.segments[0].index = 7)],
+    ["started_at", (manifest) => (manifest.segments[0].started_at = "not-a-time")],
+    ["status", (manifest) => (manifest.segments[0].status = "unknown")],
+    ["continuation_of", (manifest) => (manifest.segments[0].continuation_of = 7)],
+    ["continuation_target", (manifest) => (manifest.segments[0].continuation_of = "run_missing")],
+  ]
+
+  for (const [name, mutate] of invalid) {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-invalid-manifest-${name}-`))
+    const logicalRoot = path.join(traceRoot, "validated-case")
+    try {
+      await fs.mkdir(logicalRoot, { recursive: true })
+      const manifest = validManifest()
+      mutate(manifest)
+      const descriptor = manifest.segments?.[0]
+      const descriptorPath =
+        typeof descriptor?.path === "string" &&
+        !path.isAbsolute(descriptor.path) &&
+        !descriptor.path.split(/[\\/]/).includes("..")
+          ? descriptor.path
+          : "segments/run_existing"
+      await fs.mkdir(path.join(logicalRoot, descriptorPath), { recursive: true })
+      await fs.writeFile(path.join(logicalRoot, descriptorPath, "segment.json"), JSON.stringify(descriptor) + "\n")
+      await fs.writeFile(path.join(logicalRoot, "session.json"), JSON.stringify(manifest) + "\n")
+      await fs.writeFile(path.join(logicalRoot, "preserved.bin"), Buffer.from([0, 1, 2, 255]))
+      const before = await treeHash(logicalRoot)
+      const outputDir = path.join(traceRoot, `materialized-${name}`)
+
+      expect(() => materializeTrace({ caseDir: logicalRoot, outputDir }), name).toThrow()
+      expect(await treeHash(logicalRoot), name).toBe(before)
+      expect(await fileExists(outputDir), name).toBe(false)
+
+      expect(
+        () =>
+          openTraceSegment({
+            rootDir: traceRoot,
+            logicalCaseID: "validated-case",
+            sessionID: "ses_validated",
+            runID: `run_after_${name}`,
+          }),
+        name,
+      ).toThrow()
+      expect(await treeHash(logicalRoot), name).toBe(before)
+      expect(await fileExists(path.join(logicalRoot, ".derived")), name).toBe(false)
+      expect(await fileExists(path.join(logicalRoot, "segments", `run_after_${name}`)), name).toBe(false)
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true })
+    }
+  }
+})
+
 test("globally serializes concurrent late bindings without duplicate session roots", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-global-bind-"))
   try {
@@ -899,6 +1006,21 @@ async function writeClosedSegment(
     timestamp: "2026-08-15T00:00:01.000Z",
     time_ms: 1,
     status: "success",
+    aliases: input.referenceFixture
+      ? [
+          "design:shared_design",
+          "claim:shared_claim",
+          "evidence:shared_evidence",
+          "verification:shared_verification",
+          "change:shared_change",
+          "context:shared_context",
+          "response:shared_response",
+          "response_segment:shared_segment",
+          "tool_call:shared_tool_call",
+          "skill:shared_skill",
+          "mcp_call:shared_mcp_call",
+        ]
+      : [],
     data: {
       claim: `${input.marker} fact`,
       ...(input.referenceFixture
@@ -908,17 +1030,35 @@ async function writeClosedSegment(
             ordinary_text: "node:run_start",
             node_id: "run_start",
             parent_node_id: "run_start",
-            design_id: "run_start",
-            claim_id: "shared_fact",
+            design_id: "shared_design",
+            claim_id: "shared_claim",
+            evidence_id: "shared_evidence",
+            verification_id: "shared_verification",
+            change_id: "shared_change",
+            context_id: "shared_context",
+            response_id: "shared_response",
+            segment_id: "shared_segment",
+            tool_call_id: "shared_tool_call",
+            skill_id: "shared_skill",
+            mcp_call_id: "shared_mcp_call",
             customer_node_id: "run_start",
             artifact_id: "shared_artifact",
             missing_artifact_id: "missing_artifact",
-            typed_ref: { ref_type: "node", ref_id: "run_start", legacy_ref: "node:run_start" },
+            typed_ref: {
+              ref_type: "node",
+              ref_id: "shared_evidence",
+              legacy_ref: "evidence:shared_evidence",
+            },
             candidate_ref: { ref_type: "node", ref_id: "run_start", legacy_ref: "node:run_start" },
             missing_typed_ref: { ref_type: "node", ref_id: "missing_node", legacy_ref: "node:missing_node" },
             legacy_refs: ["node:run_start", "artifact:shared_artifact"],
             generation_context_ref: "node:run_start",
+            direct_evidence_refs: ["evidence:shared_evidence"],
+            verification_refs: ["verification:shared_verification"],
+            generation_provenance_refs: ["node:run_start"],
+            changed_test_refs: ["change:shared_change"],
             documentation_ref: "https://example.test/node:run_start",
+            customer_node_ref: "customer supplied node:run_start",
           }
         : {}),
     },
@@ -1003,6 +1143,75 @@ async function writeClosedSegment(
   expect(segment.finalize(input.terminal?.manifest.status === "error" ? "failed" : "completed")).toBe(true)
 }
 
+test("uses the global manifest lock for flat, segmented-output, and publication materialization", async () => {
+  const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-materializer-global-lock-"))
+  try {
+    process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = "0"
+    const flatCase = path.join(traceRoot, "legacy-flat")
+    await fs.mkdir(flatCase)
+    const flatEntries: CausalIRJournalEntry[] = []
+    const flatStore = new CausalIRStore({
+      runID: "run_flat_lock",
+      caseID: "legacy-flat",
+      append: (entry) => flatEntries.push(entry),
+    })
+    flatStore.createNode({
+      node_id: "run_start",
+      kind: "run.start",
+      component: "run",
+      timestamp: "2026-08-15T00:00:00.000Z",
+      time_ms: 0,
+      status: "running",
+      data: { run_id: "run_flat_lock", case_id: "legacy-flat" },
+    })
+    flatStore.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-15T00:00:01.000Z",
+      manifest: { case_id: "legacy-flat", run_id: "run_flat_lock" },
+    })
+    await fs.writeFile(
+      path.join(flatCase, "records.jsonl"),
+      flatEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    )
+
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "segmented-lock",
+      sessionID: "ses_segmented_lock",
+      runID: "run_segmented_lock",
+    })
+    await writeClosedSegment(segment, {
+      runID: "run_segmented_lock",
+      marker: "locked",
+      caseID: "segmented-lock",
+    })
+    const outputDir = path.join(traceRoot, "read-only-output")
+    const flatBefore = await treeHash(flatCase)
+    const segmentedBefore = await treeHash(segment.logicalRoot)
+    const release = acquireTraceSessionLock(traceRoot, globalManifestLockKey)
+    try {
+      expect(() => materializeTrace({ caseDir: flatCase })).toThrow("timed out waiting for trace session lock")
+      expect(() => materializeTrace({ caseDir: segment.logicalRoot, outputDir })).toThrow(
+        "timed out waiting for trace session lock",
+      )
+      expect(() => materializeTrace({ caseDir: segment.logicalRoot })).toThrow(
+        "timed out waiting for trace session lock",
+      )
+    } finally {
+      release()
+    }
+    expect(await treeHash(flatCase)).toBe(flatBefore)
+    expect(await treeHash(segment.logicalRoot)).toBe(segmentedBefore)
+    expect(await fileExists(outputDir)).toBe(false)
+  } finally {
+    if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+    else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
 test("materializes two colliding segments as one scoped trace with continuation provenance", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-unified-segments-"))
   try {
@@ -1066,7 +1275,7 @@ test("materializes two colliding segments as one scoped trace with continuation 
         segment_id: node.scope.run_id,
       })
       expect(node.input_refs[0].ref_id).toBe(`${node.scope.run_id}::node::run_start`)
-      expect(node.source_refs[0].legacy_ref).toBe("evidence:run_start")
+      expect(node.source_refs[0].legacy_ref).toBe(`evidence:${node.scope.run_id}::node::run_start`)
       expect(fact.input_refs).toEqual([`node:${node.scope.run_id}::node::run_start`])
     }
     for (const edge of localEdges) {
@@ -1303,6 +1512,29 @@ function expectValidScopedGraph(trace: any) {
     if (diagnostic.artifact_id) expect(artifacts.has(diagnostic.artifact_id)).toBe(true)
     if (diagnostic.reference) expectRef(diagnostic.reference)
   }
+  const visit = (value: unknown) => {
+    if (typeof value === "string") {
+      const scoped = /^(node|record|design|claim|context|response|response_segment|tool_call|skill|mcp_call|evidence|verification|change|observation|span):(.+::node::.+)$/.exec(
+        value,
+      )
+      if (scoped) expect(nodes.has(scoped[2]!)).toBe(true)
+      const artifact = /^artifact:(.+::artifact::.+)$/.exec(value)
+      if (artifact) expect(artifacts.has(artifact[1]!)).toBe(true)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    if (value && typeof value === "object") for (const item of Object.values(value)) visit(item)
+  }
+  visit({
+    nodes: trace.nodes,
+    edges: trace.edges,
+    diagnostics: trace.diagnostics,
+    manifest: trace.manifest,
+    metrics: trace.metrics,
+  })
 }
 
 async function visibleDerivedState(caseDir: string) {
@@ -1382,15 +1614,24 @@ test("rewrites only schema-declared references with per-segment identity maps", 
       ordinary_text: "node:run_start",
       node_id: `${prefix}::node::run_start`,
       parent_node_id: `${prefix}::node::run_start`,
-      design_id: `${prefix}::node::run_start`,
+      design_id: `${prefix}::node::shared_fact`,
       claim_id: `${prefix}::node::shared_fact`,
+      evidence_id: `${prefix}::node::shared_fact`,
+      verification_id: `${prefix}::node::shared_fact`,
+      change_id: `${prefix}::node::shared_fact`,
+      context_id: `${prefix}::node::shared_fact`,
+      response_id: `${prefix}::node::shared_fact`,
+      segment_id: `${prefix}::node::shared_fact`,
+      tool_call_id: `${prefix}::node::shared_fact`,
+      skill_id: `${prefix}::node::shared_fact`,
+      mcp_call_id: `${prefix}::node::shared_fact`,
       customer_node_id: "run_start",
       artifact_id: `${prefix}::artifact::shared_artifact`,
       missing_artifact_id: "missing_artifact",
       typed_ref: {
         ref_type: "node",
-        ref_id: `${prefix}::node::run_start`,
-        legacy_ref: `node:${prefix}::node::run_start`,
+        ref_id: `${prefix}::node::shared_fact`,
+        legacy_ref: `evidence:${prefix}::node::shared_fact`,
       },
       candidate_ref: {
         ref_type: "node",
@@ -1400,7 +1641,12 @@ test("rewrites only schema-declared references with per-segment identity maps", 
       missing_typed_ref: { ref_type: "node", ref_id: "missing_node", legacy_ref: "node:missing_node" },
       legacy_refs: [`node:${prefix}::node::run_start`, `artifact:${prefix}::artifact::shared_artifact`],
       generation_context_ref: `node:${prefix}::node::run_start`,
+      direct_evidence_refs: [`evidence:${prefix}::node::shared_fact`],
+      verification_refs: [`verification:${prefix}::node::shared_fact`],
+      generation_provenance_refs: [`node:${prefix}::node::run_start`],
+      changed_test_refs: [`change:${prefix}::node::shared_fact`],
       documentation_ref: "https://example.test/node:run_start",
+      customer_node_ref: "customer supplied node:run_start",
     })
     const diagnostic = trace.diagnostics.find((item: any) => item.scope?.run_id === "run_schema_second")
     expect(diagnostic).toMatchObject({
@@ -1492,6 +1738,42 @@ test("publishes each derived compatibility set through one atomic generation ind
     if (previousFailure === undefined) delete process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
     else process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = previousFailure
     await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("cleans a first derived generation after copy and root-link failures", async () => {
+  const previousFailure = process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
+  try {
+    for (const step of ["generation_copying", "root_link_installing"]) {
+      const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-derived-first-${step}-`))
+      try {
+        const segment = openTraceSegment({
+          rootDir: traceRoot,
+          logicalCaseID: "first-generation-case",
+          sessionID: "ses_first_generation",
+          runID: `run_${step}`,
+        })
+        await writeClosedSegment(segment, {
+          runID: `run_${step}`,
+          marker: step,
+          caseID: "first-generation-case",
+          terminal: { manifest: { status: "success", run_id: `run_${step}` }, metrics: {} },
+        })
+        const before = await treeHash(segment.logicalRoot)
+        process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = step
+
+        expect(() => materializeTrace({ caseDir: segment.logicalRoot })).toThrow(
+          `injected derived publication failure: ${step}`,
+        )
+        expect(await treeHash(segment.logicalRoot)).toBe(before)
+        expect(await fileExists(path.join(segment.logicalRoot, ".derived"))).toBe(false)
+      } finally {
+        await fs.rm(traceRoot, { recursive: true, force: true })
+      }
+    }
+  } finally {
+    if (previousFailure === undefined) delete process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
+    else process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = previousFailure
   }
 })
 

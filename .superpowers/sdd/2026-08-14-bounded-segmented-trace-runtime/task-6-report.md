@@ -398,3 +398,87 @@ The full case-trace failure is exactly `persists semantic trace records with art
 - Derived generations are immutable once installed. Session finalization increments the manifest generation; read-only rendering of a still-running generation stays temporary and never publishes into the logical root.
 - Root `legacy-trace.json` remains the newest valid terminal's legacy projection. The canonical and provenance files are the complete multi-segment history.
 - A malformed unrelated session manifest encountered while scanning the configured trace root prevents session discovery and causes passive fallback. This favors uniqueness and evidence preservation over partial discovery.
+
+## Fix Round 3/5 Completion
+
+Status on 2026-08-16: **review round 3 complete**. The full case-trace suite has only the explicitly excluded, unchanged `artifact[0]` assertion failing.
+
+### RED
+
+The initial focused run established four segment/materializer failures (`26 pass, 4 fail`) and one renderer failure (`21 pass, 1 fail`):
+
+- a well-typed but invalid `lock_key` was silently normalized and the root was mutated;
+- legacy-flat and explicit-output materialization bypassed the global manifest lock;
+- semantic aliases such as `evidence:`, `verification:`, `change:`, context, response, tool, skill, and MCP identities were not resolved to scoped canonical nodes;
+- injected first-generation copy failure did not exist, so publication succeeded instead of proving cleanup;
+- renderer temporary reconstruction hardlinked a segment artifact, changing its source `ctime`.
+
+A second RED check made the manifest test physically valid and then proved that a reversed `created_at`/`updated_at` ordering was accepted. The table also covers every descriptor field, optional session IDs, status, traversal/absolute paths, exact records/artifacts/index contracts, generation, lock metadata, and continuation targets.
+
+### GREEN Behavior
+
+- `readTraceSessionManifest` is now the single parser used by allocation, binding/finalization, materialization, and renderer generation checks. It validates full field types and values, timestamp ordering, global lock metadata, nonnegative generation, ordered unique run/segment identities, session consistency, continuation targets, and canonical non-escaping descriptor paths. Resume additionally validates each immutable physical `segment.json` identity before creating a directory.
+- Malformed roots are rejected before output or segment creation. Both allocation and explicit-output materialization tests compare recursive tree hashes and assert that no new segment, `.derived`, or output directory appears.
+- Flat materialization, explicit-output/read-only reconstruction, segmented publication, and renderer reads all use `trace-root-manifest-v1`. Renderer holds the lock across session/trace generation comparison and the complete read or temporary replay, including legacy-flat input.
+- Multi-segment replay pre-registers canonical node aliases and rejects ambiguous alias tails. Exact semantic ID fields and resolved safe-suffix `*_ref`/`*_refs` values scope through canonical entity maps. Recognized causal schemes resolve to scoped canonical node IDs; URLs, paths, customer fields, ordinary text, and unresolved values remain byte-for-byte unchanged. The graph validator walks typed and legacy scoped references across nodes, edges, diagnostics, terminal data, and metrics.
+- Generation creation, population, compatibility-link installation, and current-symlink swap are one rollback boundary. Injected failures during first-generation copying and after the first root-link install recursively remove temporary/new generations, restore prior paths, and remove newly created empty `.derived` parents.
+- Read-only materialization recursively copies compatibility artifact bytes. Renderer tests preserve source content, `ctime`, link count, and the full logical-root tree while reconstructing a stale generation containing an interrupted segment.
+
+### Exact Layout
+
+```text
+$OPENCODE_CASE_TRACE_DIR/session-case/
+  session.json
+  trace.json                   -> .derived/current/trace.json
+  manifest.json                -> .derived/current/manifest.json
+  legacy-trace.json            -> .derived/current/legacy-trace.json
+  provenance-trace.json        -> .derived/current/provenance-trace.json
+  partial/latest.json          -> ../.derived/current/partial/latest.json
+  .derived/
+    current                    -> generations/<generation>
+    generations/<generation>/
+      trace.json
+      manifest.json
+      legacy-trace.json
+      provenance-trace.json
+      partial/latest.json
+      artifacts/...
+  segments/
+    <segment-id>/
+      segment.json
+      records.jsonl
+      index.sqlite
+      artifacts/...
+```
+
+New segmented roots still do not expose mutable root `records.jsonl`, `events.jsonl`, or `raw-events.jsonl`. A legacy root journal remains immutable segment zero.
+
+### Final Verification
+
+```text
+packages/opencode:
+  trace-segment.test.ts                                  30 pass, 0 fail, 623 expects
+  trace-materializer.test.ts + diagnostics               8 pass, 0 fail, 24 expects
+  trace-materializer-memory.test.ts                       1 pass, 0 fail, 5 expects
+    peak RSS                                             255,197,184 bytes
+  worker-trace + materializer-process + thread           11 pass, 0 fail, 37 expects
+  case-trace.test.ts (120 s test ceiling)                162 pass, 1 fail, 2134 expects
+
+packages/trace-renderer:
+  load.test.ts + cli.test.ts                             38 pass, 0 fail, 201 expects
+  bun run typecheck                                      pass
+
+repository:
+  git diff --check                                       pass
+```
+
+The first 30-second full case-trace run reported `161 pass, 2 fail, 1 hook error`: the known artifact assertion plus a spurious `stores large semantic payloads` timeout with an impossible `917,529 ms` duration. That exact test immediately passed alone in 326 ms. A complete rerun with a 120-second per-test ceiling passed it in 260 ms and finished at `162 pass, 1 fail`; the sole failure is the excluded `trace.artifacts[0]` baseline, which remains unchanged.
+
+`packages/opencode` typecheck still exits 2 only for the pre-existing sidebar implicit-any diagnostics, worktree/main SDK private-type duplication, plugin overload/dependency resolution, missing plugin dependencies, and semver declarations. No Task 6 or observability file appears in its diagnostics.
+
+### Compatibility Risks
+
+- Strict segmented-manifest validation rejects old or hand-authored segmented manifests that omit `lock_key`, `generation`, `artifacts`, or `index`, use noncanonical descriptor paths, or contain inconsistent session/continuation metadata. Legacy flat roots without `session.json` remain supported.
+- Alias tails shared by multiple nodes are intentionally left unresolved rather than assigned nondeterministically. Explicit canonical IDs and fully qualified aliases remain deterministic.
+- Standalone case directories directly under a protected parent use the case directory as the lock-root anchor because a sibling lock for the inferred parent cannot be created. Normal configured trace roots use the same parent-root global domain as allocation and publication.
+- Atomic root generation switching still depends on symlink support. A link/swap failure removes the candidate generation and leaves the previous visible set intact.

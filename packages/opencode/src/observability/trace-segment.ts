@@ -56,39 +56,89 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return Boolean(input) && typeof input === "object" && !Array.isArray(input)
 }
 
-function readSessionManifest(file: string): TraceSessionManifest | undefined {
+function nonemptyString(input: unknown): input is string {
+  return typeof input === "string" && input.length > 0
+}
+
+function validTimestamp(input: unknown): input is string {
+  return nonemptyString(input) && Number.isFinite(Date.parse(input))
+}
+
+function validRelativePath(input: unknown, allowCurrent = false): input is string {
+  if (!nonemptyString(input) || input.includes("\0")) return false
+  const portable = input.replaceAll("\\", "/")
+  if (portable.startsWith("/") || /^[a-zA-Z]:\//.test(portable)) return false
+  const normalized = path.posix.normalize(portable)
+  if (normalized === ".") return allowCurrent && portable === "."
+  return normalized === portable && normalized !== ".." && !normalized.startsWith("../")
+}
+
+function pathIsWithinDescriptor(descriptorPath: string, candidate: string) {
+  if (descriptorPath === ".") return validRelativePath(candidate)
+  return candidate.startsWith(`${descriptorPath}/`) && validRelativePath(candidate)
+}
+
+function parseSegmentDescriptor(input: unknown, file: string): TraceSegmentDescriptor {
+  if (!isRecord(input)) throw new Error(`${file}: invalid trace segment descriptor`)
+  const descriptor = input as Partial<TraceSegmentDescriptor>
+  if (
+    !nonemptyString(descriptor.segment_id) ||
+    !nonemptyString(descriptor.run_id) ||
+    !nonemptyString(descriptor.case_id) ||
+    (descriptor.session_id !== undefined && !nonemptyString(descriptor.session_id)) ||
+    !validRelativePath(descriptor.path, descriptor.segment_id === "legacy-root") ||
+    !validRelativePath(descriptor.records) ||
+    !validRelativePath(descriptor.artifacts) ||
+    !validRelativePath(descriptor.index) ||
+    !pathIsWithinDescriptor(descriptor.path, descriptor.records) ||
+    !pathIsWithinDescriptor(descriptor.path, descriptor.artifacts) ||
+    !pathIsWithinDescriptor(descriptor.path, descriptor.index) ||
+    !validTimestamp(descriptor.started_at) ||
+    !["running", "completed", "failed", "cancelled", "interrupted_unfinalized"].includes(
+      descriptor.status as string,
+    ) ||
+    (descriptor.continuation_of !== undefined && !nonemptyString(descriptor.continuation_of))
+  )
+    throw new Error(`${file}: invalid trace segment descriptor`)
+  const prefix = descriptor.path === "." ? "" : `${descriptor.path}/`
+  if (
+    (descriptor.segment_id === "legacy-root"
+      ? descriptor.path !== "."
+      : descriptor.path !== `segments/${descriptor.segment_id}`) ||
+    descriptor.records !== `${prefix}records.jsonl` ||
+    descriptor.artifacts !== `${prefix}artifacts` ||
+    descriptor.index !== `${prefix}index.sqlite`
+  )
+    throw new Error(`${file}: invalid trace segment descriptor paths`)
+  return descriptor as TraceSegmentDescriptor
+}
+
+export function readTraceSessionManifest(file: string): TraceSessionManifest | undefined {
   if (!fs.existsSync(file)) return undefined
   const manifest = JSON.parse(fs.readFileSync(file, "utf8")) as unknown
   if (
     !isRecord(manifest) ||
     manifest.schema_version !== "1.0" ||
-    typeof manifest.logical_case_id !== "string" ||
-    typeof manifest.created_at !== "string" ||
-    typeof manifest.updated_at !== "string" ||
+    !nonemptyString(manifest.logical_case_id) ||
+    (manifest.session_id !== undefined && !nonemptyString(manifest.session_id)) ||
+    manifest.lock_key !== TRACE_MANIFEST_LOCK_KEY ||
+    !Number.isSafeInteger(manifest.generation) ||
+    (manifest.generation as number) < 0 ||
+    !validTimestamp(manifest.created_at) ||
+    !validTimestamp(manifest.updated_at) ||
+    Date.parse(manifest.updated_at as string) < Date.parse(manifest.created_at as string) ||
     !Array.isArray(manifest.segments)
   )
     throw new Error(`${file}: invalid trace session manifest`)
-  const session = manifest as unknown as TraceSessionManifest
+  const session = manifest as TraceSessionManifest
   const runIDs = new Set<string>()
   const segmentIDs = new Set<string>()
-  for (const descriptor of session.segments) {
+  const segments = session.segments.map((input) => parseSegmentDescriptor(input, file))
+  for (const descriptor of segments) {
     if (
-      !isRecord(descriptor) ||
-      typeof descriptor.segment_id !== "string" ||
-      !descriptor.segment_id ||
-      typeof descriptor.run_id !== "string" ||
-      !descriptor.run_id ||
-      typeof descriptor.case_id !== "string" ||
-      !descriptor.case_id ||
-      typeof descriptor.path !== "string" ||
-      !descriptor.path ||
-      typeof descriptor.records !== "string" ||
-      !descriptor.records ||
-      typeof descriptor.started_at !== "string" ||
-      !descriptor.started_at ||
-      !["running", "completed", "failed", "cancelled", "interrupted_unfinalized"].includes(
-        descriptor.status as string,
-      ) ||
+      descriptor.case_id !== session.logical_case_id ||
+      descriptor.session_id !== session.session_id ||
+      (descriptor.continuation_of !== undefined && !runIDs.has(descriptor.continuation_of)) ||
       runIDs.has(descriptor.run_id) ||
       segmentIDs.has(descriptor.segment_id)
     )
@@ -98,9 +148,13 @@ function readSessionManifest(file: string): TraceSessionManifest | undefined {
   }
   return {
     ...session,
-    lock_key: TRACE_MANIFEST_LOCK_KEY,
-    generation: Number.isSafeInteger(session.generation) && session.generation >= 0 ? session.generation : 0,
+    segments,
   }
+}
+
+function readSegmentDescriptor(file: string) {
+  if (!fs.existsSync(file)) throw new Error(`${file}: missing immutable trace segment descriptor`)
+  return parseSegmentDescriptor(JSON.parse(fs.readFileSync(file, "utf8")) as unknown, file)
 }
 
 function readFirstJournalEntry(file: string) {
@@ -340,13 +394,24 @@ export function withTraceSessionLock<T>(rootDir: string, key: string, operation:
   }
 }
 
+export function traceSessionLockRootForCase(caseDir: string) {
+  const logicalRoot = path.resolve(caseDir)
+  const inferredTraceRoot = path.dirname(logicalRoot)
+  try {
+    fs.accessSync(path.dirname(inferredTraceRoot), fs.constants.W_OK)
+    return inferredTraceRoot
+  } catch {
+    return logicalRoot
+  }
+}
+
 function sessionRoots(rootDir: string, sessionID: string) {
   if (!fs.existsSync(rootDir)) return []
   const matches: string[] = []
   for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const candidate = path.join(rootDir, entry.name)
-    if (readSessionManifest(path.join(candidate, "session.json"))?.session_id === sessionID) matches.push(candidate)
+    if (readTraceSessionManifest(path.join(candidate, "session.json"))?.session_id === sessionID) matches.push(candidate)
   }
   return matches
 }
@@ -362,9 +427,26 @@ function resolveLogicalRoot(rootDir: string, requestedCaseID: string, sessionID:
 function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined) {
   if (!fs.existsSync(logicalRoot)) return { current: undefined, legacy: undefined }
   if (!fs.statSync(logicalRoot).isDirectory()) throw new Error(`${logicalRoot}: expected a logical trace directory`)
-  const current = readSessionManifest(path.join(logicalRoot, "session.json"))
+  const current = readTraceSessionManifest(path.join(logicalRoot, "session.json"))
   if (current?.session_id && sessionID && current.session_id !== sessionID)
     throw new Error(`${logicalRoot}: session identity changed`)
+  for (const descriptor of current?.segments ?? []) {
+    if (descriptor.segment_id === "legacy-root") continue
+    const segmentFile = path.join(logicalRoot, descriptor.path, "segment.json")
+    const physical = readSegmentDescriptor(segmentFile)
+    for (const key of [
+      "segment_id",
+      "run_id",
+      "case_id",
+      "path",
+      "records",
+      "artifacts",
+      "index",
+      "started_at",
+      "continuation_of",
+    ] as const)
+      if (physical[key] !== descriptor[key]) throw new Error(`${segmentFile}: trace segment descriptor changed`)
+  }
   const legacy = legacyRootDescriptor(logicalRoot, sessionID ?? current?.session_id)
   return { current, legacy }
 }
@@ -409,7 +491,7 @@ function replaceDescriptor(
   segmentID: string,
   update: (manifest: TraceSessionManifest, descriptor: TraceSegmentDescriptor) => TraceSessionManifest,
 ) {
-  const manifest = readSessionManifest(sessionFile)
+  const manifest = readTraceSessionManifest(sessionFile)
   if (!manifest) return false
   const descriptor = manifest.segments.find((item) => item.segment_id === segmentID)
   if (!descriptor) return false
@@ -519,7 +601,7 @@ export function openTraceSegment(input: {
       bindSessionID(sessionID) {
         try {
           return withTraceSessionLock(rootDir, lockKey, () => {
-            const latest = readSessionManifest(sessionFile)
+            const latest = readTraceSessionManifest(sessionFile)
             if (!latest || !latest.segments.some((item) => item.segment_id === segmentID)) return false
             if (latest.session_id === sessionID) return true
             if (latest.session_id) return false

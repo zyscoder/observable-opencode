@@ -30,6 +30,8 @@ import {
 } from "./streaming-json-writer"
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
 import {
+  readTraceSessionManifest,
+  traceSessionLockRootForCase,
   TRACE_MANIFEST_LOCK_KEY,
   withTraceSessionLock,
   type TraceSegmentDescriptor,
@@ -63,6 +65,7 @@ type SegmentReplayScope = {
   pathPrefix: string
   namespace: boolean
   idMaps: Record<"node" | "edge" | "artifact" | "diagnostic", Map<string, string>>
+  nodeAliases: Map<string, string | null>
 }
 
 type TerminalEnvelope = {
@@ -118,48 +121,55 @@ function resolvedScopedEntityID(
   return scope.idMaps[type].get(id)
 }
 
-const NODE_ID_KEYS = new Set([
-  "node_id",
-  "parent_node_id",
-  "design_id",
-  "claim_id",
-  "claim_node_id",
-  "segment_id",
-  "record_id",
-  "parent_record_id",
-  "outcome_record_id",
-  "response_node_id",
-  "result_node_id",
-  "context_id",
-  "context_snapshot_id",
-  "input_context_snapshot_id",
-  "snapshot_id",
-  "assessment_id",
-  "change_id",
-  "check_id",
-  "compaction_id",
-  "constraint_id",
-  "evaluation_id",
-  "fact_id",
-  "decision_id",
-  "final_response_segment_id",
-  "finality_gate_message_id",
-  "gate_id",
-  "last_check_id",
-  "ledger_id",
-  "lifecycle_id",
-  "message_id",
-  "observation_id",
-  "obligation_id",
-  "request_id",
-  "response_id",
-  "response_segment_id",
-  "runtime_id",
-  "source_segment_id",
-  "task_id",
-  "tool_call_id",
-  "turn_id",
-  "verification_id",
+const NODE_ID_KEY_SCHEMES = new Map<string, readonly string[]>([
+  ["node_id", ["node", "record"]],
+  ["parent_node_id", ["node", "record"]],
+  ["record_id", ["record", "node"]],
+  ["parent_record_id", ["record", "node"]],
+  ["outcome_record_id", ["record", "node"]],
+  ["response_node_id", ["node", "response", "response_segment"]],
+  ["result_node_id", ["node", "record"]],
+  ["design_id", ["design"]],
+  ["claim_id", ["claim", "response_claim"]],
+  ["claim_node_id", ["claim", "response_claim", "node"]],
+  ["segment_id", ["response_segment", "final_response_evidence"]],
+  ["source_segment_id", ["response_segment", "final_response_evidence"]],
+  ["response_segment_id", ["response_segment", "final_response_evidence"]],
+  ["final_response_segment_id", ["response_segment", "final_response_evidence"]],
+  ["evidence_id", ["evidence", "repo_fact"]],
+  ["fact_id", ["evidence", "repo_fact"]],
+  ["verification_id", ["verification"]],
+  ["change_id", ["change"]],
+  ["observation_id", ["observation"]],
+  ["context_id", ["context", "context_snapshot"]],
+  ["context_snapshot_id", ["context_snapshot", "context"]],
+  ["input_context_snapshot_id", ["context_snapshot", "context"]],
+  ["snapshot_id", ["context_snapshot", "context"]],
+  ["response_id", ["response", "response_segment", "final_response_evidence"]],
+  ["request_id", ["llm_request", "request"]],
+  ["message_id", ["message"]],
+  ["finality_gate_message_id", ["message"]],
+  ["tool_call_id", ["tool_call", "tool_result", "tool_error"]],
+  ["tool_result_id", ["tool_result"]],
+  ["tool_id", ["tool", "tool_call"]],
+  ["skill_id", ["skill"]],
+  ["mcp_id", ["mcp", "mcp_call"]],
+  ["mcp_call_id", ["mcp_call"]],
+  ["span_id", ["span", "tool_span"]],
+  ["turn_id", ["llm_turn", "llm"]],
+  ["assessment_id", ["claim_support"]],
+  ["check_id", ["compaction_check"]],
+  ["last_check_id", ["compaction_check"]],
+  ["compaction_id", ["compaction"]],
+  ["decision_id", ["decision"]],
+  ["evaluation_id", ["external_evaluation"]],
+  ["gate_id", ["exit_gate"]],
+  ["task_id", ["subagent_task"]],
+  ["constraint_id", ["constraint"]],
+  ["ledger_id", ["ledger"]],
+  ["lifecycle_id", ["lifecycle"]],
+  ["obligation_id", ["obligation"]],
+  ["runtime_id", ["runtime"]],
 ])
 const EDGE_ID_KEYS = new Set(["edge_id"])
 const ARTIFACT_ID_KEYS = new Set(["artifact_id", "output_artifact_id", "summary_artifact_id"])
@@ -303,14 +313,16 @@ function scopedLegacyReference(value: string | undefined, scope: SegmentReplaySc
           : prefix === "diagnostic"
             ? "diagnostic"
             : undefined
-  if (!type) return value
   const id = value.slice(separator + 1)
-  return `${prefix}:${resolvedScopedEntityID(scope, type, id) ?? `${scope.segmentID}::${type}::${id}`}`
+  if (type)
+    return `${prefix}:${resolvedScopedEntityID(scope, type, id) ?? `${scope.segmentID}::${type}::${id}`}`
+  const alias = resolvedNodeAlias(scope, value) ?? resolvedNodeAlias(scope, id)
+  return alias && CAUSAL_NODE_ALIAS_SCHEMES.has(prefix) ? `${prefix}:${alias}` : value
 }
 
 function referenceEntityType(key: string): "node" | "edge" | "artifact" | "diagnostic" | undefined {
   const normalized = key.toLowerCase()
-  if (NODE_ID_KEYS.has(normalized)) return "node"
+  if (NODE_ID_KEY_SCHEMES.has(normalized)) return "node"
   if (EDGE_ID_KEYS.has(normalized)) return "edge"
   if (ARTIFACT_ID_KEYS.has(normalized)) return "artifact"
   if (DIAGNOSTIC_ID_KEYS.has(normalized)) return "diagnostic"
@@ -318,7 +330,63 @@ function referenceEntityType(key: string): "node" | "edge" | "artifact" | "diagn
 }
 
 function isReferenceKey(key: string) {
-  return REFERENCE_KEYS.has(key.toLowerCase())
+  const normalized = key.toLowerCase()
+  return REFERENCE_KEYS.has(normalized) || normalized.endsWith("_ref") || normalized.endsWith("_refs")
+}
+
+const CAUSAL_NODE_ALIAS_SCHEMES = new Set([
+  "design",
+  "claim",
+  "record",
+  "node",
+  "prompt",
+  "context",
+  "context_snapshot",
+  "compaction_check",
+  "compaction",
+  "llm_request",
+  "span",
+  "llm_turn",
+  "llm",
+  "exit_gate",
+  "decision",
+  "tool",
+  "tool_call",
+  "tool_span",
+  "tool_result",
+  "tool_error",
+  "mcp",
+  "mcp_call",
+  "skill",
+  "subagent_task",
+  "observation",
+  "evidence",
+  "repo_fact",
+  "external_evaluation",
+  "change",
+  "verification",
+  "response",
+  "response_segment",
+  "final_response_evidence",
+  "response_claim",
+  "claim_support",
+])
+
+function resolvedNodeAlias(scope: SegmentReplayScope, alias: string) {
+  const resolved = scope.nodeAliases.get(alias)
+  return resolved === null ? undefined : resolved
+}
+
+function resolvedNodeID(scope: SegmentReplayScope, id: string, key = "") {
+  const direct = resolvedScopedEntityID(scope, "node", id)
+  if (direct) return direct
+  const alias = resolvedNodeAlias(scope, id)
+  if (alias) return alias
+  for (const scheme of NODE_ID_KEY_SCHEMES.get(key.toLowerCase()) ?? []) {
+    const byScheme = resolvedNodeAlias(scope, `${scheme}:${id}`)
+    if (byScheme) return byScheme
+  }
+  return undefined
 }
 
 function canonicalReference(value: unknown): CausalIRRef | undefined {
@@ -339,12 +407,21 @@ function scopedSchemaReferences(value: unknown, scope: SegmentReplayScope, key =
   if (!scope.namespace) return value
   if (typeof value === "string") {
     const entityType = referenceEntityType(key)
+    if (entityType === "node") return resolvedNodeID(scope, value, key) ?? value
     if (entityType) return resolvedScopedEntityID(scope, entityType, value) ?? value
-    return isReferenceKey(key) ? (scopedLegacyReference(value, scope) ?? value) : value
+    if (!isReferenceKey(key)) return value
+    const legacy = scopedLegacyReference(value, scope)
+    if (legacy !== value) return legacy
+    const node = resolvedNodeID(scope, value, key)
+    if (node) return node
+    const matches = (["edge", "artifact", "diagnostic"] as const)
+      .map((type) => resolvedScopedEntityID(scope, type, value))
+      .filter(nonemptyString)
+    return matches.length === 1 ? matches[0] : value
   }
   if (Array.isArray(value)) return value.map((item) => scopedSchemaReferences(item, scope, key))
   const canonical = canonicalReference(value)
-  if (canonical) return isReferenceKey(key) ? scopedReference(canonical, scope) : value
+  if (canonical) return isReferenceKey(key) ? scopedReference(canonical, scope, key) : value
   const object = record(value)
   if (!object) return value
   return Object.fromEntries(
@@ -352,9 +429,9 @@ function scopedSchemaReferences(value: unknown, scope: SegmentReplayScope, key =
   )
 }
 
-function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope): CausalIRRef {
+function scopedReference(ref: CausalIRRef, scope: SegmentReplayScope, key = ""): CausalIRRef {
   if (ref.ref_type === "node") {
-    const refID = resolvedScopedEntityID(scope, "node", ref.ref_id)
+    const refID = resolvedNodeID(scope, ref.ref_id, key)
     if (!refID) return ref
     return {
       ...ref,
@@ -391,7 +468,10 @@ function scopedNode(node: CausalIRNode, scope: SegmentReplayScope): CausalIRNode
     output_refs: node.output_refs.map((ref) => scopedReference(ref, scope)),
     source_refs: node.source_refs.map((ref) => scopedReference(ref, scope)),
     artifact_refs: node.artifact_refs.map((id) => resolvedScopedEntityID(scope, "artifact", id) ?? id),
-    aliases: [...node.aliases, `run:${scope.runID}:node:${node.node_id}`],
+    aliases: [
+      ...node.aliases.map((alias) => scopedLegacyReference(alias, scope) ?? alias),
+      `run:${scope.runID}:node:${node.node_id}`,
+    ],
     integrity: { ...node.integrity, payload_hash: causalIRPayloadHash(payload) },
     metadata: {
       ...(node.metadata ?? {}),
@@ -1085,6 +1165,7 @@ class ReplayIndex {
         artifact: new Map(),
         diagnostic: new Map(),
       },
+      nodeAliases: new Map(),
     }
     this.putEdge({
       edge_id: `${input.segmentKey}::edge::run.continuation::${input.previousRunID}`,
@@ -1280,6 +1361,26 @@ function parseLine(line: string) {
 
 function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope) {
   if (!scope.namespace) return
+  const registerAlias = (alias: string, nodeID: string) => {
+    const existing = scope.nodeAliases.get(alias)
+    if (existing === undefined) scope.nodeAliases.set(alias, nodeID)
+    else if (existing !== nodeID) scope.nodeAliases.set(alias, null)
+  }
+  const registerNode = (value: unknown) => {
+    const node = record(value)
+    if (!node || !nonemptyString(node.node_id)) return
+    const scoped = scopedEntityID(scope, "node", node.node_id)
+    registerAlias(node.node_id, scoped)
+    for (const alias of Array.isArray(node.aliases) ? node.aliases : []) {
+      if (!nonemptyString(alias)) continue
+      const separator = alias.indexOf(":")
+      const scheme = separator > 0 ? alias.slice(0, separator) : undefined
+      if (!scheme || !CAUSAL_NODE_ALIAS_SCHEMES.has(scheme)) continue
+      registerAlias(alias, scoped)
+      const local = alias.slice(separator + 1)
+      if (local) registerAlias(local, scoped)
+    }
+  }
   const register = (
     type: "node" | "edge" | "artifact" | "diagnostic",
     value: unknown,
@@ -1299,14 +1400,14 @@ function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope
         throw error
       }
       const operation = entry.operation
-      if (operation === "node.created" || operation === "node.updated") register("node", entry.data, "node_id")
+      if (operation === "node.created" || operation === "node.updated") registerNode(entry.data)
       if (operation === "edge.created") register("edge", entry.data, "edge_id")
       if (operation === "artifact.created" || operation === "artifact.reused")
         register("artifact", entry.data, "artifact_id")
       if (operation === "diagnostic.created") register("diagnostic", entry.data, "diagnostic_id")
       const snapshot = lifecycleSnapshot(entry.data)
       if (!snapshot) return
-      for (const node of snapshot.nodes) register("node", node, "node_id")
+      for (const node of snapshot.nodes) registerNode(node)
       for (const edge of snapshot.edges) register("edge", edge, "edge_id")
       for (const artifact of snapshot.artifacts) register("artifact", artifact, "artifact_id")
       for (const diagnostic of snapshot.diagnostics) register("diagnostic", diagnostic, "diagnostic_id")
@@ -1492,7 +1593,7 @@ function linkFileAtomic(source: string, destination: string) {
   }
 }
 
-function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirectory: string) {
+function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirectory: string, copyOnly = false) {
   if (!fs.existsSync(sourceDirectory)) return
   if (!fs.statSync(sourceDirectory).isDirectory()) return
   for (const entry of fs.readdirSync(sourceDirectory, { withFileTypes: true })) {
@@ -1500,11 +1601,15 @@ function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirector
     const destination = path.join(destinationDirectory, entry.name)
     if (entry.isDirectory()) {
       fs.mkdirSync(destination, { recursive: true })
-      linkCompatibilityArtifacts(source, destination)
+      linkCompatibilityArtifacts(source, destination, copyOnly)
       continue
     }
     if (!entry.isFile() || fs.existsSync(destination)) continue
     fs.mkdirSync(path.dirname(destination), { recursive: true })
+    if (copyOnly) {
+      copyFileAtomic(source, destination)
+      continue
+    }
     try {
       fs.linkSync(source, destination)
     } catch (error) {
@@ -1666,14 +1771,18 @@ function ensurePreexistingGeneration(
   if (!hasVisibleSet) return undefined
   const name = `preexisting-${crypto.randomUUID()}`
   const generationDir = path.join(derivedDir, "generations", name)
-  fs.mkdirSync(generationDir, { recursive: true })
-  for (const relative of relativeFiles)
-    copyVisibleFile(path.join(caseDir, relative), path.join(generationDir, relative))
-  if (includeArtifacts)
-    linkCompatibilityArtifacts(path.join(caseDir, "artifacts"), path.join(generationDir, "artifacts"))
   try {
+    fs.mkdirSync(generationDir, { recursive: true })
+    for (const relative of relativeFiles)
+      copyVisibleFile(path.join(caseDir, relative), path.join(generationDir, relative))
+    if (includeArtifacts)
+      linkCompatibilityArtifacts(path.join(caseDir, "artifacts"), path.join(generationDir, "artifacts"))
     swapSymlink(currentLink, path.posix.join("generations", name))
   } catch (error) {
+    try {
+      if (lstatExists(currentLink) && fs.readlinkSync(currentLink) === path.posix.join("generations", name))
+        fs.unlinkSync(currentLink)
+    } catch {}
     fs.rmSync(generationDir, { recursive: true, force: true })
     throw error
   }
@@ -1719,6 +1828,7 @@ function installRootCompatibilityLinks(caseDir: string, relativeFiles: string[])
       try {
         fs.symlinkSync(target, temporary)
         fs.renameSync(temporary, destination)
+        derivedPublicationFailure("root_link_installing")
       } catch (error) {
         try {
           fs.unlinkSync(temporary)
@@ -1758,28 +1868,23 @@ function publishStagedTrace(stageDir: string, caseDir: string, generation: numbe
   const generationsDir = path.join(derivedDir, "generations")
   const currentLink = path.join(derivedDir, "current")
   const legacyAuthority = fs.existsSync(path.join(caseDir, "records.jsonl"))
-  fs.mkdirSync(generationsDir, { recursive: true })
+  const derivedExisted = lstatExists(derivedDir)
+  const generationsExisted = lstatExists(generationsDir)
   let preexistingGeneration: string | undefined
-  try {
-    preexistingGeneration = ensurePreexistingGeneration(caseDir, derivedDir, currentLink, !legacyAuthority)
-  } catch (error) {
-    for (const directory of [generationsDir, derivedDir]) {
-      try {
-        fs.rmdirSync(directory)
-      } catch {}
-    }
-    throw error
-  }
-  const oldCurrent = lstatExists(currentLink) ? fs.readlinkSync(currentLink) : undefined
   const generationName = String(generation)
   const generationDir = path.join(generationsDir, generationName)
   const temporaryGeneration = path.join(generationsDir, `.${generationName}.${crypto.randomUUID()}.tmp`)
+  let oldCurrent: string | undefined
   let links: RootLinkTransaction | undefined
   let currentSwapped = false
   let generationInstalled = false
   try {
+    fs.mkdirSync(generationsDir, { recursive: true })
+    preexistingGeneration = ensurePreexistingGeneration(caseDir, derivedDir, currentLink, !legacyAuthority)
+    oldCurrent = lstatExists(currentLink) ? fs.readlinkSync(currentLink) : undefined
     if (!fs.existsSync(generationDir)) {
       fs.mkdirSync(temporaryGeneration, { recursive: true })
+      derivedPublicationFailure("generation_copying")
       if (oldCurrent)
         linkCompatibilityArtifacts(
           path.join(derivedDir, "current", "artifacts"),
@@ -1842,7 +1947,12 @@ function publishStagedTrace(stageDir: string, caseDir: string, generation: numbe
       } catch {}
       fs.rmSync(path.join(derivedDir, preexistingGeneration), { recursive: true, force: true })
     }
-    for (const directory of [generationsDir, derivedDir]) {
+    fs.rmSync(temporaryGeneration, { recursive: true, force: true })
+    for (const [directory, existed] of [
+      [generationsDir, generationsExisted],
+      [derivedDir, derivedExisted],
+    ] as const) {
+      if (existed) continue
       try {
         fs.rmdirSync(directory)
       } catch {}
@@ -1871,36 +1981,9 @@ function resolveWithin(root: string, relative: string) {
 
 function readSession(caseDir: string) {
   const file = path.join(caseDir, "session.json")
-  if (!fs.existsSync(file)) return undefined
-  const input = record(JSON.parse(fs.readFileSync(file, "utf8")) as unknown)
-  if (
-    !input ||
-    input.schema_version !== "1.0" ||
-    !nonemptyString(input.logical_case_id) ||
-    !Array.isArray(input.segments)
-  )
-    throw new Error(`${file}: invalid trace session manifest`)
-  const parsed = input as unknown as TraceSessionManifest
-  const session: TraceSessionManifest = {
-    ...parsed,
-    lock_key: TRACE_MANIFEST_LOCK_KEY,
-    generation: Number.isSafeInteger(parsed.generation) && parsed.generation >= 0 ? parsed.generation : 0,
-  }
+  const session = readTraceSessionManifest(file)
+  if (!session) return undefined
   if (!session.segments.length) throw new Error(`${file}: trace session has no segments`)
-  const runIDs = new Set<string>()
-  for (const descriptor of session.segments) {
-    if (
-      !record(descriptor) ||
-      !nonemptyString(descriptor.segment_id) ||
-      !nonemptyString(descriptor.run_id) ||
-      !nonemptyString(descriptor.case_id) ||
-      !nonemptyString(descriptor.path) ||
-      !nonemptyString(descriptor.records)
-    )
-      throw new Error(`${file}: invalid trace segment descriptor`)
-    if (runIDs.has(descriptor.run_id)) throw new Error(`${file}: duplicate run ${descriptor.run_id}`)
-    runIDs.add(descriptor.run_id)
-  }
   return session
 }
 
@@ -1927,13 +2010,14 @@ function materializeTraceSnapshot(input: {
   caseDir: string
   outputDir?: string
   sessionSnapshot?: TraceSessionManifest | null
+  copyArtifacts?: boolean
 }): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
   if (!fs.statSync(caseDir).isDirectory()) throw new Error(`${caseDir}: expected a case directory`)
   const outputDir = path.resolve(input.outputDir ?? caseDir)
-  fs.mkdirSync(outputDir, { recursive: true })
   const session = input.sessionSnapshot === undefined ? readSession(caseDir) : (input.sessionSnapshot ?? undefined)
   const sources = materializationSources(caseDir, session)
+  fs.mkdirSync(outputDir, { recursive: true })
   const indexPath = path.join(
     outputDir,
     `.trace-materializer.${process.pid}.${Math.random().toString(16).slice(2)}.sqlite`,
@@ -1956,6 +2040,7 @@ function materializeTraceSnapshot(input: {
           artifact: new Map(),
           diagnostic: new Map(),
         },
+        nodeAliases: new Map(),
       }
       discoverSegmentEntityIDs(source.recordsFile, scope)
       index.beginSegment(scope)
@@ -2153,6 +2238,7 @@ function materializeTraceSnapshot(input: {
       linkCompatibilityArtifacts(
         path.join(path.dirname(legacySource.source.recordsFile), "artifacts"),
         path.join(outputDir, "artifacts"),
+        input.copyArtifacts === true,
       )
     }
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
@@ -2164,17 +2250,28 @@ function materializeTraceSnapshot(input: {
   }
 }
 
-export function materializeTrace(input: { caseDir: string; outputDir?: string }): TraceMaterializationResult {
+export function materializeTrace(input: {
+  caseDir: string
+  outputDir?: string
+  _lockHeld?: boolean
+}): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
+  const locked = <T>(operation: () => T) =>
+    input._lockHeld
+      ? operation()
+      : withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, operation)
   if (input.outputDir)
-    return materializeTraceSnapshot({
-      caseDir,
-      outputDir: input.outputDir,
-      sessionSnapshot: readSession(caseDir) ?? null,
-    })
+    return locked(() =>
+      materializeTraceSnapshot({
+        caseDir,
+        outputDir: input.outputDir,
+        sessionSnapshot: readSession(caseDir) ?? null,
+        copyArtifacts: true,
+      }),
+    )
 
   let session = readSession(caseDir)
-  if (!session) return materializeTraceSnapshot({ caseDir, sessionSnapshot: null })
+  if (!session) return locked(() => materializeTraceSnapshot({ caseDir, sessionSnapshot: null }))
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-publication-"))
@@ -2183,7 +2280,7 @@ export function materializeTrace(input: { caseDir: string; outputDir?: string })
       const readyFile = process.env.OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE
       if (readyFile) fs.writeFileSync(readyFile, `${session.generation}\n`)
       let published = false
-      withTraceSessionLock(path.dirname(caseDir), TRACE_MANIFEST_LOCK_KEY, () => {
+      withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, () => {
         const latest = readSession(caseDir)
         if (!latest || latest.generation !== session!.generation) return
         publishStagedTrace(stageDir, caseDir, session!.generation)

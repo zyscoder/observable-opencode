@@ -9,6 +9,11 @@ import {
   replayFinalizedCausalIRTrace,
   validateCausalIRJournal,
 } from "opencode/observability/causal-ir"
+import {
+  acquireTraceSessionLock,
+  traceSessionLockRootForCase,
+  TRACE_MANIFEST_LOCK_KEY,
+} from "opencode/observability/trace-segment"
 import { loadRenderableTrace } from "../src/load"
 
 function withCaseDirectory(run: (caseDir: string) => void) {
@@ -237,6 +242,25 @@ function segmentedJournal(runID: string, marker: string, complete = true) {
 }
 
 describe("loadRenderableTrace", () => {
+  test("holds the global trace-root lock while reading a legacy-flat snapshot", () => {
+    const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+    withCaseDirectory((caseDir) => {
+      const { journal } = createJournal()
+      fs.writeFileSync(path.join(caseDir, "records.jsonl"), journal.map((entry) => JSON.stringify(entry)).join("\n"))
+      const before = treeHashes(caseDir)
+      const release = acquireTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY)
+      try {
+        process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = "0"
+        expect(() => loadRenderableTrace(caseDir)).toThrow("timed out waiting for trace session lock")
+      } finally {
+        release()
+        if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+        else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+      }
+      expect(treeHashes(caseDir)).toEqual(before)
+    })
+  })
+
   test("discovers session.json and loads all immutable segments as one renderable trace", () => {
     withCaseDirectory((caseDir) => {
       const descriptors = [
@@ -352,7 +376,20 @@ describe("loadRenderableTrace", () => {
       ;(stale.manifest as Record<string, unknown>).session_generation = 1
       const traceFile = path.join(caseDir, "trace.json")
       fs.writeFileSync(traceFile, JSON.stringify(stale))
+      const terminalSegment = path.join(caseDir, descriptors[0]!.path)
+      const sourceArtifact = path.join(terminalSegment, "artifacts", "renderer.txt")
+      fs.mkdirSync(path.dirname(sourceArtifact), { recursive: true })
+      fs.writeFileSync(sourceArtifact, "immutable renderer artifact")
+      fs.writeFileSync(
+        path.join(terminalSegment, "legacy-trace.json"),
+        JSON.stringify({
+          trace_version: "1.3",
+          artifacts: [{ artifact_id: "renderer_artifact", path: "artifacts/renderer.txt" }],
+        }),
+      )
       const before = treeHashes(caseDir)
+      const artifactBefore = fs.statSync(sourceArtifact, { bigint: true })
+      const artifactBytes = fs.readFileSync(sourceArtifact)
 
       for (const input of [caseDir, traceFile]) {
         const result = loadRenderableTrace(input)
@@ -365,6 +402,10 @@ describe("loadRenderableTrace", () => {
       }
       expect(treeHashes(caseDir)).toEqual(before)
       expect(JSON.parse(fs.readFileSync(traceFile, "utf8")).manifest.session_generation).toBe(1)
+      const artifactAfter = fs.statSync(sourceArtifact, { bigint: true })
+      expect(fs.readFileSync(sourceArtifact)).toEqual(artifactBytes)
+      expect(artifactAfter.ctimeNs).toBe(artifactBefore.ctimeNs)
+      expect(artifactAfter.nlink).toBe(artifactBefore.nlink)
     })
   })
 
