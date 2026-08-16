@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { classifyShellOperation, inferVerificationStatus } from "../../src/tool/tool"
 import { captureRepositorySnapshot, repositorySnapshotDelta } from "../../src/observability/repository-snapshot"
 import fs from "node:fs"
@@ -16,6 +17,8 @@ describe("tool semantic observability", () => {
     try {
       fs.writeFileSync(invalidRoot, "not a directory")
       const run = async (enabled: boolean, traceRoot: string) => {
+        const workspace = path.join(root, "workspaces", enabled ? path.basename(traceRoot) : "disabled")
+        fs.mkdirSync(workspace, { recursive: true })
         const proc = Bun.spawn([process.execPath, script], {
           cwd: packageDir,
           env: {
@@ -23,6 +26,7 @@ describe("tool semantic observability", () => {
             OPENCODE_CASE_TRACE: enabled ? "1" : "0",
             OPENCODE_CASE_ID: "passive-tool-equivalence",
             OPENCODE_CASE_TRACE_DIR: traceRoot,
+            OPENCODE_EQUIVALENCE_WORKSPACE: workspace,
           },
           stdout: "pipe",
           stderr: "pipe",
@@ -30,8 +34,8 @@ describe("tool semantic observability", () => {
         const code = await proc.exited
         const stderr = await new Response(proc.stderr).text()
         const stdout = await new Response(proc.stdout).text()
-        expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
-        return { result: JSON.parse(stdout), traceRoot }
+        expect(code).toBe(0)
+        return { result: JSON.parse(stdout), traceRoot, stderr, code }
       }
 
       const disabled = await run(false, path.join(root, "disabled"))
@@ -40,6 +44,33 @@ describe("tool semantic observability", () => {
 
       expect(enabled.result).toEqual(disabled.result)
       expect(invalid.result).toEqual(disabled.result)
+      expect({ enabled: enabled.code, disabled: disabled.code, invalid: invalid.code }).toEqual({
+        enabled: 0,
+        disabled: 0,
+        invalid: 0,
+      })
+      expect(disabled.stderr).toBe("")
+      expect(invalid.stderr).toBe("")
+      expect(enabled.stderr).toMatch(
+        /^\[observable-opencode\] Session trace saved\n(?:  .+\n)+$/,
+      )
+      expect(enabled.stderr).toContain("  json: ")
+      expect(disabled.result.fileHashes).toEqual({
+        "agent-output.txt": createHash("sha256").update("stable agent file\n").digest("hex"),
+      })
+      expect(disabled.result.toolCalls).toEqual([
+        { callID: "passive-success", tool: "passive-benchmark", input: { scenario: "success", payload: "fixed-input" } },
+        { callID: "passive-error", tool: "passive-benchmark", input: { scenario: "error", payload: "fixed-input" } },
+        {
+          callID: "passive-pre-aborted",
+          tool: "passive-benchmark",
+          input: { scenario: "pre-aborted", payload: "fixed-input" },
+        },
+      ])
+      expect(disabled.result.sessionRows.messages).toEqual([
+        expect.objectContaining({ id: "msg_passive_assistant", sessionID: "ses_passive_projection", role: "assistant" }),
+      ])
+      expect(disabled.result.sessionRows.parts).toHaveLength(3)
       expect(disabled.result.errorOracles).toEqual([
         {
           scenario: "error",
@@ -182,7 +213,11 @@ describe("tool semantic observability", () => {
         },
       ])
       expect(fs.existsSync(path.join(disabled.traceRoot, "passive-tool-equivalence"))).toBe(false)
-      expect(fs.existsSync(path.join(enabled.traceRoot, "passive-tool-equivalence", "records.jsonl"))).toBe(true)
+      const traceCase = path.join(enabled.traceRoot, "passive-tool-equivalence")
+      const session = JSON.parse(fs.readFileSync(path.join(traceCase, "session.json"), "utf8"))
+      expect(session.segments).toHaveLength(1)
+      expect(fs.existsSync(path.join(traceCase, session.segments[0].records))).toBe(true)
+      expect(fs.existsSync(path.join(traceCase, "trace.json"))).toBe(true)
       expect(fs.statSync(invalidRoot).isFile()).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })

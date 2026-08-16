@@ -34,7 +34,7 @@ describe("case trace runtime persistence", () => {
             `const rssBefore = process.memoryUsage().rss`,
             `const finalizationStarted = performance.now()`,
             `CaseTrace.finish({ status: "success", result: { answer: "agent-visible-result" } })`,
-            `fs.writeFileSync(path.join(active.caseDir, "task6-finalization-stats.json"), JSON.stringify({ rss_before: rssBefore, rss_after: process.memoryUsage().rss, finalization_ms: performance.now() - finalizationStarted }))`,
+            `fs.writeFileSync(path.join(active.logicalCaseDir, "task6-finalization-stats.json"), JSON.stringify({ rss_before: rssBefore, rss_after: process.memoryUsage().rss, finalization_ms: performance.now() - finalizationStarted }))`,
             `process.stdout.write("agent-visible-result")`,
           ].join("\n"),
         )
@@ -929,7 +929,7 @@ describe("case trace runtime persistence", () => {
     120_000,
   )
 
-  test("removes a stale running canonical and reports persistent terminal canonical write failure", async () => {
+  test("removes a stale segment canonical and recovers the root after terminal canonical write failure", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stale-running-canonical-"))
     const packageDir = packageDirForTest()
     const script = path.join(dir, "stale-running-canonical.ts")
@@ -963,11 +963,16 @@ describe("case trace runtime persistence", () => {
       const code = await proc.exited
       const stderr = await new Response(proc.stderr).text()
       const caseDir = path.join(dir, "task6-stale-running-canonical")
-      const canonical = await fs.readFile(path.join(caseDir, "trace.json"), "utf8").catch(() => undefined)
+      const session = JSON.parse(await fs.readFile(path.join(caseDir, "session.json"), "utf8"))
+      const segmentCanonical = await fs
+        .readFile(path.join(caseDir, session.segments[0].path, "trace.json"), "utf8")
+        .catch(() => undefined)
+      const canonical = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8"))
       const partial = JSON.parse(await fs.readFile(path.join(caseDir, "partial/latest.json"), "utf8"))
 
       expect(code, stderr).toBe(0)
-      expect(canonical).toBeUndefined()
+      expect(segmentCanonical).toBeUndefined()
+      expect(canonical.manifest).toMatchObject({ status: "cancelled", shutdown_signal: "SIGTERM" })
       expect(partial.manifest).toMatchObject({ status: "cancelled", shutdown_signal: "SIGTERM" })
       expect(stderr).toContain("[opencode-observability] terminal trace persistence failed")
       expect(stderr).toContain("task6-stale-running-canonical")
@@ -1092,7 +1097,7 @@ describe("case trace runtime persistence", () => {
     }
   })
 
-  test("removes stale canonical truth when emergency fallback and partial loading both fail", async () => {
+  test("removes stale segment truth while root materialization recovers an incomplete journal", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-emergency-double-failure-"))
     const packageDir = packageDirForTest()
     const script = path.join(dir, "emergency-double-failure.ts")
@@ -1130,12 +1135,16 @@ describe("case trace runtime persistence", () => {
       })
       const code = await proc.exited
       const stderr = await new Response(proc.stderr).text()
-      const canonical = await fs
-        .readFile(path.join(dir, "task6-emergency-double-failure", "trace.json"), "utf8")
+      const caseDir = path.join(dir, "task6-emergency-double-failure")
+      const session = JSON.parse(await fs.readFile(path.join(caseDir, "session.json"), "utf8"))
+      const segmentCanonical = await fs
+        .readFile(path.join(caseDir, session.segments[0].path, "trace.json"), "utf8")
         .catch(() => undefined)
+      const canonical = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8"))
 
       expect(code, stderr).toBe(0)
-      expect(canonical).toBeUndefined()
+      expect(segmentCanonical).toBeUndefined()
+      expect(canonical.manifest).toMatchObject({ status: "error", recovery_status: "incomplete_journal_replay" })
       expect(stderr).toContain("[opencode-observability] terminal trace persistence failed")
       expect(stderr).toContain('"canonical_removed":true')
     } finally {

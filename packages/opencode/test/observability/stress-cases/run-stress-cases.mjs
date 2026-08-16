@@ -5,6 +5,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { analyzeTraceDirectory } from "./analyze-trace-sufficiency.mjs"
 import { loadCases } from "./lib/stress-review.mjs"
+import { assertTraceSemanticCategories as assertSemanticCategories } from "../semantic-categories.mjs"
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 const defaultOut = "/tmp/observable-opencode-stress-run"
@@ -16,6 +17,7 @@ function parseArgs(argv) {
     cases: [],
     dryRun: false,
     config: "",
+    semanticProbe: "",
   }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
@@ -23,6 +25,7 @@ function parseArgs(argv) {
     else if (arg === "--out") args.out = argv[++index]
     else if (arg === "--case") args.cases.push(argv[++index])
     else if (arg === "--config") args.config = argv[++index]
+    else if (arg === "--semantic-probe") args.semanticProbe = argv[++index]
     else if (arg === "--dry-run") args.dryRun = true
     else if (arg === "--help" || arg === "-h") args.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -33,11 +36,40 @@ function parseArgs(argv) {
 function usage() {
   return [
     "Usage: node run-stress-cases.mjs --binary <observable-binary> [--out /tmp/run] [--case case-id] [--dry-run]",
+    "       node run-stress-cases.mjs --semantic-probe <trace.json>",
     "",
     "Environment:",
     "  DEEPSEEK_API_KEY             required for real runs",
     "  OPENCODE_STRESS_MODEL        defaults to deepseek-v4-pro",
   ].join("\n")
+}
+
+const STRESS_PROBE_CATEGORIES = [
+  "artifact",
+  "compaction",
+  "edge",
+  "lifecycle",
+  "mcp",
+  "node",
+  "response",
+  "skill",
+  "subagent",
+  "tool",
+]
+
+export function assertTraceSemanticCategories(traceFile, required = STRESS_PROBE_CATEGORIES) {
+  return assertSemanticCategories(path.resolve(traceFile), required)
+}
+
+function requiredCaseSemanticCategories(caseDef) {
+  const categories = new Set(["artifact", "edge", "lifecycle", "node", "response", "tool"])
+  for (const mechanism of caseDef.required_trace_mechanisms ?? []) {
+    if (mechanism.startsWith("context.compaction")) categories.add("compaction")
+    if (mechanism.startsWith("mcp.")) categories.add("mcp")
+    if (mechanism.startsWith("subagent.")) categories.add("subagent")
+    if (mechanism.startsWith("skill.")) categories.add("skill")
+  }
+  return [...categories].sort()
 }
 
 function selectedCases(args) {
@@ -194,9 +226,16 @@ async function runOneCase(caseDef, args) {
 
   const traceFile = path.join(tracesDir, caseDef.case_id, "trace.json")
   if (!fs.existsSync(traceFile)) throw new Error(`trace.json was not generated for ${caseDef.case_id}`)
+  const categories = assertTraceSemanticCategories(traceFile, requiredCaseSemanticCategories(caseDef))
+  console.log(`[stress] ${caseDef.case_id} semantic categories: ${categories.join(", ")}`)
 }
 
 export async function runStressCases(args) {
+  if (args.semanticProbe) {
+    const categories = assertTraceSemanticCategories(args.semanticProbe)
+    console.log(`[stress] semantic categories: ${categories.join(", ")}`)
+    return categories
+  }
   const cases = selectedCases(args)
   if (args.dryRun) {
     for (const item of cases) console.log(`${item.case_id}\t${item.category}\t${item.fixture_dir}`)

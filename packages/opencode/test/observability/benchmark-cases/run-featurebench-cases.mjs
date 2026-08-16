@@ -6,6 +6,7 @@ import { request as httpRequest } from "node:http"
 import { request as httpsRequest } from "node:https"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { assertTraceSemanticCategories as assertSemanticCategories } from "../semantic-categories.mjs"
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 const manifestFile = path.join(rootDir, "open-source-benchmarks.json")
@@ -26,6 +27,7 @@ function parseArgs(argv) {
     config: "",
     dryRun: false,
     requestTimeoutMs: 2 * 60 * 60 * 1000,
+    semanticProbe: "",
   }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
@@ -35,6 +37,7 @@ function parseArgs(argv) {
     else if (arg === "--case") args.cases.push(argv[++index])
     else if (arg === "--config") args.config = argv[++index]
     else if (arg === "--request-timeout-ms") args.requestTimeoutMs = Number(argv[++index])
+    else if (arg === "--semantic-probe") args.semanticProbe = argv[++index]
     else if (arg === "--dry-run") args.dryRun = true
     else if (arg === "--help" || arg === "-h") args.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -45,11 +48,18 @@ function parseArgs(argv) {
 function usage() {
   return [
     "Usage: node run-featurebench-cases.mjs --binary <observable-binary> --dataset-rows <rows.json> [options]",
+    "       node run-featurebench-cases.mjs --semantic-probe <trace.json>",
     "",
     "The runner uses FeatureBench's official problem statement and masked repository setup, then sends",
     "the request through opencode serve -> session -> HTTP message. It never includes patch/test_patch",
     "content in the agent prompt.",
   ].join("\n")
+}
+
+const FEATUREBENCH_SEMANTIC_CATEGORIES = ["artifact", "edge", "lifecycle", "node", "response", "tool"]
+
+export function assertTraceSemanticCategories(traceFile, required = FEATUREBENCH_SEMANTIC_CATEGORIES) {
+  return assertSemanticCategories(path.resolve(traceFile), required)
 }
 
 export function selectFeatureBenchRows(payload, sourceManifest) {
@@ -444,6 +454,7 @@ async function runOneCase(row, args, sourceManifest) {
   } catch (error) {
     throw requestError ?? error
   }
+  const traceSemanticCategories = assertTraceSemanticCategories(traceFile)
   const modelPatch = run("git", ["diff", "--binary", "HEAD"], { cwd: repoDir })
   const evaluation = officialEvaluationStatus({ dockerAvailable: hasDocker() })
   const result = {
@@ -458,6 +469,7 @@ async function runOneCase(row, args, sourceManifest) {
     model_patch_length: modelPatch.length,
     model_patch: modelPatch,
     trace_file: path.relative(outDir, traceFile),
+    trace_semantic_categories: traceSemanticCategories,
     evaluation,
   }
   fs.writeFileSync(path.join(resultDir, "result.json"), JSON.stringify(result, null, 2) + "\n")
@@ -466,6 +478,11 @@ async function runOneCase(row, args, sourceManifest) {
 }
 
 export async function runFeatureBenchCases(args) {
+  if (args.semanticProbe) {
+    const categories = assertTraceSemanticCategories(args.semanticProbe)
+    console.log(`[featurebench] semantic categories: ${categories.join(", ")}`)
+    return categories
+  }
   const sourceManifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"))
   const rowsPayload = JSON.parse(fs.readFileSync(path.resolve(args.datasetRows), "utf8"))
   let rows = selectFeatureBenchRows(rowsPayload, sourceManifest)

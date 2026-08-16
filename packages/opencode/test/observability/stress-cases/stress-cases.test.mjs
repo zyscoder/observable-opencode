@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -225,6 +226,50 @@ test("stress runner supports explicit multi-step HTTP flows for compaction scena
   assert.equal(flowActions[1].auto, false)
   assert.match(flowActions[2].text, /上一轮|前一轮/)
   assert.doesNotMatch(flowActions[2].text, /src\/payment/)
+})
+
+test("stress runner executes a deterministic semantic-category probe", async () => {
+  const runner = await import("./run-stress-cases.mjs")
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-stress-semantic-probe-"))
+  const traceFile = path.join(temp, "trace.json")
+  fs.writeFileSync(
+    traceFile,
+    JSON.stringify({
+      manifest: { status: "success" },
+      nodes: [
+        { node_id: "run", kind: "run.start", component: "run" },
+        { node_id: "compact", kind: "context.compaction", component: "context" },
+        { node_id: "tool", kind: "tool.call", component: "tool" },
+        { node_id: "skill", kind: "skill.load", component: "skill" },
+        { node_id: "mcp", kind: "mcp.call", component: "mcp" },
+        { node_id: "subagent", kind: "subagent.call", component: "task" },
+        { node_id: "response", kind: "response.output", component: "result" },
+      ],
+      edges: [{ edge_id: "edge", relation: "produced" }],
+      artifacts: [{ artifact_id: "artifact", path: "artifacts/sha256/value.txt" }],
+      records: [],
+    }),
+  )
+
+  assert.equal(typeof runner.assertTraceSemanticCategories, "function")
+  assert.deepEqual(runner.assertTraceSemanticCategories(traceFile), [
+    "artifact",
+    "compaction",
+    "edge",
+    "lifecycle",
+    "mcp",
+    "node",
+    "response",
+    "skill",
+    "subagent",
+    "tool",
+  ])
+
+  const result = spawnSync(process.execPath, [path.join(rootDir, "run-stress-cases.mjs"), "--semantic-probe", traceFile], {
+    encoding: "utf8",
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /semantic categories: artifact, compaction, edge, lifecycle, mcp, node, response, skill, subagent, tool/)
 })
 
 test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {

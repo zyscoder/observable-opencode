@@ -123,6 +123,7 @@ if (childMode) {
         maxRSS: number
       }
       expect(measurement.maxRSS).toBe(Math.max(measurement.materializerMaxRSS, measurement.finalMaxRSS))
+      console.info("trace-materializer-memory-rss", JSON.stringify(measurement))
       expect(measurement.maxRSS).toBeLessThanOrEqual(MAX_RSS_BYTES)
       expect(exitCode, stderr).toBe(0)
     } finally {

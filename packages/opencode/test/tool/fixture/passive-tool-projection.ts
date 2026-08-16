@@ -1,5 +1,8 @@
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
+import { createHash } from "node:crypto"
+import fs from "node:fs"
+import path from "node:path"
 import { Agent } from "../../../src/agent/agent"
 import { Bus } from "../../../src/bus"
 import { Config } from "../../../src/config/config"
@@ -22,7 +25,12 @@ import { Truncate } from "../../../src/tool/truncate"
 import * as Log from "@opencode-ai/core/util/log"
 
 Date.now = () => 1_700_000_000_000
+let partSequence = 0
+Object.defineProperty(PartID, "ascending", {
+  value: (given?: string) => PartID.make(given ?? `prt_passive_${String(++partSequence).padStart(3, "0")}`),
+})
 await Log.init({ print: false })
+const workspace = process.env.OPENCODE_EQUIVALENCE_WORKSPACE ?? process.cwd()
 
 class PassiveToolError extends Error {
   constructor() {
@@ -61,6 +69,7 @@ const agent: Agent.Info = {
 }
 
 const parts = new Map<string, MessageV2.Part>()
+const messages = new Map<string, MessageV2.Info>()
 const sessionLayer = Layer.mock(Session.Service, {
   getPart: (input) => Effect.succeed(parts.get(input.partID)),
   updatePart: (part) =>
@@ -68,7 +77,11 @@ const sessionLayer = Layer.mock(Session.Service, {
       parts.set(part.id, structuredClone(part))
       return part
     }),
-  updateMessage: (message) => Effect.succeed(message),
+  updateMessage: (message) =>
+    Effect.sync(() => {
+      messages.set(message.id, structuredClone(message))
+      return message
+    }),
 })
 
 let stream = Stream.empty as Stream.Stream<LLM.Event, unknown>
@@ -146,6 +159,7 @@ const result = await Effect.runPromise(
             if (args.scenario === "pre-aborted" && ctx.abort.aborted) {
               return yield* Effect.die(new DOMException("Passive tool pre-aborted", "AbortError"))
             }
+            fs.writeFileSync(path.join(workspace, "agent-output.txt"), "stable agent file\n")
             return {
               title: "passive success",
               output: "stable tool output",
@@ -286,8 +300,40 @@ const result = await Effect.runPromise(
         model,
       ),
     )
+    const fileHashes = Object.fromEntries(
+      fs
+        .readdirSync(workspace)
+        .sort()
+        .map((file) => [file, createHash("sha256").update(fs.readFileSync(path.join(workspace, file))).digest("hex")]),
+    )
+    const sessionRows = {
+      messages: [...messages.values()].map((message) => ({
+        id: message.id,
+        sessionID: message.sessionID,
+        role: message.role,
+        ...("parentID" in message ? { parentID: message.parentID } : {}),
+        ...("finish" in message ? { finish: message.finish } : {}),
+      })),
+      parts: toolParts.map((part) => ({
+        id: part.id,
+        messageID: part.messageID,
+        sessionID: part.sessionID,
+        type: part.type,
+        callID: part.callID,
+        tool: part.tool,
+        status: part.state.status,
+      })),
+    }
+    const toolCalls = projectedToolParts.map((part) => ({
+      callID: part.callID,
+      tool: part.tool,
+      input: part.state.input,
+    }))
 
     return {
+      fileHashes,
+      sessionRows,
+      toolCalls,
       inputs,
       callbackCounts: { metadata: metadataCallbacks.length, ask: askCallbacks.length },
       metadataCallbacks,

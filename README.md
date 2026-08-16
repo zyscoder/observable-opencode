@@ -239,12 +239,19 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
 | `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
 | `OPENCODE_CASE_TRACE_QUIET` | 否 | 设为 `1` 隐藏退出时的 Trace 路径提示，不影响落盘。 |
-| `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` | 否 | TUI 退出后等待 worker 清理资源并完成 Trace 持久化的最大时长（毫秒）；启用 Trace 时默认 `3600000`，未启用时默认 `5000`。它不限制 Agent 或 LLM 的执行时长。 |
+| `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` | 否 | TUI 退出后等待 worker 清理资源并完成 journal close 的最大时长（毫秒）；启用 Trace 时默认 `3600000`，未启用时默认 `5000`。它不限制 Agent 或 LLM 的执行时长。 |
 | `OPENCODE_SERVER_PASSWORD` | HTTP 推荐 | 为 `opencode serve` 启用 Basic Auth，用户名固定为 `opencode`。 |
 
 高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
 默认值为 `2048`。大文本会写入 `artifacts/` 并由 HTML 按需展示。通常应保持默认值；将它
 提高到数十万会显著放大序列化、内存和收尾开销，复杂 case 甚至可能延迟信号处理。
+
+Trace recorder 的默认内存边界是 512 个 hot Causal IR nodes、1,024 个 hot edges、每类最多
+256 个 recent refs，以及 2,048 字符的内联语义预览；已完成的 active lifecycle record 会立即
+驱逐。冷数据从 segment-local SQLite 查询，增大这些边界不是保持语义完整性的前提。验收上限是
+标准 10,000-record payload 在 warm-up 后的 observer-owned RSS 增长不超过 128 MiB，以及 1 GiB
+journal 的离线 materializer peak RSS 不超过 256 MiB。这些是 Trace 自身的内存边界，不会改变
+OpenCode 的模型 context window、compaction 或 Agent 行为。
 
 ### 目标仓库的 `.opencode` 扩展依赖
 
@@ -287,37 +294,41 @@ opencode /data/repos/target-project
 [observable-opencode] Session trace saved
   session: ses_...
   case: benchmark-case-001
-  status: cancelled
+  status: completed
   directory: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4
   json: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
   partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
 ```
 
-在 TUI 中，`Ctrl-C` 是 `app.exit` 快捷键，主线程会先请求 worker 停止并等待
-`trace.json` 完成持久化，再终止 worker。启用 Trace 时默认最多等待一小时；若企业环境中的
-长 session 需要更多时间，可提高 `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS`。等待超时时终端会明确
-提示 `trace.json may be unavailable`，而不是静默只留下 `records.jsonl`。
+在 TUI 中，正常退出、`Ctrl-C`/`SIGINT` 和 `SIGTERM` 都走同一条 parent/worker 生命周期：
+worker 先释放 Session、Tool、MCP 和内部 Server，只向当前 segment journal 追加轻量
+`case.runtime_closed` terminal record；parent 随后终止 worker，并在独立进程中运行 materializer，
+最后发布 root `trace.json`。完整 Causal IR、provenance 和 legacy projection 不在 Agent worker 的
+退出堆内构造。
 
-该时长只作用于退出阶段，包括释放 Session、Tool、MCP 和内部 Server，收尾未关闭的语义节点，
-追加 Causal IR 的 `case.finalized`，以及原子写入 `trace.json`、`manifest.json` 和
-`partial/latest.json`。它不是 LLM 请求超时、Tool 超时或 case 执行超时。`3600000` 只是等待
-上限，并不意味着每次退出都会等待一小时；worker 完成持久化后，TUI 会立即退出。通常无需
-显式设置。确需覆盖时可使用：
+`OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` 只限制 worker 资源清理和 journal close，启用 Trace 时默认
+`3600000`，未启用时默认 `5000`。它不是 LLM、Tool 或整个 case 的执行超时；worker close 完成
+后会立即进入独立 materialization。确需覆盖时可使用：
 
 ```bash
-# 允许复杂长 session 在 Ctrl-C 后最多用两小时完成资源清理和 Trace 持久化
+# 允许复杂长 session 在 Ctrl-C 后最多用两小时完成资源清理和 journal close
 export OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS=7200000
 ```
 
-不要为了加快退出而把它设置得过短，否则主线程可能在 finalization 完成前终止 worker，表现为
-case 目录中已有持续追加的 `records.jsonl`，但没有最终的 `trace.json`。该配置无法改变
-`SIGKILL` 的行为，因为 `SIGKILL` 不允许进程执行任何用户态收尾逻辑。
+worker close 或 materializer 失败只降低 observability：不会重试 Agent 操作，不会改变消息、
+文件、session rows 或原始退出码。失败时 immutable segment 仍是权威证据，可使用
+`observable-trace finalize <logical-case-dir>` 重试；成功后，终端才会打印 logical directory、
+root JSON 和 partial 路径。`OPENCODE_CASE_TRACE_QUIET=1` 只隐藏这份 Trace receipt。
 
-可捕获的中断会执行 terminal finalizer，写入状态通常为 `cancelled` 的语义 Trace 和终端兼容
-输出。运行期间不会生成完整 partial snapshot。`SIGKILL` 无法执行任何用户态退出处理，
-当前 run 只能依赖被杀前已追加的 `records.jsonl` journal 进行恢复；`partial/latest.json`
-仅在正常退出或可捕获信号完成 finalization 后出现，不能作为 `SIGKILL` 的当前 run 恢复源。设置
-`OPENCODE_CASE_TRACE_QUIET=1` 只关闭终端路径提示，不会关闭 Trace。
+使用 `opencode -s <session-id> /path/to/project` 继续同一 session 时，runtime 会定位已有 logical
+case directory，在 `segments/` 下创建新的 process-lifetime segment，并用 `continuation_of` 和
+统一 Trace 中的 `run.continuation` 语义连接前一 run。已有 journal、artifact、index 和
+`segment.json` 不会被打开写入、截断或删除。
+
+`SIGKILL` 和 OOM 无法执行任何用户态 cleanup，因此不会立即完成 Trace，也不应期待当前 run
+马上出现新的 `trace.json` 或 `partial/latest.json`。被杀前已完整 append 的 JSONL 行和 artifact
+仍是 durable evidence；之后显式 finalization 或下一次同 session continuation 会把无 terminal
+record 的前一 segment 标记为 `interrupted_unfinalized`，并从 valid journal prefix 恢复统一 Trace。
 
 ## 启动 HTTP Server 并记录 Trace
 
@@ -370,68 +381,86 @@ curl -fsS -X DELETE "http://127.0.0.1:4096/session/$SESSION_ID" \
   -H "x-opencode-directory: $PROJECT_DIR"
 ```
 
+HTTP server 与 TUI 使用同一 logical-root/immutable-segment 格式。删除 root session 或正常、
+可捕获信号关闭 server 会自动完成可达 Trace；进程被 `SIGKILL` 时同样只能在之后从 durable
+segment evidence 恢复。自动发布失败不会改变 HTTP response 或 session 数据，可在 server 外部
+用同一个 `observable-trace finalize <logical-case-dir>` 命令重试。
+
 ## Trace 目录
 
-一个进程可以生成多份 root Trace，而不是只有一份全局 Trace。以 case ID
-`benchmark-case-001` 为例，首个 root 使用基础目录，后续 root 和进程级事件使用各自
-独立目录：
+一个 root session 对应一个 logical Trace directory；同一 session 的每个 process lifetime
+写入一个新的 segment。一个进程仍可因 `/new`、多个 HTTP root session 或 process-level
+事件生成多个 logical roots。以 `benchmark-case-001` 为例：
 
 ```text
 /data/evo-bench/traces/
-├── benchmark-case-001/                              # first root
-├── benchmark-case-001--<session>--<digest>/          # later root
-└── benchmark-case-001--process--<digest>/             # process-level events
+├── benchmark-case-001/                               # first logical root
+├── benchmark-case-001--<session>--<digest>/          # another root session
+└── benchmark-case-001--process--<digest>/            # process-level root
 ```
 
-运行中的目录只包含 append-only JSONL 和当前 run 引用的 artifacts：
+新的 segmented logical root 布局如下：
 
 ```text
-<trace-directory>/
-├── events.jsonl
-├── records.jsonl
-├── raw-events.jsonl
-└── artifacts/
+<logical-case-dir>/
+├── session.json                       # atomic ordered segment manifest + generation
+├── segments/
+│   ├── <segment-id-1>/
+│   │   ├── segment.json               # immutable process-lifetime identity
+│   │   ├── records.jsonl              # authoritative append-only Causal IR journal
+│   │   ├── events.jsonl
+│   │   ├── raw-events.jsonl
+│   │   ├── index.sqlite               # private observer index
+│   │   └── artifacts/                 # immutable large semantic payloads
+│   └── <segment-id-2>/
+│       └── ...
+├── trace.json                         # generation-switched unified derived output
+├── provenance-trace.json              # derived compatibility projection
+├── legacy-trace.json                  # derived compatibility projection
+├── manifest.json                      # derived unified manifest
+├── partial/latest.json                # derived terminal/recovery view
+└── artifacts/                         # compatibility links/copies only
 ```
 
-正常退出或可捕获信号完成 terminal finalization 后，目录增加以下语义和兼容输出：
+`records.jsonl` 与 segment artifacts 是 durable authority。`session.json` 使用原子替换记录
+segment 顺序、session/run identity、continuation、状态和当前 generation。root `trace.json`
+及相关文件只是一个 generation 的统一派生输出，可以在不改变任何 prior evidence 的情况下
+重建和替换。新的 segmented run 不会在 root 创建可变 `records.jsonl` alias。
 
-```text
-<trace-directory>/
-├── trace.json                 # Causal IR 语义 Trace
-├── provenance-trace.json      # 归因事实投影
-├── legacy-trace.json          # 兼容投影
-├── events.jsonl               # 结构化事件流
-├── records.jsonl              # Causal IR 结构化记录流
-├── raw-events.jsonl           # 原始事件流
-├── manifest.json              # root/process 与产物清单
-├── artifacts/                 # 大文本和可校验语义载荷
-└── partial/
-    └── latest.json            # terminal compatibility output
-```
-
-复用稳定 `OPENCODE_CASE_ID` 启动新 trace 时，runtime 会先使上一 run 的 terminal/derived
-语义 JSON 输出失效，再记录新 journal，因此 live `records.jsonl` 始终属于当前 run。已有的
-离线 `trace.html` 会保留，但可能仍展示上一 run；必须显式重新渲染才能更新。runtime 不拥有、
-不删除也不生成 HTML。
+现有 flat root 仍作为 read-only legacy segment zero 支持：原有 root `records.jsonl`、
+`index.sqlite` 和 artifacts 保持原位且不被改写；renderer/materializer 可以读取它们并生成派生
+视图，但 runtime 不会把后续 run 追加到旧 flat journal。已有 `trace.html` 也不会被 runtime
+删除或更新，resume 或重新 finalization 后必须显式重新 render。
 
 ## 离线渲染 Trace
 
 运行时不会生成 HTML。下载与 OpenCode runtime 相同平台后缀的
-`observable-trace-<platform>`，并在 case 完成后显式运行：
+`observable-trace-<platform>`。自动 materialization 失败、SIGKILL recovery 或需要显式刷新
+root generation 时，先执行可重复的 manual finalization：
+
+```bash
+./observable-trace-linux-x64 finalize /data/evo-bench/traces/benchmark-case-001
+```
+
+该命令从所有 ordered segments 的 valid journal prefix 原子重建 root derived outputs；失败可
+再次运行，且不会修改 segment evidence。随后生成 HTML：
 
 ```bash
 ./observable-trace-linux-x64 render /data/evo-bench/traces/benchmark-case-001
 ```
 
-默认输出是 `<case-dir>/trace.html`；也可用 `--output <path>` 写到报告目录。若 case
-已有已完成的 `trace.json`，renderer 会生成完整视图。若只有 `records.jsonl`，renderer 会
-回放 journal 并在 HTML 中标记为不完整恢复，不能把它当作成功完成的 case。`SIGKILL` 无法
-执行 finalizer，也不会留下当前 run 的 `partial/latest.json`，因此只能依赖被杀前已持久化的
-`records.jsonl`；之后可显式重新渲染 journal-only 恢复结果，替换可能保留的上一 run HTML。
+默认输出是 `<case-dir>/trace.html`；也可用 `--output <path>` 写到报告目录。renderer 接受
+logical case directory、root `session.json`、root `trace.json`，以及 read-only legacy flat
+directory/file。若 root derived output 缺失或 generation 已过期，renderer 会在临时目录进行
+read-only materialization，再把完整或 incomplete recovery 状态写入 HTML，不会更新 source
+root。包含 `interrupted_unfinalized` segment 的视图会明确标为 incomplete，不能当作成功完成的
+case。
 
 生成的 HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 多层转换、
-LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因不读取 HTML，也不应将
-`trace.html` 作为输入；归因始终读取 `trace.json`。
+LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因输入只能是 logical root
+`trace.json` 或 logical case directory；不能使用某个 physical segment、segment-local output、
+`legacy-trace.json` 或 `trace.html`。以 directory 为输入的流程必须先 finalization 当前
+`session.json.generation`，再消费统一 root Trace。
 
 ## 使用离线归因 CLI
 

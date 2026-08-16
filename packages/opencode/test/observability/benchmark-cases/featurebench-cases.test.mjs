@@ -186,6 +186,43 @@ test("runner waits for trace finalization after the server process exits", async
   assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).status, "success")
 })
 
+test("FeatureBench runner executes a deterministic semantic-category probe", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-semantic-probe-"))
+  const traceFile = path.join(directory, "trace.json")
+  fs.writeFileSync(
+    traceFile,
+    JSON.stringify({
+      manifest: { status: "success" },
+      nodes: [
+        { node_id: "run", kind: "run.start", component: "run" },
+        { node_id: "tool", kind: "tool.call", component: "tool" },
+        { node_id: "response", kind: "response.output", component: "result" },
+      ],
+      edges: [{ edge_id: "edge", relation: "produced" }],
+      artifacts: [{ artifact_id: "artifact", path: "artifacts/sha256/value.txt" }],
+      records: [],
+    }),
+  )
+
+  assert.equal(typeof featureBenchRunner.assertTraceSemanticCategories, "function")
+  assert.deepEqual(featureBenchRunner.assertTraceSemanticCategories(traceFile), [
+    "artifact",
+    "edge",
+    "lifecycle",
+    "node",
+    "response",
+    "tool",
+  ])
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(import.meta.dirname, "run-featurebench-cases.mjs"), "--semantic-probe", traceFile],
+    { encoding: "utf8" },
+  )
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /semantic categories: artifact, edge, lifecycle, node, response, tool/)
+})
+
 test("runner allows large traces enough time to finalize after a signal", () => {
   assert.equal(featureBenchRunner.DEFAULT_CHILD_EXIT_TIMEOUT_MS, 5 * 60_000)
 })

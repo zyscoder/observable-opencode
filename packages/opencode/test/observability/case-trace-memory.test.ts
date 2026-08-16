@@ -71,6 +71,10 @@ if (childMode) {
     const match = stdout.match(/CASE_TRACE_MEMORY (\{[^\n]+\})/)
     expect(match, stdout).not.toBeNull()
     const measurement = JSON.parse(match![1]!) as { warmRSS: number; finalRSS: number }
+    console.info(
+      "case-trace-memory-rss",
+      JSON.stringify({ ...measurement, growthRSS: measurement.finalRSS - measurement.warmRSS }),
+    )
     expect(measurement.finalRSS - measurement.warmRSS).toBeLessThanOrEqual(128 * 1024 * 1024)
   }, 120_000)
 }
