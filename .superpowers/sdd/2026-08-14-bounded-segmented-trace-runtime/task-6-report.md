@@ -482,3 +482,67 @@ The first 30-second full case-trace run reported `161 pass, 2 fail, 1 hook error
 - Alias tails shared by multiple nodes are intentionally left unresolved rather than assigned nondeterministically. Explicit canonical IDs and fully qualified aliases remain deterministic.
 - Standalone case directories directly under a protected parent use the case directory as the lock-root anchor because a sibling lock for the inferred parent cannot be created. Normal configured trace roots use the same parent-root global domain as allocation and publication.
 - Atomic root generation switching still depends on symlink support. A link/swap failure removes the candidate generation and leaves the previous visible set intact.
+
+## Fix Round 4/5 Completion
+
+Status on 2026-08-16: **review round 4 complete**. The accepted full case-trace rerun has only the explicitly excluded, unchanged `artifact[0]` positional assertion failing.
+
+### RED Evidence
+
+Focused tests were added and run before each production change:
+
+- `empty_segments` allowed `openTraceSegment` to publish `run_after_empty_segments` instead of throwing.
+- after emptiness was rejected, `missing_non_first_continuation` created the explicit materialization output directory before failing; after presence was enforced, `non_immediate_continuation` did the same because a third descriptor could still target the first run.
+- the deterministic read/lock-gap child paused immediately before lock acquisition while the parent opened and finalized a real segmented continuation. The stale implementation published a legacy-only trace with `session_generation: undefined` instead of generation `2`.
+- canonical nodes named `shared_design`, `shared_claim`, and `shared_verification` captured the matching semantic fields even though another node owned the exact `design:`, `claim:`, and `verification:` aliases.
+- the Win32 path simulation failed because there was no shared portable relative-path/resolution boundary.
+- the prior chmod fixture was a false publication regression: its empty manifest omitted `lock_key` and `generation`, so validation failed before chmod mattered. The repaired fixture first passes `readTraceSessionManifest`, then proves publication reaches `EACCES` and leaves the logical-root tree unchanged.
+
+### Implementation Summary
+
+- The shared manifest parser rejects empty segment lists, requires descriptor zero to omit `continuation_of`, and requires every later descriptor to name the immediately preceding `run_id`. Full validation still occurs before output or segment creation.
+- `materializeTrace` now acquires the global root lock before its first session read. Legacy materialization happens from that same locked absence snapshot, segmented staging uses the locked manifest snapshot, and every retry snapshot is returned from the publication lock without an unlocked reread.
+- Field-specific semantic schemes are resolved before canonical node IDs. Exact scheme ambiguity or disagreement remains unresolved; canonical/plain-alias fallback occurs only when no field-specific alias is present.
+- Generated descriptor paths use POSIX separators. Shared helpers normalize native/Win32 relative results and safely resolve validated POSIX manifest paths without accepting absolute, traversal, backslash, drive, or UNC inputs.
+- The atomic-publication fixture now contains a complete prior descriptor and physical `segment.json`, asserts the injected permission error code, compares recursive tree hashes and manifest bytes, and checks candidate/temp cleanup.
+
+### Exact Verification
+
+```text
+cd packages/opencode
+bun test test/observability/trace-segment.test.ts --timeout 30000
+# 32 pass, 0 fail, 693 expect() calls
+
+bun test test/observability/trace-materializer.test.ts \
+  test/observability/trace-materializer-diagnostics.test.ts --timeout 30000
+# 8 pass, 0 fail, 24 expect() calls
+
+bun test test/cli/tui/worker-trace.test.ts \
+  test/cli/tui/trace-materializer-process.test.ts \
+  test/cli/tui/thread.test.ts --timeout 30000
+# 11 pass, 0 fail, 37 expect() calls
+
+cd packages/trace-renderer
+bun test test/load.test.ts test/cli.test.ts --timeout 30000
+# 38 pass, 0 fail, 201 expect() calls
+
+bun run typecheck
+# pass
+```
+
+The final-tree 1 GiB memory regression passed with `1 pass, 0 fail, 5 expect() calls`. Its measured peak RSS was **255,934,464 bytes**, below the **268,435,456-byte** limit.
+
+One final post-report segment run transiently missed the concurrent-first-creator child-ready gate and reported `31 pass, 1 fail, 1 hook error`. The exact test immediately passed alone in 450 ms, and the complete segment file rerun finished at the accepted `32 pass, 0 fail, 693 expect() calls` shown above.
+
+The first broad run reported `161 pass, 2 fail, 1 hook error`: the known artifact assertion plus the previously observed Bun timing outlier in `keeps decision generation provenance within the decision session`. That exact test immediately passed alone in 347 ms. A fresh complete rerun then finished with `162 pass, 1 fail, 2134 expect() calls`; the sole failure was `persists semantic trace records with artifacts and redaction` at its unchanged `trace.artifacts[0]` assumption. No production behavior or baseline assertion was changed to satisfy it.
+
+`git diff --check` passed before the report update and is rerun as the final commit gate.
+
+### Full-Suite Exclusions
+
+Only the known unchanged `artifact[0]` positional assertion is excluded. The transient decision-generation timeout is not excluded: its isolated rerun and the accepted full rerun both passed.
+
+### Concerns
+
+- Strict manifests now reject empty histories, non-immediate chains, and backslash-authored paths. This is intentional evidence-integrity enforcement; legacy flat roots without `session.json` remain supported.
+- Win32 behavior is covered through `path.win32` simulation in this macOS run rather than a native Windows CI execution.

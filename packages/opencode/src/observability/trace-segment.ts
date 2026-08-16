@@ -65,12 +65,38 @@ function validTimestamp(input: unknown): input is string {
 }
 
 function validRelativePath(input: unknown, allowCurrent = false): input is string {
-  if (!nonemptyString(input) || input.includes("\0")) return false
-  const portable = input.replaceAll("\\", "/")
-  if (portable.startsWith("/") || /^[a-zA-Z]:\//.test(portable)) return false
-  const normalized = path.posix.normalize(portable)
-  if (normalized === ".") return allowCurrent && portable === "."
-  return normalized === portable && normalized !== ".." && !normalized.startsWith("../")
+  if (!nonemptyString(input) || input.includes("\0") || input.includes("\\")) return false
+  if (input.startsWith("/") || /^[a-zA-Z]:\//.test(input)) return false
+  const normalized = path.posix.normalize(input)
+  if (normalized === ".") return allowCurrent && input === "."
+  return normalized === input && normalized !== ".." && !normalized.startsWith("../")
+}
+
+function usesWin32Paths(input: string) {
+  return /^[a-zA-Z]:[\\/]/.test(input) || input.startsWith("\\\\")
+}
+
+export function relativeTraceManifestPath(root: string, target: string) {
+  const implementation = usesWin32Paths(root) || usesWin32Paths(target) ? path.win32 : path
+  const relative = implementation.relative(implementation.resolve(root), implementation.resolve(target))
+  const portable = relative.split(implementation.sep).join(path.posix.sep)
+  if (!validRelativePath(portable)) throw new Error(`${target}: path escapes trace root ${root}`)
+  return portable
+}
+
+export function resolveTraceManifestPath(root: string, relative: string) {
+  if (!validRelativePath(relative, true)) throw new Error(`${relative}: invalid trace manifest path`)
+  const implementation = usesWin32Paths(root) ? path.win32 : path
+  const resolvedRoot = implementation.resolve(root)
+  const resolved = implementation.resolve(resolvedRoot, ...relative.split(path.posix.sep))
+  const fromRoot = implementation.relative(resolvedRoot, resolved)
+  if (
+    fromRoot === ".." ||
+    fromRoot.startsWith(`..${implementation.sep}`) ||
+    implementation.isAbsolute(fromRoot)
+  )
+    throw new Error(`${relative}: path escapes trace root ${root}`)
+  return resolved
 }
 
 function pathIsWithinDescriptor(descriptorPath: string, candidate: string) {
@@ -127,18 +153,19 @@ export function readTraceSessionManifest(file: string): TraceSessionManifest | u
     !validTimestamp(manifest.created_at) ||
     !validTimestamp(manifest.updated_at) ||
     Date.parse(manifest.updated_at as string) < Date.parse(manifest.created_at as string) ||
-    !Array.isArray(manifest.segments)
+    !Array.isArray(manifest.segments) ||
+    manifest.segments.length === 0
   )
     throw new Error(`${file}: invalid trace session manifest`)
   const session = manifest as TraceSessionManifest
   const runIDs = new Set<string>()
   const segmentIDs = new Set<string>()
   const segments = session.segments.map((input) => parseSegmentDescriptor(input, file))
-  for (const descriptor of segments) {
+  for (const [index, descriptor] of segments.entries()) {
     if (
       descriptor.case_id !== session.logical_case_id ||
       descriptor.session_id !== session.session_id ||
-      (descriptor.continuation_of !== undefined && !runIDs.has(descriptor.continuation_of)) ||
+      descriptor.continuation_of !== segments[index - 1]?.run_id ||
       runIDs.has(descriptor.run_id) ||
       segmentIDs.has(descriptor.segment_id)
     )
@@ -432,7 +459,7 @@ function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined)
     throw new Error(`${logicalRoot}: session identity changed`)
   for (const descriptor of current?.segments ?? []) {
     if (descriptor.segment_id === "legacy-root") continue
-    const segmentFile = path.join(logicalRoot, descriptor.path, "segment.json")
+    const segmentFile = resolveTraceManifestPath(logicalRoot, path.posix.join(descriptor.path, "segment.json"))
     const physical = readSegmentDescriptor(segmentFile)
     for (const key of [
       "segment_id",
@@ -540,7 +567,7 @@ export function openTraceSegment(input: {
     }
 
     const now = new Date().toISOString()
-    const relative = path.relative(logicalRoot, segmentDir)
+    const relative = relativeTraceManifestPath(logicalRoot, segmentDir)
     const previous = existingSegments.at(-1)
     const descriptor: TraceSegmentDescriptor = {
       segment_id: segmentID,
@@ -548,9 +575,9 @@ export function openTraceSegment(input: {
       case_id: logicalCaseID,
       session_id: input.sessionID ?? current?.session_id,
       path: relative,
-      records: path.join(relative, "records.jsonl"),
-      artifacts: path.join(relative, "artifacts"),
-      index: path.join(relative, "index.sqlite"),
+      records: path.posix.join(relative, "records.jsonl"),
+      artifacts: path.posix.join(relative, "artifacts"),
+      index: path.posix.join(relative, "index.sqlite"),
       started_at: now,
       status: "running",
       ...(previous ? { continuation_of: previous.run_id } : {}),

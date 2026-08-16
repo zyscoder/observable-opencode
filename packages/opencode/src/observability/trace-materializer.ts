@@ -31,6 +31,7 @@ import {
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
 import {
   readTraceSessionManifest,
+  resolveTraceManifestPath,
   traceSessionLockRootForCase,
   TRACE_MANIFEST_LOCK_KEY,
   withTraceSessionLock,
@@ -378,14 +379,21 @@ function resolvedNodeAlias(scope: SegmentReplayScope, alias: string) {
 }
 
 function resolvedNodeID(scope: SegmentReplayScope, id: string, key = "") {
+  const fieldMatches = new Set<string>()
+  let fieldAliasFound = false
+  for (const scheme of NODE_ID_KEY_SCHEMES.get(key.toLowerCase()) ?? []) {
+    const alias = `${scheme}:${id}`
+    if (!scope.nodeAliases.has(alias)) continue
+    fieldAliasFound = true
+    const resolved = scope.nodeAliases.get(alias)
+    if (!resolved) return undefined
+    fieldMatches.add(resolved)
+  }
+  if (fieldAliasFound) return fieldMatches.size === 1 ? fieldMatches.values().next().value : undefined
   const direct = resolvedScopedEntityID(scope, "node", id)
   if (direct) return direct
   const alias = resolvedNodeAlias(scope, id)
   if (alias) return alias
-  for (const scheme of NODE_ID_KEY_SCHEMES.get(key.toLowerCase()) ?? []) {
-    const byScheme = resolvedNodeAlias(scope, `${scheme}:${id}`)
-    if (byScheme) return byScheme
-  }
   return undefined
 }
 
@@ -1972,13 +1980,6 @@ type MaterializationSource = {
   descriptor?: TraceSegmentDescriptor
 }
 
-function resolveWithin(root: string, relative: string) {
-  const resolved = path.resolve(root, relative)
-  if (resolved !== root && !resolved.startsWith(root + path.sep))
-    throw new Error(`${relative}: path escapes case directory`)
-  return resolved
-}
-
 function readSession(caseDir: string) {
   const file = path.join(caseDir, "session.json")
   const session = readTraceSessionManifest(file)
@@ -2001,7 +2002,7 @@ function materializationSources(caseDir: string, session: TraceSessionManifest |
     runID: descriptor.run_id,
     caseID: descriptor.case_id,
     pathPrefix: descriptor.path,
-    recordsFile: resolveWithin(caseDir, descriptor.records),
+    recordsFile: resolveTraceManifestPath(caseDir, descriptor.records),
     descriptor,
   }))
 }
@@ -2009,13 +2010,13 @@ function materializationSources(caseDir: string, session: TraceSessionManifest |
 function materializeTraceSnapshot(input: {
   caseDir: string
   outputDir?: string
-  sessionSnapshot?: TraceSessionManifest | null
+  sessionSnapshot: TraceSessionManifest | null
   copyArtifacts?: boolean
 }): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
   if (!fs.statSync(caseDir).isDirectory()) throw new Error(`${caseDir}: expected a case directory`)
   const outputDir = path.resolve(input.outputDir ?? caseDir)
-  const session = input.sessionSnapshot === undefined ? readSession(caseDir) : (input.sessionSnapshot ?? undefined)
+  const session = input.sessionSnapshot ?? undefined
   const sources = materializationSources(caseDir, session)
   fs.mkdirSync(outputDir, { recursive: true })
   const indexPath = path.join(
@@ -2270,8 +2271,13 @@ export function materializeTrace(input: {
       }),
     )
 
-  let session = readSession(caseDir)
-  if (!session) return locked(() => materializeTraceSnapshot({ caseDir, sessionSnapshot: null }))
+  const initial = locked(() => {
+    const session = readSession(caseDir)
+    if (session) return { session }
+    return { result: materializeTraceSnapshot({ caseDir, sessionSnapshot: null }) }
+  })
+  if (initial.result) return initial.result
+  let session = initial.session
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-publication-"))
@@ -2279,14 +2285,13 @@ export function materializeTrace(input: {
       const staged = materializeTraceSnapshot({ caseDir, outputDir: stageDir, sessionSnapshot: session })
       const readyFile = process.env.OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE
       if (readyFile) fs.writeFileSync(readyFile, `${session.generation}\n`)
-      let published = false
-      withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, () => {
+      const publication = locked(() => {
         const latest = readSession(caseDir)
-        if (!latest || latest.generation !== session!.generation) return
-        publishStagedTrace(stageDir, caseDir, session!.generation)
-        published = true
+        if (!latest || latest.generation !== session.generation) return { latest, published: false }
+        publishStagedTrace(stageDir, caseDir, session.generation)
+        return { latest, published: true }
       })
-      if (published)
+      if (publication.published)
         return {
           ...staged,
           caseDir,
@@ -2294,8 +2299,8 @@ export function materializeTrace(input: {
           manifestFile: path.join(caseDir, "manifest.json"),
           partialFile: path.join(caseDir, "partial", "latest.json"),
         }
-      session = readSession(caseDir)
-      if (!session) throw new Error(`${caseDir}: trace session disappeared during materialization`)
+      if (!publication.latest) throw new Error(`${caseDir}: trace session disappeared during materialization`)
+      session = publication.latest
     } finally {
       fs.rmSync(stageDir, { recursive: true, force: true })
     }

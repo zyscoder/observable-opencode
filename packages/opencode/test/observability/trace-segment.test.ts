@@ -6,7 +6,13 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { CausalIRStore, type CausalIRJournalEntry } from "@/observability/causal-ir"
 import { materializeTrace } from "@/observability/trace-materializer"
-import { acquireTraceSessionLock, openTraceSegment } from "@/observability/trace-segment"
+import {
+  acquireTraceSessionLock,
+  openTraceSegment,
+  readTraceSessionManifest,
+  relativeTraceManifestPath,
+  resolveTraceManifestPath,
+} from "@/observability/trace-segment"
 
 const packageDir = path.resolve(import.meta.dir, "../..")
 const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
@@ -705,6 +711,7 @@ test("validates every session manifest and descriptor field before mutating a lo
     ["updated_at", (manifest) => (manifest.updated_at = 7)],
     ["timestamp_order", (manifest) => (manifest.updated_at = "2026-08-14T23:59:59.000Z")],
     ["segments", (manifest) => (manifest.segments = {})],
+    ["empty_segments", (manifest) => (manifest.segments = [])],
     ["segment_id", (manifest) => (manifest.segments[0].segment_id = 7)],
     ["run_id", (manifest) => (manifest.segments[0].run_id = "")],
     ["case_id", (manifest) => (manifest.segments[0].case_id = 7)],
@@ -732,7 +739,52 @@ test("validates every session manifest and descriptor field before mutating a lo
     ["started_at", (manifest) => (manifest.segments[0].started_at = "not-a-time")],
     ["status", (manifest) => (manifest.segments[0].status = "unknown")],
     ["continuation_of", (manifest) => (manifest.segments[0].continuation_of = 7)],
+    ["first_continuation", (manifest) => (manifest.segments[0].continuation_of = "run_before_first")],
     ["continuation_target", (manifest) => (manifest.segments[0].continuation_of = "run_missing")],
+    [
+      "missing_non_first_continuation",
+      (manifest) => {
+        manifest.segments.push({
+          ...manifest.segments[0],
+          segment_id: "run_second",
+          run_id: "run_second",
+          path: "segments/run_second",
+          records: "segments/run_second/records.jsonl",
+          artifacts: "segments/run_second/artifacts",
+          index: "segments/run_second/index.sqlite",
+          started_at: "2026-08-15T00:00:01.000Z",
+        })
+      },
+    ],
+    [
+      "non_immediate_continuation",
+      (manifest) => {
+        manifest.segments.push(
+          {
+            ...manifest.segments[0],
+            segment_id: "run_second",
+            run_id: "run_second",
+            path: "segments/run_second",
+            records: "segments/run_second/records.jsonl",
+            artifacts: "segments/run_second/artifacts",
+            index: "segments/run_second/index.sqlite",
+            started_at: "2026-08-15T00:00:01.000Z",
+            continuation_of: "run_existing",
+          },
+          {
+            ...manifest.segments[0],
+            segment_id: "run_third",
+            run_id: "run_third",
+            path: "segments/run_third",
+            records: "segments/run_third/records.jsonl",
+            artifacts: "segments/run_third/artifacts",
+            index: "segments/run_third/index.sqlite",
+            started_at: "2026-08-15T00:00:02.000Z",
+            continuation_of: "run_existing",
+          },
+        )
+      },
+    ],
   ]
 
   for (const [name, mutate] of invalid) {
@@ -776,6 +828,39 @@ test("validates every session manifest and descriptor field before mutating a lo
     } finally {
       await fs.rm(traceRoot, { recursive: true, force: true })
     }
+  }
+})
+
+test("writes POSIX manifest paths and resolves them safely with Win32 path behavior", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-portable-manifest-paths-"))
+  try {
+    const winRoot = String.raw`C:\trace-root\portable-case`
+    const winSegment = path.win32.join(winRoot, "segments", "run_win")
+    const relative = relativeTraceManifestPath(winRoot, winSegment)
+    expect(relative).toBe("segments/run_win")
+    expect(resolveTraceManifestPath(winRoot, relative)).toBe(winSegment)
+
+    for (const invalid of [
+      "../outside",
+      String.raw`..\outside`,
+      "/absolute",
+      "C:/absolute",
+      String.raw`C:\absolute`,
+      String.raw`\\server\share\records.jsonl`,
+    ])
+      expect(() => resolveTraceManifestPath(winRoot, invalid), invalid).toThrow()
+
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "portable-case",
+      sessionID: "ses_portable",
+      runID: "run_portable",
+    })
+    const session = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
+    for (const field of ["path", "records", "artifacts", "index"])
+      expect(session.segments[0][field]).not.toContain("\\")
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })
 
@@ -871,36 +956,65 @@ test("failed atomic manifest publication removes the unpublished segment and pre
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-atomic-failure-"))
   const logicalRoot = path.join(traceRoot, "atomic-failure")
   const sessionDestination = path.join(logicalRoot, "session.json")
+  const existingDescriptor = {
+    segment_id: "run_existing",
+    run_id: "run_existing",
+    case_id: "atomic-failure",
+    session_id: "ses_atomic_failure",
+    path: "segments/run_existing",
+    records: "segments/run_existing/records.jsonl",
+    artifacts: "segments/run_existing/artifacts",
+    index: "segments/run_existing/index.sqlite",
+    started_at: "2026-08-15T00:00:00.000Z",
+    status: "completed",
+  }
   const original =
     JSON.stringify(
       {
         schema_version: "1.0",
         logical_case_id: "atomic-failure",
         session_id: "ses_atomic_failure",
+        lock_key: globalManifestLockKey,
+        generation: 1,
         created_at: "2026-08-15T00:00:00.000Z",
         updated_at: "2026-08-15T00:00:00.000Z",
-        segments: [],
+        segments: [existingDescriptor],
       },
       undefined,
       2,
     ) + "\n"
   try {
-    await fs.mkdir(path.join(logicalRoot, "segments"), { recursive: true })
+    const existingSegmentDir = path.join(logicalRoot, existingDescriptor.path)
+    await fs.mkdir(existingSegmentDir, { recursive: true })
+    await fs.writeFile(path.join(existingSegmentDir, "segment.json"), JSON.stringify(existingDescriptor) + "\n")
     await fs.writeFile(sessionDestination, original)
+    expect(readTraceSessionManifest(sessionDestination)).toMatchObject({
+      lock_key: globalManifestLockKey,
+      generation: 1,
+      segments: [existingDescriptor],
+    })
+    const before = await treeHash(logicalRoot)
     await fs.chmod(logicalRoot, 0o555)
 
-    expect(() =>
+    let publicationError: unknown
+    try {
       openTraceSegment({
         rootDir: traceRoot,
         logicalCaseID: "atomic-failure",
         sessionID: "ses_atomic_failure",
         runID: "run_atomic_failure",
-      }),
-    ).toThrow()
+      })
+    } catch (error) {
+      publicationError = error
+    }
+    expect(publicationError).toBeInstanceOf(Error)
+    expect(["EACCES", "EPERM", "EROFS"]).toContain((publicationError as NodeJS.ErrnoException).code)
     await fs.chmod(logicalRoot, 0o755)
 
+    expect(await treeHash(logicalRoot)).toBe(before)
     expect(await fs.readFile(sessionDestination, "utf8")).toBe(original)
-    expect(await fs.readdir(path.join(logicalRoot, "segments"))).toEqual([])
+    expect(await fs.readdir(path.join(logicalRoot, "segments"))).toEqual(["run_existing"])
+    expect(await fileExists(path.join(logicalRoot, "segments", "run_atomic_failure"))).toBe(false)
     expect((await fs.readdir(logicalRoot)).filter((file) => file.includes(".tmp"))).toEqual([])
   } finally {
     await fs.chmod(logicalRoot, 0o755).catch(() => {})
@@ -999,6 +1113,17 @@ async function writeClosedSegment(
     status: "running",
     data: { marker: input.marker, run_id: input.runID, case_id: caseID },
   })
+  if (input.referenceFixture)
+    for (const nodeID of ["shared_design", "shared_claim", "shared_verification"])
+      store.createNode({
+        node_id: nodeID,
+        kind: "execution.observation",
+        component: "runtime",
+        timestamp: "2026-08-15T00:00:00.500Z",
+        time_ms: 0.5,
+        status: "success",
+        data: { collision: nodeID },
+      })
   store.createNode({
     node_id: "shared_fact",
     kind: "evidence.semantic_fact",
@@ -1208,6 +1333,105 @@ test("uses the global manifest lock for flat, segmented-output, and publication 
   } finally {
     if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
     else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("chooses segmented materialization from the session snapshot read after locking", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-materializer-lock-gap-"))
+  const logicalRoot = path.join(traceRoot, "lock-gap-case")
+  const readyFile = path.join(traceRoot, "materializer-lock.ready")
+  const gateFile = path.join(traceRoot, "materializer-lock.gate")
+  const outputFile = path.join(traceRoot, "materializer-output.json")
+  const script = path.join(traceRoot, "materialize-lock-gap.ts")
+  try {
+    const legacyEntries: CausalIRJournalEntry[] = []
+    const legacy = new CausalIRStore({
+      runID: "run_gap_legacy",
+      caseID: "lock-gap-case",
+      append: (entry) => legacyEntries.push(entry),
+    })
+    legacy.createNode({
+      node_id: "run_start",
+      kind: "run.start",
+      component: "run",
+      timestamp: "2026-08-15T00:00:00.000Z",
+      time_ms: 0,
+      status: "running",
+      data: { marker: "legacy-only", run_id: "run_gap_legacy", case_id: "lock-gap-case" },
+    })
+    legacy.closeRuntime({
+      format: "runtime_close",
+      status: "success",
+      closed_at: "2026-08-15T00:00:01.000Z",
+      manifest: { case_id: "lock-gap-case", run_id: "run_gap_legacy" },
+    })
+    await fs.mkdir(logicalRoot, { recursive: true })
+    await fs.writeFile(
+      path.join(logicalRoot, "records.jsonl"),
+      legacyEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    )
+    await fs.writeFile(
+      script,
+      [
+        `import fs from "node:fs"`,
+        `const request = JSON.parse(process.argv[2])`,
+        `const mkdirSync = fs.mkdirSync.bind(fs)`,
+        `let paused = false`,
+        `fs.mkdirSync = ((directory, options) => {`,
+        `  if (!paused && String(directory) === request.lockDir) {`,
+        `    paused = true`,
+        `    fs.writeFileSync(request.readyFile, "ready")`,
+        `    while (!fs.existsSync(request.gateFile)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2)`,
+        `  }`,
+        `  return mkdirSync(directory, options)`,
+        `})`,
+        `const { materializeTrace } = await import(${JSON.stringify(materializerModule)})`,
+        `const result = materializeTrace({ caseDir: request.logicalRoot })`,
+        `fs.writeFileSync(request.outputFile, JSON.stringify(result))`,
+      ].join("\n"),
+    )
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        script,
+        JSON.stringify({
+          logicalRoot,
+          lockDir: lockDirectory(traceRoot, globalManifestLockKey),
+          readyFile,
+          gateFile,
+          outputFile,
+        }),
+      ],
+      { cwd: packageDir, stdout: "pipe", stderr: "pipe" },
+    )
+    expect(await waitForFilePresence(readyFile)).toBe(true)
+
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "lock-gap-case",
+      sessionID: "ses_lock_gap",
+      runID: "run_gap_segmented",
+    })
+    await writeClosedSegment(segment, {
+      runID: "run_gap_segmented",
+      marker: "segmented-after-lock",
+      caseID: "lock-gap-case",
+    })
+    await fs.writeFile(gateFile, "continue")
+
+    const exitCode = await child.exited
+    const stderr = await new Response(child.stderr).text()
+    expect(exitCode, stderr).toBe(0)
+    expect(stderr).toBe("")
+    const result = JSON.parse(await fs.readFile(outputFile, "utf8")) as any
+    const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8")) as any
+    const session = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
+    expect(trace.manifest.session_generation).toBe(session.generation)
+    expect(trace.manifest.segments).toHaveLength(2)
+    expect(trace.nodes.some((node: any) => node.scope?.run_id === "run_gap_segmented")).toBe(true)
+  } finally {
+    await fs.writeFile(gateFile, "continue").catch(() => {})
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })
@@ -1780,6 +2004,8 @@ test("cleans a first derived generation after copy and root-link failures", asyn
 test("publishes only a generation-matched session snapshot with trace.json as the commit marker", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-generation-publication-"))
   const readyFile = path.join(traceRoot, "stage.ready")
+  const publicationReadyFile = path.join(traceRoot, "publication.ready")
+  const publicationGateFile = path.join(traceRoot, "publication.gate")
   const script = path.join(traceRoot, "materialize.ts")
   try {
     const segment = openTraceSegment({
@@ -1794,13 +2020,23 @@ test("publishes only a generation-matched session snapshot with trace.json as th
     await fs.writeFile(
       script,
       [
-        `import { materializeTrace } from ${JSON.stringify(materializerModule)}`,
+        `import fs from "node:fs"`,
+        `const mkdirSync = fs.mkdirSync.bind(fs)`,
+        `let paused = false`,
+        `fs.mkdirSync = ((directory, options) => {`,
+        `  if (!paused && String(directory) === ${JSON.stringify(lockDirectory(traceRoot, globalManifestLockKey))} && fs.existsSync(${JSON.stringify(readyFile)})) {`,
+        `    paused = true`,
+        `    fs.writeFileSync(${JSON.stringify(publicationReadyFile)}, "ready")`,
+        `    while (!fs.existsSync(${JSON.stringify(publicationGateFile)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2)`,
+        `  }`,
+        `  return mkdirSync(directory, options)`,
+        `})`,
+        `const { materializeTrace } = await import(${JSON.stringify(materializerModule)})`,
         `const result = materializeTrace({ caseDir: ${JSON.stringify(segment.logicalRoot)} })`,
         `process.stdout.write(JSON.stringify(result))`,
       ].join("\n"),
     )
 
-    const release = acquireTraceSessionLock(traceRoot, segment.lockKey)
     const child = Bun.spawn([process.execPath, script], {
       cwd: packageDir,
       env: { ...process.env, OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE: readyFile },
@@ -1808,22 +2044,28 @@ test("publishes only a generation-matched session snapshot with trace.json as th
       stderr: "pipe",
     })
     expect(await waitForFilePresence(readyFile)).toBe(true)
+    expect(await waitForFilePresence(publicationReadyFile)).toBe(true)
     expect(await fs.readFile(path.join(segment.logicalRoot, "trace.json"), "utf8")).toBe(staleCommitMarker)
 
+    const release = acquireTraceSessionLock(traceRoot, segment.lockKey)
     const manifest = JSON.parse(await fs.readFile(segment.sessionFile, "utf8")) as any
     manifest.generation += 1
-    manifest.updated_at = "2026-08-15T23:59:59.000Z"
+    manifest.updated_at = new Date(Date.parse(manifest.updated_at) + 1).toISOString()
     await fs.writeFile(segment.sessionFile, JSON.stringify(manifest, undefined, 2) + "\n")
     release()
+    await fs.writeFile(publicationGateFile, "continue")
 
-    expect(await child.exited).toBe(0)
-    expect(await new Response(child.stderr).text()).toBe("")
+    const exitCode = await child.exited
+    const stderr = await new Response(child.stderr).text()
+    expect(exitCode, stderr).toBe(0)
+    expect(stderr).toBe("")
     const output = JSON.parse(await new Response(child.stdout).text()) as any
     const trace = JSON.parse(await fs.readFile(output.traceFile, "utf8")) as any
     expect(trace.manifest.session_generation).toBe(manifest.generation)
     expect(trace.manifest.run_id).toBe("run_generation")
     expect(await fs.readFile(path.join(segment.logicalRoot, "trace.json"), "utf8")).not.toBe(staleCommitMarker)
   } finally {
+    await fs.writeFile(publicationGateFile, "continue").catch(() => {})
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })
