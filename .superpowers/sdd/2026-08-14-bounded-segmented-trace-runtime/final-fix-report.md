@@ -102,3 +102,31 @@ Durability and recovery evidence:
 - Segment allocation creates and fsyncs an empty `records.jsonl`, then fsyncs its directory before atomically publishing `segment.json` and `session.json`.
 - The allocation-only test fixture stops at the exact pre-first-entry crash boundary. Materialization returns `completeness: "incomplete"`, `recoveredLines: 0`, top-level error/interrupted status, descriptor-derived identities and start time, empty legacy projections, and an explicit interrupted recovery record.
 - Materialization leaves both the zero-byte journal and the published session manifest byte-identical. Segmented journals missing from older crash windows receive the same zero-line interrupted recovery; flat missing/empty journals remain invalid.
+
+## Checkpoint 4: Disk-backed multi-segment namespace lookup
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Finding covered:
+
+- Critical: multi-segment entity-ID and node-alias predeclaration no longer retains graph-cardinality JavaScript maps. Namespaced existence, alias ownership, and ambiguity are indexed in the temporary materializer SQLite database with 256-entry entity and alias lookup caches.
+
+RED evidence:
+
+- `bun test test/observability/trace-materializer-multisegment-memory.test.ts --timeout 600000`: the final 1 GiB fixture contains 1,088,692,372 journal bytes across two segments and repeated local identities. The original map-backed materializer peaked at 578,387,968 bytes versus the 268,435,456-byte limit.
+- The first disk-table implementation reduced peak RSS to 315,179,008 bytes. Bounded transaction batches removed the commit spike but remained RED at 290,095,104 bytes, showing that JavaScript pre-scan parsing still retained too much allocator memory.
+- After the namespace schema landed, the original sparse acceptance exposed a narrow regression: 268,632,064 bytes, 196,608 bytes over the hard limit.
+
+GREEN evidence:
+
+- `bun test test/observability/trace-materializer-multisegment-memory.test.ts --timeout 600000`: 1 pass, 0 fail, 7 expectations in 24.63 s. A standalone production Bun child materialized 1,088,692,372 bytes and 62,008 valid entries at a 169,017,344-byte peak, with both colliding alias references resolving to their segment-scoped target IDs.
+- `bun test test/observability/trace-materializer-memory.test.ts --timeout 600000`: 1 pass, 0 fail, 5 expectations in 3.99 s. The pre-existing sparse 1,073,873,543-byte journal plus renderer load peaked at 252,297,216 bytes after reducing the temporary SQLite page cache from 8 MiB to 4 MiB.
+- `bun test test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts test/observability/trace-segment.test.ts --timeout 120000`: 43 pass, 0 fail, 740 expectations in 8.79 s.
+- `bun run typecheck` in `packages/opencode`: exit 2 with the exact pre-change 22-diagnostic baseline and no new diagnostics.
+- `git diff --check`: pass.
+
+Memory and semantic evidence:
+
+- Predeclaration uses SQLite JSON queries over each bounded physical line, avoiding a graph-retaining JavaScript parse pass. Entity existence and typed alias owners are stored in `WITHOUT ROWID` tables; aliases preserve unique-owner and ambiguity behavior.
+- The high-cardinality fixture repeats all local node IDs across two immutable segments, includes three typed aliases per node, compacts each segment to a small terminal snapshot, and verifies exact namespace resolution after replay. This exercises high cardinality without weakening the 1 GiB journal or loading a synthetic 1 GiB derived JSON document into the renderer.
+- The measured child is a plain production Bun process; the parent `bun test` process builds the fixture, verifies bytes/RSS/exit status, and validates the child-reported semantic assertions without adding test-runner memory to the materializer envelope.

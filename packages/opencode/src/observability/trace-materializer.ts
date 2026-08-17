@@ -85,6 +85,183 @@ type LegacyRow = { legacy_ref: string }
 type OccurrenceRow = { owner_type: "node" | "edge"; owner_id: string; field: string }
 type DiagnosticIDRow = { diagnostic_id: string }
 type EntityIDRow = { entity_id: string }
+type NamespaceEntityRow = { present: number }
+type NamespaceAliasRow = { owner_count: number; node_id: string | null }
+
+type NamespaceEntityType = "node" | "edge" | "artifact" | "diagnostic"
+
+const DECLARE_NAMESPACE_ENTITIES_SQL = `
+  WITH input(document) AS (SELECT CASE WHEN json_valid(?) THEN ? ELSE '{}' END),
+  entities(entity_type, original_id) AS (
+    SELECT
+      CASE json_extract(document, '$.operation')
+        WHEN 'node.created' THEN 'node'
+        WHEN 'node.updated' THEN 'node'
+        WHEN 'edge.created' THEN 'edge'
+        WHEN 'artifact.created' THEN 'artifact'
+        WHEN 'artifact.reused' THEN 'artifact'
+        WHEN 'diagnostic.created' THEN 'diagnostic'
+      END,
+      CASE json_extract(document, '$.operation')
+        WHEN 'node.created' THEN json_extract(document, '$.data.node_id')
+        WHEN 'node.updated' THEN json_extract(document, '$.data.node_id')
+        WHEN 'edge.created' THEN json_extract(document, '$.data.edge_id')
+        WHEN 'artifact.created' THEN json_extract(document, '$.data.artifact_id')
+        WHEN 'artifact.reused' THEN json_extract(document, '$.data.artifact_id')
+        WHEN 'diagnostic.created' THEN json_extract(document, '$.data.diagnostic_id')
+      END
+    FROM input
+    UNION ALL
+    SELECT 'node', json_extract(item.value, '$.node_id')
+    FROM input, json_each(input.document, '$.data.snapshot.nodes') AS item
+    UNION ALL
+    SELECT 'edge', json_extract(item.value, '$.edge_id')
+    FROM input, json_each(input.document, '$.data.snapshot.edges') AS item
+    UNION ALL
+    SELECT 'artifact', json_extract(item.value, '$.artifact_id')
+    FROM input, json_each(input.document, '$.data.snapshot.artifacts') AS item
+    UNION ALL
+    SELECT 'diagnostic', json_extract(item.value, '$.diagnostic_id')
+    FROM input, json_each(input.document, '$.data.snapshot.diagnostics') AS item
+  )
+  INSERT OR IGNORE INTO namespace_entities(segment_key, entity_type, original_id)
+  SELECT ?, entity_type, original_id
+  FROM entities
+  WHERE entity_type IS NOT NULL AND typeof(original_id) = 'text' AND length(original_id) > 0
+`
+
+const DECLARE_NAMESPACE_ALIASES_SQL = `
+  WITH input(document) AS (SELECT CASE WHEN json_valid(?) THEN ? ELSE '{}' END),
+  nodes(node) AS (
+    SELECT json_extract(document, '$.data')
+    FROM input
+    WHERE json_extract(document, '$.operation') IN ('node.created', 'node.updated')
+    UNION ALL
+    SELECT item.value
+    FROM input, json_each(input.document, '$.data.snapshot.nodes') AS item
+  ),
+  direct_aliases(alias, node_id) AS (
+    SELECT json_extract(node, '$.node_id'), json_extract(node, '$.node_id') FROM nodes
+  ),
+  alias_parts(alias, node_id, separator) AS (
+    SELECT item.value, json_extract(node, '$.node_id'), instr(item.value, ':')
+    FROM nodes, json_each(nodes.node, '$.aliases') AS item
+    WHERE typeof(item.value) = 'text'
+  ),
+  valid_aliases(alias, node_id, local_id) AS (
+    SELECT parts.alias, parts.node_id, substr(parts.alias, parts.separator + 1)
+    FROM alias_parts AS parts
+    JOIN namespace_alias_schemes AS schemes
+      ON schemes.scheme = substr(parts.alias, 1, parts.separator - 1)
+    WHERE parts.separator > 1 AND parts.separator < length(parts.alias)
+  ),
+  aliases(alias, node_id) AS (
+    SELECT alias, node_id FROM direct_aliases
+    UNION ALL
+    SELECT alias, node_id FROM valid_aliases
+    UNION ALL
+    SELECT local_id, node_id FROM valid_aliases
+  )
+  INSERT OR IGNORE INTO namespace_node_aliases(segment_key, alias, node_id)
+  SELECT ?, alias, node_id
+  FROM aliases
+  WHERE typeof(alias) = 'text' AND length(alias) > 0 AND typeof(node_id) = 'text' AND length(node_id) > 0
+`
+
+class BoundedLookupCache<T> {
+  private readonly values = new Map<string, T>()
+
+  constructor(private readonly limit: number) {}
+
+  get(key: string) {
+    if (!this.values.has(key)) return undefined
+    const value = this.values.get(key)!
+    this.values.delete(key)
+    this.values.set(key, value)
+    return value
+  }
+
+  set(key: string, value: T) {
+    this.values.delete(key)
+    this.values.set(key, value)
+    while (this.values.size > this.limit) this.values.delete(this.values.keys().next().value!)
+  }
+}
+
+class DiskNamespaceLookup {
+  private readonly entityCache = new BoundedLookupCache<string | false>(256)
+  private readonly aliasCache = new BoundedLookupCache<{ present: boolean; nodeID?: string }>(256)
+  private transactionOpen = false
+
+  constructor(
+    private readonly db: Database,
+    private readonly segmentID: string,
+  ) {}
+
+  begin() {
+    if (this.transactionOpen) return
+    this.db.exec("BEGIN")
+    this.transactionOpen = true
+  }
+
+  commit() {
+    if (!this.transactionOpen) return
+    this.db.exec("COMMIT")
+    this.transactionOpen = false
+  }
+
+  rollback() {
+    if (!this.transactionOpen) return
+    this.db.exec("ROLLBACK")
+    this.transactionOpen = false
+  }
+
+  declareEntity(type: NamespaceEntityType, id: string) {
+    const scoped = `${this.segmentID}::${type}::${id}`
+    this.db
+      .query("INSERT OR IGNORE INTO namespace_entities(segment_key, entity_type, original_id) VALUES (?, ?, ?)")
+      .run(this.segmentID, type, id)
+    this.entityCache.set(`${type}\0${id}`, scoped)
+    return scoped
+  }
+
+  resolveEntity(type: NamespaceEntityType, id: string) {
+    const key = `${type}\0${id}`
+    const cached = this.entityCache.get(key)
+    if (cached !== undefined) return cached === false ? undefined : cached
+    const present = this.db
+      .query<
+        NamespaceEntityRow,
+        [string, string, string]
+      >("SELECT 1 AS present FROM namespace_entities WHERE segment_key = ? AND entity_type = ? AND original_id = ?")
+      .get(this.segmentID, type, id)?.present
+    const scoped = present ? `${this.segmentID}::${type}::${id}` : undefined
+    this.entityCache.set(key, scoped ?? false)
+    return scoped
+  }
+
+  declareJournalLine(line: string) {
+    this.db.query(DECLARE_NAMESPACE_ENTITIES_SQL).run(line, line, this.segmentID)
+    this.db.query(DECLARE_NAMESPACE_ALIASES_SQL).run(line, line, this.segmentID)
+  }
+
+  resolveAlias(alias: string) {
+    const cached = this.aliasCache.get(alias)
+    if (cached) return cached
+    const row = this.db
+      .query<
+        NamespaceAliasRow,
+        [string, string]
+      >("SELECT COUNT(*) AS owner_count, MIN(node_id) AS node_id FROM namespace_node_aliases WHERE segment_key = ? AND alias = ?")
+      .get(this.segmentID, alias)!
+    const resolution = {
+      present: row.owner_count > 0,
+      ...(row.owner_count === 1 && row.node_id ? { nodeID: `${this.segmentID}::node::${row.node_id}` } : {}),
+    }
+    this.aliasCache.set(alias, resolution)
+    return resolution
+  }
+}
 
 type SegmentReplayScope = {
   key: string
@@ -93,8 +270,7 @@ type SegmentReplayScope = {
   caseID: string
   pathPrefix: string
   namespace: boolean
-  idMaps: Record<"node" | "edge" | "artifact" | "diagnostic", Map<string, string>>
-  nodeAliases: Map<string, string | null>
+  namespaceLookup?: DiskNamespaceLookup
 }
 
 type TerminalEnvelope = {
@@ -132,22 +308,15 @@ function nonemptyString(input: unknown): input is string {
   return typeof input === "string" && input.length > 0
 }
 
-function scopedEntityID(scope: SegmentReplayScope, type: "node" | "edge" | "artifact" | "diagnostic", id: string) {
+function scopedEntityID(scope: SegmentReplayScope, type: NamespaceEntityType, id: string) {
   if (!scope.namespace) return id
-  const existing = scope.idMaps[type].get(id)
-  if (existing) return existing
-  const scoped = `${scope.segmentID}::${type}::${id}`
-  scope.idMaps[type].set(id, scoped)
-  return scoped
+  if (!scope.namespaceLookup) throw new Error("missing namespace lookup")
+  return scope.namespaceLookup.declareEntity(type, id)
 }
 
-function resolvedScopedEntityID(
-  scope: SegmentReplayScope,
-  type: "node" | "edge" | "artifact" | "diagnostic",
-  id: string,
-) {
+function resolvedScopedEntityID(scope: SegmentReplayScope, type: NamespaceEntityType, id: string) {
   if (!scope.namespace) return id
-  return scope.idMaps[type].get(id)
+  return scope.namespaceLookup?.resolveEntity(type, id)
 }
 
 const NODE_ID_KEY_SCHEMES = new Map<string, readonly string[]>([
@@ -401,8 +570,7 @@ const CAUSAL_NODE_ALIAS_SCHEMES = new Set([
 ])
 
 function resolvedNodeAlias(scope: SegmentReplayScope, alias: string) {
-  const resolved = scope.nodeAliases.get(alias)
-  return resolved === null ? undefined : resolved
+  return scope.namespaceLookup?.resolveAlias(alias).nodeID
 }
 
 function resolvedNodeID(scope: SegmentReplayScope, id: string, key = "") {
@@ -410,11 +578,11 @@ function resolvedNodeID(scope: SegmentReplayScope, id: string, key = "") {
   let fieldAliasFound = false
   for (const scheme of NODE_ID_KEY_SCHEMES.get(key.toLowerCase()) ?? []) {
     const alias = `${scheme}:${id}`
-    if (!scope.nodeAliases.has(alias)) continue
+    const resolution = scope.namespaceLookup?.resolveAlias(alias)
+    if (!resolution?.present) continue
     fieldAliasFound = true
-    const resolved = scope.nodeAliases.get(alias)
-    if (!resolved) return undefined
-    fieldMatches.add(resolved)
+    if (!resolution.nodeID) return undefined
+    fieldMatches.add(resolution.nodeID)
   }
   if (fieldAliasFound) return fieldMatches.size === 1 ? fieldMatches.values().next().value : undefined
   const direct = resolvedScopedEntityID(scope, "node", id)
@@ -725,7 +893,7 @@ class ReplayIndex {
     this.db.exec("PRAGMA journal_mode = OFF")
     this.db.exec("PRAGMA synchronous = OFF")
     this.db.exec("PRAGMA temp_store = FILE")
-    this.db.exec("PRAGMA cache_size = -8192")
+    this.db.exec("PRAGMA cache_size = -4096")
     this.db.exec(`
       CREATE TABLE nodes (
         entity_id TEXT PRIMARY KEY,
@@ -787,7 +955,26 @@ class ReplayIndex {
         ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
         json TEXT NOT NULL
       );
+      CREATE TABLE namespace_entities (
+        segment_key TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        original_id TEXT NOT NULL,
+        PRIMARY KEY (segment_key, entity_type, original_id)
+      ) WITHOUT ROWID;
+      CREATE TABLE namespace_node_aliases (
+        segment_key TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        PRIMARY KEY (segment_key, alias, node_id)
+      ) WITHOUT ROWID;
+      CREATE TABLE namespace_alias_schemes (
+        scheme TEXT PRIMARY KEY
+      ) WITHOUT ROWID;
     `)
+    const insertAliasScheme = this.db.query("INSERT INTO namespace_alias_schemes(scheme) VALUES (?)")
+    this.db.transaction(() => {
+      for (const scheme of CAUSAL_NODE_ALIAS_SCHEMES) insertAliasScheme.run(scheme)
+    })()
   }
 
   get identities() {
@@ -1497,14 +1684,7 @@ class ReplayIndex {
       runID: input.runID,
       caseID: input.caseID,
       pathPrefix: "",
-      namespace: true,
-      idMaps: {
-        node: new Map(),
-        edge: new Map(),
-        artifact: new Map(),
-        diagnostic: new Map(),
-      },
-      nodeAliases: new Map(),
+      namespace: false,
     }
     this.putEdge({
       edge_id: `${input.segmentKey}::edge::run.continuation::${input.previousRunID}`,
@@ -1683,8 +1863,7 @@ class ReplayIndex {
           const data = record(envelope.data)
           if (!data) return
           if (envelope.type === "event") insertEvent.run(JSON.stringify(data))
-          if (envelope.type === "span.end" && data.error !== undefined)
-            insertError.run(JSON.stringify(data.error))
+          if (envelope.type === "span.end" && data.error !== undefined) insertError.run(JSON.stringify(data.error))
         },
         () => {},
       )
@@ -1692,16 +1871,12 @@ class ReplayIndex {
   }
 
   *legacyRuntimeEvents() {
-    for (const row of this.db
-      .query<JsonRow, []>("SELECT json FROM legacy_runtime_events ORDER BY ordinal")
-      .iterate())
+    for (const row of this.db.query<JsonRow, []>("SELECT json FROM legacy_runtime_events ORDER BY ordinal").iterate())
       yield JSON.parse(row.json) as unknown
   }
 
   *legacyRuntimeErrors(terminalError: unknown) {
-    for (const row of this.db
-      .query<JsonRow, []>("SELECT json FROM legacy_runtime_errors ORDER BY ordinal")
-      .iterate())
+    for (const row of this.db.query<JsonRow, []>("SELECT json FROM legacy_runtime_errors ORDER BY ordinal").iterate())
       yield JSON.parse(row.json) as unknown
     if (terminalError !== undefined) yield terminalError
   }
@@ -1791,60 +1966,28 @@ function parseLine(line: string) {
 }
 
 function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope) {
-  if (!scope.namespace || !fs.existsSync(recordsFile)) return
-  const registerAlias = (alias: string, nodeID: string) => {
-    const existing = scope.nodeAliases.get(alias)
-    if (existing === undefined) scope.nodeAliases.set(alias, nodeID)
-    else if (existing !== nodeID) scope.nodeAliases.set(alias, null)
+  if (!scope.namespace || !scope.namespaceLookup || !fs.existsSync(recordsFile)) return
+  let bytesSinceGC = 0
+  scope.namespaceLookup.begin()
+  try {
+    readPhysicalLines(
+      recordsFile,
+      (line) => scope.namespaceLookup!.declareJournalLine(line),
+      (sourceBytes) => {
+        bytesSinceGC += sourceBytes
+        if (bytesSinceGC < MATERIALIZER_GC_BYTES) return
+        scope.namespaceLookup!.commit()
+        Bun.gc(true)
+        scope.namespaceLookup!.begin()
+        bytesSinceGC = 0
+      },
+    )
+    scope.namespaceLookup.commit()
+  } catch (error) {
+    scope.namespaceLookup.rollback()
+    throw error
   }
-  const registerNode = (value: unknown) => {
-    const node = record(value)
-    if (!node || !nonemptyString(node.node_id)) return
-    const scoped = scopedEntityID(scope, "node", node.node_id)
-    registerAlias(node.node_id, scoped)
-    for (const alias of Array.isArray(node.aliases) ? node.aliases : []) {
-      if (!nonemptyString(alias)) continue
-      const separator = alias.indexOf(":")
-      const scheme = separator > 0 ? alias.slice(0, separator) : undefined
-      if (!scheme || !CAUSAL_NODE_ALIAS_SCHEMES.has(scheme)) continue
-      registerAlias(alias, scoped)
-      const local = alias.slice(separator + 1)
-      if (local) registerAlias(local, scoped)
-    }
-  }
-  const register = (
-    type: "node" | "edge" | "artifact" | "diagnostic",
-    value: unknown,
-    key: "node_id" | "edge_id" | "artifact_id" | "diagnostic_id",
-  ) => {
-    const entity = record(value)
-    if (entity && nonemptyString(entity[key])) scopedEntityID(scope, type, entity[key] as string)
-  }
-  readPhysicalLines(
-    recordsFile,
-    (line) => {
-      let entry: Record<string, unknown>
-      try {
-        entry = parseLine(line) as Record<string, unknown>
-      } catch (error) {
-        if (error instanceof JournalJsonError) return
-        throw error
-      }
-      const operation = entry.operation
-      if (operation === "node.created" || operation === "node.updated") registerNode(entry.data)
-      if (operation === "edge.created") register("edge", entry.data, "edge_id")
-      if (operation === "artifact.created" || operation === "artifact.reused")
-        register("artifact", entry.data, "artifact_id")
-      if (operation === "diagnostic.created") register("diagnostic", entry.data, "diagnostic_id")
-      const snapshot = lifecycleSnapshot(entry.data)
-      if (!snapshot) return
-      for (const node of snapshot.nodes) registerNode(node)
-      for (const edge of snapshot.edges) register("edge", edge, "edge_id")
-      for (const artifact of snapshot.artifacts) register("artifact", artifact, "artifact_id")
-      for (const diagnostic of snapshot.diagnostics) register("diagnostic", diagnostic, "diagnostic_id")
-    },
-    () => {},
-  )
+  if (bytesSinceGC > 0) Bun.gc(true)
 }
 
 function recoverJournal(recordsFile: string, index: ReplayIndex, allowEmpty = false) {
@@ -2494,13 +2637,7 @@ function materializeTraceSnapshot(input: {
         caseID: source.caseID ?? "",
         pathPrefix: source.pathPrefix,
         namespace,
-        idMaps: {
-          node: new Map(),
-          edge: new Map(),
-          artifact: new Map(),
-          diagnostic: new Map(),
-        },
-        nodeAliases: new Map(),
+        ...(namespace ? { namespaceLookup: new DiskNamespaceLookup(index.db, source.key) } : {}),
       }
       discoverSegmentEntityIDs(source.recordsFile, scope)
       index.beginSegment(scope)
