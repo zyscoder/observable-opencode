@@ -144,6 +144,8 @@ export class SessionTraceRegistry<T extends object> {
   private readonly aliases = new Map<string, string>()
   private readonly owners = new Map<string, Set<T>>()
   private readonly recentOwnerRefs = new Map<string, Set<string>>()
+  private readonly retiredSessionIDs = new Set<string>()
+  private readonly retiredOwnerRefs = new Map<string, Set<string>>()
   private finalized = new WeakSet<T>()
   private processTrace: T | undefined
   private compatibilityTrace: T | undefined
@@ -188,6 +190,15 @@ export class SessionTraceRegistry<T extends object> {
   }
 
   resolveActive(hint?: Partial<TraceRouteHint>): T | undefined {
+    const sessionID = hint?.sessionID
+    if (sessionID) {
+      const rootSessionID = this.rootSessionID(sessionID)
+      if (this.retiredSessionIDs.has(sessionID) || this.retiredSessionIDs.has(rootSessionID)) return undefined
+    }
+    if (
+      (hint?.refs ?? []).some((ref) => this.isRetiredOwnerRef(ref) && !(this.owners.get(ref)?.size ?? 0))
+    )
+      return undefined
     const trace = this.resolve(hint)
     return this.finalized.has(trace) ? undefined : trace
   }
@@ -211,6 +222,7 @@ export class SessionTraceRegistry<T extends object> {
 
   claimCompatibility(sessionID: string): T | undefined {
     const rootSessionID = this.rootSessionID(sessionID)
+    if (this.retiredSessionIDs.has(sessionID) || this.retiredSessionIDs.has(rootSessionID)) return undefined
     if (this.compatibilitySessionID) {
       return this.compatibilitySessionID === rootSessionID ? this.compatibilityTrace : undefined
     }
@@ -300,6 +312,8 @@ export class SessionTraceRegistry<T extends object> {
       this.aliases.clear()
       this.owners.clear()
       this.recentOwnerRefs.clear()
+      this.retiredSessionIDs.clear()
+      this.retiredOwnerRefs.clear()
       this.processTrace = undefined
       this.compatibilityTrace = undefined
       this.compatibilitySessionID = undefined
@@ -340,5 +354,59 @@ export class SessionTraceRegistry<T extends object> {
     if (this.finalized.has(trace)) return
     callback(trace)
     this.finalized.add(trace)
+    this.retire(trace)
+  }
+
+  private retire(trace: T) {
+    const rootSessionIDs = new Set<string>()
+    for (const [sessionID, owner] of this.roots) {
+      if (owner !== trace) continue
+      rootSessionIDs.add(sessionID)
+      this.rememberRetiredSessionID(sessionID)
+      this.roots.delete(sessionID)
+    }
+    for (const [childSessionID] of this.aliases) {
+      if (!rootSessionIDs.has(this.rootSessionID(childSessionID))) continue
+      this.rememberRetiredSessionID(childSessionID)
+      this.aliases.delete(childSessionID)
+    }
+    this.orphans.delete(trace)
+    for (const [ref, owners] of this.owners) {
+      if (!owners.delete(trace)) continue
+      this.rememberRetiredOwnerRef(ref)
+      if (!owners.size) this.owners.delete(ref)
+    }
+    if (this.compatibilityTrace === trace) {
+      this.compatibilityTrace = undefined
+      this.compatibilitySessionID = undefined
+    }
+    if (this.processTrace === trace) this.processTrace = undefined
+  }
+
+  private rememberRetiredSessionID(sessionID: string) {
+    this.retiredSessionIDs.delete(sessionID)
+    this.retiredSessionIDs.add(sessionID)
+    while (this.retiredSessionIDs.size > maxRecentReferencesPerCategory) {
+      const retired = this.retiredSessionIDs.values().next().value
+      if (retired === undefined) break
+      this.retiredSessionIDs.delete(retired)
+    }
+  }
+
+  private rememberRetiredOwnerRef(ref: string) {
+    const category = referenceCategory(ref)
+    const retired = this.retiredOwnerRefs.get(category) ?? new Set<string>()
+    retired.delete(ref)
+    retired.add(ref)
+    this.retiredOwnerRefs.set(category, retired)
+    while (retired.size > maxRecentReferencesPerCategory) {
+      const stale = retired.values().next().value
+      if (stale === undefined) break
+      retired.delete(stale)
+    }
+  }
+
+  private isRetiredOwnerRef(ref: string) {
+    return this.retiredOwnerRefs.get(referenceCategory(ref))?.has(ref) ?? false
   }
 }

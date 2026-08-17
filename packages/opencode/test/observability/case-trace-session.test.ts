@@ -34,6 +34,32 @@ test("keeps process and root ordinals independent", () => {
   ])
 })
 
+test("retires finalized ownership while preserving monotonic root ordinals", () => {
+  const created: Array<{ sessionID: string | undefined; ordinal: number; trace: FakeTrace }> = []
+  const registry = new SessionTraceRegistry<FakeTrace>((sessionID, ordinal) => {
+    const trace = create(sessionID ?? "process")
+    created.push({ sessionID, ordinal, trace })
+    return trace
+  })
+
+  for (let index = 0; index < 10_000; index++) {
+    const sessionID = `ses_${index}`
+    const trace = registry.resolve({ sessionID })
+    registry.remember(trace, [`span:span_${index}`])
+    registry.finishSession(sessionID, (item) => item.finished.push({ status: "success" }))
+  }
+
+  expect(registry.values()).toEqual([])
+  expect(created[0]).toMatchObject({ sessionID: "ses_0", ordinal: 0 })
+  expect(created.at(-1)).toMatchObject({ sessionID: "ses_9999", ordinal: 9_999 })
+  expect(created.every((item) => item.trace.finished.length === 1)).toBeTrue()
+  expect(registry.resolveActive({ sessionID: "ses_9999" })).toBeUndefined()
+  expect(registry.resolveActive({ refs: ["span:span_9999"] })).toBeUndefined()
+
+  registry.resolve({ sessionID: "ses_after" })
+  expect(created.at(-1)).toMatchObject({ sessionID: "ses_after", ordinal: 10_000 })
+})
+
 test("routes an explicit process scope away from compatibility and root traces", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID, _ordinal, kind) =>
     create(sessionID ?? kind),
@@ -226,12 +252,13 @@ test("isolates unknown refs after multiple roots without losing known owners", (
 test("finishes every root exactly once", () => {
   const registry = new SessionTraceRegistry<FakeTrace>((sessionID) => create(sessionID ?? "process"))
 
-  registry.resolve({ sessionID: "ses_a" })
-  registry.resolve({ sessionID: "ses_b" })
+  const first = registry.resolve({ sessionID: "ses_a" })
+  const second = registry.resolve({ sessionID: "ses_b" })
   registry.finishAll((trace) => trace.finished.push({ status: "success" }))
   registry.finishAll((trace) => trace.finished.push({ status: "success" }))
 
-  expect(registry.values().map((trace) => trace.finished.length)).toEqual([1, 1])
+  expect([first.finished.length, second.finished.length]).toEqual([1, 1])
+  expect(registry.values()).toEqual([])
 })
 
 test("continues finalization after a failure and retries the failed trace", () => {

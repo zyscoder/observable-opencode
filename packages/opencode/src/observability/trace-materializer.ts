@@ -779,6 +779,14 @@ class ReplayIndex {
         json TEXT NOT NULL,
         PRIMARY KEY (diagnostic_id, ordinal)
       );
+      CREATE TABLE legacy_runtime_events (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        json TEXT NOT NULL
+      );
+      CREATE TABLE legacy_runtime_errors (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        json TEXT NOT NULL
+      );
     `)
   }
 
@@ -1655,6 +1663,49 @@ class ReplayIndex {
     }
   }
 
+  ingestLegacyRuntimeFile(file: string) {
+    if (!fs.existsSync(file)) return
+    const insertEvent = this.db.query("INSERT INTO legacy_runtime_events(json) VALUES (?)")
+    const insertError = this.db.query("INSERT INTO legacy_runtime_errors(json) VALUES (?)")
+    this.db.transaction(() => {
+      readPhysicalLines(
+        file,
+        (line) => {
+          let envelope: Record<string, unknown>
+          try {
+            const parsed = JSON.parse(line) as unknown
+            const candidate = record(parsed)
+            if (!candidate) return
+            envelope = candidate
+          } catch {
+            return
+          }
+          const data = record(envelope.data)
+          if (!data) return
+          if (envelope.type === "event") insertEvent.run(JSON.stringify(data))
+          if (envelope.type === "span.end" && data.error !== undefined)
+            insertError.run(JSON.stringify(data.error))
+        },
+        () => {},
+      )
+    })()
+  }
+
+  *legacyRuntimeEvents() {
+    for (const row of this.db
+      .query<JsonRow, []>("SELECT json FROM legacy_runtime_events ORDER BY ordinal")
+      .iterate())
+      yield JSON.parse(row.json) as unknown
+  }
+
+  *legacyRuntimeErrors(terminalError: unknown) {
+    for (const row of this.db
+      .query<JsonRow, []>("SELECT json FROM legacy_runtime_errors ORDER BY ordinal")
+      .iterate())
+      yield JSON.parse(row.json) as unknown
+    if (terminalError !== undefined) yield terminalError
+  }
+
   closeIndex() {
     this.db.close(false)
   }
@@ -1895,9 +1946,9 @@ function legacyMembers(
     ["environment", manifest.environment],
     ["token_usage", manifest.token_usage ?? {}],
     ["spans", streamingJsonArray(index.legacySpans())],
-    ["events", streamingJsonArray(index.compatibilityRecords(manifest, metrics))],
+    ["events", streamingJsonArray(index.legacyRuntimeEvents())],
     ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
-    ["errors", streamingJsonArray(manifest.error === undefined ? [] : [manifest.error])],
+    ["errors", streamingJsonArray(index.legacyRuntimeErrors(manifest.error))],
     ["result", manifest.result],
     ["context_snapshots", streamingJsonArray(index.legacyNodeData(["context.pack"]))],
     ["semantic_decisions", streamingJsonArray(index.legacyNodeData(["decision"]))],
@@ -2446,6 +2497,7 @@ function materializeTraceSnapshot(input: {
       discoverSegmentEntityIDs(source.recordsFile, scope)
       index.beginSegment(scope)
       const recovered = recoverJournal(source.recordsFile, index)
+      index.ingestLegacyRuntimeFile(path.join(path.dirname(source.recordsFile), "raw-events.jsonl"))
       const identities = index.identities
       if (source.runID && identities.runID !== source.runID)
         throw new Error(`${source.recordsFile}: descriptor run identity does not match journal`)

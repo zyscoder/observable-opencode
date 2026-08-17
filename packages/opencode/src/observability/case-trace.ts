@@ -5257,6 +5257,11 @@ class ActiveCaseTrace {
   private spans = new Map<string, TraceSpan>()
   private spanNodeIDs = new Map<string, string>()
   private events: TraceEvent[] = []
+  private totalSpans = 0
+  private totalEvents = 0
+  private totalErrors = 0
+  private streamEventCounts = new Map<string, number>()
+  private streamEventOverflow = 0
   private readonly causalIR: TraceOwnedCausalIRStore
   private queryCausalNodes(query: CausalIRNodeQuery = {}) {
     return this.causalIR.queryNodes(query) as CausalNode[]
@@ -5272,6 +5277,66 @@ class ActiveCaseTrace {
 
   private queryArtifacts() {
     return this.causalIR.queryArtifacts() as TraceArtifact[]
+  }
+
+  private forEachCausalNode(query: CausalIRNodeQuery, visit: (node: CausalNode) => void) {
+    let afterSequence = query.afterSequence ?? 0
+    while (true) {
+      const batch = this.queryCausalNodes({
+        ...query,
+        afterSequence,
+        reverse: false,
+        limit: 256,
+      })
+      if (!batch.length) return
+      for (const node of batch) visit(node)
+      const nextSequence = this.causalIR.nodeOrder(batch.at(-1)!.node_id)
+      if (nextSequence === undefined || nextSequence <= afterSequence || batch.length < 256) return
+      afterSequence = nextSequence
+    }
+  }
+
+  private verificationRecordFromNode(node: CausalNode | undefined): TraceVerificationRecord | undefined {
+    if (!node || node.kind !== "verification") return undefined
+    const data = recordFromUnknown(node.data)
+    const verificationID = data ? stringField(data, ["verification_id", "verificationID"]) : undefined
+    const status = node.status
+    if (!data || !verificationID || (status !== "passed" && status !== "failed" && status !== "unknown"))
+      return undefined
+    return {
+      ...data,
+      verification_id: verificationID,
+      span_id: node.span_id,
+      status,
+      parsed_failures: Array.isArray(data.parsed_failures) ? (data.parsed_failures as TraceParsedFailure[]) : [],
+    } as TraceVerificationRecord
+  }
+
+  private verificationRecordByID(verificationID: string) {
+    return (
+      this.verificationRecords.find((item) => item.verification_id === verificationID) ??
+      this.verificationRecordFromNode(this.findCausalNode(`vernode_${verificationID}`))
+    )
+  }
+
+  private changeRecordFromNode(node: CausalNode | undefined): TraceChangeRecord | undefined {
+    if (!node || node.kind !== "change") return undefined
+    const data = recordFromUnknown(node.data)
+    const changeID = data ? stringField(data, ["change_id", "changeID"]) : undefined
+    if (!data || !changeID || !Array.isArray(data.files)) return undefined
+    return {
+      ...data,
+      change_id: changeID,
+      span_id: node.span_id,
+      files: data.files.filter((item): item is string => typeof item === "string"),
+    } as TraceChangeRecord
+  }
+
+  private changeRecordByID(changeID: string) {
+    return (
+      this.changeRecords.find((item) => item.change_id === changeID) ??
+      this.changeRecordFromNode(this.findCausalNode(`chgnode_${changeID}`))
+    )
   }
 
   private nextCausalNodeID(prefix: string) {
@@ -5290,6 +5355,13 @@ class ActiveCaseTrace {
   private semanticEdgeSequence = 0
   private causalNodeSequence = 0
   private causalEdgeSequence = 0
+  private contextSnapshotSequence = 0
+  private semanticDecisionSequence = 0
+  private verificationSequence = 0
+  private changeSequence = 0
+  private constraintSequence = 0
+  private responseSegmentSequence = 0
+  private designSequence = 0
   private verificationRecords: TraceVerificationRecord[] = []
   private changeRecords: TraceChangeRecord[] = []
   private constraintRecords: TraceConstraintRecord[] = []
@@ -5297,9 +5369,16 @@ class ActiveCaseTrace {
   private responseSourceBySegmentID = new Map<string, unknown>()
   private claimedResponseSegmentIDs = new Set<string>()
   private designRecords: TraceDesignRecord[] = []
+  private hasUserVisibleResponse = false
+  private hasFinalAnswerResponse = false
+  private hasExplicitFinalAnswerResponse = false
+  private latestFinalResponseSegment: TraceResponseSegment | undefined
   private recentFailedVerificationID: string | undefined
   private recentChangeID: string | undefined
   private repositoryRevision = 0
+  private changedTestObserved = false
+  private changedProductionObserved = false
+  private changedTestOracleObserved = false
   private recentContextSnapshotIDs: string[] = []
   private recentPromptNodeIDs: string[] = []
   private recentContextNodeIDs: string[] = []
@@ -5450,6 +5529,7 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.spans.set(id, span)
+    this.totalSpans += 1
     if (["tool", "skill", "task", "mcp"].includes(input.component)) this.remember(this.recentToolSpanIDs, id)
     this.write("span.start", span)
     const nodeKind = this.nodeKindForSpan(input.component)
@@ -5509,7 +5589,8 @@ class ActiveCaseTrace {
     }
     if (error) {
       span.error = error
-      this.errors.push(error)
+      this.totalErrors += 1
+      this.rememberRuntimeRecord(this.errors, error)
     }
     this.write("span.end", span)
     const nodeID = this.spanNodeIDs.get(id)
@@ -5553,6 +5634,8 @@ class ActiveCaseTrace {
         this.causalIR.updateNode(node)
       }
     }
+    this.spans.delete(id)
+    this.spanNodeIDs.delete(id)
   }
 
   private spanStartData(input: StartSpanInput): Record<string, unknown> {
@@ -5711,12 +5794,14 @@ class ActiveCaseTrace {
           ? undefined
           : this.summarizeJson(input.data, `${input.component}.${input.event_type}.data`),
     }
-    this.events.push(event)
+    this.totalEvents += 1
+    this.rememberRuntimeRecord(this.events, event)
+    this.countStreamEvent(event.event_type)
     this.write("event", event)
     this.promoteToolRuntimeEvent(input)
     const loopDecision = loopDecisionFromRuntimeEvent(input.component, input.event_type, input.data, {
-      has_user_visible_response: this.responseSegments.some((segment) => segment.visibility === "user_visible"),
-      has_final_answer: this.responseSegments.some((segment) => segment.response_role === "final_answer"),
+      has_user_visible_response: this.hasUserVisibleResponse,
+      has_final_answer: this.hasFinalAnswerResponse,
     })
     if (loopDecision) {
       this.node({
@@ -6076,8 +6161,9 @@ class ActiveCaseTrace {
   }
 
   contextSnapshot(input: ContextSnapshotInput) {
+    const ordinal = ++this.contextSnapshotSequence
     const snapshot: TraceContextSnapshot = {
-      snapshot_id: input.snapshot_id ?? semanticID("ctx", this.contextSnapshots.length + 1),
+      snapshot_id: input.snapshot_id ?? semanticID("ctx", ordinal),
       span_id: input.span_id,
       phase: input.phase,
       provider_id: input.provider_id,
@@ -6097,7 +6183,7 @@ class ActiveCaseTrace {
       tools: input.tools === undefined ? undefined : this.summarizeJson(input.tools, `context.${input.phase}.tools`),
       metadata: input.metadata,
     }
-    this.contextSnapshots.push(snapshot)
+    this.rememberRuntimeRecord(this.contextSnapshots, snapshot)
     this.remember(this.recentContextSnapshotIDs, snapshot.snapshot_id)
     this.write("semantic.context_snapshot", snapshot)
     const node = this.node({
@@ -6135,6 +6221,7 @@ class ActiveCaseTrace {
   }
 
   decision(input: SemanticDecisionInput) {
+    const ordinal = ++this.semanticDecisionSequence
     const explicitSourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const generationProvenance = this.currentGenerationProvenance(input.metadata)
     const generationRefs =
@@ -6143,7 +6230,7 @@ class ActiveCaseTrace {
         : []
     const sourceRefs = dedupeStrings([...explicitSourceRefs, ...generationRefs])
     const decision: TraceSemanticDecision = {
-      decision_id: input.decision_id ?? semanticID("dec", this.semanticDecisions.length + 1),
+      decision_id: input.decision_id ?? semanticID("dec", ordinal),
       span_id: input.span_id,
       component: input.component,
       decision_type: input.decision_type,
@@ -6154,7 +6241,7 @@ class ActiveCaseTrace {
       source_refs: sourceRefs,
       metadata: input.metadata,
     }
-    this.semanticDecisions.push(decision)
+    this.rememberRuntimeRecord(this.semanticDecisions, decision)
     this.write("semantic.decision", decision)
     const node = this.node({
       node_id: `decisionnode_${decision.decision_id}`,
@@ -6432,9 +6519,10 @@ class ActiveCaseTrace {
       if (change.changed_test_oracle || riskFlags.includes("test_oracle_changed")) oracleChanged = true
     }
     const riskFlags = dedupeStrings([
-      ...(changedTestRefs.length ? ["tests_modified_before_verification"] : []),
-      ...(oracleChanged ? ["test_oracle_modified_before_verification"] : []),
-      ...(changedTestRefs.length && changedProductionRefs.length
+      ...(this.changedTestObserved || changedTestRefs.length ? ["tests_modified_before_verification"] : []),
+      ...(this.changedTestOracleObserved || oracleChanged ? ["test_oracle_modified_before_verification"] : []),
+      ...((this.changedTestObserved || changedTestRefs.length) &&
+      (this.changedProductionObserved || changedProductionRefs.length)
         ? ["production_and_tests_modified_before_verification"]
         : []),
     ])
@@ -6454,7 +6542,7 @@ class ActiveCaseTrace {
       seen.add(ref)
       if (ref.startsWith("verification:")) {
         const verificationID = ref.slice("verification:".length)
-        const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
+        const verification = this.verificationRecordByID(verificationID)
         if (verification) found.set(verification.verification_id, verification)
         return
       }
@@ -6471,6 +6559,10 @@ class ActiveCaseTrace {
       for (const verification of this.verificationRecords) {
         if (verification.span_id === spanID) found.set(verification.verification_id, verification)
       }
+      this.forEachCausalNode({ kinds: ["verification"], dataEquals: { span_id: spanID } }, (node) => {
+        const verification = this.verificationRecordFromNode(node)
+        if (verification) found.set(verification.verification_id, verification)
+      })
     }
     return [...found.values()]
   }
@@ -6525,6 +6617,8 @@ class ActiveCaseTrace {
   }
 
   verification(input: VerificationRecordInput) {
+    const ordinal = ++this.verificationSequence
+    const commandKey = input.command?.trim()
     const parsed = input.parsed_failures ?? parseVerificationFailures({ stdout: input.stdout, stderr: input.stderr })
     const exitCode = optionalNumber(input.exit_code)
     const commandOutcomes = parsedCommandOutcomes(input.stdout, input.stderr)
@@ -6541,7 +6635,21 @@ class ActiveCaseTrace {
         : verificationScope.changedTestRefs.length
           ? "post_test_change"
           : "post_change"
-    const superseded = this.verificationRecords.filter((item) => item.command?.trim() === input.command?.trim())
+    const supersededByID = new Map(
+      this.verificationRecords
+        .filter((item) => item.command?.trim() === commandKey)
+        .map((item) => [item.verification_id, item]),
+    )
+    if (commandKey) {
+      this.forEachCausalNode(
+        { kinds: ["verification"], dataEquals: { command_key: commandKey } },
+        (node) => {
+          const verification = this.verificationRecordFromNode(node)
+          if (verification) supersededByID.set(verification.verification_id, verification)
+        },
+      )
+    }
+    const superseded = [...supersededByID.values()]
     const finalTestResult = finalTestResultSemantics({
       command: input.command,
       purpose: input.purpose,
@@ -6568,7 +6676,7 @@ class ActiveCaseTrace {
         })),
     )
     const verification: TraceVerificationRecord = {
-      verification_id: input.verification_id ?? semanticID("ver", this.verificationRecords.length + 1),
+      verification_id: input.verification_id ?? semanticID("ver", ordinal),
       span_id: input.span_id,
       tool_call_id: input.tool_call_id,
       command: input.command,
@@ -6603,7 +6711,7 @@ class ActiveCaseTrace {
       verification_attempt: verificationAttempt,
       metadata: input.metadata,
     }
-    this.verificationRecords.push(verification)
+    this.rememberRuntimeRecord(this.verificationRecords, verification)
     for (const previous of superseded) {
       previous.effective_for_final_state = false
       previous.superseded_by_refs = dedupeStrings([
@@ -6629,7 +6737,9 @@ class ActiveCaseTrace {
       status: verification.status,
       data: {
         verification_id: verification.verification_id,
+        span_id: input.span_id,
         command: input.command,
+        command_key: commandKey,
         cwd: input.cwd,
         purpose: input.purpose,
         stage: verification.stage,
@@ -6678,6 +6788,7 @@ class ActiveCaseTrace {
   }
 
   change(input: ChangeRecordInput) {
+    const ordinal = ++this.changeSequence
     const revisionBefore = this.repositoryRevision
     const revisionAfter = revisionBefore + 1
     const explicitSourceRefs = input.source_refs ?? input.evidence_refs ?? []
@@ -6740,7 +6851,7 @@ class ActiveCaseTrace {
       ...(input.diff !== undefined && !changeSemantics ? ["change_semantics_unavailable"] : []),
     ])
     const change: TraceChangeRecord = {
-      change_id: input.change_id ?? semanticID("chg", this.changeRecords.length + 1),
+      change_id: input.change_id ?? semanticID("chg", ordinal),
       span_id: input.span_id,
       tool_call_id: input.tool_call_id,
       files: input.files,
@@ -6758,7 +6869,11 @@ class ActiveCaseTrace {
       verification_refs: input.verification_refs,
       metadata: input.metadata,
     }
-    this.changeRecords.push(change)
+    if (targetRole === "test_code" || targetRole === "mixed") this.changedTestObserved = true
+    if (targetRole === "production_code" || targetRole === "mixed") this.changedProductionObserved = true
+    if (changedTestOracle || changeSemantics?.risk_flags?.includes("test_oracle_changed"))
+      this.changedTestOracleObserved = true
+    this.rememberRuntimeRecord(this.changeRecords, change)
     this.remember(this.recentChangeIDs, change.change_id)
     this.write("semantic.change", change)
     this.node({
@@ -6789,7 +6904,19 @@ class ActiveCaseTrace {
       temporal_advisory_refs: motivatingEvidenceRefs,
     })
     this.repositoryRevision = revisionAfter
+    const invalidatedVerificationIDs = new Set<string>()
+    this.forEachCausalNode({ kinds: ["verification"] }, (node) => {
+      const cold = this.verificationRecordFromNode(node)
+      if (!cold) return
+      const verification =
+        this.verificationRecords.find((item) => item.verification_id === cold.verification_id) ?? cold
+      if (verification.effective_for_final_state === false) return
+      verification.effective_for_final_state = false
+      invalidatedVerificationIDs.add(verification.verification_id)
+      this.syncVerificationNode(verification)
+    })
     for (const verification of this.verificationRecords) {
+      if (invalidatedVerificationIDs.has(verification.verification_id)) continue
       if (verification.effective_for_final_state === false) continue
       verification.effective_for_final_state = false
       this.syncVerificationNode(verification)
@@ -6815,15 +6942,16 @@ class ActiveCaseTrace {
   }
 
   constraint(input: ConstraintRecordInput) {
+    const ordinal = ++this.constraintSequence
     const constraint: TraceConstraintRecord = {
-      constraint_id: input.constraint_id ?? semanticID("constraint", this.constraintRecords.length + 1),
+      constraint_id: input.constraint_id ?? semanticID("constraint", ordinal),
       source: input.source,
       constraint: redactText(input.constraint),
       status: input.status,
       source_refs: input.source_refs ?? input.evidence_refs,
       metadata: input.metadata,
     }
-    this.constraintRecords.push(constraint)
+    this.rememberRuntimeRecord(this.constraintRecords, constraint)
     this.node({
       node_id: `constraintnode_${constraint.constraint_id}`,
       kind: "semantic.constraint",
@@ -7108,13 +7236,14 @@ class ActiveCaseTrace {
   }
 
   responseOutput(input: ResponseOutputInput) {
+    const ordinal = ++this.responseSegmentSequence
     const sourceRefs = this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs)
     const classifiedRefs = classifySourceRefs(sourceRefs)
     const responseRecordSourceRefs = this.narrowResponseRecordSourceRefs(sourceRefs, classifiedRefs)
     const generationProvenance = this.currentGenerationProvenance(input.metadata)
     const generationGrounding = this.generationGroundingCandidates(generationProvenance)
     const visibility = input.visibility ?? (input.metadata?.visibility as string | undefined) ?? "user_visible"
-    const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? this.responseSegments.length + 1
+    const turnIndex = input.turn_index ?? optionalNumber(input.metadata?.turn_index) ?? ordinal
     const metadataResponseRole = input.metadata?.response_role as TraceResponseSegment["response_role"] | undefined
     const responseRoleExplicit = input.response_role !== undefined || metadataResponseRole !== undefined
     const metadataFinality =
@@ -7146,7 +7275,7 @@ class ActiveCaseTrace {
       candidate_source_refs: sourceRefs,
     }
     const segment: TraceResponseSegment = {
-      segment_id: input.segment_id ?? semanticID("segment", this.responseSegments.length + 1),
+      segment_id: input.segment_id ?? semanticID("segment", ordinal),
       response_artifact: input.response_artifact,
       text: this.summarizeText(input.text, "result.response.output"),
       response_role: responseRole,
@@ -7164,14 +7293,20 @@ class ActiveCaseTrace {
       source_locations: sourceLocations,
       metadata,
     }
-    this.responseSegments.push(segment)
+    this.rememberRuntimeRecord(this.responseSegments, segment)
+    if (visibility === "user_visible") this.hasUserVisibleResponse = true
+    if (responseRole === "final_answer") this.hasFinalAnswerResponse = true
+    if (responseRole === "final_answer" && visibility === "user_visible" && isFinalForCase) {
+      this.latestFinalResponseSegment = segment
+      if (finalitySource === "explicit") this.hasExplicitFinalAnswerResponse = true
+    }
     this.rememberBoundedMap(this.responseSourceBySegmentID, segment.segment_id, input.text)
     this.write("semantic.response_output", segment)
     const record = this.node({
       node_id: `responsenode_${segment.segment_id}`,
       kind: "response.output",
       component: "result",
-      title: `Response output ${this.responseSegments.length}`,
+      title: `Response output ${ordinal}`,
       data: {
         segment_id: segment.segment_id,
         response_artifact: input.response_artifact,
@@ -7234,9 +7369,7 @@ class ActiveCaseTrace {
     for (const ref of refs) {
       const parsed = this.parseSourceRef(ref)
       if (!parsed || parsed.type !== "verification") continue
-      const node = this.queryCausalNodes({ kinds: ["verification"] }).find(
-        (item) => item.kind === "verification" && item.data?.verification_id === parsed.id,
-      )
+      const node = this.findCausalNode(`vernode_${parsed.id}`)
       const riskFlags = stringArrayField(node?.data ?? {}, [
         "verification_scope_risk_flags",
         "verificationScopeRiskFlags",
@@ -7252,8 +7385,9 @@ class ActiveCaseTrace {
     if (!targets.length) return []
     const changeRefs = dedupeStrings(sourceRefs.filter((ref) => ref.startsWith("change:")))
     if (!changeRefs.length) return []
-    const changeRefSet = new Set(changeRefs)
-    const changes = this.changeRecords.filter((change) => changeRefSet.has(`change:${change.change_id}`))
+    const changes = changeRefs
+      .map((ref) => this.changeRecordByID(ref.slice("change:".length)))
+      .filter((change): change is TraceChangeRecord => Boolean(change))
     if (!changes.length) return []
     const changedFiles = dedupeStrings(changes.flatMap((change) => change.files ?? []))
     const evidenceRefs: string[] = []
@@ -7332,7 +7466,7 @@ class ActiveCaseTrace {
     ]).filter((ref) => ref.startsWith("verification:"))
     const effectiveVerificationRefs = verificationSourceRefs.filter((ref) => {
       const verificationID = ref.slice("verification:".length)
-      const verification = this.verificationRecords.find((item) => item.verification_id === verificationID)
+      const verification = this.verificationRecordByID(verificationID)
       return (
         verification?.effective_for_final_state === true && verification.repository_revision === this.repositoryRevision
       )
@@ -7352,7 +7486,7 @@ class ActiveCaseTrace {
       if (ref.startsWith("verification:")) return effectiveVerificationRefs.includes(ref)
       if (!ref.startsWith("change:")) return false
       const changeID = ref.slice("change:".length)
-      const change = this.changeRecords.find((item) => item.change_id === changeID)
+      const change = this.changeRecordByID(changeID)
       return change?.revision_after === this.repositoryRevision
     })
     const directSupportRefs = dedupeStrings([
@@ -7854,6 +7988,10 @@ class ActiveCaseTrace {
       }
       this.causalIR.updateNode(node)
     }
+    if (finalSegment?.visibility === "user_visible" && finalSegment.is_final_for_case) {
+      this.latestFinalResponseSegment = finalSegment
+      this.hasExplicitFinalAnswerResponse = finalSegment.finality_source === "explicit"
+    }
   }
 
   private responseSegmentIDForDesignRecord(record: TraceDesignRecord) {
@@ -7919,6 +8057,9 @@ class ActiveCaseTrace {
     segment.response_role = "final_answer"
     segment.is_final_for_case = true
     segment.finality_source = "explicit"
+    this.hasFinalAnswerResponse = true
+    this.hasExplicitFinalAnswerResponse = true
+    this.latestFinalResponseSegment = segment
     segment.metadata = {
       ...(segment.metadata ?? {}),
       response_role: "final_answer",
@@ -8029,8 +8170,9 @@ class ActiveCaseTrace {
   }
 
   designRecord(input: DesignRecordInput) {
+    const ordinal = ++this.designSequence
     const design: TraceDesignRecord = {
-      design_id: input.design_id ?? semanticID("design", this.designRecords.length + 1),
+      design_id: input.design_id ?? semanticID("design", ordinal),
       span_id: input.span_id,
       source: input.source,
       requirement_summary: this.summarizeDesignField(input.requirement_summary, "design.requirement_summary"),
@@ -8044,7 +8186,7 @@ class ActiveCaseTrace {
       source_refs: this.normalizeSourceRefs(input.source_refs ?? input.evidence_refs),
       metadata: input.metadata,
     }
-    this.designRecords.push(design)
+    this.rememberRuntimeRecord(this.designRecords, design)
     this.node({
       node_id: design.design_id,
       kind: "design.record",
@@ -8824,7 +8966,10 @@ class ActiveCaseTrace {
       this.normalizeFinalResponseSegments()
       this.pruneDesignRecordsForFinalResponses()
       const error = input?.error ? errorInfo(input.error) : undefined
-      if (error) this.errors.push(error)
+      if (error) {
+        this.totalErrors += 1
+        this.rememberRuntimeRecord(this.errors, error)
+      }
       this.result =
         input?.result === undefined
           ? this.result
@@ -9238,8 +9383,8 @@ class ActiveCaseTrace {
     const causalIR = synchronize ? this.causalIR.synchronize() : this.causalIR.snapshot()
     const streamSummary = this.streamSummary()
     const provenance = this.projectCausalIRSnapshot(causalIR, manifest, {
-      spans: this.spans.size,
-      events: this.events.length,
+      spans: this.totalSpans,
+      events: this.totalEvents,
       token_usage: cloneTokenUsage(this.tokenUsage) ?? {},
       stream_summary: streamSummary,
       trace_health: traceHealth,
@@ -9259,8 +9404,8 @@ class ActiveCaseTrace {
         provenance_projection: "provenance-trace.json",
       },
       metrics: {
-        spans: this.spans.size,
-        events: this.events.length,
+        spans: this.totalSpans,
+        events: this.totalEvents,
         records: causalIR.nodes.length,
         dataflow_edges: causalIR.edges.length,
         artifacts: causalIR.artifacts.length,
@@ -9501,33 +9646,18 @@ class ActiveCaseTrace {
   }
 
   private streamSummary() {
-    const counts: Record<string, number> = {}
-    for (const event of this.events) {
-      const key = `${event.event_type.replaceAll(".", "_").replaceAll("-", "_")}_events`
-      counts[key] = (counts[key] ?? 0) + 1
-    }
+    const counts = Object.fromEntries(this.streamEventCounts)
+    if (this.streamEventOverflow) counts.other_event_types_events = this.streamEventOverflow
     return counts
   }
 
   private inferCaseStatus(serverStatus: TraceStatus, error: TraceError | undefined): TraceStatus {
     const resultStatus = stringField(recordFromUnknown(this.result) ?? {}, ["case_status", "caseStatus", "status"])
     if (resultStatus === "success" || resultStatus === "error" || resultStatus === "cancelled") return resultStatus
-    if (error || this.errors.length) return "error"
-    const finalAnswer = this.responseSegments.some(
-      (segment) =>
-        segment.response_role === "final_answer" &&
-        segment.visibility === "user_visible" &&
-        segment.is_final_for_case === true,
-    )
+    if (error || this.totalErrors) return "error"
+    const finalAnswer = Boolean(this.latestFinalResponseSegment)
     if (finalAnswer && serverStatus === "success") return "success"
-    const explicitFinalAnswer = this.responseSegments.some(
-      (segment) =>
-        segment.response_role === "final_answer" &&
-        segment.visibility === "user_visible" &&
-        segment.is_final_for_case === true &&
-        segment.finality_source === "explicit",
-    )
-    if (explicitFinalAnswer) return "success"
+    if (this.hasExplicitFinalAnswerResponse) return "success"
     return serverStatus
   }
 
@@ -9540,15 +9670,11 @@ class ActiveCaseTrace {
   private emitCaseLifecycleRecord(serverStatus: TraceStatus, caseStatus: TraceStatus) {
     const shutdownReason = this.serverShutdownReason()
     const shutdown = this.shutdownLifecycle(caseStatus)
-    const finalSegment = this.responseSegments
-      .filter(
-        (segment) =>
-          segment.response_role === "final_answer" &&
-          segment.visibility === "user_visible" &&
-          segment.is_final_for_case === true &&
-          (caseStatus === "success" || segment.finality_source === "explicit"),
-      )
-      .at(-1)
+    const finalSegment =
+      this.latestFinalResponseSegment &&
+      (caseStatus === "success" || this.latestFinalResponseSegment.finality_source === "explicit")
+        ? this.latestFinalResponseSegment
+        : undefined
     const failedOpenRecordRefs = this.finalizedOpenRecordRefsForCase(caseStatus)
     const signalNode =
       shutdown.signal && shutdown.disposition === "interrupted_before_case_completion"
@@ -10756,6 +10882,25 @@ class ActiveCaseTrace {
     if (target.length > limit) target.splice(0, target.length - limit)
   }
 
+  private rememberRuntimeRecord<T>(target: T[], value: T) {
+    target.push(value)
+    if (target.length > 256) target.splice(0, target.length - 256)
+  }
+
+  private countStreamEvent(eventType: string) {
+    const key = `${eventType.replaceAll(".", "_").replaceAll("-", "_")}_events`
+    const count = this.streamEventCounts.get(key)
+    if (count !== undefined) {
+      this.streamEventCounts.set(key, count + 1)
+      return
+    }
+    if (this.streamEventCounts.size < 256) {
+      this.streamEventCounts.set(key, 1)
+      return
+    }
+    this.streamEventOverflow += 1
+  }
+
   private rememberBoundedMap<K, V>(target: Map<K, V>, key: K, value: V) {
     target.delete(key)
     target.set(key, value)
@@ -11822,7 +11967,7 @@ export namespace CaseTrace {
     if (!enabledFromEnv() || compatibilityFinished || !sessionID) return
     ensureLifecycle()
     if (claimCompatibilitySession(sessionID)) return
-    traceRegistry().resolve({ sessionID })
+    traceRegistry().resolveActive({ sessionID })
   }
 
   export function startSpan(input: StartSpanInput) {

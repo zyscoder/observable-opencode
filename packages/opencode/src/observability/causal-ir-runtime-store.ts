@@ -40,6 +40,8 @@ export type CausalIRNodeQuery = {
   sessionID?: string
   messageID?: string
   callID?: string
+  dataEquals?: Record<string, string | number | boolean | null>
+  afterSequence?: number
   limit?: number
   reverse?: boolean
 }
@@ -500,7 +502,7 @@ export class CausalIRRuntimeStore {
   private queryNodesUnsafe(query: CausalIRNodeQuery): CausalNodeLike[] {
     if (query.ids?.length === 0 || query.kinds?.length === 0) return []
     const clauses: string[] = []
-    const parameters: Array<string | number> = []
+    const parameters: Array<string | number | null> = []
     const addList = (column: string, values: string[] | undefined) => {
       if (!values) return
       clauses.push(`${column} IN (${placeholders(values)})`)
@@ -519,10 +521,19 @@ export class CausalIRRuntimeStore {
       clauses.push(`${column} = ?`)
       parameters.push(value)
     }
+    if (query.afterSequence !== undefined) {
+      clauses.push("sequence > ?")
+      parameters.push(query.afterSequence)
+    }
+    for (const [key, value] of Object.entries(query.dataEquals ?? {})) {
+      if (!/^[A-Za-z0-9_]+$/.test(key)) return []
+      clauses.push("json_extract(runtime_json, ?) = ?")
+      parameters.push(`$.data.${key}`, typeof value === "boolean" ? Number(value) : value)
+    }
     const limit = boundedLimit(query.limit)
     if (limit !== undefined) parameters.push(limit)
     const rows = this.db
-      .query<EntityRow, Array<string | number>>(
+      .query<EntityRow, Array<string | number | null>>(
         `SELECT runtime_json AS json FROM nodes${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY sequence ${query.reverse ? "DESC" : "ASC"}${limit === undefined ? "" : " LIMIT ?"}`,
       )
       .all(...parameters)

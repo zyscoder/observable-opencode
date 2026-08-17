@@ -1226,6 +1226,59 @@ describe("case trace runtime persistence", () => {
       String.prototype.slice = originalSlice
     }
   })
+
+  test("queries evicted verification facts from SQLite for supersession and change invalidation", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-cold-verification-"))
+    const packageDir = packageDirForTest()
+    const script = path.join(dir, "cold-verification.ts")
+    const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+
+    try {
+      await fs.writeFile(
+        script,
+        [
+          `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+          `CaseTrace.configure()`,
+          `CaseTrace.verification({ verification_id: "ver_first", command: "bun test reused", status: "passed", parsed_failures: [] })`,
+          `for (let index = 0; index < 300; index++) CaseTrace.verification({ verification_id: "ver_filler_" + index, command: "bun test filler-" + index, status: "passed", parsed_failures: [] })`,
+          `CaseTrace.verification({ verification_id: "ver_last", command: "bun test reused", status: "passed", parsed_failures: [] })`,
+          `CaseTrace.change({ change_id: "change_after_verification", files: ["src/current.ts"], diff: "+current" })`,
+          `CaseTrace.closeAll({ status: "success" })`,
+        ].join("\n"),
+      )
+
+      const child = Bun.spawn([process.execPath, script], {
+        cwd: packageDir,
+        env: {
+          ...process.env,
+          OPENCODE_CASE_TRACE: "1",
+          OPENCODE_CASE_ID: "cold-verification",
+          OPENCODE_CASE_TRACE_DIR: dir,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+      expect(exitCode, stderr).toBe(0)
+
+      const caseDir = path.join(dir, "cold-verification")
+      materializeTrace({ caseDir })
+      const trace = JSON.parse(await fs.readFile(path.join(caseDir, "trace.json"), "utf8")) as any
+      const first = trace.nodes.find((node: any) => node.node_id === "vernode_ver_first")
+      const last = trace.nodes.find((node: any) => node.node_id === "vernode_ver_last")
+
+      expect(first.data).toMatchObject({
+        effective_for_final_state: false,
+        superseded_by_refs: ["verification:ver_last"],
+      })
+      expect(last.data).toMatchObject({
+        effective_for_final_state: false,
+        supersedes_refs: ["verification:ver_first"],
+      })
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 function packageDirForTest() {
