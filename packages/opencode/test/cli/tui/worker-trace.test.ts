@@ -103,6 +103,38 @@ test("worker trace helper preserves runtime shutdown failure alongside materiali
   ])
 })
 
+test("worker trace helper journals process signals as cancelled shutdowns", async () => {
+  const calls: unknown[] = []
+  const request = {
+    caseDir: "/tmp/case",
+    caseID: "case",
+    runID: "run",
+    recordsFile: "/tmp/case/records.jsonl",
+  }
+
+  await expect(
+    finalizeWorkerTraces({
+      signal: "SIGTERM",
+      trace: {
+        closeAll(input) {
+          calls.push(input)
+          return [request]
+        },
+      },
+    }),
+  ).resolves.toEqual({ requests: [request] })
+  expect(calls).toEqual([
+    {
+      status: "cancelled",
+      result: {
+        reason: "SIGTERM",
+        signal: "SIGTERM",
+        trace_flush: "process_signal",
+      },
+    },
+  ])
+})
+
 test("worker trace helper returns an empty request list when journal close throws", async () => {
   const failure = new Error("server stop failed")
   await expect(

@@ -133,8 +133,10 @@ function eagerStream(input: RunRuntimeInput, ctx: BootContext) {
   return ctx.resume === true || !input.resolveSession || !!input.demo
 }
 
-type InteractiveTraceSessionLifecycle = Pick<typeof CaseTrace, "finishSession">
-type InteractiveTraceLifecycle = Pick<typeof CaseTrace, "finishSession" | "finishAll">
+type InteractiveTraceSessionLifecycle = Pick<typeof CaseTrace, "closeSession"> &
+  Partial<Pick<typeof CaseTrace, "materializeClosedTraces">>
+type InteractiveTraceLifecycle = Pick<typeof CaseTrace, "closeSession" | "closeAll"> &
+  Partial<Pick<typeof CaseTrace, "materializeClosedTraces">>
 
 /** @internal Exported for trace lifecycle tests */
 export function finishReplacedTraceSession(
@@ -143,13 +145,14 @@ export function finishReplacedTraceSession(
   trace: InteractiveTraceSessionLifecycle = CaseTrace,
 ) {
   if (!sessionID) return
-  trace.finishSession(sessionID, {
+  const requests = trace.closeSession(sessionID, {
     status: error ? "error" : "success",
     error,
     result: {
       reason: "session.replaced",
     },
   })
+  if (requests.length) trace.materializeClosedTraces?.(requests)
 }
 
 /** @internal Trace-only outcome channel; does not alter the interactive error contract. */
@@ -201,11 +204,14 @@ export async function replaceInteractiveTraceSession<T>(input: {
 }
 
 /** @internal Exported for trace lifecycle tests */
-export function finishInteractiveTraceSessions(input: {
-  sessionID?: string
-  error?: unknown
-  beforeTraceFinalize?: BeforeTraceFinalize
-}, trace: InteractiveTraceLifecycle = CaseTrace) {
+export function finishInteractiveTraceSessions(
+  input: {
+    sessionID?: string
+    error?: unknown
+    beforeTraceFinalize?: BeforeTraceFinalize
+  },
+  trace: InteractiveTraceLifecycle = CaseTrace,
+) {
   try {
     input.beforeTraceFinalize?.({ sessionID: input.sessionID, failure: input.error })
   } catch {
@@ -213,20 +219,22 @@ export function finishInteractiveTraceSessions(input: {
   }
   const status = input.error ? "error" : "success"
   if (input.sessionID) {
-    trace.finishSession(input.sessionID, {
+    const requests = trace.closeSession(input.sessionID, {
       status,
       error: input.error,
       result: {
         reason: "interactive.runtime.closed",
       },
     })
+    if (requests.length) trace.materializeClosedTraces?.(requests)
   }
-  trace.finishAll({
+  const requests = trace.closeAll({
     status: "success",
     result: {
       reason: "interactive.runtime.closed",
     },
   })
+  if (requests.length) trace.materializeClosedTraces?.(requests)
 }
 
 function variantsFor(providers: RunProvider[], model: RunInput["model"]) {

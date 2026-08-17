@@ -70,7 +70,8 @@ type SessionInfo = {
   directory?: string
 }
 
-type RunTraceLifecycle = Pick<typeof CaseTrace, "finishSession" | "finishAll">
+type RunTraceLifecycle = Pick<typeof CaseTrace, "closeSession" | "closeAll"> &
+  Partial<Pick<typeof CaseTrace, "materializeClosedTraces">>
 
 function inline(info: Inline) {
   const suffix = info.description ? UI.Style.TEXT_DIM + ` ${info.description}` + UI.Style.TEXT_NORMAL : ""
@@ -96,26 +97,32 @@ export function finishRunTraces(
     exit_code: exitCode,
   }
 
+  const requests = []
   if (input.sessionID) {
-    trace.finishSession(input.sessionID, {
-      status,
-      error: input.failure,
-      result,
-    })
+    requests.push(
+      ...trace.closeSession(input.sessionID, {
+        status,
+        error: input.failure,
+        result,
+      }),
+    )
   }
 
   // Earlier interactive roots have their own terminal result. The process
   // record and any still-open roots close successfully instead of inheriting
   // the last active turn's error.
   const processStatus = !input.sessionID && status === "error" ? "error" : "success"
-  trace.finishAll({
-    status: processStatus,
-    ...(processStatus === "error" && input.failure ? { error: input.failure } : {}),
-    result: {
-      ...result,
-      reason: "run.closed",
-    },
-  })
+  requests.push(
+    ...trace.closeAll({
+      status: processStatus,
+      ...(processStatus === "error" && input.failure ? { error: input.failure } : {}),
+      result: {
+        ...result,
+        reason: "run.closed",
+      },
+    }),
+  )
+  if (requests.length) trace.materializeClosedTraces?.(requests)
 }
 
 /** @internal Best-effort trace publication for exit paths that bypass finally. */

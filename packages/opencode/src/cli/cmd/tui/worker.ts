@@ -105,12 +105,14 @@ export const rpc = {
     } catch (error) {
       shutdownFailure = error
     }
-    return shutdownFailure ? { failure: shutdownFailure instanceof Error ? shutdownFailure.message : String(shutdownFailure) } : {}
+    return shutdownFailure
+      ? { failure: shutdownFailure instanceof Error ? shutdownFailure.message : String(shutdownFailure) }
+      : {}
   },
-  async closeTraces() {
+  async closeTraces(input?: { signal?: NodeJS.Signals }) {
     const failure = shutdownFailure
     shutdownFailure = undefined
-    return finalizeWorkerTraces({ failure })
+    return finalizeWorkerTraces({ failure, signal: input?.signal })
   },
 }
 

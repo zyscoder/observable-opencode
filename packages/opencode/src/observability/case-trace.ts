@@ -26,7 +26,12 @@ import { SessionTraceRegistry, traceRouteHint } from "./case-trace-session"
 import { atomizeResponseClaims } from "./claim-atomization"
 import { isBrokenClaimFragment, isNonFactualResponseClaim } from "./claim-atomization-core"
 import { TRACE_VERSION, isFormalRecordType, shouldPromoteRuntimeEvent } from "./trace-semantic-contract"
-import { collectTracePublication, reportTracePublication, type TracePublicationStatus } from "./trace-publication"
+import {
+  collectMaterializedTracePublication,
+  collectTracePublication,
+  reportTracePublication,
+  type TracePublicationStatus,
+} from "./trace-publication"
 import { openTraceSegment, type TraceSegment } from "./trace-segment"
 import { materializeTrace } from "./trace-materializer"
 
@@ -6819,6 +6824,21 @@ class ActiveCaseTrace {
       metadata: input.metadata,
     }
     this.constraintRecords.push(constraint)
+    this.node({
+      node_id: `constraintnode_${constraint.constraint_id}`,
+      kind: "semantic.constraint",
+      component: "prompt",
+      title: constraint.constraint,
+      status:
+        constraint.status === "observed_violated"
+          ? "error"
+          : constraint.status === "observed_satisfied"
+            ? "success"
+            : "running",
+      data: constraint,
+      source_refs: constraint.source_refs,
+      metadata: constraint.metadata,
+    })
     this.write("semantic.constraint", constraint)
     return constraint
   }
@@ -8871,9 +8891,17 @@ class ActiveCaseTrace {
     const result =
       input?.result === undefined
         ? this.result
-        : (sanitizeTraceJson(input.result, "result", ["runtime_close", "result"]) as Record<string, unknown>)
+        : (sanitizeTraceJson(
+            {
+              ...(recordFromUnknown(this.result) ?? {}),
+              ...input.result,
+            },
+            "result",
+            ["runtime_close", "result"],
+          ) as Record<string, unknown>)
+    let commit: CausalIRCommitResult | undefined
     try {
-      this.causalIR.closeRuntime({
+      commit = this.causalIR.closeRuntime({
         format: "runtime_close",
         status,
         closed_at: closedAt,
@@ -8894,7 +8922,8 @@ class ActiveCaseTrace {
     this.responseSourceBySegmentID.clear()
     this.finished = true
     if (!this.persistenceEnabled) return
-    this.segment?.finalize(status === "success" ? "completed" : status === "error" ? "failed" : "cancelled")
+    if (commit?.committed && this.syncRuntimeCloseJournal())
+      this.segment?.finalize(status === "success" ? "completed" : status === "error" ? "failed" : "cancelled")
     return Object.freeze({
       caseDir: this.logicalCaseDir,
       caseID: this.caseID,
@@ -8902,6 +8931,23 @@ class ActiveCaseTrace {
       ...(this.sessionID ? { sessionID: this.sessionID } : {}),
       recordsFile: this.recordsFile,
     })
+  }
+
+  private syncRuntimeCloseJournal() {
+    let descriptor: number | undefined
+    try {
+      descriptor = fs.openSync(this.recordsFile, "r")
+      fs.fsyncSync(descriptor)
+      return true
+    } catch {
+      return false
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          fs.closeSync(descriptor)
+        } catch {}
+      }
+    }
   }
 
   flushForSignal(signal: NodeJS.Signals) {
@@ -10764,7 +10810,7 @@ class ActiveCaseTrace {
     if (component === "skill") return "skill.load"
     if (component === "task") return "subagent.call"
     if (component === "runtime" || component === "prompt" || component === "processor") return "task.loop"
-    return undefined
+    return "execution.observation"
   }
 
   private componentForObservationSource(source: string): TraceComponent {
@@ -11634,32 +11680,62 @@ function finishTracesBestEffort(finish: (trace: ActiveCaseTrace) => void) {
   compatibilityFinished = true
 }
 
+function materializeClosedTracesBestEffort(requests: TraceMaterializationRequest[]) {
+  const caseDirs = new Set<string>()
+  for (const request of requests) {
+    const caseDir = path.resolve(request.caseDir)
+    if (caseDirs.has(caseDir)) continue
+    caseDirs.add(caseDir)
+    try {
+      materializeTrace({ caseDir })
+      if (process.env.OPENCODE_CASE_TRACE_QUIET === "1") continue
+      const publication = collectMaterializedTracePublication(request)
+      if (publication) reportTracePublication(publication)
+    } catch (error) {
+      try {
+        process.stderr.write(
+          `[opencode-observability] terminal trace materialization failed ${JSON.stringify({
+            case_id: request.caseID,
+            case_dir: caseDir,
+            error: error instanceof Error ? error.message : String(error),
+          })}\n`,
+        )
+      } catch {}
+    }
+  }
+}
+
+function closeTracesBestEffort(input: FinishTraceInput) {
+  const requests: TraceMaterializationRequest[] = []
+  try {
+    registry?.finishAll((trace) => {
+      const request = trace.closeRuntime(input)
+      if (request) requests.push(request)
+    })
+  } catch {}
+  compatibilityFinished = true
+  materializeClosedTracesBestEffort(requests)
+}
+
 function finishActiveFromProcessExit(code: number | undefined) {
-  finishTracesBestEffort((trace) =>
-    trace.finish({
-      status: code && code !== 0 ? "error" : "success",
-      result: {
-        exit_code: code ?? process.exitCode ?? 0,
-        reason: "process.exit",
-      },
-    }),
-  )
+  closeTracesBestEffort({
+    status: code && code !== 0 ? "error" : "success",
+    result: {
+      exit_code: code ?? process.exitCode ?? 0,
+      reason: "process.exit",
+    },
+  })
 }
 
 function finishActiveFromSignal(signal: NodeJS.Signals) {
-  finishTracesBestEffort((trace) => trace.flushForSignal(signal))
+  closeTracesBestEffort({
+    status: "cancelled",
+    result: { reason: signal, signal, trace_flush: "process_signal" },
+  })
 }
 
 function finishActiveFromError(reason: string, error: unknown) {
-  finishTracesBestEffort((trace) =>
-    trace.finish({
-      status: "error",
-      error,
-      result: {
-        reason,
-      },
-    }),
-  )
+  closeTracesBestEffort({ status: "error", error, result: { reason } })
 }
 
 function installProcessFinalizer() {
@@ -11915,6 +11991,22 @@ export namespace CaseTrace {
       compatibilityFinished = true
     }
     return requests
+  }
+
+  export function closeSession(sessionID: string, input?: FinishTraceInput): TraceMaterializationRequest[] {
+    if (!enabledFromEnv()) return []
+    const requests: TraceMaterializationRequest[] = []
+    try {
+      registry?.finishSession(sessionID, (trace) => {
+        const request = trace.closeRuntime(input)
+        if (request) requests.push(request)
+      })
+    } catch {}
+    return requests
+  }
+
+  export function materializeClosedTraces(requests: TraceMaterializationRequest[]) {
+    materializeClosedTracesBestEffort(requests)
   }
 
   export function finish(input?: FinishTraceInput) {

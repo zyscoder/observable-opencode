@@ -7,13 +7,12 @@ import { pathToFileURL } from "node:url"
 import { normalizeTemporalReferences, writeJsonDocumentAtomic } from "@/observability/causal-ir"
 import { sanitizeTraceJson, sanitizeTraceJsonStringChunks, sanitizeTraceJsonValue } from "@/observability/case-trace"
 import { captureRepositorySnapshot } from "@/observability/repository-snapshot"
+import { materializeTrace } from "@/observability/trace-materializer"
 
 process.env.OPENCODE_CASE_TRACE_QUIET = "1"
 
 describe("case trace runtime persistence", () => {
-  test(
-    "uses the bounded writer for a real 5000-record trace and stores one authoritative payload",
-    async () => {
+  test("uses the bounded writer for a real 5000-record trace and stores one authoritative payload", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-streaming-trace-runtime-"))
       const packageDir = packageDirForTest()
       const script = path.join(dir, "large-runtime-trace.ts")
@@ -83,9 +82,7 @@ describe("case trace runtime persistence", () => {
       } finally {
         await fs.rm(dir, { recursive: true, force: true })
       }
-    },
-    120_000,
-  )
+  }, 120_000)
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     test(`keeps repeated ${signal} partial finalization byte-identical`, async () => {
@@ -235,9 +232,7 @@ describe("case trace runtime persistence", () => {
     }
   })
 
-  test(
-    "writes a 32MiB causal record in bounded chunks",
-    async () => {
+  test("writes a 32MiB causal record in bounded chunks", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-single-record-budget-"))
       const target = path.join(dir, "trace.json")
       const marker = "single-record-prefix:"
@@ -270,9 +265,7 @@ describe("case trace runtime persistence", () => {
       } finally {
         await fs.rm(dir, { recursive: true, force: true })
       }
-    },
-    120_000,
-  )
+  }, 120_000)
 
   test("keeps streaming JSON sanitization deeply equal to the legacy whole-document sanitizer", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-streaming-json-sanitize-parity-"))
@@ -600,7 +593,12 @@ describe("case trace runtime persistence", () => {
       expect(traceText).toContain("persisted_before_cycle_signal")
       expect(traceText).toContain("cycle-result-before-sigterm")
       expect(traceText).toMatch(/\[Circular:\$\.[^\]]+\]/)
-      expect(await fs.access(path.join(caseDir, "trace.html")).then(() => true).catch(() => false)).toBe(false)
+      expect(
+        await fs
+          .access(path.join(caseDir, "trace.html"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false)
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
@@ -695,9 +693,7 @@ describe("case trace runtime persistence", () => {
       expect(JSON.parse(await fs.readFile(target, "utf8"))).toBeNull()
 
       await fs.writeFile(target, '{"stable":true}')
-      expect(() =>
-        writeJsonDocumentAtomic(target, { broken: 1n }, { sanitize: (value) => value }),
-      ).toThrow()
+      expect(() => writeJsonDocumentAtomic(target, { broken: 1n }, { sanitize: (value) => value })).toThrow()
       expect(JSON.parse(await fs.readFile(target, "utf8"))).toEqual({ stable: true })
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
@@ -729,24 +725,21 @@ describe("case trace runtime persistence", () => {
     }
   })
 
-  test("recovers a coherent cancelled partial after a SIGTERM trace write failure", async () => {
+  test("preserves a retryable cancelled journal after a SIGTERM materializer publication failure", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sigterm-emergency-recovery-"))
     const packageDir = packageDirForTest()
     const script = path.join(dir, "sigterm-emergency-recovery.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const blocker = path.join(dir, "materializer-blocker")
 
     try {
+      await fs.writeFile(blocker, "not a directory")
       await fs.writeFile(
         script,
         [
           `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-          `const trace = CaseTrace.configure({ input: { prompt: "emergency terminal recovery" } }) as any`,
+          `CaseTrace.configure({ input: { prompt: "emergency terminal recovery" } })`,
           `CaseTrace.node({ node_id: "persisted_before_emergency", kind: "execution.observation", component: "runtime", title: "persisted before emergency" })`,
-          `const originalSafeWrite = trace.safeWrite.bind(trace)`,
-          `trace.safeWrite = (target: string, content: unknown) => {`,
-          `  if (target === trace.traceFile) return false`,
-          `  return originalSafeWrite(target, content)`,
-          `}`,
           `process.kill(process.pid, "SIGTERM")`,
         ].join("\n"),
       )
@@ -757,6 +750,7 @@ describe("case trace runtime persistence", () => {
           OPENCODE_CASE_TRACE: "1",
           OPENCODE_CASE_ID: "task6-sigterm-emergency-recovery",
           OPENCODE_CASE_TRACE_DIR: dir,
+          OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE: path.join(blocker, "ready"),
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -764,14 +758,26 @@ describe("case trace runtime persistence", () => {
       const code = await proc.exited
       const stderr = await new Response(proc.stderr).text()
       const caseDir = path.join(dir, "task6-sigterm-emergency-recovery")
-      const partialText = await fs.readFile(path.join(caseDir, "partial/latest.json"), "utf8")
-      const manifest = JSON.parse(await fs.readFile(path.join(caseDir, "manifest.json"), "utf8"))
-      const partial = JSON.parse(partialText)
 
       expect(code).toBe(143)
-      expect(stderr).toContain("[opencode-observability] terminal trace persistence failed")
-      expect(stderr).toContain('"trace":false')
-      expect(stderr).toContain('"canonical_removed":true')
+      expect(stderr).toContain("[opencode-observability] terminal trace materialization failed")
+      expect(stderr).toContain("task6-sigterm-emergency-recovery")
+      expect(
+        await fs
+          .access(path.join(caseDir, "trace.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false)
+      const session = JSON.parse(await fs.readFile(path.join(caseDir, "session.json"), "utf8")) as any
+      expect(session.segments).toMatchObject([{ status: "cancelled" }])
+      const recordsFile = path.join(caseDir, session.segments[0].records)
+      expect(await fs.readFile(recordsFile, "utf8")).toContain('"operation":"case.runtime_closed"')
+
+      await fs.rm(blocker)
+      const recovered = materializeTrace({ caseDir })
+      const partialText = await fs.readFile(recovered.partialFile, "utf8")
+      const manifest = JSON.parse(await fs.readFile(recovered.manifestFile, "utf8"))
+      const partial = JSON.parse(partialText)
       expect(partial.manifest).toMatchObject({
         status: "cancelled",
         process_status: "cancelled",
@@ -779,29 +785,32 @@ describe("case trace runtime persistence", () => {
       })
       expect(manifest).toMatchObject({ status: "cancelled", shutdown_signal: "SIGTERM" })
       expect(partialText).toContain("persisted_before_emergency")
-      expect(await fs.access(path.join(caseDir, "trace.html")).then(() => true).catch(() => false)).toBe(false)
+      expect(
+        await fs
+          .access(path.join(caseDir, "trace.html"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false)
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
   })
 
-  test("reports an explicit terminal persistence failure when every critical SIGTERM path is unwritable", async () => {
+  test("reports an explicit terminal materializer failure without changing SIGTERM exit semantics", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sigterm-all-unwritable-"))
     const packageDir = packageDirForTest()
     const script = path.join(dir, "sigterm-all-unwritable.ts")
     const traceModule = pathToFileURL(path.join(packageDir, "src/observability/case-trace.ts")).href
+    const blocker = path.join(dir, "materializer-blocker")
 
     try {
+      await fs.writeFile(blocker, "not a directory")
       await fs.writeFile(
         script,
         [
           `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
-          `const trace = CaseTrace.configure({ input: { prompt: "all terminal paths unwritable" } }) as any`,
+          `CaseTrace.configure({ input: { prompt: "all terminal paths unwritable" } })`,
           `CaseTrace.node({ node_id: "persisted_before_total_failure", kind: "execution.observation", component: "runtime", title: "persisted before total failure" })`,
-          `const blocked = new Set([trace.traceFile, trace.partialFile, trace.manifestFile])`,
-          `const originalSafeWrite = trace.safeWrite.bind(trace)`,
-          `trace.safeWrite = (target: string, content: unknown) => blocked.has(target) ? false : originalSafeWrite(target, content)`,
-          `trace.safeLinkOrWrite = (_source: string, target: string) => blocked.has(target) ? false : false`,
           `process.kill(process.pid, "SIGTERM")`,
         ].join("\n"),
       )
@@ -812,6 +821,7 @@ describe("case trace runtime persistence", () => {
           OPENCODE_CASE_TRACE: "1",
           OPENCODE_CASE_ID: "task6-sigterm-all-unwritable",
           OPENCODE_CASE_TRACE_DIR: dir,
+          OPENCODE_TRACE_MATERIALIZER_STAGE_READY_FILE: path.join(blocker, "ready"),
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -820,9 +830,11 @@ describe("case trace runtime persistence", () => {
       const stderr = await new Response(proc.stderr).text()
 
       expect(code).toBe(143)
-      expect(stderr).toContain("[opencode-observability] terminal trace persistence failed")
+      expect(stderr).toContain("[opencode-observability] terminal trace materialization failed")
       expect(stderr).toContain("task6-sigterm-all-unwritable")
-      expect(stderr).toContain("SIGTERM")
+      const caseDir = path.join(dir, "task6-sigterm-all-unwritable")
+      const session = JSON.parse(await fs.readFile(path.join(caseDir, "session.json"), "utf8")) as any
+      expect(session.segments).toMatchObject([{ status: "cancelled" }])
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
@@ -860,7 +872,7 @@ describe("case trace runtime persistence", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-streaming-json-unicode-"))
     const target = path.join(dir, "trace.json")
     const document = {
-      text: "中文🙂 quotation: \" slash: \\",
+      text: '中文🙂 quotation: " slash: \\',
       controls: "line\nnull\0tab\t",
       lone_high: "\ud800",
       lone_low: "\udfff",
@@ -875,9 +887,7 @@ describe("case trace runtime persistence", () => {
     }
   })
 
-  test(
-    "sanitizes production JSON incrementally without a whole-root clone or full-string replace",
-    async () => {
+  test("sanitizes production JSON incrementally without a whole-root clone or full-string replace", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-production-sanitize-budget-"))
       const target = path.join(dir, "trace.json")
       const payload = `production-sanitize-prefix:${"x".repeat(8 * 1024 * 1024)}`
@@ -925,9 +935,7 @@ describe("case trace runtime persistence", () => {
         String.prototype.replace = originalReplace
         await fs.rm(dir, { recursive: true, force: true })
       }
-    },
-    120_000,
-  )
+  }, 120_000)
 
   test("removes a stale segment canonical and recovers the root after terminal canonical write failure", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-stale-running-canonical-"))
@@ -1037,7 +1045,7 @@ describe("case trace runtime persistence", () => {
         for (let offset = 0; offset < longInput.length; ) {
           seed = Math.imul(seed ^ (seed >>> 15), 1 | seed)
           seed ^= seed + Math.imul(seed ^ (seed >>> 7), 61 | seed)
-          const width = 1 + ((seed ^ (seed >>> 14)) >>> 0) % 31
+          const width = 1 + (((seed ^ (seed >>> 14)) >>> 0) % 31)
           fragments.push(longInput.slice(offset, offset + width))
           offset += width
         }
@@ -1218,7 +1226,6 @@ describe("case trace runtime persistence", () => {
       String.prototype.slice = originalSlice
     }
   })
-
 })
 
 function packageDirForTest() {

@@ -106,13 +106,25 @@ test("materializes a runtime-closed journal into a complete canonical trace", as
     const result = materializeTrace({ caseDir })
     const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8"))
     const manifest = JSON.parse(await fs.readFile(result.manifestFile, "utf8"))
+    const legacy = JSON.parse(await fs.readFile(path.join(caseDir, "legacy-trace.json"), "utf8"))
 
     expect(result).toMatchObject({ caseDir, completeness: "complete", recoveredLines: 3 })
     expect(trace).toMatchObject({
       manifest: { case_id: "case-materializer", run_id: "run_materializer", status: "success" },
     })
-    expect(trace.nodes.map((node: { node_id: string }) => node.node_id)).toEqual(["run_start", "response_1"])
+    expect(trace.nodes.slice(0, 2).map((node: { node_id: string }) => node.node_id)).toEqual([
+      "run_start",
+      "response_1",
+    ])
+    expect(trace.nodes.at(-1)).toMatchObject({ kind: "case.completed", status: "success" })
     expect(manifest).toMatchObject({ case_id: "case-materializer", status: "success" })
+    expect(legacy).toMatchObject({
+      trace_version: "1.3",
+      case_id: "case-materializer",
+      run_id: "run_materializer",
+      status: "success",
+      response_segments: [expect.objectContaining({ text: "replayed output" })],
+    })
     expect(JSON.parse(await fs.readFile(result.partialFile, "utf8"))).toEqual(trace)
   } finally {
     await fs.rm(caseDir, { recursive: true, force: true })
@@ -146,7 +158,11 @@ test("recovers the valid journal prefix when the final JSONL line is torn", asyn
     const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8"))
 
     expect(result).toMatchObject({ completeness: "incomplete", recoveredLines: 3 })
-    expect(trace.nodes.map((node: { node_id: string }) => node.node_id)).toEqual(["run_start", "response_1"])
+    expect(trace.nodes.slice(0, 2).map((node: { node_id: string }) => node.node_id)).toEqual([
+      "run_start",
+      "response_1",
+    ])
+    expect(trace.nodes.at(-1)).toMatchObject({ kind: "case.completed", status: "success" })
     expect(trace.manifest).toMatchObject({
       recovery_status: "incomplete_journal_replay",
       recovery: { dropped_lines: 1 },
@@ -308,7 +324,7 @@ test("preserves snapshot replacement order and appends later new entities at the
     const result = materializeTrace({ caseDir })
     const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8"))
 
-    expect(trace.nodes.map((node: { node_id: string }) => node.node_id)).toEqual([
+    expect(trace.nodes.slice(0, 8).map((node: { node_id: string }) => node.node_id)).toEqual([
       "run_start",
       "replacement_1",
       "replacement_2",
@@ -318,6 +334,7 @@ test("preserves snapshot replacement order and appends later new entities at the
       "replacement_6",
       "appended_after_snapshot",
     ])
+    expect(trace.nodes.at(-1)).toMatchObject({ kind: "case.completed", status: "success" })
     expect(trace.nodes[2]).toEqual(expect.objectContaining({ node_id: "replacement_2", title: "updated in place" }))
   } finally {
     await fs.rm(caseDir, { recursive: true, force: true })

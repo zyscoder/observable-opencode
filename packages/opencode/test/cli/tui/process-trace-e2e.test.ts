@@ -95,9 +95,7 @@ async function waitForDurableResponse(traceRoot: string, diagnostic: () => strin
     }
     await Bun.sleep(25)
   }
-  throw new Error(
-    `timed out waiting for a production TUI response journal under ${traceRoot}; ${diagnostic()}`,
-  )
+  throw new Error(`timed out waiting for a production TUI response journal under ${traceRoot}; ${diagnostic()}`)
 }
 
 function waitForExit(proc: ReturnType<typeof spawnPty>) {
@@ -106,15 +104,14 @@ function waitForExit(proc: ReturnType<typeof spawnPty>) {
   })
 }
 
-test(
-  "production TUI materializes trace.json after normal exit, SIGINT, and SIGTERM",
-  async () => {
+test("production TUI materializes trace.json after normal exit, SIGINT, SIGTERM, and SIGHUP", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-task-7-production-tui-"))
     const server = await listenLoopback()
     try {
       for (const scenario of [
         { mode: "sigint", signal: "SIGINT", exitCode: 130 },
         { mode: "sigterm", signal: "SIGTERM", exitCode: 143 },
+      { mode: "sighup", signal: "SIGHUP", exitCode: 129 },
         { mode: "normal", input: "\u0004", exitCode: 0 },
       ] as const) {
         const scenarioRoot = path.join(root, scenario.mode)
@@ -207,8 +204,15 @@ test(
           expect(result.exitCode).toBe(scenario.exitCode)
           expect(output.join("")).toContain("Session trace saved")
           expect(session.segments).toHaveLength(1)
-          expect(session.segments[0].status).toBe("completed")
-          expect(trace.manifest.status).toBe("success")
+        expect(session.segments[0].status).toBe("signal" in scenario ? "cancelled" : "completed")
+        expect(trace.manifest.status).toBe("signal" in scenario ? "cancelled" : "success")
+        if ("signal" in scenario) {
+          expect(trace.manifest).toMatchObject({
+            server_status: "cancelled",
+            process_status: "cancelled",
+            shutdown_signal: scenario.signal,
+          })
+        }
           expect(trace.records.some((record: any) => record.event_type === "response.output")).toBe(true)
         } finally {
           try {
@@ -221,6 +225,4 @@ test(
       await server.close()
       await fs.rm(root, { recursive: true, force: true })
     }
-  },
-  1_200_000,
-)
+}, 1_200_000)

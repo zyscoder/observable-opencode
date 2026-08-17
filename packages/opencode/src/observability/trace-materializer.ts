@@ -7,6 +7,7 @@ import {
   CAUSAL_IR_VERSION,
   CausalIRJournalValidationError,
   canonicalCausalIREdge,
+  canonicalCausalIRNode,
   causalIRLegacyRef,
   causalIRPayloadHash,
   projectProvenanceTrace,
@@ -16,11 +17,13 @@ import {
   type CausalIREdge,
   type CausalIRJournalEntry,
   type CausalIRNode,
+  type CausalNodeLike,
   type CausalIRRef,
   type CausalIRRuntimeCloseData,
   type CausalIRStoreSnapshot,
   type CausalIRDiagnosticLike,
 } from "./causal-ir"
+import { atomizeResponseClaims } from "./claim-atomization"
 import {
   streamingJsonArray,
   streamingJsonRawChunks,
@@ -49,6 +52,31 @@ export type TraceMaterializationResult = {
 }
 
 type JsonRow = { json: string }
+type OrderedJsonRow = JsonRow & { ordinal: number }
+
+function legacyFieldSummary(value: unknown) {
+  if (value === undefined) return undefined
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof (value as Record<string, unknown>).type === "string" &&
+    typeof (value as Record<string, unknown>).hash === "string" &&
+    typeof (value as Record<string, unknown>).preview === "string"
+  )
+    return value
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    return { type: value === null ? "null" : typeof value, value }
+  const serialized = JSON.stringify(value) ?? "null"
+  const previewLimit = Math.max(1, Number(process.env.OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH) || 2_000)
+  return {
+    type: Array.isArray(value) ? "array" : "object",
+    length: serialized.length,
+    hash: crypto.createHash("sha256").update(serialized).digest("hex").slice(0, 16),
+    preview: serialized.slice(0, previewLimit),
+    ...(Array.isArray(value) ? {} : { keys: Object.keys(value as Record<string, unknown>).slice(0, 50) }),
+  }
+}
 type KindRow = { kind: string }
 type CountRow = { count: number }
 type HashRow = { payload_hash: string }
@@ -315,8 +343,7 @@ function scopedLegacyReference(value: string | undefined, scope: SegmentReplaySc
             ? "diagnostic"
             : undefined
   const id = value.slice(separator + 1)
-  if (type)
-    return `${prefix}:${resolvedScopedEntityID(scope, type, id) ?? `${scope.segmentID}::${type}::${id}`}`
+  if (type) return `${prefix}:${resolvedScopedEntityID(scope, type, id) ?? `${scope.segmentID}::${type}::${id}`}`
   const alias = resolvedNodeAlias(scope, value) ?? resolvedNodeAlias(scope, id)
   return alias && CAUSAL_NODE_ALIAS_SCHEMES.has(prefix) ? `${prefix}:${alias}` : value
 }
@@ -792,6 +819,10 @@ class ReplayIndex {
       : undefined
   }
 
+  get terminalOperation() {
+    return this.lastOperation
+  }
+
   private validationError(message: string): never {
     throw new CausalIRJournalValidationError(this.segmentRecoveredLines + 1, message)
   }
@@ -1132,6 +1163,298 @@ class ReplayIndex {
       .get(segmentKey)!.count
   }
 
+  private *segmentNodeRows(segmentKey: string, kind?: string) {
+    let ordinal = -1
+    while (true) {
+      const row = kind
+        ? this.db
+            .query<OrderedJsonRow, [string, string, number]>(
+              `SELECT ordinal, CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json
+               FROM nodes WHERE segment_key = ? AND kind = ? AND ordinal > ? ORDER BY ordinal LIMIT 1`,
+            )
+            .get(segmentKey, kind, ordinal)
+        : this.db
+            .query<OrderedJsonRow, [string, number]>(
+              `SELECT ordinal, CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json
+               FROM nodes WHERE segment_key = ? AND ordinal > ? ORDER BY ordinal LIMIT 1`,
+            )
+            .get(segmentKey, ordinal)
+      if (!row) return
+      ordinal = row.ordinal
+      yield row
+    }
+  }
+
+  runStart(segmentKey: string) {
+    const row = this.segmentNodeRows(segmentKey, "run.start")[Symbol.iterator]().next().value as JsonRow | undefined
+    return row ? (JSON.parse(row.json) as CausalIRNode) : undefined
+  }
+
+  private replaceNode(node: CausalIRNode) {
+    const canonical = canonicalCausalIRNode(
+      {
+        node_id: node.node_id,
+        kind: node.kind,
+        schema_version: node.schema_version,
+        origin: node.origin,
+        component: node.component,
+        span_id: node.span_id,
+        parent_span_id: node.parent_span_id,
+        timestamp: node.timestamp,
+        time_ms: node.time_ms,
+        title: node.title,
+        status: node.status,
+        input_refs: node.legacy_input_refs ?? node.input_refs.map(causalIRLegacyRef),
+        output_refs: node.legacy_output_refs ?? node.output_refs.map(causalIRLegacyRef),
+        source_refs: node.legacy_source_refs ?? node.source_refs.map(causalIRLegacyRef),
+        source_locations: node.source_locations,
+        typed_resources: node.typed_resources,
+        artifact_refs: node.artifact_refs,
+        aliases: node.aliases,
+        derivation: node.derivation ?? undefined,
+        data: node.data,
+        metadata: node.metadata,
+      },
+      { runID: node.scope.run_id, caseID: node.scope.case_id, sequence: node.order.sequence },
+    )
+    this.db
+      .query("UPDATE nodes SET kind = ?, wrapped = 0, json = ? WHERE entity_id = ?")
+      .run(canonical.kind, JSON.stringify(canonical), canonical.node_id)
+  }
+
+  private putDerivedNode(
+    input: Omit<CausalNodeLike, "timestamp" | "time_ms" | "origin" | "derivation"> & {
+      timestamp: string
+      time_ms: number
+    },
+  ) {
+    const inputRefs = input.input_refs ?? []
+    const node = canonicalCausalIRNode(
+      {
+        ...input,
+        origin: "deterministic_derived",
+        derivation: {
+          algorithm: "trace_materializer_terminal_enrichment",
+          algorithm_version: "1",
+          derived_at: input.timestamp,
+          input_refs: inputRefs.map(typedCausalIRReference),
+          reproducible: true,
+        },
+      },
+      { runID: this.runID, caseID: this.caseID, sequence: this.nextOrdinal.nodes + 1 },
+    )
+    this.putNode(node)
+    return node
+  }
+
+  private putDerivedEdge(input: { edgeID: string; from: string; to: string; relation: string; label: string }) {
+    this.putEdge(
+      canonicalCausalIREdge({
+        edge_id: input.edgeID,
+        from: { type: "node", id: input.from },
+        to: { type: "node", id: input.to },
+        relation: input.relation,
+        eligible_for_attribution: false,
+        derivation_method: "trace_materializer_terminal_enrichment_v1",
+        label: input.label,
+        metadata: { behavior_impact: "none", projection_stage: "terminal_materialization" },
+      }),
+    )
+  }
+
+  enrichRuntimeTerminal(input: {
+    segmentKey: string
+    status: "success" | "error" | "cancelled"
+    closedAt: string
+    result?: Record<string, unknown>
+    error?: unknown
+  }) {
+    if (
+      this.db
+        .query<
+          CountRow,
+          [string]
+        >("SELECT COUNT(*) AS count FROM nodes WHERE segment_key = ? AND kind IN ('case.completed', 'case.failed')")
+        .get(input.segmentKey)!.count > 0
+    )
+      return
+
+    const finalizedReason =
+      input.status === "cancelled" ? "trace_cancelled" : input.status === "error" ? "trace_error" : "trace_finished"
+    const failedOpenRefs: string[] = []
+    for (const row of this.segmentNodeRows(input.segmentKey)) {
+      const node = JSON.parse(row.json) as CausalIRNode
+      if (node.status !== "running") continue
+      if (input.status !== "success" && failedOpenRefs.length < 16) failedOpenRefs.push(`node:${node.node_id}`)
+      node.status = input.status
+      node.data = {
+        ...(node.data ?? {}),
+        finalized_status: "finalized_without_close",
+        finalized_reason: finalizedReason,
+        finalized_at: input.closedAt,
+        original_status: "running",
+      }
+      this.replaceNode(node)
+    }
+
+    let timeMS = Date.parse(input.closedAt)
+    const runStart = this.runStart(input.segmentKey)
+    if (runStart && Number.isFinite(timeMS)) timeMS = Math.max(0, timeMS - Date.parse(runStart.timestamp))
+    if (!Number.isFinite(timeMS)) timeMS = this.nextOrdinal.nodes
+
+    let finalResponseSegmentID: string | undefined
+    for (const row of this.segmentNodeRows(input.segmentKey, "response.output")) {
+      const response = JSON.parse(row.json) as CausalIRNode
+      const data = response.data ?? {}
+      if (
+        data.response_role !== "final_answer" ||
+        data.visibility !== "user_visible" ||
+        data.is_final_for_case !== true ||
+        (input.status !== "success" && data.finality_source !== "explicit")
+      )
+        continue
+      const segmentID = typeof data.segment_id === "string" ? data.segment_id : response.node_id
+      finalResponseSegmentID = segmentID
+      const claims = atomizeResponseClaims(data.text)
+      claims.forEach((claim, index) => {
+        const suffix = causalIRPayloadHash(`${segmentID}:${index}:${claim.key}`).slice(0, 12)
+        const claimNodeID = `materialized_responseclaim_${suffix}`
+        const sourceRefs = [
+          `node:${response.node_id}`,
+          ...(Array.isArray(data.source_refs)
+            ? data.source_refs.filter((ref): ref is string => typeof ref === "string")
+            : []),
+        ]
+        const supportLevel = sourceRefs.length > 1 ? "supported" : "unsupported"
+        this.putDerivedNode({
+          node_id: claimNodeID,
+          kind: "response.claim",
+          component: "result",
+          title: claim.text,
+          status: "success",
+          timestamp: input.closedAt,
+          time_ms: timeMS,
+          input_refs: [`node:${response.node_id}`],
+          source_refs: sourceRefs,
+          data: {
+            claim_id: `claim_${suffix}`,
+            response_segment_id: segmentID,
+            text: claim.text,
+            claim_key: claim.key,
+            claim_format: claim.claim_format,
+            raw_text: claim.raw_text,
+            canonical_text: claim.canonical_text,
+            claim_group_id: claim.claim_group_id,
+            claim_index: claim.claim_index,
+            claim_count: claim.claim_count,
+            source_byte_range: claim.source_byte_range,
+            atomization_status: claim.atomization_status,
+            atomization_reason: claim.atomization_reason,
+            source_refs: sourceRefs.slice(1),
+            support_level: supportLevel,
+            quality_flags: supportLevel === "unsupported" ? ["unsupported_response_claim"] : [],
+            metadata: {
+              response_node_id: response.node_id,
+              response_role: data.response_role,
+              is_final_for_case: true,
+              finality_source: data.finality_source,
+            },
+          },
+        })
+        const assessmentNodeID = `materialized_claimsupport_${suffix}`
+        this.putDerivedNode({
+          node_id: assessmentNodeID,
+          kind: "claim.support_assessment",
+          component: "evaluation",
+          title: `support assessment for ${claim.text}`,
+          status: "success",
+          timestamp: input.closedAt,
+          time_ms: timeMS,
+          input_refs: [`node:${claimNodeID}`],
+          source_refs: [`node:${claimNodeID}`, ...sourceRefs.slice(1)],
+          data: {
+            assessment_id: `claimsupport_${suffix}`,
+            claim_id: `claim_${suffix}`,
+            response_segment_id: segmentID,
+            claim_node_id: claimNodeID,
+            support_level: supportLevel,
+            quality_flags: supportLevel === "unsupported" ? ["unsupported_response_claim"] : [],
+          },
+        })
+        this.putDerivedEdge({
+          edgeID: `materialized_response_to_claim_${suffix}`,
+          from: response.node_id,
+          to: claimNodeID,
+          relation: "response_to_claim",
+          label: "Final response was deterministically atomized into a claim",
+        })
+      })
+    }
+
+    const signal = typeof input.result?.signal === "string" ? input.result.signal : undefined
+    let signalNode: CausalIRNode | undefined
+    if (signal) {
+      signalNode = this.putDerivedNode({
+        node_id: `materialized_process_signal_${causalIRPayloadHash(`${this.runID}:${signal}`).slice(0, 12)}`,
+        kind: "process.signal",
+        component: "runtime",
+        title: `process received ${signal}`,
+        status: "cancelled",
+        timestamp: input.closedAt,
+        time_ms: timeMS,
+        data: {
+          signal,
+          shutdown_disposition: "interrupted_before_case_completion",
+          server_shutdown_reason: "process_signal",
+          observation_source: "process_signal_handler",
+          sender_identity_available: false,
+          recording_mode: "passive_posthoc",
+          agent_feedback: "none",
+        },
+      })
+    }
+
+    const caseKind = input.status === "success" ? "case.completed" : "case.failed"
+    const caseNode = this.putDerivedNode({
+      node_id: `materialized_${caseKind.replace(".", "_")}_${causalIRPayloadHash(this.runID).slice(0, 12)}`,
+      kind: caseKind,
+      component: "run",
+      title: input.status === "success" ? "case completed" : "case failed",
+      status: input.status,
+      timestamp: input.closedAt,
+      time_ms: timeMS,
+      input_refs: signalNode ? [`node:${signalNode.node_id}`] : finalResponseSegmentID ? [] : failedOpenRefs,
+      source_refs: signalNode
+        ? [`node:${signalNode.node_id}`]
+        : finalResponseSegmentID
+          ? [`response_segment:${finalResponseSegmentID}`]
+          : failedOpenRefs,
+      data: {
+        run_id: this.runID,
+        case_id: this.caseID,
+        server_status: input.status,
+        process_status: input.status,
+        server_shutdown_reason: signal ? "process_signal" : undefined,
+        shutdown_signal: signal,
+        shutdown_disposition: signal ? "interrupted_before_case_completion" : "normal_case_completion",
+        case_status: input.status,
+        final_response_segment_id: finalResponseSegmentID,
+        result: input.result,
+        error: input.error,
+        finalized_open_record_refs: input.status === "success" ? [] : failedOpenRefs,
+        finalized_open_record_count: input.status === "success" ? 0 : failedOpenRefs.length,
+      },
+    })
+    if (signalNode)
+      this.putDerivedEdge({
+        edgeID: `materialized_signal_to_case_${causalIRPayloadHash(this.runID).slice(0, 12)}`,
+        from: signalNode.node_id,
+        to: caseNode.node_id,
+        relation: "failed_before",
+        label: "External process signal interrupted the case",
+      })
+  }
+
   recordCount() {
     let count = 0
     for (const row of this.db.query<KindRow, []>("SELECT kind FROM nodes").iterate())
@@ -1280,6 +1603,55 @@ class ReplayIndex {
         },
       )
       yield projection.dataflow_edges[0]!
+    }
+  }
+
+  *legacyNodeData(kinds: string[]) {
+    const placeholders = kinds.map(() => "?").join(", ")
+    for (const row of this.db
+      .query<
+        JsonRow,
+        string[]
+      >(`SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json FROM nodes WHERE kind IN (${placeholders}) ORDER BY ordinal`)
+      .iterate(...kinds)) {
+      const node = JSON.parse(row.json) as CausalIRNode
+      yield node.data ?? {}
+    }
+  }
+
+  *legacySpans() {
+    for (const row of this.db
+      .query<JsonRow, []>(
+        `SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json
+         FROM nodes
+         WHERE kind IN ('llm.call', 'tool.call', 'mcp.call', 'skill.load', 'subagent.call', 'task.loop', 'execution.observation')
+         ORDER BY ordinal`,
+      )
+      .iterate()) {
+      const node = JSON.parse(row.json) as CausalIRNode
+      if (!node.span_id) continue
+      const data = node.data ?? {}
+      yield {
+        span_id: node.span_id,
+        parent_span_id: node.parent_span_id,
+        component: node.component,
+        operation: data.operation,
+        name: node.title,
+        status: node.status,
+        start_time: node.timestamp,
+        start_ms: node.time_ms,
+        end_time: data.finalized_at,
+        duration_ms: data.duration_ms,
+        input_summary: legacyFieldSummary(data.input),
+        output_summary: legacyFieldSummary(data.output),
+        token_usage: data.token_usage,
+        error: data.error,
+        metadata: {
+          ...(node.metadata ?? {}),
+          ...(data.finalized_status === undefined ? {} : { finalized_status: data.finalized_status }),
+          ...(data.finalized_reason === undefined ? {} : { finalized_reason: data.finalized_reason }),
+        },
+      }
     }
   }
 
@@ -1502,6 +1874,39 @@ function provenanceMembers(
     ["dataflow_edges", streamingJsonArray(index.compatibilityEdges(manifest, metrics))],
     ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
     ["metrics", metrics],
+  ]
+}
+
+function legacyMembers(
+  index: ReplayIndex,
+  manifest: Record<string, unknown>,
+  metrics: Record<string, unknown>,
+): StreamingJsonObjectMember[] {
+  return [
+    ["trace_version", "1.3"],
+    ["case_id", manifest.case_id],
+    ["run_id", manifest.run_id],
+    ["session_id", manifest.session_id],
+    ["started_at", manifest.started_at],
+    ["ended_at", manifest.ended_at],
+    ["duration_ms", manifest.duration_ms],
+    ["status", manifest.status],
+    ["input", manifest.input],
+    ["environment", manifest.environment],
+    ["token_usage", manifest.token_usage ?? {}],
+    ["spans", streamingJsonArray(index.legacySpans())],
+    ["events", streamingJsonArray(index.compatibilityRecords(manifest, metrics))],
+    ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
+    ["errors", streamingJsonArray(manifest.error === undefined ? [] : [manifest.error])],
+    ["result", manifest.result],
+    ["context_snapshots", streamingJsonArray(index.legacyNodeData(["context.pack"]))],
+    ["semantic_decisions", streamingJsonArray(index.legacyNodeData(["decision"]))],
+    ["dataflow_edges", streamingJsonArray(index.compatibilityEdges(manifest, metrics))],
+    ["verification_records", streamingJsonArray(index.legacyNodeData(["verification"]))],
+    ["change_records", streamingJsonArray(index.legacyNodeData(["change"]))],
+    ["constraint_records", streamingJsonArray(index.legacyNodeData(["semantic.constraint"]))],
+    ["response_segments", streamingJsonArray(index.legacyNodeData(["response.output"]))],
+    ["design_records", streamingJsonArray(index.legacyNodeData(["design.record"]))],
   ]
 }
 
@@ -1898,12 +2303,7 @@ function publishStagedTrace(stageDir: string, caseDir: string, generation: numbe
           path.join(derivedDir, "current", "artifacts"),
           path.join(temporaryGeneration, "artifacts"),
         )
-      for (const relative of [
-        "trace.json",
-        "manifest.json",
-        "provenance-trace.json",
-        "legacy-trace.json",
-      ])
+      for (const relative of ["trace.json", "manifest.json", "provenance-trace.json", "legacy-trace.json"])
         copyVisibleFile(path.join(stageDir, relative), path.join(temporaryGeneration, relative))
       linkFileAtomic(
         path.join(temporaryGeneration, "trace.json"),
@@ -2056,6 +2456,7 @@ function materializeTraceSnapshot(input: {
         identities,
         close: index.close,
         envelope: index.envelope,
+        terminalOperation: index.terminalOperation,
         counts: {
           nodes: index.segmentCount("nodes", source.key),
           edges: index.segmentCount("edges", source.key),
@@ -2082,14 +2483,19 @@ function materializeTraceSnapshot(input: {
     }
     const droppedLines = replays.reduce((total, replay) => total + replay.droppedLines, 0)
     const journalBytes = replays.reduce((total, replay) => total + replay.journalBytes, 0)
-    index.reconcileDiagnostics()
-    memoryPhase("diagnostics_complete", journalBytes)
     const latest = replays.at(-1)!
     const validTerminal = replays.findLast((replay) => replay.close && replay.envelope?.manifest)
-    const terminal = validTerminal ?? latest
+    const terminal = latest
+    const previousTerminal = terminal.close ? undefined : validTerminal
     const complete = droppedLines === 0 && replays.every((replay) => replay.close !== undefined)
     const completeness = complete ? "complete" : "incomplete"
     const terminalManifest = terminal.envelope?.manifest ?? {}
+    const runStart = index.runStart(terminal.source.key)
+    const runData = runStart?.data ?? {}
+    const closeResult = record(terminalManifest.result)
+    const publicResult = closeResult
+      ? Object.fromEntries(Object.entries(closeResult).filter(([key]) => key !== "open_lifecycle"))
+      : terminalManifest.result
     const terminalStatus =
       terminalManifest.status === "success" ||
       terminalManifest.status === "error" ||
@@ -2097,13 +2503,23 @@ function materializeTraceSnapshot(input: {
         ? terminalManifest.status
         : (terminal.close?.status ?? "error")
     const historicalInterruptions = Boolean(
-      session &&
-        validTerminal &&
-        replays.some((replay) => replay !== terminal && (replay.droppedLines > 0 || !replay.close)),
+      session && replays.some((replay) => replay.droppedLines > 0 || !replay.close),
     )
-    const status = complete || historicalInterruptions ? terminalStatus : "error"
+    const status = terminal.close ? terminalStatus : "error"
     const runID = terminal.identities.runID
     const caseID = session?.logical_case_id ?? latest.identities.caseID
+    const effectiveSegments = session?.segments.map((descriptor) => {
+      const replay = replays.find((candidate) => candidate.source.descriptor?.segment_id === descriptor.segment_id)
+      if (!replay) return descriptor
+      if (replay.close) {
+        const reconciled =
+          replay.close.status === "success" ? "completed" : replay.close.status === "error" ? "failed" : "cancelled"
+        return descriptor.status === reconciled ? descriptor : { ...descriptor, status: reconciled }
+      }
+      if (descriptor.status !== "running" && descriptor.status !== "interrupted_unfinalized")
+        return { ...descriptor, status: "interrupted_unfinalized" as const }
+      return descriptor
+    })
     const sourceFiles = record(terminalManifest.files) ?? {}
     const activeRecords = terminal.source.descriptor?.records ?? "records.jsonl"
     const activeRawEvents = terminal.source.descriptor
@@ -2114,26 +2530,64 @@ function materializeTraceSnapshot(input: {
       trace_version: TRACE_VERSION,
       case_id: caseID,
       run_id: runID,
+      started_at: terminalManifest.started_at ?? runStart?.timestamp,
+      ended_at: terminalManifest.ended_at ?? terminal.close?.closed_at,
+      ...((terminalManifest.duration_ms ??
+        (runStart && terminal.close?.closed_at
+          ? Math.max(0, Date.parse(terminal.close.closed_at) - Date.parse(runStart.timestamp))
+          : undefined)) === undefined
+        ? {}
+        : {
+            duration_ms:
+              terminalManifest.duration_ms ??
+              Math.max(0, Date.parse(terminal.close!.closed_at) - Date.parse(runStart!.timestamp)),
+          }),
       status,
       server_status: terminalManifest.server_status ?? status,
       process_status: terminalManifest.process_status ?? status,
       case_status: terminalManifest.case_status ?? status,
+      ...(status === "success"
+        ? { case_completed_at: terminalManifest.case_completed_at ?? terminal.close?.closed_at }
+        : {}),
+      collection_mode: terminalManifest.collection_mode ?? "passive_sidecar",
+      behavior_impact: terminalManifest.behavior_impact ?? "none",
+      subject_revision: terminalManifest.subject_revision ?? runData.subject_revision,
+      input: terminalManifest.input ?? runData.input,
+      environment: terminalManifest.environment ?? runData.environment,
+      token_usage: terminalManifest.token_usage ?? {},
+      result: publicResult,
+      ...(terminalManifest.error === undefined ? {} : { error: terminalManifest.error }),
+      ...(typeof closeResult?.signal === "string"
+        ? {
+            server_shutdown_reason: "process_signal",
+            shutdown_signal: closeResult.signal,
+            shutdown_disposition: "interrupted_before_case_completion",
+          }
+        : { shutdown_disposition: terminalManifest.shutdown_disposition ?? "normal_case_completion" }),
+      ...(previousTerminal?.envelope?.manifest
+        ? {
+            previous_terminal: {
+              ...previousTerminal.envelope.manifest,
+              run_id: previousTerminal.identities.runID,
+            },
+          }
+        : {}),
       ...((session?.session_id ?? terminal.close?.manifest.session_id)
         ? { session_id: session?.session_id ?? terminal.close?.manifest.session_id }
         : {}),
       ...(session
         ? {
             session_generation: session.generation,
-            segments: session.segments,
+            segments: effectiveSegments,
             segment_summary: {
-              count: session.segments.length,
-              completed: session.segments.filter((segment) => segment.status === "completed").length,
-              failed: session.segments.filter((segment) => segment.status === "failed").length,
-              cancelled: session.segments.filter((segment) => segment.status === "cancelled").length,
-              interrupted_unfinalized: session.segments.filter(
+              count: effectiveSegments!.length,
+              completed: effectiveSegments!.filter((segment) => segment.status === "completed").length,
+              failed: effectiveSegments!.filter((segment) => segment.status === "failed").length,
+              cancelled: effectiveSegments!.filter((segment) => segment.status === "cancelled").length,
+              interrupted_unfinalized: effectiveSegments!.filter(
                 (segment) => segment.status === "interrupted_unfinalized",
               ).length,
-              running: session.segments.filter((segment) => segment.status === "running").length,
+              running: effectiveSegments!.filter((segment) => segment.status === "running").length,
             },
           }
         : {}),
@@ -2149,41 +2603,53 @@ function materializeTraceSnapshot(input: {
       },
       ...(completeness === "complete"
         ? {}
-        : historicalInterruptions
-          ? {
-              historical_interruptions: true,
-              session_recovery: {
-                status: "incomplete_segment_history",
-                dropped_lines: droppedLines,
-                segments: replays
-                  .filter((replay) => replay.droppedLines > 0 || !replay.close)
-                  .map((replay) => ({
-                    run_id: replay.identities.runID,
-                    path: path.relative(caseDir, replay.source.recordsFile),
-                    dropped_lines: replay.droppedLines,
-                    status: replay.close ? "recovered" : "interrupted_unfinalized",
-                  })),
-              },
-            }
-          : {
-              recovery_status: "incomplete_journal_replay",
-              ...(terminalManifest.recovery_status === undefined
-                ? {}
-                : { source_recovery_status: terminalManifest.recovery_status }),
-              ...(terminalManifest.recovery === undefined ? {} : { source_recovery: terminalManifest.recovery }),
-              recovery: {
-                dropped_lines: droppedLines,
-                segments: replays
-                  .filter((replay) => replay.droppedLines > 0 || !replay.close)
-                  .map((replay) => ({
-                    run_id: replay.identities.runID,
-                    path: path.relative(caseDir, replay.source.recordsFile),
-                    dropped_lines: replay.droppedLines,
-                    status: replay.close ? "recovered" : "interrupted_unfinalized",
-                  })),
-              },
-            }),
+        : {
+            recovery_status: "incomplete_journal_replay",
+            ...(terminalManifest.recovery_status === undefined
+              ? {}
+              : { source_recovery_status: terminalManifest.recovery_status }),
+            ...(terminalManifest.recovery === undefined ? {} : { source_recovery: terminalManifest.recovery }),
+            recovery: {
+              dropped_lines: droppedLines,
+              segments: replays
+                .filter((replay) => replay.droppedLines > 0 || !replay.close)
+                .map((replay) => ({
+                  run_id: replay.identities.runID,
+                  path: path.relative(caseDir, replay.source.recordsFile),
+                  dropped_lines: replay.droppedLines,
+                  status: replay.close ? "recovered" : "interrupted_unfinalized",
+                })),
+            },
+            ...(historicalInterruptions
+              ? {
+                  historical_interruptions: true,
+                  session_recovery: {
+                    status: "incomplete_segment_history",
+                    dropped_lines: droppedLines,
+                    segments: replays
+                      .filter((replay) => replay.droppedLines > 0 || !replay.close)
+                      .map((replay) => ({
+                        run_id: replay.identities.runID,
+                        path: path.relative(caseDir, replay.source.recordsFile),
+                        dropped_lines: replay.droppedLines,
+                        status: replay.close ? "recovered" : "interrupted_unfinalized",
+                      })),
+                  },
+                }
+              : {}),
+          }),
     }
+    if (terminal.terminalOperation === "case.runtime_closed" && terminal.close) {
+      index.enrichRuntimeTerminal({
+        segmentKey: terminal.source.key,
+        status,
+        closedAt: terminal.close.closed_at,
+        ...(record(terminal.close.result) ? { result: record(terminal.close.result)! } : {}),
+        ...(terminal.close.error === undefined ? {} : { error: terminal.close.error }),
+      })
+    }
+    index.reconcileDiagnostics()
+    memoryPhase("diagnostics_complete", journalBytes)
     const metrics = aggregateMetrics(replays, index, terminal.identities.runID, namespace)
     const poisoned = replays.some(
       (replay) =>
@@ -2241,6 +2707,8 @@ function materializeTraceSnapshot(input: {
         path.join(outputDir, "artifacts"),
         input.copyArtifacts === true,
       )
+    } else {
+      writeStreamingJsonObjectAtomic(legacyFile, legacyMembers(index, manifest, metrics))
     }
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
   } finally {

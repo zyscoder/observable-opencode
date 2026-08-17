@@ -52,7 +52,9 @@ describe("tui thread", () => {
 
     expect(resolveTuiWorkerShutdownTimeout(env)).toBe(5_000)
     expect(resolveTuiWorkerTraceCloseTimeout(env)).toBe(10)
-    await expect(waitForTuiWorkerTraceClose(Bun.sleep(100), env)).rejects.toThrow("TUI worker trace close timed out after 10ms")
+    await expect(waitForTuiWorkerTraceClose(Bun.sleep(100), env)).rejects.toThrow(
+      "TUI worker trace close timed out after 10ms",
+    )
   })
 
   test("closes and terminates the worker before materializing and publishing traces for normal and Ctrl-C exits", async () => {
@@ -64,15 +66,16 @@ describe("tui thread", () => {
       traceFile: "/tmp/case/trace.json",
     }
 
-    for (const exit of ["normal", "ctrl-c"]) {
+    for (const exit of ["normal", "ctrl-c"] as const) {
       const calls: string[] = []
       await finalizeTuiWorker({
+        ...(exit === "ctrl-c" ? { signal: "SIGINT" as const } : {}),
         shutdown: async () => {
           calls.push(`${exit}:close`)
           return {}
         },
-        closeTraces: async () => {
-          calls.push(`${exit}:journal-close`)
+        closeTraces: async (input) => {
+          calls.push(`${exit}:journal-close:${input?.signal ?? "none"}`)
           return { requests: [request] }
         },
         terminate: () => {
@@ -89,7 +92,7 @@ describe("tui thread", () => {
 
       expect(calls).toEqual([
         `${exit}:close`,
-        `${exit}:journal-close`,
+        `${exit}:journal-close:${exit === "ctrl-c" ? "SIGINT" : "none"}`,
         `${exit}:terminate`,
         `${exit}:materialize:1`,
         `${exit}:publish`,

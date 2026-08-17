@@ -70,8 +70,9 @@ export function waitForTuiWorkerTraceClose<T>(
 }
 
 export async function finalizeTuiWorker(input: {
+  signal?: NodeJS.Signals
   shutdown: () => Promise<{ failure?: string }>
-  closeTraces: () => Promise<WorkerTraceCloseResult>
+  closeTraces: (input?: { signal?: NodeJS.Signals }) => Promise<WorkerTraceCloseResult>
   terminate: () => unknown
   materialize?: typeof materializeWorkerTraces
   publish?: typeof reportTracePublication
@@ -87,7 +88,10 @@ export async function finalizeTuiWorker(input: {
     return undefined
   })
   const trace: WorkerTraceCloseResult = shutdown
-    ? await waitForTuiWorkerTraceClose(input.closeTraces(), input.env).catch((error) => {
+    ? await waitForTuiWorkerTraceClose(
+        input.signal ? input.closeTraces({ signal: input.signal }) : input.closeTraces(),
+        input.env,
+      ).catch((error) => {
         try {
           input.onShutdownFailure?.(error)
         } catch {}
@@ -99,11 +103,13 @@ export async function finalizeTuiWorker(input: {
       input.onShutdownFailure?.(new Error(trace.failure))
     } catch {}
   }
-  await Promise.resolve().then(input.terminate).catch((error) => {
-    try {
-      input.onTerminateFailure?.(error)
-    } catch {}
-  })
+  await Promise.resolve()
+    .then(input.terminate)
+    .catch((error) => {
+      try {
+        input.onTerminateFailure?.(error)
+      } catch {}
+    })
   try {
     const publications = await (input.materialize ?? materializeWorkerTraces)(trace.requests)
     const publish = input.publish ?? reportTracePublication
@@ -270,8 +276,16 @@ export const TuiThreadCommand = cmd({
         process.off("unhandledRejection", error)
         process.off("SIGUSR2", reload)
         await finalizeTuiWorker({
+          signal:
+            process.exitCode === 130
+              ? "SIGINT"
+              : process.exitCode === 143
+                ? "SIGTERM"
+                : process.exitCode === 129
+                  ? "SIGHUP"
+                  : undefined,
           shutdown: async () => await client.call("shutdown", undefined),
-          closeTraces: async () => await client.call("closeTraces", undefined),
+          closeTraces: async (input) => await client.call("closeTraces", input),
           terminate: () => worker.terminate(),
           materialize: (requests) =>
             materializeWorkerTraces(requests, {

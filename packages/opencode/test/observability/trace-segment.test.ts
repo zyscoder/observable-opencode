@@ -1085,6 +1085,96 @@ test("runtime close returns the logical root while retaining the physical segmen
   }
 })
 
+test("an uncommitted runtime close leaves the segment interrupted instead of advertising completion", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-uncommitted-close-"))
+  const script = path.join(traceRoot, "runtime-close-failure.ts")
+  try {
+    await fs.writeFile(
+      script,
+      [
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `const trace = CaseTrace.configure({ caseID: "uncommitted-close-case" }) as any`,
+        `const durableAppend = trace.writeCausalIRRecord.bind(trace)`,
+        `trace.writeCausalIRRecord = (entry: any) => entry.operation === "case.runtime_closed" ? false : durableAppend(entry)`,
+        `const request = CaseTrace.closeAll({ status: "success" })[0]`,
+        `process.stdout.write(JSON.stringify(request))`,
+      ].join("\n"),
+    )
+    const child = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: traceRoot,
+        OPENCODE_CASE_TRACE_QUIET: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await child.exited).toBe(0)
+    const request = JSON.parse(await new Response(child.stdout).text()) as any
+    expect(await new Response(child.stderr).text()).toBe("")
+    const session = JSON.parse(await fs.readFile(path.join(request.caseDir, "session.json"), "utf8")) as any
+    const journal = await fs.readFile(request.recordsFile, "utf8")
+
+    expect(session.segments).toMatchObject([{ status: "running" }])
+    expect(journal).not.toContain('"operation":"case.runtime_closed"')
+    const materialized = materializeTrace({ caseDir: request.caseDir })
+    const trace = JSON.parse(await fs.readFile(materialized.traceFile, "utf8")) as any
+    expect(materialized.completeness).toBe("incomplete")
+    expect(trace.manifest).toMatchObject({ status: "error", recovery_status: "incomplete_journal_replay" })
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("terminal fsync failure leaves runtime status unpublished and materialization reconciles journal authority", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-terminal-fsync-"))
+  const script = path.join(traceRoot, "terminal-fsync-failure.ts")
+  try {
+    await fs.writeFile(
+      script,
+      [
+        `import fs from "node:fs"`,
+        `import { CaseTrace } from ${JSON.stringify(traceModule)}`,
+        `CaseTrace.configure({ caseID: "terminal-fsync-case" })`,
+        `const durableFsync = fs.fsyncSync`,
+        `fs.fsyncSync = () => { throw new Error("injected terminal fsync failure") }`,
+        `const request = CaseTrace.closeAll({ status: "success", result: { answer: "durable" } })[0]`,
+        `fs.fsyncSync = durableFsync`,
+        `process.stdout.write(JSON.stringify(request))`,
+      ].join("\n"),
+    )
+    const child = Bun.spawn([process.execPath, script], {
+      cwd: packageDir,
+      env: {
+        ...process.env,
+        OPENCODE_CASE_TRACE: "1",
+        OPENCODE_CASE_TRACE_DIR: traceRoot,
+        OPENCODE_CASE_TRACE_QUIET: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(await child.exited).toBe(0)
+    const request = JSON.parse(await new Response(child.stdout).text()) as any
+    expect(await new Response(child.stderr).text()).toBe("")
+    const before = JSON.parse(await fs.readFile(path.join(request.caseDir, "session.json"), "utf8")) as any
+    expect(before.segments).toMatchObject([{ status: "running" }])
+    expect(await fs.readFile(request.recordsFile, "utf8")).toContain('"operation":"case.runtime_closed"')
+
+    const materialized = materializeTrace({ caseDir: request.caseDir })
+    const trace = JSON.parse(await fs.readFile(materialized.traceFile, "utf8")) as any
+    expect(trace.manifest).toMatchObject({
+      status: "success",
+      segments: [expect.objectContaining({ status: "completed" })],
+      segment_summary: { completed: 1, running: 0 },
+    })
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
 async function writeClosedSegment(
   segment: ReturnType<typeof openTraceSegment>,
   input: {
@@ -1468,9 +1558,11 @@ test("materializes two colliding segments as one scoped trace with continuation 
         { run_id: "run_second", status: "completed", continuation_of: "run_first" },
       ],
     })
-    expect(trace.nodes).toHaveLength(4)
-    expect(new Set(trace.nodes.map((node: any) => node.node_id)).size).toBe(4)
-    expect(new Set(trace.nodes.map((node: any) => node.scope.run_id))).toEqual(new Set(["run_first", "run_second"]))
+    const replayedNodes = trace.nodes.filter((node: any) => node.kind !== "case.completed")
+    expect(replayedNodes).toHaveLength(4)
+    expect(new Set(replayedNodes.map((node: any) => node.node_id)).size).toBe(4)
+    expect(new Set(replayedNodes.map((node: any) => node.scope.run_id))).toEqual(new Set(["run_first", "run_second"]))
+    expect(trace.nodes.at(-1)).toMatchObject({ kind: "case.completed", scope: { run_id: "run_second" } })
 
     const localEdges = trace.edges.filter((edge: any) => edge.metadata?.provenance_type !== "run.continuation")
     expect(localEdges).toHaveLength(2)
@@ -1551,7 +1643,7 @@ async function writeUnclosedSegment(
   )
 }
 
-test("uses one newest valid terminal segment despite historical and later interruptions", async () => {
+test("latest interrupted segment controls top-level status while preserving the prior terminal result", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-terminal-selection-"))
   try {
     const first = openTraceSegment({
@@ -1607,18 +1699,23 @@ test("uses one newest valid terminal segment despite historical and later interr
     const legacy = JSON.parse(await fs.readFile(path.join(first.logicalRoot, "legacy-trace.json"), "utf8")) as any
     expect(result.completeness).toBe("incomplete")
     expect(trace.manifest).toMatchObject({
-      run_id: "run_terminal_success",
-      status: "success",
-      server_status: "success",
-      process_status: "success",
-      case_status: "success",
-      result: { marker: "terminal result" },
-      recovery_status: "terminal_recovery_preserved",
-      recovery: { source: "terminal" },
+      run_id: "run_interrupted_after",
+      status: "error",
+      server_status: "error",
+      process_status: "error",
+      case_status: "error",
+      recovery_status: "incomplete_journal_replay",
+      previous_terminal: {
+        run_id: "run_terminal_success",
+        status: "success",
+        result: { marker: "terminal result" },
+        recovery_status: "terminal_recovery_preserved",
+        recovery: { source: "terminal" },
+      },
       historical_interruptions: true,
       segment_summary: { interrupted_unfinalized: 1, running: 1 },
     })
-    expect(legacy).toMatchObject({ run_id: "run_terminal_success", marker: "terminal" })
+    expect(legacy).toMatchObject({ run_id: "run_interrupted_after", status: "error" })
   } finally {
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
@@ -1739,9 +1836,10 @@ function expectValidScopedGraph(trace: any) {
   }
   const visit = (value: unknown) => {
     if (typeof value === "string") {
-      const scoped = /^(node|record|design|claim|context|response|response_segment|tool_call|skill|mcp_call|evidence|verification|change|observation|span):(.+::node::.+)$/.exec(
-        value,
-      )
+      const scoped =
+        /^(node|record|design|claim|context|response|response_segment|tool_call|skill|mcp_call|evidence|verification|change|observation|span):(.+::node::.+)$/.exec(
+          value,
+        )
       if (scoped) expect(nodes.has(scoped[2]!)).toBe(true)
       const artifact = /^artifact:(.+::artifact::.+)$/.exec(value)
       if (artifact) expect(artifacts.has(artifact[1]!)).toBe(true)

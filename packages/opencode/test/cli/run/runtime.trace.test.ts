@@ -52,7 +52,10 @@ test("does not finalize the old root when replacement creation fails", async () 
         throw new Error("create failed")
       },
       trace: {
-        finishSession: (sessionID) => finished.push(sessionID),
+        closeSession: (sessionID) => {
+          finished.push(sessionID)
+          return []
+        },
       },
     }),
   ).rejects.toThrow("create failed")
@@ -72,7 +75,10 @@ test("finalizes the old root only after the replacement is prepared for switchin
       order.push("prepare")
     },
     trace: {
-      finishSession: () => order.push("finish"),
+      closeSession: () => {
+        order.push("finish")
+        return []
+      },
     },
   })
 
@@ -84,8 +90,11 @@ test("does not propagate the active root failure into process fallback result", 
   finishRunTraces(
     { sessionID: "ses_b", failure: new Error("B failed") },
     {
-      finishSession: () => {},
-      finishAll: (input) => all.push(input),
+      closeSession: () => [],
+      closeAll: (input) => {
+        all.push(input)
+        return []
+      },
     },
   )
 
@@ -106,8 +115,11 @@ test("finalizes the process trace as error when startup fails before a session e
   finishRunTraces(
     { failure },
     {
-      finishSession: () => {},
-      finishAll: (input) => all.push(input),
+      closeSession: () => [],
+      closeAll: (input) => {
+        all.push(input)
+        return []
+      },
     },
   )
 
@@ -130,8 +142,8 @@ test("closes and finalizes a failed startup trace before preserving exit code on
         failure: unknown
         closeRunSpan: (failure?: unknown, exitCode?: number) => void
         trace?: {
-          finishSession: (sessionID: string, input?: Record<string, unknown>) => void
-          finishAll: (input?: Record<string, unknown>) => void
+          closeSession: (sessionID: string, input?: Record<string, unknown>) => unknown[]
+          closeAll: (input?: Record<string, unknown>) => unknown[]
         }
         exit: (code: number) => never
       }) => never
@@ -152,10 +164,11 @@ test("closes and finalizes a failed startup trace before preserving exit code on
         order.push("close")
       },
       trace: {
-        finishSession: () => {},
-        finishAll: (input) => {
+        closeSession: () => [],
+        closeAll: (input) => {
           const result = input?.result as Record<string, unknown> | undefined
           order.push(`finish:${input?.status}:${result?.exit_code}`)
+          return []
         },
       },
       exit: (code) => {
@@ -231,10 +244,14 @@ test("finalizes a replaced interactive root independently from a later failed ro
   const finished: Array<{ sessionID: string; input: Record<string, unknown> | undefined }> = []
   const all: Array<Record<string, unknown> | undefined> = []
   const trace = {
-    finishSession: (sessionID: string, input?: Record<string, unknown>) => {
+    closeSession: (sessionID: string, input?: Record<string, unknown>) => {
       finished.push({ sessionID, input })
+      return []
     },
-    finishAll: (input?: Record<string, unknown>) => all.push(input),
+    closeAll: (input?: Record<string, unknown>) => {
+      all.push(input)
+      return []
+    },
   }
 
   finishReplacedTraceSession("ses_a", undefined, trace)
@@ -312,8 +329,8 @@ test("closes the outer run span before interactive trace finalization preserves 
   const traces = await Promise.all(
     (await fs.readdir(dir, { withFileTypes: true }))
       .filter((entry) => entry.isDirectory())
-      .map(async (entry) =>
-        JSON.parse(await fs.readFile(path.join(dir, entry.name, "legacy-trace.json"), "utf8")) as any,
+      .map(
+        async (entry) => JSON.parse(await fs.readFile(path.join(dir, entry.name, "legacy-trace.json"), "utf8")) as any,
       ),
   )
   const trace = traces.find((item) => item.session_id === "ses_final")

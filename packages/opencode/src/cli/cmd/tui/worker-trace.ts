@@ -7,26 +7,35 @@ export type WorkerTraceCloseResult = {
   failure?: string
 }
 
-export async function finalizeWorkerTraces(input: {
-  failure?: unknown
-  trace?: WorkerTraceFinalizer
-} = {}): Promise<WorkerTraceCloseResult> {
+export async function finalizeWorkerTraces(
+  input: {
+    failure?: unknown
+    signal?: NodeJS.Signals
+    trace?: WorkerTraceFinalizer
+  } = {},
+): Promise<WorkerTraceCloseResult> {
   const trace = input.trace ?? CaseTrace
   try {
     const requests = trace.closeAll({
-      status: input.failure ? "error" : "success",
-      error: input.failure,
-      result: { reason: "worker.shutdown" },
+      status: input.signal ? "cancelled" : input.failure ? "error" : "success",
+      ...(input.failure ? { error: input.failure } : {}),
+      result: input.signal
+        ? { reason: input.signal, signal: input.signal, trace_flush: "process_signal" }
+        : { reason: "worker.shutdown" },
     })
     return {
       requests,
-      ...(input.failure ? { failure: input.failure instanceof Error ? input.failure.message : String(input.failure) } : {}),
+      ...(input.failure
+        ? { failure: input.failure instanceof Error ? input.failure.message : String(input.failure) }
+        : {}),
     }
   } catch {
     // Trace persistence is diagnostic only and must not affect worker shutdown.
     return {
       requests: [],
-      ...(input.failure ? { failure: input.failure instanceof Error ? input.failure.message : String(input.failure) } : {}),
+      ...(input.failure
+        ? { failure: input.failure instanceof Error ? input.failure.message : String(input.failure) }
+        : {}),
     }
   }
 }
