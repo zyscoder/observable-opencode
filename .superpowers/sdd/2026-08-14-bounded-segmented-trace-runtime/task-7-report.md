@@ -314,3 +314,151 @@ fixture environment type was corrected. The exact remaining classes/locations ar
 - Confirmed README does not claim that `SIGKILL` performs immediate finalization.
 - Confirmed legacy journals and prior segment evidence are hashed before and after recovery.
 - Confirmed the complete diff passes `git diff --check` before commit.
+
+## Fix Round 1/5 Completion
+
+Fix Round 1 replaces the manual TUI and Agent substitutes with production subprocess
+coverage. Checkpoints are `ad8b4cbe2` (production TUI and Agent), `7412b3976` (passive
+equivalence and actual runners), and `9378ada4c` (runtime-recovery separation and cleanup).
+
+### RED Evidence
+
+- `bun test test/observability/production-agent-e2e.test.ts --timeout 1200000` reached the
+  real CLI but stalled after `ProviderModelNotFoundError`; the subprocess inherited the
+  checkout `PWD` despite its temporary `cwd`. After using production `--dir`, successive
+  RED results exposed whole-history workflow matching, inherited `OPENCODE_DB=:memory:`,
+  resume misclassification, and the real four-row compaction persistence contract.
+- `bun test test/tool/semantic-observability.test.ts --timeout 1200000 -t "production Agent behavior"`
+  initially failed before comparison, then reported the persisted write title's slashless
+  temporary path as the only enabled/disabled difference.
+- `bun test test/observability/stress-cases/stress-cases.test.mjs --timeout 1200000 -t "actual production case"`
+  failed **0 pass, 1 fail** with HTTP `500 ProviderModelNotFoundError` because the runner
+  hardcoded provider `deepseek`.
+- `bun test test/observability/benchmark-cases/featurebench-cases.test.mjs --timeout 1200000 -t "actual production case"`
+  failed **0 pass, 1 fail** first on `unknown argument: --manifest`, then on
+  `unknown argument: --skip-docker`, then on the hardcoded provider.
+- `bun test test/observability/case-trace.test.ts --timeout 1200000 -t "persists semantic trace records with artifacts and redaction"`
+  failed **0 pass, 1 fail** because artifact zero was `run.start.environment`.
+- `bun typecheck` reported Task-owned `TS2345` in
+  `fixture/task-7-production-harness.ts:329` and `TS2769` in
+  `trace-segment.test.ts:1011`, in addition to the environmental baseline errors.
+
+### GREEN Evidence
+
+```text
+bun test test/cli/tui/process-trace-e2e.test.ts \
+  test/observability/production-agent-e2e.test.ts --timeout 1200000
+```
+
+Observed: **2 pass, 0 fail, 44 expectations**. The TUI uses the production CLI in a PTY for
+normal EOF, `SIGINT`, and `SIGTERM`; the Agent uses production `opencode run`, persisted
+SQLite rows, a loopback model, local MCP, temporary Skill, and the production subagent.
+
+```text
+bun test test/tool/semantic-observability.test.ts \
+  test/observability/stress-cases/stress-cases.test.mjs \
+  test/observability/benchmark-cases/featurebench-cases.test.mjs \
+  --timeout 1200000 -t production
+```
+
+Observed: **3 pass, 0 fail**. Passive equivalence compares real model requests, persisted
+sessions/messages/parts, Tool calls, output hashes, stdout, non-trace stderr, and exit code.
+Stress runs a canonical case through its CLI. FeatureBench clones and seals a temporary
+local git repo, runs its CLI, and records Docker as disabled without probing it.
+
+```text
+bun test test/observability/task-7-e2e.test.ts --timeout 120000
+```
+
+Observed: **2 pass, 0 fail, 26 expectations** for real `SIGKILL` durability,
+failed-materialization retry, and legacy flat recovery. This low-level runtime fixture no
+longer emits Tool, Skill, MCP, Subagent, compaction, lifecycle, or response records.
+
+```text
+bun test test/observability/case-trace.test.ts --timeout 1200000 \
+  -t "persists semantic trace records with artifacts and redaction"
+bun test test/observability/trace-segment.test.ts --timeout 120000 \
+  -t "failed atomic manifest publication"
+```
+
+Observed: **1 pass, 0 fail** for each command. The semantic artifact is selected through
+the context snapshot's `artifact_id`; the publication assertion now supplies a definite
+string to Bun's typed matcher.
+
+### Final Verification
+
+```text
+bun test test/cli/tui/process-trace-e2e.test.ts \
+  test/cli/tui/thread.test.ts test/cli/tui/worker-trace.test.ts \
+  test/cli/tui/trace-materializer-process.test.ts \
+  test/observability/production-agent-e2e.test.ts \
+  test/observability/task-7-e2e.test.ts \
+  test/tool/semantic-observability.test.ts \
+  test/observability/stress-cases/stress-cases.test.mjs \
+  test/observability/benchmark-cases/featurebench-cases.test.mjs \
+  --timeout 1200000
+```
+
+Observed: **47 pass, 0 fail, 136 expectations**. This includes each runner's actual
+production case; no fabricated trace is used by runner acceptance.
+
+```text
+bun test test/observability/causal-ir.test.ts \
+  test/observability/causal-ir-runtime-store.test.ts \
+  test/observability/case-trace-session.test.ts \
+  test/observability/streaming-json-writer.test.ts \
+  test/observability/trace-segment.test.ts \
+  test/observability/trace-materializer.test.ts \
+  test/observability/trace-materializer-diagnostics.test.ts \
+  test/observability/trace-publication.test.ts \
+  test/cli/trace-finalize.test.ts --timeout 1200000
+```
+
+Observed: **141 pass, 0 fail, 1,092 expectations**.
+
+```text
+bun test test/observability/case-trace-runtime.test.ts --timeout 120000
+bun test test/observability/case-trace.test.ts --timeout 1200000
+```
+
+Observed: runtime **28 pass, 0 fail, 7,334 expectations**; full CaseTrace **163 pass,
+0 fail, 2,137 expectations**. The prior order-dependent CaseTrace exclusion is closed.
+
+```text
+cd packages/trace-renderer
+bun test test/load.test.ts test/cli.test.ts test/html.test.ts test/viewer.test.ts \
+  --timeout 120000
+bun typecheck
+```
+
+Observed: renderer **62 pass, 0 fail, 362 expectations**; typecheck exit `0`.
+
+```text
+cd packages/opencode
+bun typecheck
+```
+
+Observed at HEAD: exit `2` with **22 environmental diagnostics** in the same sidebar,
+duplicate SDK client, plugin slot, unresolved plugin dependency, and `semver` declaration
+classes recorded above. No Task 7 file appears.
+
+Base comparison used `git archive 7521658c333d12b26ea0713d53ca230b8d8e7ee9` in a
+temporary directory, linked the identical root and package-local installed dependencies,
+and ran the same `bun typecheck` command. Base exits `2` with the same 22 environmental
+diagnostics plus the Task-owned `trace-segment.test.ts:1011` `TS2769`. HEAD removes that
+diagnostic and adds none. The temporary archive and dependency links were removed and
+their absence verified.
+
+```text
+bun test test/observability/case-trace-memory.test.ts --timeout 120000
+bun test test/observability/trace-materializer-memory.test.ts --timeout 600000
+```
+
+Observed: both **1 pass, 0 fail**. Runtime RSS was
+`{"warmRSS":449970176,"finalRSS":461029376,"growthRSS":11059200}` against the
+128 MiB growth limit. The 1,073,873,543-byte sparse journal reported
+`{"materializerMaxRSS":255016960,"finalMaxRSS":255016960,"maxRSS":255016960}`
+against the 256 MiB peak limit, including renderer load.
+
+No live external API, paid model, Docker command, or Docker availability probe ran in this
+round. `git diff --check` final result: **pass** (exit `0`, no output).
