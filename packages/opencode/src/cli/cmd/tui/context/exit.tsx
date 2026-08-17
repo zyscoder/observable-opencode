@@ -33,6 +33,7 @@ export const { use: useExit, provider: ExitProvider } = createSimpleContext({
       (reason?: unknown) => {
         if (task) return task
         task = (async () => {
+          disposeSignals()
           await input.onBeforeExit?.()
           // Reset window title before destroying renderer
           renderer.setTerminalTitle("")
@@ -54,7 +55,22 @@ export const { use: useExit, provider: ExitProvider } = createSimpleContext({
         message: store,
       },
     )
-    process.on("SIGHUP", () => exit())
+    const signals = [
+      ["SIGHUP", 129],
+      ["SIGINT", 130],
+      ["SIGTERM", 143],
+    ] as const
+    const handlers = signals.map(([signal, exitCode]) => {
+      const handler = () => {
+        process.exitCode = exitCode
+        void exit()
+      }
+      process.once(signal, handler)
+      return [signal, handler] as const
+    })
+    const disposeSignals = () => {
+      for (const [signal, handler] of handlers) process.off(signal, handler)
+    }
     return exit
   },
 })
