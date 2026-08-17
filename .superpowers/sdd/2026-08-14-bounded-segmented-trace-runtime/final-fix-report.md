@@ -276,3 +276,52 @@ GREEN evidence:
 - The helper now accepts the existing strict `CausalIRJournalEntry[]` schema rather than weakening or casting around the journal contract.
 - `bun run typecheck` in `packages/opencode`: exit 2 with exactly the established 22-diagnostic baseline; no touched observability, runtime, or test file remains in the output.
 - `bun test test/observability/case-trace.test.ts --test-name-pattern "persists semantic trace records|finalizes canonical partial and trace when" --timeout 120000`: 3 pass, 0 fail, 139 expectations in 1.78 s.
+
+## Final Commit Mapping
+
+- `abc76df37` covers Critical 1 and 5 plus Important 1, 2, and 4: journal-only production close, signal cancellation, terminal commit/durability, disk-backed terminal/legacy materialization, and latest-segment status authority.
+- `a1ef64f20` covers Critical 2: bounded runtime compatibility collections and registry ownership with monotonic IDs and cold SQLite semantics.
+- `f3ed67f9c` covers Critical 3: durable empty-journal initialization and zero-line interrupted recovery at the first-entry crash boundary.
+- `9b4b1c1b5` covers Critical 4: SQLite-backed namespace predeclaration and bounded alias/entity lookup.
+- `c242bcc5a` covers Important 3 and 5 plus Minor 1 and 2: short renderer lock scope with generation recheck, realpath/no-follow containment, bounded generation retention, and corrected timeout documentation.
+- `3409069f1` and `6d50ef0b6` complete Critical 1 and Important 4 integration: materialized spans, exact legacy semantic edges, verification/constraint/context compatibility, artifact reachability, and journal-only terminal parity.
+- `efd942acc` aligns segmented compatibility assertions with immutable journal/artifact authority without changing production schema or path checks.
+- `fa069af80` restores production-shaped process-scope ownership in the real interactive run fixture.
+- `f77d66067` removes the branch-local type diagnostic and restores the exact typecheck baseline.
+
+## Final Verification
+
+Core, compatibility, durability, and security:
+
+- `bun test test/observability/case-trace.test.ts test/observability/case-trace-runtime.test.ts test/observability/case-trace-session.test.ts test/observability/case-trace-memory.test.ts test/observability/case-trace-terminal-memory.test.ts --timeout 120000`: 221 pass, 0 fail, 9,652 expectations in 100.96 s. Terminal close RSS moved from 618,397,696 to 609,599,488 bytes, a -8,798,208-byte (-8.39 MiB) delta.
+- `bun test test/observability/causal-ir.test.ts test/observability/causal-ir-runtime-store.test.ts test/observability/claim-atomization.test.ts test/observability/streaming-json-writer.test.ts test/observability/trace-publication.test.ts test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts test/observability/trace-segment.test.ts test/observability/trace-terminal-equivalence.test.ts --timeout 1200000`: 159 pass, 0 fail, 1,227 expectations in 11.53 s.
+- `bun test test/observability/trace-segment.test.ts test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts test/observability/trace-terminal-equivalence.test.ts --timeout 120000`: 47 pass, 0 fail, 799 expectations in 9.53 s. This includes first-entry crash, latest-interrupted status, terminal append/fsync durability, legacy projection, allocation/publication concurrency, symlink attacks, and rollback/current generation retention.
+- `bun test test/observability/task-7-e2e.test.ts --timeout 120000`: 2 pass, 0 fail, 26 expectations in 4.25 s for SIGKILL durable-byte preservation, failed-materialization retry, and legacy-flat recovery.
+- `bun test --timeout 120000` in `packages/trace-renderer`: 64 pass, 0 fail, 368 expectations in 8.67 s across load, CLI, HTML, viewer, renderer/allocation generation retry, symlink rejection, artifact identity, and compiled command execution.
+
+Production entrypoints and semantic equivalence:
+
+- `bun test test/cli/tui/worker-trace.test.ts test/cli/tui/thread.test.ts test/cli/tui/trace-materializer-process.test.ts test/cli/run/runtime.trace.test.ts test/cli/serve-command.test.ts test/cli/trace-finalize.test.ts --timeout 120000`: 27 pass, 0 fail, 93 expectations in 11.57 s. The suite covers run/serve/TUI journal-only shutdown, SIGINT/SIGTERM/SIGHUP cancellation mapping, worker/materializer ordering, startup and transport failures, replacement roots, process ownership, and standalone finalization.
+- `bun test test/observability/trace-terminal-equivalence.test.ts`: journal-only close plus disk materialization is semantically equivalent to deterministic full finish, including stable journal entities, audited terminal enrichment, manifests, constraints, legacy spans, and compatibility projections.
+- `bun test test/tool/semantic-observability.test.ts --test-name-pattern "classifies shell commands|does not treat a pipeline|detects an actual repository mutation" --timeout 120000`: 3 pass, 0 fail, 17 expectations in 0.81 s.
+- Exact production E2E command `bun test test/cli/tui/process-trace-e2e.test.ts test/observability/production-agent-e2e.test.ts test/observability/trace-terminal-equivalence.test.ts --timeout 1200000`: terminal semantic equivalence passed; production Agent and TUI cases failed before product startup because the managed sandbox returned synthetic `EADDRINUSE` for `listen(0, "127.0.0.1")`. Checkpoint 1 records the production TUI signal matrix passing outside that network sandbox before the later projection-only integration commits.
+
+Memory acceptance:
+
+- `bun test test/observability/case-trace-mixed-memory.test.ts --timeout 240000`: 2 pass, 0 fail, 40 expectations in 86.78 s. Warm RSS 936,574,976; final RSS 1,017,479,168; post-warm-up growth 80,904,192 bytes (77.16 MiB), below 128 MiB. All seven compatibility ID families reached ordinal 1000; disk materialization preserved evicted records in 6.45 s.
+- `bun test test/observability/trace-materializer-multisegment-memory.test.ts --timeout 600000`: 1 pass, 0 fail, 7 expectations in 27.86 s. Two high-cardinality segments total 1,088,692,372 journal bytes and 62,008 entries; peak RSS 170,246,144 bytes (162.36 MiB), below 256 MiB.
+- `bun test test/observability/trace-materializer-memory.test.ts --timeout 600000`: 1 pass, 0 fail, 5 expectations in 4.64 s. Sparse 1,073,873,543-byte replay plus renderer load peaked at 255,082,496 bytes (243.27 MiB), below 256 MiB.
+
+Stress, FeatureBench, and static verification:
+
+- `node --test test/observability/stress-cases/stress-cases.test.mjs`: 13 pass, 1 loopback-bind `EPERM`; the production runner case was blocked before startup. `node test/observability/stress-cases/run-stress-cases.mjs --dry-run` passed and enumerated all 11 configured cases.
+- `node --test test/observability/benchmark-cases/featurebench-cases.test.mjs`: 12 pass, 2 loopback-bind `EPERM`; the delayed HTTP and actual production runner cases were blocked before startup. Runner finalization wait, signal forwarding, process-group targeting, semantic selection, masking, and sealed-history tests passed.
+- `bun run typecheck` in `packages/trace-renderer`: exit 0.
+- `bun run typecheck` in `packages/opencode`: exit 2 with exactly the established 22 unrelated diagnostics and no touched-file diagnostics.
+- `git diff --check`: pass before every checkpoint and final report commit.
+
+## Concerns
+
+- The managed execution sandbox forbids loopback listeners. Final-code production Agent/TUI HTTP E2E and the production stress/FeatureBench cases were executed but could not pass their fixture setup here; failures are `EADDRINUSE`/`EPERM` at `127.0.0.1` before application code. An unsandboxed rerun request was unavailable after the environment's approval limit was reached.
+- The sparse 1 GiB acceptance is within its hard ceiling with 13,352,960 bytes (12.73 MiB) of headroom, so future SQLite/runtime upgrades should retain this RSS regression test.
+- OpenCode's 22-diagnostic typecheck baseline remains an upstream workspace concern; this branch introduces no additional diagnostics.
