@@ -1917,7 +1917,7 @@ test("detects a legacy terminal journal line larger than four MiB without changi
   }
 })
 
-test("content-addresses compatibility artifacts when a resumed segment reuses a path with different bytes", async () => {
+test("keeps compatibility artifacts distinct when resumed segments reuse a path with different bytes", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-compat-artifact-collision-"))
   try {
     const first = openTraceSegment({
@@ -1949,10 +1949,13 @@ test("content-addresses compatibility artifacts when a resumed segment reuses a 
     })
     materializeTrace({ caseDir: first.logicalRoot })
     const legacy = JSON.parse(await fs.readFile(path.join(first.logicalRoot, "legacy-trace.json"), "utf8")) as any
-    const projectedPath = legacy.artifacts[0].path as string
-    expect(projectedPath).not.toBe("artifacts/fact.txt")
-    expect(projectedPath).toStartWith("artifacts/sha256/")
-    expect(await fs.readFile(path.join(first.logicalRoot, projectedPath), "utf8")).toBe("second artifact")
+    const firstArtifact = legacy.artifacts.find((artifact: any) => artifact.scope?.run_id === "run_artifact_first")
+    const secondArtifact = legacy.artifacts.find((artifact: any) => artifact.scope?.run_id === "run_artifact_second")
+    expect(firstArtifact.path).toBe("segments/run_artifact_first/artifacts/fact.txt")
+    expect(secondArtifact.path).toBe("segments/run_artifact_second/artifacts/fact.txt")
+    expect(firstArtifact.path).not.toBe(secondArtifact.path)
+    expect(await fs.readFile(path.join(first.logicalRoot, firstArtifact.path), "utf8")).toBe("first artifact")
+    expect(await fs.readFile(path.join(first.logicalRoot, secondArtifact.path), "utf8")).toBe("second artifact")
     expect(await fs.readFile(path.join(first.logicalRoot, "artifacts/fact.txt"), "utf8")).toBe("first artifact")
   } finally {
     await fs.rm(traceRoot, { recursive: true, force: true })
@@ -2494,7 +2497,14 @@ test("aggregates rich terminal manifests and metrics across ordered segments", a
     expect(provenance).toMatchObject({ manifest: trace.manifest, metrics: trace.metrics })
     expect(provenance.records).toEqual(trace.records)
     expect(provenance.dataflow_edges).toEqual(trace.dataflow_edges)
-    expect(legacy).toMatchObject({ trace_version: "1.3", run_id: "run_rich_second", marker: "second" })
+    expect(legacy).toMatchObject({
+      trace_version: "1.3",
+      run_id: "run_rich_second",
+      status: "error",
+      result: { second: true },
+      errors: [{ message: "latest failure" }],
+    })
+    expect(legacy.marker).toBeUndefined()
   } finally {
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
@@ -2637,6 +2647,7 @@ test("direct finish materializes and publishes the logical root while runtime st
     const provenance = JSON.parse(await fs.readFile(path.join(logicalRoot, "provenance-trace.json"), "utf8")) as any
     const legacy = JSON.parse(await fs.readFile(path.join(logicalRoot, "legacy-trace.json"), "utf8")) as any
     const segment = JSON.parse(await fs.readFile(path.join(physicalDir, "segment.json"), "utf8")) as any
+    const physicalLegacyBefore = await fs.readFile(path.join(physicalDir, "legacy-trace.json"), "utf8")
     expect(trace.manifest).toMatchObject({
       status: "success",
       case_status: "success",
@@ -2654,9 +2665,8 @@ test("direct finish materializes and publishes the logical root while runtime st
     expect(provenance).toMatchObject({ manifest: trace.manifest, metrics: trace.metrics })
     expect(provenance.records).toEqual(trace.records)
     expect(legacy).toMatchObject({ trace_version: "1.3", run_id: segment.run_id, status: "success" })
-    expect(await fs.readFile(path.join(physicalDir, "legacy-trace.json"), "utf8")).toBe(
-      await fs.readFile(path.join(logicalRoot, "legacy-trace.json"), "utf8"),
-    )
+    materializeTrace({ caseDir: logicalRoot })
+    expect(await fs.readFile(path.join(physicalDir, "legacy-trace.json"), "utf8")).toBe(physicalLegacyBefore)
     for (const runtimeFile of ["records.jsonl", "events.jsonl", "raw-events.jsonl"]) {
       expect(await fileExists(path.join(logicalRoot, runtimeFile))).toBe(false)
       expect(await fileExists(path.join(physicalDir, runtimeFile))).toBe(true)

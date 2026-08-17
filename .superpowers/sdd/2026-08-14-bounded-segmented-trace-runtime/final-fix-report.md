@@ -221,3 +221,25 @@ Disk and semantic evidence:
 - Constraint updates and completed spans use keyed SQLite upserts that preserve first-observation order while replacing only the latest durable state.
 - Canonical node/edge and raw-event scans remain iterator-based. No unbounded runtime collection or full legacy document is reintroduced.
 - Artifact publication merges every immutable segment's content-addressed tree and retains no symlink-following path shortcut.
+
+## Checkpoint 8: Align legacy compatibility tests with immutable journal authority
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Root-cause evidence:
+
+- `bun test test/observability/causal-ir.test.ts test/observability/causal-ir-runtime-store.test.ts test/observability/claim-atomization.test.ts test/observability/streaming-json-writer.test.ts test/observability/trace-publication.test.ts test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts test/observability/trace-segment.test.ts test/observability/trace-terminal-equivalence.test.ts test/tool/semantic-observability.test.ts --timeout 1200000`: 159 pass, 4 fail, 1,232 expectations in 11.78 s.
+- Three failures were stale pre-materializer contracts: they expected the latest physical legacy file to replace the unified disk-backed projection, expected a fixture-only top-level `marker` absent from the legacy 1.3 schema, and expected the replaceable logical-root projection to remain byte-identical to a segment-local projection. The fourth failure was the sandbox's synthetic loopback `EADDRINUSE` at `server.listen(0, "127.0.0.1")`.
+- Durable `records.jsonl` and immutable segment artifacts already contained both colliding artifacts and the latest terminal status. No production path or schema was changed to satisfy obsolete copy-through assumptions.
+
+GREEN evidence:
+
+- `bun test test/observability/trace-segment.test.ts --test-name-pattern "keeps compatibility artifacts distinct|aggregates rich terminal manifests|direct finish materializes" --timeout 120000`: 3 pass, 0 fail, 41 expectations in 1.15 s.
+- `bun test test/observability/trace-segment.test.ts test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts test/observability/trace-terminal-equivalence.test.ts --timeout 120000`: 47 pass, 0 fail, 799 expectations in 9.53 s.
+- Full CaseTrace family command: `bun test test/observability/case-trace.test.ts test/observability/case-trace-runtime.test.ts test/observability/case-trace-session.test.ts test/observability/case-trace-memory.test.ts test/observability/case-trace-terminal-memory.test.ts --timeout 120000`: 221 pass, 0 fail, 9,652 expectations in 100.96 s.
+
+Compatibility and immutability evidence:
+
+- Reused artifact-relative paths remain separately readable at their scoped immutable segment paths; the root compatibility alias retains its original bytes.
+- The unified legacy projection now has explicit assertions for latest terminal status, result, and error instead of relying on a non-schema fixture marker.
+- Repeated materialization asserts that the segment-local legacy projection remains byte-identical, while the logical-root projection remains replaceable and journal-derived.
