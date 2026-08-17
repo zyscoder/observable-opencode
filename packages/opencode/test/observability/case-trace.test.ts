@@ -177,6 +177,7 @@ const causalIRJournalContract = {
   "case.checkpointed": { recordType: "checkpoint", category: "case" },
   // Finalization continues an existing checkpoint chain when one exists, but can be the first lifecycle record.
   "case.finalized": { recordType: "finish", category: "case" },
+  "case.runtime_closed": { recordType: "runtime_close", category: "runtime_close" },
 } as const
 
 function canonicalJSONForCausalIRAudit(input: unknown, arrayValue = false): string | undefined {
@@ -303,16 +304,76 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
     ...artifact,
     path: artifact.path.replace(/^segments\/[^/]+\//, ""),
   }))
-  expect(replayed.nodes.map((node) => node.node_id)).toEqual(trace.nodes.map((node: any) => node.node_id))
-  expect(replayed.edges.map((edge) => edge.edge_id)).toEqual(trace.edges.map((edge: any) => edge.edge_id))
+  const replayedNodeIDs = new Set(replayed.nodes.map((node) => node.node_id))
+  const replayedEdgeIDs = new Set(replayed.edges.map((edge) => edge.edge_id))
+  const journalNodes = trace.nodes.filter((node: any) => replayedNodeIDs.has(node.node_id))
+  const journalEdges = trace.edges.filter((edge: any) => replayedEdgeIDs.has(edge.edge_id))
+  const materializedNodes = trace.nodes.filter((node: any) => !replayedNodeIDs.has(node.node_id))
+  const materializedEdges = trace.edges.filter((edge: any) => !replayedEdgeIDs.has(edge.edge_id))
+  expect(journalNodes.map((node: any) => node.node_id)).toEqual(replayed.nodes.map((node) => node.node_id))
+  for (const [index, journalNode] of replayed.nodes.entries()) {
+    const materializedNode = journalNodes[index]
+    if (journalNode.status !== "running" || materializedNode.status === "running") {
+      expect(materializedNode).toEqual(journalNode)
+      continue
+    }
+    const omitFinalization = (value: any) => {
+      const output = { ...(value ?? {}) }
+      delete output.finalized_status
+      delete output.finalized_reason
+      delete output.finalized_at
+      delete output.original_status
+      return output
+    }
+    const omitMutable = (value: any) => {
+      const output = { ...value }
+      delete output.status
+      delete output.payload
+      delete output.data
+      delete output.integrity
+      delete output.legacy_input_refs
+      delete output.legacy_output_refs
+      delete output.legacy_source_refs
+      return output
+    }
+    expect(omitMutable(materializedNode)).toEqual(omitMutable(journalNode))
+    expect(materializedNode.data).toMatchObject({
+      finalized_status: "finalized_without_close",
+      finalized_at: trace.manifest.ended_at,
+      original_status: "running",
+    })
+    expect(materializedNode.data.finalized_reason).toMatch(/^trace_(cancelled|error|finished)$/)
+    expect(omitFinalization(materializedNode.data)).toEqual(journalNode.data)
+    expect(omitFinalization(materializedNode.payload)).toEqual(journalNode.payload)
+    expect(materializedNode.integrity).toEqual({
+      ...journalNode.integrity,
+      payload_hash: causalIRPayloadHashForAudit(materializedNode.payload),
+    })
+  }
+  expect(replayed.edges).toEqual(journalEdges)
+  for (const node of materializedNodes) {
+    expect(node.node_id).toMatch(/^materialized_/)
+    expect(node).toMatchObject({
+      origin: "deterministic_derived",
+      derivation: {
+        algorithm: "trace_materializer_terminal_enrichment",
+        algorithm_version: "1",
+        reproducible: true,
+      },
+    })
+  }
+  for (const edge of materializedEdges) {
+    expect(edge.edge_id).toMatch(/^materialized_/)
+    expect(edge).toMatchObject({
+      eligible_for_attribution: false,
+      derivation_method: "trace_materializer_terminal_enrichment_v1",
+      metadata: { behavior_impact: "none", projection_stage: "terminal_materialization" },
+    })
+  }
   expect(replayed.artifacts.map((artifact) => [artifact.artifact_id, artifact.hash])).toEqual(
     trace.artifacts.map((artifact: any) => [artifact.artifact_id, artifact.hash]),
   )
   expect(replayed.diagnostics).toEqual(trace.diagnostics)
-  expect(replayed).toMatchObject({
-    nodes: trace.nodes,
-    edges: trace.edges,
-  })
   expect(replayed.artifacts).toEqual(
     trace.journal?.format === "causal-ir-segmented-jsonl" ? expectedPhysicalArtifacts : trace.artifacts,
   )
@@ -320,6 +381,10 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
   expect(typeof replayTrace).toBe("function")
   if (typeof replayTrace !== "function") return
   const replayedTrace = replayTrace(journal)
+  if (journal.at(-1)?.operation === "case.runtime_closed") {
+    expect(replayedTrace).toBeUndefined()
+    return
+  }
   if (trace.journal?.format !== "causal-ir-segmented-jsonl") {
     expect(replayedTrace).toEqual(trace)
     return
@@ -327,12 +392,16 @@ function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
   expect(replayedTrace).toMatchObject({
     trace_version: trace.trace_version,
     causal_ir_version: trace.causal_ir_version,
-    nodes: trace.nodes,
-    edges: trace.edges,
+    nodes: journalNodes,
+    edges: journalEdges,
     diagnostics: trace.diagnostics,
-    records: trace.records,
-    dataflow_edges: trace.dataflow_edges,
   })
+  const replayedRecordIDs = new Set(replayedTrace.records.map((record: any) => record.record_id))
+  const replayedDataflowEdgeIDs = new Set(replayedTrace.dataflow_edges.map((edge: any) => edge.edge_id))
+  expect(replayedTrace.records).toEqual(trace.records.filter((record: any) => replayedRecordIDs.has(record.record_id)))
+  expect(replayedTrace.dataflow_edges).toEqual(
+    trace.dataflow_edges.filter((edge: any) => replayedDataflowEdgeIDs.has(edge.edge_id)),
+  )
   expect(replayedTrace.artifacts).toEqual(expectedPhysicalArtifacts)
 }
 
@@ -352,9 +421,24 @@ function assertExactlyOneFinalizationAtEnd(journal: any[]) {
 
 function assertFinalForcedCheckpointMatchesCanonicalTrace(journal: any[], partial: any, trace: any) {
   assertCausalIRJournalAudit(journal)
+  const terminal = journal.at(-1)
+  if (terminal?.operation === "case.runtime_closed") {
+    expect(journal.filter((entry) => entry.operation === "case.runtime_closed")).toHaveLength(1)
+    expect(terminal.data).toMatchObject({
+      format: "runtime_close",
+      status: trace.manifest.server_status ?? trace.manifest.status,
+      closed_at: trace.manifest.ended_at,
+      manifest: {
+        case_id: terminal.case_id,
+        run_id: terminal.run_id,
+      },
+    })
+    expect(partial).toEqual(trace)
+    return
+  }
   assertExactlyOneFinalizationAtEnd(journal)
 
-  const finalized = journal.at(-1)
+  const finalized = terminal
   expect(finalized?.payload_hash).toBe(causalIRPayloadHashForAudit(finalized?.data))
   expect(finalized?.data?.format).toBe("compact_causal_ir_finalization")
   expect(finalized?.data?.snapshot).toBeUndefined()

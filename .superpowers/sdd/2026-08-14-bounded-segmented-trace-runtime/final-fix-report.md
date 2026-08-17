@@ -164,3 +164,32 @@ Concurrency, path, and retention evidence:
 - The malicious-tree matrix covers symlinked `session.json`, segment directory, `segment.json`, `records.jsonl`, `artifacts`, `index.sqlite`, `legacy-trace.json`, `.derived`, `partial/`, and renderer `trace.json`/`records.jsonl`. Outside-file/tree hashes remain unchanged.
 - Manifest-relative paths remain lexical after realpath validation, preserving stable `/var`-relative recovery metadata on macOS while containment checks use canonical `/private/var` paths.
 - The retention test publishes three generations, observes only the latest two directories, confirms the oldest directory is removed, and reads the oldest generation successfully through a file descriptor opened before reclamation.
+
+## Checkpoint 6: Materialized terminal and legacy compatibility integration
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Integration gaps covered:
+
+- Journal-only signal traces now prove that journal entities are the exact durable source subset, open-node closure is limited to audited deterministic finalization fields, and additional terminal nodes/edges carry reproducible materializer derivation metadata.
+- A process signal after an explicit successful final answer preserves `case_status: success` and `shutdown_disposition: graceful_after_case_completion` instead of being overwritten as interrupted.
+- Completed runtime spans remain evicted from JavaScript memory, but `span.start`/`span.end` evidence is upserted into temporary SQLite and streamed into `legacy-trace.json`, preserving token usage, redaction, and concrete tool-span references.
+- Modern segmented traces regenerate legacy compatibility from durable journal/raw-event evidence. Existing flat legacy roots remain copy-compatible for migration.
+
+RED evidence:
+
+- `bun test test/observability/case-trace.test.ts --test-name-pattern "keeps process-signal shutdown separate|preserves explicit token metrics|uses concrete source refs|finalizes canonical partial and trace when" --timeout 120000`: 0 pass, 5 fail in 2.04 s. Two signal cases exposed deterministic materializer nodes absent from raw replay, the successful signal manifest was overwritten to `interrupted_before_case_completion`, and both legacy span consumers found an empty `spans` array.
+- Root-cause inspection showed complete sanitized `span.start` and `span.end` envelopes in `raw-events.jsonl`, while `ingestLegacyRuntimeFile()` imported only generic events and errors. Modern direct-finish segments also contained a bounded in-memory legacy file with completed spans evicted, which the root materializer copied instead of rebuilding.
+- After adding the journal-only oracle, its first RED showed that open observed nodes are intentionally finalized during materialization. The strengthened assertion now compares all stable fields exactly and permits only terminal status, the four explicit finalization fields, compatibility refs, and the recomputed payload hash to differ.
+
+GREEN evidence:
+
+- `bun test test/observability/case-trace.test.ts --test-name-pattern "keeps process-signal shutdown separate|preserves explicit token metrics|uses concrete source refs|finalizes canonical partial and trace when" --timeout 120000`: 5 pass, 0 fail, 152 expectations in 2.03 s.
+- `bun test test/observability/trace-materializer.test.ts test/observability/trace-terminal-equivalence.test.ts --timeout 120000`: 8 pass, 0 fail, 28 expectations in 1.26 s.
+- `git diff --check`: pass before checkpointing.
+
+Durability and compatibility evidence:
+
+- Runtime span reconstruction is disk-backed and ordered by first lifecycle occurrence; `span.end` atomically replaces the start payload without changing its ordinal. Formal-node projection remains a fallback only when no raw lifecycle exists, preventing duplicates.
+- Namespaced multi-segment raw span/event/error references use the same disk-backed schema-aware resolver as canonical entities.
+- Legacy reconstruction retains already-sanitized token metadata and credentials remain redacted in both raw evidence and the generated compatibility document.

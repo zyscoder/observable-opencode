@@ -953,6 +953,11 @@ class ReplayIndex {
         ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
         json TEXT NOT NULL
       );
+      CREATE TABLE legacy_runtime_spans (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        span_id TEXT NOT NULL UNIQUE,
+        json TEXT NOT NULL
+      );
       CREATE TABLE legacy_runtime_errors (
         ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
         json TEXT NOT NULL
@@ -1810,11 +1815,20 @@ class ReplayIndex {
   }
 
   *legacySpans() {
+    for (const row of this.db.query<JsonRow, []>("SELECT json FROM legacy_runtime_spans ORDER BY ordinal").iterate())
+      yield JSON.parse(row.json) as unknown
     for (const row of this.db
       .query<JsonRow, []>(
-        `SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json
-         FROM nodes
-         WHERE kind IN ('llm.call', 'tool.call', 'mcp.call', 'skill.load', 'subagent.call', 'task.loop', 'execution.observation')
+        `WITH span_nodes AS (
+           SELECT ordinal, CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json
+           FROM nodes
+           WHERE kind IN ('llm.call', 'tool.call', 'mcp.call', 'skill.load', 'subagent.call', 'task.loop', 'execution.observation')
+         )
+         SELECT json FROM span_nodes
+         WHERE NOT EXISTS (
+           SELECT 1 FROM legacy_runtime_spans
+           WHERE span_id = json_extract(span_nodes.json, '$.span_id')
+         )
          ORDER BY ordinal`,
       )
       .iterate()) {
@@ -1847,7 +1861,12 @@ class ReplayIndex {
 
   ingestLegacyRuntimeFile(file: string) {
     if (!fs.existsSync(file)) return
+    if (!this.scope) throw new Error("replay segment scope is not initialized")
     const insertEvent = this.db.query("INSERT INTO legacy_runtime_events(json) VALUES (?)")
+    const insertSpan = this.db.query(
+      `INSERT INTO legacy_runtime_spans(span_id, json) VALUES (?, ?)
+       ON CONFLICT(span_id) DO UPDATE SET json = excluded.json`,
+    )
     const insertError = this.db.query("INSERT INTO legacy_runtime_errors(json) VALUES (?)")
     this.db.transaction(() => {
       readPhysicalLines(
@@ -1862,9 +1881,12 @@ class ReplayIndex {
           } catch {
             return
           }
-          const data = record(envelope.data)
-          if (!data) return
+          const rawData = record(envelope.data)
+          if (!rawData) return
+          const data = scopedSchemaReferences(rawData, this.scope!) as Record<string, unknown>
           if (envelope.type === "event") insertEvent.run(JSON.stringify(data))
+          if ((envelope.type === "span.start" || envelope.type === "span.end") && nonemptyString(data.span_id))
+            insertSpan.run(data.span_id, JSON.stringify(data))
           if (envelope.type === "span.end" && data.error !== undefined) insertError.run(JSON.stringify(data.error))
         },
         () => {},
@@ -2816,6 +2838,12 @@ function materializeTraceSnapshot(input: {
       session && replays.some((replay) => replay.droppedLines > 0 || !replay.close),
     )
     const status = terminal.close ? terminalStatus : "error"
+    const caseStatus =
+      terminalManifest.case_status === "success" ||
+      terminalManifest.case_status === "error" ||
+      terminalManifest.case_status === "cancelled"
+        ? terminalManifest.case_status
+        : status
     const runID = terminal.identities.runID
     const caseID = session?.logical_case_id ?? latest.identities.caseID
     const effectiveSegments = session?.segments.map((descriptor) => {
@@ -2855,7 +2883,7 @@ function materializeTraceSnapshot(input: {
       status,
       server_status: terminalManifest.server_status ?? status,
       process_status: terminalManifest.process_status ?? status,
-      case_status: terminalManifest.case_status ?? status,
+      case_status: caseStatus,
       ...(status === "success"
         ? { case_completed_at: terminalManifest.case_completed_at ?? terminal.close?.closed_at }
         : {}),
@@ -2871,7 +2899,9 @@ function materializeTraceSnapshot(input: {
         ? {
             server_shutdown_reason: "process_signal",
             shutdown_signal: closeResult.signal,
-            shutdown_disposition: "interrupted_before_case_completion",
+            shutdown_disposition:
+              terminalManifest.shutdown_disposition ??
+              (caseStatus === "success" ? "graceful_after_case_completion" : "interrupted_before_case_completion"),
           }
         : {
             shutdown_disposition:
@@ -3011,7 +3041,11 @@ function materializeTraceSnapshot(input: {
     memoryPhase("partial_complete", journalBytes)
     writeStreamingJsonObjectAtomic(provenanceFile, provenanceMembers(index, manifest, metrics))
     memoryPhase("provenance_complete", journalBytes)
-    const legacySource = fs.existsSync(terminal.source.legacyTraceFile) ? terminal : undefined
+    const legacySource =
+      (terminal.source.key === "legacy-flat" || terminal.source.descriptor?.segment_id === "legacy-root") &&
+      fs.existsSync(terminal.source.legacyTraceFile)
+        ? terminal
+        : undefined
     if (legacySource) {
       copyFileAtomic(legacySource.source.legacyTraceFile, legacyFile)
       linkCompatibilityArtifacts(
