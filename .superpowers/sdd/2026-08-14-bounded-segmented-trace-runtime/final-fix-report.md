@@ -78,3 +78,27 @@ Implementation evidence:
 - Completed span and span-node ownership is evicted immediately; finalized registry roots, aliases, and owners are retired while bounded tombstones prevent accidental rerouting and root ordinals remain monotonic.
 - SQLite node queries support bounded sequence pagination and indexed JSON equality filters used for cold verification/change semantics.
 - The materializer streams raw runtime events and span errors through its temporary SQLite index instead of retaining the raw event log in JavaScript memory.
+
+## Checkpoint 3: First-entry allocation crash recovery
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Finding covered:
+
+- Critical: a newly published segment can no longer point at a journal that has never existed, and a zero-line or pre-fix missing segmented journal materializes as an interrupted prefix instead of poisoning the logical session.
+
+RED evidence:
+
+- `bun test test/observability/trace-segment.test.ts --timeout 30000 -t "durably initializes and recovers"`: 0 pass, 1 fail. Immediately after the allocation boundary, reading `segments/run_first_entry_crash/records.jsonl` failed with `ENOENT`; `session.json` had already published that path.
+
+GREEN evidence:
+
+- The same targeted command: 1 pass, 0 fail, 7 expectations in 17.79 ms.
+- `bun test test/observability/trace-segment.test.ts test/observability/trace-materializer.test.ts --timeout 120000`: 42 pass, 0 fail, 737 expectations in 5.83 s.
+- `bun run typecheck` in `packages/opencode`: exit 2 with the exact pre-change 22-diagnostic baseline and no new diagnostics.
+
+Durability and recovery evidence:
+
+- Segment allocation creates and fsyncs an empty `records.jsonl`, then fsyncs its directory before atomically publishing `segment.json` and `session.json`.
+- The allocation-only test fixture stops at the exact pre-first-entry crash boundary. Materialization returns `completeness: "incomplete"`, `recoveredLines: 0`, top-level error/interrupted status, descriptor-derived identities and start time, empty legacy projections, and an explicit interrupted recovery record.
+- Materialization leaves both the zero-byte journal and the published session manifest byte-identical. Segmented journals missing from older crash windows receive the same zero-line interrupted recovery; flat missing/empty journals remain invalid.

@@ -513,6 +513,27 @@ function writeJsonAtomic(file: string, value: unknown) {
   }
 }
 
+function initializeJournal(file: string) {
+  let handle: number | undefined
+  try {
+    handle = fs.openSync(file, "wx")
+    fs.fsyncSync(handle)
+    fs.closeSync(handle)
+    handle = undefined
+    fsyncDirectory(path.dirname(file))
+  } catch (error) {
+    if (handle !== undefined) {
+      try {
+        fs.closeSync(handle)
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(file)
+    } catch {}
+    throw error
+  }
+}
+
 function replaceDescriptor(
   sessionFile: string,
   segmentID: string,
@@ -599,6 +620,7 @@ export function openTraceSegment(input: {
     }
     const segmentFile = path.join(segmentDir, "segment.json")
     try {
+      initializeJournal(path.join(segmentDir, "records.jsonl"))
       writeJsonAtomic(segmentFile, descriptor)
       fsyncDirectory(segmentsDir)
       writeJsonAtomic(sessionFile, manifest)

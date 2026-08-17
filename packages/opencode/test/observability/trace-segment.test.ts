@@ -1023,6 +1023,62 @@ test("failed atomic manifest publication removes the unpublished segment and pre
   }
 })
 
+test("durably initializes and recovers a segment published before its first journal entry", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-first-entry-crash-"))
+  try {
+    const segment = openTraceSegment({
+      rootDir: traceRoot,
+      logicalCaseID: "first-entry-crash",
+      sessionID: "ses_first_entry_crash",
+      runID: "run_first_entry_crash",
+    })
+    const recordsFile = path.join(segment.segmentDir, "records.jsonl")
+    const sessionBefore = await fs.readFile(segment.sessionFile)
+
+    expect(await fs.readFile(recordsFile, "utf8")).toBe("")
+
+    const result = materializeTrace({ caseDir: segment.logicalRoot })
+    const trace = JSON.parse(await fs.readFile(result.traceFile, "utf8")) as any
+    const legacy = JSON.parse(await fs.readFile(path.join(segment.logicalRoot, "legacy-trace.json"), "utf8")) as any
+
+    expect(result).toMatchObject({ completeness: "incomplete", recoveredLines: 0 })
+    expect(trace.nodes).toEqual([])
+    expect(trace.manifest).toMatchObject({
+      case_id: "first-entry-crash",
+      run_id: "run_first_entry_crash",
+      session_id: "ses_first_entry_crash",
+      started_at: segment.descriptor.started_at,
+      status: "error",
+      process_status: "error",
+      shutdown_disposition: "interrupted_before_case_completion",
+      recovery_status: "incomplete_journal_replay",
+      recovery: {
+        dropped_lines: 0,
+        segments: [
+          {
+            run_id: "run_first_entry_crash",
+            path: "segments/run_first_entry_crash/records.jsonl",
+            dropped_lines: 0,
+            status: "interrupted_unfinalized",
+          },
+        ],
+      },
+      segment_summary: { count: 1, running: 1 },
+    })
+    expect(legacy).toMatchObject({
+      case_id: "first-entry-crash",
+      run_id: "run_first_entry_crash",
+      status: "error",
+      spans: [],
+      events: [],
+    })
+    expect(await fs.readFile(recordsFile, "utf8")).toBe("")
+    expect(await fs.readFile(segment.sessionFile)).toEqual(sessionBefore)
+  } finally {
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
 test("finalizing a segment changes root metadata only", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-segment-finalize-"))
   try {

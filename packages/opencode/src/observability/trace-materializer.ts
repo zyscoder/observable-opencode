@@ -800,8 +800,8 @@ class ReplayIndex {
 
   beginSegment(scope: SegmentReplayScope) {
     this.scope = scope
-    this.runID = ""
-    this.caseID = ""
+    this.runID = scope.runID
+    this.caseID = scope.caseID
     this.runtimeClosed = false
     this.terminalClose = undefined
     this.terminal = undefined
@@ -1791,7 +1791,7 @@ function parseLine(line: string) {
 }
 
 function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope) {
-  if (!scope.namespace) return
+  if (!scope.namespace || !fs.existsSync(recordsFile)) return
   const registerAlias = (alias: string, nodeID: string) => {
     const existing = scope.nodeAliases.get(alias)
     if (existing === undefined) scope.nodeAliases.set(alias, nodeID)
@@ -1847,11 +1847,16 @@ function discoverSegmentEntityIDs(recordsFile: string, scope: SegmentReplayScope
   )
 }
 
-function recoverJournal(recordsFile: string, index: ReplayIndex) {
+function recoverJournal(recordsFile: string, index: ReplayIndex, allowEmpty = false) {
   let droppedLines = 0
   let journalBytes = 0
   let bytesSinceGC = 0
   let nextWatermark = MEMORY_WATERMARK_BYTES
+
+  if (!fs.existsSync(recordsFile)) {
+    if (allowEmpty) return { droppedLines, journalBytes }
+    throw new Error(`${recordsFile}:1: journal is missing`)
+  }
 
   const processLine = (line: string, lineNumber: number, recoverableTail: boolean) => {
     try {
@@ -1882,7 +1887,10 @@ function recoverJournal(recordsFile: string, index: ReplayIndex) {
       nextWatermark += MEMORY_WATERMARK_BYTES
     }
   })
-  if (!lineCount) throw new Error(`${recordsFile}:1: journal is empty`)
+  if (!lineCount) {
+    if (allowEmpty) return { droppedLines, journalBytes }
+    throw new Error(`${recordsFile}:1: journal is empty`)
+  }
   if (bytesSinceGC > 0) {
     index.releaseTransientBindings()
     Bun.gc(true)
@@ -2496,7 +2504,7 @@ function materializeTraceSnapshot(input: {
       }
       discoverSegmentEntityIDs(source.recordsFile, scope)
       index.beginSegment(scope)
-      const recovered = recoverJournal(source.recordsFile, index)
+      const recovered = recoverJournal(source.recordsFile, index, source.descriptor !== undefined)
       index.ingestLegacyRuntimeFile(path.join(path.dirname(source.recordsFile), "raw-events.jsonl"))
       const identities = index.identities
       if (source.runID && identities.runID !== source.runID)
@@ -2582,7 +2590,7 @@ function materializeTraceSnapshot(input: {
       trace_version: TRACE_VERSION,
       case_id: caseID,
       run_id: runID,
-      started_at: terminalManifest.started_at ?? runStart?.timestamp,
+      started_at: terminalManifest.started_at ?? runStart?.timestamp ?? terminal.source.descriptor?.started_at,
       ended_at: terminalManifest.ended_at ?? terminal.close?.closed_at,
       ...((terminalManifest.duration_ms ??
         (runStart && terminal.close?.closed_at
@@ -2615,7 +2623,11 @@ function materializeTraceSnapshot(input: {
             shutdown_signal: closeResult.signal,
             shutdown_disposition: "interrupted_before_case_completion",
           }
-        : { shutdown_disposition: terminalManifest.shutdown_disposition ?? "normal_case_completion" }),
+        : {
+            shutdown_disposition:
+              terminalManifest.shutdown_disposition ??
+              (terminal.close ? "normal_case_completion" : "interrupted_before_case_completion"),
+          }),
       ...(previousTerminal?.envelope?.manifest
         ? {
             previous_terminal: {
