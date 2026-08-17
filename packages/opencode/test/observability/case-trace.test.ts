@@ -5,7 +5,11 @@ import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import * as CausalIRModule from "@/observability/causal-ir"
-import { replayCausalIRJournal, validateCausalIRJournal } from "@/observability/causal-ir"
+import {
+  replayCausalIRJournal,
+  type CausalIRJournalEntry,
+  validateCausalIRJournal,
+} from "@/observability/causal-ir"
 import type { ProvenanceTraceSummary, TraceSummary } from "@/observability/case-trace"
 
 process.env.OPENCODE_CASE_TRACE_QUIET = "1"
@@ -298,7 +302,7 @@ async function waitForCompleteCausalIRCheckpoint(caseDir: string, markerNodeID: 
   }
 }
 
-function assertJournalReplaysCanonicalTrace(journal: unknown[], trace: any) {
+function assertJournalReplaysCanonicalTrace(journal: CausalIRJournalEntry[], trace: any) {
   const replayed = replayCausalIRJournal(journal)
   const expectedPhysicalArtifacts = trace.artifacts.map((artifact: any) => ({
     ...artifact,

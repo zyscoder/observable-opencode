@@ -262,3 +262,17 @@ Production-path evidence:
 
 - Worker signal mapping, trace-only shutdown failures, normal/Ctrl-C worker termination ordering, the separate five-second cleanup and trace-close deadlines, serial external materialization, run replacement and startup failures, serve startup, and standalone finalize all pass.
 - The fixture now owns and closes the process trace exactly where production does; it does not replace or stand in for the separately executed production E2E command.
+
+## Checkpoint 10: Restore the typecheck baseline
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+RED evidence:
+
+- `bun run typecheck` in `packages/opencode`: exit 2 with 23 diagnostics. The additional branch-local diagnostic was `test/observability/case-trace.test.ts(384,23): TS2339`, where the new journal replay helper accepted `unknown[]` and accessed `operation` on its terminal entry.
+
+GREEN evidence:
+
+- The helper now accepts the existing strict `CausalIRJournalEntry[]` schema rather than weakening or casting around the journal contract.
+- `bun run typecheck` in `packages/opencode`: exit 2 with exactly the established 22-diagnostic baseline; no touched observability, runtime, or test file remains in the output.
+- `bun test test/observability/case-trace.test.ts --test-name-pattern "persists semantic trace records|finalizes canonical partial and trace when" --timeout 120000`: 3 pass, 0 fail, 139 expectations in 1.78 s.
