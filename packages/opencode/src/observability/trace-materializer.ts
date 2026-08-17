@@ -289,6 +289,16 @@ type ScopedCausalIREdge = CausalIREdge & {
 
 const MATERIALIZER_GC_BYTES = 4 * 1024 * 1024
 const MEMORY_WATERMARK_BYTES = 128 * 1024 * 1024
+const LEGACY_SEMANTIC_EDGE_PROJECTION_KEY = "__case_trace_legacy_semantic_edge_projection"
+const LEGACY_SEMANTIC_EDGE_OPTIONAL_FIELDS = new Set([
+  "evidence_tier",
+  "eligible_for_attribution",
+  "derivation_method",
+  "evidence_refs",
+  "confidence",
+  "label",
+  "metadata",
+])
 
 const OPERATIONS = new Set<CausalIRJournalEntry["operation"]>([
   "node.created",
@@ -308,6 +318,25 @@ function record(input: unknown): Record<string, unknown> | undefined {
 
 function nonemptyString(input: unknown): input is string {
   return typeof input === "string" && input.length > 0
+}
+
+function legacyCompatibilityData(input: Record<string, unknown> | undefined) {
+  const data = { ...(input ?? {}) }
+  delete data.finalized_status
+  delete data.finalized_reason
+  delete data.finalized_at
+  delete data.original_status
+  return data
+}
+
+function materializerTestLikeCommand(command: unknown, purpose: unknown) {
+  return Boolean(
+    (typeof command === "string" &&
+      /\b(test|pytest|jest|vitest|mocha)\b|bun test|npm test|pnpm test|yarn test|go test|cargo test|node .*test|xcodebuild/i.test(
+        command,
+      )) ||
+      (typeof purpose === "string" && /test|verify|verification|regression/i.test(purpose)),
+  )
 }
 
 function scopedEntityID(scope: SegmentReplayScope, type: NamespaceEntityType, id: string) {
@@ -956,6 +985,12 @@ class ReplayIndex {
       CREATE TABLE legacy_runtime_spans (
         ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
         span_id TEXT NOT NULL UNIQUE,
+        json TEXT NOT NULL
+      );
+      CREATE TABLE legacy_runtime_constraints (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        constraint_id TEXT NOT NULL UNIQUE,
+        evaluated INTEGER NOT NULL,
         json TEXT NOT NULL
       );
       CREATE TABLE legacy_runtime_errors (
@@ -1801,16 +1836,141 @@ class ReplayIndex {
     }
   }
 
-  *legacyNodeData(kinds: string[]) {
+  *legacySemanticEdges(manifest: Record<string, unknown>, metrics: Record<string, unknown>) {
+    for (const row of this.entityRows("edges")) {
+      const edge = JSON.parse(row.json) as CausalIREdge
+      const marker = record(edge.metadata?.[LEGACY_SEMANTIC_EDGE_PROJECTION_KEY])
+      if (!marker || !Array.isArray(marker.fields)) continue
+      const fields = new Set(
+        marker.fields.filter(
+          (field): field is string => typeof field === "string" && LEGACY_SEMANTIC_EDGE_OPTIONAL_FIELDS.has(field),
+        ),
+      )
+      const projection = projectProvenanceTrace(
+        {
+          version: CAUSAL_IR_VERSION,
+          runID: this.runID,
+          caseID: this.caseID,
+          nodes: [],
+          edges: [edge],
+          artifacts: [],
+          diagnostics: [],
+        },
+        {
+          traceVersion: TRACE_VERSION,
+          manifest: manifest as { case_id: string; run_id: string },
+          metrics: metrics as never,
+        },
+      )
+      const compatibility = projection.dataflow_edges[0]
+      if (!compatibility) continue
+      const output: Record<string, unknown> = {
+        edge_id: edge.edge_id,
+        from: compatibility.from,
+        to: compatibility.to,
+        relation: edge.original_relation,
+      }
+      if (fields.has("evidence_tier")) output.evidence_tier = edge.evidence_tier
+      if (fields.has("eligible_for_attribution")) output.eligible_for_attribution = edge.eligible_for_attribution
+      if (fields.has("derivation_method")) output.derivation_method = edge.derivation_method
+      if (fields.has("evidence_refs"))
+        output.evidence_refs = edge.evidence_refs.map((ref) => ref.legacy_ref ?? `${ref.ref_type}:${ref.ref_id}`)
+      if (fields.has("confidence")) output.confidence = edge.confidence
+      if (fields.has("label")) output.label = edge.label
+      if (fields.has("metadata")) {
+        const metadata = { ...(edge.metadata ?? {}) }
+        delete metadata[LEGACY_SEMANTIC_EDGE_PROJECTION_KEY]
+        output.metadata = metadata
+      }
+      yield output
+    }
+  }
+
+  private *legacyNodes(kinds: string[]) {
     const placeholders = kinds.map(() => "?").join(", ")
     for (const row of this.db
       .query<
         JsonRow,
         string[]
       >(`SELECT CASE WHEN wrapped = 1 THEN json_extract(json, '$.data') ELSE json END AS json FROM nodes WHERE kind IN (${placeholders}) ORDER BY ordinal`)
-      .iterate(...kinds)) {
-      const node = JSON.parse(row.json) as CausalIRNode
-      yield node.data ?? {}
+      .iterate(...kinds))
+      yield JSON.parse(row.json) as CausalIRNode
+  }
+
+  *legacyNodeData(kinds: string[]) {
+    for (const node of this.legacyNodes(kinds)) yield legacyCompatibilityData(node.data)
+  }
+
+  *legacyContextSnapshots() {
+    for (const node of this.legacyNodes(["context.pack"])) {
+      const data = legacyCompatibilityData(node.data)
+      if (nonemptyString(data.snapshot_id)) yield data
+    }
+  }
+
+  *legacyVerificationRecords() {
+    for (const node of this.legacyNodes(["verification"])) {
+      const data = legacyCompatibilityData(node.data)
+      yield { ...data, ...(node.status === undefined ? {} : { status: node.status }) }
+    }
+  }
+
+  private legacyChangeRefs() {
+    const refs: string[] = []
+    for (const node of this.legacyNodes(["change"])) {
+      const id = node.data?.change_id
+      if (nonemptyString(id)) refs.push(`change:${id}`)
+    }
+    return refs
+  }
+
+  private legacyVerificationRefs() {
+    const refs: string[] = []
+    for (const node of this.legacyNodes(["verification"])) {
+      if (!materializerTestLikeCommand(node.data?.command, node.data?.purpose)) continue
+      const id = node.data?.verification_id
+      if (nonemptyString(id)) refs.push(`verification:${id}`)
+    }
+    return refs
+  }
+
+  private evaluateLegacyConstraint(input: Record<string, unknown>) {
+    if (input.status !== "unknown" || typeof input.constraint !== "string") return input
+    const text = input.constraint.toLowerCase()
+    const sourceRefs = new Set(
+      Array.isArray(input.source_refs) ? input.source_refs.filter((ref): ref is string => typeof ref === "string") : [],
+    )
+    let status = input.status
+    if (/do not modify|read[- ]?only|只读|不修改|不要修改/.test(text)) {
+      const changes = this.legacyChangeRefs()
+      status = changes.length ? "observed_violated" : "observed_satisfied"
+      for (const ref of changes) sourceRefs.add(ref)
+    } else if (/run verification tests|run tests|执行测试|运行测试/.test(text)) {
+      const verifications = this.legacyVerificationRefs()
+      status = verifications.length ? "observed_satisfied" : "observed_violated"
+      for (const ref of verifications) sourceRefs.add(ref)
+    } else if (/only make necessary changes|only necessary|minimal change|只改必要|最小修改/.test(text)) {
+      const changes = this.legacyChangeRefs()
+      const verifications = this.legacyVerificationRefs()
+      if (!changes.length || verifications.length || sourceRefs.size) status = "observed_satisfied"
+      for (const ref of changes) sourceRefs.add(ref)
+      for (const ref of verifications) sourceRefs.add(ref)
+    }
+    return status === input.status ? input : { ...input, status, source_refs: [...sourceRefs] }
+  }
+
+  *legacyConstraintRecords() {
+    for (const row of this.db
+      .query<JsonRow, []>("SELECT json FROM legacy_runtime_constraints ORDER BY ordinal")
+      .iterate())
+      yield this.evaluateLegacyConstraint(JSON.parse(row.json) as Record<string, unknown>)
+    const present = this.db.query<{ present: number }, [string]>(
+      "SELECT 1 AS present FROM legacy_runtime_constraints WHERE constraint_id = ?",
+    )
+    for (const node of this.legacyNodes(["semantic.constraint"])) {
+      const data = legacyCompatibilityData(node.data)
+      if (nonemptyString(data.constraint_id) && present.get(data.constraint_id)) continue
+      yield this.evaluateLegacyConstraint(data)
     }
   }
 
@@ -1867,6 +2027,14 @@ class ReplayIndex {
       `INSERT INTO legacy_runtime_spans(span_id, json) VALUES (?, ?)
        ON CONFLICT(span_id) DO UPDATE SET json = excluded.json`,
     )
+    const insertConstraint = this.db.query(
+      `INSERT INTO legacy_runtime_constraints(constraint_id, evaluated, json) VALUES (?, 0, ?)
+       ON CONFLICT(constraint_id) DO NOTHING`,
+    )
+    const updateConstraint = this.db.query(
+      `INSERT INTO legacy_runtime_constraints(constraint_id, evaluated, json) VALUES (?, 1, ?)
+       ON CONFLICT(constraint_id) DO UPDATE SET evaluated = 1, json = excluded.json`,
+    )
     const insertError = this.db.query("INSERT INTO legacy_runtime_errors(json) VALUES (?)")
     this.db.transaction(() => {
       readPhysicalLines(
@@ -1887,6 +2055,10 @@ class ReplayIndex {
           if (envelope.type === "event") insertEvent.run(JSON.stringify(data))
           if ((envelope.type === "span.start" || envelope.type === "span.end") && nonemptyString(data.span_id))
             insertSpan.run(data.span_id, JSON.stringify(data))
+          if (envelope.type === "semantic.constraint" && nonemptyString(data.constraint_id))
+            insertConstraint.run(data.constraint_id, JSON.stringify(data))
+          if (envelope.type === "semantic.constraint_evaluated" && nonemptyString(data.constraint_id))
+            updateConstraint.run(data.constraint_id, JSON.stringify(data))
           if (envelope.type === "span.end" && data.error !== undefined) insertError.run(JSON.stringify(data.error))
         },
         () => {},
@@ -2125,12 +2297,12 @@ function legacyMembers(
     ["artifacts", streamingJsonArray(index.rawEntities("artifacts"))],
     ["errors", streamingJsonArray(index.legacyRuntimeErrors(manifest.error))],
     ["result", manifest.result],
-    ["context_snapshots", streamingJsonArray(index.legacyNodeData(["context.pack"]))],
+    ["context_snapshots", streamingJsonArray(index.legacyContextSnapshots())],
     ["semantic_decisions", streamingJsonArray(index.legacyNodeData(["decision"]))],
-    ["dataflow_edges", streamingJsonArray(index.compatibilityEdges(manifest, metrics))],
-    ["verification_records", streamingJsonArray(index.legacyNodeData(["verification"]))],
+    ["dataflow_edges", streamingJsonArray(index.legacySemanticEdges(manifest, metrics))],
+    ["verification_records", streamingJsonArray(index.legacyVerificationRecords())],
     ["change_records", streamingJsonArray(index.legacyNodeData(["change"]))],
-    ["constraint_records", streamingJsonArray(index.legacyNodeData(["semantic.constraint"]))],
+    ["constraint_records", streamingJsonArray(index.legacyConstraintRecords())],
     ["response_segments", streamingJsonArray(index.legacyNodeData(["response.output"]))],
     ["design_records", streamingJsonArray(index.legacyNodeData(["design.record"]))],
   ]
@@ -3055,6 +3227,12 @@ function materializeTraceSnapshot(input: {
       )
     } else {
       writeStreamingJsonObjectAtomic(legacyFile, legacyMembers(index, manifest, metrics))
+      for (const source of sources)
+        linkCompatibilityArtifacts(
+          source.artifactsDirectory,
+          path.join(outputDir, "artifacts"),
+          input.copyArtifacts === true,
+        )
     }
     return { caseDir, traceFile, manifestFile, partialFile, completeness, recoveredLines: index.recoveredLines }
   } finally {

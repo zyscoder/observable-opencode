@@ -71,7 +71,7 @@ test("journal-only terminal materialization is semantically equivalent to determ
         `const trace = CaseTrace.configure({ input: { prompt: "equivalence" }, environment: { model: "fixture" } }) as any`,
         `CaseTrace.setSessionID("ses_equivalence")`,
         `trace.startSpan({ component: "tool", operation: "read", name: "open span" })`,
-        `CaseTrace.constraint({ source: "user", constraint: "do not edit", status: "observed_satisfied" })`,
+        `CaseTrace.constraint({ source: "user", constraint: "do not modify repository files", status: "unknown" })`,
         `CaseTrace.agentLifecycle({ session_id: "ses_equivalence", message_id: "msg", agent: "build", phase: "turn.started", status: "running", summary: "open lifecycle" })`,
         `CaseTrace.responseOutput({ text: "equivalent answer", response_role: "final_answer", visibility: "user_visible", is_final_for_case: true, finality_source: "explicit" })`,
         `if (process.env.TRACE_TERMINAL_MODE === "full") trace.finish({ status: "success", result: { answer: "equivalent answer" } })`,
@@ -104,7 +104,12 @@ test("journal-only terminal materialization is semantically equivalent to determ
       })
     }
 
-    expect(signature(outputs[1].trace, outputs[1].legacy)).toEqual(signature(outputs[0].trace, outputs[0].legacy))
+    const fullSignature = signature(outputs[0].trace, outputs[0].legacy)
+    const journalSignature = signature(outputs[1].trace, outputs[1].legacy)
+    expect(fullSignature.constraints).toEqual([
+      { source: "user", constraint: "do not modify repository files", status: "observed_satisfied" },
+    ])
+    expect(journalSignature).toEqual(fullSignature)
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }

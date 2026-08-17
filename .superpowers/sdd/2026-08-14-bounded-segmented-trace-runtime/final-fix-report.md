@@ -193,3 +193,31 @@ Durability and compatibility evidence:
 - Runtime span reconstruction is disk-backed and ordered by first lifecycle occurrence; `span.end` atomically replaces the start payload without changing its ordinal. Formal-node projection remains a fallback only when no raw lifecycle exists, preventing duplicates.
 - Namespaced multi-segment raw span/event/error references use the same disk-backed schema-aware resolver as canonical entities.
 - Legacy reconstruction retains already-sanitized token metadata and credentials remain redacted in both raw evidence and the generated compatibility document.
+
+## Checkpoint 7: Complete disk-materialized legacy parity
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Integration gaps covered:
+
+- Regenerated modern legacy output links immutable segment artifacts into the compatibility artifact tree, including the 5,000-record authoritative-payload workload.
+- Legacy semantic edges are projected only from the canonical opt-in marker and preserve original relation, optional-field presence, evidence refs, confidence, label, and metadata exactly.
+- `context_snapshots` excludes internal `context.pack` set nodes; verification records restore their canonical top-level `passed`/`failed` status.
+- Constraint compatibility records are upserted from durable `semantic.constraint` and `semantic.constraint_evaluated` raw evidence. Journal-only unknown constraints receive the same deterministic read-only/test/minimal-change evaluation from disk-backed change and verification facts.
+
+RED evidence:
+
+- Full CaseTrace family command: `bun test test/observability/case-trace.test.ts test/observability/case-trace-runtime.test.ts test/observability/case-trace-session.test.ts test/observability/case-trace-memory.test.ts test/observability/case-trace-terminal-memory.test.ts --timeout 120000`: 215 pass, 6 fail, 9,607 expectations in 99.88 s. Failures were the missing compatibility artifact directory, normalized legacy edge shape, duplicate context snapshot, two missing verification statuses, and stale unknown constraint status.
+- Strengthening `trace-terminal-equivalence.test.ts` from an explicitly satisfied constraint to an unknown read-only constraint initially passed symmetrically with both projections wrong. Adding the required `observed_satisfied` oracle produced the intended RED: 0 pass, 1 fail in 1.17 s.
+
+GREEN evidence:
+
+- `bun test test/observability/case-trace-runtime.test.ts test/observability/case-trace.test.ts test/observability/trace-terminal-equivalence.test.ts --test-name-pattern "uses the bounded writer|projects legacy semantic edges|persists semantic trace records|marks verification as failed|does not infer verification failure|evaluates read-only constraints|journal-only terminal materialization" --timeout 120000`: 7 pass, 0 fail, 68 expectations in 13.69 s.
+- The targeted 5,000-record child reported RSS 282,247,168 before direct compatibility finalization and 653,328,384 after, with 5,891.27 ms finalization. This legacy `finish()` compatibility path is intentionally retained for callers; production TUI/run/serve use the separately measured journal-only close path.
+- `git diff --check`: pass before checkpointing.
+
+Disk and semantic evidence:
+
+- Constraint updates and completed spans use keyed SQLite upserts that preserve first-observation order while replacing only the latest durable state.
+- Canonical node/edge and raw-event scans remain iterator-based. No unbounded runtime collection or full legacy document is reintroduced.
+- Artifact publication merges every immutable segment's content-addressed tree and retains no symlink-following path shortcut.
