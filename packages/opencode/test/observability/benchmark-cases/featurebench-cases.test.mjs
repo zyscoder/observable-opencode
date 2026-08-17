@@ -8,6 +8,13 @@ import path from "node:path"
 import test from "node:test"
 import * as featureBenchRunner from "./run-featurebench-cases.mjs"
 import manifest from "./open-source-benchmarks.json" with { type: "json" }
+import {
+  createTask7BenchmarkRepository,
+  runTask7Process,
+  startTask7RunnerModel,
+  writeTask7ObservableBinary,
+  writeTask7RunnerConfig,
+} from "../fixture/task-7-runner-harness.mjs"
 
 const { buildAgentPrompt, officialEvaluationStatus, selectFeatureBenchRows } = featureBenchRunner
 
@@ -186,41 +193,93 @@ test("runner waits for trace finalization after the server process exits", async
   assert.equal(JSON.parse(fs.readFileSync(traceFile, "utf8")).status, "success")
 })
 
-test("FeatureBench runner executes a deterministic semantic-category probe", () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-semantic-probe-"))
-  const traceFile = path.join(directory, "trace.json")
-  fs.writeFileSync(
-    traceFile,
-    JSON.stringify({
-      manifest: { status: "success" },
-      nodes: [
-        { node_id: "run", kind: "run.start", component: "run" },
-        { node_id: "tool", kind: "tool.call", component: "tool" },
-        { node_id: "response", kind: "response.output", component: "result" },
+test("FeatureBench runner validates semantics from an actual production case", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "featurebench-production-runner-"))
+  const sourceRepo = path.join(directory, "source-repo")
+  const out = path.join(directory, "out")
+  const config = path.join(directory, "config")
+  const instanceID = "task7__local.production.case"
+  const repo = "task7/local"
+  const problemStatement = "Create task-7-runner-output.txt with deterministic production evidence."
+  const baseCommit = createTask7BenchmarkRepository(sourceRepo)
+  const outputFile = path.join(out, "repos", instanceID, "task-7-runner-output.txt")
+  const model = await startTask7RunnerModel(outputFile)
+  try {
+    const localManifest = {
+      source: { dataset: "Task7/LocalFeatureBench", split: "fixture", license: "MIT" },
+      instances: [{
+        instance_id: instanceID,
+        repo,
+        base_commit: baseCommit,
+        problem_statement_sha256: crypto.createHash("sha256").update(problemStatement).digest("hex"),
+      }],
+    }
+    const rows = {
+      rows: [{
+        row: {
+          instance_id: instanceID,
+          repo,
+          base_commit: baseCommit,
+          problem_statement: problemStatement,
+          patch: "",
+          test_patch: "",
+          FAIL_TO_PASS: [],
+          PASS_TO_PASS: [],
+        },
+      }],
+    }
+    const manifestFile = path.join(directory, "manifest.json")
+    const rowsFile = path.join(directory, "rows.json")
+    fs.writeFileSync(manifestFile, JSON.stringify(localManifest))
+    fs.writeFileSync(rowsFile, JSON.stringify(rows))
+    writeTask7RunnerConfig(config, model.url)
+    const binary = writeTask7ObservableBinary(path.join(directory, "bin"))
+
+    const result = await runTask7Process(
+      process.execPath,
+      [
+        path.join(import.meta.dirname, "run-featurebench-cases.mjs"),
+        "--binary", binary,
+        "--dataset-rows", rowsFile,
+        "--manifest", manifestFile,
+        "--out", out,
+        "--config", config,
+        "--case", instanceID,
+        "--skip-docker",
       ],
-      edges: [{ edge_id: "edge", relation: "produced" }],
-      artifacts: [{ artifact_id: "artifact", path: "artifacts/sha256/value.txt" }],
-      records: [],
-    }),
-  )
+      {
+        env: {
+          ...process.env,
+          DEEPSEEK_API_KEY: "task-7-local",
+          OPENCODE_BENCHMARK_PROVIDER: "task7",
+          OPENCODE_BENCHMARK_MODEL: "test-model",
+          OPENCODE_DB: "opencode.db",
+          OPENCODE_DISABLE_AUTOUPDATE: "1",
+          OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
+          OPENCODE_DISABLE_LSP_DOWNLOAD: "1",
+          OPENCODE_DISABLE_MODELS_FETCH: "1",
+          GIT_ALLOW_PROTOCOL: "file",
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: `url.file://${sourceRepo}.insteadOf`,
+          GIT_CONFIG_VALUE_0: `https://github.com/${repo}.git`,
+        },
+      },
+    )
 
-  assert.equal(typeof featureBenchRunner.assertTraceSemanticCategories, "function")
-  assert.deepEqual(featureBenchRunner.assertTraceSemanticCategories(traceFile), [
-    "artifact",
-    "edge",
-    "lifecycle",
-    "node",
-    "response",
-    "tool",
-  ])
-
-  const result = spawnSync(
-    process.execPath,
-    [path.join(import.meta.dirname, "run-featurebench-cases.mjs"), "--semantic-probe", traceFile],
-    { encoding: "utf8" },
-  )
-  assert.equal(result.status, 0, result.stderr)
-  assert.match(result.stdout, /semantic categories: artifact, edge, lifecycle, node, response, tool/)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(fs.readFileSync(outputFile, "utf8"), "task-7-production-runner-output\n")
+    const benchmarkResult = JSON.parse(
+      fs.readFileSync(path.join(out, "benchmark-results", instanceID, "result.json"), "utf8"),
+    )
+    assert.equal(benchmarkResult.request_status, "completed")
+    for (const category of ["artifact", "edge", "lifecycle", "node", "response", "tool"]) {
+      assert.ok(benchmarkResult.trace_semantic_categories.includes(category), category)
+    }
+    assert.equal(benchmarkResult.evaluation.reason, "docker_disabled_by_option")
+  } finally {
+    await model.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test("runner allows large traces enough time to finalize after a signal", () => {

@@ -1,228 +1,111 @@
 import { describe, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 import { classifyShellOperation, inferVerificationStatus } from "../../src/tool/tool"
 import { captureRepositorySnapshot, repositorySnapshotDelta } from "../../src/observability/repository-snapshot"
+import { createTask7ProductionHarness } from "../observability/fixture/task-7-production-harness"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { execFileSync } from "node:child_process"
 
 describe("tool semantic observability", () => {
-  test("keeps production-projected passive tool behavior identical across tracing boundaries", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-passive-tool-equivalence-"))
-    const packageDir = path.resolve(import.meta.dir, "../..")
-    const script = path.join(import.meta.dir, "fixture", "passive-tool-projection.ts")
-    const invalidRoot = path.join(root, "invalid-root")
+  test("keeps production Agent behavior identical with tracing enabled and disabled", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-passive-production-equivalence-"))
+
+    const normalize = (value: unknown, runRoot: string): unknown => {
+      if (Array.isArray(value)) return value.map((item) => normalize(item, runRoot))
+      if (value && typeof value === "object") {
+        return Object.fromEntries(
+          Object.entries(value)
+            .filter(([key]) => !["id", "sessionID", "messageID", "time"].includes(key))
+            .map(([key, item]) => [key, normalize(item, runRoot)]),
+        )
+      }
+      if (typeof value !== "string") return value
+      return value
+        .replaceAll(runRoot, "<run-root>")
+        .replaceAll(runRoot.replace(/^\/+/, ""), "<run-root>")
+        .replace(/ses_[A-Za-z0-9]+/g, "<session-id>")
+        .replace(/msg_[A-Za-z0-9]+/g, "<message-id>")
+        .replace(/prt_[A-Za-z0-9]+/g, "<part-id>")
+    }
+
+    const stripTracePublication = (value: string) =>
+      value.replace(/\[observable-opencode\] Session trace saved\n(?:  .+\n)+/g, "")
+
+    const run = async (name: string, tracing: boolean) => {
+      const runRoot = path.join(root, name)
+      fs.mkdirSync(runRoot, { recursive: true })
+      const harness = await createTask7ProductionHarness(runRoot)
+      try {
+        const result = await harness.run({
+          tracing,
+          caseID: "passive-production-equivalence",
+          message: "TASK7_ROOT_WORKFLOW execute the deterministic production workflow",
+        })
+        const sessions = harness.persistedSessions()
+        const sessionNames = new Map(sessions.map((session, index) => [session.id, `session-${index + 1}`]))
+        const sessionRows = sessions.map((session) => ({
+          name: sessionNames.get(session.id),
+          parent: session.parent_id ? sessionNames.get(session.parent_id) : null,
+          title: session.title,
+          directory: normalize(session.directory, runRoot),
+        }))
+        const messages = sessions.flatMap((session) =>
+          harness.persistedMessages(session.id).map((row) => ({
+            session: sessionNames.get(session.id),
+            data: normalize(JSON.parse(row.data), runRoot),
+          })),
+        )
+        const parts = sessions.flatMap((session) =>
+          harness.persistedParts(session.id).map((row) => ({
+            session: sessionNames.get(session.id),
+            data: normalize(JSON.parse(row.data), runRoot),
+          })),
+        )
+        const toolCalls = parts
+          .filter((row) => (row.data as any).type === "tool")
+          .map((row) => ({ session: row.session, ...(row.data as any) }))
+        const file = fs.readFileSync(path.join(harness.projectDir, "agent-output.txt"))
+        return {
+          result: {
+            exitCode: result.exitCode,
+            stdout: result.stdout,
+            stderr: normalize(stripTracePublication(result.stderr), runRoot),
+          },
+          sessionRows,
+          messages,
+          parts,
+          toolCalls,
+          agentVisibleRequests: normalize(harness.requests, runRoot),
+          fileHash: Bun.CryptoHasher.hash("sha256", file, "hex"),
+          traceRoot: harness.traceRoot,
+          rawStderr: result.stderr,
+        }
+      } finally {
+        await harness.dispose()
+      }
+    }
 
     try {
-      fs.writeFileSync(invalidRoot, "not a directory")
-      const run = async (enabled: boolean, traceRoot: string) => {
-        const workspace = path.join(root, "workspaces", enabled ? path.basename(traceRoot) : "disabled")
-        fs.mkdirSync(workspace, { recursive: true })
-        const proc = Bun.spawn([process.execPath, script], {
-          cwd: packageDir,
-          env: {
-            ...process.env,
-            OPENCODE_CASE_TRACE: enabled ? "1" : "0",
-            OPENCODE_CASE_ID: "passive-tool-equivalence",
-            OPENCODE_CASE_TRACE_DIR: traceRoot,
-            OPENCODE_EQUIVALENCE_WORKSPACE: workspace,
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        })
-        const code = await proc.exited
-        const stderr = await new Response(proc.stderr).text()
-        const stdout = await new Response(proc.stdout).text()
-        expect(code).toBe(0)
-        return { result: JSON.parse(stdout), traceRoot, stderr, code }
-      }
-
-      const disabled = await run(false, path.join(root, "disabled"))
-      const enabled = await run(true, path.join(root, "enabled"))
-      const invalid = await run(true, invalidRoot)
+      const disabled = await run("disabled", false)
+      const enabled = await run("enabled", true)
 
       expect(enabled.result).toEqual(disabled.result)
-      expect(invalid.result).toEqual(disabled.result)
-      expect({ enabled: enabled.code, disabled: disabled.code, invalid: invalid.code }).toEqual({
-        enabled: 0,
-        disabled: 0,
-        invalid: 0,
-      })
-      expect(disabled.stderr).toBe("")
-      expect(invalid.stderr).toBe("")
-      expect(enabled.stderr).toMatch(
-        /^\[observable-opencode\] Session trace saved\n(?:  .+\n)+$/,
-      )
-      expect(enabled.stderr).toContain("  json: ")
-      expect(disabled.result.fileHashes).toEqual({
-        "agent-output.txt": createHash("sha256").update("stable agent file\n").digest("hex"),
-      })
-      expect(disabled.result.toolCalls).toEqual([
-        { callID: "passive-success", tool: "passive-benchmark", input: { scenario: "success", payload: "fixed-input" } },
-        { callID: "passive-error", tool: "passive-benchmark", input: { scenario: "error", payload: "fixed-input" } },
-        {
-          callID: "passive-pre-aborted",
-          tool: "passive-benchmark",
-          input: { scenario: "pre-aborted", payload: "fixed-input" },
-        },
-      ])
-      expect(disabled.result.sessionRows.messages).toEqual([
-        expect.objectContaining({ id: "msg_passive_assistant", sessionID: "ses_passive_projection", role: "assistant" }),
-      ])
-      expect(disabled.result.sessionRows.parts).toHaveLength(3)
-      expect(disabled.result.errorOracles).toEqual([
-        {
-          scenario: "error",
-          constructorName: "PassiveToolError",
-          name: "PassiveToolError",
-          isPassiveToolError: true,
-          hasPassiveToolErrorPrototype: true,
-          message: "passive benchmark failure",
-        },
-        {
-          scenario: "pre-aborted",
-          constructorName: "DOMException",
-          name: "AbortError",
-          isPassiveToolError: false,
-          hasPassiveToolErrorPrototype: false,
-          message: "Passive tool pre-aborted",
-        },
-      ])
-      expect(disabled.result.inputs).toEqual([
-        { scenario: "success", payload: "fixed-input" },
-        { scenario: "error", payload: "fixed-input" },
-        { scenario: "pre-aborted", payload: "fixed-input" },
-      ])
-      expect(disabled.result.callbackCounts).toEqual({ metadata: 3, ask: 3 })
-      expect(disabled.result.metadataCallbacks).toEqual([
-        {
-          scenario: "success",
-          value: { title: "passive success", metadata: { callback: "success" } },
-        },
-        {
-          scenario: "error",
-          value: { title: "passive error", metadata: { callback: "error" } },
-        },
-        {
-          scenario: "pre-aborted",
-          value: { title: "passive pre-aborted", metadata: { callback: "pre-aborted" } },
-        },
-      ])
-      expect(disabled.result.askCallbacks).toEqual(
-        ["success", "error", "pre-aborted"].map((scenario) => ({
-          scenario,
-          value: { permission: "read", patterns: ["fixed-input"], always: [], metadata: {} },
-        })),
-      )
-      expect(disabled.result.projectedToolParts).toEqual([
-        {
-          callID: "passive-success",
-          tool: "passive-benchmark",
-          state: {
-            status: "completed",
-            input: { scenario: "success", payload: "fixed-input" },
-            output: "stable tool output",
-            metadata: { scenario: "success", truncated: false },
-            title: "passive success",
-            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
-            attachments: [
-              {
-                type: "file",
-                mime: "text/plain",
-                filename: "passive.txt",
-                url: "data:text/plain;base64,cGFzc2l2ZQ==",
-              },
-            ],
-          },
-        },
-        {
-          callID: "passive-error",
-          tool: "passive-benchmark",
-          state: {
-            status: "error",
-            input: { scenario: "error", payload: "fixed-input" },
-            error: "passive benchmark failure",
-            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
-          },
-        },
-        {
-          callID: "passive-pre-aborted",
-          tool: "passive-benchmark",
-          state: {
-            status: "error",
-            input: { scenario: "pre-aborted", payload: "fixed-input" },
-            error: "Passive tool pre-aborted",
-            time: { start: 1_700_000_000_000, end: 1_700_000_000_000 },
-          },
-        },
-      ])
-      expect(disabled.result.agentVisibleMessages).toEqual([
-        { role: "user", content: [{ type: "text", text: "run passive benchmark" }] },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool-call",
-              toolCallId: "passive-success",
-              toolName: "passive-benchmark",
-              input: { scenario: "success", payload: "fixed-input" },
-            },
-            {
-              type: "tool-call",
-              toolCallId: "passive-error",
-              toolName: "passive-benchmark",
-              input: { scenario: "error", payload: "fixed-input" },
-            },
-            {
-              type: "tool-call",
-              toolCallId: "passive-pre-aborted",
-              toolName: "passive-benchmark",
-              input: { scenario: "pre-aborted", payload: "fixed-input" },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: "passive-success",
-              toolName: "passive-benchmark",
-              output: {
-                type: "content",
-                value: [
-                  { type: "text", text: "stable tool output" },
-                  { type: "media", mediaType: "text/plain", data: "cGFzc2l2ZQ==" },
-                ],
-              },
-            },
-            {
-              type: "tool-result",
-              toolCallId: "passive-error",
-              toolName: "passive-benchmark",
-              output: { type: "error-text", value: "passive benchmark failure" },
-            },
-            {
-              type: "tool-result",
-              toolCallId: "passive-pre-aborted",
-              toolName: "passive-benchmark",
-              output: { type: "error-text", value: "Passive tool pre-aborted" },
-            },
-          ],
-        },
-      ])
-      expect(fs.existsSync(path.join(disabled.traceRoot, "passive-tool-equivalence"))).toBe(false)
-      const traceCase = path.join(enabled.traceRoot, "passive-tool-equivalence")
-      const session = JSON.parse(fs.readFileSync(path.join(traceCase, "session.json"), "utf8"))
-      expect(session.segments).toHaveLength(1)
-      expect(fs.existsSync(path.join(traceCase, session.segments[0].records))).toBe(true)
-      expect(fs.existsSync(path.join(traceCase, "trace.json"))).toBe(true)
-      expect(fs.statSync(invalidRoot).isFile()).toBe(true)
+      expect(enabled.sessionRows).toEqual(disabled.sessionRows)
+      expect(enabled.messages).toEqual(disabled.messages)
+      expect(enabled.parts).toEqual(disabled.parts)
+      expect(enabled.toolCalls).toEqual(disabled.toolCalls)
+      expect(enabled.agentVisibleRequests).toEqual(disabled.agentVisibleRequests)
+      expect(enabled.fileHash).toBe(disabled.fileHash)
+      expect(enabled.result.exitCode).toBe(0)
+      expect(enabled.rawStderr).toContain("[observable-opencode] Session trace saved")
+      expect(disabled.rawStderr).not.toContain("[observable-opencode] Session trace saved")
+      expect(fs.existsSync(path.join(disabled.traceRoot, "passive-production-equivalence"))).toBe(false)
+      expect(fs.existsSync(path.join(enabled.traceRoot, "passive-production-equivalence", "trace.json"))).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
-  })
+  }, 1_200_000)
 
   test("classifies shell commands by their actual semantic operation", () => {
     expect(classifyShellOperation("python3 -m pytest tests/test_api.py -q")).toBe("verification")

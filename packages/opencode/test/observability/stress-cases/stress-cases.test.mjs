@@ -1,5 +1,4 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -7,6 +6,12 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { analyzeTraceDirectory } from "./analyze-trace-sufficiency.mjs"
 import { loadCases, reviewTraceSufficiency, scoreTraceQuality, summarizeReviews } from "./lib/stress-review.mjs"
+import {
+  runTask7Process,
+  startTask7RunnerModel,
+  writeTask7ObservableBinary,
+  writeTask7RunnerConfig,
+} from "../fixture/task-7-runner-harness.mjs"
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
 
@@ -228,48 +233,53 @@ test("stress runner supports explicit multi-step HTTP flows for compaction scena
   assert.doesNotMatch(flowActions[2].text, /src\/payment/)
 })
 
-test("stress runner executes a deterministic semantic-category probe", async () => {
-  const runner = await import("./run-stress-cases.mjs")
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-stress-semantic-probe-"))
-  const traceFile = path.join(temp, "trace.json")
-  fs.writeFileSync(
-    traceFile,
-    JSON.stringify({
-      manifest: { status: "success" },
-      nodes: [
-        { node_id: "run", kind: "run.start", component: "run" },
-        { node_id: "compact", kind: "context.compaction", component: "context" },
-        { node_id: "tool", kind: "tool.call", component: "tool" },
-        { node_id: "skill", kind: "skill.load", component: "skill" },
-        { node_id: "mcp", kind: "mcp.call", component: "mcp" },
-        { node_id: "subagent", kind: "subagent.call", component: "task" },
-        { node_id: "response", kind: "response.output", component: "result" },
+test("stress runner validates semantics from an actual production case", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-stress-production-runner-"))
+  const out = path.join(temp, "out")
+  const config = path.join(temp, "config")
+  const caseID = "wrong-implementation-target"
+  const outputFile = path.join(out, "repos", caseID, "task-7-runner-output.txt")
+  const model = await startTask7RunnerModel(outputFile)
+  try {
+    const binary = writeTask7ObservableBinary(path.join(temp, "bin"))
+    writeTask7RunnerConfig(config, model.url)
+    const result = await runTask7Process(
+      process.execPath,
+      [
+        path.join(rootDir, "run-stress-cases.mjs"),
+        "--binary", binary,
+        "--out", out,
+        "--config", config,
+        "--case", caseID,
       ],
-      edges: [{ edge_id: "edge", relation: "produced" }],
-      artifacts: [{ artifact_id: "artifact", path: "artifacts/sha256/value.txt" }],
-      records: [],
-    }),
-  )
+      {
+        env: {
+          ...process.env,
+          DEEPSEEK_API_KEY: "task-7-local",
+          OPENCODE_STRESS_PROVIDER: "task7",
+          OPENCODE_STRESS_MODEL: "test-model",
+          OPENCODE_DB: "opencode.db",
+          OPENCODE_DISABLE_AUTOUPDATE: "1",
+          OPENCODE_DISABLE_DEFAULT_PLUGINS: "1",
+          OPENCODE_DISABLE_LSP_DOWNLOAD: "1",
+          OPENCODE_DISABLE_MODELS_FETCH: "1",
+        },
+      },
+    )
 
-  assert.equal(typeof runner.assertTraceSemanticCategories, "function")
-  assert.deepEqual(runner.assertTraceSemanticCategories(traceFile), [
-    "artifact",
-    "compaction",
-    "edge",
-    "lifecycle",
-    "mcp",
-    "node",
-    "response",
-    "skill",
-    "subagent",
-    "tool",
-  ])
-
-  const result = spawnSync(process.execPath, [path.join(rootDir, "run-stress-cases.mjs"), "--semantic-probe", traceFile], {
-    encoding: "utf8",
-  })
-  assert.equal(result.status, 0, result.stderr)
-  assert.match(result.stdout, /semantic categories: artifact, compaction, edge, lifecycle, mcp, node, response, skill, subagent, tool/)
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /semantic categories:/)
+    for (const category of ["artifact", "edge", "lifecycle", "node", "response", "tool"]) {
+      assert.match(result.stdout, new RegExp(`\\b${category}\\b`))
+    }
+    assert.equal(fs.readFileSync(outputFile, "utf8"), "task-7-production-runner-output\n")
+    const trace = JSON.parse(fs.readFileSync(path.join(out, "traces", caseID, "trace.json"), "utf8"))
+    assert.ok(trace.records.some((record) => record.event_type === "tool.call"))
+    assert.ok(trace.records.some((record) => record.event_type === "response.output"))
+  } finally {
+    await model.close()
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
 })
 
 test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {

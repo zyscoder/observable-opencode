@@ -21,6 +21,7 @@ function sha256(value) {
 function parseArgs(argv) {
   const args = {
     binary: "",
+    manifest: manifestFile,
     datasetRows: "/private/tmp/featurebench-lite-rows.json",
     out: "/private/tmp/observable-opencode-featurebench-run",
     cases: [],
@@ -28,16 +29,19 @@ function parseArgs(argv) {
     dryRun: false,
     requestTimeoutMs: 2 * 60 * 60 * 1000,
     semanticProbe: "",
+    skipDocker: false,
   }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (arg === "--binary") args.binary = argv[++index]
+    else if (arg === "--manifest") args.manifest = argv[++index]
     else if (arg === "--dataset-rows") args.datasetRows = argv[++index]
     else if (arg === "--out") args.out = argv[++index]
     else if (arg === "--case") args.cases.push(argv[++index])
     else if (arg === "--config") args.config = argv[++index]
     else if (arg === "--request-timeout-ms") args.requestTimeoutMs = Number(argv[++index])
     else if (arg === "--semantic-probe") args.semanticProbe = argv[++index]
+    else if (arg === "--skip-docker") args.skipDocker = true
     else if (arg === "--dry-run") args.dryRun = true
     else if (arg === "--help" || arg === "-h") args.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -47,7 +51,7 @@ function parseArgs(argv) {
 
 function usage() {
   return [
-    "Usage: node run-featurebench-cases.mjs --binary <observable-binary> --dataset-rows <rows.json> [options]",
+    "Usage: node run-featurebench-cases.mjs --binary <observable-binary> --dataset-rows <rows.json> [--manifest manifest.json] [options]",
     "       node run-featurebench-cases.mjs --semantic-probe <trace.json>",
     "",
     "The runner uses FeatureBench's official problem statement and masked repository setup, then sends",
@@ -127,7 +131,14 @@ export function binarySupportsSubjectRevision(binaryPath) {
     .includes(Buffer.from("OPENCODE_TRACE_SUBJECT_REVISION"))
 }
 
-export function officialEvaluationStatus({ dockerAvailable }) {
+export function officialEvaluationStatus({ dockerAvailable, disabled = false }) {
+  if (disabled) {
+    return {
+      status: "not_run",
+      reason: "docker_disabled_by_option",
+      evaluator: "FeatureBench official harness",
+    }
+  }
   if (!dockerAvailable) {
     return {
       status: "not_run",
@@ -431,7 +442,7 @@ async function runOneCase(row, args, sourceManifest) {
       `http://127.0.0.1:${port}/session/${session.id}/message?directory=${directory}`,
       {
         model: {
-          providerID: "deepseek",
+          providerID: process.env.OPENCODE_BENCHMARK_PROVIDER ?? "deepseek",
           modelID: process.env.OPENCODE_BENCHMARK_MODEL ?? "deepseek-v4-pro",
         },
         agent: "build",
@@ -456,7 +467,10 @@ async function runOneCase(row, args, sourceManifest) {
   }
   const traceSemanticCategories = assertTraceSemanticCategories(traceFile)
   const modelPatch = run("git", ["diff", "--binary", "HEAD"], { cwd: repoDir })
-  const evaluation = officialEvaluationStatus({ dockerAvailable: hasDocker() })
+  const evaluation = officialEvaluationStatus({
+    dockerAvailable: args.skipDocker ? false : hasDocker(),
+    disabled: args.skipDocker,
+  })
   const result = {
     benchmark: sourceManifest.source,
     instance: row.benchmark_manifest,
@@ -483,7 +497,7 @@ export async function runFeatureBenchCases(args) {
     console.log(`[featurebench] semantic categories: ${categories.join(", ")}`)
     return categories
   }
-  const sourceManifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"))
+  const sourceManifest = JSON.parse(fs.readFileSync(path.resolve(args.manifest), "utf8"))
   const rowsPayload = JSON.parse(fs.readFileSync(path.resolve(args.datasetRows), "utf8"))
   let rows = selectFeatureBenchRows(rowsPayload, sourceManifest)
   if (args.cases.length) {

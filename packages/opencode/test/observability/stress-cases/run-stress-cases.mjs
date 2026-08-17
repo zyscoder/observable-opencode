@@ -204,7 +204,7 @@ async function runOneCase(caseDef, args) {
     })
     for (const action of planCaseActions(caseDef)) {
       const model = {
-        providerID: action.providerID ?? "deepseek",
+        providerID: action.providerID ?? process.env.OPENCODE_STRESS_PROVIDER ?? "deepseek",
         modelID: action.modelID ?? process.env.OPENCODE_STRESS_MODEL ?? "deepseek-v4-pro",
       }
       if (action.type === "prompt") {
