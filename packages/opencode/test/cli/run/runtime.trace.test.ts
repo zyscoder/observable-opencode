@@ -431,6 +431,7 @@ test("writes independent real traces for A success, replacement, B transport fai
       `}`,
       `const submit = (text) => { for (const fn of [...prompts]) fn({ text, parts: [] }) }`,
       `CaseTrace.configure({ caseID: "interactive-real-outcomes" })`,
+      `const processRun = CaseTrace.startSpan({ component: "run", operation: "execute", trace_scope: "process" })`,
       `let sessionID = "ses_a"`,
       `CaseTrace.setSessionID(sessionID)`,
       `const outcomes = createInteractiveTraceOutcomeTracker()`,
@@ -468,7 +469,7 @@ test("writes independent real traces for A success, replacement, B transport fai
       `await Promise.resolve()`,
       `footer.close()`,
       `await task`,
-      `finishInteractiveTraceSessions({ sessionID, error: outcomes.failure(sessionID) })`,
+      `finishInteractiveTraceSessions({ sessionID, error: outcomes.failure(sessionID), beforeTraceFinalize: ({ failure }) => processRun?.end({ status: failure ? "error" : "success", error: failure }) })`,
       `finishInteractiveTraceSessions({ sessionID, error: outcomes.failure(sessionID) })`,
     ].join("\n"),
   )

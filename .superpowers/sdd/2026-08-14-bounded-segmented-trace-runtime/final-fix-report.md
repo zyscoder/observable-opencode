@@ -243,3 +243,22 @@ Compatibility and immutability evidence:
 - Reused artifact-relative paths remain separately readable at their scoped immutable segment paths; the root compatibility alias retains its original bytes.
 - The unified legacy projection now has explicit assertions for latest terminal status, result, and error instead of relying on a non-schema fixture marker.
 - Repeated materialization asserts that the segment-local legacy projection remains byte-identical, while the logical-root projection remains replaceable and journal-derived.
+
+## Checkpoint 9: Restore production-shaped interactive process ownership
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+RED and root-cause evidence:
+
+- `bun test test/cli/tui/worker-trace.test.ts test/cli/tui/thread.test.ts test/cli/tui/trace-materializer-process.test.ts test/cli/run/runtime.trace.test.ts test/cli/serve-command.test.ts test/cli/trace-finalize.test.ts --timeout 120000`: 26 pass, 1 fail, 89 expectations in 11.64 s. The synthetic real-trace replacement fixture produced two roots instead of its expected three.
+- Production `run` creates a process-scoped outer `run.execute` span before binding a session and closes it through `beforeTraceFinalize`. The synthetic fixture omitted both operations, so its compatibility root was correctly claimed by `ses_a`; this was a fixture defect rather than product trace loss.
+
+GREEN evidence:
+
+- `bun test test/cli/run/runtime.trace.test.ts --test-name-pattern "writes independent real traces" --timeout 120000`: 1 pass, 0 fail, 6 expectations in 1.52 s.
+- `bun test test/cli/tui/worker-trace.test.ts test/cli/tui/thread.test.ts test/cli/tui/trace-materializer-process.test.ts test/cli/run/runtime.trace.test.ts test/cli/serve-command.test.ts test/cli/trace-finalize.test.ts --timeout 120000`: 27 pass, 0 fail, 93 expectations in 11.57 s.
+
+Production-path evidence:
+
+- Worker signal mapping, trace-only shutdown failures, normal/Ctrl-C worker termination ordering, the separate five-second cleanup and trace-close deadlines, serial external materialization, run replacement and startup failures, serve startup, and standalone finalize all pass.
+- The fixture now owns and closes the process trace exactly where production does; it does not replace or stand in for the separately executed production E2E command.
