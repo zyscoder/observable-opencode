@@ -323,7 +323,7 @@ export async function createTask7ProductionHarness(root: string) {
   const env = environment(root)
   const databaseFile = path.join(env.XDG_DATA_HOME, "opencode", "opencode.db")
 
-  function query<T>(sql: string, values: unknown[] = []) {
+  function query<T>(sql: string, values: string[] = []) {
     const database = new Database(databaseFile, { readonly: true })
     try {
       return database.query(sql).all(...values) as T[]

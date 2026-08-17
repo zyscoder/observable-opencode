@@ -1008,7 +1008,8 @@ test("failed atomic manifest publication removes the unpublished segment and pre
       publicationError = error
     }
     expect(publicationError).toBeInstanceOf(Error)
-    expect(["EACCES", "EPERM", "EROFS"]).toContain((publicationError as NodeJS.ErrnoException).code)
+    const publicationCode = (publicationError as NodeJS.ErrnoException).code
+    expect(["EACCES", "EPERM", "EROFS"]).toContain(publicationCode ?? "missing_error_code")
     await fs.chmod(logicalRoot, 0o755)
 
     expect(await treeHash(logicalRoot)).toBe(before)

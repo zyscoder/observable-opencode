@@ -7414,7 +7414,11 @@ describe("case trace", () => {
     expect(traceText).not.toContain("Bearer abc")
     expect(traceText).not.toContain("final_response_evidence")
 
-    const artifactText = await fs.readFile(path.join(caseDir, trace.artifacts[0].path), "utf8")
+    const messagesArtifact = trace.artifacts.find(
+      (artifact: any) => artifact.artifact_id === trace.context_snapshots[0].messages.artifact_id,
+    )
+    expect(messagesArtifact?.label).toBe("context.llm_request.messages")
+    const artifactText = await fs.readFile(path.join(caseDir, messagesArtifact.path), "utf8")
     expect(artifactText).toContain("semantic model message")
     expect(artifactText).not.toContain(secret)
     expect(artifactText).not.toContain("Bearer abc")
